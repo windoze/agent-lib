@@ -373,11 +373,15 @@ trait LlmClient: Send + Sync {
 - 真实多轮验收发现并修复 OpenAI request mapper 的类级协议缺陷：assistant 历史文本不再错误使用用户侧 `input_text`，而是按 Responses 角色词汇编码为 `output_text`，并从保留的 response extra 恢复 `refusal`；assistant image 与未知 replay 文本类型在发网前返回明确协议错误，user/tool-result 的 `input_text`/`input_image` 语义保持不变。新增 output/refusal、modeled 字段优先及非法边界回归测试。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test adapter::openai_resp::request::tests`(6 passed),`cargo test --all --all-targets`(130 passed,7 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_normalization -- --ignored --nocapture`(1 passed,两 provider 共三类场景,17.57s)。
 
-### M6-2 [TODO] 能力矩阵与逃生舱实证
+### M6-2 [DONE] 能力矩阵与逃生舱实证
 **做什么**:
 - 文档 `docs/capability-matrix.md`:记录两 provider 的 Capability 默认值与实测差异。
 - 测试:断言各 provider 的方言字段确实落入 extra(Foundry cache_creation.ephemeral_*、Azure content_filters),证明逃生舱 B 生效、无信息丢失。
 **验证**:能力矩阵与实测一致;逃生舱测试通过。
+**完成记录**:
+- 2026-07-13: 新增 `docs/capability-matrix.md`,逐字段记录 Anthropic Messages 与 OpenAI Responses 的协议级 `Capability` 默认值,并将默认能力上界、当前 Foundry 部署的真实验证范围和未实测边界明确分层;同时记录两家 endpoint 在 tool stop、cache accounting、reasoning 与 Azure 内容过滤元数据上的实测差异。
+- 新增跨 provider 验收测试 `tests/capability_escape_hatches.rs`:通过 `Box<dyn LlmClient>` 确认两 adapter 暴露各自默认 capability;把脱敏真实响应中的 Anthropic `usage.cache_creation` 完整对象和 Azure `content_filters` 完整数组与归一化 `extra` 做全值比较,并验证 `Response` serde 往返后证据仍不丢失。
+- 验证通过:`cargo fmt --all`,`cargo test --test capability_escape_hatches`(3 passed),`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(133 passed,7 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`cargo fmt --all -- --check`,`git diff --check`;加载 `.envrc` 后 Anthropic 真实集成测试 3 项、OpenAI Responses 真实集成测试 3 项及跨 provider normalization 矩阵 1 项全部通过。
 
 ### M6-3 [TODO] 使用示例与 crate 文档
 **做什么**:

@@ -1,56 +1,36 @@
 # 当前执行计划
 
-## 目标与边界
+## 目标与约束
 
-- 以 `TODO.md` 为唯一的任务顺序与验收依据。
-- 本次只完成第一个标题未带 `[DONE]` 的任务；完成并提交后立即停止，不进入下一项。
-- `PLAN.md` 仅在阶段级计划、依赖或完成标准确实变化时修改。
-- 不做开放式历史问题排查；只处理当前任务、其直接阻塞项、当前任务引入的回归，以及测试策略要求处理的失败。
-- 本文件记录可审查的计划、依据、关键决策和进度；不记录模型私有的逐字思维链。
+- 以 `TODO.md` 为唯一任务顺序与验收依据，识别并完成首个标题未带 `[DONE]` 的任务。
+- 不做开放式历史问题扫描；仅检查当前任务、其直接依赖、最新提交中与该任务直接相关的未完成事项，以及验证过程中暴露的失败。
+- 若发现阻塞当前任务且尚未跟踪的真实前置问题，只在 `TODO.md` 中加入最少量前置任务、记录依赖、提交后停止；不以缩小范围或特殊处理规避规范。
+- 若可完成，则完整实现、测试、更新 `TODO.md` 的标题与完成记录、提交全部相关未提交改动，然后停止，不进入下一任务。
+- `PLAN.md` 仅在阶段级顺序、依赖、假设或完成标准确实变化时更新。
 
-## 分步执行计划
+## 分步计划
 
-1. 读取 `TODO.md`，严格按标题上的 `[DONE]` 状态识别第一个未完成任务，并完整提取其依赖、实现范围、测试与完成记录要求。
-2. 检查仓库工作区状态与最新提交，只判断是否存在未提交的续作，以及最新提交是否明确提到与当前任务直接相关的未完成问题。
-3. 阅读当前任务直接涉及的设计、代码与测试；先建立基线，不进行无关的历史缺陷扫描。
-4. 若发现使当前任务无法按规格实现的具体前置缺陷：精确界定问题，以最少数量在 `TODO.md` 中加入前置任务、补充依赖；必要时才改 `PLAN.md`；提交该记录后停止。
-5. 若无阻塞，按任务原定执行单元完整实现。采用小而聚焦的补丁，及时回读受影响代码；对同一根因明确影响的一类情况作类级修复，不引入临时绕过。
-6. 添加或更新覆盖任务验收条件、边界行为和回归风险的测试及文档。
-7. 按要求先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，然后运行任务指定测试及不超过 30 分钟的 `cargo test --all --all-targets`；如任务要求，再运行 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。任何未被明确排期的失败都必须修复或转化为前置任务，不能忽略。
-8. 验证实现与任务清单逐项一致；在 `TODO.md` 的任务标题前加 `[DONE]` 并填写真实完成记录。仅在阶段计划变化时更新 `PLAN.md`。
-9. 再次检查差异和工作区，确认没有误改或遗漏；若这是异常中断后的续作，按要求将现有未提交文件全部纳入同一次任务提交。
-10. 使用清晰、包含任务编号的提交信息提交全部本次变更。确认提交成功后停止，不读取或执行下一任务。
+1. 读取 `TODO.md`，从头定位首个标题未显式标记 `[DONE]` 的任务，提取其需求、依赖、测试与完成记录要求。
+2. 检查 Git 工作区与最新提交，区分既有用户改动/上次中断遗留，并确认最新提交是否明确提到与当前任务直接相关的未完成问题。
+3. 只读取当前任务所需的设计、计划和源码/测试上下文，建立实现边界；如发现具体阻塞，按规则更新任务依赖并停止。
+4. 以小而聚焦的补丁实现当前任务，同时补齐覆盖正常路径、边界、错误路径和兼容性的测试及必要文档。
+5. 每完成关键步骤或计划发生变化时更新本文件，记录已完成事项、发现的问题与下一步。
+6. 按指定顺序验证：`cargo fmt --all`，然后 `cargo clippy --all-targets -- -D warnings`，再运行任务指定测试与最长不超过 30 分钟的完整 `cargo test --all --all-targets`；最后运行任务要求的文档构建或其他检查。
+7. 若出现未被后续任务明确覆盖的测试失败，立即修复，或在 `TODO.md` 中加入最小前置/跟进任务；未解决前不把当前任务标为完成。
+8. 完成后在 `TODO.md` 任务标题前加 `[DONE]` 并填写可复核的完成记录；仅在阶段计划实际变化时修改 `PLAN.md`。
+9. 复查 diff、测试结果和任务范围，更新本文件为最终状态；使用清晰的任务编号提交所有相关未提交文件（包括恢复任务遗留文件），确认提交成功后停止。
 
-## 当前进度
+## 当前状态
 
-- 已在任何仓库检查或命令执行前建立本计划文件。
-- 已读取 `TODO.md`；按标题状态识别出的第一个未完成任务是 **M6-1 `[TODO]` 归一化一致性集成测试**。
-- 本次任务要求：在 `tests/` 中以同一套参数化断言覆盖 Anthropic 与 OpenAI Responses 的纯文本、多轮、tool call 往返；必须通过 `Box<dyn LlmClient>` 调用；测试断言层不得泄漏 provider 特判；有相应环境变量时两家都应通过。
-
-## M6-1 针对性实施方案
-
-1. 检查 `git status` 与最新提交说明，判断是否是未提交续作，以及最新提交是否明确留下与 M6-1 直接相关的问题。
-2. 阅读现有两家真实集成测试、adapter 构造 API、`LlmClient`/`ChatRequest`/`Response`/tool 类型；复用项目既有环境变量约定、超时与跳过策略。
-3. 设计一个 provider-neutral 的测试场景驱动器：仅在 client 构造层选择 provider，后续纯文本、多轮、tool 往返均接受 `Box<dyn LlmClient>`，并调用相同的结构断言辅助函数。
-4. 对 tool 往返保留第一次 assistant tool call，模拟执行工具并以统一 `ToolResult` 内容回灌，再发起第二次请求；断言 id 关联、assistant 文本/工具块、stop reason 与 usage 的合理性。
-5. 确保断言表达跨 provider 共同契约，不比较 provider 原始 id、具体文本、精确 token 数或 provider 专属 extra；若现有公共模型不足以无绕过地表达往返，则按阻塞策略处理而不缩窄测试。
-6. 先运行新增集成测试的编译与聚焦验证；真实 endpoint 测试默认 `#[ignore]`，在环境配置可用时运行两家同一套场景，并保证每个 case 有小于 1 分钟的超时。
-7. 依次运行格式化、严格 clippy、完整测试与文档警告检查；处理所有失败。
-8. 将 M6-1 标题改为 `[DONE]` 并填写实现和验证记录；审阅差异后提交包含任务号的单一提交，然后停止。
-
-## 当前下一步
-
-- 已检查工作区与最新提交：除本计划文件外起始状态干净；最新提交为已完成的 M5-R，没有明确遗留与 M6-1 直接相关的问题，因此不是异常中断后的续作，也没有需要插入的前置任务。
-- 已核对两家 request mapper：统一 `Message`/`ContentBlock` 可原样承载多轮 assistant 消息、tool call id 和 `Role::Tool` 的 `ToolResult`；OpenAI replay 元数据也随 block extra 保留，当前任务不存在模型边界阻塞。
-- 已新增模块化的跨 provider 测试矩阵：endpoint/provider 分支仅位于 client 构造层；纯文本、多轮、tool 往返场景和结构断言均共享，并通过 `Box<dyn LlmClient>` 调用。
-- 新增测试默认忽略，整个矩阵由 55 秒外层 deadline 约束；缺少任一 provider 配置时只跳过对应 target，不读取或输出 secret。
-- 已执行 `cargo fmt --all`；首次严格 Clippy 编译发现一处 `nonminimal_bool`，属于新增断言的等价表达式 lint，已按建议改为 `Option::is_none_or`，没有规格或设计变化。
-- 重新格式化与严格 Clippy 已通过；新增测试目标默认模式通过（1 个 opt-in 测试按预期 ignored）。
-- 使用 `direnv exec .` 运行真实矩阵时，Anthropic 的三类场景全部通过；OpenAI 纯文本通过，但多轮 follow-up 返回 HTTP 400：assistant 历史被 request mapper 错误编码为 `input_text`，服务端明确只接受 `output_text`/`refusal`。这是直接阻塞当前任务的既有协议缺陷，不能通过缩窄或改写测试绕过。
-- 已按根因进行类级修复：OpenAI user 文本/图片继续使用 `input_text`/`input_image`；assistant 文本改用 `output_text`，并从已保留的 response extra 恢复 `refusal` 类型；Responses 不支持的 assistant image 与未知 replay 文本类型在发网前返回明确协议错误；tool result 多模态仍使用 input 内容词汇。
-- 已更新完整请求期望，并新增 assistant output/refusal、modeled 字段优先、assistant image 与未知 replay 类型的回归覆盖。
-- 修复后验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；OpenAI request mapper 聚焦测试 6 项；真实跨 provider 矩阵 1 项（Anthropic 与 OpenAI 均完整跑完纯文本、多轮、tool 往返，17.57 秒）。
-- 完整质量门通过：`cargo test --all --all-targets` 为 130 passed、7 ignored；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 成功。
-- 已将 `TODO.md` 的 M6-1 标题更新为 `[DONE]` 并写入实现、直接阻塞修复和真实验证记录；阶段级计划未变化，因此不修改 `PLAN.md`。
-- 最终 `cargo fmt --all -- --check` 与 `git diff --check` 通过；工作区仅包含 M6-1 的测试矩阵、OpenAI assistant 历史修复及回归测试、`TODO.md` 和本进度文件，没有 `PLAN.md`/`PROMPT.md` 或无关改动。
-- 已创建单一提交 `[M6-1] Add cross-provider normalization acceptance tests`；提交后的只读检查确认 `main` 仅领先 `origin/main` 1 个提交且工作区干净。本次 M6-1 已完成，立即停止，不开始 M6-2。
+- 状态：已读取 `TODO.md`，首个未完成任务确定为 `M6-2 [TODO] 能力矩阵与逃生舱实证`；没有跳过 review 任务或后续任务。
+- 当前任务交付物：新增 `docs/capability-matrix.md`，记录 Anthropic Messages 与 OpenAI Responses 的默认 `Capability` 及真实 endpoint 差异；新增/强化自动化测试，明确断言 Anthropic/Foundry 的 `cache_creation.ephemeral_*` 和 Azure/OpenAI 的 `content_filters` 落入 `extra` 且不丢失。
+- 当前任务验收：能力矩阵必须与代码默认表和已录制真实 fixture 一致；聚焦逃生舱测试、格式化、严格 clippy、全量测试与文档构建全部通过；随后将 `M6-2` 标为 `[DONE]`、填写完成记录并提交。
+- 已完成检查：任务开始前 Git 工作区无项目遗留改动（仅本文件是本次新增改动）；最新提交 `7844640 Update doc` 只加入后续 `NEXT-1`，未声明与 `M6-2` 直接相关的未完成问题，因此无需新增前置任务。
+- 实现判断：两家完整响应解析器已具备正确逃生舱行为；Anthropic 单元测试已全值断言 `usage.extra.cache_creation`，OpenAI 测试目前主要断言 `content_filters` 键存在。当前任务无需改生产逻辑，但需要新增跨 provider 的公开 API 验收，比较原始 fixture 与归一化 `extra` 的完整 JSON 值，并验证 `Response` serde 往返后仍保持一致。
+- 文档判断：矩阵将分成“代码中的协议级默认表”和“当前 Foundry 部署实测证据”两层；未在真实 endpoint 验证的模态、并行工具、结构化输出等只记录为默认能力，不伪装成部署实测结论。
+- 已完成实现：新增 `docs/capability-matrix.md`，逐字段列出两家协议默认值、当前 Foundry 实测范围、未实测边界和方言字段归宿；新增 `tests/capability_escape_hatches.rs`，通过公开 adapter API 验证默认 capability 绑定，并对两份脱敏真实响应做原始 JSON 全值比较及 `Response` serde 往返。
+- 生产代码未修改：现有解析行为满足任务要求；本次通过独立跨 provider 验收把此前分散/较弱的断言固化为明确证据。
+- 已通过验证：`cargo fmt --all`；新增验收测试 3/3；`cargo clippy --all-targets -- -D warnings`；`cargo test --all --all-targets`（库单元测试 130 项 + 新增验收 3 项通过，7 项真实 endpoint 测试按预期忽略）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`cargo fmt --all -- --check`；`git diff --check`。
+- 真实 endpoint 复验通过：加载 `.envrc` 后 Anthropic 非流式/流式文本/tool 3 项、OpenAI Responses 非流式/流式文本/tool 3 项全部通过；跨 provider normalization 矩阵完整执行纯文本、多轮和 tool 往返并通过（1 项，18.17 秒）。
+- 已将 `TODO.md` 的任务标题更新为 `M6-2 [DONE]` 并写入文档、测试和验证记录；阶段级计划与依赖未变化，因此未修改 `PLAN.md`，也未开始 `M6-3`。
+- 下一步：执行最终格式/diff/工作区审查，暂存本次全部四个文件并检查 staged diff；确认无误后创建单一 `[M6-2]` 提交并停止。
