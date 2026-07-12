@@ -216,7 +216,7 @@ enum StreamEvent {
 - 新增 Anthropic Foundry Bearer/version header 与 OpenAI Responses Foundry `api-key`/`api-version` 两种真实配置形态、全部认证变体及完整/最小请求 round-trip 测试。
 - 验证通过:`cargo test client::config::tests`(3 passed),`cargo test client::request::tests`(2 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(70 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
-### M3-4 [TODO] `LlmClient` trait
+### M3-4 [DONE] `LlmClient` trait
 **上下文**:`DESIGN.md` 一律 `#[async_trait]` + dyn-safe;两种消费姿势(流式 / collect 完整)。
 **做什么**:
 - `client/mod.rs`:
@@ -231,6 +231,10 @@ trait LlmClient: Send + Sync {
 ```
 - 确认 `Box<dyn LlmClient>` 可用(dyn-safe)。
 **验证**:写一个 mock 实现 + 断言可 `Box<dyn LlmClient>`;`chat` 默认实现(基于 chat_stream + Accumulator)可选。
+**完成记录**:
+- 2026-07-13: 实现 `#[async_trait]` 的 provider-neutral `LlmClient: Send + Sync`,提供结构化 capability 查询、原生完整响应 `chat` 与返回 `'static` boxed event stream 的 `chat_stream`;两条响应路径保持独立,供后续适配器分别实现非流式与流式 wire。
+- 新增 mock trait 实现并通过 `Box<dyn LlmClient>` 实际调用 capability、`chat`、`chat_stream`;将 boxed stream 交给统一 `Accumulator` 折叠,断言与非流式响应完全一致。
+- 验证通过:`cargo test client::tests::boxed_dyn_client_supports_complete_and_streaming_calls`(1 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(71 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
 ### M3-R [TODO] Milestone 3 Review
 **验证清单**:
