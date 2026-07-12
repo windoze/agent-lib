@@ -5,7 +5,10 @@
 //! It does not change the Client wire model: system instructions remain
 //! configuration, while message ids remain in [`ConversationMessage`]. Closed
 //! turns can enter history only through the crate-private validated commit path
-//! used by the pending layer.
+//! used by the pending layer. Cancellation discards active partials and either
+//! drops the whole pending turn, restores an assistant boundary with explicit
+//! cancelled tool results, or validates a caller-supplied final response before
+//! committing.
 
 pub mod config;
 pub mod error;
@@ -17,14 +20,15 @@ mod validation;
 
 pub use config::ConversationConfig;
 pub use error::{
-    CommitError, ContentBlockKind, ConversationError, PairingMessageKind, PendingMessageError,
-    PendingTurnError,
+    CancelError, CommitError, ContentBlockKind, ConversationError, PairingMessageKind,
+    PendingMessageError, PendingTurnError,
 };
 pub use id::{ArtifactId, ConversationId, MessageId, ToolCallId, TurnId};
 pub use message::ConversationMessage;
 pub use pending::{
-    AssistantFinish, FrozenMessage, PendingMessage, PendingToolCall, PendingTurn, PendingTurnPhase,
-    ToolCallMapping,
+    AssistantFinish, CANCELLED_TOOL_RESULT_TEXT, CancelDisposition, CancelOutcome,
+    CancelledToolResult, FrozenMessage, PendingMessage, PendingToolCall, PendingTurn,
+    PendingTurnPhase, ToolCallMapping,
 };
 pub use turn::{ToolPairing, Turn, TurnMeta, TurnResponseMeta};
 

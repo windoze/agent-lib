@@ -7,8 +7,12 @@
 //! committed history until a final assistant response passes the shared
 //! closed-turn validator.
 
+mod cancel;
 mod message;
 mod turn;
 
+pub use cancel::{
+    CANCELLED_TOOL_RESULT_TEXT, CancelDisposition, CancelOutcome, CancelledToolResult,
+};
 pub use message::{FrozenMessage, PendingMessage};
 pub use turn::{AssistantFinish, PendingToolCall, PendingTurn, PendingTurnPhase, ToolCallMapping};

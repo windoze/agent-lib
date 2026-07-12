@@ -276,6 +276,22 @@ impl PendingTurn {
         })
     }
 
+    /// Applies a fully validated cancellation closure as one infallible step.
+    ///
+    /// Replacing `state` drops any active [`PendingMessage`] without finishing
+    /// or parsing it. The caller prepares every synthetic result and updated
+    /// correlation before invoking this method, so no partial closure can be
+    /// observed after mutation begins.
+    pub(in crate::conversation) fn resume_after_cancel(
+        &mut self,
+        cancelled_messages: Vec<ConversationMessage>,
+        tool_calls: Vec<PendingToolCall>,
+    ) {
+        self.messages.extend(cancelled_messages);
+        self.tool_calls = tool_calls;
+        self.state = PendingTurnState::AwaitingAssistant;
+    }
+
     /// Reports whether an identity is already frozen in this transaction.
     pub(super) fn contains_message_id(&self, message_id: MessageId) -> bool {
         self.messages

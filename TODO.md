@@ -416,7 +416,7 @@ validator。
   0 failed，全部 example targets passed）；`cargo test --doc`（1 个正向与 9 个 compile-fail
   passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
-### M2-4 [TODO] Cancel 裂缝闭合与“cancel 后仍可 feed”
+### M2-4 [DONE] Cancel 裂缝闭合与“cancel 后仍可 feed”
 
 **前置依赖**：M2-3。
 
@@ -450,6 +450,39 @@ validator。
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、cancel 聚焦测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
   `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增聚焦的 `pending/cancel.rs` 与 data-only `cancel/prepare.rs`，公开
+  `CancelDisposition::{DiscardTurn, ResumeTurn, CommitTurn}`、`CancelledToolResult`、
+  `CancelOutcome`、分类化 `CancelError` 与 `Conversation::cancel_pending`。`DiscardTurn` 对任意
+  pending phase 直接整体丢弃；Resume 与 Commit 对每个 frozen open call 要求调用方显式给出
+  provider call id、稳定 `ToolCallId` 和 result `MessageId`，既能在 mapping 前原子建立
+  pairing，也会拒绝改变已注册的 framework id。
+- synthetic result 固定生成完整 tool-role message，nested text 明确记录执行被中断，唯一权威
+  `ToolStatus::Cancelled` 原样保留；每个 open call 使用独立外部 message id。已正常完成的
+  parallel result 不会重写，只闭合仍 open 的 calls；active streaming/complete/terminal
+  `PendingMessage` 从不被 finish、parse 或暴露，成功 Resume/Commit 时随状态替换整体 drop，
+  partial text/reasoning/tool JSON 不进入任何完整 message。
+- Resume 在全部 mapping、缺失/多余项及 conversation-wide identity 预检完成后，才一次性追加
+  cancelled messages、闭合 bookkeeping 并回到 `AwaitingAssistant`。Commit 使用独立完整
+  `Response` 经过同一 `PendingMessage` freeze 语义，明确拒绝再次产生 ToolUse，汇总既有与最终
+  response usage/metadata 后构造 data-only `TurnData`；只有唯一 `commit_draft` I1--I4 validator
+  成功才清空原 pending。状态、freeze、identity 或 validator 失败均保留 pending 与 committed
+  history，可用原 response/id 修正重试，不产生半闭合 Turn。
+- 新增 14 个按 success 及 state/identity/final-response error 分组的 cancel 状态机测试：
+  覆盖纯文本流与三段 tool JSON 中途 cancel、mapping 前 parallel calls、tool 执行中部分完成、
+  三种 disposition、无 pending、
+  ReadyToCommit、重复 provider id、缺失/重复/未知 synthetic result、既有/新 framework id、
+  pending/committed message id 冲突、非法 final role/tool-use/content，以及 commit validator
+  失败原子性；逐项断言 `Cancelled` 持久化、partial 不落盘、I1--I4 与后续 feed→commit/新 Turn
+  可用。README 与 crate/module rustdoc 同步公共 cancel 语义和 typed resume 示例。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test conversation::pending::turn::tests::cancel`（14 passed）；
+  `cargo test conversation::pending`（35 passed）；1800 秒硬上限内
+  `cargo test --all --all-targets`（209 个库测试与 3 个离线集成测试 passed、7 ignored、
+  0 failed，全部 example targets passed）；`cargo test --doc`（1 个正向与 9 个 compile-fail
+  passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
 ### M2-R [TODO] Milestone 2 Review
 

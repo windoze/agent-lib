@@ -55,6 +55,21 @@ pub struct PendingToolCall {
 }
 
 impl PendingToolCall {
+    /// Creates one internal pending correlation at a checked transition boundary.
+    pub(in crate::conversation) fn new(
+        call_id: ToolCallId,
+        provider_call_id: String,
+        call_msg: MessageId,
+        result_msg: Option<MessageId>,
+    ) -> Self {
+        Self {
+            call_id,
+            provider_call_id,
+            call_msg,
+            result_msg,
+        }
+    }
+
     /// Returns the framework-owned bookkeeping identity.
     #[must_use]
     pub const fn call_id(&self) -> ToolCallId {
@@ -77,6 +92,11 @@ impl PendingToolCall {
     #[must_use]
     pub const fn result_message_id(&self) -> Option<MessageId> {
         self.result_msg
+    }
+
+    /// Closes this internal pending correlation after all result checks pass.
+    pub(in crate::conversation) fn set_result_message_id(&mut self, message_id: MessageId) {
+        self.result_msg = Some(message_id);
     }
 }
 
@@ -157,16 +177,14 @@ impl PendingTurn {
             .expect("a mapped assistant was frozen into pending messages")
             .id();
         self.tool_calls
-            .extend(
-                provider_call_ids
-                    .into_iter()
-                    .map(|provider_call_id| PendingToolCall {
-                        call_id: by_provider[provider_call_id.as_str()],
-                        provider_call_id,
-                        call_msg,
-                        result_msg: None,
-                    }),
-            );
+            .extend(provider_call_ids.into_iter().map(|provider_call_id| {
+                PendingToolCall::new(
+                    by_provider[provider_call_id.as_str()],
+                    provider_call_id,
+                    call_msg,
+                    None,
+                )
+            }));
         self.state = PendingTurnState::AwaitingToolResults;
         Ok(())
     }
@@ -234,7 +252,7 @@ impl PendingTurn {
                     content: vec![block],
                 },
             ));
-        self.tool_calls[index].result_msg = Some(message_id);
+        self.tool_calls[index].set_result_message_id(message_id);
         if self.tool_calls.iter().all(|call| call.result_msg.is_some()) {
             self.state = PendingTurnState::AwaitingAssistant;
         }

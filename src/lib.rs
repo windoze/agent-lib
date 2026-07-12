@@ -21,7 +21,9 @@
 //!   a non-serializable [`conversation::PendingMessage`] freeze boundary inside
 //!   the unique [`conversation::PendingTurn`] transaction. Pending turns support
 //!   repeated and parallel tool round-trips while keeping partial Client data
-//!   outside immutable history.
+//!   outside immutable history. [`conversation::CancelDisposition`] can discard,
+//!   resume with explicit cancelled tool results, or atomically close and commit
+//!   that transaction without touching previously committed turns.
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are deliberately outside this crate. Those layers should persist and replay

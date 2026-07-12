@@ -10,7 +10,8 @@ Anthropic Messages 与 OpenAI Responses 的非流式/流式适配器、真实 en
 provider 归一化验收，以及 Conversation Core 的强类型 identity、独立 system 配置、
 immutable message envelope、只读 closed Turn、I1--I4 validator、原子 commit 数据边界，
 不暴露 partial 的 stream/non-stream `PendingMessage` 冻结边界，以及可容纳任意多轮工具往返、
-显式记录 open call 并只在最终 assistant 后提交的 `PendingTurn` 事务。
+显式记录 open call 并只在最终 assistant 后提交的 `PendingTurn` 事务；pending cancel 可选择
+整体丢弃、合成 `Cancelled` tool results 后继续，或补入完整最终 assistant 后原子提交。
 已完成的 Client 层实施记录见
 [`docs/archive/2026-07-13-client-layer/TODO.md`](docs/archive/2026-07-13-client-layer/TODO.md)；
 当前 Conversation Core 阶段计划和任务见 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。
@@ -27,9 +28,10 @@ immutable message envelope、只读 closed Turn、I1--I4 validator、原子 comm
 - `client`：dyn-safe `LlmClient`、分类错误、结构化 capability、endpoint 与请求配置。
 - `conversation`：外部注入的强类型 id、独立 system 配置、不可原地修改的消息 envelope、
   共享只读 message 的 closed `Turn`、分类 commit 错误、唯一 I1--I4 校验门，以及复用 Client
-  `Accumulator` 的单消息 pending/freeze 状态机和唯一 `PendingTurn` 事务状态机。
+  `Accumulator` 的单消息 pending/freeze 状态机、唯一 `PendingTurn` 事务状态机和原子 cancel
+  disposition。
 
-Conversation Core 正按任务顺序继续实现 cancel、boundary、projection 与
+Conversation Core 正按任务顺序继续实现 boundary、projection 与
 持久化；Agent loop、Tool registry 与多 agent 编排仍不在范围内。完整设计和当前阶段
 计划分别见 [`DESIGN.md`](DESIGN.md) 与 [`PLAN.md`](PLAN.md)。
 
@@ -126,6 +128,39 @@ fn commit_text_response(
 `register_tool_calls`、`append_tool_response`（或 `append_tool_result`）闭合本轮 calls。
 pending 只公开 frozen messages、phase、usage、response metadata 与只读 tool-call 视图；
 活跃 accumulator 和 partial JSON 始终不可见。
+
+`cancel_pending` 只处理尚未提交的事务。`DiscardTurn` 整体丢弃 pending；`ResumeTurn` 丢弃
+活跃 partial，并要求调用方为每个已冻结 open call 提供 provider id、稳定 `ToolCallId` 与
+result `MessageId`。库会生成带明确中断文本和 `ToolStatus::Cancelled` 的完整结果，然后回到
+`AwaitingAssistant`。尚未执行 `register_tool_calls` 的冻结 call 也能在同一个原子操作中建立
+mapping；已 mapping 的 call 则必须使用原 id：
+
+```rust
+use agent_lib::conversation::{
+    CancelDisposition, CancelOutcome, CancelledToolResult, Conversation, ConversationError,
+    MessageId, ToolCallId,
+};
+
+fn cancel_open_call_and_resume(
+    conversation: &mut Conversation,
+    provider_call_id: &str,
+    call_id: ToolCallId,
+    result_message_id: MessageId,
+) -> Result<CancelOutcome, ConversationError> {
+    conversation.cancel_pending(CancelDisposition::ResumeTurn {
+        cancelled_results: vec![CancelledToolResult::new(
+            provider_call_id,
+            call_id,
+            result_message_id,
+        )],
+    })
+}
+```
+
+若当前只有 active partial 而没有冻结 open call，`cancelled_results` 传空数组即可。
+`CancelDisposition::commit_turn(...)` 会在同样闭合 calls 后追加调用方提供的完整、无 tool-use
+最终 `Response`，再复用唯一 I1--I4 validator 原子提交。任一 identity、状态、freeze 或
+validator 错误都保留原 pending 与 committed history，成功 discard/commit 后可立即开始新 Turn。
 
 单条 assistant response 在进入 PendingTurn 前先通过 `PendingMessage` 冻结。流式调用逐个
 `push(StreamEvent)`；非流式调用从完整 `Response` 创建同一状态机。两条路径都只在

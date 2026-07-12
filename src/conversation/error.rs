@@ -470,6 +470,95 @@ pub enum PendingTurnError {
     },
 }
 
+/// A pending-turn cancellation request was rejected atomically.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum CancelError {
+    /// Cancellation was requested at a committed boundary.
+    #[error("the conversation has no pending turn to cancel")]
+    NoPending,
+
+    /// The selected disposition cannot apply to the pending phase.
+    #[error("cannot {disposition}: pending turn is in phase {actual:?}")]
+    InvalidTransition {
+        /// Human-readable cancellation action.
+        disposition: &'static str,
+        /// Phase that rejected the action.
+        actual: PendingTurnPhase,
+    },
+
+    /// Frozen tool-use content repeated a provider call identity.
+    #[error("provider call id `{provider_call_id}` is duplicated in the pending turn")]
+    DuplicateProviderCallId {
+        /// Repeated provider identity.
+        provider_call_id: String,
+    },
+
+    /// The caller supplied more than one synthetic result for one open call.
+    #[error("provider call `{provider_call_id}` has more than one cancellation result")]
+    DuplicateCancellationResult {
+        /// Multiply closed provider identity.
+        provider_call_id: String,
+    },
+
+    /// An open call has no caller-supplied identities for its synthetic result.
+    #[error("provider call `{provider_call_id}` is missing a cancellation result")]
+    MissingCancellationResult {
+        /// Open provider identity missing from the cancellation request.
+        provider_call_id: String,
+    },
+
+    /// A synthetic result names no currently open provider call.
+    #[error(
+        "cancellation result names unknown or already closed provider call `{provider_call_id}`"
+    )]
+    UnknownCancellationResult {
+        /// Provider identity absent from the open-call set.
+        provider_call_id: String,
+    },
+
+    /// A registered provider call was paired with a different framework id.
+    #[error(
+        "provider call `{provider_call_id}` is mapped to tool call {expected}, not supplied id {actual}"
+    )]
+    ToolCallIdMismatch {
+        /// Provider identity whose mapping changed.
+        provider_call_id: String,
+        /// Existing framework identity.
+        expected: ToolCallId,
+        /// Conflicting caller-supplied identity.
+        actual: ToolCallId,
+    },
+
+    /// A cancellation request tried to reuse a framework call identity.
+    #[error("tool call id {call_id} is not unique in this conversation")]
+    DuplicateToolCallId {
+        /// Reused framework identity.
+        call_id: ToolCallId,
+    },
+
+    /// A synthetic result or final assistant tried to reuse a message id.
+    #[error("message id {message_id} is not unique in this conversation")]
+    DuplicateMessageId {
+        /// Reused message identity.
+        message_id: MessageId,
+    },
+
+    /// The complete final response could not cross the assistant freeze boundary.
+    #[error("cancel final assistant could not freeze: {source}")]
+    InvalidFinalResponse {
+        /// Existing pending-message classification retained as the source.
+        #[source]
+        source: PendingMessageError,
+    },
+
+    /// A cancellation commit tried to end with another tool invocation.
+    #[error("cancel final assistant contains tool use `{provider_call_id}`")]
+    FinalAssistantContainsToolUse {
+        /// Provider call that would leave the turn open again.
+        provider_call_id: String,
+    },
+}
+
 /// A Conversation operation failed without changing committed state.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ConversationError {
@@ -488,6 +577,10 @@ pub enum ConversationError {
     /// A pending turn could not begin or advance in its current state.
     #[error("pending turn operation failed: {0}")]
     PendingTurn(#[from] PendingTurnError),
+
+    /// A pending cancellation could not be prepared or applied atomically.
+    #[error("pending turn cancellation failed: {0}")]
+    Cancel(#[from] CancelError),
 
     /// History and version cannot be advanced together because the version is exhausted.
     #[error("commit cannot advance history and version atomically from version {current_version}")]
