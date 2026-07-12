@@ -2,6 +2,7 @@
 
 use super::{start_message, stop_message};
 use crate::{
+    client::ClientError,
     model::{normalized::StopReason, usage::Usage},
     stream::{
         BlockId, BlockKind, Delta, StreamEvent,
@@ -126,13 +127,14 @@ fn unclosed_text_block_is_rejected() {
 #[test]
 fn explicit_error_event_is_returned_immediately() {
     let mut accumulator = Accumulator::new();
+    let stream_error = ClientError::Network("provider disconnected".to_owned());
     let error = accumulator
-        .push(StreamEvent::Error("provider disconnected".to_owned()))
+        .push(StreamEvent::Error(stream_error.clone()))
         .unwrap_err();
 
     assert!(matches!(
         error,
-        AccumulatorError::Stream(message) if message == "provider disconnected"
+        AccumulatorError::Stream(error) if error == stream_error
     ));
 }
 

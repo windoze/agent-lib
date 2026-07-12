@@ -1,7 +1,7 @@
 //! Stream folding support for collecting events into complete responses.
 
 use crate::{
-    client::Response,
+    client::{ClientError, Response},
     model::{
         content::ContentBlock,
         message::{Message, Role},
@@ -20,7 +20,7 @@ use thiserror::Error;
 pub enum AccumulatorError {
     /// The provider emitted an explicit error event.
     #[error("stream reported an error: {0}")]
-    Stream(String),
+    Stream(#[source] ClientError),
     /// No message start event supplied the response role.
     #[error("stream ended without a message start event")]
     MissingMessageStart,
@@ -104,9 +104,10 @@ impl Accumulator {
 
     /// Validates and folds one normalized event into the in-progress response.
     pub fn push(&mut self, event: StreamEvent) -> Result<(), AccumulatorError> {
-        if let StreamEvent::Error(message) = &event {
-            return Err(AccumulatorError::Stream(message.clone()));
-        }
+        let event = match event {
+            StreamEvent::Error(error) => return Err(AccumulatorError::Stream(error)),
+            event => event,
+        };
 
         if self.stop_reason.is_some() {
             return Err(AccumulatorError::EventAfterMessageStop(event_name(&event)));

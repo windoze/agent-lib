@@ -1,9 +1,12 @@
 //! Normalized streaming event types.
 
-use crate::model::{
-    message::Role,
-    normalized::{Normalized, StopReason},
-    usage::Usage,
+use crate::{
+    client::ClientError,
+    model::{
+        message::Role,
+        normalized::{Normalized, StopReason},
+        usage::Usage,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -145,18 +148,21 @@ pub enum StreamEvent {
     },
     /// Reports a provider or protocol error observed in the stream.
     ///
-    /// Corresponds directly to Vercel v5's `error` part. The string payload is
-    /// temporary until M3-1 introduces the classified `ClientError` type.
-    Error(String),
+    /// Corresponds directly to Vercel v5's `error` part and retains the
+    /// provider-neutral category needed by retry and fallback policy.
+    Error(ClientError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::{BlockId, BlockKind, Delta, StreamEvent};
-    use crate::model::{
-        message::Role,
-        normalized::{Normalized, StopReason},
-        usage::Usage,
+    use crate::{
+        client::ClientError,
+        model::{
+            message::Role,
+            normalized::{Normalized, StopReason},
+            usage::Usage,
+        },
     };
     use serde::{Serialize, de::DeserializeOwned};
     use serde_json::json;
@@ -265,7 +271,9 @@ mod tests {
             StreamEvent::MessageStop {
                 stop_reason: Normalized::from_mapped(StopReason::EndTurn, "end_turn"),
             },
-            StreamEvent::Error("provider stream disconnected".to_owned()),
+            StreamEvent::Error(ClientError::Network(
+                "provider stream disconnected".to_owned(),
+            )),
         ];
 
         for event in events {
@@ -283,8 +291,11 @@ mod tests {
             json!({ "block_stop": { "id": "text-1" } })
         );
         assert_eq!(
-            serde_json::to_value(StreamEvent::Error("bad event".to_owned())).unwrap(),
-            json!({ "error": "bad event" })
+            serde_json::to_value(StreamEvent::Error(ClientError::Protocol(
+                "bad event".to_owned()
+            )))
+            .unwrap(),
+            json!({ "error": { "protocol": "bad event" } })
         );
     }
 }

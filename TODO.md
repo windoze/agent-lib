@@ -179,12 +179,17 @@ enum StreamEvent {
 
 ## Milestone 3 — Client 抽象(trait / capability / error / config)
 
-### M3-1 [TODO] `ClientError` 分类
+### M3-1 [DONE] `ClientError` 分类
 **上下文**:`DESIGN.md` §5 统一 error model;retry/backoff 依赖分类。回填 M2-2 的占位。
 **做什么**:
 - `client/error.rs`(`thiserror`):`enum ClientError { RateLimited { retry_after: Option<Duration> }, Timeout, ContextLengthExceeded, ContentFiltered, Network(..), Protocol(..), Auth, Api { status: u16, body: String }, Other(..) }`。
 - 提供从 HTTP status + body 分类的构造辅助(429→RateLimited 且解析 retry-after;探测见 Foundry 401/404/content_filter 形态)。
 **验证**:单元测试:各 HTTP 状态/响应体 → 正确分类;429 的 retry-after 解析。
+**完成记录**:
+- 2026-07-13: 实现可 serde 的 provider-neutral `ClientError` 九类错误模型与 HTTP 响应分类辅助；覆盖限流、超时、context 超限、内容过滤、认证和保留原始 status/body 的通用 API 错误。
+- `Retry-After` 支持标准 delay-seconds 与 HTTP-date，两者均归一为 `Duration`；非法值保留为未知，过期日期归一为零等待。
+- 将 `StreamEvent::Error(String)` 与 `AccumulatorError::Stream(String)` 回填为分类化 `ClientError`，保持流事件 round-trip 与错误 source 链，不丢失 retry/fallback 所需信息。
+- 新增 10 个聚焦测试，覆盖全变体 serde、Foundry/Azure content-filter 形态、OpenAI context 错误、401/403、404/500、408/504、413 及 429 header 边界；验证通过:`cargo test client::error::tests`(10 passed),`cargo test stream::`(19 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(60 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
 ### M3-2 [TODO] `Capability`(结构化)
 **上下文**:`DESIGN.md` §5 Capability 非布尔标志。来源=默认表 + 可覆盖。

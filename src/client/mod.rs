@@ -3,4 +3,5 @@
 pub mod error;
 pub mod response;
 
+pub use error::ClientError;
 pub use response::Response;

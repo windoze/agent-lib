@@ -1,59 +1,56 @@
-# 当前执行计划
+# 当前任务执行计划
 
-## 推理与约束摘要
+## 原则与范围
 
-- 本次调用只处理 `TODO.md` 中标题未带 `[DONE]` 的第一个任务；完成并提交后立即停止，不进入下一项。
-- `TODO.md` 是任务顺序、依赖、验收要求与完成记录的唯一事实来源；`PLAN.md` 只在阶段级计划确实变化时修改。
-- 在尚未读取仓库文件前，不预设当前任务内容，也不做开放式历史问题扫描。选定任务后，只检查最新提交是否明确提到与该任务直接相关的未完成问题。
-- 先检查工作区是否有既存未提交改动并保护用户改动；若这是一次中断后的续做，则完成时按要求把当前未提交文件一并纳入原子提交。
-- 若发现直接阻塞当前任务的真实缺陷或缺失前置条件，将按最小粒度把前置任务插入 `TODO.md`、保持当前任务未完成、提交任务表调整后停止；不通过缩小范围、改变表示或特例绕过规范。
-- 任何未被后续明确任务覆盖的测试失败都必须在本次修复，或作为最小前置/后续任务写入正确顺序；存在未处理失败时不得把当前任务标为 `[DONE]`。
-- 验证顺序固定为 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`，随后按任务要求执行文档构建或其他专项验证；完整测试最长不超过 30 分钟，单个测试若超过 1 分钟将立即调查。
-- 代码修改使用小而聚焦的补丁；先理解现有模块与测试结构，再实现完整行为和覆盖同根因的整类情况。
+- 以 `TODO.md` 为唯一任务顺序与完成状态来源，只执行首个标题未带 `[DONE]` 的任务。
+- 在选择当前任务前不进行开放式历史问题排查；仅检查最新提交是否明确提到与当前任务直接相关的未完成事项。
+- 不记录模型私有的逐字思维过程；本文件记录可审计的判断依据、执行步骤、关键发现、计划变更与验证结果。
+- 若发现阻塞当前任务的真实规格缺口或未排期测试失败，按要求修复，或在 `TODO.md` 中插入最少的前置任务并提交后停止。
 
-## 分步执行计划
+## 初始执行步骤
 
-1. 读取 `TODO.md`，按标题中的 `[DONE]` 状态定位第一个未完成任务，完整提取其依赖、实现要求、测试要求和完成记录格式。
-2. 检查 `git status`、最新提交信息及该任务直接涉及的文件；只判断最新提交中与当前任务明确相关的未完成事项，不进行无边界缺陷扫描。
-3. 将本文件更新为已选定任务的具体实施方案，包括预计修改文件、行为边界、测试矩阵和潜在阻塞点。
-4. 阅读当前任务所需的设计、实现和测试文件；确认任务能按原执行单元完成。若存在强制前置条件，按 Roadblock 流程更新并提交 `TODO.md` 后停止。
-5. 使用多个小补丁实现任务；每完成一个关键实现或计划发生变化，更新本文件的进度与决定。
-6. 增补或调整测试，覆盖正常路径、边界条件、错误路径以及同一根因影响的同类场景；先运行聚焦测试进行快速反馈。
-7. 按规定顺序运行格式化、严格 Clippy、完整测试及任务指定验证；修复所有未明确排期的失败和警告，并记录最终命令与结果。
-8. 更新 `TODO.md`：仅在全部要求和验证通过后给当前任务标题加 `[DONE]`，填写准确完成记录。仅当阶段级计划发生变化时才更新 `PLAN.md`。
-9. 复查差异、工作区状态和任务边界，确保没有开始下一任务；将最终状态同步到本文件。
-10. 使用清晰且包含任务编号的提交信息提交本次全部应纳入改动；核对提交与工作区后停止。
+1. 阅读 `TODO.md`，定位首个未完成任务，提取其需求、依赖、验证命令和完成记录要求。
+2. 检查工作树状态与最新一次提交，仅判断是否存在与该任务直接相关的遗留事项；不触碰无关用户改动。
+3. 阅读当前任务直接涉及的设计文档与代码/测试，确认实现边界；随后把具体任务、验收标准和文件范围补充到本文件。
+4. 完整实现当前任务，并以小而聚焦的补丁逐步修改；每完成关键步骤或改变计划即更新本文件。
+5. 增补并运行相关测试。最终按顺序运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`（最长 30 分钟）和任务要求的其他验证（如文档构建）。
+6. 在所有要求通过后，将任务标题加上 `[DONE]` 并填写 `TODO.md` 完成记录；仅当阶段级计划确实改变时更新 `PLAN.md`。
+7. 复查差异与工作树，提交当前任务要求的全部变更，使用清晰且包含任务编号的提交消息，然后停止，不处理下一任务。
 
-## 当前进度
+## 当前状态
 
-- 已创建本计划文件。
-- 已完整读取 `TODO.md`，按标题状态定位到第一个未完成任务：`M2-R [TODO] Milestone 2 Review`。
-- 本次不会进入 M3；只审查并在必要时修正 Milestone 2 的产出，验证通过后更新 M2-R 完成记录并提交。
+- 已完整读取到首个未完成任务并选定 **M3-1 `ClientError` 分类**；本次不会处理 M3-2 或后续任务。
 
-## M2-R 具体审查方案
+## M3-1 具体范围与验收标准
 
-1. 检查工作区状态和最新提交；确认是否为 M2-3 中断后的续做，以及最新提交是否明确留下与 M2-R 直接相关的问题。
-2. 对照 `TODO.md` 的 M2-1、M2-2、M2-3 和 M2-R 条目，以及 `DESIGN.md` / `docs/client-layer-references.md` 的 streaming 约束，逐项建立“要求—实现—测试”映射。
-3. 审查 `stream` 模块、`client::Response` 及测试结构，重点验证：
-   - Text、Reasoning、ToolInput 都遵循 BlockStart/BlockDelta/BlockStop 三段式；
-   - 事件按稳定 `BlockId` 而非当前位置关联；
-   - tool JSON delta 只累积字符串，在明确边界后解析且失败返回错误；
-   - `Accumulator` 是唯一折叠实现，`collect` 复用它；
-   - 交错 block 保持开始顺序，并行的多个 tool call 各自正确关联、解析和输出；
-   - 空流、usage、上游/事件错误、非法序列等已按任务约束处理。
-4. 先运行现有聚焦测试建立基线；若上述任一验收点缺少实现或测试，使用小补丁修复整类问题并添加对应回归测试，不以 review 文案代替实证。
-5. 依次运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。完整测试设置不超过 30 分钟的超时。
-6. 全部通过后，将 M2-R 标题改为 `[DONE]` 并填写逐项审查与验证记录；复查差异后提交，提交完成即停止。
+- 在 `client/error.rs` 以 `thiserror` 定义 `ClientError`：`RateLimited { retry_after: Option<Duration> }`、`Timeout`、`ContextLengthExceeded`、`ContentFiltered`、`Network(..)`、`Protocol(..)`、`Auth`、`Api { status: u16, body: String }`、`Other(..)`。
+- 提供从 HTTP status、body 与可用响应头信息进行分类的辅助 API；429 必须解析 `Retry-After`，并覆盖 Foundry 401/404/content-filter 一类响应形态。
+- 将 M2-2 `StreamEvent::Error(String)` 占位回填为 `StreamEvent::Error(ClientError)`，同时保持事件 serde round-trip 能力与 Accumulator 错误传播行为。
+- 为状态/响应体分类、`Retry-After`、serde round-trip 和流事件回填添加或调整测试；不能以窄化输入形态绕过同类错误。
+- 最终验证顺序：聚焦测试 → `cargo fmt --all` → `cargo clippy --all-targets -- -D warnings` → `cargo test --all --all-targets`（不超过 30 分钟）→ `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` → `git diff --check`。
 
-## 执行记录
+## 下一步
 
-- 工作区基线：开始时仅本计划文件有本次新增改动；最新提交 `d893594` 为 `[M2-3] Implement stream response accumulator`，未声明相关未完成问题。
-- 已完成规范与实现映射审查：`StreamEvent` 的统一三段式、稳定 `BlockId`、`Delta::Json` 原始片段约束、唯一 `Accumulator` 和复用它的 `collect` 均已落实。
-- 聚焦基线 `cargo test stream::` 通过（18 passed）。
-- 发现 M2-R 的“并行 tool call”只有间接覆盖，缺少两个工具块交错推进的直接断言；已在 `folding.rs` 添加双 tool block 交错 JSON delta、逆序停止、按稳定 id 独立折叠并保持开始顺序的回归测试。
-- 新增聚焦测试通过（1 passed）。
-- 最终验证已通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；带 1800 秒上限的 `cargo test --all --all-targets`（50 passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
-- `TODO.md` 已将 M2-R 标记为 `[DONE]` 并填写完成记录；`PLAN.md` 未修改，因为阶段顺序、依赖与完成标准均未变化。
-- 最终差异审查通过：改动仅包含 M2-R 完成记录、本执行计划和并行工具调用回归测试；`git diff --check` 无空白错误。
-- 已核对任务顺序并将 3 个文件作为一个原子变更提交，提交说明为 `[M2-R] Complete Milestone 2 review`。
-- 当前任务已完整结束；最终只确认提交后工作区状态，然后停止，不执行 M3-1。
+1. 检查 `git status` 与最新提交说明，识别是否存在 M3-1 直接相关的未提交/遗留事项。
+2. 阅读 `DESIGN.md` 错误模型段落、现有 `client`/`stream` 模块与测试，确定 serde、错误所有权与公开 API 的现有约定。
+3. 分小补丁实现错误类型、分类器和流事件回填，再逐层验证。
+
+## 已确认的实现决策
+
+- 2026-07-13：工作树除本文件外无修改；最新提交 `b52b468` 仅完成 M2 Review，没有提及 M3-1 的未完成阻塞项。
+- `ClientError` 需要派生 `Serialize`/`Deserialize`、`Clone`、`PartialEq`/`Eq`，因为 `StreamEvent` 当前具备这些数据模型能力，回填后不能造成能力回退。
+- HTTP 分类辅助不依赖尚未引入的 `reqwest`，输入采用状态码、响应正文和可选的 `Retry-After` 原始值；M4 可直接从响应头提取字符串后调用。
+- `Retry-After` 同时支持标准的 delay-seconds 与 HTTP-date。为正确处理后者，增加轻量 `httpdate` 依赖，并以可注入当前时间的内部路径编写确定性测试；已过期日期归一为零等待，非法值为 `None`。
+- 分类优先级：429 限流；408/504 超时；正文中的 context-length/content-policy 语义；401/403 认证；其余状态保留为 `Api { status, body }`。正文语义先于 403 认证，以正确承载 provider 用 403 表达的内容策略拒绝。
+- `Network`、`Protocol`、`Other` 使用可序列化字符串上下文；`AccumulatorError::Stream` 改为承载完整 `ClientError`，不把已分类信息降级回字符串。
+
+## 进展与验证记录
+
+- 2026-07-13：已新增 `ClientError` 全部九类变体、HTTP 错误分类辅助、标准两种 `Retry-After` 形式解析，并在 `client` 模块公开重导出。
+- 2026-07-13：已将 `StreamEvent::Error(String)` 回填为 `StreamEvent::Error(ClientError)`；`AccumulatorError::Stream` 同步保留分类类型及 error source 链。
+- 2026-07-13：新增独立错误测试模块，覆盖全变体 serde、429 秒数/HTTP-date/无效值/过期值、408/504 timeout、413 与 provider context body、Foundry/Azure content filter、401/403 auth、404/500 原始 API 错误。
+- 聚焦测试结果：`cargo test client::error::tests` 10 passed；首次运行只发现测试反序列化目标类型缺少显式标注，已修复后通过。
+- 回归测试结果：`cargo test stream::` 19 passed，确认流事件 serde 与 Accumulator 分类错误传播无回归。
+- 最终验证结果：`cargo fmt --all` 通过；`cargo clippy --all-targets -- -D warnings` 通过；`cargo test --all --all-targets` 60 passed；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过；此前及更新完成记录前的 `git diff --check` 通过。
+- 已将 `TODO.md` 的 M3-1 标题更新为 `[DONE]` 并填写完成记录。阶段级顺序、依赖和验收标准未改变，因此不修改 `PLAN.md`。
+- 2026-07-13：最终格式、差异与任务边界检查均通过；本次全部文件已纳入 `[M3-1] Implement classified client errors` 提交。完成最终工作树确认后停止，不开始 M3-2。
