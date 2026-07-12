@@ -27,6 +27,12 @@ pub enum AuthScheme {
 /// This configuration is independent of the endpoint's Anthropic Messages or
 /// OpenAI Responses wire protocol. Query parameters and extra headers remain
 /// ordered vectors so repeated keys and caller-specified order are preserved.
+/// Adapters append their protocol path to `base_url`: `/v1/messages` for
+/// Anthropic Messages and `/responses` for OpenAI Responses.
+///
+/// Although this type supports serde for application configuration, `auth`
+/// contains credentials. Do not log or persist a serialized value unless the
+/// destination is explicitly approved for secrets.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointConfig {
     /// Base URL to which an adapter appends its protocol-specific path.

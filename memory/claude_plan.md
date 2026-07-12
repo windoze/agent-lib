@@ -1,36 +1,35 @@
 # 当前执行计划
 
-## 目标与约束
+## 目标与边界
 
-- 以 `TODO.md` 为唯一任务顺序与验收依据，识别并完成首个标题未带 `[DONE]` 的任务。
-- 不做开放式历史问题扫描；仅检查当前任务、其直接依赖、最新提交中与该任务直接相关的未完成事项，以及验证过程中暴露的失败。
-- 若发现阻塞当前任务且尚未跟踪的真实前置问题，只在 `TODO.md` 中加入最少量前置任务、记录依赖、提交后停止；不以缩小范围或特殊处理规避规范。
-- 若可完成，则完整实现、测试、更新 `TODO.md` 的标题与完成记录、提交全部相关未提交改动，然后停止，不进入下一任务。
+- 以 `TODO.md` 为唯一的任务顺序与验收依据。
+- 本次只处理第一个标题未以 `[DONE]` 开头的任务；完成、记录并提交后立即停止。
+- 不进行开放式历史问题扫描；只处理当前任务直接依赖、当前任务引入的回归，以及验证时发现且未被明确排期的失败。
 - `PLAN.md` 仅在阶段级顺序、依赖、假设或完成标准确实变化时更新。
 
-## 分步计划
+## 执行步骤
 
-1. 读取 `TODO.md`，从头定位首个标题未显式标记 `[DONE]` 的任务，提取其需求、依赖、测试与完成记录要求。
-2. 检查 Git 工作区与最新提交，区分既有用户改动/上次中断遗留，并确认最新提交是否明确提到与当前任务直接相关的未完成问题。
-3. 只读取当前任务所需的设计、计划和源码/测试上下文，建立实现边界；如发现具体阻塞，按规则更新任务依赖并停止。
-4. 以小而聚焦的补丁实现当前任务，同时补齐覆盖正常路径、边界、错误路径和兼容性的测试及必要文档。
-5. 每完成关键步骤或计划发生变化时更新本文件，记录已完成事项、发现的问题与下一步。
-6. 按指定顺序验证：`cargo fmt --all`，然后 `cargo clippy --all-targets -- -D warnings`，再运行任务指定测试与最长不超过 30 分钟的完整 `cargo test --all --all-targets`；最后运行任务要求的文档构建或其他检查。
-7. 若出现未被后续任务明确覆盖的测试失败，立即修复，或在 `TODO.md` 中加入最小前置/跟进任务；未解决前不把当前任务标为完成。
-8. 完成后在 `TODO.md` 任务标题前加 `[DONE]` 并填写可复核的完成记录；仅在阶段计划实际变化时修改 `PLAN.md`。
-9. 复查 diff、测试结果和任务范围，更新本文件为最终状态；使用清晰的任务编号提交所有相关未提交文件（包括恢复任务遗留文件），确认提交成功后停止。
+1. 首先完整读取 `TODO.md`，按标题标记识别第一个未完成任务，并摘录其依赖、实现要求和验证要求。
+2. 在选定任务后，检查工作区状态与最新提交；只判断未提交内容和最新提交是否与该任务直接相关，避免扩大排查范围。
+3. 阅读当前任务直接涉及的设计说明、源文件与测试，确认现状和所需行为；若发现使正确实现不可能的具体前置问题，按规则在 `TODO.md` 中插入最少的前置任务、记录依赖、提交后停止。
+4. 若无阻塞，按任务规范完整实现；采用小而聚焦的补丁，保留用户已有改动，并为公共行为及边界条件补充或调整测试和必要文档。
+5. 按要求先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，随后运行任务指定测试及 `cargo test --all --all-targets`；需要时运行 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。完整测试设置不超过 30 分钟的超时。
+6. 对任何失败进行分类：当前任务相关或未明确排期的失败在本次修复；若构成无法在当前任务内正确解决的真实前置条件，则更新 `TODO.md` 插入最少前置任务，并保持当前任务未完成。
+7. 验收全部通过后，在 `TODO.md` 的任务标题前添加 `[DONE]`，填写准确的完成记录（实现、测试、文档与验证命令）；仅在阶段计划变化时修改 `PLAN.md`。
+8. 复查 diff、任务边界和工作区状态；若属于意外中断后的续作，按要求将当前所有未提交文件纳入同一提交。使用清晰、包含任务编号的提交消息提交。
+9. 确认提交成功和工作区状态，记录最终提交信息，然后停止，不开始下一任务。
 
-## 当前状态
+## 进度记录
 
-- 状态：已读取 `TODO.md`，首个未完成任务确定为 `M6-2 [TODO] 能力矩阵与逃生舱实证`；没有跳过 review 任务或后续任务。
-- 当前任务交付物：新增 `docs/capability-matrix.md`，记录 Anthropic Messages 与 OpenAI Responses 的默认 `Capability` 及真实 endpoint 差异；新增/强化自动化测试，明确断言 Anthropic/Foundry 的 `cache_creation.ephemeral_*` 和 Azure/OpenAI 的 `content_filters` 落入 `extra` 且不丢失。
-- 当前任务验收：能力矩阵必须与代码默认表和已录制真实 fixture 一致；聚焦逃生舱测试、格式化、严格 clippy、全量测试与文档构建全部通过；随后将 `M6-2` 标为 `[DONE]`、填写完成记录并提交。
-- 已完成检查：任务开始前 Git 工作区无项目遗留改动（仅本文件是本次新增改动）；最新提交 `7844640 Update doc` 只加入后续 `NEXT-1`，未声明与 `M6-2` 直接相关的未完成问题，因此无需新增前置任务。
-- 实现判断：两家完整响应解析器已具备正确逃生舱行为；Anthropic 单元测试已全值断言 `usage.extra.cache_creation`，OpenAI 测试目前主要断言 `content_filters` 键存在。当前任务无需改生产逻辑，但需要新增跨 provider 的公开 API 验收，比较原始 fixture 与归一化 `extra` 的完整 JSON 值，并验证 `Response` serde 往返后仍保持一致。
-- 文档判断：矩阵将分成“代码中的协议级默认表”和“当前 Foundry 部署实测证据”两层；未在真实 endpoint 验证的模态、并行工具、结构化输出等只记录为默认能力，不伪装成部署实测结论。
-- 已完成实现：新增 `docs/capability-matrix.md`，逐字段列出两家协议默认值、当前 Foundry 实测范围、未实测边界和方言字段归宿；新增 `tests/capability_escape_hatches.rs`，通过公开 adapter API 验证默认 capability 绑定，并对两份脱敏真实响应做原始 JSON 全值比较及 `Response` serde 往返。
-- 生产代码未修改：现有解析行为满足任务要求；本次通过独立跨 provider 验收把此前分散/较弱的断言固化为明确证据。
-- 已通过验证：`cargo fmt --all`；新增验收测试 3/3；`cargo clippy --all-targets -- -D warnings`；`cargo test --all --all-targets`（库单元测试 130 项 + 新增验收 3 项通过，7 项真实 endpoint 测试按预期忽略）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`cargo fmt --all -- --check`；`git diff --check`。
-- 真实 endpoint 复验通过：加载 `.envrc` 后 Anthropic 非流式/流式文本/tool 3 项、OpenAI Responses 非流式/流式文本/tool 3 项全部通过；跨 provider normalization 矩阵完整执行纯文本、多轮和 tool 往返并通过（1 项，18.17 秒）。
-- 已将 `TODO.md` 的任务标题更新为 `M6-2 [DONE]` 并写入文档、测试和验证记录；阶段级计划与依赖未变化，因此未修改 `PLAN.md`，也未开始 `M6-3`。
-- 下一步：执行最终格式/diff/工作区审查，暂存本次全部四个文件并检查 staged diff；确认无误后创建单一 `[M6-2]` 提交并停止。
+- 2026-07-13：已建立初始执行计划；尚未读取或执行 `TODO.md` 中的任务。
+- 2026-07-13：已完整核对 `TODO.md` 的任务标题顺序；首个未完成任务为 `M6-3 [TODO] 使用示例与 crate 文档`。本次边界固定为：新增非流式、流式打字机、tool call 往返三个可运行示例，完善 crate/API 文档与 README 配置用法，完成规定验证、更新完成记录并提交。
+- 2026-07-13：工作区基线除本计划文件外干净；最新提交为已完成的 M6-2，未记录 M6-3 的直接阻塞或遗留实现。已审阅公共 client/adapter/stream/model API 与真实集成测试配置，未发现必须先插入的新前置任务。
+- 2026-07-13：确定示例结构：`examples/support/mod.rs` 集中读取 `AGENT_LIB_PROVIDER` 和 provider 凭据、构造带超时的 `Box<dyn LlmClient>` 与通用请求；三个入口分别演示完整响应、文本 delta 即时输出并经公共 Accumulator 折叠、以及 get_weather 调用结果回灌。默认 endpoint 参数与已通过真实测试的配置一致，model/API version 支持环境变量覆盖。
+- 2026-07-13：已新增 `non_streaming`、`streaming_typewriter`、`tool_round_trip` 及共享 support；`cargo fmt --all` 与 `cargo check --examples` 首轮通过。已完善 crate 级架构/完整响应/streaming/逃生舱文档，补充关键 Client API 的调用契约与凭据安全说明，并更新 README 的 endpoint 配置、Client 用法、示例和真实测试说明。
+- 2026-07-13：正式验证已通过：严格 clippy 无 warning；完整本地测试共 133 passed、7 ignored；新增 crate 文档 doctest 1 passed；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过。加载 `.envrc` 后，三个示例分别以 `AGENT_LIB_PROVIDER=anthropic` 和 `openai` 真实运行，共六次示例流程全部成功，tool 示例在两家均完成模型调用、本地结果回灌与最终文本。
+- 2026-07-13：已将 `M6-3` 标题改为 `[DONE]` 并填写完成记录；最终 `cargo fmt --all -- --check`、`git diff --check` 和任务标题顺序检查通过。下一个未完成任务仍为 `M6-R`，本次不会执行。剩余步骤仅为暂存本次全部文件、复核 staged diff 并创建 M6-3 提交。
+- 2026-07-13：本次全部 11 个文件已作为单一 M6-3 提交写入 Git；任务已完成并停止，不开始 M6-R。
+
+## 计划变更记录
+
+- 无阶段或任务级变更；仅将初始通用步骤具体化为 M6-3 的示例与文档实现方案。

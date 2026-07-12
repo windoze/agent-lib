@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 /// can render them using the target protocol's required representation.
 /// Provider-specific fields remain bound to their provider through
 /// [`ProviderExtras`] and are merged only during final wire serialization.
+/// Message content must already be complete-state data: streaming deltas are
+/// folded before a prior assistant message is replayed. Set `stream` to match
+/// the selected [`crate::client::LlmClient`] method.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChatRequest {
     /// Model or deployment identifier understood by the endpoint.
@@ -25,6 +28,9 @@ pub struct ChatRequest {
     /// Sampling temperature, or `None` to leave the parameter unspecified.
     pub temperature: Option<f32>,
     /// Whether the endpoint should return an incremental response stream.
+    ///
+    /// Use `false` with [`crate::client::LlmClient::chat`] and `true` with
+    /// [`crate::client::LlmClient::chat_stream`].
     pub stream: bool,
     /// Provider-specific request fields for the selected adapter, if any.
     pub provider_extras: Option<ProviderExtras>,

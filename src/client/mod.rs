@@ -24,16 +24,29 @@ pub use response::Response;
 /// callers can select an implementation at runtime through `dyn LlmClient`.
 /// Complete and incremental response paths remain separate so an adapter can
 /// use its provider's native non-streaming endpoint without first constructing
-/// a normalized event stream.
+/// a normalized event stream. A client is safe to share across tasks; adapter
+/// clones reuse the underlying HTTP connection pool.
 #[async_trait]
 pub trait LlmClient: Send + Sync {
-    /// Returns the structured capabilities advertised by this client.
+    /// Returns the protocol-level structured capabilities advertised by this client.
+    ///
+    /// Model- or deployment-specific limits may be narrower than this default
+    /// table and should be applied by the caller when known.
     fn capability(&self) -> &Capability;
 
     /// Executes one request and returns its complete normalized response.
+    ///
+    /// `request.stream` must be `false` so the provider returns its native JSON
+    /// complete-response representation.
     async fn chat(&self, request: ChatRequest) -> Result<Response, ClientError>;
 
     /// Starts one request and returns its normalized incremental event stream.
+    ///
+    /// `request.stream` must be `true`. Errors encountered before response
+    /// headers are returned directly; transport or protocol failures observed
+    /// later are yielded by the stream. Callers can fold the events with
+    /// [`crate::stream::accumulator::Accumulator`] or
+    /// [`crate::stream::accumulator::collect`].
     async fn chat_stream(
         &self,
         request: ChatRequest,

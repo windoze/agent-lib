@@ -383,11 +383,15 @@ trait LlmClient: Send + Sync {
 - 新增跨 provider 验收测试 `tests/capability_escape_hatches.rs`:通过 `Box<dyn LlmClient>` 确认两 adapter 暴露各自默认 capability;把脱敏真实响应中的 Anthropic `usage.cache_creation` 完整对象和 Azure `content_filters` 完整数组与归一化 `extra` 做全值比较,并验证 `Response` serde 往返后证据仍不丢失。
 - 验证通过:`cargo fmt --all`,`cargo test --test capability_escape_hatches`(3 passed),`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(133 passed,7 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`cargo fmt --all -- --check`,`git diff --check`;加载 `.envrc` 后 Anthropic 真实集成测试 3 项、OpenAI Responses 真实集成测试 3 项及跨 provider normalization 矩阵 1 项全部通过。
 
-### M6-3 [TODO] 使用示例与 crate 文档
+### M6-3 [DONE] 使用示例与 crate 文档
 **做什么**:
 - `examples/`:非流式、流式打字机、tool call 往返各一个可运行示例(读环境变量选 provider)。
 - 完善 `lib.rs` crate 文档与公共 API 文档注释;README 增加 Client 层用法与配置说明。
 **验证**:`cargo run --example ...` 全部可运行(有环境变量时);`cargo doc` 无缺失文档 warning。
+**完成记录**:
+- 2026-07-13: 新增共享环境配置与 `non_streaming`、`streaming_typewriter`、`tool_round_trip` 三个可运行示例;通过 `AGENT_LIB_PROVIDER=anthropic|openai` 构造 `Box<dyn LlmClient>`,支持两家已验证 endpoint 的凭据、model 与 API version 配置。流式示例边输出 text delta 边复用统一 `Accumulator`,tool 示例完成模型调用、本地结果和关联 id 回灌、最终回答的完整往返。
+- 完善 crate 级架构边界、完整响应、streaming 纪律与逃生舱文档,补充 `LlmClient`/`ChatRequest`/`EndpointConfig` 的调用契约和凭据安全说明;README 更新 Client 配置表、端到端用法、示例命令及真实集成测试入口。
+- 验证通过:`cargo fmt --all`,`cargo check --examples`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(133 passed,7 ignored),`cargo test --doc`(1 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后三个示例分别以 Anthropic 与 OpenAI Responses 真实运行,共六个流程全部成功。
 
 ### M6-R [TODO] Milestone 6 / Client 层总 Review
 **验证清单**:
