@@ -393,13 +393,17 @@ trait LlmClient: Send + Sync {
 - 完善 crate 级架构边界、完整响应、streaming 纪律与逃生舱文档,补充 `LlmClient`/`ChatRequest`/`EndpointConfig` 的调用契约和凭据安全说明;README 更新 Client 配置表、端到端用法、示例命令及真实集成测试入口。
 - 验证通过:`cargo fmt --all`,`cargo check --examples`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(133 passed,7 ignored),`cargo test --doc`(1 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后三个示例分别以 Anthropic 与 OpenAI Responses 真实运行,共六个流程全部成功。
 
-### M6-R [TODO] Milestone 6 / Client 层总 Review
+### M6-R [DONE] Milestone 6 / Client 层总 Review
 **验证清单**:
 - 全量 `cargo test`(含 `-- --ignored` 真实集成)通过。
 - 归一化一致性、逃生舱、能力矩阵、示例齐备。
 - 回溯 DESIGN.md §5 Client 层约束逐条满足:Capability 结构化 / error 分类 / usage 一等 / ContentBlock / streaming 三纪律 / 三逃生舱。
 - 确认 Client 层为 Conversation 层提供了完备类型(Message/ContentBlock/StreamEvent/Usage),可开始 Conversation 层实现。
 - 更新本文件 M6 标记 `[DONE]`;在 PLAN.md 记录 Client 层完成。
+**完成记录**:
+- 2026-07-13: 对照 `DESIGN.md` §5、`PLAN.md` 已定决策及 M1--M6 产出完成 Client 层总审阅;确认结构化 `Capability`、分类化 `ClientError`、一等 `Usage`、完整态 `ContentBlock`、稳定 block id、tool JSON 完整边界解析、唯一 `Accumulator` 折叠逻辑及请求/响应/归一化三类逃生舱均已落实。
+- 确认 Anthropic Messages 与 OpenAI Responses 通过同一 dyn-safe `LlmClient` 和同构 `StreamEvent` 提供完整态、流式及 tool 往返;跨 provider 一致性测试、方言字段保真测试、能力矩阵和三个可运行示例齐备。`Message`/`ContentBlock`/`StreamEvent`/`Usage` 的 serde 与公共文档满足 Conversation 层后续使用,Conversation/Agent/Tool registry/多 agent 职责仍保持在本 crate 边界之外。
+- 验证通过:`cargo fmt --all`,`cargo fmt --all -- --check`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(133 passed,7 ignored),`cargo test --doc`(1 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_anthropic -- --ignored --nocapture`(3 passed,1.68s)、`cargo test --test integration_openai_resp -- --ignored --nocapture`(3 passed,3.17s)、`cargo test --test integration_normalization -- --ignored --nocapture`(1 passed,19.94s)。所有真实测试单项均低于一分钟;`git diff --check` 通过。
 
 ---
 
