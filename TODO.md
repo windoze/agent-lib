@@ -236,12 +236,17 @@ trait LlmClient: Send + Sync {
 - 新增 mock trait 实现并通过 `Box<dyn LlmClient>` 实际调用 capability、`chat`、`chat_stream`;将 boxed stream 交给统一 `Accumulator` 折叠,断言与非流式响应完全一致。
 - 验证通过:`cargo test client::tests::boxed_dyn_client_supports_complete_and_streaming_calls`(1 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(71 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
-### M3-R [TODO] Milestone 3 Review
+### M3-R [DONE] Milestone 3 Review
 **验证清单**:
 - error 分类覆盖 retry 所需;Capability 结构化无布尔堆砌;EndpointConfig 能表达两个真实 endpoint 的认证/query 差异。
 - trait dyn-safe,`Box<dyn LlmClient>` 编译通过。
 - M2-2 的 ClientError 占位已回填为真类型。
 - `cargo test` 全绿;更新本文件 M3 标记 `[DONE]`。
+**完成记录**:
+- 2026-07-13: 对照 `DESIGN.md` §3--§5 与 `PLAN.md` 已定决策完成 M3 全量审阅；确认 `ClientError` 保留 retry/backoff 所需分类与 `Retry-After`，`Capability` 使用 context/模态/stop reason 等结构化字段且默认表可覆盖，`EndpointConfig` 能表达两个 Foundry endpoint 的认证、query 与 header 差异。
+- 确认 `LlmClient` 使用 `#[async_trait]`、`Send + Sync` 且可装箱为 `Box<dyn LlmClient>`；完整响应与 boxed stream 两条调用路径均由 mock 实际执行。`StreamEvent::Error` 已回填为分类化 `ClientError`，不存在 M2-2 的字符串占位。
+- 修正根 `README.md` 的陈旧里程碑状态，补充已完成的统一流式聚合与 Client 抽象模块概览；阶段顺序和依赖未变化，未修改 `PLAN.md`。
+- 验证通过:`cargo test client::`(22 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(71 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
 ---
 
