@@ -67,7 +67,7 @@
 - 2026-07-13: 实现完整态 `ContentBlock` 与 `ImageSource`,覆盖 text/image/tool_use/tool_result/thinking,支持 URL/base64 图片、多模态 tool result、thinking signature 保留,并为块与图片 source 保留 flatten `extra` 逃生舱。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`。
 
-### M1-5 [TODO] `Message` 与 `Tool`(schema)/ `ToolCall` / `ToolResponse`
+### M1-5 [DONE] `Message` 与 `Tool`(schema)/ `ToolCall` / `ToolResponse`
 **上下文**:`Message` 是 Turn 的内容物(见 `conversation-core.md` §2.3,中立层)。`Tool` 定义含 JSON schema。`ToolCall`/`ToolResponse` 是统一 data model(`DESIGN.md` §2.1),ToolResponse 要能表达非正常结果(需审批/被拒/出错)。
 **做什么**:
 - `model/message.rs`:`struct Message { role: Role, content: Vec<ContentBlock> }`(content 是 Vec,不是 String)。**本层不含 MessageId**——id 归 Conversation 层(见 conversation-core.md),client 层 Message 保持 wire-neutral 纯数据。
@@ -76,6 +76,9 @@
 **验证**:
 - serde round-trip。
 - 构造一个含 tool 的 `Message` 序列并断言结构。
+**完成记录**:
+- 2026-07-13: 实现不含 Conversation `MessageId` 的完整态 `Message`,以及 JSON schema `Tool`、`ToolCall`、支持多模态内容与 Ok/Error/Denied/Cancelled 状态的 `ToolResponse`。
+- 验证通过:`cargo fmt --all`,`cargo test model::message::tests`,`cargo test model::tool::tests`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(26 passed)。
 
 ### M1-6 [TODO] `ProviderExtras`(逃生舱 A)与 `ProviderId`
 **上下文**:`DESIGN.md` §4(A);请求侧方言口袋,绑定 ProviderId,只在序列化最后一步 merge。优先级低但类型先立。
