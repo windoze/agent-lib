@@ -7,6 +7,7 @@ use crate::model::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 
 pub mod accumulator;
 
@@ -33,6 +34,12 @@ impl BlockId {
     /// Returns the owned stable string representation.
     pub fn into_inner(self) -> String {
         self.0
+    }
+}
+
+impl fmt::Display for BlockId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
     }
 }
 

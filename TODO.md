@@ -145,7 +145,7 @@ enum StreamEvent {
 - `Error(String)` 按任务约定作为临时可序列化载荷,留待已排期的 M3-1 回填分类化 `ClientError`；新增全部八类事件的 serde round-trip 与稳定 `snake_case` 表示测试。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(37 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
-### M2-3 [TODO] `Accumulator`:StreamEvent → 完整 Response
+### M2-3 [DONE] `Accumulator`:StreamEvent → 完整 Response
 **上下文**:`DESIGN.md` §5 streaming 纪律 3(流可折叠)、`conversation-core.md` §5(PartialBlock/HashMap<index/id>)。这是 streaming 归一化的心脏,逻辑只写一份,两适配器复用。
 **做什么**:
 - 先定义 `Response`(若 M3 未定义):`struct Response { message: Message, usage: Usage, stop_reason: Normalized<StopReason>, extra: Map }`。
@@ -158,6 +158,11 @@ enum StreamEvent {
 - tool 参数分 3 个 Json delta 累积后正确 parse。
 - partial JSON(缺尾)→ finish 返回错误而非 panic。
 - 空流、仅 usage、错误事件的边界处理。
+**完成记录**:
+- 2026-07-13:新增可 serde 的 `client::Response`,保留 provider `extra` 逃生舱;实现按稳定 `BlockId` 关联并按 BlockStart 顺序输出的统一 `Accumulator`,覆盖 text/reasoning/tool input 三类块与流式 usage 合并。
+- 工具参数仅累积原始 JSON delta,在 `ToolInputAvailable`、`BlockStop` 或最终 `finish` 边界解析;available 完整值优先,非法或残缺 JSON 返回分类化 `AccumulatorError` 而非 panic。
+- 新增通用异步 `collect` 并以 `CollectError<E>` 区分上游流错误与折叠错误;测试拆分为 folding/errors/collect 模块,覆盖交错块、三段 JSON、available 优先、空流、仅 usage、错误事件、未闭合块、id/类型错配与 fallible stream。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(49 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
 ### M2-R [TODO] Milestone 2 Review
 **验证清单**:
