@@ -345,13 +345,18 @@ trait LlmClient: Send + Sync {
 - 以两次脱敏真实 Foundry text/tool SSE 固定 fixture，新增 14 个聚焦测试，覆盖 UTF-8/framing 分片、文本/tool 事件序列、并行 tool item 交错、reasoning、fold 与完整响应一致、partial JSON、错序/错配/截断、provider error 和本地 HTTP/dyn client；新增默认忽略且 55 秒上限的真实流式文本/tool-call 集成测试。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(129 passed,6 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_openai_resp -- --ignored --nocapture`(3 passed,3.80s),`git diff --check`。
 
-### M5-R [TODO] Milestone 5 Review
+### M5-R [DONE] Milestone 5 Review
 **验证清单**:
 - 两适配器产出的 StreamEvent **同构**,同一 Accumulator 均可折叠。
 - Azure 方言字段(content_filters 等)进 extra 未丢。
 - reasoning/tool 累积规则与 Anthropic 一致。
 - 真实集成测试通过(有环境变量时)。
 - 更新本文件 M5 标记 `[DONE]`。
+**完成记录**:
+- 2026-07-13: 对照 M5-1、M5-2、`PLAN.md` 的块三段式与 streaming 三纪律完成 OpenAI Responses 里程碑审阅；确认 Anthropic 与 OpenAI Responses 均只产出公共 `StreamEvent`，使用 provider 映射后的稳定 `BlockId`，并由唯一的 `stream::accumulator::Accumulator` 折叠完整响应。
+- 确认 OpenAI function arguments delta 始终作为原始 `Delta::Json` 累积，只在 `response.function_call_arguments.done` 完整边界核对并解析后发布 `ToolInputAvailable`；真实五段 JSON、两个交错 tool item 与残缺 JSON 错误测试均覆盖。reasoning 同样使用 BlockStart/Delta/BlockStop，并保留 encrypted reasoning signature，行为与 Anthropic thinking 流一致。
+- 确认完整态与流式终态共用响应转换语义；Azure `content_filters` 在两条路径均进入 `Response.extra`，未知未来流事件保留在 `openai_unmodeled_stream_events`，usage 的 cache/reasoning 分列及 stop reason 原始值均未丢失。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(129 passed,6 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_openai_resp -- --ignored --nocapture`(3 passed,2.41s)。
 
 ---
 
