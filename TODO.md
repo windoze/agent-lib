@@ -26,7 +26,7 @@
 - 2026-07-12: 添加基础依赖,建立 `client`/`model`/`stream`/`adapter` 模块树及文档注释。
 - 验证通过:`cargo fmt`,`cargo clippy --all-targets -- -D warnings`,`cargo build`,`cargo doc --no-deps`,`cargo test --all --all-targets`。
 
-### M1-2 [TODO] `Role` 与 `Normalized<T>` + `StopReason`
+### M1-2 [DONE] `Role` 与 `Normalized<T>` + `StopReason`
 **上下文**:逃生舱 (C),见 `DESIGN.md` §4(C)。`Normalized<T>` = 归一化枚举值 + 保留 provider 原始字符串,映射不上时 value=Unknown/Other 且 raw 留证据。这是全项目最基础的防御性类型,先做。
 **做什么**:
 - `model/normalized.rs`:`struct Normalized<T> { value: T, raw: Option<String> }`,`serde` 派生,`T: Serialize+Deserialize`。提供构造:`from_mapped(value, raw)`、`unknown(raw)`。
@@ -35,6 +35,9 @@
 **验证**:
 - 单元测试:`Normalized<StopReason>` 从 `"tool_use"` → `ToolUse` 且 raw=`Some("tool_use")`;从未知 `"weird"` → `Other` 且 raw 保留。
 - serde round-trip 测试通过。
+**完成记录**:
+- 2026-07-13: 实现 `Normalized<T>`、`StopReason` 原始字符串归一化与 `Role` 小写 wire name,并添加 focused serde/unit tests。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`。
 
 ### M1-3 [TODO] `Usage`
 **上下文**:`DESIGN.md` §5 Usage 一等公民;探测实证 Anthropic 返回 `input_tokens`/`output_tokens`/`cache_creation_input_tokens`/`cache_read_input_tokens`,OpenAI 用 `prompt_tokens`/`completion_tokens` + `completion_tokens_details.reasoning_tokens`。cache_read/cache_write/reasoning **必须单列**,不得揉进 input。
