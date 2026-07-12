@@ -23,6 +23,8 @@
 ### 1.2 Conversation 层
 负责消息流的维护和 tool 支持:tool schema、tool call/response id 的对应关系。
 
+> 核心数据结构(committed log + pending + projection、Turn、Boundary、不变量)见 [`docs/conversation-core.md`](docs/conversation-core.md)。
+
 要点:
 - 屏蔽两家 provider 的模型差异(Anthropic 的 `tool_use`/`tool_result` 是嵌在 message 里的 block;OpenAI response 是独立 item),对外用中立模型。
 - **System prompt 归一化**(Anthropic 单独字段 vs OpenAI message)。
@@ -98,8 +100,9 @@ trait CompactionTrigger {
 }
 ```
 - **手动**:调用方直接调 `compact(plan)`。
-- **自动**:在**一个轮次完成后**求值(天然 checkpoint,不会切在流式中途或 tool 配对中间),如"window 使用超过 soft limit"。依赖横切层 usage accounting。
-- 两级阈值:soft limit 触发 compaction,hard limit 是硬上限。
+- **自动**:在**一个轮次完成后(turn 边界)**求值(天然 checkpoint,不会切在流式中途或 tool 配对中间),如"window 使用超过 soft limit"。依赖横切层 usage accounting。
+- **compaction 只覆盖完整 turn,不涵盖 pending turn**(契合不变量 + 简化投影 + 语义正确;详见 `docs/conversation-core.md` §6.1)。
+- 两级阈值分工:**soft limit 命中于 turn 中途只"标记待压",推迟到下个 turn 边界执行**;**hard limit 的 turn 内保护归 agent loop 层**(step 边界应急,非 compaction 职责)。
 - trigger 只决定"要不要压、压哪段",产出 `CompactionPlan` 交策略执行,不决定"怎么压"。
 
 *分阶段/分层压缩(rolling / tiered summary):*
