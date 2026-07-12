@@ -109,6 +109,76 @@ fn folds_interleaved_blocks_and_three_tool_json_fragments_in_start_order() {
 }
 
 #[test]
+fn folds_parallel_tool_calls_by_stable_id_in_start_order() {
+    let mut accumulator = Accumulator::new();
+    let weather_id = BlockId::new("tool-weather");
+    let time_id = BlockId::new("tool-time");
+    start_message(&mut accumulator);
+
+    for event in [
+        StreamEvent::BlockStart {
+            id: weather_id.clone(),
+            kind: BlockKind::ToolInput {
+                tool_name: "get_weather".to_owned(),
+                tool_call_id: "call-weather".to_owned(),
+            },
+        },
+        StreamEvent::BlockStart {
+            id: time_id.clone(),
+            kind: BlockKind::ToolInput {
+                tool_name: "get_time".to_owned(),
+                tool_call_id: "call-time".to_owned(),
+            },
+        },
+        StreamEvent::BlockDelta {
+            id: weather_id.clone(),
+            delta: Delta::Json("{\"city\":\"Tok".to_owned()),
+        },
+        StreamEvent::BlockDelta {
+            id: time_id.clone(),
+            delta: Delta::Json("{\"timezone\":".to_owned()),
+        },
+        StreamEvent::BlockDelta {
+            id: weather_id.clone(),
+            delta: Delta::Json("yo\"}".to_owned()),
+        },
+        StreamEvent::BlockDelta {
+            id: time_id.clone(),
+            delta: Delta::Json("\"UTC\"}".to_owned()),
+        },
+        StreamEvent::BlockStop {
+            id: time_id.clone(),
+        },
+        StreamEvent::BlockStop {
+            id: weather_id.clone(),
+        },
+    ] {
+        accumulator.push(event).expect("fold stream event");
+    }
+    stop_message(&mut accumulator, StopReason::ToolUse);
+
+    let response = accumulator.finish().expect("finish response");
+
+    assert_eq!(
+        response.message.content,
+        vec![
+            ContentBlock::ToolUse {
+                id: "call-weather".to_owned(),
+                name: "get_weather".to_owned(),
+                input: json!({ "city": "Tokyo" }),
+                extra: Map::new(),
+            },
+            ContentBlock::ToolUse {
+                id: "call-time".to_owned(),
+                name: "get_time".to_owned(),
+                input: json!({ "timezone": "UTC" }),
+                extra: Map::new(),
+            },
+        ]
+    );
+}
+
+#[test]
 fn tool_input_available_overrides_a_value_parsed_at_block_stop() {
     let mut accumulator = Accumulator::new();
     let id = BlockId::new("tool-1");

@@ -164,12 +164,16 @@ enum StreamEvent {
 - 新增通用异步 `collect` 并以 `CollectError<E>` 区分上游流错误与折叠错误;测试拆分为 folding/errors/collect 模块,覆盖交错块、三段 JSON、available 优先、空流、仅 usage、错误事件、未闭合块、id/类型错配与 fallible stream。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(49 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
-### M2-R [TODO] Milestone 2 Review
+### M2-R [DONE] Milestone 2 Review
 **验证清单**:
 - 三段式同构在 text/reasoning/tool 上都成立;Accumulator 只有一份折叠逻辑。
 - 纪律 1(id 关联)、纪律 2(累积后 parse)、纪律 3(可折叠)均由测试覆盖。
 - 交错 block、并行 tool call 的折叠正确。
 - `cargo test` 全绿;更新本文件 M2 标记 `[DONE]`。
+**完成记录**:
+- 2026-07-13: 对照 `DESIGN.md` streaming 三纪律与 `docs/client-layer-references.md` 完成 M2 全量审阅;确认 text/reasoning/tool 共享 BlockStart/BlockDelta/BlockStop 三段式、稳定 `BlockId` 关联、tool JSON 仅在完整边界解析,且 `collect` 复用唯一 `Accumulator` 折叠逻辑。
+- 补充两个并行 tool call 的交错 JSON delta 回归测试,覆盖按稳定 id 独立累积、逆序结束仍按 block start 顺序输出,并与既有交错 text/reasoning/tool、三段 JSON、partial JSON 及错误边界测试共同闭合验收清单。
+- 验证通过:`cargo test stream::`(18 passed),新增聚焦测试(1 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(50 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
 ---
 
