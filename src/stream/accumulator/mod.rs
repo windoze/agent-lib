@@ -92,6 +92,7 @@ pub struct Accumulator {
     blocks: HashMap<BlockId, PartialBlock>,
     order: Vec<BlockId>,
     usage: Usage,
+    extra: Map<String, Value>,
     role: Option<Role>,
     stop_reason: Option<Normalized<StopReason>>,
 }
@@ -143,6 +144,7 @@ impl Accumulator {
                 block.set_tool_input(&id, input)?;
             }
             StreamEvent::Usage(usage) => self.usage.merge(usage),
+            StreamEvent::ResponseMetadata { extra } => self.extra.extend(extra),
             StreamEvent::MessageStop { stop_reason } => {
                 self.stop_reason = Some(stop_reason);
             }
@@ -176,7 +178,7 @@ impl Accumulator {
             message: Message { role, content },
             usage: self.usage,
             stop_reason,
-            extra: Map::new(),
+            extra: self.extra,
         })
     }
 
@@ -219,6 +221,7 @@ enum PartialBlock {
     },
     Reasoning {
         text: String,
+        signature: String,
         stopped: bool,
     },
     ToolInput {
@@ -241,6 +244,7 @@ impl PartialBlock {
             },
             BlockKind::Reasoning => Self::Reasoning {
                 text: String::new(),
+                signature: String::new(),
                 stopped: false,
             },
             BlockKind::ToolInput {
@@ -267,6 +271,10 @@ impl PartialBlock {
             (Self::Text { text, .. }, Delta::Text(delta))
             | (Self::Reasoning { text, .. }, Delta::Reasoning(delta)) => {
                 text.push_str(&delta);
+                Ok(())
+            }
+            (Self::Reasoning { signature, .. }, Delta::ReasoningSignature(delta)) => {
+                signature.push_str(&delta);
                 Ok(())
             }
             (
@@ -349,10 +357,14 @@ impl PartialBlock {
                 },
                 stopped,
             )),
-            Self::Reasoning { text, stopped } => Ok((
+            Self::Reasoning {
+                text,
+                signature,
+                stopped,
+            } => Ok((
                 ContentBlock::Thinking {
                     text,
-                    signature: None,
+                    signature: (!signature.is_empty()).then_some(signature),
                     extra: Map::new(),
                 },
                 stopped,
@@ -404,7 +416,7 @@ impl PartialBlock {
     fn delta_name(&self) -> &'static str {
         match self {
             Self::Text { .. } => "text",
-            Self::Reasoning { .. } => "reasoning",
+            Self::Reasoning { .. } => "reasoning or reasoning_signature",
             Self::ToolInput { .. } => "json",
         }
     }
@@ -417,6 +429,7 @@ impl Delta {
             Self::Text(_) => "text",
             Self::Json(_) => "json",
             Self::Reasoning(_) => "reasoning",
+            Self::ReasoningSignature(_) => "reasoning_signature",
         }
     }
 }
@@ -438,6 +451,7 @@ fn event_name(event: &StreamEvent) -> &'static str {
         StreamEvent::BlockStop { .. } => "block_stop",
         StreamEvent::ToolInputAvailable { .. } => "tool_input_available",
         StreamEvent::Usage(_) => "usage",
+        StreamEvent::ResponseMetadata { .. } => "response_metadata",
         StreamEvent::MessageStop { .. } => "message_stop",
         StreamEvent::Error(_) => "error",
     }

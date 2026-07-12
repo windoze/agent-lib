@@ -278,7 +278,7 @@ trait LlmClient: Send + Sync {
 - 以两次真实 Foundry 探测响应(消息/工具 id 已脱敏)固定 text 与 tool_use fixture;新增 8 个聚焦测试覆盖真实响应、thinking/未知 stop reason、三级逃生舱、畸形 wire、本地成功传输、429、非法 2xx body 与 stream 误用。新增默认 `#[ignore]`、55 秒超时且缺环境变量时跳过的真实非流式集成测试。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test adapter::anthropic::response::tests -- --nocapture`(8 passed),`cargo test --all --all-targets`(85 passed,1 ignored),加载 `.envrc` 后 `cargo test --test integration_anthropic -- --ignored --nocapture`(1 passed,1.85s),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
-### M4-3 [TODO] Anthropic 流式(SSE)→ `StreamEvent`
+### M4-3 [DONE] Anthropic 流式(SSE)→ `StreamEvent`
 **上下文**:Anthropic SSE 事件:`message_start`/`content_block_start`/`content_block_delta`(text_delta / input_json_delta / thinking_delta)/`content_block_stop`/`message_delta`(带 stop_reason+usage)/`message_stop`。**决策 4**:把 Anthropic 的 `index` 映射成稳定 `BlockId`。**纪律 2**:input_json_delta 只累积。
 **做什么**:
 - `adapter/anthropic/` 流式:解析 SSE,产出归一化 `StreamEvent`:
@@ -291,6 +291,12 @@ trait LlmClient: Send + Sync {
 - 单元测试:喂探测记录的真实 SSE 分片 → 断言 StreamEvent 序列 + id 关联正确。
 - 经 Accumulator 折叠 → Response 与非流式结果结构一致。
 - `#[ignore]` 集成测试:真实流式 "count 1..5" 与 tool call(get_weather Tokyo),断言事件序列 + 折叠结果(对照探测输出:tool 参数 `{"city":"Tokyo"}`)。
+**完成记录**:
+- 2026-07-13: 添加 `eventsource-stream` 并实现 Anthropic SSE 传输、标准 framing/UTF-8 分片解码及严格生命周期状态机；覆盖 message/content block/message delta/stop、ping 与 provider error,把 provider `index` 稳定映射为 `anthropic-block-{index}`。
+- 正确处理 Anthropic 累计 usage 快照,避免 `message_start` 与 `message_delta` 重复计数；tool `input_json_delta` 始终保留为原始片段,仅在 block stop 完整边界解析并依次发布 `ToolInputAvailable`/`BlockStop`,非法或残缺 JSON 返回协议错误。
+- 补齐通用 `ReasoningSignature` 增量和 `ResponseMetadata` 逃生舱,使 thinking `signature_delta` 可折叠回完整签名,并把 model/id/stop sequence 与 Foundry `amazon-bedrock-invocationMetrics` 等未建模字段合并到 `Response.extra`；`AnthropicAdapter` 已实现 `LlmClient` 的完整态与流式路径。
+- 使用脱敏的真实 Foundry text/tool SSE fixture 增加 15 个 Anthropic 流聚焦测试,覆盖任意字节分片、事件序列、稳定 id、交错 block、tool JSON、thinking signature、累计 usage、metadata、错序/中断/错误分类及本地 HTTP/dyn client；统一 Accumulator 聚焦测试 13 项通过。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(101 passed,3 ignored),加载 `.envrc` 后 `cargo test --test integration_anthropic -- --ignored --nocapture`(3 passed,2.30s),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
 ### M4-R [TODO] Milestone 4 Review
 **验证清单**:

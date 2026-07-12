@@ -9,7 +9,7 @@ use crate::{
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::fmt;
 
 pub mod accumulator;
@@ -77,6 +77,13 @@ pub enum Delta {
     Json(String),
     /// Model reasoning text appended to a reasoning block.
     Reasoning(String),
+    /// An opaque replay signature appended to a reasoning block.
+    ///
+    /// Providers such as Anthropic stream this separately from visible
+    /// reasoning text. The fragments remain opaque and are concatenated so the
+    /// completed [`crate::model::content::ContentBlock::Thinking`] can be sent
+    /// back to the provider without losing its signature.
+    ReasoningSignature(String),
 }
 
 /// A provider-neutral event emitted while an LLM response is streaming.
@@ -139,6 +146,16 @@ pub enum StreamEvent {
     /// Corresponds to usage carried by Vercel v5's `finish-step` and `finish`
     /// message-control parts.
     Usage(Usage),
+    /// Preserves unmodeled response-level provider metadata observed in-stream.
+    ///
+    /// Adapters emit this only for fields attached to genuine provider wire
+    /// events. The accumulator merges the fields into
+    /// [`crate::client::Response::extra`], providing the streaming equivalent
+    /// of the complete-response `flatten` escape hatch.
+    ResponseMetadata {
+        /// Provider fields not represented by normalized response members.
+        extra: Map<String, Value>,
+    },
     /// Ends the streamed assistant message with its normalized stop reason.
     ///
     /// Corresponds to Vercel v5's `finish` message-control part.
@@ -165,7 +182,7 @@ mod tests {
         },
     };
     use serde::{Serialize, de::DeserializeOwned};
-    use serde_json::json;
+    use serde_json::{Map, json};
     use std::fmt::Debug;
 
     fn assert_json_round_trip<T>(value: T)
@@ -229,6 +246,7 @@ mod tests {
             Delta::Text("hello".to_owned()),
             Delta::Json("{\"city\":\"Shang".to_owned()),
             Delta::Reasoning("considering weather data".to_owned()),
+            Delta::ReasoningSignature("opaque-signature".to_owned()),
         ] {
             assert_json_round_trip(delta);
         }
@@ -268,6 +286,9 @@ mod tests {
                 output: 5,
                 ..Usage::default()
             }),
+            StreamEvent::ResponseMetadata {
+                extra: Map::from_iter([("provider_request_id".to_owned(), json!("req-1"))]),
+            },
             StreamEvent::MessageStop {
                 stop_reason: Normalized::from_mapped(StopReason::EndTurn, "end_turn"),
             },

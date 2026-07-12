@@ -1,9 +1,18 @@
 //! Anthropic Messages API transport and wire-format adapter.
 
-use crate::client::EndpointConfig;
+use crate::{
+    client::{
+        ANTHROPIC_DEFAULT_CAPABILITY, Capability, ChatRequest, ClientError, EndpointConfig,
+        LlmClient, Response,
+    },
+    stream::StreamEvent,
+};
+use async_trait::async_trait;
+use futures::stream::BoxStream;
 
 mod request;
 mod response;
+mod stream;
 
 /// Client resources and endpoint configuration for Anthropic Messages.
 ///
@@ -37,5 +46,26 @@ impl AnthropicAdapter {
     /// Returns the endpoint transport configuration used by this adapter.
     pub fn endpoint(&self) -> &EndpointConfig {
         &self.endpoint
+    }
+}
+
+#[async_trait]
+impl LlmClient for AnthropicAdapter {
+    /// Returns the protocol-level Anthropic Messages capability table entry.
+    fn capability(&self) -> &Capability {
+        &ANTHROPIC_DEFAULT_CAPABILITY
+    }
+
+    /// Executes the adapter's native complete-response path.
+    async fn chat(&self, request: ChatRequest) -> Result<Response, ClientError> {
+        AnthropicAdapter::chat(self, request).await
+    }
+
+    /// Executes the adapter's native SSE path.
+    async fn chat_stream(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError> {
+        AnthropicAdapter::chat_stream(self, request).await
     }
 }

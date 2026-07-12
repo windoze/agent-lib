@@ -44,6 +44,10 @@ fn folds_interleaved_blocks_and_three_tool_json_fragments_in_start_order() {
             delta: Delta::Reasoning("Need a lookup.".to_owned()),
         },
         StreamEvent::BlockDelta {
+            id: reasoning_id.clone(),
+            delta: Delta::ReasoningSignature("opaque-".to_owned()),
+        },
+        StreamEvent::BlockDelta {
             id: tool_id.clone(),
             delta: Delta::Json("\"Shang".to_owned()),
         },
@@ -54,6 +58,10 @@ fn folds_interleaved_blocks_and_three_tool_json_fragments_in_start_order() {
         StreamEvent::BlockDelta {
             id: tool_id.clone(),
             delta: Delta::Json("hai\"}".to_owned()),
+        },
+        StreamEvent::BlockDelta {
+            id: reasoning_id.clone(),
+            delta: Delta::ReasoningSignature("signature".to_owned()),
         },
         StreamEvent::BlockStop {
             id: reasoning_id.clone(),
@@ -96,7 +104,7 @@ fn folds_interleaved_blocks_and_three_tool_json_fragments_in_start_order() {
             },
             ContentBlock::Thinking {
                 text: "Need a lookup.".to_owned(),
-                signature: None,
+                signature: Some("opaque-signature".to_owned()),
                 extra: Map::new(),
             },
         ]
@@ -214,4 +222,38 @@ fn tool_input_available_overrides_a_value_parsed_at_block_stop() {
         panic!("expected tool-use content");
     };
     assert_eq!(input, &json!({ "city": "authoritative" }));
+}
+
+#[test]
+fn response_metadata_merges_into_complete_response_with_later_values_winning() {
+    let mut accumulator = Accumulator::new();
+    start_message(&mut accumulator);
+    accumulator
+        .push(StreamEvent::ResponseMetadata {
+            extra: Map::from_iter([
+                ("request_id".to_owned(), json!("req-1")),
+                ("phase".to_owned(), json!("start")),
+            ]),
+        })
+        .unwrap();
+    accumulator
+        .push(StreamEvent::ResponseMetadata {
+            extra: Map::from_iter([
+                ("phase".to_owned(), json!("stop")),
+                ("latency_ms".to_owned(), json!(42)),
+            ]),
+        })
+        .unwrap();
+    stop_message(&mut accumulator, StopReason::EndTurn);
+
+    let response = accumulator.finish().expect("finish metadata response");
+
+    assert_eq!(
+        response.extra,
+        Map::from_iter([
+            ("request_id".to_owned(), json!("req-1")),
+            ("phase".to_owned(), json!("stop")),
+            ("latency_ms".to_owned(), json!(42)),
+        ])
+    );
 }
