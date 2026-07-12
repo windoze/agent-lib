@@ -39,7 +39,7 @@
 - 2026-07-13: 实现 `Normalized<T>`、`StopReason` 原始字符串归一化与 `Role` 小写 wire name,并添加 focused serde/unit tests。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`。
 
-### M1-3 [TODO] `Usage`
+### M1-3 [DONE] `Usage`
 **上下文**:`DESIGN.md` §5 Usage 一等公民;探测实证 Anthropic 返回 `input_tokens`/`output_tokens`/`cache_creation_input_tokens`/`cache_read_input_tokens`,OpenAI 用 `prompt_tokens`/`completion_tokens` + `completion_tokens_details.reasoning_tokens`。cache_read/cache_write/reasoning **必须单列**,不得揉进 input。
 **做什么**:
 - `model/usage.rs`:`struct Usage { input: u32, output: u32, cache_read: u32, cache_write: u32, reasoning: u32, total: Option<u32> }`,字段用 `#[serde(default)]`。
@@ -48,6 +48,9 @@
 **验证**:
 - 单元测试:分别用 Anthropic 与 OpenAI 的真实 usage JSON 片段反序列化,断言 cache/reasoning 落到正确字段。
 - 未知字段进入 `extra` 而非丢失。
+**完成记录**:
+- 2026-07-13: 实现 provider-neutral `Usage` 类型,支持 Anthropic/OpenAI usage 字段归一化、cache_read/cache_write/reasoning 单列、`extra` 逃生舱、流式 `merge` 与 `total_computed()`。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`。
 
 ### M1-4 [TODO] `ContentBlock` 与多模态承载
 **上下文**:`DESIGN.md` §5;参考 Anthropic 块分类(`docs/client-layer-references.md`)。这是"完整态"块(区别于 M2 的流式增量态)。

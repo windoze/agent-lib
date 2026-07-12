@@ -1,23 +1,18 @@
-# Execution Plan
-
-I will not record private chain-of-thought, but this file captures the actionable plan and progress for the current invocation.
+## Execution Plan
 
 1. Read `TODO.md` to identify the first task whose heading is not prefixed with `[DONE]`.
-2. Check the latest commit message only for directly relevant unfinished work tied to that task.
-3. Read the task details, dependencies, and validation requirements.
-4. Implement the task as written, adding only necessary prerequisite tasks if a concrete blocker makes completion impossible.
-5. Run formatting, linting, and tests required by the task, escalating to the full suite if required.
-6. Update `TODO.md` to mark the completed task with `[DONE]` and record validation results, or leave it incomplete and document any blocker/prerequisite.
-7. Update this file at key milestones.
-8. Commit all changes for this invocation, then stop without starting the next task.
+2. Check the latest commit only for unfinished work directly relevant to that selected task.
+3. Read the selected task requirements, dependencies, and validation instructions.
+4. Inspect the relevant code and tests for that task only.
+5. Implement the task completely, or add the minimum prerequisite task to `TODO.md` if a concrete blocker makes completion impossible.
+6. Run formatting, linting, and the relevant tests in the required order, escalating to the full suite when needed.
+7. Update `TODO.md` by prefixing the completed task title with `[DONE]` and filling in its completion record, or document the blocker/prerequisite if blocked.
+8. Update this file when key milestones are reached or the plan changes.
+9. Commit all task-related changes with a descriptive message and stop without starting the next task.
 
-Progress:
-- Initial execution plan created.
-- Identified first incomplete task: `M1-2 [TODO] Role 与 Normalized<T> + StopReason`.
-- Latest commit completes `M1-1` and does not mention unfinished work relevant to `M1-2`.
-- Next: implement normalized enum wrapper, role enum, stop reason mapping, and focused serde tests.
-- Implemented `Normalized<T>`, `StopReason`, raw stop-reason normalization, `Role`, and focused serde/unit tests.
-- Next: run `cargo fmt`, linting, and tests; fix any failures before marking the task done.
-- Validation passed: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all --all-targets`.
-- Marked `M1-2` as `[DONE]` in `TODO.md` with completion notes.
-- Next: inspect final diff, commit all current invocation changes, and stop.
+## Current Progress
+
+- Selected first incomplete task: `M1-3 [TODO] Usage`.
+- Latest commit only records `M1-2` completion and does not mention unfinished work relevant to `M1-3`.
+- Implementation target: fill `src/model/usage.rs` with the provider-neutral `Usage` model, provider-field normalization for Anthropic/OpenAI usage fragments, merge/total helpers, and focused unit tests.
+- Implemented `Usage`, marked `M1-3` complete in `TODO.md`, and validated with `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all --all-targets`.
