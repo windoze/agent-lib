@@ -52,7 +52,7 @@
 - 2026-07-13: 实现 provider-neutral `Usage` 类型,支持 Anthropic/OpenAI usage 字段归一化、cache_read/cache_write/reasoning 单列、`extra` 逃生舱、流式 `merge` 与 `total_computed()`。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`。
 
-### M1-4 [TODO] `ContentBlock` 与多模态承载
+### M1-4 [DONE] `ContentBlock` 与多模态承载
 **上下文**:`DESIGN.md` §5;参考 Anthropic 块分类(`docs/client-layer-references.md`)。这是"完整态"块(区别于 M2 的流式增量态)。
 **做什么**:
 - `model/content.rs`:`enum ContentBlock { Text{text}, Image{source}, ToolUse{id,name,input:Value}, ToolResult{tool_use_id,content,is_error}, Thinking{text,signature:Option<String>} }`。
@@ -63,6 +63,9 @@
 **验证**:
 - serde round-trip 覆盖每个变体。
 - 反序列化一段含 text+tool_use 的真实 Anthropic content 数组成功。
+**完成记录**:
+- 2026-07-13: 实现完整态 `ContentBlock` 与 `ImageSource`,覆盖 text/image/tool_use/tool_result/thinking,支持 URL/base64 图片、多模态 tool result、thinking signature 保留,并为块与图片 source 保留 flatten `extra` 逃生舱。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`。
 
 ### M1-5 [TODO] `Message` 与 `Tool`(schema)/ `ToolCall` / `ToolResponse`
 **上下文**:`Message` 是 Turn 的内容物(见 `conversation-core.md` §2.3,中立层)。`Tool` 定义含 JSON schema。`ToolCall`/`ToolResponse` 是统一 data model(`DESIGN.md` §2.1),ToolResponse 要能表达非正常结果(需审批/被拒/出错)。
