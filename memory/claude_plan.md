@@ -1,83 +1,93 @@
-# 本轮执行计划
+# 当前执行计划
 
-## 约束与当前状态
+## 目标与约束
 
-- 本轮只完成 `TODO.md` 中按顺序出现的第一个标题未带 `[DONE]` 的任务，完成后立即停止，不进入下一任务。
-- `TODO.md` 是任务顺序、依赖、验收条件和完成记录的唯一事实来源；只有阶段级计划发生实质变化时才修改 `PLAN.md`。
-- 当前尚未读取仓库状态或任务内容；这是本轮的第一个文件操作。以下先记录可审计的执行计划，不记录模型的私有逐字思维链。
-- 不为方便而拆分任务。只有发现阻断当前任务的具体、未跟踪前置条件时，才在 `TODO.md` 中加入最少数量的前置任务，提交该结构性变更后停止。
-- 已存在的用户改动必须保留；若这是一次中断后的续作，最终提交应原子地包含当前任务遗留的全部未提交文件。
+- 本次调用只完成 `TODO.md` 中按顺序出现的第一个、标题未带 `[DONE]` 的任务，然后停止。
+- `TODO.md` 是任务顺序、需求、依赖、验证和完成记录的唯一事实来源；`PLAN.md` 仅在阶段级计划确实变化时更新。
+- 不做开放式历史缺陷扫描。只检查最新提交是否明确提到与当前任务直接相关的未完成问题，以及当前任务实施或验证中暴露的阻塞问题。
+- 若发现必须先解决的具体前置问题，则以最少的新任务更新 `TODO.md`、保持当前任务未完成、提交任务清单调整后停止；不采用规避方案。
+- 若实现完成，则依次格式化、严格 lint、运行完整测试和文档构建，并将任务标题标为 `[DONE]`、填写完成记录、提交全部相关改动后停止。
+- 不泄露私有的逐 token 推理；本文件记录可审查的决策依据、假设、执行步骤、证据和进度。
 
-## 执行步骤
+## 分步执行计划
 
-1. 首先完整读取 `TODO.md`，按标题是否显式带 `[DONE]` 判断完成状态，定位第一个未完成任务并摘录其范围、依赖、测试要求和完成记录要求。
-2. 检查 `git status` 与最新一次提交信息；只分析与当前任务直接相关的未提交改动和最新提交所明确提及的未完事项，不进行开放式历史缺陷扫描。
-3. 阅读当前任务直接涉及的设计、源码、测试及仓库级说明文件（包括适用的 `AGENTS.md`）；确认预期行为、现有实现边界和验收路径。
-4. 若发现具体阻断项，判断它是否会阻止任务正确实现、使规定行为无效，或属于本轮直接引入的回归：
-   - 可以在当前任务范围内完整修复时，修复同一根因影响的整个已识别类别并补测试；
-   - 必须新增前置任务时，以最小粒度更新 `TODO.md` 的顺序与依赖，必要时更新阶段级 `PLAN.md`，提交后停止；
-   - 不通过缩小表示、专用特例、弱化断言或其他 workaround 绕过问题。
-5. 采用小而聚焦的补丁完成实现，并在每个关键步骤后重新读取相关区段；为公开行为补齐正常、边界、错误和序列化/流式状态等与任务要求相符的测试。
-6. 按规定顺序验证：先 `cargo fmt --all`，再 `cargo clippy --all-targets -- -D warnings`，然后在不超过 30 分钟的超时下运行 `cargo test --all --all-targets`，最后按任务要求运行文档构建或其他专项检查。任何未被后续明确任务精确覆盖的失败都必须立即修复或排入正确的前置位置。
-7. 验证通过后，仅在任务标题前加 `[DONE]`，并在 `TODO.md` 的完成记录中写明实现内容、测试命令和结果；只有阶段结构确实变化才更新 `PLAN.md`。
-8. 再次检查 diff、格式、测试结果与工作树，确认没有遗漏或意外改动；用包含任务编号的清晰信息提交当前任务的全部相关改动。若 `PROMPT.md` 意外变化，也按要求纳入提交而不擅自还原。
-9. 将本文件更新为最终进度摘要（所选任务、关键决定、验证结果、提交号），确认提交后停止，不读取或实施下一个任务。
+1. 读取 `TODO.md`，从头定位第一个标题未带 `[DONE]` 的任务，完整提取其需求、依赖、验收标准和完成记录要求。
+2. 检查工作树、当前分支和最新提交信息：
+   - 保护用户已有改动，不覆盖或回退无关内容；
+   - 判断是否为上次中断后遗留的同一任务；
+   - 仅处理最新提交中明确指出且与当前任务直接相关的未完成问题。
+3. 阅读当前任务直接涉及的设计文档和代码/测试，建立需求到实现与测试的对应关系；避免无关范围扩张。
+4. 完整实现当前任务。采用小而聚焦的补丁，每次关键修改后复读受影响区域；如根因明显影响同类场景，则修复整个已识别的问题类别。
+5. 添加或调整覆盖正常路径、边界条件、错误路径和序列化/流式状态（按任务实际内容选择）的测试。发现规范不匹配时先判断能否在当前任务内正确修复；若不能，按前置任务规则处理。
+6. 按规定顺序验证：
+   - `cargo fmt --all`
+   - `cargo clippy --all-targets -- -D warnings`
+   - `cargo test --all --all-targets`（最长 30 分钟，单测试不得超过 1 分钟）
+   - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
+   对任何未被后续明确任务覆盖的失败，立即修复或在 `TODO.md` 中加入最小前置任务；未处理前不标记完成。
+7. 验证通过后，更新 `TODO.md`：给当前任务标题加 `[DONE]`，填写实际实现内容、测试命令和结果。只有阶段级依赖或完成标准改变时才更新 `PLAN.md`。
+8. 检查最终 diff 和状态，确认仅包含当前任务以及恢复同一任务所需的全部未提交文件；如 `PROMPT.md` 有意外改动，也按用户要求纳入提交且不回退。
+9. 使用包含任务编号的清晰提交信息提交改动。提交后确认工作树状态与提交内容，然后停止，不读取或实施下一个任务。
+10. 若 `TODO.md` 已无未完成任务，则执行其规定的最终复核、提交必要调整并创建 `endtag`；这只在确认所有任务标题均为 `[DONE]` 后发生。
 
-## 进度
+## 当前进度
 
-- [x] 在运行任何仓库检查或命令前建立本轮计划。
-- [x] 定位首个未完成任务并确认工作树上下文。
-- [x] 完成实现与测试。
-- [x] 通过全部规定验证。
-- [x] 更新 `TODO.md` 完成记录。
-- [x] 提交并停止。
+- 已创建初始执行计划。
+- 已完整读取 `TODO.md`，确定首个未完成任务为 `M5-2 OpenAI Response 流式(SSE) → StreamEvent`；后续的 `M5-R` 本次不实施。
+- 当前任务的必需产出：
+  - 解析 Responses API SSE，并把 output item added / delta / done / completed 映射为统一 `StreamEvent`；
+  - 使用 `item_id` / `output_index` 建立稳定 `BlockId` 关联；
+  - 文本、reasoning、function-call arguments 分别映射为 `Delta::Text`、`Delta::Reasoning`、`Delta::Json`；
+  - tool arguments 只累积，在完整边界发布 `ToolInputAvailable`，不对 partial JSON 提前解析；
+  - 用真实录制 SSE fixture 覆盖事件序列及经唯一 `Accumulator` 折叠的一致性；
+  - 增加默认忽略的真实流式文本与 tool-call 集成测试。
+- 下一步：检查工作树与最新提交是否存在同任务遗留或直接相关的明确未完成问题，然后阅读 M5-1、Anthropic 流式实现及相关测试，设计最小且完整的同构实现。
 
-## 已选任务：M5-1
+## 已确认的实现依据与设计
 
-- 标题：`OpenAI Response 请求构造与非流式响应`。
-- 请求侧验收：将统一 `ChatRequest` 显式映射为 Responses API 的 `input`、`instructions`、`tools`、`max_output_tokens` 等字段，并完整应用 `EndpointConfig`、Azure `api-key` 和 `api-version` query；OpenAI 专属 extras 只能在最终序列化阶段合并。
-- 响应侧验收：把 `output[]` 中的 message、reasoning、function_call item 归一为 `Response.message.content`；把 input/output/reasoning token 分列；把状态/失败信息映射为保留 raw 的 `Normalized<StopReason>`；Azure `content_filters` 及其他未知字段必须进入合适的 `extra`，不得丢失。
-- 测试验收：无网络请求体单元测试、基于真实探测 JSON 的解析测试，以及默认忽略且有严格超时的真实 `gpt-5.5` 非流式集成测试。
-- 仓库上下文：最新提交 `a58e380e11b0658fe66cf7f1aca3bd06c2a07dc4`（`[M4-R] Complete Anthropic milestone review`）未声明与 M5-1 相关的未完问题；本轮开始时无既有未提交改动。
-
-## M5-1 细化步骤
-
-1. 阅读 `PLAN.md`、`DESIGN.md`、OpenAI Responses 参考/探测记录、现有模块树与 Anthropic 适配器实现，明确 wire 形态和可复用的 HTTP/错误处理边界。
-2. 建立聚焦的 `adapter/openai_resp` 子模块，将请求编码、完整响应解析和 adapter 门面分开，避免形成过长源文件。
-3. 实现请求 URL/header/query/body 构造，覆盖完整内容块、工具 schema、provider extras、错误输入和 `stream=false` 非流式约束。
-4. 实现完整响应解析与 `LlmClient::chat`，覆盖 message 文本/refusal、reasoning、function_call、usage、stop reason、Azure 方言字段及 HTTP/协议错误分类；本任务不提前实现 M5-2 的 SSE。
-5. 增加真实 fixture 驱动的单元测试、本地 HTTP 传输测试和忽略的真实 endpoint 测试；发现 wire 与既有中立模型之间的阻断性缺口时，按无 workaround 原则修复根因或写入最小前置任务并停止。
-
-## 调研结论与实现决定
-
-- `openai-docs` 官方 MCP 已注册，但当前会话无法热加载；已改用同一官方域名的 Responses migration、function calling 与 vision 指南核对字段。官方资料确认 Responses 顶层使用 `instructions`/`input`，上下文为 typed Item；function tool 使用扁平 `type/name/description/parameters`；函数结果通过 `call_id` 关联；图片通过 `input_image.image_url`（base64 为 data URL）传入。
-- 已对配置中的 Foundry endpoint 完成两次脱敏、无状态非流式探测：
-  - 文本响应包含顶层 Azure `content_filters`、空 `reasoning` item、`message` item 的 `output_text`，状态为 `completed`；
-  - 工具响应包含 `function_call` item，`arguments` 为完整 JSON 字符串，`call_id` 是应映射到中立 `ToolUse.id` 的关联标识；
-  - usage 使用 `input_tokens_details.cached_tokens` 和 `output_tokens_details.reasoning_tokens`。
-- 请求转换采用 item 级映射：普通文本/图片组成 message item，assistant tool use 组成 `function_call` item，tool result 组成 `function_call_output` item，thinking 组成 reasoning item；不合法的 role/block 组合返回协议错误，不静默改形。
-- 响应转换把 message content、reasoning、function_call 依序折叠成一个 assistant `Message`；item/content 层尚未建模的元数据放入块 `extra` 的 OpenAI 命名空间，未知 output item 原值放入顶层 `Response.extra`，顶层 `content_filters` 等字段直接保留。
-- stop reason 由 status、`incomplete_details.reason` 和实际 output 分类共同确定：function call 优先归一为 `ToolUse`，正常 completed 为 `EndTurn`，max-output incomplete 为 `MaxTokens`，refusal/content-filter 为 `Refusal`，其他状态保留 raw 并归 `Other`。
-- 现有 `Usage` 未把真实 Responses 字段 `input_tokens_details.cached_tokens` 归入 `cache_read`。这是当前任务直接依赖的同类 alias 缺口，将在 M5-1 内完整补齐并测试。
+- 工作树初始仅有本计划文件改动；最新提交 `0666b7b` 完成 M5-1，未声明与 M5-2 直接相关的遗留阻塞。
+- 已读取 OpenAI 官方 streaming guide、Responses streaming events reference 与 `/v1/responses` OpenAPI 资料。确认核心 wire 生命周期为：
+  - `response.created` / `response.in_progress`；
+  - `response.output_item.added`，message 内容另有 `response.content_part.added`；
+  - `response.output_text.delta|done`、`response.refusal.delta|done`；
+  - `response.reasoning_text.delta|done` 与 `response.reasoning_summary_text.delta|done`；
+  - `response.function_call_arguments.delta|done`；
+  - `response.content_part.done` / `response.output_item.done`；
+  - `response.completed`，以及合法的 `response.incomplete`、`response.failed`、`error` 终态。
+- 已对配置的 Foundry endpoint 做两次 55 秒内的最小真实流探测，认证值未输出或落盘：
+  - 文本流实际包含空 reasoning item、message/content part、两个 output text delta，最终 `response.completed` 含 usage 与 Azure `content_filters`；
+  - 工具流实际包含 function-call item、5 个 arguments delta、arguments done、item done 和 completed，完整参数为 `{"city":"Tokyo"}`。
+- 模块方案：在 `adapter/openai_resp/stream/` 下按 decoder / wire / normalizer / tests 拆分；SSE framing 采用与 Anthropic 一致的 terminal-on-error 模式，但状态机独立校验 Responses 的 item/content 层级。
+- 稳定 id 方案：item 级 reasoning/tool 使用 provider `item.id` 映射；message 的每个 content part 使用 `item_id + content_index` 映射，避免多 content part 被错误合并；同时校验 `output_index` 与 `item_id` 一致。
+- tool 参数纪律：delta 仅追加原始字符串并立刻产出 `Delta::Json`；只在 `response.function_call_arguments.done` 完整边界比较完整字符串、解析 JSON并产出 `ToolInputAvailable`；随后 item done 才产出 `BlockStop`。
+- terminal 方案：复用 M5-1 的完整响应转换逻辑解析 completed/incomplete 内嵌 response，以得到一致的 usage、stop reason 和顶层 extra；流状态机校验最终 normalized content 与已观察的 item/part 内容一致，随后发出 Usage、ResponseMetadata、MessageStop。
+- 错误/扩展方案：provider failed/error 映射为分类化 `ClientError`；未知合法 output item/content/event 不伪装成已支持块，而是在终态完整响应的逃生舱中保留证据。协议错序、重复、id/index 不一致、done 与 delta 内容不一致、partial JSON 和 premature EOF 均显式报错。
+- 下一步：先用小补丁抽取可复用的完整 response value 解析入口，再逐个新增 stream wire、normalizer、decoder、transport和 trait 实现；随后添加脱敏 fixture 与聚焦测试。
 
 ## 实施进度
 
-- 已实现 `OpenAiRespAdapter` 门面、`POST /responses` 请求构造和完整态 `chat` 传输；尚未加入 `LlmClient` 实现，因为 trait 要求的 SSE 方法属于紧随其后的 M5-2，当前不放置未实现 shim。
-- 请求转换已覆盖 text、URL/base64 image、reasoning、function call、function call output、JSON Schema tools、instructions、max output tokens、temperature、stream 与 OpenAI provider extras；不合法 role/block 组合和跨 provider extras 均返回可观测错误。
-- 响应转换已覆盖 message/output_text/refusal、reasoning、function_call，完整 JSON arguments 只解析一次；item/content 元数据进入块级 `openai_response` extra，未知 output item/part 进入顶层逃生舱，Azure `content_filters` 原样保留。
-- 通用 `Usage` 已补齐 `input_tokens_details.cached_tokens`/cache creation aliases，并保留 details 中其他未知计数。
-- 第一次聚焦测试暴露空 query 列表也会生成尾随 `?`；同一根因影响 Anthropic 与 OpenAI 两个请求构造器，现已做类级修复并为两边添加回归断言。
-- 当前聚焦结果：`cargo test adapter::openai_resp:: -- --nocapture` 14/14 通过；OpenAI Responses usage alias 聚焦测试通过。
-- 真实验证：加载 `.envrc` 后，`cargo test --test integration_openai_resp -- --ignored --nocapture` 1/1 通过，耗时 2.32 秒；拿到非空文本、usage、`completed` stop 和 Azure `content_filters`。
-- 已用 `async-openai 0.41.1` 的 Responses 类型复核：reasoning `id` 可选且 summary/content/encrypted_content 形态匹配；function call output 支持字符串或 input content 数组及可选 completed/incomplete status；当前请求表示与权威类型一致。
-
-## 最终验证结果
-
-- `cargo fmt --all`：通过。
-- `cargo clippy --all-targets -- -D warnings`：通过，无 warning。
-- `gtimeout 1800 cargo test --all --all-targets`：通过，115 passed、0 failed、4 ignored；所有实际运行的单测均远低于 1 分钟。
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：通过。
-- 加载 `.envrc` 后 `gtimeout 120 cargo test --test integration_openai_resp -- --ignored --nocapture`：通过，1 passed，3.09 秒。
-- `PLAN.md` 未修改：M5 阶段顺序、依赖和完成标准没有变化，本轮只完成既定 M5-1 执行单元。
-- `TODO.md` 已将首个未完成任务 `M5-1` 的标题显式改为 `[DONE]` 并补充完成记录；未开始 M5-2。
-- 已创建并复核任务提交：`[M5-1] Implement OpenAI Responses non-streaming adapter`；本文件的最终状态将 amend 进同一提交，随后只读确认并停止。
+- 已抽取 `parse_response_value`，让流式 terminal snapshot 与非流式响应共享完整 output/usage/stop reason/extra 转换逻辑。
+- 已新增 `adapter/openai_resp/stream/`：
+  - `wire.rs` 对核心 Responses 事件提供 typed view，同时保留原始 JSON；
+  - `normalizer/` 校验零起点连续 sequence、response/item/content 生命周期及冗余的 item id/output index；
+  - `decoder.rs` 支持任意 HTTP 字节分片、UTF-8/SSE framing 错误分类及 terminal-on-error；
+  - transport 校验 stream 请求模式、HTTP 错误/Retry-After 与 `text/event-stream` content type。
+- `OpenAiRespAdapter` 已实现 dyn-safe `LlmClient` 的完整态与流式两条路径。
+- 已加入 2026-07-13 实际 Foundry 文本/tool SSE 脱敏 fixture。14 个聚焦测试全部通过，覆盖：
+  - 文本、空 reasoning、tool arguments 五段增量、usage、Azure `content_filters`；
+  - 与 terminal 完整响应的 normalized 折叠一致性；
+  - 两个 tool item 交错、reasoning text 与 encrypted signature；
+  - partial JSON 只在 done 失败、sequence/event/id-index 错配、premature EOF、非法 UTF-8；
+  - provider error/failed/incomplete 分类、未知 future event 逃生舱；
+  - 本地 HTTP、Retry-After、content type、截断 body 与 `Box<dyn LlmClient>`。
+- 已在 `tests/integration_openai_resp.rs` 新增默认忽略的真实流式文本和强制 tool-call 测试；通过 `direnv exec . cargo test --test integration_openai_resp -- --ignored --nocapture` 验证 3/3 通过（含既有非流式测试，总耗时 3.56 秒）。
+- 已将原先过长的状态机代码拆分为 response normalizer、terminal reconciliation、event field 校验、message part、reasoning accumulation 与 JSON accessor 等聚焦模块；重组后聚焦测试仍为 14/14 通过。
+- 最终验证结果：
+  - `cargo fmt --all`：通过；
+  - `cargo clippy --all-targets -- -D warnings`：通过，无 warning；
+  - `cargo test --all --all-targets`：129 passed，6 ignored；
+  - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：通过；
+  - 重组后再次运行 `direnv exec . cargo test --test integration_openai_resp -- --ignored --nocapture`：3 passed，3.80 秒；
+  - `git diff --check`：通过（标记完成前结果，最终提交前会再次检查）。
+- 已将 `TODO.md` 的任务标题更新为 `M5-2 [DONE]` 并填写实现与验证完成记录；阶段顺序和依赖未变化，因此未修改 `PLAN.md`。
+- 下一步：复核最终 diff、任务边界和工作树，确认没有 secrets/无关改动并执行最终 diff check；随后以 `[M5-2]` 提交全部本任务改动并停止，不进入 `M5-R`。

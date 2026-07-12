@@ -330,7 +330,7 @@ trait LlmClient: Send + Sync {
 - 通用 `Usage` 补齐真实 Responses `input_tokens_details.cached_tokens`/cache creation aliases,并保留 details 内未知字段；以两次脱敏真实 Foundry 响应固定 text/reasoning/tool fixture,新增 14 个 adapter 聚焦测试、本地 HTTP 错误/超时边界测试及 55 秒上限的默认忽略真实非流式集成测试。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(115 passed,4 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_openai_resp -- --ignored --nocapture`(1 passed,3.09s),`git diff --check`。
 
-### M5-2 [TODO] OpenAI Response 流式(SSE)→ `StreamEvent`
+### M5-2 [DONE] OpenAI Response 流式(SSE)→ `StreamEvent`
 **上下文**:Response API 事件 `response.output_item.added` / `response.*.delta`(text/function_call arguments/reasoning) / `response.output_item.done` / `response.completed`(usage)。映射到统一 StreamEvent(见 `docs/client-layer-references.md` 对照:added→BlockStart、delta→BlockDelta、done→BlockStop)。function_call 的 `arguments` delta 只累积(纪律 2)。用稳定 BlockId 关联(item_id/output_index)。
 **做什么**:
 - 解析 Response SSE → `StreamEvent`,与 Anthropic 适配器产出**同构**的事件流(以便 Accumulator 复用)。
@@ -338,6 +338,12 @@ trait LlmClient: Send + Sync {
 **验证**:
 - 单元测试:真实 SSE 分片 → StreamEvent 序列;经 Accumulator 折叠一致。
 - `#[ignore]` 集成测试:真实流式文本 + tool call,断言事件序列与折叠结果。
+**完成记录**:
+- 2026-07-13: 实现 OpenAI Responses SSE transport、任意字节分片 framing 与 terminal-on-error 解码，以及严格校验连续 `sequence_number`、response/item/content 生命周期和 `item_id`/`output_index` 冗余关联的状态机；message content part、reasoning 与 function call 分别映射为同构的 BlockStart/Delta/Stop 事件。
+- 使用 provider item id（message content 另加 content index）生成稳定 `BlockId`；function arguments delta 始终作为原始 `Delta::Json` 透传，只在 `response.function_call_arguments.done` 完整边界核对、解析并发布 `ToolInputAvailable`，非法/残缺 JSON 返回协议错误而不 panic。
+- 流式 terminal response 复用非流式完整响应转换，统一 usage、stop reason 与 Azure `content_filters` 等顶层逃生舱；同时覆盖 raw/summary reasoning、encrypted reasoning signature、refusal、incomplete/failed/error 分类和未知未来事件保留。`OpenAiRespAdapter` 已完整实现 dyn-safe `LlmClient`。
+- 以两次脱敏真实 Foundry text/tool SSE 固定 fixture，新增 14 个聚焦测试，覆盖 UTF-8/framing 分片、文本/tool 事件序列、并行 tool item 交错、reasoning、fold 与完整响应一致、partial JSON、错序/错配/截断、provider error 和本地 HTTP/dyn client；新增默认忽略且 55 秒上限的真实流式文本/tool-call 集成测试。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(129 passed,6 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_openai_resp -- --ignored --nocapture`(3 passed,3.80s),`git diff --check`。
 
 ### M5-R [TODO] Milestone 5 Review
 **验证清单**:

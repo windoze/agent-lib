@@ -37,67 +37,14 @@ impl OpenAiRespAdapter {
                 error.column()
             ))
         })?;
-        let Value::Object(mut wire) = value else {
-            return Err(invalid_response(
-                "response JSON must be an object".to_owned(),
-            ));
-        };
 
-        match wire.get("object") {
-            Some(Value::String(object)) if object == "response" => {}
-            Some(Value::String(object)) => {
-                return Err(invalid_response(format!(
-                    "response object must be `response`, got `{object}`"
-                )));
-            }
-            Some(_) => {
-                return Err(invalid_response(
-                    "response field `object` must be a string".to_owned(),
-                ));
-            }
-            None => {
-                return Err(invalid_response(
-                    "response field `object` is required".to_owned(),
-                ));
-            }
-        }
-
-        let status = take_required_string(&mut wire, "status", "response")?;
-        let output = take_required_array(&mut wire, "output", "response")?;
-        let usage = take_usage(&mut wire)?;
-        let incomplete_reason = response_incomplete_reason(&wire)?;
-        let mut converted = convert_output(output)?;
-        if response_is_filtered(&wire)? {
-            converted.refusal_raw = Some("content_filter".to_owned());
-        }
-        if !converted.unmodeled.is_empty() {
-            insert_preserving_collision(
-                &mut wire,
-                UNMODELED_OUTPUT_KEY,
-                Value::Array(converted.unmodeled),
-            );
-        }
-
-        Ok(Response {
-            message: Message {
-                role: Role::Assistant,
-                content: converted.content,
-            },
-            usage,
-            stop_reason: normalize_stop_reason(
-                &status,
-                incomplete_reason.as_deref(),
-                converted.has_tool_call,
-                converted.refusal_raw.as_deref(),
-            ),
-            extra: wire,
-        })
+        parse_response_value(value)
     }
 
     /// Executes one native non-streaming OpenAI Responses request.
     ///
     /// Callers must set [`ChatRequest::stream`] to `false`; SSE responses are
-    /// handled by the separately scheduled streaming adapter task.
+    /// handled by [`OpenAiRespAdapter::chat_stream`].
     pub async fn chat(&self, request: ChatRequest) -> Result<Response, ClientError> {
         if request.stream {
             return Err(invalid_response(
@@ -129,6 +76,69 @@ impl OpenAiRespAdapter {
 
         Self::parse_response(&body)
     }
+}
+
+/// Converts one already-deserialized complete response object.
+///
+/// Streaming terminal events embed the same response shape as the native
+/// non-streaming endpoint. Keeping their conversion here guarantees identical
+/// usage, stop-reason, and escape-hatch behavior across both paths.
+pub(super) fn parse_response_value(value: Value) -> Result<Response, ClientError> {
+    let Value::Object(mut wire) = value else {
+        return Err(invalid_response(
+            "response JSON must be an object".to_owned(),
+        ));
+    };
+
+    match wire.get("object") {
+        Some(Value::String(object)) if object == "response" => {}
+        Some(Value::String(object)) => {
+            return Err(invalid_response(format!(
+                "response object must be `response`, got `{object}`"
+            )));
+        }
+        Some(_) => {
+            return Err(invalid_response(
+                "response field `object` must be a string".to_owned(),
+            ));
+        }
+        None => {
+            return Err(invalid_response(
+                "response field `object` is required".to_owned(),
+            ));
+        }
+    }
+
+    let status = take_required_string(&mut wire, "status", "response")?;
+    let output = take_required_array(&mut wire, "output", "response")?;
+    let usage = take_usage(&mut wire)?;
+    let incomplete_reason = response_incomplete_reason(&wire)?;
+    let mut converted = convert_output(output)?;
+    if response_is_filtered(&wire)? {
+        converted.refusal_raw = Some("content_filter".to_owned());
+    }
+    if !converted.unmodeled.is_empty() {
+        insert_preserving_collision(
+            &mut wire,
+            UNMODELED_OUTPUT_KEY,
+            Value::Array(converted.unmodeled),
+        );
+    }
+
+    Ok(Response {
+        message: Message {
+            role: Role::Assistant,
+            content: converted.content,
+        },
+        usage,
+        stop_reason: normalize_stop_reason(
+            &status,
+            incomplete_reason.as_deref(),
+            converted.has_tool_call,
+            converted.refusal_raw.as_deref(),
+        ),
+        extra: wire,
+    })
 }
 
 /// Deserializes the optional Responses usage object through the shared model.

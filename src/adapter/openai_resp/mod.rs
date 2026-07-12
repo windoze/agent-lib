@@ -1,9 +1,18 @@
 //! OpenAI Responses API transport and wire-format adapter.
 
-use crate::client::EndpointConfig;
+use crate::{
+    client::{
+        Capability, ChatRequest, ClientError, EndpointConfig, LlmClient,
+        OPENAI_RESP_DEFAULT_CAPABILITY, Response,
+    },
+    stream::StreamEvent,
+};
+use async_trait::async_trait;
+use futures::stream::BoxStream;
 
 mod request;
 mod response;
+mod stream;
 
 /// Namespace used inside content-block extras for replayable Responses wire
 /// metadata that has no provider-neutral field.
@@ -40,5 +49,26 @@ impl OpenAiRespAdapter {
     /// Returns the endpoint transport configuration used by this adapter.
     pub fn endpoint(&self) -> &EndpointConfig {
         &self.endpoint
+    }
+}
+
+#[async_trait]
+impl LlmClient for OpenAiRespAdapter {
+    /// Returns the protocol-level OpenAI Responses capability table entry.
+    fn capability(&self) -> &Capability {
+        &OPENAI_RESP_DEFAULT_CAPABILITY
+    }
+
+    /// Executes the adapter's native complete-response path.
+    async fn chat(&self, request: ChatRequest) -> Result<Response, ClientError> {
+        OpenAiRespAdapter::chat(self, request).await
+    }
+
+    /// Executes the adapter's native SSE path.
+    async fn chat_stream(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError> {
+        OpenAiRespAdapter::chat_stream(self, request).await
     }
 }
