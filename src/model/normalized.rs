@@ -99,14 +99,22 @@ mod tests {
     }
 
     #[test]
-    fn normalized_stop_reason_round_trips_through_serde() {
-        let reason = Normalized::from_mapped(StopReason::MaxTokens, "max_tokens");
+    fn every_normalized_stop_reason_round_trips_through_serde() {
+        for (value, raw) in [
+            (StopReason::ToolUse, "tool_use"),
+            (StopReason::EndTurn, "end_turn"),
+            (StopReason::MaxTokens, "max_tokens"),
+            (StopReason::StopSequence, "stop_sequence"),
+            (StopReason::Refusal, "refusal"),
+            (StopReason::Other, "provider_specific"),
+        ] {
+            let reason = Normalized::from_mapped(value, raw);
+            let json = serde_json::to_string(&reason).expect("serialize normalized stop reason");
+            let decoded: Normalized<StopReason> =
+                serde_json::from_str(&json).expect("deserialize normalized stop reason");
 
-        let json = serde_json::to_string(&reason).expect("serialize normalized stop reason");
-        let decoded: Normalized<StopReason> =
-            serde_json::from_str(&json).expect("deserialize normalized stop reason");
-
-        assert_eq!(decoded, reason);
+            assert_eq!(decoded, reason);
+        }
     }
 
     #[test]

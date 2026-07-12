@@ -160,17 +160,22 @@ mod tests {
     }
 
     #[test]
-    fn provider_extras_round_trip_through_serde() {
-        let extras = ProviderExtras {
-            provider: ProviderId::OpenAiResp,
-            fields: Map::from_iter([("reasoning".to_owned(), json!({ "effort": "high" }))]),
-        };
+    fn provider_extras_round_trip_for_every_provider_id() {
+        for (provider, wire_name) in [
+            (ProviderId::Anthropic, "anthropic"),
+            (ProviderId::OpenAiResp, "open_ai_resp"),
+        ] {
+            let extras = ProviderExtras {
+                provider,
+                fields: Map::from_iter([("reasoning".to_owned(), json!({ "effort": "high" }))]),
+            };
 
-        let encoded = serde_json::to_value(&extras).expect("serialize provider extras");
-        assert_eq!(encoded["provider"], json!("open_ai_resp"));
-        let decoded: ProviderExtras =
-            serde_json::from_value(encoded).expect("deserialize provider extras");
+            let encoded = serde_json::to_value(&extras).expect("serialize provider extras");
+            assert_eq!(encoded["provider"], json!(wire_name));
+            let decoded: ProviderExtras =
+                serde_json::from_value(encoded).expect("deserialize provider extras");
 
-        assert_eq!(decoded, extras);
+            assert_eq!(decoded, extras);
+        }
     }
 }

@@ -44,12 +44,19 @@ mod tests {
     }
 
     #[test]
-    fn role_round_trips_through_lowercase_wire_name() {
-        let json = serde_json::to_string(&Role::Assistant).expect("serialize role");
-        assert_eq!(json, "\"assistant\"");
+    fn every_role_round_trips_through_its_lowercase_wire_name() {
+        for (role, wire_name) in [
+            (Role::User, "user"),
+            (Role::Assistant, "assistant"),
+            (Role::System, "system"),
+            (Role::Tool, "tool"),
+        ] {
+            let json = serde_json::to_string(&role).expect("serialize role");
+            assert_eq!(json, format!("\"{wire_name}\""));
 
-        let decoded: Role = serde_json::from_str(&json).expect("deserialize role");
-        assert_eq!(decoded, Role::Assistant);
+            let decoded: Role = serde_json::from_str(&json).expect("deserialize role");
+            assert_eq!(decoded, role);
+        }
     }
 
     #[test]

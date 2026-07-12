@@ -8,6 +8,8 @@
 //! for this crate. They will consume the normalized types exported here instead
 //! of depending on provider-specific API shapes.
 
+#![warn(missing_docs)]
+
 pub mod adapter;
 pub mod client;
 pub mod model;

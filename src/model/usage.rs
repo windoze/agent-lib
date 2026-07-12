@@ -120,11 +120,13 @@ impl<'de> Deserialize<'de> for Usage {
     }
 }
 
+/// Adds token counts while reporting the normalized field on overflow.
 fn checked_add(left: u32, right: u32, field: &str) -> u32 {
     left.checked_add(right)
         .unwrap_or_else(|| panic!("usage {field} token count overflowed u32"))
 }
 
+/// Extracts a normalized counter from a provider-specific nested details map.
 fn merge_detail_alias<E>(
     current: u32,
     fields: &mut Map<String, Value>,
@@ -154,6 +156,7 @@ where
     Ok(merged)
 }
 
+/// Removes equivalent provider field names and returns their value or zero.
 fn take_aliased_u32<E>(fields: &mut Map<String, Value>, aliases: &[&str]) -> Result<u32, E>
 where
     E: DeError,
@@ -161,6 +164,7 @@ where
     take_optional_aliased_u32(fields, aliases).map(|value| value.unwrap_or_default())
 }
 
+/// Removes equivalent optional fields and rejects conflicting values.
 fn take_optional_aliased_u32<E>(
     fields: &mut Map<String, Value>,
     aliases: &[&str],
@@ -189,6 +193,7 @@ where
     Ok(found)
 }
 
+/// Reconciles a nested provider counter with an already normalized counter.
 fn merge_aliased_value<E>(
     current: u32,
     fields: &mut Map<String, Value>,
@@ -211,6 +216,7 @@ where
     Ok(value)
 }
 
+/// Validates and converts a JSON token counter into the normalized integer type.
 fn value_to_u32<E>(field: &str, value: Value) -> Result<u32, E>
 where
     E: DeError,

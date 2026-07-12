@@ -91,6 +91,7 @@ pub enum ImageSource {
     },
 }
 
+/// Lets serde omit the default successful tool-result error flag.
 fn is_false(value: &bool) -> bool {
     !*value
 }

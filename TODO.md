@@ -91,7 +91,7 @@
 - 2026-07-13: 实现可 serde 的 `ProviderId` 与 `ProviderExtras`,支持最终请求序列化阶段的字段合并、同名字段覆盖、provider 不匹配的可观测 no-op,并对非对象请求体返回明确错误。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test model::extras::tests`(4 passed),`cargo test --all --all-targets`(30 passed)。
 
-### M1-R [TODO] Milestone 1 Review
+### M1-R [DONE] Milestone 1 Review
 **做什么**:核对 M1 全部产出。
 **验证清单**:
 - 所有 M1 类型 `serde` round-trip 测试齐全且通过。
@@ -100,6 +100,11 @@
 - 逃生舱 B(flatten extra)在 Usage/ContentBlock 上生效;逃生舱 A/C 类型就位。
 - `cargo build` / `cargo test` / `cargo doc` 全绿,无 warning,公共类型有文档注释。
 - 更新本文件:M1 任务标记 `[DONE]`。
+**完成记录**:
+- 2026-07-13: 对照 `DESIGN.md` §4/§5 与 `PLAN.md` 已定决策完成 M1 全量审阅;确认 Message 无 id、Usage 的 cache/reasoning 分列、thinking signature、Usage/ContentBlock flatten extra、ProviderExtras 与 Normalized 均符合约束。
+- 补充根 `README.md` 的项目概览、环境、基础用法与验证说明;启用公共 API `missing_docs` lint,并补齐生产辅助函数说明。
+- 扩充 `Role`、`StopReason`、`ProviderId` 的全变体 serde round-trip 覆盖;既有测试已覆盖全部 ContentBlock/ImageSource/Tool/Message/Usage 类型、真实 usage/content 片段与逃生舱行为。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo build --all-targets`,`cargo test --all --all-targets`(30 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
 ---
 
