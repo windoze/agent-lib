@@ -110,13 +110,17 @@
 
 ## Milestone 2 — 流式事件与聚合
 
-### M2-1 [TODO] `BlockId` / `BlockKind` / `Delta`
+### M2-1 [DONE] `BlockId` / `BlockKind` / `Delta`
 **上下文**:`docs/client-layer-references.md` 决策 4/5——块用稳定 id、三段式同构。Delta 区分 text/json/reasoning。
 **做什么**:
 - `stream/mod.rs`:`struct BlockId(String)`(稳定 id,可由适配器从 index 映射生成)。
 - `enum BlockKind { Text, Reasoning, ToolInput { tool_name: String, tool_call_id: String } }`。
 - `enum Delta { Text(String), Json(String), Reasoning(String) }`(Json = tool 参数的原始片段,累积用)。
 **验证**:serde round-trip;类型文档注释说明"Json delta 不可边流边 parse"。
+**完成记录**:
+- 2026-07-13: 实现透明字符串 newtype `BlockId`、统一文本/推理/工具输入起始元数据的 `BlockKind`，以及承载文本/原始 JSON/推理片段的 `Delta`；公共文档明确工具 JSON 增量必须完整累积后再解析。
+- 为全部类型与枚举变体添加 serde round-trip 测试，并固定稳定 id、`snake_case` 枚举的 JSON 表示。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(35 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
 ### M2-2 [TODO] `StreamEvent`
 **上下文**:`docs/client-layer-references.md` 的 StreamEvent 草案 + 决策 7(只归一化 wire 真实事件,不含 approval/abort/pivot)。
