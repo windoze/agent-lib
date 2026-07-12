@@ -9,7 +9,8 @@ wire 格式。
 Anthropic Messages 与 OpenAI Responses 的非流式/流式适配器、真实 endpoint 的跨
 provider 归一化验收，以及 Conversation Core 的强类型 identity、独立 system 配置、
 immutable message envelope、只读 closed Turn、I1--I4 validator、原子 commit 数据边界，
-以及不暴露 partial 的 stream/non-stream `PendingMessage` 冻结边界。
+不暴露 partial 的 stream/non-stream `PendingMessage` 冻结边界，以及可容纳任意多轮工具往返、
+显式记录 open call 并只在最终 assistant 后提交的 `PendingTurn` 事务。
 已完成的 Client 层实施记录见
 [`docs/archive/2026-07-13-client-layer/TODO.md`](docs/archive/2026-07-13-client-layer/TODO.md)；
 当前 Conversation Core 阶段计划和任务见 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。
@@ -26,9 +27,9 @@ immutable message envelope、只读 closed Turn、I1--I4 validator、原子 comm
 - `client`：dyn-safe `LlmClient`、分类错误、结构化 capability、endpoint 与请求配置。
 - `conversation`：外部注入的强类型 id、独立 system 配置、不可原地修改的消息 envelope、
   共享只读 message 的 closed `Turn`、分类 commit 错误、唯一 I1--I4 校验门，以及复用 Client
-  `Accumulator` 的单消息 pending/freeze 状态机。
+  `Accumulator` 的单消息 pending/freeze 状态机和唯一 `PendingTurn` 事务状态机。
 
-Conversation Core 正按任务顺序继续实现 PendingTurn/cancel、boundary、projection 与
+Conversation Core 正按任务顺序继续实现 cancel、boundary、projection 与
 持久化；Agent loop、Tool registry 与多 agent 编排仍不在范围内。完整设计和当前阶段
 计划分别见 [`DESIGN.md`](DESIGN.md) 与 [`PLAN.md`](PLAN.md)。
 
@@ -64,8 +65,8 @@ Closed `Turn` 只暴露有序 message、完整 tool pairing、parent 和 metadat
 成功后才能一次性推进 Conversation history/version。失败会返回分类化
 `ConversationError`/`CommitError`，原 Conversation 全结构不变。
 
-当前公开 API 可以创建空 Conversation 并只读检查 closed history；后续 PendingTurn API 将复用
-已经建立的 crate-private commit 门，而不会暴露裸 message/turn push：
+公开 API 可以创建空 Conversation、只读检查 closed history，并通过唯一 pending 事务推进
+history；它不会暴露裸 message/turn push：
 
 ```rust
 use agent_lib::conversation::{Conversation, ConversationConfig, ConversationId};
@@ -81,8 +82,50 @@ let conversation = Conversation::new(
 assert_eq!(conversation.id(), conversation_id);
 assert_eq!(conversation.config().system(), Some("回答简洁。"));
 assert!(conversation.turns().is_empty());
+assert!(conversation.pending().is_none());
 assert_eq!(conversation.version(), 0);
 ```
+
+`begin_turn` 只把完整 user payload 放入 pending，不提前修改 raw history。assistant 可以从
+完整 `Response` 开始，也可以逐个接收 `StreamEvent`；冻结后若扫描到 `ToolUse`，调用方必须
+为每个 provider call id 提供唯一 `ToolCallId`，逐一追加完整 result，并在所有 open call
+闭合后继续下一条 assistant。只有无 tool-use 的最终 assistant 才能进入 `commit_pending`：
+
+```rust
+use agent_lib::{
+    client::Response,
+    conversation::{
+        AssistantFinish, Conversation, ConversationError, MessageId, TurnId, TurnMeta,
+    },
+    model::message::{Message, Role},
+};
+
+fn commit_text_response(
+    conversation: &mut Conversation,
+    turn_id: TurnId,
+    user_message_id: MessageId,
+    assistant_message_id: MessageId,
+    response: Response,
+) -> Result<TurnId, ConversationError> {
+    conversation.begin_turn(
+        turn_id,
+        user_message_id,
+        Message {
+            role: Role::User,
+            content: Vec::new(),
+        },
+    )?;
+    conversation.start_assistant_response(response)?;
+    let outcome = conversation.finish_assistant(assistant_message_id)?;
+    assert_eq!(outcome, AssistantFinish::ReadyToCommit);
+    conversation.commit_pending(TurnMeta::default())
+}
+```
+
+带工具的响应会返回 `AssistantFinish::RequiresToolCallMappings`；随后使用
+`register_tool_calls`、`append_tool_response`（或 `append_tool_result`）闭合本轮 calls。
+pending 只公开 frozen messages、phase、usage、response metadata 与只读 tool-call 视图；
+活跃 accumulator 和 partial JSON 始终不可见。
 
 单条 assistant response 在进入 PendingTurn 前先通过 `PendingMessage` 冻结。流式调用逐个
 `push(StreamEvent)`；非流式调用从完整 `Response` 创建同一状态机。两条路径都只在

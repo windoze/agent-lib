@@ -1,8 +1,15 @@
-use super::{ToolPairing, ToolPairingData, Turn, TurnCompletion, TurnData, TurnMeta};
+use super::{
+    ToolPairing, ToolPairingData, Turn, TurnCompletion, TurnData, TurnMeta, TurnResponseMeta,
+};
 use crate::{
     conversation::{ConversationMessage, MessageId, ToolCallId, TurnId},
     model::{
-        content::ContentBlock, message::Message, message::Role, tool::ToolStatus, usage::Usage,
+        content::ContentBlock,
+        message::Message,
+        message::Role,
+        normalized::{Normalized, StopReason},
+        tool::ToolStatus,
+        usage::Usage,
     },
 };
 use serde_json::{Map, Value, json};
@@ -26,7 +33,7 @@ fn message(id: &str, role: Role, content: Vec<ContentBlock>) -> ConversationMess
 
 /// Builds caller-supplied metadata with normalized usage and extension data.
 fn turn_meta() -> TurnMeta {
-    TurnMeta::new(
+    let mut meta = TurnMeta::new(
         Usage {
             input: 40,
             output: 12,
@@ -45,7 +52,23 @@ fn turn_meta() -> TurnMeta {
             ),
             ("trace_id".to_owned(), json!("trace-123")),
         ]),
-    )
+    );
+    meta.merge_pending(
+        Usage::default(),
+        &[
+            TurnResponseMeta::new(
+                CALL_MSG_ID.parse().expect("call message id"),
+                Normalized::from_mapped(StopReason::ToolUse, "tool_use"),
+                Map::from_iter([("request_id".to_owned(), json!("req-call"))]),
+            ),
+            TurnResponseMeta::new(
+                FINAL_MSG_ID.parse().expect("final message id"),
+                Normalized::from_mapped(StopReason::EndTurn, "end_turn"),
+                Map::from_iter([("request_id".to_owned(), json!("req-final"))]),
+            ),
+        ],
+    );
+    meta
 }
 
 /// Builds a closed turn with two parallel calls answered by one tool message.
@@ -170,6 +193,15 @@ fn closed_turn_has_ordered_messages_parallel_pairings_parent_and_meta() {
     assert_eq!(turn.meta().usage().total, Some(65));
     assert_eq!(turn.meta().timestamp(), Some("2026-07-13T04:30:00Z"));
     assert_eq!(turn.meta().source(), Some("integration-test"));
+    assert_eq!(turn.meta().responses().len(), 2);
+    assert_eq!(
+        turn.meta().responses()[0].message_id().to_string(),
+        CALL_MSG_ID
+    );
+    assert_eq!(
+        turn.meta().responses()[1].stop_reason().value,
+        StopReason::EndTurn
+    );
 }
 
 #[test]
@@ -185,6 +217,14 @@ fn closed_turn_uses_a_stable_dto_shape_that_round_trips_as_data() {
     assert_eq!(encoded["pairings"][0]["call_id"], json!(FIRST_CALL_ID));
     assert_eq!(encoded["pairings"][0]["result_msg"], json!(RESULT_MSG_ID));
     assert_eq!(encoded["meta"]["usage"]["input"], json!(40));
+    assert_eq!(
+        encoded["meta"]["responses"][0]["message_id"],
+        json!(CALL_MSG_ID)
+    );
+    assert_eq!(
+        encoded["meta"]["responses"][1]["extra"]["request_id"],
+        json!("req-final")
+    );
     assert_eq!(
         encoded["meta"]["usage"]["provider_usage"],
         json!("retained")

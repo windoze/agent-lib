@@ -1,47 +1,53 @@
 # 当前任务执行计划
 
-## 目标与边界
+> 本文件记录可审计的决策依据、执行步骤、关键进展与验证结果；不记录私有的逐字思维链。
 
-- 以 `TODO.md` 为唯一的任务顺序与完成状态来源。
-- 只处理第一个标题未带 `[DONE]` 的任务；完成并提交后立即停止，不进入下一项。
-- `PLAN.md` 仅在阶段级顺序、依赖、假设或完成标准发生变化时更新。
-- 不进行开放式历史缺陷扫描；只处理当前任务的明确要求、直接阻塞项、当前任务引入的回归，以及验证中发现且未被后续任务明确排期的测试失败。
+## 初始目标
+
+- 以 `TODO.md` 为唯一任务顺序与完成状态来源。
+- 找出标题中第一个没有 `[DONE]` 前缀的任务。
+- 在本次调用中完整实现、验证、记录并提交该任务，然后停止，不处理后续任务。
 
 ## 执行步骤
 
-1. 读取 `TODO.md`，定位第一个未完成任务，并完整提取其需求、依赖、约束、验收命令和完成记录要求。
-2. 检查最新提交说明；仅当它明确提到与当前任务直接相关的未完成问题时，将其纳入当前任务，或按规则在 `TODO.md` 中增加最小前置任务后提交并停止。
-3. 检查工作区状态与当前任务相关文件，保护用户已有改动；若这是意外中断后的同任务续作，则在最终提交中纳入全部现有未提交文件。
-4. 阅读当前任务直接涉及的设计文档、实现和测试，建立需求到代码与验证项的对应关系；不做无关的广泛排查。
-5. 按小而聚焦的补丁完整实现任务；每完成关键步骤或计划发生变化时更新本文件。
-6. 补充或调整测试，覆盖任务要求的正常路径、边界条件、错误分类和不变量；若同一根因影响一类场景，则修复整类问题而非单点绕过。
-7. 按规定顺序验证：先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，然后在不超过 30 分钟的超时下运行 `cargo test --all --all-targets`；根据任务要求运行额外测试与 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。任何未明确排期的失败都必须修复，或新增最小前置/后续任务并保持当前任务未完成。
-8. 更新文档：在 `TODO.md` 的当前任务标题前加 `[DONE]`，填写可复核的完成记录（实现内容、测试结果、关键文件）；仅在阶段计划实际变化时修改 `PLAN.md`。
-9. 复查差异、工作区状态和任务边界，确认没有秘密、临时文件、规避方案、警告或未调度失败。
-10. 用包含任务编号的清晰消息提交本次全部相关改动；确认提交成功与工作区状态后停止，不处理下一任务。
-
-## 可能的停止条件
-
-- 若当前任务被一个未跟踪且必须先独立落地的具体前置问题阻塞：在 `TODO.md` 中把最小前置任务放到正确位置，补充显式依赖，必要时更新阶段计划，提交这些记录后停止。
-- 若所有任务都已 `[DONE]`：按项目要求执行最终审查、必要调整和完整验证，提交后创建 `endtag`。
+1. 首先完整读取 `TODO.md`，只为确定首个未完成任务及其要求、依赖和指定验证。
+2. 检查最新提交是否明确提到与该任务直接相关的未完成问题，并检查工作区是否存在上次中断遗留的未提交改动；不进行开放式历史缺陷扫描。
+3. 读取该任务直接涉及的设计文档、源码与测试，确认实现边界；如发现会阻塞该任务的真实前置缺陷，按规则在 `TODO.md` 中插入最小前置任务、提交并停止。
+4. 若无阻塞，按任务原定执行单元完整实现；采用小而集中的补丁，并在关键步骤后回读相关代码。
+5. 补充或更新测试，先运行针对性验证并修复所有相关失败。
+6. 按规定顺序运行最终验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`（完整测试最长 30 分钟），以及任务明确要求的其他检查。
+7. 更新 `TODO.md`：仅在全部要求和验证通过后，为当前任务标题加 `[DONE]` 并填写完成记录；只有阶段级计划确实变化时才更新 `PLAN.md`。
+8. 检查最终 diff 和状态，确保没有遗漏本次任务或恢复任务留下的未提交文件；用清晰的任务编号提交全部应提交改动。
+9. 提交后确认工作区状态与提交内容，然后停止。
 
 ## 当前状态
 
-- 已读取 `TODO.md` 并按标题状态确定首个未完成任务为 **M2-2 `PendingMessage` 与 stream/non-stream 冻结边界**；本轮不得进入 M2-3。
-- 当前任务必须复用 Client `Accumulator`，让 stream/non-stream 共用受检冻结语义；成功冻结时才绑定外部 `MessageId`，所有 partial、terminal error、重复 finish 与 cancel/drop 路径都不得产生 closed message。
-- 最新提交为已完成的 M2-1，未声明 M2-2 遗留问题；本轮开始前工作区干净，不是意外中断续作。
-- 实现设计：`PendingMessage` 不实现 serde/Clone，内部状态分别持有唯一 `Accumulator` 或完整 `Response`；成功冻结后进入 frozen，失败后进入 terminal。`FrozenMessage` 只读承载 `ConversationMessage`、usage、stop reason 与 response extra，并提供消费式拆分。
-- stream 与 non-stream 最终都经过同一个 response→frozen 转换，统一拒绝非 assistant response；工具输入保持完整 `serde_json::Value`，stream partial JSON 只由现有 `Accumulator` 在完整边界解析。
-- `PendingMessageError` 将嵌入统一 `ConversationError`，并以原始 `AccumulatorError` 为 source；为保持既有 `ConversationError: Clone + Eq` API，原始错误放入共享只读 `Arc`，相等性以稳定的分类化错误表示比较。
-- `cancel(self)` 仅消费/丢弃 pending，不调用隐式 finish；第二次 finish、成功后 push、terminal 后 push/finish 都返回分类生命周期错误。
-- 已完成 pending 模块、错误链、实现、拆分聚焦测试及 README/crate docs 更新；`PLAN.md` 的阶段级计划没有变化。
-- 首次 `cargo fmt --all` 通过；首次严格 clippy 仅报告两个构造函数与类型级 `#[must_use]` 重复，已删除方法级冗余标注。下一步重新执行 format → clippy，随后运行聚焦测试、全量测试、doc test/rustdoc 与 diff check。
-- 第二轮 format 与严格 clippy 通过。首次 pending 聚焦测试为 8 passed / 1 failed：实现错误变体使用 `transparent` 导致标准 `Error::source()` 跳过 `PendingMessageError`，直接透传更深层 source。已改为显式 source 包装，以稳定保留 `ConversationError → PendingMessageError → AccumulatorError → ClientError` 四层链；将重新执行 format → clippy → 聚焦测试。
-- 第二次聚焦测试仍为 8 passed / 1 failed，并进一步定位到 `thiserror` 对 `Arc<AccumulatorError>` source 的自动暴露类型是 `Arc` 包装，而非可直接 downcast 的内部分类。保持严格测试不变，现已为 `PendingMessageError` 手写 `Display`/`Error::source`，明确返回共享错误的内部引用，同时保留既有统一错误的 Clone/Eq 能力。下一步再次执行完整的 format → clippy → 聚焦测试链。
-- 第三轮 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings` 与 pending 聚焦测试全部通过（9 passed）。
-- 30 分钟硬上限下的 `cargo test --all --all-targets` 通过：183 个库测试、3 个离线集成测试及全部示例 test target 通过，7 个真实 endpoint 测试按既有 `#[ignore]` 跳过，0 failed。
-- 下一步运行 doc tests（包含新增 non-serde/no-partial compile-fail）、严格 rustdoc 和 diff/worktree 审查；全部通过后更新 `TODO.md` 完成记录，再进行最终复核与提交。
-- `cargo test --doc` 通过（1 个正向、8 个 compile-fail，其中 2 个为 M2-2 新增）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过；首次提交前 `git diff --check` 通过。
-- 已逐项复核实现/测试与 M2-2 要求，没有发现阻塞项、spec deviation 或需要修改 `PLAN.md` 的阶段变化；已将 `TODO.md` 的 M2-2 标为 `[DONE]` 并写入完成记录。
-- 最终 `cargo fmt --all -- --check` 与 `git diff --check` 均通过；暂存清单只有 M2-2 的 11 个实现、测试、任务记录、进度与公共文档文件，cached diff check 通过。
-- 最后步骤：创建 `[M2-2]` 原子提交，确认提交与工作区状态后停止，不进入 M2-3。
+- 已建立初始执行计划。
+- 已读取 `TODO.md` 并确认首个未完成任务为 `M2-3 PendingTurn 事务推进与多轮 tool 记账`；直接依赖 `M2-2` 已标记完成。
+- 本次范围固定为：`begin_turn`、assistant 冻结与 ToolCallId 映射、open-call 记账、tool response 追加、ready-to-commit、usage/meta 汇总，以及复用 M1 validator 的原子 `commit_pending`。
+- 任务要求的正向场景包括纯文本、串行两轮工具、parallel 分批结果、stream/non-stream 混合与 usage 汇总；负向场景包括重复 begin、未知/重复 result、缺映射、未闭合时推进/提交、终态错误和 id 冲突。
+- 下一步只检查最新提交是否明确留下与 M2-3 直接相关的问题、工作区是否有恢复任务遗留，以及现有 pending/commit API；不做开放式历史缺陷扫描。
+
+## 设计确认（M2-3）
+
+- 最新提交为已完成的 `[M2-2] Implement pending message freeze boundary`，没有明确留下与 M2-3 直接相关的未完成问题；初始工作区除本进度文件外干净。
+- `Conversation` 将新增唯一的 `Option<PendingTurn>`；`PendingMessage` 继续保持不可克隆、不可 serde，因此不会用共享可变指针伪造 `Conversation: Clone`。现有只针对 committed 原子性的测试将改为比较可观察 committed 全结构。
+- `PendingTurn` 只公开只读状态：已冻结消息、phase、tool-call 记账、usage 与 response metadata；所有推进都经 `Conversation` 方法完成，不公开 mutable getter 或 raw push。
+- 状态机采用：`AwaitingAssistant → AssistantInProgress → AwaitingToolCallMappings → AwaitingToolResults → AwaitingAssistant`，无 tool-use 的 assistant 直接进入 `ReadyToCommit`。
+- assistant 冻结和 ToolCallId 映射分成两个显式步骤。冻结后 immutable assistant message 留在 pending；映射必须完整、一一对应且 conversation-wide ToolCallId 唯一。错误映射不修改记账，可重试。
+- tool result 追加前检查 provider call 是否已登记且仍 open、MessageId 是否唯一、block 是否为完整合法 tool-result；parallel result 可逐条追加，全部闭合后才允许下一条 assistant。
+- `commit_pending(meta)` 从 ready pending 克隆 data-only draft，复用唯一 M1 validator；失败保留 pending 和 committed history，成功后才清空 pending。
+- 每次 assistant 的 usage 自动聚合进最终 `TurnMeta`；stop reason 与 response-level provider metadata 以 typed per-response metadata 随 TurnMeta 保存，避免多轮响应元数据互相覆盖或丢失。
+
+## 实施与验证进展
+
+- 已实现唯一 `PendingTurn`：受检 `begin_turn`、stream/non-stream assistant 启动与冻结、精确 ToolCallId 映射、open-call 只读记账、完整 tool result 追加、多轮往返、ready-to-commit 与原子 `commit_pending`。
+- 已新增 typed `TurnResponseMeta` 并接入 `TurnMeta` serde；每条 assistant 的 stop reason/provider extra 按消息保留，所有 response usage 聚合到 Turn metadata。
+- 已拆分为 `pending/turn.rs`（生命周期/assistant/commit draft）与 `pending/turn/tool.rs`（mapping/open call/result），没有公开 mutable pending、raw push 或第二个 validator。
+- `PendingMessage` 继续不可克隆；因此 `Conversation` 不再提供会复制 active accumulator 的 `Clone/Eq`。旧 validator 原子性测试改为完整 committed-state snapshot 比较，未削弱断言。
+- 新增 12 个 M2-3 聚焦测试，覆盖纯文本、串行两轮工具、parallel 分批结果、stream/non-stream 混合、usage/metadata、四类 mapping 错误、未知/重复/非法 result、阶段门、identity 冲突、validator 失败原子性和错误后成功继续推进。
+- 验证已通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；`cargo test conversation::pending::turn`（12 passed）；1800 秒硬上限内 `cargo test --all --all-targets`（195 个库测试与 3 个离线集成测试 passed、7 ignored、0 failed，全部 example targets passed）；`cargo test --doc`（1 个正向与 9 个 compile-fail passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
+- 完整测试后只修正了两处 rustdoc 链接文本；compiled output 未变化，因此按任务规则不重复完整 suite，并已重新通过 format、严格 clippy、doctest 与 rustdoc。
+- 已完成完整 diff 审查，并把过长的负向测试按 begin/mapping/results/identity/commit 拆分；拆分后的严格 clippy、12 项聚焦测试、1800 秒上限完整 suite、doctest 与 rustdoc 已再次全部通过。
+- `TODO.md` 中 `M2-3` 已标记 `[DONE]` 并写入实际完成记录；`PLAN.md` 的阶段顺序/依赖/完成标准没有变化，因此未修改。
+- 最终 `git diff --check`、状态与 staged 内容审查均已通过；`[M2-3] Implement pending turn transaction` 提交已完成。本次调用到此停止，不进入 `M2-4`。

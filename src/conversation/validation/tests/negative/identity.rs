@@ -4,17 +4,20 @@ use crate::conversation::validation::tests::fixtures::{
     tool_call_id, tool_result, tool_use, turn_id,
 };
 use crate::{
-    conversation::{CommitError, ConversationError},
+    conversation::{CommitError, Conversation, ConversationError},
     model::message::Role,
 };
 
-#[test]
-fn duplicate_identity_and_parent_errors_are_classified_atomically() {
-    let mut text_history = conversation();
-    text_history
+fn text_history() -> Conversation {
+    let mut history = conversation();
+    history
         .commit_draft(text_draft(10, None, 100))
         .expect("seed text history");
+    history
+}
 
+#[test]
+fn duplicate_identity_and_parent_errors_are_classified_atomically() {
     let mut tool_history = conversation();
     tool_history
         .commit_draft(single_tool_draft(10, None, 100, 500, "old-call"))
@@ -55,7 +58,7 @@ fn duplicate_identity_and_parent_errors_are_classified_atomically() {
     let cases = vec![
         Case {
             name: "duplicate turn id in history",
-            conversation: text_history.clone(),
+            conversation: text_history(),
             data: text_draft(10, Some(turn_id(10)), 200),
             expected: ConversationError::Commit(CommitError::DuplicateTurnId {
                 turn_id: turn_id(10),
@@ -71,7 +74,7 @@ fn duplicate_identity_and_parent_errors_are_classified_atomically() {
         },
         Case {
             name: "duplicate message id in history",
-            conversation: text_history.clone(),
+            conversation: text_history(),
             data: draft(
                 11,
                 Some(turn_id(10)),
@@ -103,7 +106,7 @@ fn duplicate_identity_and_parent_errors_are_classified_atomically() {
         },
         Case {
             name: "wrong parent",
-            conversation: text_history,
+            conversation: text_history(),
             data: text_draft(11, None, 200),
             expected: ConversationError::Commit(CommitError::ParentMismatch {
                 expected: Some(turn_id(10)),

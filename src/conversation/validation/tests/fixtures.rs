@@ -44,6 +44,25 @@ pub(super) fn conversation() -> Conversation {
     )
 }
 
+/// Cloneable snapshot of every committed Conversation fact used by atomic tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CommittedState {
+    id: ConversationId,
+    config: ConversationConfig,
+    turns: Vec<Turn>,
+    version: u64,
+}
+
+/// Captures committed state without cloning a possibly active accumulator.
+pub(super) fn committed_state(conversation: &Conversation) -> CommittedState {
+    CommittedState {
+        id: conversation.id(),
+        config: conversation.config().clone(),
+        turns: conversation.turns().to_vec(),
+        version: conversation.version(),
+    }
+}
+
 /// Freezes a complete test message under an externally supplied id.
 pub(super) fn message(seed: u128, role: Role, content: Vec<ContentBlock>) -> ConversationMessage {
     ConversationMessage::new(message_id(seed), Message { role, content })

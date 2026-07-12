@@ -47,7 +47,10 @@ use crate::{
     conversation::{
         ConversationMessage, MessageId, ToolCallId, TurnId, validation::ValidatedTurnData,
     },
-    model::usage::Usage,
+    model::{
+        normalized::{Normalized, StopReason},
+        usage::Usage,
+    },
 };
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -70,13 +73,6 @@ pub struct Turn {
 
 impl Turn {
     /// Materializes a live turn from the validator's unforgeable certificate.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the M1 validator is first reached in production through the M2 pending API"
-        )
-    )]
     pub(super) fn from_validated(data: ValidatedTurnData) -> Self {
         let data = data.into_data();
         let pairings = data
@@ -195,6 +191,8 @@ impl ToolPairing {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnMeta {
     usage: Usage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    responses: Vec<TurnResponseMeta>,
     timestamp: Option<String>,
     source: Option<String>,
     extra: Map<String, Value>,
@@ -211,6 +209,7 @@ impl TurnMeta {
     ) -> Self {
         Self {
             usage,
+            responses: Vec::new(),
             timestamp,
             source,
             extra,
@@ -221,6 +220,12 @@ impl TurnMeta {
     #[must_use]
     pub const fn usage(&self) -> &Usage {
         &self.usage
+    }
+
+    /// Returns metadata retained for each frozen assistant response in order.
+    #[must_use]
+    pub fn responses(&self) -> &[TurnResponseMeta] {
+        &self.responses
     }
 
     /// Returns the optional caller-supplied timestamp without interpreting it.
@@ -236,6 +241,58 @@ impl TurnMeta {
     }
 
     /// Returns extensible turn data through a shared, non-mutating view.
+    #[must_use]
+    pub const fn extra(&self) -> &Map<String, Value> {
+        &self.extra
+    }
+
+    /// Adds response-derived facts while building a pending turn's final DTO.
+    pub(crate) fn merge_pending(&mut self, usage: Usage, responses: &[TurnResponseMeta]) {
+        self.usage.merge(usage);
+        self.responses.extend_from_slice(responses);
+    }
+}
+
+/// Metadata associated with one frozen assistant response in a turn.
+///
+/// Token usage is aggregated once at [`TurnMeta::usage`]. This per-response
+/// record keeps the response's normalized stop reason and provider evidence
+/// without flattening multiple tool round-trips into one lossy map.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnResponseMeta {
+    message_id: MessageId,
+    stop_reason: Normalized<StopReason>,
+    extra: Map<String, Value>,
+}
+
+impl TurnResponseMeta {
+    /// Creates metadata for one already-frozen assistant message.
+    #[must_use]
+    pub fn new(
+        message_id: MessageId,
+        stop_reason: Normalized<StopReason>,
+        extra: Map<String, Value>,
+    ) -> Self {
+        Self {
+            message_id,
+            stop_reason,
+            extra,
+        }
+    }
+
+    /// Returns the assistant message whose response produced this metadata.
+    #[must_use]
+    pub const fn message_id(&self) -> MessageId {
+        self.message_id
+    }
+
+    /// Returns the normalized response stop reason and retained raw spelling.
+    #[must_use]
+    pub const fn stop_reason(&self) -> &Normalized<StopReason> {
+        &self.stop_reason
+    }
+
+    /// Returns unmodeled response-level provider metadata without mutation.
     #[must_use]
     pub const fn extra(&self) -> &Map<String, Value> {
         &self.extra

@@ -1,7 +1,7 @@
 //! Classified errors produced by Conversation state transitions.
 
 use crate::{
-    conversation::{MessageId, ToolCallId, TurnId},
+    conversation::{MessageId, ToolCallId, TurnId, pending::PendingTurnPhase},
     model::message::Role,
     stream::accumulator::AccumulatorError,
 };
@@ -351,6 +351,125 @@ impl PartialEq for PendingMessageError {
 
 impl Eq for PendingMessageError {}
 
+/// A pending-turn transition was rejected without changing committed history.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum PendingTurnError {
+    /// A second turn was requested while another transaction is active.
+    #[error("pending turn {turn_id} is already active")]
+    AlreadyPending {
+        /// Identity of the transaction that must finish or be cancelled first.
+        turn_id: TurnId,
+    },
+
+    /// An operation requiring pending state was called at a committed boundary.
+    #[error("the conversation has no pending turn")]
+    NoPending,
+
+    /// A pending turn tried to reuse a committed turn identity.
+    #[error("turn id {turn_id} is already committed in this conversation")]
+    DuplicateTurnId {
+        /// Reused turn identity.
+        turn_id: TurnId,
+    },
+
+    /// A pending message tried to reuse a frozen identity.
+    #[error("message id {message_id} is not unique in this conversation")]
+    DuplicateMessageId {
+        /// Reused message identity.
+        message_id: MessageId,
+    },
+
+    /// A mapping tried to reuse a framework call identity.
+    #[error("tool call id {call_id} is not unique in this conversation")]
+    DuplicateToolCallId {
+        /// Reused framework identity.
+        call_id: ToolCallId,
+    },
+
+    /// The first payload was not authored by the external user.
+    #[error("a pending turn must begin with a user payload, found {actual:?}")]
+    InvalidUserRole {
+        /// Role supplied by the caller.
+        actual: Role,
+    },
+
+    /// A user payload contained content forbidden by the canonical grammar.
+    #[error("a pending user payload cannot contain a {block} block")]
+    InvalidUserBlock {
+        /// Rejected top-level content category.
+        block: ContentBlockKind,
+    },
+
+    /// The operation is not legal in the pending turn's current phase.
+    #[error("cannot {operation}: expected {expected}, found {actual:?}")]
+    InvalidTransition {
+        /// Human-readable operation being attempted.
+        operation: &'static str,
+        /// Human-readable phase required by the operation.
+        expected: &'static str,
+        /// Actual strongly typed phase.
+        actual: PendingTurnPhase,
+    },
+
+    /// One assistant message repeated a provider call identity, or reused it later.
+    #[error("provider call id `{provider_call_id}` is duplicated in the pending turn")]
+    DuplicateProviderCallId {
+        /// Reused provider identity.
+        provider_call_id: String,
+    },
+
+    /// The caller supplied more than one mapping for a provider call.
+    #[error("provider call `{provider_call_id}` has more than one ToolCallId mapping")]
+    DuplicateToolCallMapping {
+        /// Multiply mapped provider identity.
+        provider_call_id: String,
+    },
+
+    /// A frozen provider call did not receive its required framework identity.
+    #[error("provider call `{provider_call_id}` is missing a ToolCallId mapping")]
+    MissingToolCallMapping {
+        /// Unmapped provider identity.
+        provider_call_id: String,
+    },
+
+    /// A mapping named no tool use in the frozen assistant response.
+    #[error("ToolCallId mapping names unknown provider call `{provider_call_id}`")]
+    UnknownToolCallMapping {
+        /// Provider identity absent from the response awaiting mappings.
+        provider_call_id: String,
+    },
+
+    /// A tool-result block did not answer any call registered in this turn.
+    #[error("tool result names unknown provider call `{provider_call_id}`")]
+    UnknownToolResult {
+        /// Unregistered provider identity.
+        provider_call_id: String,
+    },
+
+    /// A registered call already has one immutable result message.
+    #[error("provider call `{provider_call_id}` already has a tool result")]
+    DuplicateToolResult {
+        /// Provider identity being answered twice.
+        provider_call_id: String,
+    },
+
+    /// The result API received a non-result content block.
+    #[error("expected a complete tool-result block, found {actual}")]
+    InvalidToolResultBlock {
+        /// Actual content category.
+        actual: ContentBlockKind,
+    },
+
+    /// A tool result carried nested content unsupported by the canonical model.
+    #[error("tool result for `{provider_call_id}` cannot contain nested {block}")]
+    InvalidToolResultContent {
+        /// Provider call being answered.
+        provider_call_id: String,
+        /// Rejected nested content category.
+        block: ContentBlockKind,
+    },
+}
+
 /// A Conversation operation failed without changing committed state.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ConversationError {
@@ -365,6 +484,10 @@ pub enum ConversationError {
         #[source]
         PendingMessageError,
     ),
+
+    /// A pending turn could not begin or advance in its current state.
+    #[error("pending turn operation failed: {0}")]
+    PendingTurn(#[from] PendingTurnError),
 
     /// History and version cannot be advanced together because the version is exhausted.
     #[error("commit cannot advance history and version atomically from version {current_version}")]

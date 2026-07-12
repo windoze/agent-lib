@@ -4,9 +4,17 @@ use crate::conversation::validation::tests::fixtures::{
     tool_result, tool_use, turn_id,
 };
 use crate::conversation::{
-    CommitError, ConversationError, PairingMessageKind, turn::ToolPairingData,
+    CommitError, Conversation, ConversationError, PairingMessageKind, turn::ToolPairingData,
 };
 use crate::model::message::Role;
+
+fn tool_history() -> Conversation {
+    let mut history = conversation();
+    history
+        .commit_draft(single_tool_draft(10, None, 100, 500, "old-call"))
+        .expect("seed committed tool turn");
+    history
+}
 
 #[test]
 fn explicit_pairing_mismatches_are_rejected_atomically() {
@@ -148,11 +156,6 @@ fn explicit_pairing_mismatches_are_rejected_atomically() {
 
 #[test]
 fn cross_turn_pairing_references_are_rejected_on_both_sides() {
-    let mut history = conversation();
-    history
-        .commit_draft(single_tool_draft(10, None, 100, 500, "old-call"))
-        .expect("seed committed tool turn");
-
     let mut cross_call = single_tool_draft(11, Some(turn_id(10)), 200, 501, "new-call");
     cross_call.pairings[0].call_msg = message_id(101);
 
@@ -162,7 +165,7 @@ fn cross_turn_pairing_references_are_rejected_on_both_sides() {
     for case in [
         Case {
             name: "cross-turn call reference",
-            conversation: history.clone(),
+            conversation: tool_history(),
             data: cross_call,
             expected: ConversationError::Commit(CommitError::CrossTurnPairing {
                 call_id: tool_call_id(501),
@@ -172,7 +175,7 @@ fn cross_turn_pairing_references_are_rejected_on_both_sides() {
         },
         Case {
             name: "cross-turn result reference",
-            conversation: history,
+            conversation: tool_history(),
             data: cross_result,
             expected: ConversationError::Commit(CommitError::CrossTurnPairing {
                 call_id: tool_call_id(501),

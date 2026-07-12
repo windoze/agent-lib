@@ -1,4 +1,4 @@
-use super::fixtures::{conversation, message, text, text_draft, turn_id};
+use super::fixtures::{committed_state, conversation, message, text, text_draft, turn_id};
 use crate::{
     conversation::{CommitError, ConversationError, TurnMeta, turn::TurnData},
     model::message::Role,
@@ -10,7 +10,7 @@ fn rejected_commit_leaves_history_version_identity_and_config_unchanged() {
     let first_id = conversation
         .commit_draft(text_draft(10, None, 100))
         .expect("commit baseline turn");
-    let before = conversation.clone();
+    let before = committed_state(&conversation);
     let invalid = TurnData {
         id: turn_id(11),
         messages: vec![
@@ -34,17 +34,19 @@ fn rejected_commit_leaves_history_version_identity_and_config_unchanged() {
             actual: None,
         })
     );
-    assert_eq!(conversation, before);
+    assert_eq!(committed_state(&conversation), before);
+    assert!(conversation.pending().is_none());
 }
 
 #[test]
 fn a_validation_failure_does_not_poison_the_next_valid_commit() {
     let mut conversation = conversation();
     let invalid = text_draft(10, Some(turn_id(999)), 100);
-    let before = conversation.clone();
+    let before = committed_state(&conversation);
 
     assert!(conversation.commit_draft(invalid).is_err());
-    assert_eq!(conversation, before);
+    assert_eq!(committed_state(&conversation), before);
+    assert!(conversation.pending().is_none());
 
     let committed = conversation
         .commit_draft(text_draft(10, None, 100))
@@ -58,7 +60,7 @@ fn a_validation_failure_does_not_poison_the_next_valid_commit() {
 fn version_exhaustion_is_classified_before_history_can_change() {
     let mut conversation = conversation();
     conversation.version = u64::MAX;
-    let before = conversation.clone();
+    let before = committed_state(&conversation);
 
     let error = conversation
         .commit_draft(text_draft(10, None, 100))
@@ -70,5 +72,6 @@ fn version_exhaustion_is_classified_before_history_can_change() {
             current_version: u64::MAX,
         }
     );
-    assert_eq!(conversation, before);
+    assert_eq!(committed_state(&conversation), before);
+    assert!(conversation.pending().is_none());
 }

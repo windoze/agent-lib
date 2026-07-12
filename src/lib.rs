@@ -18,8 +18,10 @@
 //! - [`conversation`] adds externally supplied strong identities,
 //!   Conversation-level configuration, immutable message envelopes, the
 //!   canonical role/tool validator, an atomic closed-turn commit boundary, and
-//!   a non-serializable [`conversation::PendingMessage`] freeze boundary that
-//!   reuses the Client accumulator without changing the Client payload model.
+//!   a non-serializable [`conversation::PendingMessage`] freeze boundary inside
+//!   the unique [`conversation::PendingTurn`] transaction. Pending turns support
+//!   repeated and parallel tool round-trips while keeping partial Client data
+//!   outside immutable history.
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are deliberately outside this crate. Those layers should persist and replay
