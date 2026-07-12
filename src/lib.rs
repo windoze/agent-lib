@@ -1,4 +1,4 @@
-//! Provider-neutral Client-layer building blocks for LLM API access.
+//! Provider-neutral Client and Conversation building blocks for LLM API access.
 //!
 //! `agent-lib` translates Anthropic Messages and OpenAI Responses wire formats
 //! into one set of requests, complete responses, content blocks, token usage,
@@ -15,11 +15,13 @@
 //!   classified errors, requests, responses, and the dyn-safe client trait.
 //! - [`adapter`] implements the Anthropic Messages and OpenAI Responses HTTP
 //!   and SSE protocols.
+//! - [`conversation`] adds externally supplied strong identities,
+//!   Conversation-level configuration, and immutable message envelopes without
+//!   changing the Client payload model.
 //!
-//! Conversation history ownership, message identifiers, Agent loops, tool
-//! registries, approval policy, and multi-agent orchestration are deliberately
-//! outside this crate. Those layers should persist and replay the normalized
-//! complete-state types instead of provider wire objects.
+//! Agent loops, tool registries, approval policy, and multi-agent orchestration
+//! are deliberately outside this crate. Those layers should persist and replay
+//! the normalized complete-state types instead of provider wire objects.
 //!
 //! # Complete-response example
 //!
@@ -90,5 +92,6 @@
 
 pub mod adapter;
 pub mod client;
+pub mod conversation;
 pub mod model;
 pub mod stream;

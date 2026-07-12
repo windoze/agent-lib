@@ -15,7 +15,7 @@
 
 ## Milestone 1 — 不可变已提交核心
 
-### M1-1 [TODO] Conversation 模块、强类型 identity 与不可变消息 envelope
+### M1-1 [DONE] Conversation 模块、强类型 identity 与不可变消息 envelope
 
 **前置依赖**：Client 层 M1--M6 已完成；直接复用现有 `model::message::Message`，不得给
 Client `Message` 回填 Conversation id。
@@ -46,6 +46,22 @@ Client `Message` 回填 Conversation id。
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
   `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增 `conversation::{id, config, message}` 聚焦模块并从 crate root 导出；五种私有字段
+  UUID newtype 只接受调用方提供的值，统一支持 canonical string serde、解析、只读访问、
+  比较/哈希与消费式取回，依赖未启用 UUID 生成、RNG 或时钟 feature。
+- 新增字段私有的 `ConversationMessage`，公共 API 仅含构造、Copy id getter、
+  `payload() -> &Message` 与 `into_parts`；新增独立持有可选 system prompt 的
+  `ConversationConfig`，未修改 Client `Message`，也未把 system 合成为历史 payload。
+- 补齐模块/API rustdoc、README 当前能力与用法；单元测试覆盖五类 id 和 config/envelope
+  serde、外部 id 原样保留、非法 UUID、只读/消费边界、Client Message 无 id 及 system
+  分离，两个 compile-fail doctest 验证不同 id 不可互换和 payload 不可经 getter 原地修改。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test conversation`（9 passed）；`cargo test --doc conversation`（2 passed）；
+  `cargo test --all --all-targets`（142 passed、7 ignored、0 failed）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
 ### M1-2 [TODO] Closed `Turn`、`ToolPairing` 与外部元数据
 

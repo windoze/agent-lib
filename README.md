@@ -1,12 +1,14 @@
 # agent-lib
 
-`agent-lib` 是一个面向 LLM API 的 Rust Client 层基础库。它用 provider-neutral
-的数据模型承载消息、内容块、工具调用和 token usage，同时保留 provider 原始值与
-尚未建模的字段，避免上层 Conversation / Agent 逻辑依赖特定厂商的 wire 格式。
+`agent-lib` 是一个面向 LLM API 的 Rust Client 与 Conversation Core 基础库。它用
+provider-neutral 的数据模型承载消息、内容块、工具调用和 token usage，同时保留
+provider 原始值与尚未建模的字段，避免上层 Conversation / Agent 逻辑依赖特定厂商的
+wire 格式。
 
 当前实现包含完整态数据模型、可折叠的归一化流式事件、dyn-safe Client 抽象、
-Anthropic Messages 与 OpenAI Responses 的非流式/流式适配器，以及真实 endpoint 的
-跨 provider 归一化验收。已完成的 Client 层实施记录见
+Anthropic Messages 与 OpenAI Responses 的非流式/流式适配器、真实 endpoint 的跨
+provider 归一化验收，以及 Conversation Core 的强类型 identity、独立 system 配置和
+immutable message envelope。已完成的 Client 层实施记录见
 [`docs/archive/2026-07-13-client-layer/TODO.md`](docs/archive/2026-07-13-client-layer/TODO.md)；
 当前 Conversation Core 阶段计划和任务见 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。
 
@@ -20,10 +22,37 @@ Anthropic Messages 与 OpenAI Responses 的非流式/流式适配器，以及真
 - `model::extras`：绑定 `ProviderId`、仅在最终请求序列化阶段合并的方言字段。
 - `stream`：用稳定 block id 关联增量事件，并通过统一 accumulator 折叠为完整响应。
 - `client`：dyn-safe `LlmClient`、分类错误、结构化 capability、endpoint 与请求配置。
+- `conversation`：外部注入的强类型 id、独立 system 配置与不可原地修改的消息 envelope。
 
-当前 crate 尚未实现 Conversation 日志；下一阶段只新增 Conversation Core，Agent loop、
-Tool registry 与多 agent 编排仍不在范围内。完整设计和当前阶段计划分别见
-[`DESIGN.md`](DESIGN.md) 与 [`PLAN.md`](PLAN.md)。
+Conversation Core 正按任务顺序继续实现 closed Turn、pending、boundary、projection 与
+持久化；Agent loop、Tool registry 与多 agent 编排仍不在范围内。完整设计和当前阶段
+计划分别见 [`DESIGN.md`](DESIGN.md) 与 [`PLAN.md`](PLAN.md)。
+
+下面把调用方提供的稳定 UUID 与完整 Client message 组合成冻结 envelope。system prompt
+单独保存在配置中，不会被包装成 `Role::System` 历史消息：
+
+```rust
+use agent_lib::{
+    conversation::{ConversationConfig, ConversationMessage, MessageId},
+    model::message::{Message, Role},
+};
+
+let message_id: MessageId = "018f0d9c-7b6a-7c12-8f31-1234567890ad"
+    .parse()
+    .expect("valid externally supplied id");
+let message = ConversationMessage::new(
+    message_id,
+    Message {
+        role: Role::User,
+        content: Vec::new(),
+    },
+);
+let config = ConversationConfig::new(Some("回答简洁。".to_owned()));
+
+assert_eq!(message.id(), message_id);
+assert_eq!(message.payload().role, Role::User);
+assert_eq!(config.system(), Some("回答简洁。"));
+```
 
 ## 环境与构建
 
