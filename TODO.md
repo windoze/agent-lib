@@ -80,13 +80,16 @@
 - 2026-07-13: 实现不含 Conversation `MessageId` 的完整态 `Message`,以及 JSON schema `Tool`、`ToolCall`、支持多模态内容与 Ok/Error/Denied/Cancelled 状态的 `ToolResponse`。
 - 验证通过:`cargo fmt --all`,`cargo test model::message::tests`,`cargo test model::tool::tests`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(26 passed)。
 
-### M1-6 [TODO] `ProviderExtras`(逃生舱 A)与 `ProviderId`
+### M1-6 [DONE] `ProviderExtras`(逃生舱 A)与 `ProviderId`
 **上下文**:`DESIGN.md` §4(A);请求侧方言口袋,绑定 ProviderId,只在序列化最后一步 merge。优先级低但类型先立。
 **做什么**:
 - `model/extras.rs`:`enum ProviderId { Anthropic, OpenAiResp, /* 可扩展 */ }`;`struct ProviderExtras { provider: ProviderId, fields: Map<String,Value> }`。
 - 提供 `merge_into(&self, body: &mut Value, target: ProviderId)`:仅当 target 匹配时合并,不匹配返回可观测的忽略(日志/错误按 DESIGN.md 约定)。
 **验证**:
 - 单元测试:provider 匹配时字段合并进 body;不匹配时不合并。
+**完成记录**:
+- 2026-07-13: 实现可 serde 的 `ProviderId` 与 `ProviderExtras`,支持最终请求序列化阶段的字段合并、同名字段覆盖、provider 不匹配的可观测 no-op,并对非对象请求体返回明确错误。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test model::extras::tests`(4 passed),`cargo test --all --all-targets`(30 passed)。
 
 ### M1-R [TODO] Milestone 1 Review
 **做什么**:核对 M1 全部产出。
