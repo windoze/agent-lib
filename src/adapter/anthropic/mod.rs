@@ -3,6 +3,7 @@
 use crate::client::EndpointConfig;
 
 mod request;
+mod response;
 
 /// Client resources and endpoint configuration for Anthropic Messages.
 ///

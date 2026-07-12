@@ -265,13 +265,18 @@ trait LlmClient: Send + Sync {
 - endpoint 构造覆盖 base path、重复 query、Bearer/任意 Header/None 认证、额外 header 与默认 JSON content type;畸形 URL/header 在发网前返回分类错误。新增 6 个无网络单元测试覆盖完整/最小请求与错误边界。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test adapter::anthropic::request::tests`(6 passed),`cargo test --all --all-targets`(77 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
-### M4-2 [TODO] Anthropic 非流式响应 → `Response`
+### M4-2 [DONE] Anthropic 非流式响应 → `Response`
 **上下文**:探测实测响应含 `content[]`(text/tool_use blocks)、`stop_reason`、`usage`(含 cache_creation/cache_read 细分与 `cache_creation.ephemeral_5m/1h`)。方言字段走逃生舱 B。
 **做什么**:
 - 解析 Anthropic 响应 → `Response`:content blocks → `Vec<ContentBlock>`;`stop_reason` → `Normalized<StopReason>`(保留 raw);usage 映射到单列字段,cache 细分正确归位;未知字段进 extra。
 **验证**:
 - 单元测试:用探测记录的真实响应 JSON 反序列化 → 断言 text/tool_use、stop_reason 归一化 + raw、usage 各字段。
 - `#[ignore]` 集成测试:真实调用 `databricks-claude-haiku-4-5` 说 "hi",断言拿到文本与 usage。
+**完成记录**:
+- 2026-07-13: 新增 Anthropic 完整响应解析与非流式 `AnthropicAdapter::chat`;严格校验 assistant wire role,映射 text/tool_use/thinking(含 signature),归一化 stop reason 并保留 raw,复用统一 `Usage` 映射 input/output/cache write/cache read。
+- 顶层 provider 元数据、块级未知字段及 `usage.cache_creation.ephemeral_5m_input_tokens`/`ephemeral_1h_input_tokens` 等明细分别保留在对应 `extra`;非 2xx 响应复用统一 HTTP 错误分类与 `Retry-After`,传输失败区分 timeout/network,非法成功响应返回 protocol error。
+- 以两次真实 Foundry 探测响应(消息/工具 id 已脱敏)固定 text 与 tool_use fixture;新增 8 个聚焦测试覆盖真实响应、thinking/未知 stop reason、三级逃生舱、畸形 wire、本地成功传输、429、非法 2xx body 与 stream 误用。新增默认 `#[ignore]`、55 秒超时且缺环境变量时跳过的真实非流式集成测试。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test adapter::anthropic::response::tests -- --nocapture`(8 passed),`cargo test --all --all-targets`(85 passed,1 ignored),加载 `.envrc` 后 `cargo test --test integration_anthropic -- --ignored --nocapture`(1 passed,1.85s),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
 ### M4-3 [TODO] Anthropic 流式(SSE)→ `StreamEvent`
 **上下文**:Anthropic SSE 事件:`message_start`/`content_block_start`/`content_block_delta`(text_delta / input_json_delta / thinking_delta)/`content_block_stop`/`message_delta`(带 stop_reason+usage)/`message_stop`。**决策 4**:把 Anthropic 的 `index` 映射成稳定 `BlockId`。**纪律 2**:input_json_delta 只累积。
