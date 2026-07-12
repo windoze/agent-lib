@@ -1,42 +1,38 @@
-# 当前调用执行计划
+# 当前任务执行计划
 
-## 目标与约束
+## 执行约束
 
-- 以 `TODO.md` 为任务状态、顺序、依赖、验收条件和完成记录的唯一权威来源。
-- 本次只处理按文档顺序出现的第一个标题未带 `[DONE]` 的任务；完成并提交后立即停止。
-- 不做开放式历史问题排查。仅检查最新提交是否明确提到与当前任务直接相关的未完成问题，以及当前任务执行中暴露的阻塞问题或测试失败。
-- 不通过缩小范围、改变既定模型、加入临时特例或规避损坏路径来完成任务。
-- 保护仓库中已有的用户改动；若本次是在恢复同一任务，则最终提交包含当前所有未提交文件。
+- 以 `TODO.md` 为任务顺序、依赖、验收要求和完成状态的唯一事实来源。
+- 本次只处理第一个标题未带 `[DONE]` 的任务；完成并提交后立即停止。
+- 不进行开放式历史缺陷排查；只处理会阻塞当前任务、使当前任务行为失效，或由当前任务直接引入的问题。
+- 不记录模型的隐藏逐步思考过程；本文件记录可审计的计划、关键判断、执行进展和验证证据。
 
-## 执行步骤
+## 分步计划
 
-1. 读取 `TODO.md`，按标题是否带 `[DONE]` 判定完成状态，选出第一个未完成任务，并完整提取其依赖、要求、验证项和完成记录格式。
-2. 查看最新一次 Git 提交说明及当前工作树状态。只把与已选任务直接相关的明确遗留问题纳入范围；判断是否存在同一任务的未提交恢复现场。
-3. 按当前任务所需，定向阅读相关设计文档、现有实现和测试，确定实现边界；不进行与任务无关的广泛问题扫描。
-4. 若出现使原任务无法正确落地的具体新前置条件：在 `TODO.md` 中加入最少数量的前置任务并明确依赖，必要时才更新阶段级 `PLAN.md`，提交该任务清单调整后停止。否则继续完成原任务。
-5. 使用小而集中的补丁实现完整需求，同时补充或调整针对正常、边界和错误路径的测试与必要文档。每完成一个关键步骤，就更新本文件的“进度与决策记录”。
-6. 按指定顺序验证：`cargo fmt --all`，然后 `cargo clippy --all-targets -- -D warnings`，最后在不超过 30 分钟的超时限制下运行 `cargo test --all --all-targets`；再执行任务在 `TODO.md` 中列出的其他验证（包括需要时的文档构建）。任何未被后续任务明确安排的失败都必须在本次修复或转化为正确排序的前置任务。
-7. 验证通过后，将当前任务标题显式加上 `[DONE]`，填写准确的完成记录。仅在阶段顺序、阶段依赖、假设或完成标准改变时更新 `PLAN.md`。
-8. 复查差异与工作树，确认没有推进下一个任务，然后以清晰的任务编号提交全部应纳入的改动。
-9. 若该任务恰好是最后一个任务，则按要求做最终复核并创建 `endtag`；否则提交后立即停止。
+1. 首先读取 `TODO.md`，定位第一个未完成任务，并完整提取其需求、依赖、验收标准和完成记录要求。
+2. 检查工作区状态及最新提交；只判断未提交改动或最新提交说明是否与当前任务直接相关，避免覆盖用户已有改动。
+3. 阅读当前任务直接涉及的设计文档、源码和测试，确认现有实现边界；如发现具体阻塞前置条件，按要求最小化更新 `TODO.md`、提交并停止。
+4. 若无阻塞，按任务原定范围完整实现；使用多个小而聚焦的补丁，并在关键步骤后复查相关文件。
+5. 添加或更新覆盖正常路径、边界条件和错误路径的测试；不通过缩小表示范围、私有特例或其他变通方式规避规范要求。
+6. 按规定顺序验证：`cargo fmt --all`，然后 `cargo clippy --all-targets -- -D warnings`，最后在不超过 30 分钟的限制内运行 `cargo test --all --all-targets`；再执行当前任务列出的其他验证命令。
+7. 所有验收通过后，在 `TODO.md` 的任务标题前添加 `[DONE]` 并填写准确的完成记录；仅当阶段级计划确实变化时才修改 `PLAN.md`。
+8. 复查 diff 和 Git 状态，确认没有遗漏与当前任务相关的恢复现场文件；创建清晰的单次任务提交。
+9. 记录最终提交和验证结果，然后停止，不开始下一任务。
 
-## 进度与决策记录
+## 当前进展
 
-- 2026-07-13：已在执行任何仓库检查命令前建立本计划。当前尚未读取 `TODO.md`，因此任务编号和具体实现范围待步骤 1 确定。
-- 2026-07-13：已读取 `TODO.md`。按标题前缀判定，顺序中的第一个未完成任务是 `M2-1 [TODO] BlockId / BlockKind / Delta`；本次仅实现该任务，不推进 `M2-2`。
-- `M2-1` 的明确交付范围：在 `stream/mod.rs` 增加稳定块标识 `BlockId(String)`、文本/推理/工具输入三类 `BlockKind`、文本/原始 JSON/推理三类 `Delta`；提供公共 API 文档，特别说明 JSON delta 必须先完整累积再解析；为三类类型添加 serde round-trip 覆盖。
-- 下一步：检查最新提交说明和工作树，确认是否有与 `M2-1` 直接相关的遗留问题或恢复现场；随后定向阅读 `stream` 模块、序列化风格与相关设计决策。
-- 2026-07-13：最新提交为 `84f841d`（完成 M1 Review），未提及 `M2-1` 的未完成问题；检查时除本计划文件外工作树干净，因此不是恢复中的同一任务现场。
-- 已核对 `PLAN.md` 决策 4/5/6、`docs/client-layer-references.md` 的 id 关联与工具输入三段式，以及现有公共 API/serde 风格。没有发现阻塞任务的规格冲突或新前置条件。
-- 实现决定：`BlockId` 使用透明字符串 newtype，并派生 `Hash` 以满足后续 Accumulator 的 `HashMap` 键需求；提供构造、借用和取回内部字符串的最小公共 API。两个枚举使用稳定的 `snake_case` serde 名称，结构化的 `ToolInput` 同时保留工具名与 provider tool-call id。
-- 测试将覆盖 `BlockId` 的透明字符串表示，以及 `BlockKind`、`Delta` 的每个变体 round-trip；并断言关键 wire 形状，防止后续适配器出现命名歧义。
-- 2026-07-13：已完成 `src/stream/mod.rs` 实现。新增三类公开类型及完整 rustdoc；没有改动占位的 `accumulator`，也没有提前实现 `M2-2` 内容。
-- 已加入 5 个聚焦测试，覆盖 `BlockId`、全部 `BlockKind`、全部 `Delta` 的 serde round-trip，并固定透明 id 与 `snake_case` enum 的 JSON 表示。
-- 下一步严格按质量门禁顺序执行格式化、clippy、测试与文档验证；若发现失败，将先修复再更新完成状态。
-- 首轮格式化暴露了测试中不完整 JSON 示例的 raw-string 结束符拼写错误；已改为清晰的普通转义字符串。首轮 clippy 随后暴露泛型 round-trip 辅助函数缺少 `decoded: T` 类型标注；已修复。两者均为本次新增测试的编译问题，没有改变任务设计或形成新前置条件。
-- 修复后重新执行 `cargo fmt --all` 与 `cargo clippy --all-targets -- -D warnings`，均已通过且无 warning。
-- 下一步运行完整测试套件（设置 1800 秒上限）和严格文档构建；只有全部通过后才更新 `TODO.md` 为 `[DONE]`。
-- 完整验证结果：`cargo test --all --all-targets` 在 1800 秒上限内通过，35 passed / 0 failed / 0 ignored；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过，无文档 warning。所有新增测试耗时远低于 1 分钟，未发现需要修复或排期的失败。
-- 已将 `TODO.md` 的 `M2-1` 标题显式改为 `[DONE]` 并填写实现与验证记录。阶段级计划、依赖、假设和完成标准均未变化，因此不修改 `PLAN.md`。
-- 剩余步骤：检查格式与差异、确认任务清单中的下一个任务仍未被触碰，提交本次全部三个改动文件，然后核验提交和工作树并停止。
-- 最终预提交复核通过：`cargo fmt --all -- --check` 与 `git diff --check` 均成功；差异仅包含 `src/stream/mod.rs`、`TODO.md` 和本进度文件，`M2-2` 仍保持 `[TODO]` 且实现未被触碰。现在创建单一任务提交 `[M2-1] Implement streaming block delta types`。
+- 已建立执行计划。
+- 已首先读取 `TODO.md`，确认首个未完成任务是 `M2-2 [TODO] StreamEvent`。
+- 当前任务要求：在 `stream/mod.rs` 定义 `MessageStart`、`BlockStart`、`BlockDelta`、`BlockStop`、`ToolInputAvailable`、`Usage`、`MessageStop`、`Error` 八类统一流事件；为各变体记录与 Vercel v5 part 的对应关系；补齐 serde round-trip 并保证编译通过。
+- 依赖状态：`M2-1` 已完成，所需 `BlockId`、`BlockKind`、`Delta` 已存在；真实 `ClientError` 明确安排在 `M3-1`，因此本任务按规范使用可序列化的字符串占位，不提前实施后续任务。
+- Git 检查结果：除本文件外工作区干净；最新提交 `2f2125e [M2-1] Implement streaming block delta types` 没有声明与当前任务直接相关的未完问题。
+- 设计复核结果：`PLAN.md` 与参考文档确认 StreamEvent 只含 LLM wire 真实事件，不加入 approval/abort/pivot；块事件继续使用稳定 `BlockId` 和统一三段式。
+- 实现选择：沿用现有流类型的 `snake_case` serde 枚举表示；`Error(String)` 作为任务明确允许的占位，并在文档中说明 M3-1 将替换成 `ClientError`。
+- 已在 `src/stream/mod.rs` 实现八类 `StreamEvent`，复用 `Role`、`BlockId`、`BlockKind`、`Delta`、`Usage`、`Normalized<StopReason>` 与 `serde_json::Value`。
+- 已为每个事件变体写明 Vercel v5 part 的追溯关系，并明确 Client 层不包含 Agent 层 approval/abort/pivot。
+- 已添加覆盖全部变体的 serde round-trip 测试和 `snake_case` 稳定表示断言。
+- 已按顺序完成验证：`cargo fmt --all` 通过；`cargo clippy --all-targets -- -D warnings` 通过且无 warning；`cargo test --all --all-targets` 通过（37 passed，0 failed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过。
+- 未观察到测试失败、规范偏差或需要新增前置任务的阻塞问题。
+- 已将 `TODO.md` 中 `M2-2` 标记为 `[DONE]` 并写入实现与验证记录；阶段级计划和依赖未变化，因此未修改 `PLAN.md`。
+- 提交前审计确认差异仅有 `src/stream/mod.rs`、`TODO.md` 和本进度文件；`git diff --check` 通过，没有触碰下一任务 `M2-3` 的实现，也没有遗漏其他未提交文件。
+- 下一步复核格式状态并创建单一提交 `[M2-2] Implement normalized stream events`，随后核验提交与干净工作树并停止。

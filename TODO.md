@@ -122,7 +122,7 @@
 - 为全部类型与枚举变体添加 serde round-trip 测试，并固定稳定 id、`snake_case` 枚举的 JSON 表示。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(35 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
-### M2-2 [TODO] `StreamEvent`
+### M2-2 [DONE] `StreamEvent`
 **上下文**:`docs/client-layer-references.md` 的 StreamEvent 草案 + 决策 7(只归一化 wire 真实事件,不含 approval/abort/pivot)。
 **做什么**:
 - `stream/mod.rs`:
@@ -140,6 +140,10 @@ enum StreamEvent {
 ```
 - 文档注释标注每个变体对应的 Vercel v5 part(可追溯)。
 **验证**:serde round-trip;编译通过(ClientError 占位可接受,M3 回填)。
+**完成记录**:
+- 2026-07-13: 实现 provider-neutral `StreamEvent`,覆盖消息开始/结束、统一块三段式、tool input 完整值、usage 与错误事件；各变体文档均标明 Vercel AI SDK v5 part 的对应关系,并保持 Agent 层 approval/abort/pivot 在边界之外。
+- `Error(String)` 按任务约定作为临时可序列化载荷,留待已排期的 M3-1 回填分类化 `ClientError`；新增全部八类事件的 serde round-trip 与稳定 `snake_case` 表示测试。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(37 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
 ### M2-3 [TODO] `Accumulator`:StreamEvent → 完整 Response
 **上下文**:`DESIGN.md` §5 streaming 纪律 3(流可折叠)、`conversation-core.md` §5(PartialBlock/HashMap<index/id>)。这是 streaming 归一化的心脏,逻辑只写一份,两适配器复用。
