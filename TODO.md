@@ -12,7 +12,7 @@
 
 ## Milestone 1 — 基础数据模型(完整态类型)
 
-### M1-1 [TODO] 建立 crate 骨架与依赖
+### M1-1 [DONE] 建立 crate 骨架与依赖
 **上下文**:当前 `src/lib.rs` 基本为空,`Cargo.toml` 无依赖,edition 2024。按 `PLAN.md` 的目录结构建立模块树。
 **做什么**:
 - 在 `Cargo.toml` 添加依赖:`serde`(derive)、`serde_json`、`tokio`(full)、`async-trait`、`thiserror`、`futures`。HTTP 客户端(`reqwest`,rustls)可留到 M4 再加。
@@ -22,6 +22,9 @@
 - `cargo build` 通过,无 warning。
 - `cargo doc --no-deps` 生成成功。
 - 模块树与 `PLAN.md` 一致。
+**完成记录**:
+- 2026-07-12: 添加基础依赖,建立 `client`/`model`/`stream`/`adapter` 模块树及文档注释。
+- 验证通过:`cargo fmt`,`cargo clippy --all-targets -- -D warnings`,`cargo build`,`cargo doc --no-deps`,`cargo test --all --all-targets`。
 
 ### M1-2 [TODO] `Role` 与 `Normalized<T>` + `StopReason`
 **上下文**:逃生舱 (C),见 `DESIGN.md` §4(C)。`Normalized<T>` = 归一化枚举值 + 保留 provider 原始字符串,映射不上时 value=Unknown/Other 且 raw 留证据。这是全项目最基础的防御性类型,先做。

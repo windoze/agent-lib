@@ -1,14 +1,14 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Client-layer building blocks for normalized LLM API access.
+//!
+//! This crate implements the Client layer from the project architecture. It
+//! owns provider-neutral request/response models, streaming events, adapters,
+//! and client abstractions for LLM wire protocols.
+//!
+//! Higher-level Conversation and Agent layers are intentionally out of scope
+//! for this crate. They will consume the normalized types exported here instead
+//! of depending on provider-specific API shapes.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod adapter;
+pub mod client;
+pub mod model;
+pub mod stream;
