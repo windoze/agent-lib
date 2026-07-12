@@ -9,7 +9,7 @@ use agent_lib::{
     model::{
         content::ContentBlock,
         message::{Message, Role},
-        tool::Tool,
+        tool::{Tool, ToolStatus},
     },
 };
 use serde_json::{Map, json};
@@ -188,7 +188,7 @@ fn tool_result_message(tool_call_id: &str) -> Message {
                 text: "Tokyo weather is sunny at 24 C.".to_owned(),
                 extra: Map::new(),
             }],
-            is_error: false,
+            status: ToolStatus::Ok,
             extra: Map::new(),
         }],
     }

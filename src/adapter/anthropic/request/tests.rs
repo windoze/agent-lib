@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{extras::ProviderExtras, message::Message};
+use crate::model::{extras::ProviderExtras, message::Message, tool::ToolStatus};
 use reqwest::{Method, header::AUTHORIZATION};
 use serde_json::{Map, json};
 
@@ -112,7 +112,7 @@ fn complete_chat_request_maps_to_anthropic_messages_wire_shape() {
                         text: "Weather service unavailable".to_owned(),
                         extra: empty_extra(),
                     }],
-                    is_error: true,
+                    status: ToolStatus::Error,
                     extra: Map::from_iter([("provider_status".to_owned(), json!(503))]),
                 }],
             },
@@ -252,6 +252,40 @@ fn complete_chat_request_maps_to_anthropic_messages_wire_shape() {
             "metadata": { "user_id": "user-123" }
         })
     );
+}
+
+#[test]
+fn each_tool_status_maps_to_anthropic_error_boolean_without_mutating_source() {
+    for (status, expected_is_error) in [
+        (ToolStatus::Ok, None),
+        (ToolStatus::Error, Some(true)),
+        (ToolStatus::Denied, Some(true)),
+        (ToolStatus::Cancelled, Some(true)),
+    ] {
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "toolu_123".to_owned(),
+            content: vec![ContentBlock::Text {
+                text: "result".to_owned(),
+                extra: empty_extra(),
+            }],
+            status,
+            extra: Map::from_iter([
+                ("is_error".to_owned(), json!(false)),
+                ("status".to_owned(), json!("wrong")),
+                ("provider_trace".to_owned(), json!("trace-1")),
+            ]),
+        };
+        let original = block.clone();
+        let wire = content_to_wire(&block);
+
+        assert_eq!(
+            wire.get("is_error").and_then(Value::as_bool),
+            expected_is_error
+        );
+        assert!(wire.get("status").is_none());
+        assert_eq!(wire["provider_trace"], json!("trace-1"));
+        assert_eq!(block, original);
+    }
 }
 
 #[test]

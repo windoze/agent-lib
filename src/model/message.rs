@@ -73,6 +73,7 @@ mod tests {
                 extra: empty_extra(),
             }],
             status: ToolStatus::Ok,
+            extra: empty_extra(),
         };
         let messages = vec![
             Message {
@@ -86,12 +87,7 @@ mod tests {
             },
             Message {
                 role: Role::Tool,
-                content: vec![ContentBlock::ToolResult {
-                    tool_use_id: response.tool_call_id.clone(),
-                    content: response.content.clone(),
-                    is_error: response.status == ToolStatus::Error,
-                    extra: empty_extra(),
-                }],
+                content: vec![response.clone().into()],
             },
         ];
 

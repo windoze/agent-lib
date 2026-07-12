@@ -7,7 +7,7 @@ use crate::{
         content::{ContentBlock, ImageSource},
         extras::{ProviderExtrasMergeOutcome, ProviderId},
         message::{Message, Role},
-        tool::Tool,
+        tool::{Tool, ToolStatus},
     },
 };
 use reqwest::{
@@ -153,7 +153,7 @@ fn content_to_wire(block: &ContentBlock) -> Value {
         ContentBlock::ToolResult {
             tool_use_id,
             content,
-            is_error,
+            status,
             extra,
         } => {
             let mut fields = extra.clone();
@@ -163,7 +163,8 @@ fn content_to_wire(block: &ContentBlock) -> Value {
                 "content".to_owned(),
                 Value::Array(content.iter().map(content_to_wire).collect()),
             );
-            if *is_error {
+            fields.remove("status");
+            if anthropic_tool_result_is_error(*status) {
                 fields.insert("is_error".to_owned(), Value::Bool(true));
             } else {
                 fields.remove("is_error");
@@ -188,6 +189,15 @@ fn content_to_wire(block: &ContentBlock) -> Value {
     };
 
     Value::Object(fields)
+}
+
+/// Degrades the four normalized outcomes to Anthropic's error boolean without
+/// changing the source block or inventing a more specific provider status.
+fn anthropic_tool_result_is_error(status: ToolStatus) -> bool {
+    match status {
+        ToolStatus::Ok => false,
+        ToolStatus::Error | ToolStatus::Denied | ToolStatus::Cancelled => true,
+    }
 }
 
 /// Converts URL and base64 image sources while preserving source-level extras.

@@ -8,7 +8,7 @@ use crate::{
         content::{ContentBlock, ImageSource},
         extras::ProviderExtras,
         message::{Message, Role},
-        tool::Tool,
+        tool::{Tool, ToolStatus},
     },
 };
 use reqwest::{Method, Request, header::AUTHORIZATION};
@@ -121,7 +121,7 @@ fn complete_chat_request_maps_to_responses_items_and_endpoint_shape() {
                         text: "sunny".to_owned(),
                         extra: empty_extra(),
                     }],
-                    is_error: false,
+                    status: ToolStatus::Ok,
                     extra: empty_extra(),
                 }],
             },
@@ -391,7 +391,7 @@ fn multimodal_error_tool_result_uses_list_output_and_incomplete_status() {
                     extra: empty_extra(),
                 },
             ],
-            is_error: true,
+            status: ToolStatus::Error,
             extra: Map::from_iter([("provider_trace".to_owned(), json!("trace-1"))]),
         }],
     };
@@ -414,6 +414,40 @@ fn multimodal_error_tool_result_uses_list_output_and_incomplete_status() {
             "provider_trace": "trace-1"
         })]
     );
+}
+
+#[test]
+fn each_tool_status_maps_to_responses_terminal_state_without_mutating_source() {
+    for (status, expected_status) in [
+        (ToolStatus::Ok, "completed"),
+        (ToolStatus::Error, "incomplete"),
+        (ToolStatus::Denied, "incomplete"),
+        (ToolStatus::Cancelled, "incomplete"),
+    ] {
+        let message = Message {
+            role: Role::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_owned(),
+                content: vec![ContentBlock::Text {
+                    text: "result".to_owned(),
+                    extra: empty_extra(),
+                }],
+                status,
+                extra: Map::from_iter([
+                    ("status".to_owned(), json!("wrong")),
+                    ("is_error".to_owned(), json!(false)),
+                    ("provider_trace".to_owned(), json!("trace-1")),
+                ]),
+            }],
+        };
+        let original = message.clone();
+        let items = message_to_items(0, &message).expect("map normalized tool status");
+
+        assert_eq!(items[0]["status"], json!(expected_status));
+        assert!(items[0].get("is_error").is_none());
+        assert_eq!(items[0]["provider_trace"], json!("trace-1"));
+        assert_eq!(message, original);
+    }
 }
 
 #[test]

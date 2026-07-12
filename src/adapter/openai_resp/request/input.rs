@@ -6,7 +6,7 @@ use crate::{
     model::{
         content::{ContentBlock, ImageSource},
         message::{Message, Role},
-        tool::Tool,
+        tool::{Tool, ToolStatus},
     },
 };
 use serde::Serialize;
@@ -240,7 +240,7 @@ fn tool_result_to_wire(block: &ContentBlock) -> Result<Value, ClientError> {
     let ContentBlock::ToolResult {
         tool_use_id,
         content,
-        is_error,
+        status,
         extra,
     } = block
     else {
@@ -248,16 +248,22 @@ fn tool_result_to_wire(block: &ContentBlock) -> Result<Value, ClientError> {
     };
     let output = tool_output_to_wire(content)?;
     let mut fields = replayable_item_fields(extra);
+    fields.remove("is_error");
     insert_string(&mut fields, "type", "function_call_output");
     insert_string(&mut fields, "call_id", tool_use_id);
     fields.insert("output".to_owned(), output);
-    insert_string(
-        &mut fields,
-        "status",
-        if *is_error { "incomplete" } else { "completed" },
-    );
+    insert_string(&mut fields, "status", openai_tool_result_status(*status));
 
     Ok(Value::Object(fields))
+}
+
+/// Degrades normalized result outcomes to the two terminal states accepted by
+/// a Responses `function_call_output` item.
+fn openai_tool_result_status(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Ok => "completed",
+        ToolStatus::Error | ToolStatus::Denied | ToolStatus::Cancelled => "incomplete",
+    }
 }
 
 /// Uses the compact string form for a plain result and the multimodal list

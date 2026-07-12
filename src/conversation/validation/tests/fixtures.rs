@@ -7,6 +7,7 @@ use crate::{
     model::{
         content::ContentBlock,
         message::{Message, Role},
+        tool::ToolStatus,
     },
 };
 use serde_json::{Map, json};
@@ -82,7 +83,7 @@ pub(super) fn tool_result(provider_call_id: &str) -> ContentBlock {
     ContentBlock::ToolResult {
         tool_use_id: provider_call_id.to_owned(),
         content: vec![text(&format!("result for {provider_call_id}"))],
-        is_error: false,
+        status: ToolStatus::Ok,
         extra: Map::new(),
     }
 }

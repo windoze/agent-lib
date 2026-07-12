@@ -1,14 +1,19 @@
 //! Complete-state content block types for text, tools, reasoning, and media.
 
+use super::tool::ToolStatus;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+mod serialization;
 
 /// A complete provider-neutral message content block.
 ///
 /// Streaming adapters should fold deltas into this shape only after a block is
 /// complete. Unknown provider fields are retained in each variant's `extra`
-/// map for forward compatibility.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// map for forward compatibility. Tool results serialize one authoritative
+/// [`ToolStatus`]; deserialization also migrates the historical `is_error`
+/// boolean and rejects contradictory dual representations.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     /// Plain model- or user-authored text.
@@ -47,11 +52,15 @@ pub enum ContentBlock {
         /// Multimodal result content.
         #[serde(default)]
         content: Vec<ContentBlock>,
-        /// Whether the tool execution failed.
-        #[serde(default, skip_serializing_if = "is_false")]
-        is_error: bool,
+        /// Provider-neutral outcome of attempting the tool call.
+        status: ToolStatus,
         /// Provider-specific fields this crate does not model yet.
-        #[serde(default, skip_serializing_if = "Map::is_empty", flatten)]
+        #[serde(
+            default,
+            skip_serializing_if = "Map::is_empty",
+            serialize_with = "serialization::serialize_tool_result_extra",
+            flatten
+        )]
         extra: Map<String, Value>,
     },
     /// Model thinking or reasoning text.
@@ -91,14 +100,10 @@ pub enum ImageSource {
     },
 }
 
-/// Lets serde omit the default successful tool-result error flag.
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 #[cfg(test)]
 mod tests {
     use super::{ContentBlock, ImageSource};
+    use crate::model::tool::ToolStatus;
     use serde_json::{Map, Value, json};
 
     fn empty_extra() -> Map<String, Value> {
@@ -170,7 +175,7 @@ mod tests {
                     extra: empty_extra(),
                 },
             ],
-            is_error: false,
+            status: ToolStatus::Ok,
             extra: empty_extra(),
         });
     }
@@ -246,3 +251,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "content/serialization_tests.rs"]
+mod serialization_tests;

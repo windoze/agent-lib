@@ -2,7 +2,7 @@
 
 use crate::model::content::ContentBlock;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// A tool exposed to a model, including its JSON input schema.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +27,9 @@ pub struct ToolCall {
 }
 
 /// A complete response to a prior tool call.
+///
+/// Conversion to and from [`ContentBlock::ToolResult`] preserves the call id,
+/// multimodal content, four-state outcome, and extension metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResponse {
     /// Identifier of the tool call this response answers.
@@ -35,6 +38,9 @@ pub struct ToolResponse {
     pub content: Vec<ContentBlock>,
     /// Outcome of attempting the tool call.
     pub status: ToolStatus,
+    /// Unmodeled result metadata preserved across content-block conversion.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
 }
 
 /// Outcome of attempting a tool call.
@@ -49,6 +55,61 @@ pub enum ToolStatus {
     Denied,
     /// Execution was cancelled before completion.
     Cancelled,
+}
+
+/// Error returned when a non-tool-result content block is converted into a
+/// [`ToolResponse`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("content block is not a tool result")]
+pub struct ToolResponseConversionError {
+    block: ContentBlock,
+}
+
+impl ToolResponseConversionError {
+    /// Returns the unchanged block that could not be converted.
+    pub fn block(&self) -> &ContentBlock {
+        &self.block
+    }
+
+    /// Recovers ownership of the unchanged block that could not be converted.
+    pub fn into_block(self) -> ContentBlock {
+        self.block
+    }
+}
+
+impl From<ToolResponse> for ContentBlock {
+    /// Converts a complete tool response into its message content form without
+    /// dropping status or extension metadata.
+    fn from(response: ToolResponse) -> Self {
+        Self::ToolResult {
+            tool_use_id: response.tool_call_id,
+            content: response.content,
+            status: response.status,
+            extra: response.extra,
+        }
+    }
+}
+
+impl TryFrom<ContentBlock> for ToolResponse {
+    type Error = ToolResponseConversionError;
+
+    /// Extracts a complete tool response while preserving every result field.
+    fn try_from(block: ContentBlock) -> Result<Self, Self::Error> {
+        match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                status,
+                extra,
+            } => Ok(Self {
+                tool_call_id: tool_use_id,
+                content,
+                status,
+                extra,
+            }),
+            block => Err(ToolResponseConversionError { block }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -121,8 +182,44 @@ mod tests {
                     },
                 ],
                 status,
+                extra: Map::from_iter([("provider_trace".to_owned(), json!("trace-1"))]),
             });
         }
+    }
+
+    #[test]
+    fn tool_response_and_result_block_convert_without_losing_any_field() {
+        for status in [
+            ToolStatus::Ok,
+            ToolStatus::Error,
+            ToolStatus::Denied,
+            ToolStatus::Cancelled,
+        ] {
+            let response = ToolResponse {
+                tool_call_id: "call_123".to_owned(),
+                content: vec![ContentBlock::Text {
+                    text: "result".to_owned(),
+                    extra: empty_extra(),
+                }],
+                status,
+                extra: Map::from_iter([("provider_trace".to_owned(), json!("trace-1"))]),
+            };
+
+            let block = ContentBlock::from(response.clone());
+            assert_eq!(ToolResponse::try_from(block).unwrap(), response);
+        }
+    }
+
+    #[test]
+    fn failed_tool_response_conversion_returns_the_original_block() {
+        let block = ContentBlock::Text {
+            text: "not a result".to_owned(),
+            extra: Map::from_iter([("provider_trace".to_owned(), json!("trace-1"))]),
+        };
+        let error = ToolResponse::try_from(block.clone()).expect_err("text is not a tool result");
+
+        assert_eq!(error.block(), &block);
+        assert_eq!(error.into_block(), block);
     }
 
     #[test]

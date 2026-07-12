@@ -4,7 +4,7 @@ use crate::conversation::validation::tests::fixtures::{
 };
 use crate::{
     conversation::{CommitError, ContentBlockKind, ConversationError, turn::TurnCompletion},
-    model::{content::ContentBlock, message::Role},
+    model::{content::ContentBlock, message::Role, tool::ToolStatus},
 };
 use serde_json::{Map, json};
 
@@ -22,7 +22,7 @@ fn duplicate_orphan_dangling_and_incomplete_content_are_rejected_atomically() {
     let empty_result_id = ContentBlock::ToolResult {
         tool_use_id: String::new(),
         content: vec![text("result")],
-        is_error: false,
+        status: ToolStatus::Ok,
         extra: Map::new(),
     };
     let nested_thinking = ContentBlock::ToolResult {
@@ -32,7 +32,7 @@ fn duplicate_orphan_dangling_and_incomplete_content_are_rejected_atomically() {
             signature: None,
             extra: Map::new(),
         }],
-        is_error: false,
+        status: ToolStatus::Ok,
         extra: Map::new(),
     };
 

@@ -1,7 +1,9 @@
 use super::{ToolPairing, ToolPairingData, Turn, TurnCompletion, TurnData, TurnMeta};
 use crate::{
     conversation::{ConversationMessage, MessageId, ToolCallId, TurnId},
-    model::{content::ContentBlock, message::Message, message::Role, usage::Usage},
+    model::{
+        content::ContentBlock, message::Message, message::Role, tool::ToolStatus, usage::Usage,
+    },
 };
 use serde_json::{Map, Value, json};
 
@@ -93,7 +95,7 @@ fn closed_turn() -> Turn {
                             text: "Sunny".to_owned(),
                             extra: Map::new(),
                         }],
-                        is_error: false,
+                        status: ToolStatus::Ok,
                         extra: Map::new(),
                     },
                     ContentBlock::ToolResult {
@@ -102,7 +104,7 @@ fn closed_turn() -> Turn {
                             text: "Cloudy".to_owned(),
                             extra: Map::new(),
                         }],
-                        is_error: false,
+                        status: ToolStatus::Ok,
                         extra: Map::new(),
                     },
                 ],

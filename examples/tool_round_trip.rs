@@ -5,7 +5,7 @@ mod support;
 use agent_lib::model::{
     content::ContentBlock,
     message::{Message, Role},
-    tool::Tool,
+    tool::{Tool, ToolStatus},
 };
 use serde_json::{Map, Value, json};
 use std::io;
@@ -123,7 +123,7 @@ fn weather_result(tool_call_id: &str, city: &str) -> Message {
                 text: format!("{city} weather is sunny at 24 C."),
                 extra: Map::new(),
             }],
-            is_error: false,
+            status: ToolStatus::Ok,
             extra: Map::new(),
         }],
     }
