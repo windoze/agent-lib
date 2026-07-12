@@ -315,7 +315,7 @@ trait LlmClient: Send + Sync {
 
 ## Milestone 5 — OpenAI Response 适配器
 
-### M5-1 [TODO] OpenAI Response 请求构造与非流式响应
+### M5-1 [DONE] OpenAI Response 请求构造与非流式响应
 **上下文**:真实 endpoint:base `OPENAI_BASE_URL`,header `api-key: $OPENAI_API_KEY`,query `?api-version=2025-04-01-preview`,model `gpt-5.5`,路径 `POST {base}/responses`。探测实测响应含 `content_filters`(Azure 特有,走逃生舱 B)、Response API 的 `output[]` 结构。
 **做什么**:
 - `adapter/openai_resp/`:`ChatRequest` → Response API body(`input`/`instructions`/`tools`/`max_output_tokens`)。
@@ -323,6 +323,12 @@ trait LlmClient: Send + Sync {
 **验证**:
 - 单元测试:请求 body 结构;用探测记录的真实响应 JSON 解析 → 断言。
 - `#[ignore]` 集成测试:真实 `gpt-5.5` 说 "hi"。
+**完成记录**:
+- 2026-07-13: 实现持有可复用 HTTP client 与 `EndpointConfig` 的 `OpenAiRespAdapter`,完成 `POST /responses` 请求构造、`api-key`/Bearer/无认证、`api-version` query、额外 header 与 OpenAI provider extras 的最终阶段合并；修复两家 adapter 在空 query 配置下生成尾随 `?` 的同类问题。
+- 将 provider-neutral text、URL/base64 image、reasoning、tool use/result 与 JSON Schema tool 显式映射为 Responses 的 message/reasoning/function_call/function_call_output typed items,覆盖 system instructions、max output tokens、temperature、stream、多模态工具结果和非法 role/block 组合的协议错误。
+- 实现完整响应与非流式传输:按 output 顺序归一化 message/output_text/refusal、reasoning 和 function_call,完整参数 JSON 仅在 item 完成态解析；status/incomplete/filter 证据映射为保留 raw 的 stop reason,item/content 元数据、未知 output item 与 Azure `content_filters` 分层进入逃生舱。
+- 通用 `Usage` 补齐真实 Responses `input_tokens_details.cached_tokens`/cache creation aliases,并保留 details 内未知字段；以两次脱敏真实 Foundry 响应固定 text/reasoning/tool fixture,新增 14 个 adapter 聚焦测试、本地 HTTP 错误/超时边界测试及 55 秒上限的默认忽略真实非流式集成测试。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(115 passed,4 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_openai_resp -- --ignored --nocapture`(1 passed,3.09s),`git diff --check`。
 
 ### M5-2 [TODO] OpenAI Response 流式(SSE)→ `StreamEvent`
 **上下文**:Response API 事件 `response.output_item.added` / `response.*.delta`(text/function_call arguments/reasoning) / `response.output_item.done` / `response.completed`(usage)。映射到统一 StreamEvent(见 `docs/client-layer-references.md` 对照:added→BlockStart、delta→BlockDelta、done→BlockStop)。function_call 的 `arguments` delta 只累积(纪律 2)。用稳定 BlockId 关联(item_id/output_index)。

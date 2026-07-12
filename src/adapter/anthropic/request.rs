@@ -232,8 +232,10 @@ fn messages_url(endpoint: &EndpointConfig) -> Result<Url, ClientError> {
         segments.pop_if_empty().push("v1").push("messages");
     }
     url.set_fragment(None);
-    url.query_pairs_mut()
-        .extend_pairs(endpoint.query_params.iter());
+    if !endpoint.query_params.is_empty() {
+        url.query_pairs_mut()
+            .extend_pairs(endpoint.query_params.iter());
+    }
 
     Ok(url)
 }

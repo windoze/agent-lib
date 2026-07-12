@@ -101,6 +101,20 @@ impl<'de> Deserialize<'de> for Usage {
             &["cache_creation_tokens", "cache_write_tokens"],
             "cache_write",
         )?;
+        usage.cache_read = merge_detail_alias(
+            usage.cache_read,
+            &mut usage.extra,
+            "input_tokens_details",
+            &["cached_tokens", "cache_read_tokens"],
+            "cache_read",
+        )?;
+        usage.cache_write = merge_detail_alias(
+            usage.cache_write,
+            &mut usage.extra,
+            "input_tokens_details",
+            &["cache_creation_tokens", "cache_write_tokens"],
+            "cache_write",
+        )?;
         usage.reasoning = merge_detail_alias(
             usage.reasoning,
             &mut usage.extra,
@@ -291,6 +305,10 @@ mod tests {
     fn deserializes_openai_response_usage_reasoning_alias() {
         let usage: Usage = serde_json::from_value(json!({
             "input_tokens": 31,
+            "input_tokens_details": {
+                "cached_tokens": 4,
+                "provider_input_counter": 2
+            },
             "output_tokens": 17,
             "output_tokens_details": {
                 "reasoning_tokens": 9
@@ -300,7 +318,12 @@ mod tests {
 
         assert_eq!(usage.input, 31);
         assert_eq!(usage.output, 17);
+        assert_eq!(usage.cache_read, 4);
         assert_eq!(usage.reasoning, 9);
+        assert_eq!(
+            usage.extra.get("input_tokens_details"),
+            Some(&json!({ "provider_input_counter": 2 }))
+        );
     }
 
     #[test]

@@ -1,0 +1,75 @@
+{
+  "id": "resp_recorded_tool",
+  "object": "response",
+  "created_at": 1783882290,
+  "status": "completed",
+  "background": false,
+  "completed_at": 1783882292,
+  "content_filters": [
+    {
+      "blocked": false,
+      "source_type": "prompt",
+      "content_filter_raw": [],
+      "content_filter_results": {
+        "hate": { "filtered": false, "severity": "safe" },
+        "sexual": { "filtered": false, "severity": "safe" },
+        "violence": { "filtered": false, "severity": "safe" },
+        "self_harm": { "filtered": false, "severity": "safe" },
+        "jailbreak": { "detected": false, "filtered": false }
+      }
+    }
+  ],
+  "error": null,
+  "incomplete_details": null,
+  "instructions": null,
+  "max_output_tokens": 128,
+  "model": "gpt-5.5",
+  "output": [
+    {
+      "id": "fc_recorded_weather",
+      "type": "function_call",
+      "status": "completed",
+      "arguments": "{\"city\":\"Tokyo\"}",
+      "call_id": "call_recorded_weather",
+      "name": "get_weather"
+    }
+  ],
+  "parallel_tool_calls": true,
+  "reasoning": {
+    "context": "current_turn",
+    "effort": "medium",
+    "mode": "standard",
+    "summary": null
+  },
+  "store": false,
+  "temperature": 1.0,
+  "text": {
+    "format": { "type": "text" },
+    "verbosity": "medium"
+  },
+  "tool_choice": "auto",
+  "tools": [
+    {
+      "type": "function",
+      "description": "Get current weather for a city.",
+      "name": "get_weather",
+      "parameters": {
+        "type": "object",
+        "properties": { "city": { "type": "string" } },
+        "required": ["city"],
+        "additionalProperties": false
+      },
+      "strict": true
+    }
+  ],
+  "top_p": 0.98,
+  "truncation": "disabled",
+  "usage": {
+    "input_tokens": 56,
+    "input_tokens_details": { "cached_tokens": 0 },
+    "output_tokens": 18,
+    "output_tokens_details": { "reasoning_tokens": 0 },
+    "total_tokens": 74
+  },
+  "metadata": {}
+}

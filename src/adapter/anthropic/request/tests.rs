@@ -271,6 +271,7 @@ fn optional_fields_are_omitted_and_header_auth_is_applied() {
     let body = request_body(&built);
 
     assert_eq!(built.url().path(), "/gateway/v1/messages");
+    assert_eq!(built.url().query(), None);
     assert_eq!(built.headers()["x-api-key"], "direct-key");
     assert_eq!(built.headers()[CONTENT_TYPE], "application/json");
     assert!(!built.headers().contains_key(AUTHORIZATION));
