@@ -33,7 +33,9 @@ protocol 的固定属性。集合使用 `BTreeSet`，因此序列化与测试顺
 
 ## 当前 Foundry 部署的实测范围
 
-真实集成测试使用 `PLAN.md` 所列的两个 endpoint：Anthropic Messages wire 的
+真实集成测试使用已归档
+[`Client 层 PLAN.md`](archive/2026-07-13-client-layer/PLAN.md) 所列的两个 endpoint：
+Anthropic Messages wire 的
 `databricks-claude-haiku-4-5`，以及 OpenAI Responses wire 的 `gpt-5.5`。测试不会记录
 认证值。下表中的“未实测”表示默认表仍声明协议支持，但本轮验收没有据此推断具体部署
 一定支持。

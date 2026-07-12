@@ -6,7 +6,9 @@
 
 当前实现包含完整态数据模型、可折叠的归一化流式事件、dyn-safe Client 抽象、
 Anthropic Messages 与 OpenAI Responses 的非流式/流式适配器，以及真实 endpoint 的
-跨 provider 归一化验收。实施状态和逐任务验证记录见 [`TODO.md`](TODO.md)。
+跨 provider 归一化验收。已完成的 Client 层实施记录见
+[`docs/archive/2026-07-13-client-layer/TODO.md`](docs/archive/2026-07-13-client-layer/TODO.md)；
+当前 Conversation Core 阶段计划和任务见 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。
 
 ## 设计边界
 
@@ -19,8 +21,9 @@ Anthropic Messages 与 OpenAI Responses 的非流式/流式适配器，以及真
 - `stream`：用稳定 block id 关联增量事件，并通过统一 accumulator 折叠为完整响应。
 - `client`：dyn-safe `LlmClient`、分类错误、结构化 capability、endpoint 与请求配置。
 
-本 crate 不负责 Conversation 日志、Agent loop、Tool registry 或多 agent 编排。完整设计
-和阶段计划分别见 [`DESIGN.md`](DESIGN.md) 与 [`PLAN.md`](PLAN.md)。
+当前 crate 尚未实现 Conversation 日志；下一阶段只新增 Conversation Core，Agent loop、
+Tool registry 与多 agent 编排仍不在范围内。完整设计和当前阶段计划分别见
+[`DESIGN.md`](DESIGN.md) 与 [`PLAN.md`](PLAN.md)。
 
 ## 环境与构建
 
@@ -221,4 +224,5 @@ cargo test --test integration_normalization -- --ignored --nocapture
 ```
 
 完整能力差异与已实测范围见 [`docs/capability-matrix.md`](docs/capability-matrix.md)，
-endpoint 约定与测试策略见 [`PLAN.md`](PLAN.md)。
+Client endpoint 约定与测试策略见已归档的
+[`Client 层 PLAN.md`](docs/archive/2026-07-13-client-layer/PLAN.md)。

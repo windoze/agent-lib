@@ -1,433 +1,856 @@
-# TODO:Client 层实现任务列表
+# TODO：Conversation Core 实现任务列表
 
-> 依据 `PLAN.md`。任务按实现顺序编号(M<里程碑>-<序号>)。
-> 标题含 `[TODO]` = 未完成;完成后由 coding agent 改为 `[DONE]`。
-> 每个任务含足够上下文,实现时无需反复搜索代码库。
-> 通用约定见 `PLAN.md` 的"已定关键决策"——所有任务都必须遵守,不再逐条重复。
+> 依据 [`PLAN.md`](PLAN.md) 与规范性设计
+> [`docs/conversation-core.md`](docs/conversation-core.md)。任务按真实依赖顺序编号；
+> coding agent 每次只执行首个标题未带 `[DONE]` 的任务，完成后把该标题的 `[TODO]`
+> 改为 `[DONE]` 并补充完成记录。已完成的 Client 层任务与验证记录归档在
+> [`docs/archive/2026-07-13-client-layer/TODO.md`](docs/archive/2026-07-13-client-layer/TODO.md)。
 
-参考文档:`DESIGN.md`、`docs/conversation-core.md`、`docs/client-layer-references.md`、`docs/genai-probe-findings.md`。
-真实 endpoint 参数见 `PLAN.md` 的"测试与真实环境"与仓库 `.envrc`。
-
----
-
-## Milestone 1 — 基础数据模型(完整态类型)
-
-### M1-1 [DONE] 建立 crate 骨架与依赖
-**上下文**:当前 `src/lib.rs` 基本为空,`Cargo.toml` 无依赖,edition 2024。按 `PLAN.md` 的目录结构建立模块树。
-**做什么**:
-- 在 `Cargo.toml` 添加依赖:`serde`(derive)、`serde_json`、`tokio`(full)、`async-trait`、`thiserror`、`futures`。HTTP 客户端(`reqwest`,rustls)可留到 M4 再加。
-- 建立 `PLAN.md` 目录结构里的模块文件与 `mod` 声明(空模块 + 文档注释即可):`client/`、`model/`、`stream/`、`adapter/`。
-- `lib.rs` 用 `//!` 写 crate 级文档,列出三层架构定位(本 crate 目前只做 Client 层)。
-**验证**:
-- `cargo build` 通过,无 warning。
-- `cargo doc --no-deps` 生成成功。
-- 模块树与 `PLAN.md` 一致。
-**完成记录**:
-- 2026-07-12: 添加基础依赖,建立 `client`/`model`/`stream`/`adapter` 模块树及文档注释。
-- 验证通过:`cargo fmt`,`cargo clippy --all-targets -- -D warnings`,`cargo build`,`cargo doc --no-deps`,`cargo test --all --all-targets`。
-
-### M1-2 [DONE] `Role` 与 `Normalized<T>` + `StopReason`
-**上下文**:逃生舱 (C),见 `DESIGN.md` §4(C)。`Normalized<T>` = 归一化枚举值 + 保留 provider 原始字符串,映射不上时 value=Unknown/Other 且 raw 留证据。这是全项目最基础的防御性类型,先做。
-**做什么**:
-- `model/normalized.rs`:`struct Normalized<T> { value: T, raw: Option<String> }`,`serde` 派生,`T: Serialize+Deserialize`。提供构造:`from_mapped(value, raw)`、`unknown(raw)`。
-- `model/message.rs`:`enum Role { User, Assistant, System, Tool }`(serde rename 到小写)。
-- `model/normalized.rs`:`enum StopReason { ToolUse, EndTurn, MaxTokens, StopSequence, Refusal, Other }`;约定 `Normalized<StopReason>` 为标准用法。
-**验证**:
-- 单元测试:`Normalized<StopReason>` 从 `"tool_use"` → `ToolUse` 且 raw=`Some("tool_use")`;从未知 `"weird"` → `Other` 且 raw 保留。
-- serde round-trip 测试通过。
-**完成记录**:
-- 2026-07-13: 实现 `Normalized<T>`、`StopReason` 原始字符串归一化与 `Role` 小写 wire name,并添加 focused serde/unit tests。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`。
-
-### M1-3 [DONE] `Usage`
-**上下文**:`DESIGN.md` §5 Usage 一等公民;探测实证 Anthropic 返回 `input_tokens`/`output_tokens`/`cache_creation_input_tokens`/`cache_read_input_tokens`,OpenAI 用 `prompt_tokens`/`completion_tokens` + `completion_tokens_details.reasoning_tokens`。cache_read/cache_write/reasoning **必须单列**,不得揉进 input。
-**做什么**:
-- `model/usage.rs`:`struct Usage { input: u32, output: u32, cache_read: u32, cache_write: u32, reasoning: u32, total: Option<u32> }`,字段用 `#[serde(default)]`。
-- 加 `#[serde(flatten)] extra: Map<String, Value>`(逃生舱 B)兜底未建模字段。
-- 提供 `merge`(流式累加)与 `total_computed()` 辅助。
-**验证**:
-- 单元测试:分别用 Anthropic 与 OpenAI 的真实 usage JSON 片段反序列化,断言 cache/reasoning 落到正确字段。
-- 未知字段进入 `extra` 而非丢失。
-**完成记录**:
-- 2026-07-13: 实现 provider-neutral `Usage` 类型,支持 Anthropic/OpenAI usage 字段归一化、cache_read/cache_write/reasoning 单列、`extra` 逃生舱、流式 `merge` 与 `total_computed()`。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`。
-
-### M1-4 [DONE] `ContentBlock` 与多模态承载
-**上下文**:`DESIGN.md` §5;参考 Anthropic 块分类(`docs/client-layer-references.md`)。这是"完整态"块(区别于 M2 的流式增量态)。
-**做什么**:
-- `model/content.rs`:`enum ContentBlock { Text{text}, Image{source}, ToolUse{id,name,input:Value}, ToolResult{tool_use_id,content,is_error}, Thinking{text,signature:Option<String>} }`。
-- `Image.source`:`enum ImageSource { Url(String), Base64{media_type,data} }`(承载两种方式,见 DESIGN.md 多模态承载)。
-- `ToolResult.content` 用 `Vec<ContentBlock>`(ToolResponse 也是多模态的,见 §2.1)。
-- 每个变体加逃生舱 (B) 兜底(视需要)。`ContentBlock` 用 `#[serde(tag="type")]` 贴近 wire。
-- `thinking` 保留 `signature`(探测发现 genai 丢了它,我们不丢)。
-**验证**:
-- serde round-trip 覆盖每个变体。
-- 反序列化一段含 text+tool_use 的真实 Anthropic content 数组成功。
-**完成记录**:
-- 2026-07-13: 实现完整态 `ContentBlock` 与 `ImageSource`,覆盖 text/image/tool_use/tool_result/thinking,支持 URL/base64 图片、多模态 tool result、thinking signature 保留,并为块与图片 source 保留 flatten `extra` 逃生舱。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`。
-
-### M1-5 [DONE] `Message` 与 `Tool`(schema)/ `ToolCall` / `ToolResponse`
-**上下文**:`Message` 是 Turn 的内容物(见 `conversation-core.md` §2.3,中立层)。`Tool` 定义含 JSON schema。`ToolCall`/`ToolResponse` 是统一 data model(`DESIGN.md` §2.1),ToolResponse 要能表达非正常结果(需审批/被拒/出错)。
-**做什么**:
-- `model/message.rs`:`struct Message { role: Role, content: Vec<ContentBlock> }`(content 是 Vec,不是 String)。**本层不含 MessageId**——id 归 Conversation 层(见 conversation-core.md),client 层 Message 保持 wire-neutral 纯数据。
-- `model/tool.rs`:`struct Tool { name, description, input_schema: Value }`(schema 先用 `serde_json::Value`,`schemars` 派生留后续)。
-- `struct ToolCall { id, name, input: Value }`;`struct ToolResponse { tool_call_id, content: Vec<ContentBlock>, status: ToolStatus }`;`enum ToolStatus { Ok, Error, Denied, Cancelled }`(对应 DESIGN.md 非正常结果 + Vercel `tool-output-denied`)。
-**验证**:
-- serde round-trip。
-- 构造一个含 tool 的 `Message` 序列并断言结构。
-**完成记录**:
-- 2026-07-13: 实现不含 Conversation `MessageId` 的完整态 `Message`,以及 JSON schema `Tool`、`ToolCall`、支持多模态内容与 Ok/Error/Denied/Cancelled 状态的 `ToolResponse`。
-- 验证通过:`cargo fmt --all`,`cargo test model::message::tests`,`cargo test model::tool::tests`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(26 passed)。
-
-### M1-6 [DONE] `ProviderExtras`(逃生舱 A)与 `ProviderId`
-**上下文**:`DESIGN.md` §4(A);请求侧方言口袋,绑定 ProviderId,只在序列化最后一步 merge。优先级低但类型先立。
-**做什么**:
-- `model/extras.rs`:`enum ProviderId { Anthropic, OpenAiResp, /* 可扩展 */ }`;`struct ProviderExtras { provider: ProviderId, fields: Map<String,Value> }`。
-- 提供 `merge_into(&self, body: &mut Value, target: ProviderId)`:仅当 target 匹配时合并,不匹配返回可观测的忽略(日志/错误按 DESIGN.md 约定)。
-**验证**:
-- 单元测试:provider 匹配时字段合并进 body;不匹配时不合并。
-**完成记录**:
-- 2026-07-13: 实现可 serde 的 `ProviderId` 与 `ProviderExtras`,支持最终请求序列化阶段的字段合并、同名字段覆盖、provider 不匹配的可观测 no-op,并对非对象请求体返回明确错误。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test model::extras::tests`(4 passed),`cargo test --all --all-targets`(30 passed)。
-
-### M1-R [DONE] Milestone 1 Review
-**做什么**:核对 M1 全部产出。
-**验证清单**:
-- 所有 M1 类型 `serde` round-trip 测试齐全且通过。
-- Normalized/Usage/ContentBlock 与 DESIGN.md §4/§5 描述一致;cache/reasoning 单列;thinking 保留 signature。
-- Message 不含 id(id 归 Conversation 层)这一决定已落实并注释。
-- 逃生舱 B(flatten extra)在 Usage/ContentBlock 上生效;逃生舱 A/C 类型就位。
-- `cargo build` / `cargo test` / `cargo doc` 全绿,无 warning,公共类型有文档注释。
-- 更新本文件:M1 任务标记 `[DONE]`。
-**完成记录**:
-- 2026-07-13: 对照 `DESIGN.md` §4/§5 与 `PLAN.md` 已定决策完成 M1 全量审阅;确认 Message 无 id、Usage 的 cache/reasoning 分列、thinking signature、Usage/ContentBlock flatten extra、ProviderExtras 与 Normalized 均符合约束。
-- 补充根 `README.md` 的项目概览、环境、基础用法与验证说明;启用公共 API `missing_docs` lint,并补齐生产辅助函数说明。
-- 扩充 `Role`、`StopReason`、`ProviderId` 的全变体 serde round-trip 覆盖;既有测试已覆盖全部 ContentBlock/ImageSource/Tool/Message/Usage 类型、真实 usage/content 片段与逃生舱行为。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo build --all-targets`,`cargo test --all --all-targets`(30 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
+通用约束：不得公开能直接修改 closed history 的裸容器或 unchecked 构造器；不得用
+`extra`、provider 特判或任务私有状态绕过规范缺口；id/时间由调用方注入；每个测试用例
+必须在 1 分钟内完成。每项的完整验证均按“format → 严格 clippy → 聚焦测试 → 全量测试
+→ rustdoc → diff check”的顺序执行，全量测试最长 30 分钟。
 
 ---
 
-## Milestone 2 — 流式事件与聚合
+## Milestone 1 — 不可变已提交核心
 
-### M2-1 [DONE] `BlockId` / `BlockKind` / `Delta`
-**上下文**:`docs/client-layer-references.md` 决策 4/5——块用稳定 id、三段式同构。Delta 区分 text/json/reasoning。
-**做什么**:
-- `stream/mod.rs`:`struct BlockId(String)`(稳定 id,可由适配器从 index 映射生成)。
-- `enum BlockKind { Text, Reasoning, ToolInput { tool_name: String, tool_call_id: String } }`。
-- `enum Delta { Text(String), Json(String), Reasoning(String) }`(Json = tool 参数的原始片段,累积用)。
-**验证**:serde round-trip;类型文档注释说明"Json delta 不可边流边 parse"。
-**完成记录**:
-- 2026-07-13: 实现透明字符串 newtype `BlockId`、统一文本/推理/工具输入起始元数据的 `BlockKind`，以及承载文本/原始 JSON/推理片段的 `Delta`；公共文档明确工具 JSON 增量必须完整累积后再解析。
-- 为全部类型与枚举变体添加 serde round-trip 测试，并固定稳定 id、`snake_case` 枚举的 JSON 表示。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(35 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
+### M1-1 [TODO] Conversation 模块、强类型 identity 与不可变消息 envelope
 
-### M2-2 [DONE] `StreamEvent`
-**上下文**:`docs/client-layer-references.md` 的 StreamEvent 草案 + 决策 7(只归一化 wire 真实事件,不含 approval/abort/pivot)。
-**做什么**:
-- `stream/mod.rs`:
-```
-enum StreamEvent {
-  MessageStart { role: Role },
-  BlockStart { id: BlockId, kind: BlockKind },
-  BlockDelta { id: BlockId, delta: Delta },
-  BlockStop  { id: BlockId },
-  ToolInputAvailable { id: BlockId, input: serde_json::Value },
-  Usage(Usage),
-  MessageStop { stop_reason: Normalized<StopReason> },
-  Error(ClientError),   // ClientError 若此时未定义,先用占位/String,M3 回填
-}
-```
-- 文档注释标注每个变体对应的 Vercel v5 part(可追溯)。
-**验证**:serde round-trip;编译通过(ClientError 占位可接受,M3 回填)。
-**完成记录**:
-- 2026-07-13: 实现 provider-neutral `StreamEvent`,覆盖消息开始/结束、统一块三段式、tool input 完整值、usage 与错误事件；各变体文档均标明 Vercel AI SDK v5 part 的对应关系,并保持 Agent 层 approval/abort/pivot 在边界之外。
-- `Error(String)` 按任务约定作为临时可序列化载荷,留待已排期的 M3-1 回填分类化 `ClientError`；新增全部八类事件的 serde round-trip 与稳定 `snake_case` 表示测试。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(37 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
+**前置依赖**：Client 层 M1--M6 已完成；直接复用现有 `model::message::Message`，不得给
+Client `Message` 回填 Conversation id。
 
-### M2-3 [DONE] `Accumulator`:StreamEvent → 完整 Response
-**上下文**:`DESIGN.md` §5 streaming 纪律 3(流可折叠)、`conversation-core.md` §5(PartialBlock/HashMap<index/id>)。这是 streaming 归一化的心脏,逻辑只写一份,两适配器复用。
-**做什么**:
-- 先定义 `Response`(若 M3 未定义):`struct Response { message: Message, usage: Usage, stop_reason: Normalized<StopReason>, extra: Map }`。
-- `stream/accumulator.rs`:`struct Accumulator { blocks: HashMap<BlockId, PartialBlock>, order: Vec<BlockId>, usage, stop_reason }`。
-- `PartialBlock`:按 kind 累积;Text/Reasoning 累加字符串;ToolInput 累加 Json 片段字符串,在 `ToolInputAvailable`(优先)或 `BlockStop` 时 parse 成 `Value`(parse 失败要产出明确错误,不 panic)。
-- `fn push(&mut self, ev: StreamEvent) -> Result<()>` 与 `fn finish(self) -> Result<Response>`。
-- 提供便捷:`async fn collect(stream) -> Result<Response>` 消费整条流。
-**验证**:
-- 单元测试:手工构造事件序列(含交错的两个 block id、tool JSON 分片)→ 折叠出正确 Response。
-- tool 参数分 3 个 Json delta 累积后正确 parse。
-- partial JSON(缺尾)→ finish 返回错误而非 panic。
-- 空流、仅 usage、错误事件的边界处理。
-**完成记录**:
-- 2026-07-13:新增可 serde 的 `client::Response`,保留 provider `extra` 逃生舱;实现按稳定 `BlockId` 关联并按 BlockStart 顺序输出的统一 `Accumulator`,覆盖 text/reasoning/tool input 三类块与流式 usage 合并。
-- 工具参数仅累积原始 JSON delta,在 `ToolInputAvailable`、`BlockStop` 或最终 `finish` 边界解析;available 完整值优先,非法或残缺 JSON 返回分类化 `AccumulatorError` 而非 panic。
-- 新增通用异步 `collect` 并以 `CollectError<E>` 区分上游流错误与折叠错误;测试拆分为 folding/errors/collect 模块,覆盖交错块、三段 JSON、available 优先、空流、仅 usage、错误事件、未闭合块、id/类型错配与 fallible stream。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(49 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
+**上下文**：`docs/conversation-core.md` §1/§7 要求 message 冻结后永不改变、id 在创建时
+由外部注入且可作为稳定 PK。现有 Client `Message` 有完整 payload 但故意不含 id，因此
+需要 Conversation 自己的 envelope，而不是修改 provider-neutral wire 模型。
 
-### M2-R [DONE] Milestone 2 Review
-**验证清单**:
-- 三段式同构在 text/reasoning/tool 上都成立;Accumulator 只有一份折叠逻辑。
-- 纪律 1(id 关联)、纪律 2(累积后 parse)、纪律 3(可折叠)均由测试覆盖。
-- 交错 block、并行 tool call 的折叠正确。
-- `cargo test` 全绿;更新本文件 M2 标记 `[DONE]`。
-**完成记录**:
-- 2026-07-13: 对照 `DESIGN.md` streaming 三纪律与 `docs/client-layer-references.md` 完成 M2 全量审阅;确认 text/reasoning/tool 共享 BlockStart/BlockDelta/BlockStop 三段式、稳定 `BlockId` 关联、tool JSON 仅在完整边界解析,且 `collect` 复用唯一 `Accumulator` 折叠逻辑。
-- 补充两个并行 tool call 的交错 JSON delta 回归测试,覆盖按稳定 id 独立累积、逆序结束仍按 block start 顺序输出,并与既有交错 text/reasoning/tool、三段 JSON、partial JSON 及错误边界测试共同闭合验收清单。
-- 验证通过:`cargo test stream::`(18 passed),新增聚焦测试(1 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(50 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
+**做什么**：
 
----
+- 新建 `src/conversation/` 并从 `lib.rs` 导出；按 `PLAN.md` 建立聚焦模块，避免把核心状态机
+  堆入一个长文件。
+- 引入只提供解析/serde 能力的 UUID 依赖；定义互不混淆的 `ConversationId`、`TurnId`、
+  `MessageId`、`ToolCallId`、`ArtifactId` newtype。构造函数只接收外部值，不调用 RNG、
+  时钟或数据库自增；文档约定生产调用方提供 UUIDv7/等价稳定 id。
+- 定义字段私有的 `ConversationMessage { id, payload: Message }`，只提供构造、只读 getter
+  和消费式拆分；不提供 `DerefMut`、`payload_mut` 或用同一实例原地改内容的 API。
+- 定义可 serde 的 `ConversationConfig`，至少单列 `system: Option<String>`；system 不得作为
+  closed Turn 中的 `Role::System` message 混入历史。
+- 所有新增公共类型、模块和函数补齐 rustdoc；serde 表示固定且不混淆不同 id 类型。
 
-## Milestone 3 — Client 抽象(trait / capability / error / config)
+**验证**：
 
-### M3-1 [DONE] `ClientError` 分类
-**上下文**:`DESIGN.md` §5 统一 error model;retry/backoff 依赖分类。回填 M2-2 的占位。
-**做什么**:
-- `client/error.rs`(`thiserror`):`enum ClientError { RateLimited { retry_after: Option<Duration> }, Timeout, ContextLengthExceeded, ContentFiltered, Network(..), Protocol(..), Auth, Api { status: u16, body: String }, Other(..) }`。
-- 提供从 HTTP status + body 分类的构造辅助(429→RateLimited 且解析 retry-after;探测见 Foundry 401/404/content_filter 形态)。
-**验证**:单元测试:各 HTTP 状态/响应体 → 正确分类;429 的 retry-after 解析。
-**完成记录**:
-- 2026-07-13: 实现可 serde 的 provider-neutral `ClientError` 九类错误模型与 HTTP 响应分类辅助；覆盖限流、超时、context 超限、内容过滤、认证和保留原始 status/body 的通用 API 错误。
-- `Retry-After` 支持标准 delay-seconds 与 HTTP-date，两者均归一为 `Duration`；非法值保留为未知，过期日期归一为零等待。
-- 将 `StreamEvent::Error(String)` 与 `AccumulatorError::Stream(String)` 回填为分类化 `ClientError`，保持流事件 round-trip 与错误 source 链，不丢失 retry/fallback 所需信息。
-- 新增 10 个聚焦测试，覆盖全变体 serde、Foundry/Azure content-filter 形态、OpenAI context 错误、401/403、404/500、408/504、413 及 429 header 边界；验证通过:`cargo test client::error::tests`(10 passed),`cargo test stream::`(19 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(60 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
+- 聚焦测试覆盖全部 id 与 `ConversationMessage`/`ConversationConfig` serde round-trip、不同
+  newtype 不能误用的编译期 API 边界，以及构造过程不隐式生成 id/时间。
+- 断言冻结 envelope 只暴露 `&Message`，Client `Message` 仍不含 `MessageId`，system 配置
+  不进入 payload role 序列。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦测试、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
 
-### M3-2 [DONE] `Capability`(结构化)
-**上下文**:`DESIGN.md` §5 Capability 非布尔标志。来源=默认表 + 可覆盖。
-**做什么**:
-- `client/mod.rs`:`struct Capability { max_context_tokens: Option<u32>, input_modalities: Set<Modality>, output_modalities: Set<Modality>, streaming: bool, tool_calling: bool, parallel_tool_calls: bool, prompt_caching: bool, reasoning: bool, structured_output: bool, stop_reasons: Set<StopReason> }`。
-- `enum Modality { Text, Image, Audio, File }`。
-**验证**:serde round-trip;构造 Anthropic/OpenAI 各一个默认 Capability 常量并断言字段。
-**完成记录**:
-- 2026-07-13: 实现可 serde 的结构化 `Capability` 与 `Modality`,使用确定性 `BTreeSet` 分别表达输入/输出模态和支持的 stop reason,并保留模型级 `max_context_tokens` 覆盖能力。
-- 提供可克隆覆盖的 Anthropic Messages 与 OpenAI Responses 协议级默认能力表项;模型相关 context limit 保持未知,避免协议默认值虚构具体模型上限。
-- 新增 5 个聚焦测试,覆盖 `Modality` 全变体 wire name、完整 Capability serde round-trip、两家默认表字段及克隆覆盖隔离。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test client::capability::tests`(5 passed),`cargo test --all --all-targets`(65 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
+### M1-2 [TODO] Closed `Turn`、`ToolPairing` 与外部元数据
 
-### M3-3 [DONE] `EndpointConfig` 与请求参数类型
-**上下文**:`DESIGN.md` §1.1 endpoint config(base_url/auth/方言开关),独立于 wire protocol。探测证明认证方式因 endpoint 而异(Bearer vs api-key vs x-api-key)、需自定义 query param。
-**做什么**:
-- `client/mod.rs`:`struct EndpointConfig { base_url: String, auth: AuthScheme, query_params: Vec<(String,String)>, extra_headers: Vec<(String,String)> }`。
-- `enum AuthScheme { Bearer(String), Header { name: String, value: String }, None }`(覆盖 Foundry 的 Bearer / api-key)。
-- `struct ChatRequest { model: String, messages: Vec<Message>, tools: Vec<Tool>, system: Option<String>, max_tokens, temperature, stream: bool, provider_extras: Option<ProviderExtras>, ... }`(system 单列,归一化两家差异,见 conversation-core §1.2)。
-**验证**:serde round-trip;构造两个真实 endpoint 的 config 并断言。
-**完成记录**:
-- 2026-07-13: 实现可 serde 的 `EndpointConfig` 与 `AuthScheme`,支持 Bearer、任意认证 Header(`api-key`/`x-api-key`)及无认证,并以有序键值对列表保留 endpoint query/header 配置。
-- 实现 provider-neutral `ChatRequest`,单列 system prompt,承载消息、工具、必填输出 token 上限、可选 temperature、stream 开关及绑定 `ProviderId` 的请求侧方言字段;从 `client` 模块统一重导出新 API。
-- 新增 Anthropic Foundry Bearer/version header 与 OpenAI Responses Foundry `api-key`/`api-version` 两种真实配置形态、全部认证变体及完整/最小请求 round-trip 测试。
-- 验证通过:`cargo test client::config::tests`(3 passed),`cargo test client::request::tests`(2 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(70 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
+**前置依赖**：M1-1。
 
-### M3-4 [DONE] `LlmClient` trait
-**上下文**:`DESIGN.md` 一律 `#[async_trait]` + dyn-safe;两种消费姿势(流式 / collect 完整)。
-**做什么**:
-- `client/mod.rs`:
-```
-#[async_trait]
-trait LlmClient: Send + Sync {
-  fn capability(&self) -> &Capability;
-  async fn chat(&self, req: ChatRequest) -> Result<Response, ClientError>;             // 内部可走流式+Accumulator
-  async fn chat_stream(&self, req: ChatRequest)
-      -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError>;
-}
-```
-- 确认 `Box<dyn LlmClient>` 可用(dyn-safe)。
-**验证**:写一个 mock 实现 + 断言可 `Box<dyn LlmClient>`;`chat` 默认实现(基于 chat_stream + Accumulator)可选。
-**完成记录**:
-- 2026-07-13: 实现 `#[async_trait]` 的 provider-neutral `LlmClient: Send + Sync`,提供结构化 capability 查询、原生完整响应 `chat` 与返回 `'static` boxed event stream 的 `chat_stream`;两条响应路径保持独立,供后续适配器分别实现非流式与流式 wire。
-- 新增 mock trait 实现并通过 `Box<dyn LlmClient>` 实际调用 capability、`chat`、`chat_stream`;将 boxed stream 交给统一 `Accumulator` 折叠,断言与非流式响应完全一致。
-- 验证通过:`cargo test client::tests::boxed_dyn_client_supports_complete_and_streaming_calls`(1 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(71 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
+**上下文**：Turn 是公开切割、不变量和 parent-tree 的最小单位；`conversation.turns` 只能
+保存完整 closed Turn。tool pairing 要同时保留框架 `ToolCallId`、provider call id 及调用/
+结果 message id，不能从 provider id 推断内部 identity。
 
-### M3-R [DONE] Milestone 3 Review
-**验证清单**:
-- error 分类覆盖 retry 所需;Capability 结构化无布尔堆砌;EndpointConfig 能表达两个真实 endpoint 的认证/query 差异。
-- trait dyn-safe,`Box<dyn LlmClient>` 编译通过。
-- M2-2 的 ClientError 占位已回填为真类型。
-- `cargo test` 全绿;更新本文件 M3 标记 `[DONE]`。
-**完成记录**:
-- 2026-07-13: 对照 `DESIGN.md` §3--§5 与 `PLAN.md` 已定决策完成 M3 全量审阅；确认 `ClientError` 保留 retry/backoff 所需分类与 `Retry-After`，`Capability` 使用 context/模态/stop reason 等结构化字段且默认表可覆盖，`EndpointConfig` 能表达两个 Foundry endpoint 的认证、query 与 header 差异。
-- 确认 `LlmClient` 使用 `#[async_trait]`、`Send + Sync` 且可装箱为 `Box<dyn LlmClient>`；完整响应与 boxed stream 两条调用路径均由 mock 实际执行。`StreamEvent::Error` 已回填为分类化 `ClientError`，不存在 M2-2 的字符串占位。
-- 修正根 `README.md` 的陈旧里程碑状态，补充已完成的统一流式聚合与 Client 抽象模块概览；阶段顺序和依赖未变化，未修改 `PLAN.md`。
-- 验证通过:`cargo test client::`(22 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(71 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
+**做什么**：
+
+- 在 `conversation/turn.rs` 定义字段私有、只读的 `Turn`、`TurnMeta`、`ToolPairing`；
+  `Turn` 包含 `TurnId`、有序 immutable messages、全部配对、`parent: Option<TurnId>` 与 meta。
+- `ToolPairing` 保存 `call_id`、`provider_call_id: Option<String>`、`call_msg` 和
+  `result_msg`。pending 阶段可以内部表达 `result_msg == None`，但 closed `Turn` 的公共只读
+  视图必须保证每项都有结果。
+- `TurnMeta` 至少承载聚合 `Usage`、由外部提供的可选时间戳/来源和可扩展数据字段；模型
+  内部不得调用 `now()`。明确 meta/annotation 不能用来覆盖或修改历史 message payload。
+- messages 使用共享只读所有权，`Turn` 不提供公共裸构造器或 `messages_mut`；先建立
+  crate-private draft/builder 边界，最终 closed 构造留给 M1-3 的唯一校验门。
+- 为所有类型定义确定性相等性、只读访问和 serde data shape，避免序列化锁或运行时引用；
+  live `Turn` 不得通过 unchecked derive `Deserialize` 绕过 closed 校验，可先使用内部
+  `TurnData` DTO，并在 M1-3 通过 validator 实现受检反序列化。
+
+**验证**：
+
+- 聚焦测试覆盖多 message Turn、parallel tool pairing、parent/meta 与 serde round-trip；
+  断言共享 message 的 id/payload 在读取 Turn 后不变。
+- 编译/API 审查确认外部调用方不能构造“closed 但 `result_msg == None`”的 Turn，也不能在
+  Turn 内替换 message。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦测试、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+### M1-3 [TODO] I1--I4 validator 与原子 `commit` 门
+
+**前置依赖**：M1-2。
+
+**上下文**：closed history 的正确性不能依赖调用约定。唯一合法推进路径必须先验证
+I1 tool 配对、I2 role 序列、I3 无 partial、I4 id 唯一；失败时不得留下半个 Turn 或污染
+索引。
+
+**做什么**：
+
+- 定义分类化 `ConversationError`/`CommitError`，错误至少区分重复 Turn/Message/ToolCall id、
+  duplicate/orphan/dangling provider call、非法 role/block、非法首尾状态、未完成 content、
+  parent 不匹配和非原子提交。
+- 实现 canonical Turn 状态机：恰好从一条外部 `Role::User` message 开始；assistant 只能
+  出现在 user 或全部 tool results 之后；只有 assistant 可含 `ToolUse`；只有 tool role 可含
+  `ToolResult`；parallel calls 可由多条 tool message 回答，但必须恰好一次全部闭合；最后
+  一条必须是不含 tool use 的 assistant。closed Turn 禁止 `Role::System`。
+- 逐个对照 content 中的 provider call id 与显式 `ToolPairing`，验证 call/result message id
+  指向正确 block，拒绝重复、孤儿、跨 Turn 配对与同一 result 多次消费。
+- I3 由完整 Client `Message` 类型和受检冻结路径共同保证；validator 仍须拒绝内部 draft
+  中未结束的 pending 标记，不能把 partial JSON 伪装为 `Value::Null`。
+- 实现 `Conversation` 的空实例与 crate-private draft commit：在临时状态上完成全部校验后
+  一次性生成 closed `Turn`、设置正确 parent 并推进 history/version；任何错误保持原对象
+  全结构不变。
+- 将 `TurnData`/serde 输入接入同一 validator；无论来自内存 draft 还是反序列化，都不能
+  构造违反 I1--I4 的 live `Turn`。
+
+**验证**：
+
+- 正向测试覆盖纯文本、单次 tool、多个串行 round-trip 和 parallel tool calls；每次 commit
+  后逐项断言 I1--I4。
+- 负向表驱动测试覆盖每类 duplicate/orphan/dangling、wrong role/block、未回答 parallel
+  call、带 tool use 的最终 assistant、system role、重复 id 和错误 parent；对失败前后
+  Conversation 做全结构相等断言。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦 validator/
+  commit 测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M1-R [TODO] Milestone 1 Review
+
+**前置依赖**：M1-1 至 M1-3 全部完成。
+
+**上下文**：M1 首次建立后续所有状态转换都依赖的 closed data boundary；若 immutable/API
+封装或 validator 留洞，pending、fork 与 restore 都会把同一缺陷放大，因此必须独立审阅。
+
+**做什么**：
+
+- 对照 `docs/conversation-core.md` §1--§4 审查 identity 分层、message immutability、Turn
+  边界哲学和 I1--I4；确认 Client `Message` 仍 provider-neutral 且无 id。
+- 审查所有 closed 类型的字段可见性，确认不存在 raw push、unchecked closed Turn、可变
+  message getter 或绕过 commit validator 的 serde/public API。
+- 核对 canonical role/tool 状态机能被两家 Client adapter 表达；列出 M2 pending 所需的
+  唯一 crate-private draft 接口，不提前暴露 partial。
+
+**验证**：
+
+- 运行全部 M1 聚焦测试并人工逐项映射 I1--I4；公共 API rustdoc 无缺口或模糊承诺。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
 
 ---
 
-## Milestone 4 — Anthropic 适配器
+## Milestone 2 — Pending 与 Cancel
 
-### M4-1 [DONE] 接入 HTTP 客户端与 Anthropic 请求构造
-**上下文**:真实 endpoint 见 `PLAN.md`:base `ANTHROPIC_BASE_URL`,`Authorization: Bearer $ANTHROPIC_AUTH_TOKEN`,`anthropic-version: 2023-06-01`,`content-type: application/json`,model `databricks-claude-haiku-4-5`,路径 `POST {base}/v1/messages`。探测代码 `probes/genai-probe/` 有可用写法。
-**做什么**:
-- `Cargo.toml` 加 `reqwest`(rustls、json、stream 特性)。
-- `adapter/anthropic/`:把 `ChatRequest` 序列化成 Anthropic body(system 单列字段、messages、tools 的 Anthropic schema 格式、max_tokens 必填)。
-- 应用 `EndpointConfig`(base_url + AuthScheme + 额外 header + query)。
-**验证**:单元测试:`ChatRequest` → Anthropic body JSON 结构正确(快照/字段断言),不实际联网。
-**完成记录**:
-- 2026-07-13: 添加关闭默认特性并启用 `rustls-tls`/`json`/`stream` 的 `reqwest 0.12`;实现持有可复用 HTTP client 与 `EndpointConfig` 的 `AnthropicAdapter`,以及不发网的 `POST /v1/messages` request builder。
-- 完成 `ChatRequest` 到 Anthropic Messages wire 的显式映射:system 单列,Tool role 映射为 user,tools 使用 `input_schema`,thinking 使用 `thinking` + signature,覆盖 URL/base64 图片、tool_use/tool_result、block/source extra;Anthropic provider extras 在最终 JSON 阶段合并,跨 provider extras 与 messages 内 System role 均返回可观测错误。
-- endpoint 构造覆盖 base path、重复 query、Bearer/任意 Header/None 认证、额外 header 与默认 JSON content type;畸形 URL/header 在发网前返回分类错误。新增 6 个无网络单元测试覆盖完整/最小请求与错误边界。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test adapter::anthropic::request::tests`(6 passed),`cargo test --all --all-targets`(77 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
+### M2-1 [TODO] Tool result 完整状态模型前置修复
 
-### M4-2 [DONE] Anthropic 非流式响应 → `Response`
-**上下文**:探测实测响应含 `content[]`(text/tool_use blocks)、`stop_reason`、`usage`(含 cache_creation/cache_read 细分与 `cache_creation.ephemeral_5m/1h`)。方言字段走逃生舱 B。
-**做什么**:
-- 解析 Anthropic 响应 → `Response`:content blocks → `Vec<ContentBlock>`;`stop_reason` → `Normalized<StopReason>`(保留 raw);usage 映射到单列字段,cache 细分正确归位;未知字段进 extra。
-**验证**:
-- 单元测试:用探测记录的真实响应 JSON 反序列化 → 断言 text/tool_use、stop_reason 归一化 + raw、usage 各字段。
-- `#[ignore]` 集成测试:真实调用 `databricks-claude-haiku-4-5` 说 "hi",断言拿到文本与 usage。
-**完成记录**:
-- 2026-07-13: 新增 Anthropic 完整响应解析与非流式 `AnthropicAdapter::chat`;严格校验 assistant wire role,映射 text/tool_use/thinking(含 signature),归一化 stop reason 并保留 raw,复用统一 `Usage` 映射 input/output/cache write/cache read。
-- 顶层 provider 元数据、块级未知字段及 `usage.cache_creation.ephemeral_5m_input_tokens`/`ephemeral_1h_input_tokens` 等明细分别保留在对应 `extra`;非 2xx 响应复用统一 HTTP 错误分类与 `Retry-After`,传输失败区分 timeout/network,非法成功响应返回 protocol error。
-- 以两次真实 Foundry 探测响应(消息/工具 id 已脱敏)固定 text 与 tool_use fixture;新增 8 个聚焦测试覆盖真实响应、thinking/未知 stop reason、三级逃生舱、畸形 wire、本地成功传输、429、非法 2xx body 与 stream 误用。新增默认 `#[ignore]`、55 秒超时且缺环境变量时跳过的真实非流式集成测试。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test adapter::anthropic::response::tests -- --nocapture`(8 passed),`cargo test --all --all-targets`(85 passed,1 ignored),加载 `.envrc` 后 `cargo test --test integration_anthropic -- --ignored --nocapture`(1 passed,1.85s),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
+**前置依赖**：M1-R。
 
-### M4-3 [DONE] Anthropic 流式(SSE)→ `StreamEvent`
-**上下文**:Anthropic SSE 事件:`message_start`/`content_block_start`/`content_block_delta`(text_delta / input_json_delta / thinking_delta)/`content_block_stop`/`message_delta`(带 stop_reason+usage)/`message_stop`。**决策 4**:把 Anthropic 的 `index` 映射成稳定 `BlockId`。**纪律 2**:input_json_delta 只累积。
-**做什么**:
-- `adapter/anthropic/` 流式:解析 SSE,产出归一化 `StreamEvent`:
-  - `content_block_start` → `BlockStart{ id=map(index), kind }`(kind 依 block 类型:text→Text、thinking→Reasoning、tool_use→ToolInput{name,tool_call_id})。
-  - `content_block_delta`:text_delta→`BlockDelta{Delta::Text}`;input_json_delta→`BlockDelta{Delta::Json}`;thinking_delta→`BlockDelta{Delta::Reasoning}`。
-  - `content_block_stop` → `BlockStop`;tool_use 块在 stop 时(或积累完)发 `ToolInputAvailable`。
-  - `message_delta`/`message_stop` → `Usage` + `MessageStop{stop_reason}`。
-- index→BlockId 映射在适配器内维护。
-**验证**:
-- 单元测试:喂探测记录的真实 SSE 分片 → 断言 StreamEvent 序列 + id 关联正确。
-- 经 Accumulator 折叠 → Response 与非流式结果结构一致。
-- `#[ignore]` 集成测试:真实流式 "count 1..5" 与 tool call(get_weather Tokyo),断言事件序列 + 折叠结果(对照探测输出:tool 参数 `{"city":"Tokyo"}`)。
-**完成记录**:
-- 2026-07-13: 添加 `eventsource-stream` 并实现 Anthropic SSE 传输、标准 framing/UTF-8 分片解码及严格生命周期状态机；覆盖 message/content block/message delta/stop、ping 与 provider error,把 provider `index` 稳定映射为 `anthropic-block-{index}`。
-- 正确处理 Anthropic 累计 usage 快照,避免 `message_start` 与 `message_delta` 重复计数；tool `input_json_delta` 始终保留为原始片段,仅在 block stop 完整边界解析并依次发布 `ToolInputAvailable`/`BlockStop`,非法或残缺 JSON 返回协议错误。
-- 补齐通用 `ReasoningSignature` 增量和 `ResponseMetadata` 逃生舱,使 thinking `signature_delta` 可折叠回完整签名,并把 model/id/stop sequence 与 Foundry `amazon-bedrock-invocationMetrics` 等未建模字段合并到 `Response.extra`；`AnthropicAdapter` 已实现 `LlmClient` 的完整态与流式路径。
-- 使用脱敏的真实 Foundry text/tool SSE fixture 增加 15 个 Anthropic 流聚焦测试,覆盖任意字节分片、事件序列、稳定 id、交错 block、tool JSON、thinking signature、累计 usage、metadata、错序/中断/错误分类及本地 HTTP/dyn client；统一 Accumulator 聚焦测试 13 项通过。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(101 passed,3 ignored),加载 `.envrc` 后 `cargo test --test integration_anthropic -- --ignored --nocapture`(3 passed,2.30s),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
+**上下文**：cancel 规范要求合成 `status=cancelled` 的 tool result。当前
+`ToolResponse.status` 支持 `Ok/Error/Denied/Cancelled`，但消息中的
+`ContentBlock::ToolResult` 只有 `is_error: bool`，会在持久化时丢失 Denied/Cancelled；
+把状态塞进 `extra` 属于被禁止的 workaround。
 
-### M4-R [DONE] Milestone 4 Review
-**验证清单**:
-- 非流式与流式折叠结果一致(同一 prompt)。
-- index→稳定 id 映射正确;tool JSON 仅累积后 parse;thinking signature 保留。
-- Foundry 方言字段(cache_creation.ephemeral_*、其他)未丢失(进 extra)。
-- 真实集成测试(非流式/流式/tool)通过(有环境变量时)。
-- 更新本文件 M4 标记 `[DONE]`。
-**完成记录**:
-- 2026-07-13: 对照 M4-1 至 M4-3 与 `PLAN.md` 的 streaming 三纪律完成 Anthropic 里程碑审阅；录制的真实 text/tool SSE 均经唯一 `Accumulator` 折叠，并与同一输出对应的完整响应解析结果做全结构相等断言。
-- 确认非连续、交错 provider index 映射为稳定 `anthropic-block-{index}` id；tool 参数 delta 保持原始 JSON 文本且只在 block stop 完整边界解析，残缺 JSON 返回协议错误；thinking signature 分片可完整折叠回 `ContentBlock::Thinking.signature`。
-- 确认完整态顶层/内容块/usage 逃生舱与流式 `ResponseMetadata` 均生效；`cache_creation.ephemeral_5m_input_tokens`/`ephemeral_1h_input_tokens`、`amazon-bedrock-invocationMetrics` 等 Foundry 字段保留在相应 `extra` 中，流式与非流式结果一致。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(101 passed,3 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_anthropic -- --ignored --nocapture`(3 passed,2.73s)。
+**做什么**：
+
+- 将 provider-neutral `ContentBlock::ToolResult` 改为以 `ToolStatus` 为唯一权威状态；消除
+  可产生 `status`/`is_error` 矛盾的双事实来源。为 `ToolResponse` 与 tool-result block 提供
+  明确的无损转换。
+- 若需要兼容已有持久化 JSON，使用集中式 serde migration 接受旧 `is_error` 表示并映射到
+  `Ok/Error`，冲突输入必须报错；新的 normalized 序列化只输出一个权威状态字段。
+- 类级更新 Anthropic/OpenAI request mapper、response parser、fixtures、examples 与所有
+  pattern match：Anthropic wire 的 `is_error`、OpenAI wire 的 completed/incomplete 只是
+  adapter 映射，`Denied/Cancelled` 在 Conversation 数据中仍原样保留。
+- response wire 无法区分 Denied/Cancelled 时只能归一为可证实的 `Error`，不得虚构更具体
+  状态；provider 原始证据仍按现有 escape hatch 保留。
+
+**验证**：
+
+- 测试四种 `ToolStatus` 的 normalized serde 与 `ToolResponse` 转换；旧 `is_error` migration
+  正反例及冲突拒绝；两家 request body 映射和真实 fixture 解析全部更新。
+- 回归断言现有非流式、流式、tool round-trip 和跨 provider 测试无语义退化。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、model/adapter 聚焦
+  测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M2-2 [TODO] `PendingMessage` 与 stream/non-stream 冻结边界
+
+**前置依赖**：M2-1。
+
+**上下文**：`PendingMessage` 不是 `Message`。它可以含未闭合 block 或 partial tool JSON，
+只能在 Client `Accumulator` 成功 finish 后由外部提供 id 冻结；失败或 cancel 时 partial
+必须可整体丢弃。
+
+**做什么**：
+
+- 在 `conversation/pending/message.rs` 定义非 serde 的 `PendingMessage`，内部持有唯一 Client
+  `Accumulator`、生命周期状态和必要的响应 metadata；不复制 Accumulator 折叠逻辑。
+- 提供按顺序 `push(StreamEvent)` 的受检入口；Client 的 block id、tool JSON 完整边界和
+  `AccumulatorError` 原样分类进入 Conversation 错误链。发生 terminal error 后禁止继续
+  当作有效 message 使用。
+- `finish(MessageId)` 仅在 MessageStart/所有 BlockStop/MessageStop 完整后生成 immutable
+  `ConversationMessage`，并返回 response usage、stop reason/extra 供 Turn meta 汇总；id 只在
+  成功冻结时绑定。
+- 为非流式 `Response` 提供同一验证/冻结语义，保证 stream fold 与 complete response 进入
+  pending 后得到相同消息形状；assistant tool JSON 必须已经是完整 `Value`。
+- partial state 不实现 serde，不暴露为 Client `Message`；drop/cancel 不执行隐式 finish。
+
+**验证**：
+
+- 用交错 text/reasoning/tool stream 冻结出正确 message；同一 fixture 的 stream 与
+  non-stream 路径全结构一致。
+- 覆盖 partial JSON、缺 BlockStop/MessageStop、错误事件、finish 两次、terminal 后 push 和
+  cancel/drop；所有失败均不产生 `MessageId` 或 closed message，且不 panic。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、pending message
+  聚焦测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M2-3 [TODO] `PendingTurn` 事务推进与多轮 tool 记账
+
+**前置依赖**：M2-2。
+
+**上下文**：一个 feed 可包含任意多次 tool round-trip；同一时刻只有一个 PendingTurn 和
+一条可变 PendingMessage。open tool calls 只在 pending 合法，最终 commit 必须复用 M1 的
+validator。
+
+**做什么**：
+
+- 实现 `Conversation::begin_turn`：要求没有 pending，接收外部注入的 `TurnId`、
+  `MessageId` 和合法 user payload；从当前 head 创建 `PendingTurn`，不提前写 raw history。
+- 建立显式状态转换：开始 assistant pending → stream/non-stream 冻结 → 扫描 ToolUse；
+  调用方必须为每个 provider call id 提供唯一 `ToolCallId` 映射，随后登记 open calls。
+- 实现追加 tool response：只接受与 open call 匹配的 `ToolResponse`/完整 tool-result block，
+  以外部 `MessageId` 冻结为 tool message；parallel calls 可分批返回，但同一 call 只能闭合
+  一次，全部闭合前禁止开始下一条 assistant。
+- assistant 无 ToolUse 时把 pending 标为 ready-to-commit；带 ToolUse 时必须继续 tool
+  round-trip。usage 合并进 `TurnMeta`，provider call id 与内部 ToolCallId 都保留。
+- `commit_pending(meta)` 复用 M1 唯一 validator 并原子追加 closed Turn；任何 transition/
+  validator 错误保持 committed history 不变，并保留可取消或修复的明确 pending 状态。
+
+**验证**：
+
+- 正向覆盖纯文本、串行两轮 tool、两个 parallel calls 分两条 result message 回答、
+  stream/non-stream 混合和 usage 汇总；commit 后 open_calls 为空且 I1--I4 恒真。
+- 负向覆盖重复 begin、未知/重复 result、缺少 ToolCallId 映射、open call 未全闭合就开始
+  assistant/commit、final assistant 又含 ToolUse、id 冲突；断言 raw history 原子不变。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、pending turn/tool
+  聚焦测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M2-4 [TODO] Cancel 裂缝闭合与“cancel 后仍可 feed”
+
+**前置依赖**：M2-3。
+
+**上下文**：cancel 只能影响 pending。裂缝 A 是冻结的 tool use 尚无 result，裂缝 B 是
+活跃 message 含 partial blocks/JSON。处理后必须回到明确一致状态，committed Turn 不能被
+修改或污染。
+
+**做什么**：
+
+- 实现分类化 `CancelDisposition`，至少支持：`DiscardTurn`（原子丢弃全部 pending，回到
+  最近 boundary）、`ResumeTurn`（丢 partial、为全部 open calls 追加 cancelled results，
+  保留自洽 pending 供后续 assistant 继续）、`CommitTurn`（在上述闭合后追加调用方提供的
+  完整无 tool-use assistant 终态，再走唯一 commit validator）。不允许直接把以 tool role
+  结尾的 draft 当作 closed Turn。
+- cancel 首先 drop 活跃 `PendingMessage`，绝不尝试 parse/保留半截 JSON；
+  `ResumeTurn`/`CommitTurn` 对每个已冻结 open call 生成含 `ToolStatus::Cancelled` 和明确
+  interruption 内容的结果，使用调用方提供的 message id，保持 provider/internal call id
+  配对；`DiscardTurn` 则原子丢弃整个 pending，无需制造随后又丢弃的结果。
+- 所有 disposition 必须原子：合成 id 冲突、状态非法或 commit 校验失败时返回分类错误，
+  committed history 不变且不得产生半闭合 closed Turn。
+- `DiscardTurn`/成功 `CommitTurn` 后可立即 `begin_turn`；`ResumeTurn` 可开始下一条 assistant、
+  最终 commit 后再 begin 新 Turn。Conversation 永不进入 poisoned 状态。
+
+**验证**：
+
+- 覆盖纯文本流中途 cancel、三段 tool JSON 中途 cancel、tool 执行期间 cancel、多个 parallel
+  open calls cancel，以及无 pending cancel；断言 partial 不进入任何完整消息。
+- 对三种 disposition 分别验证 open call 闭合/丢弃语义、`Cancelled` 状态持久保留、
+  committed history 从未被改写，并执行后续完整 feed→commit 证明会话可用。
+- 失败注入覆盖重复合成 id、缺 id、非法 final message；每次均检查原子性和 I1--I4。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、cancel 聚焦测试、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+### M2-R [TODO] Milestone 2 Review
+
+**前置依赖**：M2-1 至 M2-4 全部完成。
+
+**上下文**：pending/cancel 是唯一允许瞬时不满足 closed Turn 不变量的区域，也是最容易把
+partial 或 dangling tool call 泄漏进历史的边界，需要在进入分支功能前做完整状态机审计。
+
+**做什么**：
+
+- 对照规范 §5 审查 pending 是唯一可变区、同一时刻最多一条 PendingMessage、冻结只发生在
+  complete boundary，且 Accumulator 逻辑没有在 Conversation 复制第二份。
+- 核对 tool result 四状态从 Client model 到 pending/cancel/adapter 的全链路无损；确认不靠
+  `extra` 表达 Denied/Cancelled。
+- 对 cancel 的每个状态裂缝和 disposition 做不变量审计，确认 committed history 始终有效、
+  任何 cancel 路径后都存在明确的继续/丢弃路径。
+
+**验证**：
+
+- 运行完整 pending/cancel 状态机矩阵，特别复核“cancel 后仍可 feed”和 partial JSON 永不
+  落盘；公共错误与 rustdoc 足以让调用方选择正确 transition。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
 
 ---
 
-## Milestone 5 — OpenAI Response 适配器
+## Milestone 3 — Boundary 与分支历史
 
-### M5-1 [DONE] OpenAI Response 请求构造与非流式响应
-**上下文**:真实 endpoint:base `OPENAI_BASE_URL`,header `api-key: $OPENAI_API_KEY`,query `?api-version=2025-04-01-preview`,model `gpt-5.5`,路径 `POST {base}/responses`。探测实测响应含 `content_filters`(Azure 特有,走逃生舱 B)、Response API 的 `output[]` 结构。
-**做什么**:
-- `adapter/openai_resp/`:`ChatRequest` → Response API body(`input`/`instructions`/`tools`/`max_output_tokens`)。
-- 非流式响应 `output[]`(message/reasoning/function_call items)→ `Response`;usage(`input_tokens`/`output_tokens`/`output_tokens_details.reasoning_tokens`)→ 单列;`content_filters` 等入 extra;stop 状态 → `Normalized<StopReason>`。
-**验证**:
-- 单元测试:请求 body 结构;用探测记录的真实响应 JSON 解析 → 断言。
-- `#[ignore]` 集成测试:真实 `gpt-5.5` 说 "hi"。
-**完成记录**:
-- 2026-07-13: 实现持有可复用 HTTP client 与 `EndpointConfig` 的 `OpenAiRespAdapter`,完成 `POST /responses` 请求构造、`api-key`/Bearer/无认证、`api-version` query、额外 header 与 OpenAI provider extras 的最终阶段合并；修复两家 adapter 在空 query 配置下生成尾随 `?` 的同类问题。
-- 将 provider-neutral text、URL/base64 image、reasoning、tool use/result 与 JSON Schema tool 显式映射为 Responses 的 message/reasoning/function_call/function_call_output typed items,覆盖 system instructions、max output tokens、temperature、stream、多模态工具结果和非法 role/block 组合的协议错误。
-- 实现完整响应与非流式传输:按 output 顺序归一化 message/output_text/refusal、reasoning 和 function_call,完整参数 JSON 仅在 item 完成态解析；status/incomplete/filter 证据映射为保留 raw 的 stop reason,item/content 元数据、未知 output item 与 Azure `content_filters` 分层进入逃生舱。
-- 通用 `Usage` 补齐真实 Responses `input_tokens_details.cached_tokens`/cache creation aliases,并保留 details 内未知字段；以两次脱敏真实 Foundry 响应固定 text/reasoning/tool fixture,新增 14 个 adapter 聚焦测试、本地 HTTP 错误/超时边界测试及 55 秒上限的默认忽略真实非流式集成测试。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(115 passed,4 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_openai_resp -- --ignored --nocapture`(1 passed,3.09s),`git diff --check`。
+### M3-1 [TODO] 结构共享 raw history 与派生 `ToolCallIndex`
 
-### M5-2 [DONE] OpenAI Response 流式(SSE)→ `StreamEvent`
-**上下文**:Response API 事件 `response.output_item.added` / `response.*.delta`(text/function_call arguments/reasoning) / `response.output_item.done` / `response.completed`(usage)。映射到统一 StreamEvent(见 `docs/client-layer-references.md` 对照:added→BlockStart、delta→BlockDelta、done→BlockStop)。function_call 的 `arguments` delta 只累积(纪律 2)。用稳定 BlockId 关联(item_id/output_index)。
-**做什么**:
-- 解析 Response SSE → `StreamEvent`,与 Anthropic 适配器产出**同构**的事件流(以便 Accumulator 复用)。
-- item_id/index → BlockId 映射;arguments delta→`Delta::Json`;reasoning delta→`Delta::Reasoning`;完成时 `ToolInputAvailable`。
-**验证**:
-- 单元测试:真实 SSE 分片 → StreamEvent 序列;经 Accumulator 折叠一致。
-- `#[ignore]` 集成测试:真实流式文本 + tool call,断言事件序列与折叠结果。
-**完成记录**:
-- 2026-07-13: 实现 OpenAI Responses SSE transport、任意字节分片 framing 与 terminal-on-error 解码，以及严格校验连续 `sequence_number`、response/item/content 生命周期和 `item_id`/`output_index` 冗余关联的状态机；message content part、reasoning 与 function call 分别映射为同构的 BlockStart/Delta/Stop 事件。
-- 使用 provider item id（message content 另加 content index）生成稳定 `BlockId`；function arguments delta 始终作为原始 `Delta::Json` 透传，只在 `response.function_call_arguments.done` 完整边界核对、解析并发布 `ToolInputAvailable`，非法/残缺 JSON 返回协议错误而不 panic。
-- 流式 terminal response 复用非流式完整响应转换，统一 usage、stop reason 与 Azure `content_filters` 等顶层逃生舱；同时覆盖 raw/summary reasoning、encrypted reasoning signature、refusal、incomplete/failed/error 分类和未知未来事件保留。`OpenAiRespAdapter` 已完整实现 dyn-safe `LlmClient`。
-- 以两次脱敏真实 Foundry text/tool SSE 固定 fixture，新增 14 个聚焦测试，覆盖 UTF-8/framing 分片、文本/tool 事件序列、并行 tool item 交错、reasoning、fold 与完整响应一致、partial JSON、错序/错配/截断、provider error 和本地 HTTP/dyn client；新增默认忽略且 55 秒上限的真实流式文本/tool-call 集成测试。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(129 passed,6 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_openai_resp -- --ignored --nocapture`(3 passed,3.80s),`git diff --check`。
+**前置依赖**：M2-R。
 
-### M5-R [DONE] Milestone 5 Review
-**验证清单**:
-- 两适配器产出的 StreamEvent **同构**,同一 Accumulator 均可折叠。
-- Azure 方言字段(content_filters 等)进 extra 未丢。
-- reasoning/tool 累积规则与 Anthropic 一致。
-- 真实集成测试通过(有环境变量时)。
-- 更新本文件 M5 标记 `[DONE]`。
-**完成记录**:
-- 2026-07-13: 对照 M5-1、M5-2、`PLAN.md` 的块三段式与 streaming 三纪律完成 OpenAI Responses 里程碑审阅；确认 Anthropic 与 OpenAI Responses 均只产出公共 `StreamEvent`，使用 provider 映射后的稳定 `BlockId`，并由唯一的 `stream::accumulator::Accumulator` 折叠完整响应。
-- 确认 OpenAI function arguments delta 始终作为原始 `Delta::Json` 累积，只在 `response.function_call_arguments.done` 完整边界核对并解析后发布 `ToolInputAvailable`；真实五段 JSON、两个交错 tool item 与残缺 JSON 错误测试均覆盖。reasoning 同样使用 BlockStart/Delta/BlockStop，并保留 encrypted reasoning signature，行为与 Anthropic thinking 流一致。
-- 确认完整态与流式终态共用响应转换语义；Azure `content_filters` 在两条路径均进入 `Response.extra`，未知未来流事件保留在 `openai_unmodeled_stream_events`，usage 的 cache/reasoning 分列及 stop reason 原始值均未丢失。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(129 passed,6 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_openai_resp -- --ignored --nocapture`(3 passed,2.41s)。
+**上下文**：O(1) fork、逻辑 revert 和 raw 永不丢要求 history 不是可变 `Vec` 的深拷贝。
+同时 call index 只是一项可重建加速结构，不能成为 pairing 的事实来源。
+
+**做什么**：
+
+- 在 `conversation/history.rs` 实现内部持久化/结构共享 history abstraction，保存所有 raw
+  `Turn` 节点、parent 指针、当前 active lineage 与有效 tip；可使用经过文档化的 persistent
+  collection 或等价 Arc 节点结构，但 clone/fork 路径不得遍历或复制历史。
+- 保留从已 revert head 分出的旧 suffix 节点；active lineage 改道时旧 raw Turn 仍能按 id
+  读取用于调试/持久化，但不再自动进入当前有效视图。
+- 实现派生 `ToolCallIndex`，可按 internal/provider call id 定位 call/result；index 从 closed
+  turns + pending 重建，发生 head/branch 变化时只反映当前有效 lineage 和当前 pending。
+- history 的唯一写入口继续是通过 validator 的 commit；重复 id 检查覆盖所有 retained raw
+  节点，不能在隐藏旧分支上复用 MessageId/TurnId。
+
+**验证**：
+
+- 构造长历史并检查 history clone 共享节点、无 message/turn deep clone；追加新 Turn 不改变
+  已有节点内容。
+- 测试 index 构建/增量更新/全量重建等价，parallel/serial calls 均可定位；隐藏分支的 call
+  不出现在当前有效 index，但 raw 记录仍存在。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、history/index 聚焦
+  测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M3-2 [TODO] 受检 `Boundary`、version 与 stale/ABA 防护
+
+**前置依赖**：M3-1。
+
+**上下文**：Boundary 不是裸 usize。它只能指向 Turn 边界，并且要拒绝跨 Conversation、
+过期 version 和 pending 时的切割，防止同一位置在历史变化后被误接受。
+
+**做什么**：
+
+- 在 `conversation/boundary.rs` 定义字段私有的 `Boundary`，绑定来源 `ConversationId`、active
+  lineage 位置/锚点和生成时 structural version；只由 `valid_boundaries`、
+  `boundary_after(TurnId)` 返回。
+- 明确定义起始 boundary（零 Turn）和每个 closed Turn 后 boundary；已逻辑 revert 时仍可为
+  当前 active lineage 的未来 suffix 生成新 boundary 以支持 redo，但 fork child 不得越过其
+  fork ceiling。
+- 所有消费 Boundary 的操作统一校验 owner、version、锚点、范围和 pending 状态；结构变化
+  后递增 version，使旧 Boundary 即使 index 再次相同也返回 `StaleBoundary`。
+- `Boundary` 可作为 API token serde/debug，但反序列化值仍必须交给 Conversation 校验，不能
+  自证合法。
+
+**验证**：
+
+- 测试 empty/多 Turn 的完整 boundary 列表与 `boundary_after`；zero、head、future redo
+  boundary 均有明确含义。
+- 负向覆盖跨 conversation、stale version、同 index ABA、未知 Turn、越过 fork ceiling、
+  有 pending 时操作和伪造 serde token；错误分类稳定且不改变状态。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、boundary 聚焦测试、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+### M3-3 [TODO] 逻辑 `head`、revert/redo 与 revert 后分支
+
+**前置依赖**：M3-2。
+
+**上下文**：revert 只能移动 head，不能删除 Turn、Message、artifact 或 id。移动后视图和
+派生 index 以 head 为上界；从旧 head 再追加应形成新 parent 路径而非覆盖旧 raw suffix。
+
+**做什么**：
+
+- 实现 `revert_to(Boundary)`：拒绝 pending，验证 token 后移动逻辑 head、更新 version 并
+  重建/更新有效 `ToolCallIndex`；返回包含 old/new head 的可观测 outcome，不物理删除数据。
+- 通过重新获取的较后 Boundary 实现 redo；redo 只沿当前 active lineage，不能跳入已经改道
+  的 detached branch。
+- 从 reverted head `begin_turn`/commit 时，新 Turn 的 parent 必须是该 head 对应 Turn；active
+  lineage 切换到新 suffix，旧 suffix 留在 raw store，但不参与当前 boundaries/view/index。
+- 提供只读 raw/debug 查询与 current-lineage 查询，清晰区分“保留”与“当前有效”，不暴露
+  修改入口。
+
+**验证**：
+
+- 覆盖多次 revert→redo、revert 到 zero、revert 后新 commit、再次 revert，以及 tool index
+  随 head 改变；所有 raw id/payload 始终存在且不变。
+- 断言旧 boundary 在 version 变化后失效，重新生成后可操作；detached suffix 不泄漏进当前
+  view/index，parent tree 可重建两条路径。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、revert/redo 聚焦
+  测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M3-4 [TODO] O(1) `fork_at` 与共享 immutable 历史
+
+**前置依赖**：M3-3。
+
+**上下文**：fork 是从合法 Turn boundary 创建新 Conversation metadata/head，并共享之前的
+immutable message/turn；不 clone prefix、不重分配历史 id。父子分支随后必须独立推进。
+
+**做什么**：
+
+- 实现 `fork_at(Boundary, new_conversation_id)`，要求无 pending、boundary 有效且新 id 由
+  调用方提供；生成 `ForkOrigin { parent, fork_point }`，child head/fork ceiling 位于目标点。
+- fork 只 clone 结构共享 handle 与 O(1) 元数据；历史 `Turn`/`ConversationMessage` 使用相同
+  Arc/节点和相同 id。不得按旧 `DESIGN.md` 方向性文字重新分配 shared message id。
+- child 使用自己的 version/Boundary owner；父 boundary 不能直接用于 child。父子后续 commit、
+  revert、cancel 和 index 更新互不修改对方，child 首个新 Turn parent 指向共享 boundary
+  Turn。
+- child 的逻辑 raw/debug/persistence 可见集合只含 fork boundary 的祖先与 child 自己的新
+  分支；实现可共享更大的底层 store，但父分支在 fork 点之后的 suffix 不能成为 child 的
+  boundaries、snapshot 或可观察事实。
+- 为复杂度契约增加可判定内部测试（pointer equality + clone counter/不遍历断言），避免只在
+  文档声称 O(1)。
+
+**验证**：
+
+- 大历史 fork 测试断言 shared nodes `ptr_eq`、message/turn clone counter 不增长、全部历史
+  id 不变；child 创建本身不随历史长度执行线性遍历。
+- 分别推进父/子并比较 lineage、origin、head、raw payload 和 index；跨分支 Boundary/id 冲突
+  均被拒绝，原 Conversation 不变。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、fork 聚焦测试、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+### M3-R [TODO] Milestone 3 Review
+
+**前置依赖**：M3-1 至 M3-4 全部完成。
+
+**上下文**：Boundary、logical head 与结构共享共同决定 revert/fork 的正确性和复杂度；单看
+某一个 API 不能证明 raw retention、分支隔离及 stale token 防护同时成立。
+
+**做什么**：
+
+- 对照规范 §7--§9 审查两级 identity、parent tree、Boundary 受检性、logical head、redo 和
+  fork origin；确认任何路径都未物理删除 raw history。
+- 检查 O(1) fork 是实现与测试保证而非深 clone 后的口头描述；确认 shared history 使用同一
+  MessageId/TurnId 且 child 只有新 metadata/id。
+- 审查 index 的派生属性、stale/ABA 错误和 pending 时的 boundary 禁止规则，为 Projection
+  提供稳定的 checked Turn range 基础。
+
+**验证**：
+
+- 运行 branch/revert/fork 组合矩阵并检查 parent tree、raw retention、active view 与 index；
+  公共 API 不泄漏内部结构可变性。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
 
 ---
 
-## Milestone 6 — 跨 provider 验收
+## Milestone 4 — Projection 与 Compaction
 
-### M6-1 [DONE] 归一化一致性集成测试
-**上下文**:两 provider 经统一 `LlmClient` 应产出结构一致的归一化结果。
-**做什么**:
-- `tests/`:参数化测试,对 Anthropic 与 OpenAI Response 各跑:纯文本、多轮、tool call 往返(执行 tool 后回灌 result 再请求),断言归一化结构一致(role/content/stop_reason/usage 字段存在且合理)。
-- 通过 `Box<dyn LlmClient>` 调用,证明 dyn 抽象可用。
-**验证**:两 provider 均通过同一套断言(有环境变量时);无 provider 特判逻辑泄漏到测试断言层。
-**完成记录**:
-- 2026-07-13: 新增模块化的 opt-in 跨 provider 真实集成矩阵；provider 差异仅位于 endpoint/client 构造层，Anthropic Messages 与 OpenAI Responses 均通过同一个 `Box<dyn LlmClient>` 依次执行纯文本、多轮历史回放、tool call 执行结果回灌与最终回答，并复用同一套 role/content/stop reason/raw/usage/tool id 断言。整个测试由 55 秒 deadline 约束，缺失凭据时按 target 可观测跳过且不输出 secret。
-- 真实多轮验收发现并修复 OpenAI request mapper 的类级协议缺陷：assistant 历史文本不再错误使用用户侧 `input_text`，而是按 Responses 角色词汇编码为 `output_text`，并从保留的 response extra 恢复 `refusal`；assistant image 与未知 replay 文本类型在发网前返回明确协议错误，user/tool-result 的 `input_text`/`input_image` 语义保持不变。新增 output/refusal、modeled 字段优先及非法边界回归测试。
-- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test adapter::openai_resp::request::tests`(6 passed),`cargo test --all --all-targets`(130 passed,7 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_normalization -- --ignored --nocapture`(1 passed,两 provider 共三类场景,17.57s)。
+### M4-1 [TODO] `Projection`、`Span`、`Artifact` 与受检覆盖范围
 
-### M6-2 [DONE] 能力矩阵与逃生舱实证
-**做什么**:
-- 文档 `docs/capability-matrix.md`:记录两 provider 的 Capability 默认值与实测差异。
-- 测试:断言各 provider 的方言字段确实落入 extra(Foundry cache_creation.ephemeral_*、Azure content_filters),证明逃生舱 B 生效、无信息丢失。
-**验证**:能力矩阵与实测一致;逃生舱测试通过。
-**完成记录**:
-- 2026-07-13: 新增 `docs/capability-matrix.md`,逐字段记录 Anthropic Messages 与 OpenAI Responses 的协议级 `Capability` 默认值,并将默认能力上界、当前 Foundry 部署的真实验证范围和未实测边界明确分层;同时记录两家 endpoint 在 tool stop、cache accounting、reasoning 与 Azure 内容过滤元数据上的实测差异。
-- 新增跨 provider 验收测试 `tests/capability_escape_hatches.rs`:通过 `Box<dyn LlmClient>` 确认两 adapter 暴露各自默认 capability;把脱敏真实响应中的 Anthropic `usage.cache_creation` 完整对象和 Azure `content_filters` 完整数组与归一化 `extra` 做全值比较,并验证 `Response` serde 往返后证据仍不丢失。
-- 验证通过:`cargo fmt --all`,`cargo test --test capability_escape_hatches`(3 passed),`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(133 passed,7 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`cargo fmt --all -- --check`,`git diff --check`;加载 `.envrc` 后 Anthropic 真实集成测试 3 项、OpenAI Responses 真实集成测试 3 项及跨 provider normalization 矩阵 1 项全部通过。
+**前置依赖**：M3-R。
 
-### M6-3 [DONE] 使用示例与 crate 文档
-**做什么**:
-- `examples/`:非流式、流式打字机、tool call 往返各一个可运行示例(读环境变量选 provider)。
-- 完善 `lib.rs` crate 文档与公共 API 文档注释;README 增加 Client 层用法与配置说明。
-**验证**:`cargo run --example ...` 全部可运行(有环境变量时);`cargo doc` 无缺失文档 warning。
-**完成记录**:
-- 2026-07-13: 新增共享环境配置与 `non_streaming`、`streaming_typewriter`、`tool_round_trip` 三个可运行示例;通过 `AGENT_LIB_PROVIDER=anthropic|openai` 构造 `Box<dyn LlmClient>`,支持两家已验证 endpoint 的凭据、model 与 API version 配置。流式示例边输出 text delta 边复用统一 `Accumulator`,tool 示例完成模型调用、本地结果和关联 id 回灌、最终回答的完整往返。
-- 完善 crate 级架构边界、完整响应、streaming 纪律与逃生舱文档,补充 `LlmClient`/`ChatRequest`/`EndpointConfig` 的调用契约和凭据安全说明;README 更新 Client 配置表、端到端用法、示例命令及真实集成测试入口。
-- 验证通过:`cargo fmt --all`,`cargo check --examples`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(133 passed,7 ignored),`cargo test --doc`(1 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后三个示例分别以 Anthropic 与 OpenAI Responses 真实运行,共六个流程全部成功。
+**上下文**：projection 是 raw history 上的可序列化 overlay。span 只能覆盖完整 Turn，
+artifact 必须带 provenance；运行时 Boundary version token 不能未经解析直接长期充当事实。
 
-### M6-R [DONE] Milestone 6 / Client 层总 Review
-**验证清单**:
-- 全量 `cargo test`(含 `-- --ignored` 真实集成)通过。
-- 归一化一致性、逃生舱、能力矩阵、示例齐备。
-- 回溯 DESIGN.md §5 Client 层约束逐条满足:Capability 结构化 / error 分类 / usage 一等 / ContentBlock / streaming 三纪律 / 三逃生舱。
-- 确认 Client 层为 Conversation 层提供了完备类型(Message/ContentBlock/StreamEvent/Usage),可开始 Conversation 层实现。
-- 更新本文件 M6 标记 `[DONE]`;在 PLAN.md 记录 Client 层完成。
-**完成记录**:
-- 2026-07-13: 对照 `DESIGN.md` §5、`PLAN.md` 已定决策及 M1--M6 产出完成 Client 层总审阅;确认结构化 `Capability`、分类化 `ClientError`、一等 `Usage`、完整态 `ContentBlock`、稳定 block id、tool JSON 完整边界解析、唯一 `Accumulator` 折叠逻辑及请求/响应/归一化三类逃生舱均已落实。
-- 确认 Anthropic Messages 与 OpenAI Responses 通过同一 dyn-safe `LlmClient` 和同构 `StreamEvent` 提供完整态、流式及 tool 往返;跨 provider 一致性测试、方言字段保真测试、能力矩阵和三个可运行示例齐备。`Message`/`ContentBlock`/`StreamEvent`/`Usage` 的 serde 与公共文档满足 Conversation 层后续使用,Conversation/Agent/Tool registry/多 agent 职责仍保持在本 crate 边界之外。
-- 验证通过:`cargo fmt --all`,`cargo fmt --all -- --check`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(133 passed,7 ignored),`cargo test --doc`(1 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_anthropic -- --ignored --nocapture`(3 passed,1.68s)、`cargo test --test integration_openai_resp -- --ignored --nocapture`(3 passed,3.17s)、`cargo test --test integration_normalization -- --ignored --nocapture`(1 passed,19.94s)。所有真实测试单项均低于一分钟;`git diff --check` 通过。
+**做什么**：
+
+- 在 `conversation/projection/` 定义 `Projection`、`Span::Raw`、`Span::Compacted`、
+  `Artifact`、`StrategyRef` 和 token accounting/provenance。Artifact 用 `ArtifactId` 标识并
+  承载一个或多个完整 Client `Message` 作为渲染内容，不修改 raw ConversationMessage。
+- 定义 `CheckedTurnRange`：只能由同一 Conversation 当前有效的 start/end Boundary 解析得到，
+  要求有序、非空（需要时显式允许 zero-length）、不超过 head 且不含 pending；内部持久化
+  稳定 Turn anchors/id，后续使用时重新对照 lineage，避免 ephemeral version 失效。
+- Projection span 必须有序、无重叠，完整描述 raw/compacted 片段；compacted span 保存 covers、
+  artifact id 和 produced_by，artifact provenance 保存输入范围、策略版本与 tokens before/
+  after。
+- 所有字段可 serde 但构造受检；拒绝跨 Conversation boundary、反向范围、切入 detached
+  branch、缺失 artifact 和重复 ArtifactId。
+
+**验证**：
+
+- serde/构造测试覆盖 raw、单层 compacted、多个 tiered artifact 和 provenance；稳定 range
+  在 version 改变后按 Turn anchors 正确重验证。
+- 负向覆盖跨 owner、越 head、覆盖 pending、反向/重叠 span、未知 Turn/artifact 和 detached
+  branch；失败不改变现有 projection。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、projection model
+  聚焦测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M4-2 [TODO] `effective_view`、head clipping 与 pending 隔离
+
+**前置依赖**：M4-1。
+
+**上下文**：发给 Client 的是 system + projection 后的完整消息，不是 raw log。视图必须以
+head 为上界；若 revert 落进一个 compacted cover，不能使用包含未来 Turn 信息的完整摘要。
+
+**做什么**：
+
+- 定义 Client-ready `EffectiveView`，单列 system prompt 与有序完整 `Message`；
+  `Conversation::effective_view()` 遍历 head 以内 spans，Raw 渲染原 Turn messages，Compacted
+  渲染 artifact messages。
+- 默认 Projection 等价于全部可见 raw turns；raw history、message identity 和 pairing 不因
+  生成视图而 clone/mutate（返回 payload clone 仅用于构造 Client 请求时须有明确边界）。
+- 实现 head clipping：完整位于 head 前的 compacted span 可用；head 落在 cover 中时，该 span
+  对可见前缀回退为 raw turns，严禁摘要泄漏 head 后内容；redo 到完整 cover 后可再次使用
+  artifact。
+- pending 永远不进入 committed effective view。另提供只读 `pending_context`，只返回 pending
+  中已冻结的完整 messages；活跃 partial 单独保持不可见。
+
+**验证**：
+
+- 覆盖纯 raw、raw+compacted+raw、多个 tier、zero head、head 在 span 前/后/内部、
+  revert→redo 和 fork child ceiling；断言消息顺序/system 正确且无未来内容泄漏。
+- pending 测试确认已冻结消息只经显式 pending_context 出现、partial 永不出现、projection
+  不能覆盖 pending。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、effective view
+  聚焦测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M4-3 [TODO] 原子 `apply_compaction` 与 tiered/consolidated 更新
+
+**前置依赖**：M4-2。
+
+**上下文**：compaction 只替换 overlay，不删除 raw。计划需要既能只压新 raw tail，也能把
+旧 summary 与新 raw 合并重写；每一步都必须在当前完整 Turn boundary 上验证。
+
+**做什么**：
+
+- 定义可序列化 `CompactionPlan`/`CompactionStep`，能寻址 raw range 或已有 span range，引用
+  `StrategyRef` 并接收外部生成的 Artifact；plan 本身不持有 client/closure。
+- 实现 `apply_compaction` 的两阶段原子流程：先验证所有 target、artifact covers、顺序、
+  重叠、head/version、pending 和 provenance，再一次性生成新 Projection。任何一步失败保留
+  旧 projection/artifacts。
+- 支持 tiered（旧 compacted span 保留，只替换 raw tail）与 consolidate（旧 summary spans +
+  raw tail 由新 artifact 覆盖）两类操作；被替换 artifact 仍作为 provenance/raw audit 数据
+  保留，不被物理删除。
+- compaction 只能覆盖 `[0, head)` 的 closed Turn；pending 时只允许记录“待执行”意图，不得
+  实际 apply。soft-limit 触发可推迟，turn 内 hard-limit 不在本层处理。
+
+**验证**：
+
+- 测试首次压缩、连续 tiered、summary-of-summaries consolidate、部分 raw tail、revert 穿过
+  压缩点与 redo；每次比较 raw turns/id/payload 在 apply 前后完全一致。
+- 负向覆盖 stale plan、artifact covers 不一致、重叠/越界 target、未知 strategy/artifact、
+  pending apply 和多 step 中途失败；断言 projection 原子不变。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、apply compaction
+  聚焦测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M4-4 [TODO] Compaction strategy/trigger 扩展点与数据/行为分离
+
+**前置依赖**：M4-3。
+
+**上下文**：总体设计要求 strategy 与 trigger 解耦并保持 dyn-safe；但具体 summarizer、模型
+client 与调度属于外部运行时，不能序列化进 Conversation 或把 Agent loop 拉入本层。
+
+**做什么**：
+
+- 定义 `#[async_trait]` dyn-safe `CompactionStrategy`，输入只读 spans/effective context 与
+  `CompactCtx`，返回受检前的 artifact draft；外部通过 `StrategyRef`/显式 id 关联实例。
+- 定义同步 `CompactionTrigger`，只在 Turn boundary 观察 immutable Conversation/Usage 并返回
+  data-only `CompactionPlan` 或 `DeferredUntilBoundary`；trigger 不直接修改 projection。
+- 明确 runtime strategy/trigger/client handle 不 serde；Conversation 只保存 `StrategyRef`、
+  plan、artifact 和 provenance。没有 registry 时返回可观测的 unresolved error，不做 fallback。
+- 提供 mock strategy/trigger 测试工具或示例，证明 tiered/consolidated 可使用不同策略引用，
+  但不实现真实 LLM summarizer、budget loop 或 tool registry。
+
+**验证**：
+
+- dyn trait object 测试覆盖 mock async strategy、不同 trigger、deferred pending 与 boundary
+  执行；data plan serde round-trip 后可由相同 StrategyRef 解析。
+- serde 测试确认 trait object/client 不进入 snapshot；缺失/错误 strategy reference 明确失败，
+  不默默采用其他算法。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、strategy/trigger
+  聚焦测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M4-R [TODO] Milestone 4 Review
+
+**前置依赖**：M4-1 至 M4-4 全部完成。
+
+**上下文**：projection 与 raw history、head、pending 和运行时策略四个边界交叉；独立 Review
+用于确认摘要 overlay 没有退化为破坏性 truncate 或泄漏未来内容。
+
+**做什么**：
+
+- 对照规范 §6/§6.1 审查 raw/projection 分离、Turn-boundary covers、pending 排除、head 上界和
+  soft/hard-limit 职责；确认 compaction 从未删除/改写历史。
+- 核对 effective_view 在 revert 落入 compacted span 时不泄漏未来摘要，redo 后语义恢复；
+  tiered/consolidated provenance 足以调试 summary-of-summaries。
+- 审查 strategy/trigger 的 dyn-safe/data-only 边界，确认没有把 Agent loop、registry 或具体
+  summarizer 偷渡进 Core。
+
+**验证**：
+
+- 运行 projection/compaction/revert/fork 组合矩阵，检查视图、raw、artifact 与 provenance；
+  公共 API 只能通过 checked range 和原子 apply 改 projection。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
 
 ---
 
-## Client 层完成后的交接任务
+## Milestone 5 — Serde 与持久化
 
-### NEXT-1 [TODO] 归档 Client 层计划并建立 Conversation Core 计划
-**前置条件与上下文**:
-- 仅在 M6-1 至 M6-R 全部完成并标记为 `[DONE]` 后执行;本任务不补做或跳过任何 Client 层验收。
-- 执行本任务前,根目录 `PLAN.md` 与 `TODO.md` 是 Client 层的完整计划和实施记录;`docs/conversation-core.md` 是下一阶段 Conversation Core 的规范性设计输入,其中 §11 已给出实现顺序:Turn 与 I1--I4 不变量 → pending/cancel → boundary/revert/fork → projection/compaction → serde/持久化。
-- 归档目标固定为 `docs/archive/2026-07-13-client-layer/`。当前这条 NEXT-1 任务也属于 Client 层历史交接记录,必须随旧 `TODO.md` 一起进入归档;不要先用新内容覆盖根目录文件而丢失历史。
+### M5-1 [TODO] Boundary 一致点 `ConversationSnapshot`
 
-**做什么**:
-1. 创建 `docs/archive/2026-07-13-client-layer/`,将执行本任务时的根目录 `PLAN.md`、`TODO.md` 原样归档为该目录下的 `PLAN.md`、`TODO.md`。归档文件须保留全部 `[DONE]` 状态、完成记录、验证结果以及本任务,不得改写成 Conversation Core 内容。
-2. 在根目录重新创建 `PLAN.md`,以 `docs/conversation-core.md` 的完整设计和当前已落地的 Client 公共类型为依据,格式参照归档后的 `PLAN.md`。新计划至少应明确:范围与非目标、已定不变量/关键决策、里程碑与依赖顺序、建议目录和公共 API 边界、测试策略、serde/持久化边界,以及每阶段独立 Review 的要求。不得重新发明或弱化 `docs/conversation-core.md` 已确定的 message immutability、Turn/tool 配对、pending cancel 闭合、受检 Boundary、逻辑 head、O(1) fork、Projection 仅覆盖完整 Turn 等约束。
-3. 在根目录重新创建 `TODO.md`,格式参照归档后的 `TODO.md`,并将新 `PLAN.md` 拆成可按顺序执行的 Conversation Core 实现任务。任务列表必须同时满足:
-   - 按真实依赖和实现顺序分 Milestone 排列;每个实现任务使用 `M<里程碑>-<序号>` 编号(如 `M1-1`、`M1-2`),编号在各 Milestone 内连续且不重复。
-   - 每个尚未执行的任务标题都保留 `[TODO]` 标记;不得预先写成 `[DONE]` 或添加虚构的完成记录。
-   - 每个任务都包含足够的“上下文”“做什么”和“验证”信息,直接写明涉及的现有/新增模块与核心类型、必须维持的不变量、前置依赖、错误与边界行为及需要新增的测试;不能只写“参照 `docs/conversation-core.md`”而迫使 coding agent 反复搜索仓库。
-   - 每个任务都定义可判定的完整验收条件,既包含该任务的聚焦测试和关键行为断言,也包含与改动风险相称的格式化、严格 lint、全量测试及文档构建要求;涉及持久化时必须包含存盘→恢复→`effective_view` 一致性验证。
-   - 每个 Milestone 的最后单列一个 `M<里程碑>-R [TODO]` Review 任务,核对本阶段设计约束、实现、测试、公共 API 文档和下一阶段前置条件的正确性与完整性;Review 不得并入最后一个实现任务。
-4. 核对新 `PLAN.md` 的里程碑与新 `TODO.md` 一一对应,并检查仓库中描述“Client 层当前计划/任务”的链接或文字引用;只有在语义确实指向历史 Client 计划时才改为归档路径,指向当前实施计划的入口应继续使用根目录 `PLAN.md`/`TODO.md`。
+**前置依赖**：M4-R。
 
-**验证**:
-- `docs/archive/2026-07-13-client-layer/PLAN.md` 与 `docs/archive/2026-07-13-client-layer/TODO.md` 均存在,内容分别是归档前的 Client 层计划与完整任务/完成记录;归档 `TODO.md` 中仍能找到 `M1-1`、`M6-R` 和 `NEXT-1`。
-- 根目录 `PLAN.md`、`TODO.md` 均存在且只规划 Conversation Core 后续工作;两者明确以 `docs/conversation-core.md` 为设计依据,里程碑名称、顺序和交付物互相一致,不把 Agent loop、Tool registry 或多 agent 编排混入范围。
-- 人工逐项审查根目录 `TODO.md`:所有实现任务编号唯一且有序,每个标题含 `[TODO]`,每项均有具体上下文/实施内容/可判定验证条件,每个 Milestone 均以独立的 `Mx-R [TODO]` Review 收尾,并且不存在预先标记的 `[DONE]` 任务。
-- 检查改动和文档引用无空白错误或明显失效路径,并依次通过 `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 与 `git diff --check`。
+**上下文**：pending 默认不持久化。snapshot 必须包含恢复有效视图所需的全部事实，同时
+排除 Accumulator、派生 index、策略实例和其他 runtime 资源。
+
+**做什么**：
+
+- 定义 versioned `ConversationSnapshot` schema，包含 id/config、所有 retained raw closed
+  turns/messages、active lineage/head、structural version、fork origin/ceiling、projection、
+  artifacts/provenance；格式有显式 schema version 以便后续 migration。
+- 实现 `Conversation::snapshot()`：仅当 `pending == None` 且位于 committed Boundary 时成功；
+  有 pending 返回分类错误，不自动 cancel、finish 或丢弃。
+- snapshot 通过稳定 id/parent anchors 表达结构共享，不按每个 fork 深复制同一 message payload；
+  同一 snapshot 内重复引用只序列化一个事实记录。
+- 明确排除 `PendingTurn`、`PendingMessage`、Accumulator、ToolCallIndex、Arc/lock、client/registry
+  handle 和 strategy/trigger object；只保存 data-only StrategyRef。
+
+**验证**：
+
+- snapshot serde round-trip 覆盖线性历史、revert 后 detached suffix、fork origin、多个
+  artifacts 和 projection；检查共享 message/turn 事实只出现一次。
+- 有 text/tool partial、open call 或 ready-to-commit pending 时均拒绝 snapshot，且原状态不变；
+  runtime-only 字段不出现在 JSON。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、snapshot 聚焦测试、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+### M5-2 [TODO] 受检 restore 与派生索引重建
+
+**前置依赖**：M5-1。
+
+**上下文**：直接 derive `Deserialize` 到 live Conversation 会绕过 commit 门。恢复必须先进入
+data snapshot，再验证全部事实和 projection，最后构建 runtime history/index。
+
+**做什么**：
+
+- 实现 `Conversation::restore(snapshot)`/`TryFrom<ConversationSnapshot>`，按顺序校验 schema
+  version、全局 id 唯一、parent 存在且无环、Turn I1--I4、active lineage、head/ceiling、fork
+  origin、projection ranges/artifacts/provenance；任一错误返回带路径的 `RestoreError`。
+- 只在全部校验成功后建立结构共享 runtime nodes，恢复 logical head/version，并从事实数据
+  重建 ToolCallIndex；不恢复 pending。
+- 比较重建 index 与全量扫描结果，检测 snapshot 中任何冗余派生字段并拒绝/忽略其成为事实
+  来源。
+- 设计明确的 schema-version/migration 入口；当前未知未来版本拒绝而非猜测字段含义。
+
+**验证**：
+
+- 正向执行 snapshot→JSON→snapshot→restore，断言 raw/current lineage/head/origin/projection/
+  artifacts/index 全结构等价。
+- 系统注入损坏数据：duplicate id、missing/cyclic parent、非法 Turn、head 不在 lineage、错误
+  fork point、重叠 span、missing artifact、错误 covers 和未知 schema version；全部明确拒绝且
+  不产生半恢复 Conversation。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、restore/corruption
+  聚焦测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M5-3 [TODO] DB-neutral parent-tree row 映射
+
+**前置依赖**：M5-2。
+
+**上下文**：本 crate 不绑定数据库驱动，但需要可落库的稳定记录：conversation/turn/message
+以 parent pointer 和 sequence 表达；message/turn immutable、只 INSERT 不 UPDATE，fork 不复制
+共享历史行。
+
+**做什么**：
+
+- 在 `conversation/persistence/rows.rs` 定义 DB-neutral `ConversationRecord`、`TurnRecord`、
+  `MessageRecord`、`ToolPairingRecord`、`ArtifactRecord`、Projection records 及必要关联；明确 PK/FK
+  字段、parent_turn_id、message seq、owner/origin 和 schema version。
+- 实现 snapshot/history 与 rows 的确定性分解和受检重组；payload 可用 typed fields 或稳定 JSON，
+  但恢复必须走 M5-2 validator，不能由 row 顺序暗示合法性。
+- fork 导出只新增 child ConversationRecord 和 child 新 Turn rows，共享祖先按稳定 id 引用；提供
+  可判定的 insert set，不为共享 message 生成新 id/重复 UPDATE。
+- 文档明确 annotation/评分另表引用 MessageId，不能更新 immutable MessageRecord；不实现 SQL、
+  migration runner 或具体数据库连接。
+
+**验证**：
+
+- 线性/tool/fork/projection 数据执行 snapshot→rows（打乱读取顺序）→snapshot→restore，检查
+  parent/seq/pairing 和 effective ordering 正确。
+- fork 测试断言 shared ancestor Turn/Message rows id/payload 仅一份，child 只增加 metadata/
+  suffix；生成的 mutation 集只有 INSERT，无历史 UPDATE。
+- 缺行、重复 PK、错误 FK/seq/cycle 和 orphan artifact rows 明确失败。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、row mapping 聚焦测试、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+### M5-4 [TODO] 存盘→恢复→`effective_view` 端到端一致性
+
+**前置依赖**：M5-3。
+
+**上下文**：局部 serde round-trip 不足以证明恢复语义。验收必须覆盖 tool pairing、logical
+head、fork 和 compaction 的组合，并以实际 Client-ready effective view 为最终判据。
+
+**做什么**：
+
+- 建立模块化 integration fixture：多 Turn + serial/parallel tools，apply tiered/consolidated
+  compaction，revert 到压缩范围内再 redo，并 fork 后分别推进父子。
+- 对父子每个一致点同时走 JSON snapshot 与 DB-neutral rows 两条路径，恢复为新 Conversation；
+  比较 system、effective messages、raw facts、head/boundaries、origin、projection/provenance、usage
+  和 rebuilt ToolCallIndex。
+- 验证保存/恢复不调用网络、随机源、时钟或 runtime registry；所有 id/timestamp fixture 显式
+  注入，结果可重复。
+- 增加 pending snapshot 拒绝后 cancel→commit/discard→成功 snapshot 的完整流程。
+
+**验证**：
+
+- 核心断言为两条持久化路径恢复前后 `effective_view` 全结构一致，且 revert 落入摘要时仍不
+  泄漏未来内容；父子共享历史 id 不变、后续推进互相隔离。
+- fixture/每个 test 均在 1 分钟内完成，无 sleep、真实 endpoint 或 flaky 时间依赖。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、persistence integration
+  聚焦测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M5-R [TODO] Milestone 5 Review
+
+**前置依赖**：M5-1 至 M5-4 全部完成。
+
+**上下文**：持久化是另一条可能绕过 public commit API 的输入路径；Review 必须把 snapshot、
+rows、restore validator 与 live effective view 作为一条完整信任边界审查。
+
+**做什么**：
+
+- 对照规范 §10 审查 serde/data 边界、pending 一致点、parent-tree rows、immutable insert-only
+  语义、外部 id/time 和 runtime resource 排除。
+- 确认 restore 不存在绕过 I1--I4/Boundary/Projection 校验的入口，所有 derived index 都从事实
+  重建；未知 schema 明确失败。
+- 人工追踪一次 fork+compaction 会话的 JSON/rows，确认共享祖先没有复制或重分配 id，恢复后
+  effective view 与原对象一致。
+
+**验证**：
+
+- 运行全部 corruption 与存盘→恢复→effective_view 测试；检查 public persistence rustdoc 对
+  数据库集成方足够明确且不承诺未实现的 driver。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+---
+
+## Milestone 6 — 跨功能验收与文档
+
+### M6-1 [TODO] Conversation 状态机组合验收
+
+**前置依赖**：M5-R。
+
+**上下文**：单模块测试可能漏掉 transition 组合。需要从公共 API 驱动 Conversation，在每个
+可观察步骤检查 closed invariants，并覆盖 cancel、branch、projection 和 restore 的交互。
+
+**做什么**：
+
+- 新增确定性状态机/表驱动 integration tests，只通过公共 API 执行 begin、stream freeze、
+  tool results、commit、cancel、boundary、revert/redo、fork、compaction、snapshot/restore。
+- 每次 transition 后扫描所有 closed Turn 验证 I1--I4、message immutability、parent/head、
+  effective index 和 projection；失败操作还要断言原子不变。
+- 覆盖至少：parallel calls 中途 cancel 后新 feed；compacted history 内 revert 后 fork；父子
+  分别 compaction/restore；stale boundary 与坏 snapshot 恢复后继续使用原会话。
+- 保持测试模块化，长 fixture/helper 拆分文件；不引入 Agent loop/tool registry 模拟器，只用
+  显式事件和结果驱动 Core。
+
+**验证**：
+
+- 全部组合场景结束后均能再次完成一个纯文本 Turn，证明无 poisoned 状态；任何时刻 closed
+  history 都满足 I1--I4，raw message payload hash/id 不变。
+- 单个状态机 case 少于 1 分钟，失败输出包含操作序列便于复现。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、conversation state
+  machine 聚焦测试、`cargo test --all --all-targets`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+### M6-2 [TODO] 两家 Client request mapper 兼容性验收
+
+**前置依赖**：M6-1。
+
+**上下文**：Conversation 的 role/tool 语法目标是同时可交给 Anthropic Messages 与 OpenAI
+Responses。验收应在同一 effective view 上调用两家现有请求构造器，不能在 Conversation
+断言层写 provider 特判。
+
+**做什么**：
+
+- 构造包含 system、多轮、parallel tool、cancelled tool result、reasoning 和 compaction
+  artifact 的 Conversation；从同一个 `EffectiveView` 组装两份仅 adapter 不同的
+  `ChatRequest`。
+- 使用本地 dummy endpoint 调用两家 `build_request`，断言都接受 canonical role/content
+  序列、system 单列、call id 配对完整；只在 adapter wire 断言 helper 中处理协议字段差异。
+- 对 `Denied/Cancelled` tool status 验证 Conversation 事实保留，同时两家 wire 按各自能表达的
+  error/incomplete 语义映射；回放后不产生 orphan result。
+- 增加非法 Conversation 数据无法通过 public API 构造的回归，避免靠 adapter 最后报错来
+  维持 Core 不变量。
+
+**验证**：
+
+- 两家 adapter 对同一 view 构造请求成功且无网络；统一断言 role/content/tool pairing，wire
+  专属断言局限在 adapter helper。
+- 现有 Client integration/fixtures 全部回归通过，不因 Conversation 引入 provider 泄漏或
+  Client API 破坏。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、跨 adapter 聚焦测试、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+### M6-3 [TODO] Conversation 示例、README 与 crate 文档
+
+**前置依赖**：M6-2。
+
+**上下文**：实现完成后，crate 不再只是 Client 层；文档必须清楚展示 identity 注入、
+pending/commit/cancel、合法 Boundary、fork、effective view 和 persistence，一并保持 Agent/
+registry/multi-agent 非目标边界。
+
+**做什么**：
+
+- 更新 `src/lib.rs` crate docs 与根 `README.md` 的架构、模块、状态和用法；保留 Client endpoint
+  文档并把历史计划/验证链接指向归档，当前实施入口继续指向根 `PLAN.md`/`TODO.md`。
+- 新增可离线运行的 Conversation 示例：显式 deterministic ids，完成 user→assistant tool use→
+  tool result→final assistant→commit，演示 cancel 后继续 feed、valid Boundary/fork、compaction
+  后 effective view，以及 snapshot→restore 一致性。
+- 示例只模拟 normalized Client responses/events，不访问真实 endpoint；避免把 Agent loop、tool
+  registry 或 compaction summarizer 冒充为本层功能。
+- 为所有公共 Conversation 类型/错误/方法补齐 rustdoc 与最小可运行代码示例，说明 pending
+  不能 snapshot、Boundary 可能 stale、id/time 外部注入和 fork 共享语义。
+
+**验证**：
+
+- `cargo run --example conversation_core` 成功并断言关键状态；所有 rustdoc examples 编译，
+  README 链接有效且历史/当前计划语义正确。
+- 使用 `rg` 审查陈旧“Client 层当前计划/任务”引用；不改动仍正确指向当前根计划的入口。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、示例与 doc tests、
+  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+### M6-R [TODO] Milestone 6 / Conversation Core 总 Review
+
+**前置依赖**：M6-1 至 M6-3 全部完成。
+
+**上下文**：这是全部 Conversation Core 任务完成后的总验收，也是创建项目完成 tag 前最后
+一道门；完成记录必须以实际全量结果为准，不能用各里程碑局部通过替代。
+
+**做什么**：
+
+- 逐节回溯 `docs/conversation-core.md` §0--§11 与 `PLAN.md`：确认 immutable message、Turn
+  definition/I1--I4、pending/cancel、identity、Boundary/head/revert/fork、Projection、
+  compaction、serde/persistence 均有实现、测试和公共文档。
+- 确认 O(1) fork、raw non-destructive、cancel 后可 feed、Projection 只覆盖完整 Turn、
+  存盘→恢复→effective_view 一致这五项高风险承诺都有独立可判定测试，不是注释或 workaround。
+- 审查模块大小、重复逻辑、warning/TODO、公共可变性和错误 source 链；确认职责边界没有混入
+  Agent loop、Tool registry、数据库 driver 或多 agent 编排。
+- 将根 `TODO.md` 的 M6-R 标为 `[DONE]` 并填写全量验证记录；确认所有任务标题均已 `[DONE]`
+  后按项目完成规则创建 Git tag `endtag`。
+
+**验证**：
+
+- 运行所有 Conversation 聚焦/组合/持久化/adapter 兼容测试与示例；人工核对每条规范约束的
+  代码与测试位置。
+- 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
+  `cargo test --all --all-targets`、`cargo test --doc`、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`git diff --check`；所有 case 少于 1 分钟，
+  完整 suite 少于 30 分钟。
