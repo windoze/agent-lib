@@ -2,8 +2,8 @@
 //!
 //! A live [`Turn`] deliberately has no public constructor and cannot be
 //! deserialized directly. The crate-private `TurnData` shape can represent
-//! draft or persisted input, including a temporarily dangling tool call, but
-//! the M1-3 validator is responsible for converting validated data into a live
+//! draft or persisted input, including a temporarily dangling tool call. The
+//! Conversation validator is the only path that converts this data into a live
 //! closed turn.
 //!
 //! Callers can inspect messages but cannot replace one through the returned
@@ -44,7 +44,9 @@
 //! ```
 
 use crate::{
-    conversation::{ConversationMessage, MessageId, ToolCallId, TurnId},
+    conversation::{
+        ConversationMessage, MessageId, ToolCallId, TurnId, validation::ValidatedTurnData,
+    },
     model::usage::Usage,
 };
 use serde::{Deserialize, Serialize, Serializer};
@@ -55,8 +57,8 @@ use std::sync::Arc;
 ///
 /// Messages and pairings use shared immutable ownership, so cloning a turn
 /// does not clone or re-identify its history. The fields stay private and the
-/// type intentionally has no public constructor; M1-3 will make the commit
-/// validator the sole creation and deserialization gate for live turns.
+/// type intentionally has no public constructor; the commit validator is the
+/// sole creation and deserialization gate for live turns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Turn {
     id: TurnId,
@@ -67,6 +69,37 @@ pub struct Turn {
 }
 
 impl Turn {
+    /// Materializes a live turn from the validator's unforgeable certificate.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the M1 validator is first reached in production through the M2 pending API"
+        )
+    )]
+    pub(super) fn from_validated(data: ValidatedTurnData) -> Self {
+        let data = data.into_data();
+        let pairings = data
+            .pairings
+            .into_iter()
+            .map(|pairing| ToolPairing {
+                call_id: pairing.call_id,
+                provider_call_id: pairing.provider_call_id,
+                call_msg: pairing.call_msg,
+                result_msg: pairing
+                    .result_msg
+                    .expect("validated turn pairings always have a result message"),
+            })
+            .collect::<Vec<_>>();
+        Self {
+            id: data.id,
+            messages: Arc::from(data.messages),
+            pairings: Arc::from(pairings),
+            parent: data.parent,
+            meta: data.meta,
+        }
+    }
+
     /// Returns this turn's externally supplied stable identity.
     #[must_use]
     pub const fn id(&self) -> TurnId {
@@ -115,7 +148,9 @@ impl Serialize for Turn {
 ///
 /// The provider call id remains separate from [`ToolCallId`]. Unlike the
 /// crate-private draft representation, `result_msg` is not optional, so a
-/// closed pairing cannot express a dangling tool call.
+/// closed pairing cannot express a dangling tool call. A missing provider id
+/// is accepted only when the call/result message anchors identify exactly one
+/// matching provider id; the closed pairing preserves the original `None`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolPairing {
     call_id: ToolCallId,
@@ -219,6 +254,30 @@ pub(crate) struct TurnData {
     pub(crate) pairings: Vec<ToolPairingData>,
     pub(crate) parent: Option<TurnId>,
     pub(crate) meta: TurnMeta,
+    #[serde(default, skip_serializing_if = "TurnCompletion::is_complete")]
+    pub(crate) completion: TurnCompletion,
+}
+
+/// Whether a draft has finished freezing all Client content.
+///
+/// The default and the only state emitted by a live [`Turn`] is `Complete`.
+/// In-memory pending code must set `PendingContent` while a block or message is
+/// unfinished; validation rejects that marker before inspecting parsed JSON.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TurnCompletion {
+    /// Every message contains complete-state Client content.
+    #[default]
+    Complete,
+    /// At least one message or content block is still pending.
+    PendingContent,
+}
+
+impl TurnCompletion {
+    /// Lets serde preserve the existing closed-turn shape for complete data.
+    fn is_complete(&self) -> bool {
+        *self == Self::Complete
+    }
 }
 
 /// Crate-private tool-pairing data that may still be pending a result.
@@ -239,6 +298,7 @@ impl From<&Turn> for TurnData {
             pairings: turn.pairings.iter().map(ToolPairingData::from).collect(),
             parent: turn.parent,
             meta: turn.meta.clone(),
+            completion: TurnCompletion::Complete,
         }
     }
 }

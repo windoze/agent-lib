@@ -1,94 +1,126 @@
-# 当前执行计划
+# 当前 invocation 执行计划
 
-## 工作边界
+## 目标与约束
 
-- 本次调用只处理 `TODO.md` 中按文档顺序出现的第一个标题未带 `[DONE]` 的任务。
-- 不进行开放式历史缺陷扫描；仅检查最新提交是否明确提到与当前任务直接相关的未完成问题。
-- 如发现阻塞当前任务的具体前置缺陷，将按规则把最小前置任务写入 `TODO.md`、保持当前任务未完成、提交后停止。
-- 不记录内部隐性思维链；本文件记录可复核的事实、决策依据、执行步骤和验证结果。
+- 以 `TODO.md` 为任务顺序、需求、依赖、验证和完成状态的唯一权威来源。
+- 本次只完成首个标题未带 `[DONE]` 的任务；完成并提交后立即停止，不进入下一任务。
+- 不做开放式历史问题扫描；只处理会阻塞当前任务、使其指定行为无效，或由本次改动直接引入的问题。
+- 若遇到无法在当前任务内正确解决的具体前置阻塞，只添加最少的前置任务、保持当前任务未完成、提交任务表变更后停止。
+- 不采用规避规范的窄化实现、临时 shim 或测试绕行。
 
-## 初始步骤
+## 分步执行计划
 
-1. 阅读 `TODO.md`，严格识别第一个未完成任务及其依赖、验收标准和完成记录要求。
-2. 查看最新提交说明及工作区状态，判断是否存在直接关联的未完成事项或上次中断遗留；保留用户已有改动。
-3. 仅阅读与当前任务有关的 `PLAN.md`、设计文档、源码和测试，确定实现边界。
-4. 完整实现该任务；若计划或关键状态变化，立即更新本文件。
-5. 按要求先执行 `cargo fmt --all`，再执行 `cargo clippy --all-targets -- -D warnings`，随后运行任务指定测试与不超过 30 分钟的完整测试；处理所有未被明确排期的失败。
-6. 更新 `TODO.md`：仅在任务及全部验收均完成后给标题加 `[DONE]`，并填写真实完成记录。只有阶段计划发生实质变化时才更新 `PLAN.md`。
-7. 检查最终差异和状态，将本次任务相关改动（若为中断续作则包括全部未提交文件）一次性提交，使用清晰的任务编号提交信息，然后停止，不处理下一任务。
+1. 读取 `TODO.md`，按标题中的 `[DONE]` 标记识别首个未完成任务，并完整提取其需求、依赖、验收标准和完成记录要求。
+2. 检查最新 Git 提交说明与当前工作区状态：
+   - 仅判断最新提交是否明确提到与当前任务直接相关的未完成问题；
+   - 保护用户已有改动；若是中断后恢复同一任务，则将所有当前未提交文件纳入最终原子提交；
+   - 不开展无边界的历史缺陷排查。
+3. 阅读当前任务直接涉及的设计文档、源码和测试，建立需求到实现/测试的对应关系；确认是否存在必须先解决的真实前置阻塞。
+4. 若无阻塞，按模块边界以小而集中的补丁完整实现当前任务，并同步补充必要的单元/集成测试和文档；每个关键阶段后复读改动并更新本文件进度。
+5. 先运行与改动直接相关的快速测试，定位并修复问题。任何发现的失败都按 `TODO.md` 的测试失败策略处理，不忽略既有失败。
+6. 按规定顺序执行最终验证：
+   - `cargo fmt --all`
+   - `cargo clippy --all-targets -- -D warnings`
+   - `cargo test --all --all-targets`（最长 30 分钟）
+   - 当前任务若要求额外验证（例如文档构建），也一并执行。
+7. 验证全部通过后，在 `TODO.md` 中给当前任务标题添加 `[DONE]`，填写准确的实现与验证完成记录；只有阶段级计划确实变化时才更新 `PLAN.md`。
+8. 审查最终 diff、任务范围和 Git 状态，确认没有遗漏、秘密或无关改动；使用包含任务编号的清晰消息提交所有本次应纳入的改动。
+9. 确认提交成功、工作区状态符合预期，记录最终提交和验证结果，然后停止，不处理下一个任务。
 
-## 当前状态
+## 当前进度
 
-- 已读取 `TODO.md` 并锁定首个未完成任务：`M1-2 Closed Turn、ToolPairing 与外部元数据`。
-- 本次不会进入后续 `M1-3` validator/commit 实现；只建立 M1-2 要求的 immutable closed
-  data shape、只读 API、serde DTO 边界和 crate-private draft/builder 边界。
+- [x] 在执行其他命令前建立本计划。
+- [x] 识别首个未完成任务：`M1-3 I1--I4 validator 与原子 commit 门`。
+- [x] 检查最新提交及工作区状态。
+- [x] 完成实现与针对性测试。
+- [x] 通过格式化、严格 lint、完整测试及任务专项验证。
+- [x] 更新 `TODO.md`：M1-3 标题已改为 `[DONE]` 并写入完成记录。
+- [ ] 提交本次任务并停止。
 
-## M1-2 细化计划
+## 决策记录
 
-1. 检查最新提交说明与工作区状态，确认是否存在直接关联的未完成问题或中断续作文件。
-2. 阅读 `PLAN.md` 的 Milestone 1 段、`docs/conversation-core.md` 中 Turn/identity/meta/serde
-   相关规范，以及现有 `conversation` 模块和测试/API 风格。
-3. 设计并分批实现：
-   - 字段私有且只读的 `Turn`、`TurnMeta`、`ToolPairing`；
-   - `Arc` 等共享只读 message 所有权，以及稳定、无锁的 serde data shape；
-   - closed `ToolPairing` 的公共视图始终含 `result_msg: MessageId`；
-   - crate-private draft/DTO，使 pending 可暂存无结果 pairing，但外部不能构造 live closed
-     `Turn`；受检反序列化入口推迟到 M1-3 的统一 validator；
-   - 确定性 equality、只读 getter、消费式/内部转换和完整 rustdoc。
-4. 添加聚焦测试：多 message、parallel pairing、parent/meta、共享 message 稳定性、DTO/serde
-   形状；用 compile-fail doctest 或 API 测试证明外部不能 raw construct、替换 message，且
-   closed pairing 不存在 `None` result。
-5. 依验证顺序运行 format、严格 clippy、聚焦测试、全量测试、rustdoc、diff check；任何失败
-   均按任务政策修复或明确排期。
-6. 完成后更新 README（若公共 API/能力说明需要）、`TODO.md` 标题与完成记录、此进度文件，
-   最终复核并提交一次，然后停止。
+- 已读取 `TODO.md` 并确定当前任务；后续不会越过 M1-3 处理 M1-R 或 M2。
+- 本文件记录可复核的计划、事实、决策与结果，不记录模型私有的逐字思维链。
+- 初始工作区除本文件外干净；最新提交 `b1721a8`（M1-2）没有声明额外未完成故障，
+  只把 DTO→live `Turn` 的唯一 validator 明确交给当前 M1-3，故无需新增前置任务。
 
-## 规范核对后的设计决策
+## 当前任务验收映射（M1-3）
 
-- 最新提交为已完成的 M1-1，未声明与 M1-2 相关的遗留问题；开始时工作区只有本文件的
-  计划更新。
-- `Turn` 内部用 `Arc<[ConversationMessage]>` 和 `Arc<[ToolPairing]>` 保存有序只读数据；
-  公共 getter 只返回共享切片，克隆 `Turn` 时共享底层 allocation，不提供构造器、裸容器、
-  mutable getter 或 replacement API。
-- live `ToolPairing.result_msg` 使用非可选 `MessageId`，因此 public closed view 在类型上不能
-  表达悬空配对；pending/restore 输入使用 crate-private `ToolPairingData` 的
-  `Option<MessageId>`。
-- `TurnMeta` 固定保存 `Usage`、调用方传入的 `Option<String>` 时间戳和来源、以及独立嵌套的
-  `serde_json::Map` 扩展数据；不引入时钟依赖，扩展字段也不能 flatten 覆盖 message/Turn
-  字段。
-- `Turn` 本任务只实现确定性 `Serialize`。crate-private `TurnData` 负责可反序列化 DTO 与稳定
-  JSON shape，可暂存 `result_msg: None`；live `Turn` 不实现 `Deserialize`，M1-3 再通过唯一
-  validator 增加受检转换，避免本任务提前留下 unchecked closed 构造路径。
-- 测试放入独立的 `src/conversation/turn/tests.rs`，覆盖稳定 JSON/DTO round-trip、多个消息、
-  parallel pairing、parent/meta、Arc 共享、读取前后消息不变、draft dangling 表达，以及
-  compile-fail API 边界。
+- 建立分类化 `ConversationError` / `CommitError`，覆盖 id 重复、provider call 配对错误、
+  role/block 与首尾状态错误、未完成 content、parent 错误及非原子提交相关分类。
+- 实现 canonical Turn 状态机：外部 user 起始，assistant/tool 轮次及 parallel tool results
+  严格闭合，最终为不含 tool use 的 assistant，closed Turn 禁止 system。
+- 将 content block 中的 provider call id 与显式 `ToolPairing` 双向核对，拒绝 orphan、
+  dangling、重复消费与跨 Turn 引用。
+- 让内存 draft 与 serde `TurnData` 共同通过唯一 validator，禁止 pending/partial 状态进入
+  live `Turn`。
+- 实现空 `Conversation` 和 crate-private draft commit；先在临时状态完整校验，成功后一次性
+  推进 history/version，任何失败都保持原对象全结构不变。
+- 正向测试：纯文本、单次 tool、串行多轮、parallel calls，并逐项验证 I1--I4。
+- 负向表驱动测试：全部指定错误类别，并对失败前后 Conversation 做全结构相等断言。
 
-## 执行进度
+## 已识别的实现顺序
 
-- 已新增 `conversation::turn` 并公开导出 `Turn`、`TurnMeta`、`ToolPairing`。
-- 已实现 live closed types、共享只读 getter、`TurnMeta` 外部元数据、`TurnData` /
-  `ToolPairingData` crate-private DTO，以及 live Turn 到 DTO 的单向序列化。
-- 已增加独立聚焦测试和三个 compile-fail API 示例，覆盖 raw construction、原地替换消息、
-  unchecked Turn deserialize 均不可用。
-- README 与 crate docs 已同步 closed Turn 能力及受检构造边界；`PLAN.md` 的阶段级计划没有
-  变化，无需修改。
+1. 审查 M1-2 的 `Turn`/DTO、Conversation 模块导出及 content/message/tool 模型。
+2. 对照规范文档中 I1--I4 与 commit/restore 章节，固定 validator 的精确语义。
+3. 先定义错误与受检 draft/DTO 转换边界，再实现纯 validator，最后接入原子 Conversation
+   commit，避免出现第二条 unchecked 构造路径。
+4. 用模块内测试覆盖 crate-private 入口，用公共 API/compile-fail 文档测试钉住外部不可绕过
+   的边界。
 
-## 验证进度
+## 规范审阅后的接口决策
 
-- `cargo fmt --all`：通过。
-- `cargo clippy --all-targets -- -D warnings`：通过；文档补充后复跑仍通过。
-- Turn 聚焦单测：6 passed；Turn compile-fail doctest：3 passed。
-- `cargo test --all --all-targets`：145 个库单测和 3 个离线集成测试通过，7 个真实 endpoint
-  测试按既有声明 ignored，0 failed。
-- 首次严格 rustdoc 发现 public 模块文档链接 crate-private `TurnData`；这是文档 warning，已将
-  私有类型名改为非链接代码文本；随后 format、clippy 与严格 rustdoc 均复跑通过。
-- 完整 `cargo test --doc`：1 个正向 doctest 与 5 个 compile-fail doctest 通过。
-- 实现差异的首次 `git diff --check` 通过；更新完成记录后的
-  `cargo fmt --all -- --check` 与最终 `git diff --check` 也通过。
+- 新增公开、只读的 `Conversation`：由外部 `ConversationId` 与 `ConversationConfig` 创建，
+  暴露 id/config/closed turns/version getter；不在 M1-3 提前公开 raw commit。
+- `Conversation::commit_draft` 保持 crate-private。它先构造完整的提交计划，validator 成功
+  且 version 可推进后才修改 `turns` 与 `version`，从而让所有错误路径保持对象全结构相等。
+- `ConversationError` 负责操作层失败，`CommitError` 负责候选 Turn 的分类化语义失败；
+  version 溢出单列为无法原子推进的错误。
+- `validation` 是唯一把 `TurnData` 转成 live `Turn` 的入口。validator 生成字段不可由其他
+  模块构造的 validated token；`Turn` 只消费该 token，不提供 raw crate-private constructor。
+- canonical role/block 采用两家 adapter 的公共可表达子集：User 只含 text/image，
+  Assistant 只含 text/thinking/tool-use，Tool 只含 tool-result，System 禁止；tool-result 的
+  内层输出只允许 text/image。
+- DTO 增加默认不出现在 closed serde 形状中的显式 completion marker。完整 Client
+  `Message` 仍允许合法 JSON `null`；只有 marker 为 complete 才可提交，因此 pending JSON
+  不能靠写成 `Value::Null` 绕过 I3。
 
-## 完成状态
+## 基线验证
 
-- M1-2 的实现、测试、文档和验证要求均已满足，`TODO.md` 标题已改为 `[DONE]` 并写入完成
-  记录。
-- 最终差异/状态已审查；剩余步骤仅为提交全部本次改动并确认提交后工作区干净。计划使用
-  `[M1-2] Add immutable closed turn data boundary`，提交后立即停止，不开始 M1-3。
+- `cargo test conversation`：通过（15 passed，1 个需真实凭据的 normalization 测试按既有
+  配置 ignored；0 failed）。
+
+## 实现进度记录
+
+- 已新增公开分类错误 `ConversationError` / `CommitError`，细分 turn/message/tool-call id、
+  provider call、role/block、首尾、partial、parent、pairing reference 与原子 version 推进。
+- 已新增 `Conversation` 空实例、只读 getter、私有 history/version 和 crate-private
+  `commit_draft`；所有可失败检查发生在修改 state 之前。
+- 已实现唯一 `validation` 门：canonical user→assistant→tool*→assistant 状态机，显式 pairing
+  与 content 双向核对，conversation-wide I4、cross-turn reference 及完整性 marker 校验。
+- `Turn` 现在只能消费 validator 私有字段的 certificate；旧 M1-2 fixture 也已改走 validator，
+  不再直接写 live `Turn` 字段。
+- 测试已拆分为 fixture/positive/negative/atomic 模块，覆盖纯文本、单次/串行/并行调用、
+  serde 同门恢复、完整 JSON null、全部指定负例及每个错误路径的全结构原子性。
+- 为保持 M1-2 `provider_call_id: Option<String>` 的既定模型，缺省 provider id 只在
+  call/result message anchors 唯一确定同一 content id 时接受；歧义输入分类拒绝，closed
+  pairing 保留原始 `None`。正反例均已覆盖。
+- 按文件规模要求把 validator 拆为 completion/identity、role/content sequence、pairing
+  三个聚焦模块；负向测试再按 state/content/identity/pairing/serde 拆分，重构后聚焦测试
+  保持通过。
+- README 与 crate docs 已更新当前能力；新增 compile-fail 文档测试钉住只读 history。
+
+## 当前验证结果
+
+- `cargo check --lib`：通过，0 warnings。
+- `cargo test conversation`：最终通过（33 passed，0 failed；1 个真实 endpoint 测试
+  ignored）。
+- `cargo test conversation::validation -- --nocapture`：通过（17 test functions，0 failed）。
+- `cargo clippy --all-targets -- -D warnings`：通过，0 warnings。
+- `cargo test --all --all-targets`：通过（163 个库单测与 3 个离线集成测试 passed，
+  7 ignored，0 failed；30 分钟硬上限内完成）。
+- `cargo test --doc`：通过（1 个正向与 6 个 compile-fail）。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：通过。
+- 实现验证后仅更新 `TODO.md`/本进度文件；按策略无需因此重跑完整 suite。
+- 最终 `git diff --cached --check`：通过；暂存清单共 22 个文件，均属于 M1-3 实现、测试、
+  README/TODO 与本进度记录，未包含 `PLAN.md`、`PROMPT.md` 或无关改动。

@@ -1,10 +1,9 @@
-use super::{ToolPairing, ToolPairingData, Turn, TurnData, TurnMeta};
+use super::{ToolPairing, ToolPairingData, Turn, TurnCompletion, TurnData, TurnMeta};
 use crate::{
     conversation::{ConversationMessage, MessageId, ToolCallId, TurnId},
     model::{content::ContentBlock, message::Message, message::Role, usage::Usage},
 };
 use serde_json::{Map, Value, json};
-use std::sync::Arc;
 
 const PARENT_ID: &str = "018f0d9c-7b6a-7c12-8f31-1234567890ab";
 const TURN_ID: &str = "018f0d9c-7b6a-7c12-8f31-1234567890ac";
@@ -53,10 +52,11 @@ fn closed_turn() -> Turn {
     let result_message = RESULT_MSG_ID
         .parse::<MessageId>()
         .expect("result message id");
+    let parent = PARENT_ID.parse::<TurnId>().expect("parent turn id");
 
-    Turn {
+    let data = TurnData {
         id: TURN_ID.parse::<TurnId>().expect("turn id"),
-        messages: Arc::from(vec![
+        messages: vec![
             message(
                 USER_MSG_ID,
                 Role::User,
@@ -115,24 +115,28 @@ fn closed_turn() -> Turn {
                     extra: Map::new(),
                 }],
             ),
-        ]),
-        pairings: Arc::from(vec![
-            ToolPairing {
+        ],
+        pairings: vec![
+            ToolPairingData {
                 call_id: FIRST_CALL_ID.parse::<ToolCallId>().expect("tool call id"),
                 provider_call_id: Some("provider-shanghai".to_owned()),
                 call_msg: call_message,
-                result_msg: result_message,
+                result_msg: Some(result_message),
             },
-            ToolPairing {
+            ToolPairingData {
                 call_id: SECOND_CALL_ID.parse::<ToolCallId>().expect("tool call id"),
                 provider_call_id: Some("provider-tokyo".to_owned()),
                 call_msg: call_message,
-                result_msg: result_message,
+                result_msg: Some(result_message),
             },
-        ]),
-        parent: Some(PARENT_ID.parse::<TurnId>().expect("parent turn id")),
+        ],
+        parent: Some(parent),
         meta: turn_meta(),
-    }
+        completion: TurnCompletion::Complete,
+    };
+
+    crate::conversation::validation::validate_turn_data(data, &[], Some(parent))
+        .expect("fixture must pass the sole closed-turn validator")
 }
 
 #[test]
@@ -209,8 +213,8 @@ fn cloning_a_turn_shares_storage_and_reading_preserves_message_identity_and_payl
         .map(ConversationMessage::id)
         .collect::<Vec<_>>();
 
-    assert!(Arc::ptr_eq(&turn.messages, &cloned.messages));
-    assert!(Arc::ptr_eq(&turn.pairings, &cloned.pairings));
+    assert!(std::sync::Arc::ptr_eq(&turn.messages, &cloned.messages));
+    assert!(std::sync::Arc::ptr_eq(&turn.pairings, &cloned.pairings));
     let _ = turn
         .messages()
         .iter()

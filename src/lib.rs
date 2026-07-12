@@ -16,9 +16,9 @@
 //! - [`adapter`] implements the Anthropic Messages and OpenAI Responses HTTP
 //!   and SSE protocols.
 //! - [`conversation`] adds externally supplied strong identities,
-//!   Conversation-level configuration, immutable message envelopes, and the
-//!   read-only closed-turn data boundary without changing the Client payload
-//!   model.
+//!   Conversation-level configuration, immutable message envelopes, the
+//!   canonical role/tool validator, and an atomic closed-turn commit boundary
+//!   without changing the Client payload model.
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are deliberately outside this crate. Those layers should persist and replay
