@@ -3,8 +3,9 @@
 use crate::{
     conversation::{MessageId, ToolCallId, TurnId},
     model::message::Role,
+    stream::accumulator::AccumulatorError,
 };
-use std::fmt;
+use std::{fmt, sync::Arc};
 use thiserror::Error;
 
 /// The content-block category reported by role/content validation.
@@ -265,12 +266,105 @@ pub enum CommitError {
     },
 }
 
+/// A pending assistant message could not advance or freeze safely.
+///
+/// Accumulator failures retain the original Client-layer error as a source so
+/// callers can still distinguish block lifecycle, incomplete JSON, and
+/// provider error events without Conversation duplicating that taxonomy.
+#[derive(Clone, Debug)]
+pub enum PendingMessageError {
+    /// A normalized stream event violated the Client accumulator contract.
+    Accumulator(Arc<AccumulatorError>),
+
+    /// A previous accumulation or freeze error made the partial state unusable.
+    Terminal,
+
+    /// The message was already frozen and cannot produce another identity.
+    AlreadyFrozen,
+
+    /// Stream events cannot be appended to an already complete response.
+    StreamEventForCompleteResponse,
+
+    /// LLM responses must freeze as assistant messages.
+    InvalidResponseRole {
+        /// Role carried by the complete Client response.
+        actual: Role,
+    },
+}
+
+impl From<AccumulatorError> for PendingMessageError {
+    fn from(source: AccumulatorError) -> Self {
+        Self::Accumulator(Arc::new(source))
+    }
+}
+
+impl fmt::Display for PendingMessageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Accumulator(source) => {
+                write!(formatter, "pending message accumulation failed: {source}")
+            }
+            Self::Terminal => {
+                formatter.write_str("pending message is terminal after a previous error")
+            }
+            Self::AlreadyFrozen => formatter.write_str("pending message has already been frozen"),
+            Self::StreamEventForCompleteResponse => {
+                formatter.write_str("a complete non-streaming response cannot accept stream events")
+            }
+            Self::InvalidResponseRole { actual } => write!(
+                formatter,
+                "pending LLM response must have assistant role, found {actual:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PendingMessageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Accumulator(source) => Some(source.as_ref()),
+            Self::Terminal
+            | Self::AlreadyFrozen
+            | Self::StreamEventForCompleteResponse
+            | Self::InvalidResponseRole { .. } => None,
+        }
+    }
+}
+
+impl PartialEq for PendingMessageError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Accumulator(left), Self::Accumulator(right)) => {
+                left.to_string() == right.to_string()
+            }
+            (Self::Terminal, Self::Terminal)
+            | (Self::AlreadyFrozen, Self::AlreadyFrozen)
+            | (Self::StreamEventForCompleteResponse, Self::StreamEventForCompleteResponse) => true,
+            (
+                Self::InvalidResponseRole { actual: left },
+                Self::InvalidResponseRole { actual: right },
+            ) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PendingMessageError {}
+
 /// A Conversation operation failed without changing committed state.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ConversationError {
     /// The candidate turn failed closed-turn validation.
     #[error("turn commit rejected: {0}")]
     Commit(#[from] CommitError),
+
+    /// A partial or complete assistant response could not freeze safely.
+    #[error("pending message operation failed: {0}")]
+    PendingMessage(
+        #[from]
+        #[source]
+        PendingMessageError,
+    ),
 
     /// History and version cannot be advanced together because the version is exhausted.
     #[error("commit cannot advance history and version atomically from version {current_version}")]

@@ -17,8 +17,9 @@
 //!   and SSE protocols.
 //! - [`conversation`] adds externally supplied strong identities,
 //!   Conversation-level configuration, immutable message envelopes, the
-//!   canonical role/tool validator, and an atomic closed-turn commit boundary
-//!   without changing the Client payload model.
+//!   canonical role/tool validator, an atomic closed-turn commit boundary, and
+//!   a non-serializable [`conversation::PendingMessage`] freeze boundary that
+//!   reuses the Client accumulator without changing the Client payload model.
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are deliberately outside this crate. Those layers should persist and replay

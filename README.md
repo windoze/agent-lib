@@ -8,7 +8,8 @@ wire 格式。
 当前实现包含完整态数据模型、可折叠的归一化流式事件、dyn-safe Client 抽象、
 Anthropic Messages 与 OpenAI Responses 的非流式/流式适配器、真实 endpoint 的跨
 provider 归一化验收，以及 Conversation Core 的强类型 identity、独立 system 配置、
-immutable message envelope、只读 closed Turn、I1--I4 validator 与原子 commit 数据边界。
+immutable message envelope、只读 closed Turn、I1--I4 validator、原子 commit 数据边界，
+以及不暴露 partial 的 stream/non-stream `PendingMessage` 冻结边界。
 已完成的 Client 层实施记录见
 [`docs/archive/2026-07-13-client-layer/TODO.md`](docs/archive/2026-07-13-client-layer/TODO.md)；
 当前 Conversation Core 阶段计划和任务见 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。
@@ -24,9 +25,10 @@ immutable message envelope、只读 closed Turn、I1--I4 validator 与原子 com
 - `stream`：用稳定 block id 关联增量事件，并通过统一 accumulator 折叠为完整响应。
 - `client`：dyn-safe `LlmClient`、分类错误、结构化 capability、endpoint 与请求配置。
 - `conversation`：外部注入的强类型 id、独立 system 配置、不可原地修改的消息 envelope、
-  共享只读 message 的 closed `Turn`、分类 commit 错误及唯一 I1--I4 校验门。
+  共享只读 message 的 closed `Turn`、分类 commit 错误、唯一 I1--I4 校验门，以及复用 Client
+  `Accumulator` 的单消息 pending/freeze 状态机。
 
-Conversation Core 正按任务顺序继续实现 closed Turn、pending、boundary、projection 与
+Conversation Core 正按任务顺序继续实现 PendingTurn/cancel、boundary、projection 与
 持久化；Agent loop、Tool registry 与多 agent 编排仍不在范围内。完整设计和当前阶段
 计划分别见 [`DESIGN.md`](DESIGN.md) 与 [`PLAN.md`](PLAN.md)。
 
@@ -62,7 +64,7 @@ Closed `Turn` 只暴露有序 message、完整 tool pairing、parent 和 metadat
 成功后才能一次性推进 Conversation history/version。失败会返回分类化
 `ConversationError`/`CommitError`，原 Conversation 全结构不变。
 
-当前公开 API 可以创建空 Conversation 并只读检查 closed history；M2 的 pending API 将复用
+当前公开 API 可以创建空 Conversation 并只读检查 closed history；后续 PendingTurn API 将复用
 已经建立的 crate-private commit 门，而不会暴露裸 message/turn push：
 
 ```rust
@@ -80,6 +82,26 @@ assert_eq!(conversation.id(), conversation_id);
 assert_eq!(conversation.config().system(), Some("回答简洁。"));
 assert!(conversation.turns().is_empty());
 assert_eq!(conversation.version(), 0);
+```
+
+单条 assistant response 在进入 PendingTurn 前先通过 `PendingMessage` 冻结。流式调用逐个
+`push(StreamEvent)`；非流式调用从完整 `Response` 创建同一状态机。两条路径都只在
+`finish` 成功时绑定调用方提供的 id，并把 usage、stop reason 与 provider metadata 和
+immutable message 一起返回；partial JSON、缺失 stop 或 error event 不会产生 message：
+
+```rust
+use agent_lib::{
+    client::Response,
+    conversation::{ConversationError, FrozenMessage, MessageId, PendingMessage},
+};
+
+fn freeze_response(
+    response: Response,
+    message_id: MessageId,
+) -> Result<FrozenMessage, ConversationError> {
+    let mut pending = PendingMessage::from_response(response);
+    pending.finish(message_id)
+}
 ```
 
 validator 接受的 canonical Turn 必须从一条 user message 开始，只允许完整闭合的

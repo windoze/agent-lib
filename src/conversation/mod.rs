@@ -11,6 +11,7 @@ pub mod config;
 pub mod error;
 pub mod id;
 pub mod message;
+pub mod pending;
 pub mod turn;
 #[cfg_attr(
     not(test),
@@ -22,9 +23,12 @@ pub mod turn;
 mod validation;
 
 pub use config::ConversationConfig;
-pub use error::{CommitError, ContentBlockKind, ConversationError, PairingMessageKind};
+pub use error::{
+    CommitError, ContentBlockKind, ConversationError, PairingMessageKind, PendingMessageError,
+};
 pub use id::{ArtifactId, ConversationId, MessageId, ToolCallId, TurnId};
 pub use message::ConversationMessage;
+pub use pending::{FrozenMessage, PendingMessage};
 pub use turn::{ToolPairing, Turn, TurnMeta};
 
 use turn::TurnData;
@@ -33,7 +37,7 @@ use turn::TurnData;
 ///
 /// A new value is empty and receives all identity and configuration from the
 /// caller. Public code can inspect committed state but cannot push raw turns;
-/// the future pending API will use the same crate-private atomic commit gate.
+/// the pending-turn API will use the same crate-private atomic commit gate.
 ///
 /// Committed history cannot be extended through its read-only slice:
 ///
