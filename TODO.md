@@ -203,13 +203,18 @@ enum StreamEvent {
 - 新增 5 个聚焦测试,覆盖 `Modality` 全变体 wire name、完整 Capability serde round-trip、两家默认表字段及克隆覆盖隔离。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test client::capability::tests`(5 passed),`cargo test --all --all-targets`(65 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
-### M3-3 [TODO] `EndpointConfig` 与请求参数类型
+### M3-3 [DONE] `EndpointConfig` 与请求参数类型
 **上下文**:`DESIGN.md` §1.1 endpoint config(base_url/auth/方言开关),独立于 wire protocol。探测证明认证方式因 endpoint 而异(Bearer vs api-key vs x-api-key)、需自定义 query param。
 **做什么**:
 - `client/mod.rs`:`struct EndpointConfig { base_url: String, auth: AuthScheme, query_params: Vec<(String,String)>, extra_headers: Vec<(String,String)> }`。
 - `enum AuthScheme { Bearer(String), Header { name: String, value: String }, None }`(覆盖 Foundry 的 Bearer / api-key)。
 - `struct ChatRequest { model: String, messages: Vec<Message>, tools: Vec<Tool>, system: Option<String>, max_tokens, temperature, stream: bool, provider_extras: Option<ProviderExtras>, ... }`(system 单列,归一化两家差异,见 conversation-core §1.2)。
 **验证**:serde round-trip;构造两个真实 endpoint 的 config 并断言。
+**完成记录**:
+- 2026-07-13: 实现可 serde 的 `EndpointConfig` 与 `AuthScheme`,支持 Bearer、任意认证 Header(`api-key`/`x-api-key`)及无认证,并以有序键值对列表保留 endpoint query/header 配置。
+- 实现 provider-neutral `ChatRequest`,单列 system prompt,承载消息、工具、必填输出 token 上限、可选 temperature、stream 开关及绑定 `ProviderId` 的请求侧方言字段;从 `client` 模块统一重导出新 API。
+- 新增 Anthropic Foundry Bearer/version header 与 OpenAI Responses Foundry `api-key`/`api-version` 两种真实配置形态、全部认证变体及完整/最小请求 round-trip 测试。
+- 验证通过:`cargo test client::config::tests`(3 passed),`cargo test client::request::tests`(2 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(70 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
 ### M3-4 [TODO] `LlmClient` trait
 **上下文**:`DESIGN.md` 一律 `#[async_trait]` + dyn-safe;两种消费姿势(流式 / collect 完整)。
