@@ -1,68 +1,60 @@
-# 当前任务执行计划
+# 当前执行计划
 
-## 决策摘要
+## 目标与边界
 
-- `TODO.md` 是任务顺序、需求、依赖、验证要求和完成记录的唯一权威来源。
-- 本次调用只处理首个标题未带 `[DONE]` 的任务；完成后立即停止，不进入后续任务。
-- 在读取 `TODO.md` 前不做开放式缺陷排查。选定任务后，只检查与该任务直接相关的实现、最新提交和验证状态。
-- 若发现会阻塞当前任务的真实前置缺陷，则按规则在 `TODO.md` 中加入最少量的前置任务、保持当前任务未完成、提交任务表变更并停止。
-- 若能够完成任务，则实现全部要求，按规定顺序执行格式化、严格 lint、完整测试和文档验证，更新 `TODO.md` 的标题及完成记录，最后提交所有本次任务范围内以及任何遗留的未提交文件。
-- 不把 `PLAN.md` 当作日常进度日志；只有阶段级顺序、依赖、假设或完成标准变化时才更新。
+- 本次调用只处理 `TODO.md` 中标题未带 `[DONE]` 的第一个任务。
+- `TODO.md` 是任务顺序、依赖、验收条件和完成记录的唯一事实来源；仅当阶段级计划发生变化时才修改 `PLAN.md`。
+- 不做开放式历史问题扫描。只检查当前任务、最新提交中与当前任务直接相关的未完成事项，以及验证过程中实际暴露的失败。
+- 不以缩小范围、特殊分支或替代表示规避规范问题。若出现阻塞当前任务的真实前置缺口，则按要求在 `TODO.md` 中增加最少的前置任务、提交并停止。
 
-## 分步执行计划
+## 执行步骤
 
-1. 读取 `TODO.md`，从上到下找出首个标题未带 `[DONE]` 的任务，摘录其需求、依赖、验收条件和完成记录要求。
-2. 查看最新一次提交的主题与必要详情，判断是否明确提到与当前任务直接相关的未完成问题。
-3. 检查工作区状态；区分用户既有改动、上次中断遗留改动和当前任务所需改动，避免覆盖或丢失任何内容。
-4. 仅读取当前任务直接涉及的设计、代码和测试，建立需求到实现及验证的对应关系；若遇到阻塞性规格缺口，按“最少前置任务”规则处理并停止。
-5. 用小而聚焦的补丁完成实现和测试；每完成关键步骤即更新本文件的进度和必要的计划调整。
-6. 按顺序运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`（完整测试最长 30 分钟）以及任务要求的其他验证；修复所有未被后续明确任务覆盖的失败。
-7. 必要时运行 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`，并核对当前任务的全部验收项。
-8. 在 `TODO.md` 中给任务标题加 `[DONE]`，填写准确的完成记录和验证结果；仅在阶段计划确实变化时修改 `PLAN.md`。
-9. 复查 diff 和工作区，提交本次完整任务；提交信息包含任务编号和清晰描述。
-10. 确认提交成功、工作区状态符合预期，然后停止，不开始下一个任务。
+1. 读取 `TODO.md`，按标题的 `[DONE]` 前缀确定第一个未完成任务，并完整提取其需求、依赖和验证要求。
+2. 检查工作区状态和最新提交；保留用户已有改动，并只把最新提交中明确提到且直接影响当前任务的未完成问题纳入范围。
+3. 阅读当前任务涉及的设计文档和实现/测试代码，建立需求到代码与测试的对应关系；若发现具体阻塞前置条件，立即更新本文件和 `TODO.md`，不继续绕过问题。
+4. 以小而聚焦的补丁完成实现，并补充覆盖正常路径、边界情况、错误路径和序列化/兼容性要求的测试；每完成关键步骤即更新本文件。
+5. 按指定顺序验证：`cargo fmt --all`，然后 `cargo clippy --all-targets -- -D warnings`，再运行任务要求的测试及 `cargo test --all --all-targets`（完整测试最长 30 分钟），最后按任务要求运行文档构建等检查。
+6. 对任何测试失败进行根因处理：修复整类缺陷；若确属已明确排期的后续任务则核对记录，否则修复或插入最少的前置/跟进任务。在存在未处理、未排期失败时不标记完成。
+7. 验收全部通过后，在 `TODO.md` 的任务标题前加 `[DONE]` 并填写可复核的完成记录（实现、测试命令及结果）；仅在阶段级依赖或完成标准变化时更新 `PLAN.md`。
+8. 复查差异和工作区状态，确保没有遗漏本次恢复任务应纳入的未提交文件；创建一个清晰描述该任务的 Git 提交。
+9. 确认提交成功、工作区状态符合预期后停止，不开始下一个任务。若本次恰好完成全部任务，则额外执行最终审查并按要求创建 `endtag`。
 
-## 当前进度
+## 进度记录
 
-- [x] 在执行其他命令前创建本计划文件。
-- [x] 识别首个未完成任务：`M4-3 Anthropic 流式(SSE) → StreamEvent`。
-- [x] 核对最新提交与工作区状态：最新提交为完整的 M4-2；未声明 M4-3 阻塞项；初始工作区无代码遗留，仅本计划文件被本次修改。
-- [x] 完成实现与针对性测试：Anthropic 流聚焦测试 15 项、统一 Accumulator 聚焦测试 13 项均通过。
-- [x] 完成格式化、lint、完整测试及文档验证；真实 endpoint 文本/工具流式测试也已通过。
-- [x] 更新 `TODO.md`：仅 `M4-3` 标为 `[DONE]`，`M4-R` 保持未完成；阶段计划未变化，未修改 `PLAN.md`。
-- [x] 已提交本次完整任务；最终进度状态将 amend 到同一提交后停止，不进入下一任务。
+- 已建立初始执行计划。
+- 已完整读取 `TODO.md` 并锁定本次唯一任务：`M4-R [TODO] Milestone 4 Review`；后续 `M5-1` 及之后任务不在本次范围。
+- 当前任务的明确验收点为：同一 prompt 的非流式结果与流式折叠结果一致；Anthropic index 到稳定 block id 的映射正确；tool JSON 只在完整累积后解析；thinking signature 保留；Foundry cache 明细及其他方言字段进入 `extra`；环境可用时真实非流式/流式/tool 集成测试全部通过。
 
-## M4-3 任务边界与验收映射
+## M4-R 专项审阅路径
 
-- 解析 Anthropic SSE 的 `message_start`、`content_block_start`、`content_block_delta`、`content_block_stop`、`message_delta`、`message_stop`，产出统一 `StreamEvent`。
-- 在适配器内部维护 Anthropic `index` 到稳定 `BlockId` 的映射；text、thinking、tool_use 分别映射为 `BlockKind::Text`、`Reasoning`、`ToolInput`。
-- text/input_json/thinking delta 分别映射为 `Delta::Text`、`Json`、`Reasoning`；工具 JSON 只累积，完成边界发出 `ToolInputAvailable`。
-- 用真实探测 SSE fixture 覆盖事件顺序、跨分片解析和 id 关联；把事件交给唯一 `Accumulator`，断言折叠结果与非流式响应结构一致。
-- 增加默认忽略的真实流式集成测试，覆盖文本 `count 1..5` 与 `get_weather(Tokyo)` 工具调用，并限制单测试运行时间低于一分钟。
-- 实现完整的 `LlmClient::chat_stream` 路径，正确应用 endpoint/auth/query/header，非 2xx 和传输/协议错误继续使用统一 `ClientError` 分类。
-- 只有全部验收和仓库级验证通过后，才把 `M4-3` 标题改成 `[DONE]` 并填写完成记录；`M4-R` 保持未完成。
+1. 检查 Git 工作区与最新提交，只识别与 M4-R 直接相关的遗留事项，并保留所有已有未提交改动。
+2. 对照 M4-1 至 M4-3 的实现、单元测试、真实 fixture 和集成测试，逐项建立 M4-R 验收证据。
+3. 重点核对是否已有“同一 prompt”下非流式 `Response` 与流式经统一 `Accumulator` 折叠结果的直接一致性断言；若没有，补充不依赖网络且可稳定复现的端到端回归测试，避免只凭两组独立测试推断一致性。
+4. 核对稳定 block id、tool JSON 完整边界、thinking signature、顶层/块级/usage 级 `extra` 的测试覆盖；只修复实际缺口，不触碰 OpenAI 适配器任务。
+5. 按顺序运行格式化、严格 clippy、完整测试和文档构建；若 `.envrc` 能提供 Anthropic 测试所需变量，则加载后执行全部 ignored Anthropic 真实集成测试，并确保单项均在一分钟内结束。
+6. 全部通过后将标题改为 `M4-R [DONE]`，填写详细完成记录，复查差异并提交本任务的全部未提交文件，然后停止。
 
-## 实现设计（完成相关源码审阅后细化）
+## 审阅发现
 
-1. 添加轻量 `eventsource-stream` 依赖，把任意 HTTP 字节分片按 SSE 标准解成完整 event；不手写易漏掉 UTF-8 跨分片、多行 data、CRLF 等边界的传输解析器。
-2. 新建模块化的 `adapter/anthropic/stream/`：
-   - serde 解码 Anthropic 事件 envelope；只忽略明确的 `ping`，未知/错序/重复事件均返回 `ClientError::Protocol`。
-   - 状态机维护 message 生命周期、`index -> anthropic-block-{index}`、各 block kind、tool JSON 原始片段和最终 stop reason。
-   - `message_start` 与 `message_delta` 的 Anthropic usage 是累计快照；先转成非负增量再发 `Usage`，避免统一 `Accumulator::merge` 重复计算 output tokens。
-   - 工具块只在 stop 边界解析完整 JSON，依次发 `ToolInputAvailable` 与 `BlockStop`；非法 JSON直接形成协议错误。
-   - 正常 `message_stop` 后结束流；HTTP body/SSE/生命周期中途终止均形成可观察错误。
-3. 补齐 thinking signature：Anthropic 实际协议含 `signature_delta`，而当前模型不能把它折叠进 `ContentBlock::Thinking.signature`。为 `Delta` 增加 provider-neutral 的 `ReasoningSignature`，并在唯一 `Accumulator` 中按 reasoning block 累积；同时增加回归测试。该修复是 M4-3 正确实现和 M4-R 验收的直接前提，不另行拆任务。
-4. 补齐流式响应 metadata 逃生舱：真实 Foundry `message_stop` 含 `amazon-bedrock-invocationMetrics`，现有事件模型会令折叠后的 `Response.extra` 永远为空。新增通用 `ResponseMetadata` 事件，并让 Accumulator 合并 message start/delta/stop 的未建模顶层字段，避免把响应 metadata 错塞进 usage 或直接丢弃。
-5. 在 `AnthropicAdapter` 上提供 inherent `chat_stream`，并实现 `LlmClient`（capability、非流式、流式均转发到既有路径）。成功响应校验 SSE content type；非 2xx 保留 body、HTTP 分类和 `Retry-After`。
-6. 测试分层：真实形态 SSE fixture 的任意字节分片解析；text/tool/thinking/signature/id/usage/metadata/event-order 错误；统一 Accumulator 折叠；本地 HTTP 流式传输与错误分类；默认 ignored 的真实文本及工具集成测试。
+- Git 初始状态仅有本文件的本次计划更新；最新提交 `eed8f81 [M4-3] Implement Anthropic streaming SSE adapter` 未声明与 M4-R 直接相关的未完成问题。
+- 文本录制流测试 `real_text_sse_maps_events_and_matches_complete_response_shape` 将真实 SSE 规范化、折叠后，与同一输出对应的完整 Anthropic JSON 解析结果做 `assert_eq!`，覆盖 content、usage、stop reason 和 response extra 的全结构一致性。
+- 工具录制流测试 `real_tool_sse_keeps_raw_fragments_and_publishes_complete_input_at_stop` 同样与完整响应做全结构相等断言，并明确断言原始 JSON fragments、完整 `ToolInputAvailable` 与 `BlockStop` 的发布顺序。
+- `interleaved_provider_indices_keep_stable_ids_and_start_order` 覆盖非连续且交错的 provider index `2/7` 映射为稳定 id `anthropic-block-2/7`，并验证按 block start 顺序折叠。
+- `partial_tool_json_is_not_parsed_until_block_stop` 证明残缺 JSON delta 到达时不会解析，只有完整边界 `content_block_stop` 才返回协议错误；不存在边流边 parse 的绕行实现。
+- `thinking_signature_deltas_survive_normalization_and_folding` 证明分片 signature 经 `ReasoningSignature` 拼接后完整落入 `ContentBlock::Thinking.signature`。
+- 完整响应测试覆盖顶层、content block 与 usage 三层逃生舱；流式文本 fixture 覆盖 `usage.cache_creation.ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens` 以及顶层 `amazon-bedrock-invocationMetrics` 合并到最终 `Response.extra`，且流式/非流式完整结果相等。
+- 真实集成测试共有三项：非流式文本、流式文本、流式工具调用；每项均有 55 秒超时，满足单测试少于一分钟的要求。
+- 当前未发现阻塞 M4-R 或要求新增前置任务的规范偏差；进入验证阶段。
 
-## 完成证据
+## 验证与完成状态
 
-- 真实 Foundry 探测确认 text 流、工具流和累计 usage 形态；脱敏 fixture 已覆盖 `count 1..5` 与拆分后的 `{"city": "Tokyo"}`。
-- 流式生产代码已按职责拆为 103 行传输入口、87 行 SSE 解码驱动、455 行事件状态机、55 行 usage 快照转换和 173 行 wire 类型，测试另拆 parsing/errors/transport 三个模块。
-- `cargo fmt --all`：通过。
+- `cargo fmt --all`：通过，未产生源码格式改动。
 - `cargo clippy --all-targets -- -D warnings`：通过，无 warning。
-- `cargo test --all --all-targets`：101 passed、0 failed、3 ignored。
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：通过。
-- 加载 `.envrc` 后运行 `cargo test --test integration_anthropic -- --ignored --nocapture`：3 passed（非流式 hi、流式 count、流式 get_weather Tokyo），总耗时 2.30 秒。
-- staged diff 检查后为三份 SSE fixture 增加合法的注释终止行,既保留最后事件所需的空行分隔又消除 trailing blank line；随后重新运行 Anthropic 流聚焦测试(15 passed)和全量测试(101 passed,3 ignored),结果仍为绿色。
+- `cargo test --all --all-targets`：通过；101 项单元测试通过，0 失败；真实 Anthropic 测试按默认配置 3 项 ignored。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：通过，无文档 warning。
+- 安全检查确认 `.envrc` 中 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN` 均可用，未输出凭据值。
+- 加载 `.envrc` 后执行 `cargo test --test integration_anthropic -- --ignored --nocapture`：3 项全部通过，0 失败，总耗时 2.73 秒；每项均远低于一分钟上限。
+- 已将 `TODO.md` 中唯一当前任务标题更新为 `M4-R [DONE] Milestone 4 Review`，并写入逐项审阅证据与全部验证结果。
+- 阶段顺序、依赖和完成标准均未变化，因此按约束不修改 `PLAN.md`。
+- 最终 diff 与空白错误检查通过；已创建 `[M4-R] Complete Anthropic milestone review` 提交，纳入 `TODO.md` 和本进度文件。
+- 剩余步骤：把本条最终状态并入同一任务提交，确认提交和工作区状态后停止，不进入 M5。

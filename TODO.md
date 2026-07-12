@@ -298,13 +298,18 @@ trait LlmClient: Send + Sync {
 - 使用脱敏的真实 Foundry text/tool SSE fixture 增加 15 个 Anthropic 流聚焦测试,覆盖任意字节分片、事件序列、稳定 id、交错 block、tool JSON、thinking signature、累计 usage、metadata、错序/中断/错误分类及本地 HTTP/dyn client；统一 Accumulator 聚焦测试 13 项通过。
 - 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(101 passed,3 ignored),加载 `.envrc` 后 `cargo test --test integration_anthropic -- --ignored --nocapture`(3 passed,2.30s),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
-### M4-R [TODO] Milestone 4 Review
+### M4-R [DONE] Milestone 4 Review
 **验证清单**:
 - 非流式与流式折叠结果一致(同一 prompt)。
 - index→稳定 id 映射正确;tool JSON 仅累积后 parse;thinking signature 保留。
 - Foundry 方言字段(cache_creation.ephemeral_*、其他)未丢失(进 extra)。
 - 真实集成测试(非流式/流式/tool)通过(有环境变量时)。
 - 更新本文件 M4 标记 `[DONE]`。
+**完成记录**:
+- 2026-07-13: 对照 M4-1 至 M4-3 与 `PLAN.md` 的 streaming 三纪律完成 Anthropic 里程碑审阅；录制的真实 text/tool SSE 均经唯一 `Accumulator` 折叠，并与同一输出对应的完整响应解析结果做全结构相等断言。
+- 确认非连续、交错 provider index 映射为稳定 `anthropic-block-{index}` id；tool 参数 delta 保持原始 JSON 文本且只在 block stop 完整边界解析，残缺 JSON 返回协议错误；thinking signature 分片可完整折叠回 `ContentBlock::Thinking.signature`。
+- 确认完整态顶层/内容块/usage 逃生舱与流式 `ResponseMetadata` 均生效；`cache_creation.ephemeral_5m_input_tokens`/`ephemeral_1h_input_tokens`、`amazon-bedrock-invocationMetrics` 等 Foundry 字段保留在相应 `extra` 中，流式与非流式结果一致。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(101 passed,3 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_anthropic -- --ignored --nocapture`(3 passed,2.73s)。
 
 ---
 
