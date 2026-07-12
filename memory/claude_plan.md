@@ -124,3 +124,64 @@
 - 实现验证后仅更新 `TODO.md`/本进度文件；按策略无需因此重跑完整 suite。
 - 最终 `git diff --cached --check`：通过；暂存清单共 22 个文件，均属于 M1-3 实现、测试、
   README/TODO 与本进度记录，未包含 `PLAN.md`、`PROMPT.md` 或无关改动。
+
+# 本次调用执行计划（2026-07-13）
+
+## 目标与边界
+
+- 以 `TODO.md` 为唯一任务顺序与验收来源，识别并完成标题中第一个没有 `[DONE]` 前缀的任务。
+- 本次只完成一个既有任务；只有遇到使正确实现不可能的具体前置阻塞时，才在 `TODO.md` 中插入最少的新前置任务并停止。
+- 不进行开放式历史缺陷扫描；只处理当前任务的依赖、直接回归，以及验证过程中出现且未被明确排期的失败。
+- 保留用户已有工作；先检查工作树和最近提交，再判断哪些未提交内容属于本次任务或恢复中的同一任务。
+
+## 分步计划
+
+1. 读取 `TODO.md`，从上到下确认第一个标题未标记 `[DONE]` 的任务，记录其要求、依赖、测试与完成记录格式。
+2. 查看最新提交说明与工作树状态，只核对它们是否与该任务直接相关；若最新提交明确提及相关未完成问题，将其纳入任务或登记为前置依赖。
+3. 阅读该任务直接涉及的 `PLAN.md` 段落、设计文档、源码和测试，建立当前行为与验收要求的对应关系。
+4. 按小而聚焦的补丁实现完整任务；每完成关键实现或计划发生变化，就回写本文件的“进度记录”。
+5. 增补或调整覆盖正常路径、边界条件与错误路径的测试；如发现规范不匹配，修复整个同根因类别，不使用临时绕行。
+6. 按规定顺序验证：`cargo fmt --all`，然后 `cargo clippy --all-targets -- -D warnings`，再运行任务相关测试，最后运行不超过 30 分钟的 `cargo test --all --all-targets`；按任务要求补充文档构建等检查。
+7. 若出现未排期测试失败，先修复或在 `TODO.md` 中加入最少且顺序正确的任务；未解决前不把当前任务标记为完成。
+8. 验收全部通过后，在 `TODO.md` 的任务标题前添加 `[DONE]` 并填写真实完成记录；仅在阶段级计划确有变化时更新 `PLAN.md`。
+9. 复查差异与状态，以清晰的任务编号提交本次全部应纳入的未提交文件，然后停止，不开始下一任务。
+
+## 当前进度
+
+- [完成] 初始计划已写入，随后完整读取 `TODO.md`。
+- [完成] 首个未完成任务确认为 `M1-R Milestone 1 Review`；本次不进入 M2。
+- [完成] 工作树基线除本计划文件外干净；最新提交 `1c48573` 是已完成的 M1-3，提交说明未声明与 M1-R 直接相关的遗留故障。
+- [完成] 对照规范 §1--§4 审阅 M1 代码、测试、公开 API、serde 边界与 adapter 可表达性。
+- [完成] 修正两处陈旧 serde/validator rustdoc，新增同一 canonical Turn 的双 adapter 离线回归测试。
+- [完成] format、严格 clippy、M1 聚焦测试、全量测试、doc tests 与严格 rustdoc 均通过。
+- [完成] `TODO.md` 已将 M1-R 标为 `[DONE]` 并记录审阅/验证；最终未暂存 diff 与状态审查通过。
+- [完成] 本任务 5 个文件已全部暂存，`git diff --cached --check` 与 staged 清单复核通过；本文件将随 M1-R 原子提交，提交后立即停止。
+
+## M1-R 审阅检查表
+
+- identity 分层：Client `Message` 不含 Conversation id；五类强类型 id 不混用且由外部注入。
+- immutable envelope / closed Turn：字段与共享所有权不可由 public API 原地修改或替换。
+- 唯一信任门：内存 draft 与 serde DTO 均经 I1--I4 validator；不存在 raw push、unchecked closed constructor 或反序列化绕行。
+- canonical 语法：user 起始、assistant/tool round-trip 完整闭合、final assistant、system 独立；Anthropic/OpenAI request mapper 均能表达。
+- M2 接口边界：列明并核实唯一 crate-private draft/commit 路径，不提前公开 partial。
+- 验收：M1 聚焦测试与 I1--I4 人工映射、公共 rustdoc、format、严格 clippy、全量测试、rustdoc、diff check。
+
+## 审阅发现与处理决定
+
+- 公开封装符合要求：`Turn` 没有 public/raw constructor 或 `Deserialize`；`Conversation::turns`、`Turn::messages`、`ConversationMessage::payload` 均只返回共享只读引用；Client `Message` 仍只有 role/content。
+- 唯一受检物化链为 `TurnData → validation::validate_turn_data → ValidatedTurnData → Turn::from_validated`；certificate 字段对 sibling 不可构造。唯一 history 推进入口为 crate-private `Conversation::commit_draft`，它在修改 history/version 前完成 version、parent、I1--I4 全部检查。
+- canonical 允许矩阵是 User(text/image)、Assistant(text/thinking/tool-use)、Tool(tool-result[text/image])，System 只在 `ConversationConfig`；逐项与 Anthropic/OpenAI request mapper 对照后没有发现表示缺口，assistant image 已由 validator 明确拒绝。
+- 待修正文档：`turn.rs` 两处仍写“M1-3 将验证/直到 M1-3”，与当前已完成状态不符，会造成 serde 信任边界承诺含糊。
+- 待补测试：新增离线 Review 回归，以同一个经 validator commit 的、覆盖 text/image/thinking/parallel tool 的 canonical Turn 分别调用两家 `build_request`，证明 mapper 接受且 system 仍单列。
+- 不更新 `PLAN.md`：阶段顺序、依赖、假设和完成标准均未变化。
+
+## M1-R 验证结果
+
+- `cargo fmt --all`：通过。
+- `cargo clippy --all-targets -- -D warnings`：通过，0 warning。
+- `cargo test conversation`：通过，34 passed；真实 endpoint normalization case 仍按既有配置 ignored。
+- `cargo test --all --all-targets`：通过，164 个库单测与 3 个离线集成测试 passed，7 个真实 endpoint 测试 ignored，0 failed；由 1800 秒 subprocess timeout 约束，实际 2 秒内完成。
+- `cargo test --doc`：通过，1 个正向示例与 6 个 compile-fail API 边界测试。
+- 首次严格 rustdoc 发现公开文档链接到私有 DTO；已改为不泄漏私有类型的文字承诺。此后只改注释，按任务策略复用上述全量绿灯结果。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：修正后通过。
+- `git diff --check`：通过；当前 5 个变更文件均属于 M1-R，未修改 `PLAN.md` 或 `PROMPT.md`。

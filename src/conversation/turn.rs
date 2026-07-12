@@ -134,7 +134,8 @@ impl Turn {
 /// Serializes a live turn through the validator-facing data-transfer shape.
 ///
 /// There is intentionally no inverse `Deserialize` implementation on
-/// [`Turn`]: persisted input must remain data until M1-3 validates it.
+/// [`Turn`]: persisted input remains in the crate-private data-transfer shape
+/// until the same validator used by in-memory commits certifies it.
 impl Serialize for Turn {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -245,8 +246,8 @@ impl TurnMeta {
 ///
 /// This is data, not a certified closed [`Turn`]. Its tool-pairing DTO permits
 /// `result_msg: None` so pending state and untrusted persisted input can be
-/// represented without weakening the public closed type. M1-3 will validate
-/// this shape before constructing a live turn.
+/// represented without weakening the public closed type. The sole
+/// Conversation validator checks this shape before constructing a live turn.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TurnData {
     pub(crate) id: TurnId,
