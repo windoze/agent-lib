@@ -392,3 +392,30 @@ trait LlmClient: Send + Sync {
 - 回溯 DESIGN.md §5 Client 层约束逐条满足:Capability 结构化 / error 分类 / usage 一等 / ContentBlock / streaming 三纪律 / 三逃生舱。
 - 确认 Client 层为 Conversation 层提供了完备类型(Message/ContentBlock/StreamEvent/Usage),可开始 Conversation 层实现。
 - 更新本文件 M6 标记 `[DONE]`;在 PLAN.md 记录 Client 层完成。
+
+---
+
+## Client 层完成后的交接任务
+
+### NEXT-1 [TODO] 归档 Client 层计划并建立 Conversation Core 计划
+**前置条件与上下文**:
+- 仅在 M6-1 至 M6-R 全部完成并标记为 `[DONE]` 后执行;本任务不补做或跳过任何 Client 层验收。
+- 执行本任务前,根目录 `PLAN.md` 与 `TODO.md` 是 Client 层的完整计划和实施记录;`docs/conversation-core.md` 是下一阶段 Conversation Core 的规范性设计输入,其中 §11 已给出实现顺序:Turn 与 I1--I4 不变量 → pending/cancel → boundary/revert/fork → projection/compaction → serde/持久化。
+- 归档目标固定为 `docs/archive/2026-07-13-client-layer/`。当前这条 NEXT-1 任务也属于 Client 层历史交接记录,必须随旧 `TODO.md` 一起进入归档;不要先用新内容覆盖根目录文件而丢失历史。
+
+**做什么**:
+1. 创建 `docs/archive/2026-07-13-client-layer/`,将执行本任务时的根目录 `PLAN.md`、`TODO.md` 原样归档为该目录下的 `PLAN.md`、`TODO.md`。归档文件须保留全部 `[DONE]` 状态、完成记录、验证结果以及本任务,不得改写成 Conversation Core 内容。
+2. 在根目录重新创建 `PLAN.md`,以 `docs/conversation-core.md` 的完整设计和当前已落地的 Client 公共类型为依据,格式参照归档后的 `PLAN.md`。新计划至少应明确:范围与非目标、已定不变量/关键决策、里程碑与依赖顺序、建议目录和公共 API 边界、测试策略、serde/持久化边界,以及每阶段独立 Review 的要求。不得重新发明或弱化 `docs/conversation-core.md` 已确定的 message immutability、Turn/tool 配对、pending cancel 闭合、受检 Boundary、逻辑 head、O(1) fork、Projection 仅覆盖完整 Turn 等约束。
+3. 在根目录重新创建 `TODO.md`,格式参照归档后的 `TODO.md`,并将新 `PLAN.md` 拆成可按顺序执行的 Conversation Core 实现任务。任务列表必须同时满足:
+   - 按真实依赖和实现顺序分 Milestone 排列;每个实现任务使用 `M<里程碑>-<序号>` 编号(如 `M1-1`、`M1-2`),编号在各 Milestone 内连续且不重复。
+   - 每个尚未执行的任务标题都保留 `[TODO]` 标记;不得预先写成 `[DONE]` 或添加虚构的完成记录。
+   - 每个任务都包含足够的“上下文”“做什么”和“验证”信息,直接写明涉及的现有/新增模块与核心类型、必须维持的不变量、前置依赖、错误与边界行为及需要新增的测试;不能只写“参照 `docs/conversation-core.md`”而迫使 coding agent 反复搜索仓库。
+   - 每个任务都定义可判定的完整验收条件,既包含该任务的聚焦测试和关键行为断言,也包含与改动风险相称的格式化、严格 lint、全量测试及文档构建要求;涉及持久化时必须包含存盘→恢复→`effective_view` 一致性验证。
+   - 每个 Milestone 的最后单列一个 `M<里程碑>-R [TODO]` Review 任务,核对本阶段设计约束、实现、测试、公共 API 文档和下一阶段前置条件的正确性与完整性;Review 不得并入最后一个实现任务。
+4. 核对新 `PLAN.md` 的里程碑与新 `TODO.md` 一一对应,并检查仓库中描述“Client 层当前计划/任务”的链接或文字引用;只有在语义确实指向历史 Client 计划时才改为归档路径,指向当前实施计划的入口应继续使用根目录 `PLAN.md`/`TODO.md`。
+
+**验证**:
+- `docs/archive/2026-07-13-client-layer/PLAN.md` 与 `docs/archive/2026-07-13-client-layer/TODO.md` 均存在,内容分别是归档前的 Client 层计划与完整任务/完成记录;归档 `TODO.md` 中仍能找到 `M1-1`、`M6-R` 和 `NEXT-1`。
+- 根目录 `PLAN.md`、`TODO.md` 均存在且只规划 Conversation Core 后续工作;两者明确以 `docs/conversation-core.md` 为设计依据,里程碑名称、顺序和交付物互相一致,不把 Agent loop、Tool registry 或多 agent 编排混入范围。
+- 人工逐项审查根目录 `TODO.md`:所有实现任务编号唯一且有序,每个标题含 `[TODO]`,每项均有具体上下文/实施内容/可判定验证条件,每个 Milestone 均以独立的 `Mx-R [TODO]` Review 收尾,并且不存在预先标记的 `[DONE]` 任务。
+- 检查改动和文档引用无空白错误或明显失效路径,并依次通过 `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 与 `git diff --check`。
