@@ -8,10 +8,12 @@
 pub mod config;
 pub mod id;
 pub mod message;
+pub mod turn;
 
 pub use config::ConversationConfig;
 pub use id::{ArtifactId, ConversationId, MessageId, ToolCallId, TurnId};
 pub use message::ConversationMessage;
+pub use turn::{ToolPairing, Turn, TurnMeta};
 
 #[cfg(test)]
 mod tests {

@@ -63,7 +63,7 @@ Client `Message` 回填 Conversation id。
   `cargo test --all --all-targets`（142 passed、7 ignored、0 failed）；
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
-### M1-2 [TODO] Closed `Turn`、`ToolPairing` 与外部元数据
+### M1-2 [DONE] Closed `Turn`、`ToolPairing` 与外部元数据
 
 **前置依赖**：M1-1。
 
@@ -94,6 +94,28 @@ Client `Message` 回填 Conversation id。
   Turn 内替换 message。
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增并导出字段私有的 `Turn`、`ToolPairing` 与 `TurnMeta`；`Turn` 通过
+  `Arc<[ConversationMessage]>`/`Arc<[ToolPairing]>` 共享有序只读数据，仅提供 id、message、
+  pairing、parent 与 meta getter，不提供 public 构造、裸容器、mutable getter 或替换 API。
+- closed `ToolPairing.result_msg` 固定为非可选 `MessageId`，同时独立保留框架
+  `ToolCallId`、可选 provider call id 和 call/result message id；`TurnMeta` 承载聚合
+  `Usage`、调用方提供的可选时间戳/来源及独立嵌套扩展字段，不读取时钟也不能覆盖历史
+  payload。
+- 新增 crate-private `TurnData`/`ToolPairingData`，作为 draft 与 serde DTO 可表达 pending
+  的 `result_msg: None`；live `Turn` 只单向序列化到同一稳定 data shape，未实现 unchecked
+  `Deserialize` 或 DTO→live 构造，受检转换明确留给 M1-3 唯一 validator。
+- 聚焦测试覆盖 4-message Turn、两个 parallel tool pairing、parent/meta、稳定 DTO serde
+  round-trip、closed pairing 缺失/null result 拒绝、Arc pointer sharing 及读取前后 message
+  id/payload 不变；三个 compile-fail doctest 分别钉住消息不可替换、live Turn 不可直接
+  deserialize、外部不可 raw construct。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test conversation::turn`（6 passed）；`cargo test --doc`（1 个正向与 5 个
+  compile-fail passed）；`cargo test --all --all-targets`（145 个库单测与 3 个离线集成测试
+  passed、7 ignored、0 failed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
   `git diff --check`。
 
 ### M1-3 [TODO] I1--I4 validator 与原子 `commit` 门

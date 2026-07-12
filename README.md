@@ -7,8 +7,8 @@ wire 格式。
 
 当前实现包含完整态数据模型、可折叠的归一化流式事件、dyn-safe Client 抽象、
 Anthropic Messages 与 OpenAI Responses 的非流式/流式适配器、真实 endpoint 的跨
-provider 归一化验收，以及 Conversation Core 的强类型 identity、独立 system 配置和
-immutable message envelope。已完成的 Client 层实施记录见
+provider 归一化验收，以及 Conversation Core 的强类型 identity、独立 system 配置、
+immutable message envelope 和只读的 closed Turn 数据边界。已完成的 Client 层实施记录见
 [`docs/archive/2026-07-13-client-layer/TODO.md`](docs/archive/2026-07-13-client-layer/TODO.md)；
 当前 Conversation Core 阶段计划和任务见 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。
 
@@ -22,7 +22,8 @@ immutable message envelope。已完成的 Client 层实施记录见
 - `model::extras`：绑定 `ProviderId`、仅在最终请求序列化阶段合并的方言字段。
 - `stream`：用稳定 block id 关联增量事件，并通过统一 accumulator 折叠为完整响应。
 - `client`：dyn-safe `LlmClient`、分类错误、结构化 capability、endpoint 与请求配置。
-- `conversation`：外部注入的强类型 id、独立 system 配置与不可原地修改的消息 envelope。
+- `conversation`：外部注入的强类型 id、独立 system 配置、不可原地修改的消息 envelope，
+  以及共享只读 message 的 closed `Turn`/完整 `ToolPairing`/外部 `TurnMeta`。
 
 Conversation Core 正按任务顺序继续实现 closed Turn、pending、boundary、projection 与
 持久化；Agent loop、Tool registry 与多 agent 编排仍不在范围内。完整设计和当前阶段
@@ -52,6 +53,25 @@ let config = ConversationConfig::new(Some("回答简洁。".to_owned()));
 assert_eq!(message.id(), message_id);
 assert_eq!(message.payload().role, Role::User);
 assert_eq!(config.system(), Some("回答简洁。"));
+```
+
+Closed `Turn` 只暴露有序 message、完整 tool pairing、parent 和 metadata 的共享只读视图；
+克隆不会复制或重新分配 message identity。当前阶段故意不提供 public raw constructor，也不
+允许直接把 serde 输入反序列化成 live `Turn`：crate-private DTO 可以承载待校验数据，下一
+任务的 I1--I4 validator 会成为唯一 closed 构造与恢复入口。调用方目前可依赖如下只读边界：
+
+```rust
+use agent_lib::conversation::Turn;
+
+fn inspect_turn(turn: &Turn) {
+    for message in turn.messages() {
+        println!("message={} role={:?}", message.id(), message.payload().role);
+    }
+    for pairing in turn.pairings() {
+        // closed pairing 的 result message 在类型上始终存在，不是 Option。
+        println!("call={} result={}", pairing.call_id(), pairing.result_msg());
+    }
+}
 ```
 
 ## 环境与构建
