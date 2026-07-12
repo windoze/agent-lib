@@ -252,13 +252,18 @@ trait LlmClient: Send + Sync {
 
 ## Milestone 4 — Anthropic 适配器
 
-### M4-1 [TODO] 接入 HTTP 客户端与 Anthropic 请求构造
+### M4-1 [DONE] 接入 HTTP 客户端与 Anthropic 请求构造
 **上下文**:真实 endpoint 见 `PLAN.md`:base `ANTHROPIC_BASE_URL`,`Authorization: Bearer $ANTHROPIC_AUTH_TOKEN`,`anthropic-version: 2023-06-01`,`content-type: application/json`,model `databricks-claude-haiku-4-5`,路径 `POST {base}/v1/messages`。探测代码 `probes/genai-probe/` 有可用写法。
 **做什么**:
 - `Cargo.toml` 加 `reqwest`(rustls、json、stream 特性)。
 - `adapter/anthropic/`:把 `ChatRequest` 序列化成 Anthropic body(system 单列字段、messages、tools 的 Anthropic schema 格式、max_tokens 必填)。
 - 应用 `EndpointConfig`(base_url + AuthScheme + 额外 header + query)。
 **验证**:单元测试:`ChatRequest` → Anthropic body JSON 结构正确(快照/字段断言),不实际联网。
+**完成记录**:
+- 2026-07-13: 添加关闭默认特性并启用 `rustls-tls`/`json`/`stream` 的 `reqwest 0.12`;实现持有可复用 HTTP client 与 `EndpointConfig` 的 `AnthropicAdapter`,以及不发网的 `POST /v1/messages` request builder。
+- 完成 `ChatRequest` 到 Anthropic Messages wire 的显式映射:system 单列,Tool role 映射为 user,tools 使用 `input_schema`,thinking 使用 `thinking` + signature,覆盖 URL/base64 图片、tool_use/tool_result、block/source extra;Anthropic provider extras 在最终 JSON 阶段合并,跨 provider extras 与 messages 内 System role 均返回可观测错误。
+- endpoint 构造覆盖 base path、重复 query、Bearer/任意 Header/None 认证、额外 header 与默认 JSON content type;畸形 URL/header 在发网前返回分类错误。新增 6 个无网络单元测试覆盖完整/最小请求与错误边界。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test adapter::anthropic::request::tests`(6 passed),`cargo test --all --all-targets`(77 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
 ### M4-2 [TODO] Anthropic 非流式响应 → `Response`
 **上下文**:探测实测响应含 `content[]`(text/tool_use blocks)、`stop_reason`、`usage`(含 cache_creation/cache_read 细分与 `cache_creation.ephemeral_5m/1h`)。方言字段走逃生舱 B。
