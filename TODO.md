@@ -191,12 +191,17 @@ enum StreamEvent {
 - 将 `StreamEvent::Error(String)` 与 `AccumulatorError::Stream(String)` 回填为分类化 `ClientError`，保持流事件 round-trip 与错误 source 链，不丢失 retry/fallback 所需信息。
 - 新增 10 个聚焦测试，覆盖全变体 serde、Foundry/Azure content-filter 形态、OpenAI context 错误、401/403、404/500、408/504、413 及 429 header 边界；验证通过:`cargo test client::error::tests`(10 passed),`cargo test stream::`(19 passed),`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test --all --all-targets`(60 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
-### M3-2 [TODO] `Capability`(结构化)
+### M3-2 [DONE] `Capability`(结构化)
 **上下文**:`DESIGN.md` §5 Capability 非布尔标志。来源=默认表 + 可覆盖。
 **做什么**:
 - `client/mod.rs`:`struct Capability { max_context_tokens: Option<u32>, input_modalities: Set<Modality>, output_modalities: Set<Modality>, streaming: bool, tool_calling: bool, parallel_tool_calls: bool, prompt_caching: bool, reasoning: bool, structured_output: bool, stop_reasons: Set<StopReason> }`。
 - `enum Modality { Text, Image, Audio, File }`。
 **验证**:serde round-trip;构造 Anthropic/OpenAI 各一个默认 Capability 常量并断言字段。
+**完成记录**:
+- 2026-07-13: 实现可 serde 的结构化 `Capability` 与 `Modality`,使用确定性 `BTreeSet` 分别表达输入/输出模态和支持的 stop reason,并保留模型级 `max_context_tokens` 覆盖能力。
+- 提供可克隆覆盖的 Anthropic Messages 与 OpenAI Responses 协议级默认能力表项;模型相关 context limit 保持未知,避免协议默认值虚构具体模型上限。
+- 新增 5 个聚焦测试,覆盖 `Modality` 全变体 wire name、完整 Capability serde round-trip、两家默认表字段及克隆覆盖隔离。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test client::capability::tests`(5 passed),`cargo test --all --all-targets`(65 passed),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`,`git diff --check`。
 
 ### M3-3 [TODO] `EndpointConfig` 与请求参数类型
 **上下文**:`DESIGN.md` §1.1 endpoint config(base_url/auth/方言开关),独立于 wire protocol。探测证明认证方式因 endpoint 而异(Bearer vs api-key vs x-api-key)、需自定义 query param。

@@ -40,7 +40,7 @@ pub trait UnknownNormalizedValue {
 }
 
 /// Provider-neutral reasons for a model finishing a response.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// The model stopped because it emitted a tool call.

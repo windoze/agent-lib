@@ -1,56 +1,63 @@
-# 当前任务执行计划
+# 本次执行计划
 
-## 原则与范围
+## 目标与边界
 
-- 以 `TODO.md` 为唯一任务顺序与完成状态来源，只执行首个标题未带 `[DONE]` 的任务。
-- 在选择当前任务前不进行开放式历史问题排查；仅检查最新提交是否明确提到与当前任务直接相关的未完成事项。
-- 不记录模型私有的逐字思维过程；本文件记录可审计的判断依据、执行步骤、关键发现、计划变更与验证结果。
-- 若发现阻塞当前任务的真实规格缺口或未排期测试失败，按要求修复，或在 `TODO.md` 中插入最少的前置任务并提交后停止。
+- 严格以 `TODO.md` 为任务顺序、需求、依赖、验证标准和完成记录的唯一事实来源。
+- 本次只处理 `TODO.md` 中标题未带 `[DONE]` 的第一个任务；完成并提交后立即停止，不进入下一任务。
+- `PLAN.md` 只在阶段级顺序、依赖、假设或完成标准确实变化时修改。
+- 本文件记录可审计的计划、判断依据、进度、计划调整和验证结果；不记录私密的逐字推理过程。
 
 ## 初始执行步骤
 
-1. 阅读 `TODO.md`，定位首个未完成任务，提取其需求、依赖、验证命令和完成记录要求。
-2. 检查工作树状态与最新一次提交，仅判断是否存在与该任务直接相关的遗留事项；不触碰无关用户改动。
-3. 阅读当前任务直接涉及的设计文档与代码/测试，确认实现边界；随后把具体任务、验收标准和文件范围补充到本文件。
-4. 完整实现当前任务，并以小而聚焦的补丁逐步修改；每完成关键步骤或改变计划即更新本文件。
-5. 增补并运行相关测试。最终按顺序运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`（最长 30 分钟）和任务要求的其他验证（如文档构建）。
-6. 在所有要求通过后，将任务标题加上 `[DONE]` 并填写 `TODO.md` 完成记录；仅当阶段级计划确实改变时更新 `PLAN.md`。
-7. 复查差异与工作树，提交当前任务要求的全部变更，使用清晰且包含任务编号的提交消息，然后停止，不处理下一任务。
+1. 读取 `TODO.md`，按文档顺序定位第一个标题未带 `[DONE]` 的任务，并完整阅读其需求、依赖、测试与完成记录要求。
+2. 检查 Git 工作区状态和最新提交，仅判断未提交改动及最新提交是否与当前任务直接相关；不开展无边界的历史问题排查。
+3. 阅读当前任务直接涉及的设计文档、代码和测试，确认现状与验收边界；若发现阻塞当前任务的具体前置缺陷，按要求先修复，或在 `TODO.md` 中插入最少的前置任务并停止。
+4. 将已识别的任务编号、实现方案、影响文件和具体验证命令补充到本文件，然后进行小步、聚焦的代码修改；每完成关键步骤即更新进度。
+5. 增补或调整测试，覆盖任务规定的正常路径、边界情况、错误路径以及受同一根因影响的同类场景。
+6. 按规定顺序验证：`cargo fmt --all`，然后 `cargo clippy --all-targets -- -D warnings`，再运行相关测试与 `cargo test --all --all-targets`，最后按任务要求运行文档构建或其他检查。完整测试设置不超过 30 分钟的超时。
+7. 所有要求满足且不存在未安排的失败后，在 `TODO.md` 的任务标题前添加 `[DONE]`，填写可复核的完成记录；只有阶段级计划发生变化时才更新 `PLAN.md`。
+8. 复查差异与工作区，确保保留用户已有改动；若这是异常中断后恢复的同一任务，则按要求把当前所有未提交文件纳入本次原子提交。
+9. 使用清晰、包含任务编号的提交消息提交全部本任务改动，确认提交和工作区状态，然后停止。
+
+## 当前任务与验收边界
+
+- 当前任务：`M3-2 [TODO] Capability（结构化）`，是 `TODO.md` 中第一个标题未带 `[DONE]` 的任务。
+- 实现范围：在 Client 层加入结构化 `Capability` 与 `Modality`，包括上下文上限、输入/输出模态、streaming/tool calling/parallel tool calls/prompt caching/reasoning/structured output 支持，以及可接受的 stop reason 集合。
+- 明确验证：全部类型 serde round-trip；构造 Anthropic 与 OpenAI 各一个默认 Capability 常量并断言关键字段；运行格式化、严格 clippy、完整测试和严格文档构建。
+- 非范围：不提前实现 `M3-3 EndpointConfig/ChatRequest` 或 `M3-4 LlmClient`。
+
+## 实现方案
+
+1. 新建聚焦模块 `src/client/capability.rs`，定义可 serde 的 `Modality` 和 `Capability`；集合使用 `BTreeSet`，保证集合语义和序列化输出稳定。
+2. 为 `StopReason` 补充集合键所需的全序与哈希派生，不改变现有 wire 表示或归一化行为。
+3. 提供 Anthropic 与 OpenAI Responses 两份只读默认 Capability 表项。由于 Capability 属于协议/模型能力，而仓库未给出可泛化到所有模型的 context window 数值，协议级默认将 `max_context_tokens` 保持为 `None`，后续具体模型或用户配置可在克隆后覆盖。
+4. Anthropic 默认覆盖文本/图片/文件输入、文本输出；OpenAI Responses 默认覆盖文本/图片/音频/文件输入和文本/音频输出。两者明确列出 streaming、tool calling、并行工具、prompt caching、reasoning 与 structured output 支持，以及各自已归一化的 stop reason 集合。
+5. 在 `src/client/mod.rs` 中公开 capability 子模块并重导出公共类型及默认表项。
+6. 单元测试覆盖：`Modality` 全变体 snake_case serde、含 `Some(max_context_tokens)` 的完整 Capability round-trip、两份默认表关键字段、克隆后覆盖不会改变默认表。
+
+## 核查结论
+
+- 工作区在本次开始时仅有本文件的新修改；没有用户遗留代码改动。
+- 最新提交 `bab5bc7 [M3-1] Implement classified client errors` 已完成前一任务，未提及 M3-2 的未竟问题。
+- `DESIGN.md` 与 `PLAN.md` 未提供具体模型的 context window 数值，因此不编造协议级上限；这不是缩窄能力模型，`Option<u32>` 仍完整支持具体值和覆盖。
 
 ## 当前状态
 
-- 已完整读取到首个未完成任务并选定 **M3-1 `ClientError` 分类**；本次不会处理 M3-2 或后续任务。
+- 状态：实现、验证、TODO 完成记录、最终任务边界复核与 Git 提交均已完成；本次停止，不开始下一任务。
+- 当前任务：`M3-2 Capability（结构化）`。
+- 计划变更：无。
+- 验证结果：`cargo fmt --all`、严格 clippy、Capability 聚焦测试、完整测试（65 passed）和严格 rustdoc 均通过。
 
-## M3-1 具体范围与验收标准
+## 进度记录
 
-- 在 `client/error.rs` 以 `thiserror` 定义 `ClientError`：`RateLimited { retry_after: Option<Duration> }`、`Timeout`、`ContextLengthExceeded`、`ContentFiltered`、`Network(..)`、`Protocol(..)`、`Auth`、`Api { status: u16, body: String }`、`Other(..)`。
-- 提供从 HTTP status、body 与可用响应头信息进行分类的辅助 API；429 必须解析 `Retry-After`，并覆盖 Foundry 401/404/content-filter 一类响应形态。
-- 将 M2-2 `StreamEvent::Error(String)` 占位回填为 `StreamEvent::Error(ClientError)`，同时保持事件 serde round-trip 能力与 Accumulator 错误传播行为。
-- 为状态/响应体分类、`Retry-After`、serde round-trip 和流事件回填添加或调整测试；不能以窄化输入形态绕过同类错误。
-- 最终验证顺序：聚焦测试 → `cargo fmt --all` → `cargo clippy --all-targets -- -D warnings` → `cargo test --all --all-targets`（不超过 30 分钟）→ `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` → `git diff --check`。
-
-## 下一步
-
-1. 检查 `git status` 与最新提交说明，识别是否存在 M3-1 直接相关的未提交/遗留事项。
-2. 阅读 `DESIGN.md` 错误模型段落、现有 `client`/`stream` 模块与测试，确定 serde、错误所有权与公开 API 的现有约定。
-3. 分小补丁实现错误类型、分类器和流事件回填，再逐层验证。
-
-## 已确认的实现决策
-
-- 2026-07-13：工作树除本文件外无修改；最新提交 `b52b468` 仅完成 M2 Review，没有提及 M3-1 的未完成阻塞项。
-- `ClientError` 需要派生 `Serialize`/`Deserialize`、`Clone`、`PartialEq`/`Eq`，因为 `StreamEvent` 当前具备这些数据模型能力，回填后不能造成能力回退。
-- HTTP 分类辅助不依赖尚未引入的 `reqwest`，输入采用状态码、响应正文和可选的 `Retry-After` 原始值；M4 可直接从响应头提取字符串后调用。
-- `Retry-After` 同时支持标准的 delay-seconds 与 HTTP-date。为正确处理后者，增加轻量 `httpdate` 依赖，并以可注入当前时间的内部路径编写确定性测试；已过期日期归一为零等待，非法值为 `None`。
-- 分类优先级：429 限流；408/504 超时；正文中的 context-length/content-policy 语义；401/403 认证；其余状态保留为 `Api { status, body }`。正文语义先于 403 认证，以正确承载 provider 用 403 表达的内容策略拒绝。
-- `Network`、`Protocol`、`Other` 使用可序列化字符串上下文；`AccumulatorError::Stream` 改为承载完整 `ClientError`，不把已分类信息降级回字符串。
-
-## 进展与验证记录
-
-- 2026-07-13：已新增 `ClientError` 全部九类变体、HTTP 错误分类辅助、标准两种 `Retry-After` 形式解析，并在 `client` 模块公开重导出。
-- 2026-07-13：已将 `StreamEvent::Error(String)` 回填为 `StreamEvent::Error(ClientError)`；`AccumulatorError::Stream` 同步保留分类类型及 error source 链。
-- 2026-07-13：新增独立错误测试模块，覆盖全变体 serde、429 秒数/HTTP-date/无效值/过期值、408/504 timeout、413 与 provider context body、Foundry/Azure content filter、401/403 auth、404/500 原始 API 错误。
-- 聚焦测试结果：`cargo test client::error::tests` 10 passed；首次运行只发现测试反序列化目标类型缺少显式标注，已修复后通过。
-- 回归测试结果：`cargo test stream::` 19 passed，确认流事件 serde 与 Accumulator 分类错误传播无回归。
-- 最终验证结果：`cargo fmt --all` 通过；`cargo clippy --all-targets -- -D warnings` 通过；`cargo test --all --all-targets` 60 passed；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过；此前及更新完成记录前的 `git diff --check` 通过。
-- 已将 `TODO.md` 的 M3-1 标题更新为 `[DONE]` 并填写完成记录。阶段级顺序、依赖和验收标准未改变，因此不修改 `PLAN.md`。
-- 2026-07-13：最终格式、差异与任务边界检查均通过；本次全部文件已纳入 `[M3-1] Implement classified client errors` 提交。完成最终工作树确认后停止，不开始 M3-2。
+- 已新增 `src/client/capability.rs`：`Modality`、`Capability`、Anthropic/OpenAI Responses 默认表项，以及 serde/default override 测试。
+- 已在 `src/client/mod.rs` 公开模块并重导出公共 API。
+- 已为 `StopReason` 增加 `PartialOrd`、`Ord`、`Hash` 派生，以作为集合元素；归一化逻辑和 serde wire name 未改变。
+- `cargo fmt --all` 通过。
+- `cargo clippy --all-targets -- -D warnings` 通过，无 warning。
+- `cargo test client::capability::tests` 通过：5 passed。
+- `cargo test --all --all-targets` 在 30 分钟超时保护下通过：65 passed，0 failed。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过。
+- `TODO.md` 的 M3-2 标题已改为 `[DONE]` 并写入实现与验证记录；阶段计划未变化，未修改 `PLAN.md`。
+- 最终复核确认 M3-3 仍为 `[TODO]` 且未被实现；测试后仅修改 Markdown 记录，按规则复用绿色完整测试结果。
+- 本次全部变更已纳入提交 `[M3-2] Implement structured capabilities`。
