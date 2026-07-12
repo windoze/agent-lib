@@ -22,6 +22,13 @@ enum OpenAiMessageRole {
     Assistant,
 }
 
+/// Text content kinds accepted inside an assistant input-message item.
+#[derive(Clone, Copy)]
+enum AssistantTextKind {
+    OutputText,
+    Refusal,
+}
+
 /// Expands one normalized message into ordered Responses input items.
 pub(super) fn message_to_items(index: usize, message: &Message) -> Result<Vec<Value>, ClientError> {
     let role = match message.role {
@@ -42,7 +49,7 @@ pub(super) fn message_to_items(index: usize, message: &Message) -> Result<Vec<Va
             ContentBlock::Text { .. } | ContentBlock::Image { .. }
                 if message.role != Role::Tool =>
             {
-                message_content.push(message_content_to_wire(block));
+                message_content.push(message_content_to_wire(block, role)?);
             }
             ContentBlock::ToolUse { .. } if message.role == Role::Assistant => {
                 flush_message_item(&mut items, role, &mut message_content);
@@ -90,25 +97,96 @@ fn flush_message_item(items: &mut Vec<Value>, role: OpenAiMessageRole, content: 
     }));
 }
 
-/// Converts text and image blocks into Responses input-message content.
-fn message_content_to_wire(block: &ContentBlock) -> Value {
-    let fields = match block {
-        ContentBlock::Text { text, extra } => {
+/// Converts normalized text or image content according to its message role.
+fn message_content_to_wire(
+    block: &ContentBlock,
+    role: OpenAiMessageRole,
+) -> Result<Value, ClientError> {
+    let fields = match (role, block) {
+        (OpenAiMessageRole::User, ContentBlock::Text { text, extra }) => {
             let mut fields = request_fields(extra);
             insert_string(&mut fields, "type", "input_text");
             insert_string(&mut fields, "text", text);
             fields
         }
-        ContentBlock::Image { source, extra } => {
+        (OpenAiMessageRole::Assistant, ContentBlock::Text { text, extra }) => {
+            assistant_text_fields(text, extra)?
+        }
+        (OpenAiMessageRole::User, ContentBlock::Image { source, extra }) => {
             let mut fields = image_source_fields(source);
             fields.extend(request_fields(extra));
             insert_string(&mut fields, "type", "input_image");
             fields
         }
+        (OpenAiMessageRole::Assistant, ContentBlock::Image { .. }) => {
+            return Err(invalid_request(
+                "assistant image blocks cannot be represented: Responses assistant message content supports only output_text or refusal"
+                    .to_owned(),
+            ));
+        }
         _ => unreachable!("only message-compatible content reaches this converter"),
     };
 
-    Value::Object(fields)
+    Ok(Value::Object(fields))
+}
+
+/// Builds assistant text using Responses' role-specific content vocabulary.
+fn assistant_text_fields(
+    text: &str,
+    extra: &Map<String, Value>,
+) -> Result<Map<String, Value>, ClientError> {
+    let kind = assistant_text_kind(extra)?;
+    let mut fields = request_fields(extra);
+    fields.remove("text");
+    fields.remove("refusal");
+
+    match kind {
+        AssistantTextKind::OutputText => {
+            insert_string(&mut fields, "type", "output_text");
+            insert_string(&mut fields, "text", text);
+        }
+        AssistantTextKind::Refusal => {
+            insert_string(&mut fields, "type", "refusal");
+            insert_string(&mut fields, "refusal", text);
+        }
+    }
+
+    Ok(fields)
+}
+
+/// Recovers refusal evidence retained by the response parser; normalized
+/// assistant text without such evidence is ordinary `output_text`.
+fn assistant_text_kind(extra: &Map<String, Value>) -> Result<AssistantTextKind, ClientError> {
+    let Some(provider) = extra.get(RESPONSE_EXTRA_KEY) else {
+        return Ok(AssistantTextKind::OutputText);
+    };
+    let Value::Object(provider) = provider else {
+        return Err(invalid_request(format!(
+            "assistant text `{RESPONSE_EXTRA_KEY}` replay metadata must be an object"
+        )));
+    };
+    let Some(content) = provider.get("content") else {
+        return Ok(AssistantTextKind::OutputText);
+    };
+    let Value::Object(content) = content else {
+        return Err(invalid_request(
+            "assistant text replay metadata field `content` must be an object".to_owned(),
+        ));
+    };
+
+    match content.get("type") {
+        None => Ok(AssistantTextKind::OutputText),
+        Some(Value::String(value)) => match value.as_str() {
+            "output_text" => Ok(AssistantTextKind::OutputText),
+            "refusal" => Ok(AssistantTextKind::Refusal),
+            _ => Err(invalid_request(format!(
+                "assistant text replay metadata has unsupported content type `{value}`"
+            ))),
+        },
+        Some(_) => Err(invalid_request(
+            "assistant text replay metadata field `content.type` must be a string".to_owned(),
+        )),
+    }
 }
 
 /// Converts a URL or base64 image into Responses' `image_url` field.
@@ -196,7 +274,7 @@ fn tool_output_to_wire(content: &[ContentBlock]) -> Result<Value, ClientError> {
         .enumerate()
         .map(|(index, block)| match block {
             ContentBlock::Text { .. } | ContentBlock::Image { .. } => {
-                Ok(message_content_to_wire(block))
+                message_content_to_wire(block, OpenAiMessageRole::User)
             }
             _ => Err(invalid_request(format!(
                 "tool result content block {index} must be text or image"

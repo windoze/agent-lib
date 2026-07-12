@@ -199,7 +199,7 @@ fn complete_chat_request_maps_to_responses_items_and_endpoint_shape() {
                 },
                 {
                     "role": "assistant",
-                    "content": [{ "type": "input_text", "text": "I'll check." }]
+                    "content": [{ "type": "output_text", "text": "I'll check." }]
                 },
                 {
                     "type": "reasoning",
@@ -239,6 +239,61 @@ fn complete_chat_request_maps_to_responses_items_and_endpoint_shape() {
             "store": false,
             "reasoning": { "effort": "high" }
         })
+    );
+}
+
+#[test]
+fn assistant_text_uses_output_vocabulary_and_replays_refusal_kind() {
+    let plain = Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: "normalized answer".to_owned(),
+            extra: Map::from_iter([
+                ("type".to_owned(), json!("input_text")),
+                ("text".to_owned(), json!("stale answer")),
+                ("refusal".to_owned(), json!("stale refusal")),
+                ("provider_hint".to_owned(), json!(true)),
+            ]),
+        }],
+    };
+    assert_eq!(
+        message_to_items(0, &plain).expect("map plain assistant text"),
+        vec![json!({
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "normalized answer",
+                "provider_hint": true
+            }]
+        })]
+    );
+
+    let refusal = Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: "normalized refusal".to_owned(),
+            extra: Map::from_iter([(
+                RESPONSE_EXTRA_KEY.to_owned(),
+                json!({
+                    "item": { "id": "msg_refusal", "type": "message" },
+                    "content": {
+                        "type": "refusal",
+                        "refusal": "wire refusal",
+                        "annotations": []
+                    }
+                }),
+            )]),
+        }],
+    };
+    assert_eq!(
+        message_to_items(0, &refusal).expect("replay assistant refusal"),
+        vec![json!({
+            "role": "assistant",
+            "content": [{
+                "type": "refusal",
+                "refusal": "normalized refusal"
+            }]
+        })]
     );
 }
 
@@ -397,6 +452,34 @@ fn invalid_roles_blocks_and_foreign_extras_are_rejected() {
     };
     let error = serialize_body(&request).expect_err("empty tool message should be rejected");
     assert!(error.to_string().contains("contains no tool results"));
+
+    request = minimal_request();
+    request.messages[0] = Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Image {
+            source: ImageSource::Url {
+                url: "https://example.test/assistant.png".to_owned(),
+                extra: empty_extra(),
+            },
+            extra: empty_extra(),
+        }],
+    };
+    let error = serialize_body(&request).expect_err("assistant image should be rejected");
+    assert!(error.to_string().contains("assistant image blocks"));
+
+    request = minimal_request();
+    request.messages[0] = Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: "future output".to_owned(),
+            extra: Map::from_iter([(
+                RESPONSE_EXTRA_KEY.to_owned(),
+                json!({ "content": { "type": "future_text" } }),
+            )]),
+        }],
+    };
+    let error = serialize_body(&request).expect_err("unknown assistant text kind should fail");
+    assert!(error.to_string().contains("unsupported content type"));
 
     request = minimal_request();
     request.provider_extras = Some(ProviderExtras {

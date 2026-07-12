@@ -362,12 +362,16 @@ trait LlmClient: Send + Sync {
 
 ## Milestone 6 — 跨 provider 验收
 
-### M6-1 [TODO] 归一化一致性集成测试
+### M6-1 [DONE] 归一化一致性集成测试
 **上下文**:两 provider 经统一 `LlmClient` 应产出结构一致的归一化结果。
 **做什么**:
 - `tests/`:参数化测试,对 Anthropic 与 OpenAI Response 各跑:纯文本、多轮、tool call 往返(执行 tool 后回灌 result 再请求),断言归一化结构一致(role/content/stop_reason/usage 字段存在且合理)。
 - 通过 `Box<dyn LlmClient>` 调用,证明 dyn 抽象可用。
 **验证**:两 provider 均通过同一套断言(有环境变量时);无 provider 特判逻辑泄漏到测试断言层。
+**完成记录**:
+- 2026-07-13: 新增模块化的 opt-in 跨 provider 真实集成矩阵；provider 差异仅位于 endpoint/client 构造层，Anthropic Messages 与 OpenAI Responses 均通过同一个 `Box<dyn LlmClient>` 依次执行纯文本、多轮历史回放、tool call 执行结果回灌与最终回答，并复用同一套 role/content/stop reason/raw/usage/tool id 断言。整个测试由 55 秒 deadline 约束，缺失凭据时按 target 可观测跳过且不输出 secret。
+- 真实多轮验收发现并修复 OpenAI request mapper 的类级协议缺陷：assistant 历史文本不再错误使用用户侧 `input_text`，而是按 Responses 角色词汇编码为 `output_text`，并从保留的 response extra 恢复 `refusal`；assistant image 与未知 replay 文本类型在发网前返回明确协议错误，user/tool-result 的 `input_text`/`input_image` 语义保持不变。新增 output/refusal、modeled 字段优先及非法边界回归测试。
+- 验证通过:`cargo fmt --all`,`cargo clippy --all-targets -- -D warnings`,`cargo test adapter::openai_resp::request::tests`(6 passed),`cargo test --all --all-targets`(130 passed,7 ignored),`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`;加载 `.envrc` 后 `cargo test --test integration_normalization -- --ignored --nocapture`(1 passed,两 provider 共三类场景,17.57s)。
 
 ### M6-2 [TODO] 能力矩阵与逃生舱实证
 **做什么**:
