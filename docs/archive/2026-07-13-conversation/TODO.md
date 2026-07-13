@@ -1,10 +1,10 @@
 # TODO：Conversation Core 实现任务列表
 
 > 依据 [`PLAN.md`](PLAN.md) 与规范性设计
-> [`docs/conversation-core.md`](docs/conversation-core.md)。任务按真实依赖顺序编号；
+> [`docs/conversation-core.md`](../../conversation-core.md)。任务按真实依赖顺序编号；
 > coding agent 每次只执行首个标题未带 `[DONE]` 的任务，完成后把该标题的 `[TODO]`
 > 改为 `[DONE]` 并补充完成记录。已完成的 Client 层任务与验证记录归档在
-> [`docs/archive/2026-07-13-client-layer/TODO.md`](docs/archive/2026-07-13-client-layer/TODO.md)。
+> [`docs/archive/2026-07-13-client-layer/TODO.md`](../2026-07-13-client-layer/TODO.md)。
 
 通用约束：不得公开能直接修改 closed history 的裸容器或 unchecked 构造器；不得用
 `extra`、provider 特判或任务私有状态绕过规范缺口；id/时间由调用方注入；每个测试用例
@@ -1671,18 +1671,18 @@ registry/multi-agent 非目标边界。
 
 ## Milestone 7 — 交接：归档 Conversation 计划并起草 Agent 层计划
 
-### M7-1 [TODO] 归档 Conversation 计划并为 Agent 层编写新的 PLAN.md / TODO.md
+### M7-1 [DONE] 归档 Conversation 计划并为 Agent 层编写新的 PLAN.md / TODO.md
 
 **前置依赖**：Conversation Core 全部里程碑（M1-R 至 M6-R）已 `[DONE]`。本任务是纯文档/计划
 交接，不写实现代码，也不改动 `src/` 下任何 Rust 文件。
 
 **上下文**：Conversation 层实现收尾后，项目重心转入 `DESIGN.md` §1.3 的 Agent 层。该层的
-规范性设计已落在 [`docs/agent-layer.md`](docs/agent-layer.md)（Agent 三层拆分
+规范性设计已落在 [`docs/agent-layer.md`](../../agent-layer.md)（Agent 三层拆分
 `AgentSpec`/`AgentState`/`AgentLoop` + `RunContext`、pivot/reconfig 两级边界、垂直功能
 API-first、plan「计划板」/ blackboard「聊天群」、简单 agent + fork 编排原则）。当前根目录的
 `PLAN.md`、`TODO.md` 只服务已完成的 Conversation Core，须整体归档，再为 Agent 层新建同名
 计划文件。归档惯例参照现有
-[`docs/archive/2026-07-13-client-layer/`](docs/archive/2026-07-13-client-layer/)（该目录内
+[`docs/archive/2026-07-13-client-layer/`](../2026-07-13-client-layer/)（该目录内
 存放上一阶段的 `PLAN.md` 与 `TODO.md`）。
 
 **做什么**：
@@ -1745,3 +1745,24 @@ API-first、plan「计划板」/ blackboard「聊天群」、简单 agent + fork
 - Markdown 无断链、无残留 `Conversation Core` 专属措辞误入 Agent 层文件；`git diff --check` 通过。
 - 本任务仅改动 Markdown 与目录结构，不触碰 `src/`、`Cargo.toml`、`tests/`；`cargo fmt --all` 与
   `cargo test --all --all-targets` 相对归档前无新增改动或失败。
+
+**完成记录（2026-07-13）**：
+
+- 新建 `docs/archive/2026-07-13-conversation/`，并用 `git mv` 将执行本任务前的根 `PLAN.md` 与
+  `TODO.md` 移入该目录；归档文件内的 markdown 相对链接已修正为归档位置可点击的路径，文件间
+  `PLAN.md`/`TODO.md` 同目录引用保持不变。
+- 根目录新建 Agent 层 `PLAN.md`，覆盖范围/非目标、规范优先级与已定关键决策、6 个依赖有序
+  里程碑、建议目录/API 边界、测试策略、serde/恢复边界和每阶段 Review 门；计划明确复用
+  Conversation 已落地的 committed log、pending、projection、`Boundary`、fork、snapshot/restore
+  与 cancel 闭合能力，并将 `docs/agent-layer.md` §8 的三项新增需求落为 step-boundary `user`
+  注入入口、`LoopCursor` + Conversation 暂停/恢复、`RunContext` 贯穿三层。
+- 根目录新建 Agent 层 `TODO.md`，包含 M1--M6 共 6 个里程碑、26 个 `[TODO]` 任务，其中 20 个实现
+  任务与 6 个独立 `Mx-R` review 任务；每项均包含「前置依赖 / 上下文 / 做什么 / 验证」四段，
+  并写明完整验证命令序列。
+- 更新 `README.md` 的当前阶段入口：Client 与 Conversation 完成记录指向各自归档，当前实施计划
+  指向根 `PLAN.md`/`TODO.md` 的 Agent 层版本。
+- 验证通过：`rg -n 'PLAN\.md|TODO\.md' --glob '!target/*'` 引用审查；针对
+  `PLAN.md`、`TODO.md`、`README.md` 与 Conversation 归档文件的 markdown 链接存在性检查；
+  `cargo fmt --all`；`git diff --check`。本任务仅改动 Markdown 与目录结构，未改 `src/`、
+  `Cargo.toml` 或 `tests/`，因此未重跑 `cargo clippy --all-targets -- -D warnings`、
+  `cargo test --all --all-targets` 与 rustdoc，复用 M6-R 记录的全量绿色结果。

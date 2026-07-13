@@ -1,10 +1,10 @@
 # 实施计划：Conversation Core
 
-> 本计划以 [`docs/conversation-core.md`](docs/conversation-core.md) 为规范性设计输入，
+> 本计划以 [`docs/conversation-core.md`](../../conversation-core.md) 为规范性设计输入，
 > 在已完成的 provider-neutral Client 公共类型之上实现 Conversation Core。
-> 总体架构边界见 [`DESIGN.md`](DESIGN.md) §1.2；逐任务要求与完成记录见
+> 总体架构边界见 [`DESIGN.md`](../../../DESIGN.md) §1.2；逐任务要求与完成记录见
 > [`TODO.md`](TODO.md)。已完成的 Client 层计划和实施记录归档于
-> [`docs/archive/2026-07-13-client-layer/`](docs/archive/2026-07-13-client-layer/)。
+> [`docs/archive/2026-07-13-client-layer/`](../2026-07-13-client-layer/)。
 
 ## 范围与非目标
 
