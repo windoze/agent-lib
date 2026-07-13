@@ -25,8 +25,10 @@
 //! close (migration doc §7) that drives the in-flight turn's Conversation
 //! through [`cancel_pending`](crate::conversation::Conversation::cancel_pending)
 //! and settles the cursor back to a feedable [`LoopCursor::Idle`]. Pivot
-//! injection remains out of scope here and lands in a later M4 task; until then
-//! it resolves to a classified error cursor rather than being silently ignored.
+//! injection lands in **M4-2**: `step(External(AgentInput::Pivot(..)))` appends a
+//! `Role::User` message at a checked step boundary and re-renders the
+//! outstanding LLM request so the pivot reaches the model (migration doc §2.2),
+//! replacing the removed pivot queue.
 //!
 //! The machine is pure: [`step`](AgentMachine::step) never `await`s and never
 //! touches a client, tool, or process. The non-serialized fields are the
@@ -43,7 +45,7 @@ use crate::{
     agent::{
         AgentInput, AgentMachine, AgentState, AgentUserInput, CancelRecoveryReason,
         CursorRequirement, LlmStepMode, LoopCursor, LoopDoneReason, NoApprovalPolicy,
-        NoToolExecutionIds, Notification, Requirement, RequirementId, RequirementIds,
+        NoToolExecutionIds, Notification, PivotMessage, Requirement, RequirementId, RequirementIds,
         RequirementKind, RequirementKindTag, RequirementResolution, RequirementResult,
         StepBoundary, StepId, StepInput, StepOutcome, ToolApprovalPolicy, ToolExecutionIds,
         request::build_chat_request,
@@ -177,6 +179,68 @@ impl DefaultAgentMachine {
 
         self.in_flight = Some(InFlight::new(user.assistant_message_id()));
         self.block_on_llm(user.step_id(), Vec::new())
+    }
+
+    /// Injects a `Role::User` pivot at a checked step boundary (migration doc §2.2).
+    ///
+    /// A pivot is a *soft turn*: the driver feeds an extra `Role::User` message
+    /// between two steps instead of queueing it. Injection is only legal while
+    /// the machine is parked on a [`LoopCursor::StreamingStep`] whose pending
+    /// turn has closed a tool-result batch and is awaiting the next assistant —
+    /// exactly the boundary
+    /// [`Conversation::inject_user_message`](crate::conversation::Conversation::inject_user_message)
+    /// accepts, so the shared role-sequence validation is reused rather than
+    /// duplicated. Open tool calls ([`LoopCursor::AwaitingTool`] /
+    /// [`LoopCursor::AwaitingApproval`]), a fresh user turn's first LLM step
+    /// (whose pending has no closed tool-result step yet), and every terminal or
+    /// idle cursor reject the pivot, so it never breaks an in-flight tool phase.
+    ///
+    /// After appending the pivot, the outstanding LLM request is re-rendered
+    /// from the updated pending turn (so the pivot reaches the model on the next
+    /// fulfillment) and re-emitted under the *same* requirement id. This is the
+    /// same LLM step, so the cursor does not move.
+    fn inject_pivot(&mut self, pivot: PivotMessage) -> StepOutcome {
+        let LoopCursor::StreamingStep(cursor) = self.state.loop_cursor() else {
+            let kind = self.state.loop_cursor().kind();
+            return self.fail(format!(
+                "pivot injection requires a streaming step boundary, but cursor is `{kind:?}`"
+            ));
+        };
+        let Some(requirement_id) = cursor.requirement_id() else {
+            return self.fail(
+                "streaming step has no outstanding LLM requirement to re-render for a pivot",
+            );
+        };
+
+        // Reject non-user pivot payloads up front (mirrors the queued-pivot role
+        // check); the injection entry re-validates the role as a second guard.
+        if let Err(error) = pivot.validate() {
+            return self.fail(format!("agent state operation failed: {error}"));
+        }
+
+        let boundary = self.state.conversation().head();
+        if let Err(error) = self.state.conversation_mut().inject_user_message(
+            boundary,
+            pivot.message_id(),
+            pivot.message().clone(),
+            pivot.message_meta(),
+        ) {
+            return self.fail(format!("conversation operation failed: {error}"));
+        }
+
+        // Re-render the outstanding LLM request so the pivot is part of the next
+        // generation. Same step id and requirement id, re-rendered request, so
+        // the cursor stays on the current `StreamingStep`.
+        let tools = self.state.current_tool_set().tools().to_vec();
+        let request = build_chat_request(&self.state, tools, self.mode.request_stream_flag());
+        let requirement = Requirement::at_root(
+            requirement_id,
+            RequirementKind::NeedLlm {
+                request,
+                mode: self.mode,
+            },
+        );
+        StepOutcome::new(Vec::new(), vec![requirement], true)
     }
 
     /// Builds the next generation request and parks on one `NeedLlm` requirement.
@@ -440,15 +504,7 @@ impl AgentMachine for DefaultAgentMachine {
     fn step(&mut self, input: StepInput) -> StepOutcome {
         match input {
             StepInput::External(AgentInput::UserMessage(user)) => self.begin_user_turn(user),
-            StepInput::External(AgentInput::Pivot(_)) => {
-                self.fail("pivot injection is implemented in M4")
-            }
-            // Legacy queued-pivot and opaque cursor-resume inputs are not part of
-            // the sans-io contract; a driver feeds `StepInput::Resume` instead.
-            StepInput::External(_) => self.fail(
-                "legacy queued-pivot and cursor-resume inputs are not supported by the \
-                 sans-io machine; feed StepInput::Resume with a requirement result",
-            ),
+            StepInput::External(AgentInput::Pivot(pivot)) => self.inject_pivot(pivot),
             StepInput::Resume(resolution) => self.resume(resolution),
             StepInput::Abandon(id) => self.abandon(id),
         }

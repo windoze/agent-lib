@@ -2,13 +2,14 @@
 
 use crate::{
     agent::{AgentId, LoopPolicy, ModelRef, SkillId, ToolSetId, ToolSetRef},
-    conversation::MessageId,
+    conversation::{MessageId, MessageMeta},
     model::{
         message::{Message, Role},
         tool::Tool,
     },
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Map;
 
 use super::{AgentStateError, ensure_unique_skill_ids, ensure_unique_tool_names};
 
@@ -60,7 +61,22 @@ impl QueuedPivot {
         &self.source
     }
 
-    pub(super) fn validate(&self) -> Result<(), AgentStateError> {
+    /// Builds the [`MessageMeta`] used when this pivot is injected at a checked
+    /// pending step boundary.
+    ///
+    /// The meta records the pivot source both as a stable diagnostic label
+    /// (via [`PivotSource::label`]) and as structured `pivot_source` extra data.
+    #[must_use]
+    pub fn message_meta(&self) -> MessageMeta {
+        let mut extra = Map::new();
+        extra.insert(
+            "pivot_source".to_owned(),
+            serde_json::to_value(&self.source).expect("pivot source serializes"),
+        );
+        MessageMeta::new(Some(self.source.label()), extra)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), AgentStateError> {
         if self.message.role != Role::User {
             return Err(AgentStateError::InvalidPivotRole {
                 actual: self.message.role,
@@ -91,6 +107,23 @@ pub enum PivotSource {
         /// Stable host-side label for diagnostics.
         label: String,
     },
+}
+
+impl PivotSource {
+    /// Returns a stable, human-readable diagnostic label for this source.
+    ///
+    /// The label is recorded on the injected message meta so tracing can
+    /// attribute a pivot to the human, coordinator, skill, or host that
+    /// produced it.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Human => "pivot:human".to_owned(),
+            Self::Coordinator { agent_id } => format!("pivot:coordinator:{agent_id}"),
+            Self::Skill { skill_id } => format!("pivot:skill:{skill_id}"),
+            Self::Host { label } => format!("pivot:host:{label}"),
+        }
+    }
 }
 
 /// FIFO queue of turn-boundary reconfiguration requests.

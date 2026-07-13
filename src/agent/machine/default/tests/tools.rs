@@ -10,8 +10,8 @@
 use super::*;
 use crate::{
     agent::{
-        ApprovalRequirement, ApprovalResponse, InteractionKind, NoApprovalPolicy,
-        ToolApprovalPolicy, ToolExecutionIds, ToolRuntimeError,
+        ApprovalRequirement, ApprovalResponse, InteractionKind, NoApprovalPolicy, PivotMessage,
+        PivotSource, ToolApprovalPolicy, ToolExecutionIds, ToolRuntimeError,
     },
     conversation::ToolCallId,
     model::tool::{ToolCall, ToolResponse, ToolStatus},
@@ -25,9 +25,14 @@ const RESULT_MESSAGE_BASE: u128 = 0x0200_0000;
 const CONTINUATION_MESSAGE_BASE: u128 = 0x0300_0000;
 const CONTINUATION_STEP_BASE: u128 = 0x0400_0000;
 const TOOL_REQUIREMENT_BASE: u128 = 0x0500_0000;
+const PIVOT_MESSAGE_BASE: u128 = 0x0600_0000;
 
 fn tool_call_id(index: u128) -> ToolCallId {
     ToolCallId::new(Uuid::from_u128(TOOL_CALL_BASE + index))
+}
+
+fn pivot_message_id(index: u128) -> MessageId {
+    MessageId::new(Uuid::from_u128(PIVOT_MESSAGE_BASE + index))
 }
 
 fn result_message_id(index: u128) -> MessageId {
@@ -896,4 +901,148 @@ fn abandon_tool_batch_then_user_message_opens_new_turn() {
     assert!(conversation.pending().is_some());
     assert_eq!(conversation.pending().expect("pending").messages().len(), 1);
     assert!(conversation.turns().is_empty());
+}
+
+/// Drives the machine through one auto tool call so it rests on the post-tool
+/// `StreamingStep` — the only boundary where a pivot may inject. Returns the
+/// re-emitted `NeedLlm` requirement id awaiting the continuation response.
+fn drive_to_post_tool_streaming_step(machine: &mut DefaultAgentMachine) -> RequirementId {
+    let llm_id = park_on_need_llm(machine);
+    let outcome = resume_llm(
+        machine,
+        llm_id,
+        single_tool_response("call-weather", "get_weather"),
+    );
+    let (tool_req, _, _) = need_tool(&outcome, 0);
+    let outcome = machine.step(StepInput::resume(RequirementResolution::new(
+        tool_req,
+        RequirementResult::Tool(Ok(tool_ok("call-weather", "sunny"))),
+    )));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    outcome.requirements[0].id
+}
+
+/// Builds a `Pivot` external input carrying a human user-role message.
+fn pivot_input(index: u128, text: &str) -> AgentInput {
+    let pivot = PivotMessage::new(
+        pivot_message_id(index),
+        user_message(text),
+        PivotSource::Human,
+    )
+    .expect("valid user pivot");
+    AgentInput::pivot(pivot)
+}
+
+#[test]
+fn pivot_at_post_tool_boundary_injects_user_message_and_reemits_same_requirement() {
+    let mut machine = tool_machine(Arc::new(NoApprovalPolicy));
+    let llm2 = drive_to_post_tool_streaming_step(&mut machine);
+
+    let outcome = machine.step(StepInput::external(pivot_input(
+        0,
+        "actually, focus on Tokyo",
+    )));
+    assert!(outcome.is_quiescent());
+    assert!(outcome.notifications.is_empty());
+    // No cursor move: the same streaming step keeps its requirement id, so the
+    // re-emitted request simply replaces the outstanding one.
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert_eq!(outcome.requirements.len(), 1);
+    assert_eq!(outcome.requirements[0].id, llm2);
+    let RequirementKind::NeedLlm { request, .. } = &outcome.requirements[0].kind else {
+        panic!("pivot injection must re-emit NeedLlm");
+    };
+    // The injected user message is the last rendered turn message.
+    assert_text(
+        request.messages.last().expect("rendered messages"),
+        "actually, focus on Tokyo",
+    );
+
+    // The pivot lands in the pending turn after the tool result, as a user turn.
+    let pending = machine
+        .state()
+        .conversation()
+        .pending()
+        .expect("pending turn stays open");
+    // user + assistant(tool-use) + tool-result + user(pivot).
+    assert_eq!(pending.messages().len(), 4);
+
+    // Resuming the re-emitted requirement commits the turn with the pivot inside.
+    let _ = resume_llm(&mut machine, llm2, text_response("focusing on Tokyo"));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Done);
+    let conversation = machine.state().conversation();
+    let turn = &conversation.turns()[0];
+    assert_eq!(turn.messages().len(), 5);
+    assert_eq!(turn.messages()[3].payload().role, Role::User);
+    assert_text(turn.messages()[3].payload(), "actually, focus on Tokyo");
+    assert_text(turn.messages()[4].payload(), "focusing on Tokyo");
+    // The injection records the pivot source label on the message meta.
+    assert_eq!(
+        turn.messages()[3]
+            .meta()
+            .and_then(|meta| meta.source())
+            .expect("pivot source label"),
+        "pivot:human"
+    );
+}
+
+#[test]
+fn non_user_pivot_payload_is_rejected_at_boundary() {
+    let mut machine = tool_machine(Arc::new(NoApprovalPolicy));
+    let _ = drive_to_post_tool_streaming_step(&mut machine);
+
+    // Raw serde can build an unchecked pivot whose payload is not a user turn.
+    let invalid: PivotMessage = serde_json::from_value(json!({
+        "message_id": pivot_message_id(1),
+        "message": { "role": "assistant", "content": [] },
+        "source": { "source": "human" }
+    }))
+    .expect("raw serde builds an unchecked pivot");
+
+    let outcome = machine.step(StepInput::external(AgentInput::pivot(invalid)));
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+}
+
+#[test]
+fn pivot_before_any_tool_result_is_rejected() {
+    // At the initial streaming step the pending turn holds only the user
+    // message, so there is no closed tool-result boundary to inject after.
+    let mut machine = tool_machine(Arc::new(NoApprovalPolicy));
+    let _ = park_on_need_llm(&mut machine);
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+
+    let outcome = machine.step(StepInput::external(pivot_input(2, "too early")));
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+}
+
+#[test]
+fn pivot_with_open_tool_calls_is_rejected() {
+    let mut machine = tool_machine(Arc::new(NoApprovalPolicy));
+    let llm_id = park_on_need_llm(&mut machine);
+    let _ = resume_llm(
+        &mut machine,
+        llm_id,
+        single_tool_response("call-weather", "get_weather"),
+    );
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingTool);
+
+    let outcome = machine.step(StepInput::external(pivot_input(3, "mid tool call")));
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+}
+
+#[test]
+fn pivot_while_idle_is_rejected() {
+    let mut machine = tool_machine(Arc::new(NoApprovalPolicy));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
+
+    let outcome = machine.step(StepInput::external(pivot_input(4, "nothing running")));
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
 }

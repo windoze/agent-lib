@@ -24,7 +24,8 @@
 //!   Conversation pending, executes provider-neutral tool calls through a live
 //!   [`agent::ToolRegistry`], pauses tool execution through a live
 //!   [`agent::ToolApprovalPolicy`] and [`agent::ApprovalResponse`] boundary,
-//!   applies queued [`agent::PivotMessage`] values at checked step boundaries,
+//!   applies caller-supplied [`agent::PivotMessage`] injections at the checked
+//!   post-tool step boundary through the sans-io machine,
 //!   applies queued [`agent::ReconfigRequest`] values only at turn boundaries,
 //!   and commits only after a tool-free final assistant response.
 //! - [`conversation`] adds externally supplied strong identities,
@@ -86,7 +87,7 @@
 //! [`agent::ToolExecutor`] boundaries, [`agent::ToolApprovalPolicy`] and
 //! [`agent::ApprovalResponse`] approval boundaries, a
 //! [`agent::ToolRegistryResolver`] for turn-boundary tool-set replacement, and
-//! the [`agent::DefaultAgentLoop`] driver with `interject` soft-turning,
+//! the [`agent::DefaultAgentLoop`] driver with
 //! `reconfigure` turn-boundary config application, approval waits, and
 //! cancellation closure, without making live handles part of persisted state.
 //!

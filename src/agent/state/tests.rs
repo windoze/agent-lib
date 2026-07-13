@@ -158,12 +158,6 @@ fn agent_state_serde_round_trips_through_conversation_snapshot() {
         .replace_active_skills(vec![skill_id(2), skill_id(3)])
         .expect("active skills are unique");
     state
-        .queue_pivot(
-            QueuedPivot::new(message_id(2), user_message("pivot"), PivotSource::Human)
-                .expect("user pivot"),
-        )
-        .expect("queue pivot");
-    state
         .queue_reconfig(QueuedReconfig::ActivateSkill {
             skill_id: skill_id(4),
         })
@@ -197,7 +191,6 @@ fn agent_state_serde_round_trips_through_conversation_snapshot() {
     );
     assert_eq!(decoded.conversation().turns().len(), 1);
     assert_eq!(decoded.active_skills(), &[skill_id(2), skill_id(3)]);
-    assert_eq!(decoded.queued_pivots().len(), 1);
     assert_eq!(decoded.queued_reconfigs().len(), 1);
     assert_eq!(decoded.loop_cursor().kind(), LoopCursorKind::StreamingStep);
 }
@@ -447,24 +440,6 @@ fn runtime_handles_are_kept_outside_agent_state_serde() {
             "runtime handle key must not be serialized: {forbidden}"
         );
     }
-}
-
-#[test]
-fn agent_state_deserialize_rejects_invalid_queued_data() {
-    let state = AgentState::new(spec(), committed_conversation());
-    let mut encoded = serde_json::to_value(state).expect("serialize state");
-    encoded["queued_pivots"] = json!([
-        {
-            "message_id": "018f0d9c-7b6a-7c12-8f31-1234567890e5",
-            "message": { "role": "assistant", "content": [] },
-            "source": { "source": "human" }
-        }
-    ]);
-
-    let error = serde_json::from_value::<AgentState>(encoded)
-        .expect_err("invalid queued pivot must fail state restore");
-
-    assert!(error.to_string().contains("Role::User"));
 }
 
 #[test]

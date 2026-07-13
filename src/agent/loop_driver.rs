@@ -5,8 +5,7 @@
 //! stream before starting another feed segment for the same Agent.
 
 use crate::agent::{
-    AgentError, AgentEvent, AgentInput, ApprovalError, ApprovalResponse, PivotMessage,
-    ReconfigRequest,
+    AgentError, AgentEvent, AgentInput, ApprovalError, ApprovalResponse, ReconfigRequest,
 };
 use async_trait::async_trait;
 use futures::{Stream, stream::BoxStream};
@@ -46,14 +45,6 @@ pub trait AgentLoop: Send {
     /// Agent is still active. Other errors are classified by the loop
     /// implementation before any unchecked state is exposed.
     async fn feed(&mut self, input: AgentInput) -> Result<AgentEventStream, AgentError>;
-
-    /// Queues a user-role pivot for a future step boundary.
-    ///
-    /// # Errors
-    ///
-    /// Returns a classified [`AgentError`] when the loop cannot accept the
-    /// pivot in its current runtime state.
-    fn interject(&self, message: PivotMessage) -> Result<(), AgentError>;
 
     /// Queues a configuration change for a future turn boundary.
     ///
@@ -202,20 +193,28 @@ impl fmt::Debug for AgentEventStream {
 mod tests {
     use super::{AgentEventStream, AgentFeedGuard, AgentLoop, BoxAgentEventStream};
     use crate::agent::{
-        AgentError, AgentEvent, AgentInput, AgentOutcome, PivotMessage, ReconfigRequest, StepId,
+        AgentError, AgentEvent, AgentInput, AgentOutcome, PivotMessage, PivotSource,
+        ReconfigRequest,
     };
+    use crate::conversation::MessageId;
+    use crate::model::message::{Message, Role};
     use async_trait::async_trait;
     use futures::{StreamExt, stream};
 
-    fn step_id() -> StepId {
+    fn message_id() -> MessageId {
         "018f0d9c-7b6a-7c12-8f31-1234567890a8"
             .parse()
-            .expect("step id")
+            .expect("message id")
     }
 
-    #[allow(deprecated)]
     fn input() -> AgentInput {
-        AgentInput::resume(step_id())
+        let message = Message {
+            role: Role::User,
+            content: Vec::new(),
+        };
+        let pivot =
+            PivotMessage::new(message_id(), message, PivotSource::Human).expect("valid pivot");
+        AgentInput::pivot(pivot)
     }
 
     fn done_stream() -> BoxAgentEventStream {
@@ -231,10 +230,6 @@ mod tests {
     impl AgentLoop for FakeLoop {
         async fn feed(&mut self, _input: AgentInput) -> Result<AgentEventStream, AgentError> {
             self.guard.guard_stream(done_stream())
-        }
-
-        fn interject(&self, _message: PivotMessage) -> Result<(), AgentError> {
-            Ok(())
         }
 
         fn reconfigure(&self, _request: ReconfigRequest) -> Result<(), AgentError> {

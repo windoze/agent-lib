@@ -12,17 +12,16 @@ use crate::{
         AgentError, AgentEvent, AgentInput, AgentOutcome, AgentState, ApprovalDecision,
         ApprovalError, ApprovalRequest, ApprovalRequirement, ApprovalResponse,
         DeclaredOnlyToolRegistry, DeclaredOnlyToolRegistryResolver, LoopCursor, NoApprovalPolicy,
-        NoToolExecutionIds, PivotMessage, ReconfigRequest, RunContext, StaticToolRegistryResolver,
-        StepBoundary, StepId, ToolApprovalPolicy, ToolCallFinished, ToolCallStarted,
-        ToolExecutionIds, ToolFailurePolicy, ToolRegistry, ToolRegistryResolver, ToolRuntimeError,
-        TraceNodeId,
+        NoToolExecutionIds, ReconfigRequest, RunContext, StaticToolRegistryResolver, StepBoundary,
+        StepId, ToolApprovalPolicy, ToolCallFinished, ToolCallStarted, ToolExecutionIds,
+        ToolFailurePolicy, ToolRegistry, ToolRegistryResolver, ToolRuntimeError, TraceNodeId,
         approval::approval_response_for_decision,
-        state::{CancelRecoveryReason, PivotSource, QueuedPivot, ReconfigApplication},
+        state::{CancelRecoveryReason, ReconfigApplication},
     },
     client::{ChatRequest, ClientError, LlmClient, Response},
     conversation::{
-        AssistantFinish, CancelDisposition, CancelledToolResult, MessageId, MessageMeta,
-        ToolCallId, ToolCallMapping, TurnId, TurnMeta,
+        AssistantFinish, CancelDisposition, CancelledToolResult, MessageId, ToolCallId,
+        ToolCallMapping, TurnId, TurnMeta,
     },
     model::{
         content::ContentBlock,
@@ -261,11 +260,6 @@ impl AgentLoop for DefaultAgentLoop {
         stream.map(|stream| AgentEventStream::new(stream, permit))
     }
 
-    fn interject(&self, message: PivotMessage) -> Result<(), AgentError> {
-        let mut state = lock_agent_state(&self.runtime.state)?;
-        state.queue_pivot(message).map_err(AgentError::from)
-    }
-
     fn reconfigure(&self, request: ReconfigRequest) -> Result<(), AgentError> {
         self.runtime.queue_reconfig(request)
     }
@@ -416,54 +410,18 @@ impl LoopRuntime {
         input: AgentInput,
         stream: bool,
     ) -> Result<PreparedAssistantCall, AgentError> {
-        #[allow(deprecated)]
         let initial = match input {
-            AgentInput::UserMessage(user) => {
-                let state = lock_agent_state(&self.state)?;
-                if !state.queued_pivots().is_empty() {
-                    return Err(AgentError::QueuedPivotPending);
-                }
-                InitialUserTurn {
-                    turn_id: user.turn_id(),
-                    message_id: user.message_id(),
-                    message: user.message().clone(),
-                    assistant_message_id: user.assistant_message_id(),
-                    step_id: user.step_id(),
-                    queued_pivot: false,
-                }
-            }
-            AgentInput::QueuedPivotTurn(input) => {
-                let state = lock_agent_state(&self.state)?;
-                let pivot = state
-                    .queued_pivots()
-                    .first()
-                    .cloned()
-                    .ok_or(AgentError::NoQueuedPivot)?;
-                InitialUserTurn {
-                    turn_id: input.turn_id(),
-                    message_id: pivot.message_id(),
-                    message: pivot.message().clone(),
-                    assistant_message_id: input.assistant_message_id(),
-                    step_id: input.step_id(),
-                    queued_pivot: true,
-                }
-            }
-            AgentInput::Resume(input) => {
-                {
-                    let state = lock_agent_state(&self.state)?;
-                    if state.conversation().pending_context().is_none() {
-                        return Err(AgentError::Other(
-                            "resume feed input requires a pending conversation context".to_owned(),
-                        ));
-                    }
-                }
-                let assistant_message_id = self.tool_ids.next_assistant_message_id()?;
-                return self.prepare_assistant_call(input.step_id(), assistant_message_id, stream);
-            }
+            AgentInput::UserMessage(user) => InitialUserTurn {
+                turn_id: user.turn_id(),
+                message_id: user.message_id(),
+                message: user.message().clone(),
+                assistant_message_id: user.assistant_message_id(),
+                step_id: user.step_id(),
+            },
             AgentInput::Pivot(_) => {
                 return Err(AgentError::Other(
                     "the legacy default loop does not support direct pivot injection; \
-                     queue the pivot and feed AgentInput::QueuedPivotTurn instead"
+                     drive the sans-io machine with AgentInput::Pivot instead"
                         .to_owned(),
                 ));
             }
@@ -479,12 +437,6 @@ impl LoopRuntime {
             ) {
                 state.transition_cursor(LoopCursor::Idle)?;
                 return Err(AgentError::Conversation(error));
-            }
-            if initial.queued_pivot {
-                let removed = state
-                    .dequeue_pivot()
-                    .expect("queued pivot was peeked before begin_turn");
-                debug_assert_eq!(removed.message_id(), initial.message_id);
             }
         }
 
@@ -613,7 +565,7 @@ impl LoopRuntime {
                     .conversation_mut()
                     .commit_pending(TurnMeta::default())?;
                 let boundary = state.conversation().head();
-                let mut metadata = deferred_pivot_metadata(&state);
+                let mut metadata = Map::new();
                 if let Some(prepared_reconfig) = prepared_reconfig {
                     state.apply_reconfig_application(prepared_reconfig.application);
                     if let Some(registry) = prepared_reconfig.registry {
@@ -747,34 +699,17 @@ impl LoopRuntime {
         Ok(())
     }
 
-    fn apply_pivots_at_pending_step_boundary(
+    fn tool_result_step_boundary(
         &self,
         prepared: &PreparedAssistantCall,
     ) -> Result<AgentEvent, AgentError> {
-        let mut state = lock_agent_state(&self.state)?;
+        let state = lock_agent_state(&self.state)?;
         let boundary = state.conversation().head();
-        let mut records = Vec::new();
 
-        while let Some(pivot) = state.dequeue_pivot() {
-            let record = match state.conversation_mut().inject_user_message(
-                boundary,
-                pivot.message_id(),
-                pivot.message().clone(),
-                pivot_message_meta(&pivot),
-            ) {
-                Ok(()) => pivot_record(&pivot, "applied", "pending_turn", None),
-                Err(error) => {
-                    pivot_record(&pivot, "rejected", "pending_turn", Some(error.to_string()))
-                }
-            };
-            records.push(record);
-        }
-
-        Ok(AgentEvent::StepBoundary(StepBoundary::with_metadata(
+        Ok(AgentEvent::StepBoundary(StepBoundary::new(
             prepared.step_id,
             boundary,
             prepared.trace_node_id.clone(),
-            pivot_metadata(records),
         )))
     }
 
@@ -955,9 +890,7 @@ impl ToolBatchSegment {
             }
 
             if self.pending.is_empty() {
-                let boundary = self
-                    .runtime
-                    .apply_pivots_at_pending_step_boundary(&self.prepared)?;
+                let boundary = self.runtime.tool_result_step_boundary(&self.prepared)?;
                 self.queued.push_back(boundary);
                 self.boundary_emitted = true;
                 continue;
@@ -1435,7 +1368,6 @@ struct InitialUserTurn {
     message: Message,
     assistant_message_id: MessageId,
     step_id: StepId,
-    queued_pivot: bool,
 }
 
 struct PreparedReconfigApplication {
@@ -1490,24 +1422,6 @@ async fn wait_for_approval(
     }
 }
 
-fn deferred_pivot_metadata(state: &AgentState) -> Map<String, Value> {
-    pivot_metadata(
-        state
-            .queued_pivots()
-            .iter()
-            .map(|pivot| pivot_record(pivot, "deferred", "next_turn", None))
-            .collect(),
-    )
-}
-
-fn pivot_metadata(records: Vec<Value>) -> Map<String, Value> {
-    let mut metadata = Map::new();
-    if !records.is_empty() {
-        metadata.insert("pivots".to_owned(), Value::Array(records));
-    }
-    metadata
-}
-
 fn reconfig_metadata(records: Vec<Value>) -> Map<String, Value> {
     let mut metadata = Map::new();
     if !records.is_empty() {
@@ -1520,29 +1434,6 @@ fn merge_metadata(target: &mut Map<String, Value>, source: Map<String, Value>) {
     for (key, value) in source {
         target.insert(key, value);
     }
-}
-
-fn pivot_record(
-    pivot: &QueuedPivot,
-    status: &'static str,
-    target: &'static str,
-    error: Option<String>,
-) -> Value {
-    let mut record = Map::new();
-    record.insert("status".to_owned(), Value::String(status.to_owned()));
-    record.insert("target".to_owned(), Value::String(target.to_owned()));
-    record.insert(
-        "message_id".to_owned(),
-        serde_json::to_value(pivot.message_id()).expect("message id serializes"),
-    );
-    record.insert(
-        "source".to_owned(),
-        serde_json::to_value(pivot.source()).expect("pivot source serializes"),
-    );
-    if let Some(error) = error {
-        record.insert("error".to_owned(), Value::String(error));
-    }
-    Value::Object(record)
 }
 
 fn reconfig_records(requests: &[ReconfigRequest]) -> Vec<Value> {
@@ -1631,24 +1522,6 @@ fn reconfig_record(request: &ReconfigRequest, status: &'static str) -> Value {
         }
     }
     Value::Object(record)
-}
-
-fn pivot_message_meta(pivot: &QueuedPivot) -> MessageMeta {
-    let mut extra = Map::new();
-    extra.insert(
-        "pivot_source".to_owned(),
-        serde_json::to_value(pivot.source()).expect("pivot source serializes"),
-    );
-    MessageMeta::new(Some(pivot_source_label(pivot.source())), extra)
-}
-
-fn pivot_source_label(source: &PivotSource) -> String {
-    match source {
-        PivotSource::Human => "pivot:human".to_owned(),
-        PivotSource::Coordinator { agent_id } => format!("pivot:coordinator:{agent_id}"),
-        PivotSource::Skill { skill_id } => format!("pivot:skill:{skill_id}"),
-        PivotSource::Host { label } => format!("pivot:host:{label}"),
-    }
 }
 
 fn extract_last_tool_calls(state: &AgentState) -> Result<Vec<ToolCall>, AgentError> {

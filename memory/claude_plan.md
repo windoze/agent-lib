@@ -1,55 +1,61 @@
-# 执行计划 — M4-1 cancel = never-resume,接 Conversation::cancel_pending
+# 执行计划 — M4-2 pivot = 多喂 input，删除 pivot queue
 
 ## 选中的任务
-`TODO.md` 第一个未完成任务 = **M4-1**(Milestone 4，M1..M3 全 `[DONE]`）。
-前置 M3-R 已完成。不拆分。
+`TODO.md` 第一个未完成任务 = **M4-2**（M1..M4-1 全 `[DONE]`）。前置 M4-1 已完成。不拆分：
+pivot 注入 + 删除 pivot queue + 清理 deprecated `AgentInput` 变体是一个必须一起落地的
+内聚变更（删除变体要求机器接管 Pivot 且要求改造 legacy loop，无法分开落地而不破坏编译）。
 
-## 目标（TODO M4-1 "做什么"）
-1. 实现 `step(StepInput::Abandon(id))`：不回灌结果，定位 requirement 对应 cursor，
-   迁 `CancelRecovery`，触发本机 Conversation 的 `cancel_pending`（按 disposition 闭合裂缝），
-   收尾后 cursor 回到可 `step(External(UserMessage))` 的一致态（Idle）。
-2. 机器层触发 `Conversation::cancel_pending`（machine 拥有唯一 Conversation）。
-3. `CancellationToken` 保留为向下信号；driver 据此决定 Abandon；闭合由 never-resume+cancel_pending 完成。
-4. 在参考 driver（drain）里接入 cancel 路径。
+## 目标（TODO M4-2 “做什么”）
+1. 实现 `step(External(AgentInput::Pivot(msg)))`：在合法边界（`StreamingStep` 且 pending 处于
+   closed-tool-result 边界）向 pending 追加 `Role::User` 消息，复用
+   `Conversation::inject_user_message`（沿用其 role sequence 校验）。
+2. 删除 pivot 排队语义：`interject` 的 queue 行为、`QueuedPivotTurn`、`AgentState` 的
+   `queued_pivots`/`queue_pivot`/`dequeue_pivot`；`PivotMessage`/`PivotSource` 数据类型保留。
+3. 清理 M2-1 遗留的 `#[deprecated]` `AgentInput` 变体（`QueuedPivotTurn` 与 `Resume`），使
+   `AgentInput` 收敛为迁移文档 §2.2 目标 `{ UserMessage, Pivot }`。
+4. 更新受影响 state/loop/event 测试与文档。
 
-## 设计决策（记录，供 review）
-- cancel = 整 turn never-resume（受控丢弃+闭合），非逐 tool。
-- disposition 由 cursor 决定：
-  - `StreamingStep`（NeedLlm 未决，无 open tool call）→ `DiscardTurn`，reason `LlmInterrupted`。
-  - `AwaitingTool`/`AwaitingApproval`（有 open tool call）→ `ResumeTurn { cancelled_results }`，
-    对每个仍未闭合的 call 合成 `Cancelled` tool result（闭合悬空 tool_use），reason `ToolInterrupted`。
-    已完成的 call 保留真实结果 → 支撑"一批 tool 部分 abandon"。
-- 收尾：current → `CancelRecovery(step_id, reason)` → `Idle`；清空 in_flight scratch。
-- `ResumeTurn` 后 pending 为 coherent Resumed（无悬空 tool_use）；`begin_user_turn` 在
-  cursor==Idle 且存在 leftover pending 时先 `DiscardTurn` 再 begin_turn → 满足"step(UserMessage) 开新 turn"。
-- driver：`drain` 每批兑现前检查 `ctx.is_cancelled()`；命中则对第一条未决 requirement 喂
-  `Abandon`（一次 abandon 即整 turn 闭合），break 返回 cursor=Idle 的 TurnDone。uncancelled 时行为不变。
-
-## 涉及文件
-- src/agent/machine/default/mod.rs：Abandon 分发、begin_user_turn leftover 处理、abandon_llm_step、finish_cancel。
-- src/agent/machine/default/tools.rs：abandon_tool_phase（枚举 open ToolSlot → CancelledToolResult → ResumeTurn）。
-- src/agent/drive.rs：drain 加 cancel 检查分支。
-- 测试：machine tests（streaming abandon / tool partial abandon / 后续 UserMessage 开新 turn），
-  reference driver cancel 测试。
+## 设计决策
+- 合法边界：仅 `LoopCursor::StreamingStep`。`inject_user_message` 内部要求 phase
+  `AwaitingAssistant` 且 `is_after_closed_tool_result_step()`，因此“turn 起始首个 StreamingStep”
+  与 open tool calls 都被拒 → 满足“不破坏 open tool calls / 只在合法边界注入”。
+- re-emit：注入后重渲染 `build_chat_request`，复用同一 requirement id 重发 `NeedLlm`，cursor 不动。
+- 非 user pivot 被拒：`PivotMessage::validate()` + `inject_user_message` 的 `validate_user_payload`。
+- pivot meta 下沉为 `QueuedPivot::message_meta()` / `PivotSource::label()`，机器与 loop 共用。
+- legacy loop：保 `feed(UserMessage)`；`feed(Pivot)` 报错；删 QueuedPivotTurn/Resume 路径与
+  pivot-apply/defer helper；`interject` 从 trait 移除；recovery-resume 随 Resume 删除（M4-1 等价覆盖）。
 
 ## 验证命令（顺序）
 1. cargo fmt --all
 2. cargo clippy --all-targets -- -D warnings
-3. cargo test --lib agent::machine agent::drive（聚焦）
+3. 聚焦：cargo test --lib agent::machine agent::state agent::event
 4. cargo test --all --all-targets（≤30min）
 5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 6. git diff --check
 
 ## 进度
-- [x] machine abandon 实现（mod.rs + tools.rs）
-- [x] begin_user_turn leftover 处理
-- [x] drain cancel 路径
-- [x] 测试（machine 6 + reference 2 + streaming 1 = 9 个，全绿）
-- [x] 全套验证（fmt/clippy/test 435 lib/doc/diff 全绿）
-- [x] TODO.md 标 [DONE] + 完成记录，提交
+- [ ] queue.rs 下沉 message_meta/label
+- [ ] 机器 inject_pivot + 分发
+- [ ] state.rs 删 pivot queue
+- [ ] event.rs 删 deprecated 变体 + 错误变体
+- [ ] mod.rs 导出
+- [ ] legacy loop 改造
+- [ ] 测试增删改
+- [ ] 文档
+- [ ] 全套验证
+- [ ] TODO.md 标 [DONE] + 完成记录，提交
 
-## 结论
-M4-1 完成。cancel = never-resume：`step(Abandon)` 按 cursor 选 disposition，machine 自持
-Conversation 触发 `cancel_pending`（DiscardTurn / ResumeTurn+合成 CancelledToolResult），经
-CancelRecovery 收于 Idle；driver 在 `is_cancelled` 时喂一次 Abandon 闭合整 turn。pivot(M4-2)/
-respond_approval(M4-3) 未触碰。PLAN.md 无阶段级变更，跳过。
+---
+
+## M4-2 完成 (final)
+
+全部 8 个 Phase 完成,已提交前状态:
+
+- Phase 1-5 (queue.rs helpers / machine inject_pivot / state.rs 去 queue / event.rs 去 deprecated 变体 / mod.rs exports) — done
+- Phase 6 legacy loop rework (default.rs + loop_driver.rs) — done: 删 interject、prepare_user_turn 收敛为 {UserMessage,Pivot}、apply_pivots→tool_result_step_boundary、删 5 个 pivot helper + InitialUserTurn.queued_pivot、修 imports
+- Phase 7 测试 — done: state/tests.rs 与 loop_driver/default/tests.rs 删除失效 pivot/interject/resume 测试 + helper;新增 tools.rs 5 个 machine pivot 测试
+- Phase 8 docs — done: lib.rs / README.md 同步;迁移文档为叙述无需改
+
+验证全绿:fmt clean / clippy -D warnings clean / cargo test --all --all-targets = 433 lib + 8 integration = 441 passed 0 failed / rustdoc -D warnings clean / git diff --check clean。
+
+TODO.md M4-2 已标记 [DONE] 并写入完成记录。下一步:提交并 STOP(不启动 M4-3)。

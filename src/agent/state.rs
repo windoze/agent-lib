@@ -43,7 +43,6 @@ pub struct AgentState {
     spec: AgentSpec,
     conversation: Conversation,
     active_skills: Vec<SkillId>,
-    queued_pivots: Vec<QueuedPivot>,
     queued_reconfigs: ReconfigQueue,
     system_prompt_overlay: Option<String>,
     system_prompt_overlay_version: u64,
@@ -64,7 +63,6 @@ impl AgentState {
             spec,
             conversation,
             active_skills: Vec::new(),
-            queued_pivots: Vec::new(),
             queued_reconfigs: ReconfigQueue::new(),
             system_prompt_overlay: None,
             system_prompt_overlay_version: 0,
@@ -102,12 +100,6 @@ impl AgentState {
     #[must_use]
     pub fn active_skills(&self) -> &[SkillId] {
         &self.active_skills
-    }
-
-    /// Returns queued pivot messages waiting for a future step boundary.
-    #[must_use]
-    pub fn queued_pivots(&self) -> &[QueuedPivot] {
-        &self.queued_pivots
     }
 
     /// Returns queued reconfiguration intents waiting for a turn boundary.
@@ -165,27 +157,6 @@ impl AgentState {
         ensure_unique_skill_ids(&active_skills)?;
         self.active_skills = active_skills;
         Ok(())
-    }
-
-    /// Queues a pivot message for the next valid step boundary.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AgentStateError::InvalidPivotRole`] if the pivot message is
-    /// not a user-authored message.
-    pub fn queue_pivot(&mut self, pivot: QueuedPivot) -> Result<(), AgentStateError> {
-        pivot.validate()?;
-        self.queued_pivots.push(pivot);
-        Ok(())
-    }
-
-    /// Removes and returns the oldest queued pivot for checked loop drivers.
-    pub(crate) fn dequeue_pivot(&mut self) -> Option<QueuedPivot> {
-        if self.queued_pivots.is_empty() {
-            None
-        } else {
-            Some(self.queued_pivots.remove(0))
-        }
     }
 
     /// Queues a turn-boundary reconfiguration intent.
@@ -292,9 +263,6 @@ impl AgentState {
             .current_loop_policy
             .unwrap_or(*record.spec.loop_policy());
         let queued_reconfigs = record.queued_reconfigs;
-        for pivot in &record.queued_pivots {
-            pivot.validate()?;
-        }
         for reconfig in queued_reconfigs.as_slice() {
             reconfig.validate()?;
         }
@@ -305,7 +273,6 @@ impl AgentState {
             spec: record.spec,
             conversation,
             active_skills: record.active_skills,
-            queued_pivots: record.queued_pivots,
             queued_reconfigs,
             system_prompt_overlay: record.system_prompt_overlay,
             system_prompt_overlay_version: record.system_prompt_overlay_version.unwrap_or(0),
@@ -454,7 +421,6 @@ impl Serialize for AgentState {
             spec: self.spec.clone(),
             conversation,
             active_skills: self.active_skills.clone(),
-            queued_pivots: self.queued_pivots.clone(),
             queued_reconfigs: self.queued_reconfigs.clone(),
             system_prompt_overlay: self.system_prompt_overlay.clone(),
             system_prompt_overlay_version,
@@ -484,8 +450,6 @@ struct AgentStateRecord {
     conversation: ConversationSnapshot,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     active_skills: Vec<SkillId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    queued_pivots: Vec<QueuedPivot>,
     #[serde(default, skip_serializing_if = "ReconfigQueue::is_empty")]
     queued_reconfigs: ReconfigQueue,
     #[serde(default, skip_serializing_if = "Option::is_none")]

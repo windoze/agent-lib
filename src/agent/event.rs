@@ -49,28 +49,6 @@ pub enum AgentInput {
     /// queueing it (see the migration doc §2.2). Queueing policy — when to
     /// inject — moves to the driver / session.
     Pivot(PivotMessage),
-    /// Start the next turn from the oldest queued pivot message.
-    ///
-    /// Deprecated: the effect model injects a pivot directly via
-    /// [`AgentInput::Pivot`]. This queue-driven variant is retained only so the
-    /// legacy [`DefaultAgentLoop`](crate::agent::DefaultAgentLoop) keeps
-    /// compiling during Stage 0–2; it is removed in M4.
-    #[deprecated(
-        since = "0.1.0",
-        note = "use AgentInput::Pivot; the pivot queue is removed in M4"
-    )]
-    QueuedPivotTurn(QueuedPivotTurnInput),
-    /// Resume from a data-only loop cursor after external recovery.
-    ///
-    /// Deprecated: resume semantics move onto
-    /// [`StepInput::Resume`](crate::agent::StepInput::Resume), which feeds a
-    /// specific requirement's result back rather than resuming an opaque cursor.
-    /// Retained for the legacy loop during Stage 0–2; removed in M4.
-    #[deprecated(
-        since = "0.1.0",
-        note = "use StepInput::Resume; opaque cursor resume is removed in M4"
-    )]
-    Resume(ResumeInput),
 }
 
 impl AgentInput {
@@ -100,40 +78,6 @@ impl AgentInput {
     #[must_use]
     pub const fn pivot(pivot: PivotMessage) -> Self {
         Self::Pivot(pivot)
-    }
-
-    /// Creates input for starting a turn from the oldest queued pivot.
-    ///
-    /// Deprecated: see [`AgentInput::QueuedPivotTurn`].
-    #[deprecated(
-        since = "0.1.0",
-        note = "use AgentInput::Pivot; the pivot queue is removed in M4"
-    )]
-    #[must_use]
-    #[allow(deprecated)]
-    pub const fn queued_pivot_turn(
-        turn_id: TurnId,
-        assistant_message_id: MessageId,
-        step_id: StepId,
-    ) -> Self {
-        Self::QueuedPivotTurn(QueuedPivotTurnInput::new(
-            turn_id,
-            assistant_message_id,
-            step_id,
-        ))
-    }
-
-    /// Creates input for resuming a feed segment after external recovery.
-    ///
-    /// Deprecated: see [`AgentInput::Resume`].
-    #[deprecated(
-        since = "0.1.0",
-        note = "use StepInput::Resume; opaque cursor resume is removed in M4"
-    )]
-    #[must_use]
-    #[allow(deprecated)]
-    pub const fn resume(step_id: StepId) -> Self {
-        Self::Resume(ResumeInput::new(step_id))
     }
 }
 
@@ -230,70 +174,6 @@ impl<'de> Deserialize<'de> for AgentUserInput {
             record.step_id,
         )
         .map_err(de::Error::custom)
-    }
-}
-
-/// Identities needed to turn the oldest queued pivot into a new turn.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QueuedPivotTurnInput {
-    turn_id: TurnId,
-    assistant_message_id: MessageId,
-    step_id: StepId,
-}
-
-impl QueuedPivotTurnInput {
-    /// Creates queued-pivot turn input from caller-supplied identities.
-    ///
-    /// The pivot already carries the user message id and payload. The caller
-    /// still supplies the turn, assistant response, and step identities because
-    /// Agent code must not synthesize ids.
-    #[must_use]
-    pub const fn new(turn_id: TurnId, assistant_message_id: MessageId, step_id: StepId) -> Self {
-        Self {
-            turn_id,
-            assistant_message_id,
-            step_id,
-        }
-    }
-
-    /// Returns the caller-supplied turn identity.
-    #[must_use]
-    pub const fn turn_id(&self) -> TurnId {
-        self.turn_id
-    }
-
-    /// Returns the caller-supplied assistant message identity for this step.
-    #[must_use]
-    pub const fn assistant_message_id(&self) -> MessageId {
-        self.assistant_message_id
-    }
-
-    /// Returns the Agent step identity for this queued-pivot turn.
-    #[must_use]
-    pub const fn step_id(&self) -> StepId {
-        self.step_id
-    }
-}
-
-/// Input for resuming after a pause, approval, tool wait, or recovery point.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResumeInput {
-    step_id: StepId,
-}
-
-impl ResumeInput {
-    /// Creates resume input with the next caller-supplied step identity.
-    #[must_use]
-    pub const fn new(step_id: StepId) -> Self {
-        Self { step_id }
-    }
-
-    /// Returns the next Agent step identity.
-    #[must_use]
-    pub const fn step_id(&self) -> StepId {
-        self.step_id
     }
 }
 
@@ -832,12 +712,6 @@ pub enum AgentError {
     /// User-turn input carried a role other than `Role::User`.
     #[error("agent user input must use Role::User, found {0:?}")]
     InvalidInputRole(Role),
-    /// A queued pivot must be consumed before accepting another user turn.
-    #[error("queued pivot messages must be consumed before a new user turn")]
-    QueuedPivotPending,
-    /// Queued-pivot turn input was supplied while the pivot queue was empty.
-    #[error("queued-pivot turn input requires at least one queued pivot")]
-    NoQueuedPivot,
     /// The underlying LLM client failed.
     #[error("client operation failed: {0}")]
     Client(#[from] ClientError),
@@ -879,9 +753,7 @@ impl AgentError {
     pub const fn kind(&self) -> AgentErrorKind {
         match self {
             Self::FeedInProgress => AgentErrorKind::FeedInProgress,
-            Self::InvalidInputRole(_) | Self::QueuedPivotPending | Self::NoQueuedPivot => {
-                AgentErrorKind::InvalidInput
-            }
+            Self::InvalidInputRole(_) => AgentErrorKind::InvalidInput,
             Self::Client(_) => AgentErrorKind::Client,
             Self::Conversation(_) => AgentErrorKind::Conversation,
             Self::RunContext(RunContextError::Cancelled) => AgentErrorKind::Cancelled,
@@ -904,11 +776,11 @@ fn non_empty(value: String) -> Option<String> {
 mod tests {
     use super::{
         AgentError, AgentErrorKind, AgentEvent, AgentInput, AgentOutcome, AgentOutcomeKind,
-        ApprovalRequest, ExternalRecoveryKind, Notification, QueuedPivotTurnInput, StepBoundary,
+        ApprovalRequest, ExternalRecoveryKind, Notification, PivotMessage, StepBoundary,
         ToolCallFinished, ToolCallStarted,
     };
     use crate::{
-        agent::{BudgetDimension, BudgetError, StepId, TraceNodeId},
+        agent::{BudgetDimension, BudgetError, PivotSource, StepId, TraceNodeId},
         conversation::{
             Conversation, ConversationConfig, ConversationId, MessageId, ToolCallId, TurnId,
         },
@@ -1005,7 +877,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn agent_input_rejects_non_user_turn_payloads() {
         let error = AgentInput::user_message(
             turn_id(),
@@ -1034,12 +905,6 @@ mod tests {
         let serde_error = serde_json::from_value::<AgentInput>(encoded)
             .expect_err("serde must revalidate the user role");
         assert!(serde_error.to_string().contains("Role::User"));
-
-        assert_json_round_trip(AgentInput::QueuedPivotTurn(QueuedPivotTurnInput::new(
-            turn_id(),
-            assistant_message_id(),
-            step_id(),
-        )));
     }
 
     #[test]
@@ -1232,8 +1097,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn agent_input_round_trips_for_checked_user_and_resume_shapes() {
+    fn agent_input_round_trips_for_checked_user_and_pivot_shapes() {
         assert_json_round_trip(
             AgentInput::user_message(
                 turn_id(),
@@ -1244,7 +1108,13 @@ mod tests {
             )
             .expect("valid user input"),
         );
-        assert_json_round_trip(AgentInput::resume(step_id()));
+        let pivot = PivotMessage::new(
+            message_id(),
+            user_message("change direction"),
+            PivotSource::Human,
+        )
+        .expect("valid pivot payload");
+        assert_json_round_trip(AgentInput::pivot(pivot));
     }
 
     #[test]
