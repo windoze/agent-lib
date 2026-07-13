@@ -496,7 +496,7 @@ StepInput) -> StepOutcome`,纯、同步、无 async。现有 `AgentInput`(`event
   `cargo test --all --all-targets`(lib 396 passed / 0 failed,较 M2-2 的 388 +8;网络用例 ignored);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --check`(clean)。
 
-### [TODO] M2-4 抽出 tool step:`NeedTool` 与 `NeedInteraction`
+### [DONE] M2-4 抽出 tool step:`NeedTool` 与 `NeedInteraction`
 
 **前置依赖**:M2-3。
 
@@ -528,6 +528,60 @@ StepInput) -> StepOutcome`,纯、同步、无 async。现有 `AgentInput`(`event
 - 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦 machine 测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check`。
+
+**完成记录**:
+
+- **共享助手(前置,已单独提交)**:把 `approval_response_for_decision`(approve/deny/timeout/cancel →
+  合成 `ToolResponse`)从 `loop_driver/default.rs` 抽到 `src/agent/approval.rs` 为 `pub(crate)`,
+  legacy 与 sans-io 机器共用同一 approval→ToolResponse 转换,避免重复实现(class-wide)。
+- **模块化**:`git mv src/agent/machine/default.rs → src/agent/machine/default/mod.rs`;新增
+  `src/agent/machine/default/tools.rs` 承载 tool phase;M2-3 的内联测试外移到
+  `src/agent/machine/default/tests/mod.rs`,新增 `src/agent/machine/default/tests/tools.rs`。
+- **`DefaultAgentMachine` 结构调整**:去掉 M2-3 的 `pending_assistant_message_id`,改持非序列化 scratch
+  `in_flight: Option<InFlight>`(`InFlight { assistant_message_id, steps_started, tools: Option<ToolPhase> }`,
+  mirror legacy segment 的栈局部);新增 host 供给的 `tool_ids: Arc<dyn ToolExecutionIds>`(默认
+  `NoToolExecutionIds`)与 `approval_policy: Arc<dyn ToolApprovalPolicy>`(默认 `NoApprovalPolicy`),
+  经 builder `with_tool_execution_ids`/`with_approval_policy` 注入。cursor 仍是唯一可序列化状态,
+  只记 `RequirementId`。
+- **tool phase 模型(决策 B:一次吐一批;规避非法 cursor 迁移)**:`fold_llm_response` 遇
+  `RequiresToolCallMappings` 调 `begin_tool_phase`——从 pending 末条 assistant 抽 tool-use(复用
+  legacy `extract_last_tool_calls` 的过滤),`tool_ids.tool_call_id` 映射 + `register_tool_calls`,
+  `tool_ids.tool_result_message_id` 预分配结果 message id,`approval_policy.approval_requirement`
+  按需分流为 `auto_pending: Vec<ToolSlot>`(AutoApprove)与 `approval_pending: VecDeque<ToolSlot>`
+  (RequireApproval)。`advance_tool_phase`:①auto 非空 → 一次性 drain 全部 auto 为**一批**
+  `NeedTool` → `AwaitingTool`;②否则弹一个待审批 → `NeedInteraction` → `AwaitingApproval`;
+  ③都空 → `finish_tool_phase`。因所有 auto 一次吐尽,后续 advance 只会从 `AwaitingApproval`
+  (审批通过)或 finish 进入,**永不出现被禁止的 `AwaitingTool→AwaitingTool`**。
+- **回灌路径**:`resume` 按 cursor 路由。`resume_tool`(`AwaitingTool`)用
+  `running: BTreeMap<RequirementId, ToolSlot>` 按 `resolution.id` 定位 → 顺序无关的乱序批回灌;
+  `Tool(Ok)` 追加 `append_tool_response` + `ToolCallFinished`;`Tool(Err)` 按 `ToolFailurePolicy`
+  self-heal(`ReturnErrorToModel` 走 `to_tool_response`;`StopRun` → `fail`);一批全回灌后
+  `advance_tool_phase`。`resume_approval`(`AwaitingApproval`)校验 requirement id 与
+  `Interaction::accepts_response`(step/call 匹配),approve → 直接吐单个 `NeedTool`
+  (`AwaitingApproval→AwaitingTool`);deny/timeout/cancel → 合成 `ToolResponse` 追加 + 经
+  "restore bounce"`AwaitingApproval→AwaitingTool([call], None)` 再 advance(全走合法迁移)。
+- **步数上限与续 step**:`finish_tool_phase` 先吐 tool step 的 `StepBoundary(head)`(mirror legacy
+  pending step-boundary pivot 点),再判 `steps_started >= max_steps` → `fail_with_notifications`
+  (保留已吐的 StepBoundary);否则 `tool_ids.next_step_id()` + `next_assistant_message_id()` 续下
+  一 `NeedLlm`,`steps_started += 1`。通知统一挂 tool 所属 step 的 `step_id`。
+- **无 workaround / 未静默跳过**:tool id/approval/conversation 任一失败均分类 `fail`(discard pending →
+  `Error` cursor),不 papering。`External(Pivot)`/legacy 输入/`Abandon` 仍分类为 "M4 实现" 错误。
+- **已知边界(写明,非绕开)**:(1)批内先跑 auto 再逐个审批,与 legacy 严格 call-order 交错略有不同,
+  但结果按 tool-call id 归位、turn 组装一致,任务显式允许批顺序无关;(2)`in_flight`/`ToolPhase`
+  为非序列化 scratch(同 M2-3 的 assistant-id 边界),中途序列化会丢"哪些已回灌",持久化中途续跑属
+  M3+ driver/persistence 职责。
+- **聚焦测试(纯,同步,无 tokio;+13)**:`tests/tools.rs` 覆盖 single auto tool、parallel batch 乱序回灌、
+  tool error(ReturnErrorToModel self-heal / StopRun 停机)、approval approve/deny/cancel、
+  auto+approval 混合批(走 `StreamingStep→AwaitingTool→AwaitingApproval→AwaitingTool→StreamingStep`
+  全合法迁移)、多轮 `tool→llm→tool→text`、step-limit(保留 StepBoundary 后 Error)、未知 requirement/
+  结果类型不符/审批错配 call 的分类失败;断言每步 requirements/notifications/cursor 与 Conversation
+  追加(message 计数/末条文本)。测试用脚本化 `ScriptedRequirementIds`/`ScriptedToolIds`(host 供 id)与
+  `ApproveByName`/`AlwaysApprove` 审批策略。M2-3 的 `tool_use_response_is_rejected_until_m2_4` 相应改为
+  `tool_use_response_without_tool_id_source_fails`(默认 `NoToolExecutionIds` 下分类 "tool id unavailable")。
+- **验证**:`cargo fmt --all`(clean);`cargo clippy --all-targets -- -D warnings`(clean,修正
+  `needless_lifetimes`);`cargo test --lib agent::machine`(26 passed:13 新 tool + 13 既有);
+  `cargo test --all --all-targets`(417 passed / 0 failed,较 M2-3 的 396 之基线增量,网络用例 ignored);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --check`(clean)。
 
 ### [TODO] M2-R Milestone 2 Review
 

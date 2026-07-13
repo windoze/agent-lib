@@ -67,3 +67,13 @@
 ## 聚焦测试(纯同步)
 single tool、parallel tool(乱序回灌)、tool failure self-heal、approval approve/deny/timeout、
 multi-round tool→llm→tool→text、step-limit、mismatched requirement / wrong result kind。
+
+## 执行结果(已完成)
+- 全部按定稿模型实现:`default/tools.rs`(InFlight/ToolPhase/ToolSlot + begin/advance/emit_tool_batch/
+  emit_approval/resume_tool/resume_approval/finish_tool_phase);`default/mod.rs` 结构与 LLM step 改造;
+  `approval.rs` 共享 `approval_response_for_decision`(已单独提交)。
+- `tests/tools.rs` 新增 13 个纯同步测试,全绿。
+- 验证:`fmt` clean;`clippy --all-targets -D warnings` clean(修 `needless_lifetimes`);
+  `cargo test --lib agent::machine` 26 passed;`cargo test --all --all-targets` 417 passed / 0 failed;
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` clean;`git diff --check` clean。
+- M2-4 已在 `TODO.md` 标 `[DONE]` 并写完成记录。下一次调用处理 **M2-R**(勿在本次继续)。
