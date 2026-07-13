@@ -331,6 +331,19 @@ where
             )));
         }
 
+        // Cancellation is a downward "should stop" signal (migration doc §7):
+        // the token never resumes a requirement, it decides to abandon one. A
+        // single `Abandon` closes the whole in-flight turn via the machine's
+        // never-resume path (`cancel_pending`), settling the cursor to a
+        // feedable rest state, so we stop driving this turn once it lands.
+        if ctx.is_cancelled() {
+            if let Some(requirement) = pending.first() {
+                let mut outcome = machine.step(StepInput::Abandon(requirement.id));
+                notifications.append(&mut outcome.notifications);
+            }
+            break;
+        }
+
         let resolutions = fulfill_batch(&pending, scope, parent.as_deref_mut(), ctx).await?;
 
         pending = Vec::new();

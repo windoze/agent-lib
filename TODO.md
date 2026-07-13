@@ -907,7 +907,7 @@ workaround,属评审范围内的覆盖补全)。
 
 ## Milestone 4 — cancel / pivot 收编与删旧机制（迁移文档阶段 3）
 
-### [TODO] M4-1 cancel = never-resume,接 `Conversation::cancel_pending`
+### [DONE] M4-1 cancel = never-resume,接 `Conversation::cancel_pending`
 
 **前置依赖**:M3-R。
 
@@ -933,6 +933,62 @@ workaround,属评审范围内的覆盖补全)。
   `cancel_pending` → Conversation 无悬空 tool_use、pending 一致 → 之后可成功 `step(UserMessage)`
   开新 turn。覆盖"streaming step 中途 abandon"与"一批 tool 部分 abandon"。
 - 运行全套命令。
+
+**完成记录**:
+
+cancel = never-resume 落地。`step(StepInput::Abandon(id))` 不再回灌任何结果,而是按 parked cursor
+选择 disposition,由 machine 自己拥有的唯一 `Conversation` 触发 `cancel_pending` 闭合裂缝,再经
+瞬态 `CancelRecovery` 收束到可 feed 的 `Idle`(迁移文档 §7)。
+
+- **machine 实现**(`src/agent/machine/default/mod.rs`):
+  - 新增 `abandon(id)`:先取 `cursor.pending_requirement_ids()` 校验 `id` 属于当前未决集合(不属
+    → `fail`),再按 cursor 分派。借用先收成 `Option<(AbandonKind, StepId)>` 局部再放开,规避对
+    `self` 的可变借用冲突。
+  - `StreamingStep`(仅 LLM step 未决)→ `abandon_llm_step`:`cancel_pending(DiscardTurn)` 整体丢弃
+    pending,reason `LlmInterrupted`。
+  - `AwaitingTool`/`AwaitingApproval`(有 open tool call)→ `abandon_tool_phase`(tools.rs)。
+  - `finish_cancel(step_id, reason)`:清空 `in_flight` scratch,`current → CancelRecovery → Idle`
+    两跳(均为 `can_transition_to` 合法边),返回 quiescent outcome。
+  - `begin_user_turn`:cursor==`Idle` 且残留 pending 时先 `cancel_pending(DiscardTurn)` 再
+    `begin_turn`——tool-abandon 留下的是 *coherent* `Resumed` pending,新 user turn 取代它(否则
+    `begin_turn` 因 `AlreadyPending` 失败)。仅在 `Idle` 触发,turn 中途行为不变。
+- **tool-phase 闭合**(`src/agent/machine/default/tools.rs`):
+  - `abandon_tool_phase`:`open_cancelled_results()` 枚举全部仍未闭合的 slot(`auto_pending` +
+    `running` + `approval_pending` + `awaiting_approval`)生成 `CancelledToolResult`,恰好等于 pending
+    仍缺 result 的 frozen call 集合,满足 `cancel_pending(ResumeTurn{cancelled_results})` 的一一闭合
+    约束;已完成的 call 保留真实 result → 支撑"一批 tool 部分 abandon"。reason `ToolInterrupted`。
+- **参考 driver**(`src/agent/drive.rs` `drain`):批兑现前检查 `ctx.is_cancelled()`;命中则对
+  `pending[0]` 喂一次 `Abandon`(单次 abandon 即整 turn 闭合),`break` 返回 cursor=`Idle` 的
+  `TurnDone`。`CancellationToken` 仍是向下"该停了"信号,闭合由 never-resume + `cancel_pending` 完成;
+  未取消路径行为不变(现有 6 个 `reference_*_matches_default_loop` + drain 单测全绿)。
+
+**新增测试**(9 个,全绿):
+
+- machine(`tests/mod.rs`):`abandon_streaming_step_discards_turn_and_settles_idle`、
+  `abandon_streaming_step_then_user_message_opens_new_turn`、
+  `abandon_with_unmatched_requirement_id_fails`、`abandon_without_outstanding_requirement_fails`。
+- machine tool-phase(`tests/tools.rs`):
+  `abandon_tool_batch_synthesizes_cancelled_results_and_settles_idle`(2-tool 批,A 真结果 + B 合成
+  取消,断言 `open_calls()==0`、`tool_calls()==2`、4 条 pending 消息)、
+  `abandon_awaiting_approval_synthesizes_cancelled_result`、
+  `abandon_tool_batch_then_user_message_opens_new_turn`(残留 pending 被新 turn 丢弃)。
+- 参考 driver(`drive/reference/tests.rs`):`reference_cancel_during_tool_wait_abandons_turn`(LLM
+  handler 返回 tool_use 时取消 token → drain 下一轮 `is_cancelled` → abandon 批,tool handler 若被调
+  用即 panic;断言 cursor `Idle`、pending coherent、无 `ToolCallFinished`/`StepBoundary`)、
+  `reference_new_turn_after_cancel_starts_fresh`(取消后再喂新 uncancelled turn → 丢弃残留、正常
+  Done)。
+
+**范围说明**:pivot 注入(`Pivot(_)` 仍 `fail`)属 M4-2,`respond_approval`/`AgentFeedGuard` 删除属
+M4-3,本任务未触碰。`commit_text_turn` 收于 `Done`(终态)导致的 "Done 后多 turn" 是既有边界、非
+M4-1 要求(abandon 收于 `Idle`,`Idle→StreamingStep` 可开新 turn),未改动。未新增 `Notification`
+变体:machine 自持 Conversation,"machine 层触发 cancel_pending" 即满足 §7,合成取消 result 文本属
+`cancel_pending` 内部,不在 outcome 中镜像(避免 scope creep)。
+
+**验证命令(全绿)**:`cargo fmt --all`(clean);`cargo clippy --all-targets -- -D warnings`
+(clean,修正 2 处 `collapsible_if` → let-chain,与既有 `&& let` 风格一致);
+`cargo test --all --all-targets`(435 lib + 3+2+3 integration = 443 passed / 0 failed,较 M3-R 基线
+426→435 即 +9 新测试,网络用例 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);
+`git diff --check`(clean)。
 
 ### [TODO] M4-2 pivot = 多喂 input,删除 pivot queue
 

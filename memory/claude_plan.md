@@ -1,61 +1,55 @@
-# 执行计划 — M3-R Milestone 3 Review
+# 执行计划 — M4-1 cancel = never-resume,接 Conversation::cancel_pending
 
 ## 选中的任务
-`TODO.md` 第一个未完成任务 = **M3-R Milestone 3 Review**(M3-1..M3-3 全部 `[DONE]`)。
-里程碑 3 阶段验收 Review。**review 任务不拆分**。
+`TODO.md` 第一个未完成任务 = **M4-1**(Milestone 4，M1..M3 全 `[DONE]`）。
+前置 M3-R 已完成。不拆分。
 
-## 目标(TODO M3-R "做什么")
-逐条核对并给出证据(有测试覆盖/无覆盖):
-1. **pop 路由四条规则**有测试覆盖:
-   - 本层兑现不冒泡(handler 在本层 perform,不 pop);
-   - 本层无 handler → pop 给外层;
-   - 顶层仍无 → 报 `UnhandledRequirement`;
-   - 查找从发出者外层起(跳过自身,防即时环)。
-2. **"运行模式 = scope 差异"**:同一 machine 挂/不挂 interaction handler 行为差异有测试。
-3. 参考 driver 与 `DefaultAgentLoop` 在 text/tool/approval 的**等价性证据充分**。
-4. `UnhandledRequirement` 是**分类错误**,不静默跳过或挂起。
+## 目标（TODO M4-1 "做什么"）
+1. 实现 `step(StepInput::Abandon(id))`：不回灌结果，定位 requirement 对应 cursor，
+   迁 `CancelRecovery`，触发本机 Conversation 的 `cancel_pending`（按 disposition 闭合裂缝），
+   收尾后 cursor 回到可 `step(External(UserMessage))` 的一致态（Idle）。
+2. 机器层触发 `Conversation::cancel_pending`（machine 拥有唯一 Conversation）。
+3. `CancellationToken` 保留为向下信号；driver 据此决定 Abandon；闭合由 never-resume+cancel_pending 完成。
+4. 在参考 driver（drain）里接入 cancel 路径。
 
-## 方法
-- 只读审阅,不改生产代码(除非发现阻塞当前任务的真实缺陷/失败测试)。
-- 审阅文件:
-  - `src/agent/drive.rs`(drain / pop 路由 / UnhandledRequirement / HandlerScope + 四 trait)
-  - `src/agent/drive/reference.rs`(参考 driver 生产代码)
-  - `src/agent/drive/reference/tests.rs`(6 个等价性测试)
-  - drive.rs 的 pop 路由测试(本层不冒泡 / pop / 顶层报错 / 防即时环)
-  - `src/agent/loop_driver/default/tests.rs`(legacy 基线,对照等价性)
-- 对四条 Review 检查逐一定位测试,记录测试名与断言点;若缺口 → 按 Test Failure / No-Workaround
-  策略处理(补测试或加前置任务)。
+## 设计决策（记录，供 review）
+- cancel = 整 turn never-resume（受控丢弃+闭合），非逐 tool。
+- disposition 由 cursor 决定：
+  - `StreamingStep`（NeedLlm 未决，无 open tool call）→ `DiscardTurn`，reason `LlmInterrupted`。
+  - `AwaitingTool`/`AwaitingApproval`（有 open tool call）→ `ResumeTurn { cancelled_results }`，
+    对每个仍未闭合的 call 合成 `Cancelled` tool result（闭合悬空 tool_use），reason `ToolInterrupted`。
+    已完成的 call 保留真实结果 → 支撑"一批 tool 部分 abandon"。
+- 收尾：current → `CancelRecovery(step_id, reason)` → `Idle`；清空 in_flight scratch。
+- `ResumeTurn` 后 pending 为 coherent Resumed（无悬空 tool_use）；`begin_user_turn` 在
+  cursor==Idle 且存在 leftover pending 时先 `DiscardTurn` 再 begin_turn → 满足"step(UserMessage) 开新 turn"。
+- driver：`drain` 每批兑现前检查 `ctx.is_cancelled()`；命中则对第一条未决 requirement 喂
+  `Abandon`（一次 abandon 即整 turn 闭合），break 返回 cursor=Idle 的 TurnDone。uncancelled 时行为不变。
 
-## 验证命令(顺序)
-1. `cargo fmt --all`(纯 review 预期 clean;若无代码改动则确保 clean)
-2. `cargo clippy --all-targets -- -D warnings`
-3. `cargo test --lib agent::drive`(聚焦 M3)
-4. `cargo test --all --all-targets`(≤30min)—— 若本任务仅改 md 且上次全绿则可复用绿结果
-5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
-6. `git diff --check`
+## 涉及文件
+- src/agent/machine/default/mod.rs：Abandon 分发、begin_user_turn leftover 处理、abandon_llm_step、finish_cancel。
+- src/agent/machine/default/tools.rs：abandon_tool_phase（枚举 open ToolSlot → CancelledToolResult → ResumeTurn）。
+- src/agent/drive.rs：drain 加 cancel 检查分支。
+- 测试：machine tests（streaming abandon / tool partial abandon / 后续 UserMessage 开新 turn），
+  reference driver cancel 测试。
+
+## 验证命令（顺序）
+1. cargo fmt --all
+2. cargo clippy --all-targets -- -D warnings
+3. cargo test --lib agent::machine agent::drive（聚焦）
+4. cargo test --all --all-targets（≤30min）
+5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+6. git diff --check
 
 ## 进度
-- [ ] 审阅 drive.rs pop 路由 + UnhandledRequirement,定位四规则测试
-- [ ] 审阅 scope 差异(with/without interaction)测试
-- [ ] 审阅 reference 等价性 6 测试 vs legacy
-- [ ] 运行验证命令
-- [ ] TODO.md 标 [DONE] + Review 完成记录,提交
+- [x] machine abandon 实现（mod.rs + tools.rs）
+- [x] begin_user_turn leftover 处理
+- [x] drain cancel 路径
+- [x] 测试（machine 6 + reference 2 + streaming 1 = 9 个，全绿）
+- [x] 全套验证（fmt/clippy/test 435 lib/doc/diff 全绿）
+- [x] TODO.md 标 [DONE] + 完成记录，提交
 
 ## 结论
-(待填)
-
-## 进度(更新)
-- [x] 审阅 drive.rs pop 路由 + UnhandledRequirement:四规则测试齐全
-      (drain_fulfills_locally_without_popping / drain_pops_to_parent_when_local_scope_lacks_handler /
-       drain_top_scope_without_handler_is_unhandled_requirement / pop_starts_from_outer_scope_skipping_the_emitter)
-- [x] 审阅 scope 差异:attended = reference_approval_approve;补齐 headless 同机对照
-      reference_headless_scope_surfaces_unhandled_approval(新增 1 测试)
-- [x] 审阅 reference 等价性 6 测试 vs legacy:text/single/parallel/failure/approve/deny,committed + 通知序列一致
-- [x] 运行验证:fmt clean / clippy clean / lib agent::drive 17 passed / all-targets 434 passed 0 failed /
-      doc clean / diff --check clean
-- [x] TODO.md 标 [DONE] + Review 结论完成记录
-
-## 结论
-M3-R 通过。四条 pop 规则、运行模式=scope 差异(新增 headless 同机对照)、参考 driver 6 类等价性、
-UnhandledRequirement 分类错误——全部有测试覆盖且全绿。评审范围内补 1 测试(非 workaround)。
-下一未完成任务 = M4-1(本次不启动)。
+M4-1 完成。cancel = never-resume：`step(Abandon)` 按 cursor 选 disposition，machine 自持
+Conversation 触发 `cancel_pending`（DiscardTurn / ResumeTurn+合成 CancelledToolResult），经
+CancelRecovery 收于 Idle；driver 在 `is_cancelled` 时喂一次 Abandon 闭合整 turn。pivot(M4-2)/
+respond_approval(M4-3) 未触碰。PLAN.md 无阶段级变更，跳过。

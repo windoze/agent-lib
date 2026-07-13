@@ -1016,3 +1016,169 @@ async fn reference_approval_deny_matches_default_loop() {
     assert_text(turn.messages()[5].payload(), "handled approval decisions");
     assert!(registry.calls().is_empty());
 }
+
+// ----- cancellation (M4-1) -----
+
+/// LLM handler that cancels the run context as it returns its one scripted
+/// response, modelling a "stop" signal that arrives mid-turn.
+struct CancellingLlmHandler {
+    response: Mutex<Option<Response>>,
+}
+
+#[async_trait]
+impl crate::agent::LlmHandler for CancellingLlmHandler {
+    async fn fulfill(
+        &self,
+        _request: &ChatRequest,
+        _mode: LlmStepMode,
+        ctx: &RunContext,
+    ) -> RequirementResult {
+        ctx.cancellation().cancel();
+        let response = self
+            .response
+            .lock()
+            .expect("response mutex")
+            .take()
+            .expect("exactly one scripted llm response");
+        RequirementResult::Llm(Ok(response))
+    }
+}
+
+/// Tool handler that must never run: cancellation abandons the batch first.
+struct PanicToolHandler;
+
+#[async_trait]
+impl crate::agent::ToolHandler for PanicToolHandler {
+    async fn fulfill(
+        &self,
+        _call_id: ToolCallId,
+        _call: &ToolCall,
+        _ctx: &RunContext,
+    ) -> RequirementResult {
+        panic!("cancellation must abandon the tool batch before any tool executes");
+    }
+}
+
+/// Scope wiring the cancelling LLM handler with a tool handler that panics.
+struct CancelScope {
+    llm: CancellingLlmHandler,
+    tool: PanicToolHandler,
+}
+
+impl crate::agent::HandlerScope for CancelScope {
+    fn llm(&self) -> Option<&dyn crate::agent::LlmHandler> {
+        Some(&self.llm)
+    }
+
+    fn tool(&self) -> Option<&dyn crate::agent::ToolHandler> {
+        Some(&self.tool)
+    }
+}
+
+#[tokio::test]
+async fn reference_cancel_during_tool_wait_abandons_turn() {
+    let ids = Arc::new(FakeToolIds::new(
+        vec![tool_call_id_seed(100)],
+        vec![message_id_seed(101)],
+        vec![message_id_seed(102)],
+        vec![step_id_seed(103)],
+    ));
+    let mut machine = machine_with(
+        spec_with_tools(1, ToolFailurePolicy::ReturnErrorToModel),
+        ids,
+        Arc::new(crate::agent::NoApprovalPolicy),
+    );
+    let scope = CancelScope {
+        llm: CancellingLlmHandler {
+            response: Mutex::new(Some(tool_use_response(
+                vec![("call-weather", "get_weather", json!({ "city": "Shanghai" }))],
+                usage(5, 2),
+            ))),
+        },
+        tool: PanicToolHandler,
+    };
+    let ctx = context();
+
+    let done = crate::agent::drain(&mut machine, input(), &scope, None, &ctx)
+        .await
+        .expect("a cancelled turn drains to a rest state");
+
+    // Never-resume: the emitted tool batch is abandoned, the cursor settles to a
+    // feedable Idle, and the pending turn is coherent (its tool_use closed by a
+    // synthesized cancelled result) with nothing committed to history.
+    assert!(matches!(done.cursor(), LoopCursor::Idle));
+    assert_eq!(machine.state().loop_cursor().kind(), LoopCursorKind::Idle);
+    let conversation = machine.state().conversation();
+    let pending = conversation
+        .pending()
+        .expect("cancellation leaves a coherent pending turn");
+    assert_eq!(pending.open_calls().count(), 0);
+    assert_eq!(pending.tool_calls().len(), 1);
+    assert!(conversation.turns().is_empty());
+
+    // The turn never resumes, so no tool ran and no step boundary was emitted.
+    assert!(done.notifications().iter().all(|event| !matches!(
+        event,
+        Notification::ToolCallFinished(_) | Notification::StepBoundary(_)
+    )));
+}
+
+#[tokio::test]
+async fn reference_new_turn_after_cancel_starts_fresh() {
+    let ids = Arc::new(FakeToolIds::new(
+        vec![tool_call_id_seed(100)],
+        vec![message_id_seed(101)],
+        vec![message_id_seed(102)],
+        vec![step_id_seed(103)],
+    ));
+    let mut machine = machine_with(
+        spec_with_tools(1, ToolFailurePolicy::ReturnErrorToModel),
+        ids,
+        Arc::new(crate::agent::NoApprovalPolicy),
+    );
+    let cancel_scope = CancelScope {
+        llm: CancellingLlmHandler {
+            response: Mutex::new(Some(tool_use_response(
+                vec![("call-weather", "get_weather", json!({ "city": "Shanghai" }))],
+                usage(5, 2),
+            ))),
+        },
+        tool: PanicToolHandler,
+    };
+    let ctx = context();
+    let _ = crate::agent::drain(&mut machine, input(), &cancel_scope, None, &ctx)
+        .await
+        .expect("first turn is cancelled");
+    assert!(matches!(machine.state().loop_cursor(), LoopCursor::Idle));
+
+    // A fresh, uncancelled turn discards the interrupted pending and completes.
+    let client = Arc::new(FakeClient::with_chats(vec![Ok(assistant_response(
+        "hello again",
+        usage(3, 5),
+    ))]));
+    let registry = Arc::new(FakeToolRegistry::new(Vec::new()));
+    let scope = ReferenceScope::new(client, registry);
+    let fresh_ctx = context();
+    let second_input = AgentInput::user_message(
+        format!("018f0d9c-7b6a-7c12-8f31-{:012x}", 900_u64)
+            .parse()
+            .expect("second turn id"),
+        message_id_seed(901),
+        user_message("hello again"),
+        message_id_seed(902),
+        step_id_seed(903),
+    )
+    .expect("valid second user input");
+
+    let done = drive_turn(&mut machine, second_input, &scope, &fresh_ctx)
+        .await
+        .expect("the follow-up turn completes");
+
+    assert!(matches!(done.cursor(), LoopCursor::Done(_)));
+    let conversation = machine.state().conversation();
+    assert!(conversation.pending().is_none());
+    assert_eq!(conversation.turns().len(), 1);
+    let turn = &conversation.turns()[0];
+    assert_eq!(turn.messages().len(), 2);
+    assert_text(turn.messages()[1].payload(), "hello again");
+}

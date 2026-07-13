@@ -134,6 +134,27 @@ fn user_input() -> AgentInput {
     .expect("valid user input")
 }
 
+/// A second user turn with ids disjoint from [`user_input`], used to prove that
+/// a fresh turn opens after a never-resume abandon settled the machine at Idle.
+fn second_user_input() -> AgentInput {
+    AgentInput::user_message(
+        "018f0d9c-7b6a-7c12-8f31-1234567890b5"
+            .parse()
+            .expect("second turn id"),
+        "018f0d9c-7b6a-7c12-8f31-1234567890b6"
+            .parse()
+            .expect("second user message id"),
+        user_message("again"),
+        "018f0d9c-7b6a-7c12-8f31-1234567890b7"
+            .parse()
+            .expect("second assistant message id"),
+        "018f0d9c-7b6a-7c12-8f31-1234567890b8"
+            .parse()
+            .expect("second step id"),
+    )
+    .expect("valid second user input")
+}
+
 fn text_response(text: &str) -> Response {
     Response {
         message: Message {
@@ -349,6 +370,76 @@ fn resume_without_outstanding_requirement_fails() {
 
     assert!(outcome.is_quiescent());
     assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+}
+
+#[test]
+fn abandon_streaming_step_discards_turn_and_settles_idle() {
+    let mut machine = machine(LlmStepMode::NonStreaming);
+    let id = park_on_need_llm(&mut machine);
+    assert!(machine.state().conversation().pending().is_some());
+
+    let outcome = machine.step(StepInput::abandon(id));
+
+    // Never-resume: an outstanding LLM step is discarded wholesale, no
+    // requirement is emitted, and the cursor settles to a feedable Idle.
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert!(outcome.notifications.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
+    assert!(machine.cursor().pending_requirement_ids().is_empty());
+
+    let conversation = machine.state().conversation();
+    assert!(conversation.pending().is_none());
+    assert!(conversation.turns().is_empty());
+}
+
+#[test]
+fn abandon_streaming_step_then_user_message_opens_new_turn() {
+    let mut machine = machine(LlmStepMode::NonStreaming);
+    let id = park_on_need_llm(&mut machine);
+    let _ = machine.step(StepInput::abandon(id));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
+
+    // A fresh user message after cancellation opens a brand-new turn.
+    let outcome = machine.step(StepInput::external(second_user_input()));
+
+    assert!(outcome.is_quiescent());
+    assert_eq!(outcome.requirements.len(), 1);
+    let RequirementKind::NeedLlm { .. } = &outcome.requirements[0].kind else {
+        panic!("a new user turn must emit NeedLlm");
+    };
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    let conversation = machine.state().conversation();
+    assert!(conversation.pending().is_some());
+    assert!(conversation.turns().is_empty());
+}
+
+#[test]
+fn abandon_with_unmatched_requirement_id_fails() {
+    let mut machine = machine(LlmStepMode::NonStreaming);
+    let _id = park_on_need_llm(&mut machine);
+
+    let outcome = machine.step(StepInput::abandon(other_requirement_id()));
+
+    assert!(outcome.is_quiescent());
+    let LoopCursor::Error(error) = machine.cursor() else {
+        panic!("abandoning a non-outstanding requirement must park on the error cursor");
+    };
+    assert!(error.message().contains("not outstanding"));
+    assert!(machine.state().conversation().pending().is_none());
+}
+
+#[test]
+fn abandon_without_outstanding_requirement_fails() {
+    let mut machine = machine(LlmStepMode::NonStreaming);
+
+    let outcome = machine.step(StepInput::abandon(requirement_id()));
+
+    assert!(outcome.is_quiescent());
+    let LoopCursor::Error(error) = machine.cursor() else {
+        panic!("abandon with no outstanding requirement must park on the error cursor");
+    };
+    assert!(error.message().contains("no outstanding requirement"));
 }
 
 mod tools;

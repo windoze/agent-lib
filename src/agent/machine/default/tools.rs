@@ -44,13 +44,15 @@
 use super::DefaultAgentMachine;
 use crate::{
     agent::{
-        ApprovalDecision, ApprovalRequirement, ApprovalResponse, CursorRequirement, Interaction,
-        LoopCursor, Notification, Requirement, RequirementId, RequirementKind, RequirementKindTag,
-        RequirementResolution, RequirementResult, StepBoundary, StepId, StepOutcome,
-        ToolCallFinished, ToolCallStarted, ToolFailurePolicy, ToolWaitRequirements,
-        approval::approval_response_for_decision,
+        ApprovalDecision, ApprovalRequirement, ApprovalResponse, CancelRecoveryReason,
+        CursorRequirement, Interaction, LoopCursor, Notification, Requirement, RequirementId,
+        RequirementKind, RequirementKindTag, RequirementResolution, RequirementResult,
+        StepBoundary, StepId, StepOutcome, ToolCallFinished, ToolCallStarted, ToolFailurePolicy,
+        ToolWaitRequirements, approval::approval_response_for_decision,
     },
-    conversation::{MessageId, ToolCallId, ToolCallMapping},
+    conversation::{
+        CancelDisposition, CancelledToolResult, MessageId, ToolCallId, ToolCallMapping,
+    },
     model::{content::ContentBlock, tool::ToolCall},
 };
 use std::collections::{BTreeMap, VecDeque};
@@ -609,6 +611,57 @@ impl DefaultAgentMachine {
     fn tool_batch_idle(&self) -> bool {
         self.tool_phase()
             .is_some_and(|phase| phase.running.is_empty() && phase.awaiting_approval.is_none())
+    }
+
+    /// Never-resume close for an outstanding tool batch or approval.
+    ///
+    /// Unlike an LLM-only step, the pending turn already carries the assistant's
+    /// frozen tool_use blocks, so it cannot simply be discarded — that would
+    /// leave a dangling tool_use with no matching result. Instead the machine
+    /// synthesizes a `Cancelled` tool result for **every** still-open call and
+    /// closes the transaction with [`CancelDisposition::ResumeTurn`]. Any call
+    /// that already resolved keeps its real result, which is what lets a partial
+    /// tool batch be abandoned coherently. The turn then settles to
+    /// [`LoopCursor::Idle`] via [`finish_cancel`](Self::finish_cancel).
+    pub(super) fn abandon_tool_phase(&mut self, step_id: StepId) -> StepOutcome {
+        let Some(cancelled_results) = self.open_cancelled_results() else {
+            return self.fail("abandon reached a tool cursor without an active tool phase");
+        };
+
+        if let Err(error) = self
+            .state
+            .conversation_mut()
+            .cancel_pending(CancelDisposition::ResumeTurn { cancelled_results })
+        {
+            return self.fail(format!("conversation operation failed: {error}"));
+        }
+
+        self.finish_cancel(step_id, CancelRecoveryReason::ToolInterrupted)
+    }
+
+    /// Collects a [`CancelledToolResult`] for every still-open call in the active
+    /// tool phase — the queued auto batch, the emitted-but-unresolved `running`
+    /// batch, the approval queue, and the single outstanding approval. These are
+    /// exactly the frozen tool calls the pending turn still lacks a result for,
+    /// so they match the closure [`cancel_pending`] requires for
+    /// [`CancelDisposition::ResumeTurn`].
+    fn open_cancelled_results(&self) -> Option<Vec<CancelledToolResult>> {
+        let phase = self.tool_phase()?;
+        let open = phase
+            .auto_pending
+            .iter()
+            .chain(phase.running.values())
+            .chain(phase.approval_pending.iter())
+            .chain(phase.awaiting_approval.iter().map(|(_, slot)| slot))
+            .map(|slot| {
+                CancelledToolResult::new(
+                    slot.provider_call_id.clone(),
+                    slot.call_id,
+                    slot.result_message_id,
+                )
+            })
+            .collect();
+        Some(open)
     }
 
     /// Returns the failure policy governing tool errors this turn.

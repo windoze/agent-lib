@@ -793,3 +793,107 @@ fn approval_resume_rejecting_wrong_call_fails() {
     };
     assert!(error.message().contains("interaction result rejected"));
 }
+
+#[test]
+fn abandon_tool_batch_synthesizes_cancelled_results_and_settles_idle() {
+    let mut machine = tool_machine(Arc::new(NoApprovalPolicy));
+    let llm_id = park_on_need_llm(&mut machine);
+
+    // The model asks for two tools; both are emitted as one auto batch.
+    let outcome = resume_llm(
+        &mut machine,
+        llm_id,
+        tool_use_response_with(vec![
+            tool_use_block("call-a", "first_tool"),
+            tool_use_block("call-b", "second_tool"),
+        ]),
+    );
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingTool);
+    let (req_a, call_a, _) = need_tool(&outcome, 0);
+    let (req_b, _call_b, _) = need_tool(&outcome, 1);
+
+    // Tool A resolves with a real result; the batch stays parked on B.
+    let outcome = machine.step(StepInput::resume(RequirementResolution::new(
+        req_a,
+        RequirementResult::Tool(Ok(tool_ok("call-a", "alpha"))),
+    )));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingTool);
+    assert!(outcome.requirements.is_empty());
+
+    // Abandoning the still-open call B cancels the whole turn: A keeps its real
+    // result, B is closed by a synthesized cancelled result, and the cursor
+    // settles to a feedable Idle with a coherent (no open tool_use) pending turn.
+    let outcome = machine.step(StepInput::abandon(req_b));
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert!(outcome.notifications.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
+    assert!(machine.cursor().pending_requirement_ids().is_empty());
+
+    let conversation = machine.state().conversation();
+    let pending = conversation
+        .pending()
+        .expect("a tool abandon resumes a coherent pending turn");
+    assert_eq!(pending.open_calls().count(), 0);
+    assert_eq!(pending.tool_calls().len(), 2);
+    // user + assistant(2 tool-use) + result(A) + result(B, cancelled).
+    assert_eq!(pending.messages().len(), 4);
+    assert!(conversation.turns().is_empty());
+    let _ = call_a;
+}
+
+#[test]
+fn abandon_awaiting_approval_synthesizes_cancelled_result() {
+    let mut machine = tool_machine(Arc::new(AlwaysApprove));
+    let llm_id = park_on_need_llm(&mut machine);
+
+    let outcome = resume_llm(
+        &mut machine,
+        llm_id,
+        single_tool_response("call-weather", "get_weather"),
+    );
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingApproval);
+    let (approval_req, _, _) = need_interaction(&outcome, 0);
+
+    // Cancelling while parked on an approval closes the gated call.
+    let outcome = machine.step(StepInput::abandon(approval_req));
+    assert!(outcome.is_quiescent());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
+
+    let conversation = machine.state().conversation();
+    let pending = conversation
+        .pending()
+        .expect("an approval abandon resumes a coherent pending turn");
+    assert_eq!(pending.open_calls().count(), 0);
+    assert_eq!(pending.tool_calls().len(), 1);
+    // user + assistant(tool-use) + result(cancelled).
+    assert_eq!(pending.messages().len(), 3);
+}
+
+#[test]
+fn abandon_tool_batch_then_user_message_opens_new_turn() {
+    let mut machine = tool_machine(Arc::new(NoApprovalPolicy));
+    let llm_id = park_on_need_llm(&mut machine);
+
+    let outcome = resume_llm(
+        &mut machine,
+        llm_id,
+        single_tool_response("call-weather", "get_weather"),
+    );
+    let (tool_req, _, _) = need_tool(&outcome, 0);
+    let _ = machine.step(StepInput::abandon(tool_req));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
+    assert!(machine.state().conversation().pending().is_some());
+
+    // A fresh user message discards the interrupted turn and opens a new one.
+    let outcome = machine.step(StepInput::external(second_user_input()));
+    assert!(outcome.is_quiescent());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    let RequirementKind::NeedLlm { .. } = &outcome.requirements[0].kind else {
+        panic!("a new user turn must emit NeedLlm");
+    };
+    let conversation = machine.state().conversation();
+    assert!(conversation.pending().is_some());
+    assert_eq!(conversation.pending().expect("pending").messages().len(), 1);
+    assert!(conversation.turns().is_empty());
+}

@@ -21,8 +21,12 @@
 //!   the next [`RequirementKind::NeedLlm`] until the model returns a final
 //!   text response (`tool → llm → … → text → commit`).
 //!
-//! Pivots and cancellation remain out of scope here and land in M4; until then
-//! they resolve to a classified error cursor rather than being silently ignored.
+//! Cancellation lands here in **M4-1**: [`StepInput::Abandon`] is a never-resume
+//! close (migration doc §7) that drives the in-flight turn's Conversation
+//! through [`cancel_pending`](crate::conversation::Conversation::cancel_pending)
+//! and settles the cursor back to a feedable [`LoopCursor::Idle`]. Pivot
+//! injection remains out of scope here and lands in a later M4 task; until then
+//! it resolves to a classified error cursor rather than being silently ignored.
 //!
 //! The machine is pure: [`step`](AgentMachine::step) never `await`s and never
 //! touches a client, tool, or process. The non-serialized fields are the
@@ -37,11 +41,12 @@ mod tools;
 
 use crate::{
     agent::{
-        AgentInput, AgentMachine, AgentState, AgentUserInput, CursorRequirement, LlmStepMode,
-        LoopCursor, LoopDoneReason, NoApprovalPolicy, NoToolExecutionIds, Notification,
-        Requirement, RequirementId, RequirementIds, RequirementKind, RequirementKindTag,
-        RequirementResolution, RequirementResult, StepBoundary, StepId, StepInput, StepOutcome,
-        ToolApprovalPolicy, ToolExecutionIds, request::build_chat_request,
+        AgentInput, AgentMachine, AgentState, AgentUserInput, CancelRecoveryReason,
+        CursorRequirement, LlmStepMode, LoopCursor, LoopDoneReason, NoApprovalPolicy,
+        NoToolExecutionIds, Notification, Requirement, RequirementId, RequirementIds,
+        RequirementKind, RequirementKindTag, RequirementResolution, RequirementResult,
+        StepBoundary, StepId, StepInput, StepOutcome, ToolApprovalPolicy, ToolExecutionIds,
+        request::build_chat_request,
     },
     client::Response,
     conversation::{AssistantFinish, CancelDisposition, TurnMeta},
@@ -49,6 +54,17 @@ use crate::{
 use std::sync::Arc;
 
 use tools::InFlight;
+
+/// Which never-resume close an [`abandon`](DefaultAgentMachine::abandon) takes,
+/// selected by the parked cursor before the borrow of the cursor is released.
+#[derive(Clone, Copy)]
+enum AbandonKind {
+    /// Only an LLM step is outstanding — discard the pending turn wholesale.
+    Llm,
+    /// A tool batch or approval is outstanding — resume with synthesized
+    /// `Cancelled` results to close the dangling tool_use.
+    Tool,
+}
 
 /// Sans-io Agent machine that drives text and tool turns.
 ///
@@ -136,6 +152,21 @@ impl DefaultAgentMachine {
 
     /// Opens a fresh user turn and blocks on one `NeedLlm` requirement.
     fn begin_user_turn(&mut self, user: AgentUserInput) -> StepOutcome {
+        // A never-resume abandon of a tool batch leaves a *coherent* pending turn
+        // (its dangling tool_use closed by synthesized `Cancelled` results) with
+        // the cursor settled at `Idle`. A new user turn supersedes that
+        // interrupted turn, so discard the leftover transaction before
+        // `begin_turn` opens the next one (which rejects a second open pending).
+        if matches!(self.state.loop_cursor(), LoopCursor::Idle)
+            && self.state.conversation().pending().is_some()
+            && let Err(error) = self
+                .state
+                .conversation_mut()
+                .cancel_pending(CancelDisposition::DiscardTurn)
+        {
+            return self.fail(format!("conversation operation failed: {error}"));
+        }
+
         if let Err(error) = self.state.conversation_mut().begin_turn(
             user.turn_id(),
             user.message_id(),
@@ -296,6 +327,86 @@ impl DefaultAgentMachine {
         StepOutcome::new(vec![notification], Vec::new(), true)
     }
 
+    /// Abandons the outstanding requirement `id` on the never-resume path.
+    ///
+    /// cancel is not a distinct mechanism (migration doc §7): it is a
+    /// never-resume handler. The machine never folds a fabricated result back.
+    /// Instead it closes the in-flight turn's single Conversation pending
+    /// transaction via
+    /// [`Conversation::cancel_pending`](crate::conversation::Conversation::cancel_pending),
+    /// parks briefly on [`LoopCursor::CancelRecovery`], and settles back to
+    /// [`LoopCursor::Idle`] so a fresh
+    /// [`AgentInput::UserMessage`](crate::agent::AgentInput::UserMessage) can open
+    /// the next turn. The disposition is chosen by the parked cursor:
+    ///
+    /// - [`LoopCursor::StreamingStep`] (only an LLM step is outstanding) →
+    ///   [`CancelDisposition::DiscardTurn`], reason
+    ///   [`CancelRecoveryReason::LlmInterrupted`].
+    /// - [`LoopCursor::AwaitingTool`] / [`LoopCursor::AwaitingApproval`] (a tool
+    ///   batch or approval is outstanding) →
+    ///   [`CancelDisposition::ResumeTurn`] carrying a synthesized `Cancelled`
+    ///   result for every still-open call, reason
+    ///   [`CancelRecoveryReason::ToolInterrupted`].
+    fn abandon(&mut self, id: RequirementId) -> StepOutcome {
+        let cursor = self.state.loop_cursor();
+        let outstanding = cursor.pending_requirement_ids();
+        let plan = match cursor {
+            LoopCursor::StreamingStep(cursor) => Some((AbandonKind::Llm, cursor.step_id())),
+            LoopCursor::AwaitingTool(cursor) => Some((AbandonKind::Tool, cursor.step_id())),
+            LoopCursor::AwaitingApproval(cursor) => Some((AbandonKind::Tool, cursor.step_id())),
+            _ => None,
+        };
+
+        let Some((kind, step_id)) = plan else {
+            let cursor_kind = self.state.loop_cursor().kind();
+            return self.fail(format!(
+                "abandon received while cursor is `{cursor_kind:?}`, no outstanding requirement"
+            ));
+        };
+
+        if !outstanding.contains(&id) {
+            return self.fail(format!(
+                "abandon targets requirement {id}, which is not outstanding this step"
+            ));
+        }
+
+        match kind {
+            AbandonKind::Llm => self.abandon_llm_step(step_id),
+            AbandonKind::Tool => self.abandon_tool_phase(step_id),
+        }
+    }
+
+    /// Never-resume close for an outstanding LLM step: discard the pending turn
+    /// wholesale, since no tool_use has been committed for it yet.
+    fn abandon_llm_step(&mut self, step_id: StepId) -> StepOutcome {
+        if self.state.conversation().pending().is_some()
+            && let Err(error) = self
+                .state
+                .conversation_mut()
+                .cancel_pending(CancelDisposition::DiscardTurn)
+        {
+            return self.fail(format!("conversation operation failed: {error}"));
+        }
+        self.finish_cancel(step_id, CancelRecoveryReason::LlmInterrupted)
+    }
+
+    /// Shared cancel wrap-up: drop the in-flight scratch and step the cursor
+    /// through the transient [`LoopCursor::CancelRecovery`] to a feedable
+    /// [`LoopCursor::Idle`] rest state, returning a quiescent outcome.
+    fn finish_cancel(&mut self, step_id: StepId, reason: CancelRecoveryReason) -> StepOutcome {
+        self.in_flight = None;
+        if let Err(error) = self
+            .state
+            .transition_cursor(LoopCursor::cancel_recovery(Some(step_id), reason))
+        {
+            return self.fail(format!("cursor transition failed: {error}"));
+        }
+        if let Err(error) = self.state.transition_cursor(LoopCursor::Idle) {
+            return self.fail(format!("cursor transition failed: {error}"));
+        }
+        StepOutcome::new(Vec::new(), Vec::new(), true)
+    }
+
     /// Discards any dangling pending turn and parks the machine on a classified
     /// error cursor. `step` cannot return `Result`, so runtime failures during a
     /// step surface as an [`LoopCursor::Error`] with a quiescent outcome.
@@ -339,7 +450,7 @@ impl AgentMachine for DefaultAgentMachine {
                  sans-io machine; feed StepInput::Resume with a requirement result",
             ),
             StepInput::Resume(resolution) => self.resume(resolution),
-            StepInput::Abandon(_) => self.fail("abandon/cancel is implemented in M4"),
+            StepInput::Abandon(id) => self.abandon(id),
         }
     }
 
