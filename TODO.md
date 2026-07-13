@@ -66,7 +66,7 @@ model/system/tool 声明边界，不改 Client wire 模型。
   `cargo test agent::`；`perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
   `cargo test --doc`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
-### M1-2 [TODO] `RunContext`、取消、预算与 trace handle 边界
+### [DONE] M1-2 `RunContext`、取消、预算与 trace handle 边界
 
 **前置依赖**：M1-1。
 
@@ -90,6 +90,30 @@ loop、tool 和子 agent；`DESIGN.md` §1.3 下向约束第 6 条要求下层 a
 - 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦 context 测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增 `src/agent/context.rs` 及 `context/{cancel,budget,trace,tests}.rs` 并从 `agent` 模块导出，
+  定义字段私有的 `RunContext`，聚合 `CancellationToken`、`BudgetHandle` 与 `TraceHandle`
+  三类 live handle。
+- `CancellationToken` 支持查询、显式 cancel 和派生 child token；父 token cancel 会传播到
+  child，child cancel 不会反向污染父 context。
+- `BudgetHandle` 使用共享 ledger 记录 step/token/cost 扣减，并通过调用方传入的
+  `Duration` 检查 wall-clock；超限和 counter overflow 返回分类 `BudgetError`，失败扣减不改变
+  原 snapshot。
+- `TraceHandle` 记录 run/step/llm/tool/sub-agent 节点，保留 `TraceNodeId`、parent、kind 和
+  label；`RunContext::derive_child` 会记录 sub-agent 节点，并让 child context 继承取消链、
+  共享预算 ledger 和 trace parent。
+- `RunContext`、取消 token、预算 handle 和 trace handle 均不实现 serde；可持久化边界由
+  `BudgetSnapshot`、`BudgetUsage`、`BudgetLimits`、`TraceRecord` 等 data DTO 表达。
+- 更新 crate 根文档与 `README.md`，说明 Agent 层当前已包含 `RunContext` 横切上下文边界，
+  但 Agent loop、tool registry 和多 agent 编排仍未作为已实现能力暴露。
+- 聚焦测试覆盖 cancel 传播、child cancel 隔离、预算扣减/超限/wall-clock、child 共享父预算、
+  trace parent 链、重复/未知 trace 节点拒绝，以及 budget/trace DTO serde；doctest 覆盖
+  `RunContext` live handle 不可 serde。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test agent::context`；`perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
+  `cargo test --doc`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
 ### M1-3 [TODO] `AgentState`、唯一活动 Conversation 与 `LoopCursor`
 

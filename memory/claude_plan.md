@@ -1,52 +1,50 @@
-# 执行计划
+# 当前执行计划
 
-## 当前约束
+## 约束
 
-- 以 `TODO.md` 为唯一任务顺序来源，先识别第一个标题未带 `[DONE]` 的任务。
-- 本次只完成第一个未完成任务，完成后更新 `TODO.md`、验证、提交 Git，然后停止。
-- 若遇到阻塞当前任务的真实前置问题，不绕过；在 `TODO.md` 插入最小前置任务并提交后停止。
-- `PLAN.md` 只在阶段级计划、依赖或完成标准变化时更新。
-- 输出和进度记录使用中文。
+- 使用中文记录和汇报。
+- 以 `TODO.md` 为唯一任务顺序和完成状态来源。
+- 只完成第一个标题未带 `[DONE]` 的任务，完成后停止。
+- 如果发现阻塞当前任务的真实前置问题，先在 `TODO.md` 中插入最小必要前置任务并提交，然后停止。
+- 不能通过缩小范围、改变表示或临时 workaround 绕过规格不匹配。
+- 代码变更完成后按要求运行 `cargo fmt`、`cargo clippy --all-targets -- -D warnings`，再运行必要测试；完整测试超时不超过 30 分钟。
+- 完成任务时必须在 `TODO.md` 标题前加 `[DONE]` 并更新完成记录，然后提交 Git。
 
 ## 步骤计划
 
-1. 读取 `TODO.md`，定位第一个未完成任务，并记录任务编号、目标、依赖和验证要求。
-2. 查看最近提交信息，判断是否明确提到与该任务直接相关的未完成问题。
-3. 按任务要求读取必要代码、文档和测试，限定范围在当前任务及其直接依赖内。
-4. 实现当前任务，优先沿用仓库既有模块边界、数据模型和测试风格。
-5. 按要求更新或新增测试，先运行格式化，再运行 clippy，再运行相关测试和必要的完整测试。
-6. 如发现未被排期的测试失败，修复它；若它是当前任务的必要前置且无法同次完成，则插入前置任务并停止。
-7. 在 `TODO.md` 中把当前任务标题加上 `[DONE]`，填写完成记录、验证命令和结果。
-8. 检查工作区差异，提交所有本次任务相关变更。
-9. 发送最终摘要并停止，不继续下一个任务。
+1. 读取 `TODO.md`，按标题 `[DONE]` 前缀识别第一个未完成任务。
+2. 检查最新提交信息，若其中明确提到与当前任务直接相关的未完成问题，将其纳入当前任务或作为前置任务写入 `TODO.md`。
+3. 只阅读当前任务所需的设计、计划、源码和测试上下文，避免开放式历史问题排查。
+4. 根据当前任务要求实施代码、测试或文档变更；如遇阻塞规格问题，更新 `TODO.md` 后提交并停止。
+5. 运行格式化、lint 和相关测试；若出现未被显式排期的失败测试，修复或把最小修复任务排到当前任务前。
+6. 更新 `TODO.md`：给当前任务标题添加 `[DONE]`，补充完成记录、验证命令和结果。仅当阶段级计划变化时更新 `PLAN.md`。
+7. 复查 Git diff，确认没有误改或遗漏。
+8. 提交本次任务相关的所有变更，提交信息包含任务编号和清晰说明。
+9. 停止，不继续处理下一个任务。
 
 ## 进度
 
 - 已创建本计划文件。
-- 已读取 `TODO.md`，第一个未完成任务是 `M1-1 Agent identity、AgentSpec 与静态配置模型`。
-- 已查看最近提交 `21ca3ce [M7-1] Start agent layer planning`，未发现直接阻塞 M1-1 的未完成实现项。
-- 已读取 `docs/agent-layer.md` §1.1、`PLAN.md` 的关键决策和现有 `conversation::id` 风格。
+- 已读取 `TODO.md`，首个未完成任务确定为 `M1-2 RunContext、取消、预算与 trace handle 边界`。
+- 已检查最新提交 `e6f0bd8 [M1-1] Add agent static spec model`，未发现直接指向 `M1-2` 的未完成事项。
 
-## M1-1 具体执行计划
+## 当前任务执行计划
 
-1. 新增 `src/agent/mod.rs`、`src/agent/id.rs`、`src/agent/spec.rs`，并从 `src/lib.rs` 导出 `agent`。
-2. 在 `agent::id` 中按现有 Conversation identity 风格定义 UUID newtype：`AgentId`、`RunId`、`StepId`、`ToolSetId`、`SkillId`、`PlanId`、`BlackboardId`。
-3. 在 `agent::spec` 中定义字段私有的静态配置模型：`AgentSpec`、`WorktreeRef`、`ToolSetRef`、`ModelRef`、`LoopPolicy`，只保存可 serde 数据。
-4. 为公开类型补 rustdoc，明确 `AgentSpec` 是模板/配方，不持有 `Conversation`、`LlmClient`、`ToolRegistry` 或 runtime handle。
-5. 添加聚焦单测覆盖 id serde/parse round-trip、非法 UUID、newtype 不能误用的 compile_fail 文档测试、`AgentSpec` serde 保留外部值和 getter 只读访问。
-6. 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦 agent 测试、全量测试、rustdoc 和 `git diff --check`。
-7. 更新 `TODO.md` 完成记录，提交本任务变更。
+1. 阅读 `docs/agent-layer.md` 中 RunContext/cancel/budget/trace 相关章节、`DESIGN.md` Agent 约束，以及现有 `src/agent` 模块结构。
+2. 设计并实现 `agent::context`：字段私有 `RunContext`、取消传播、预算检查/扣减、trace 节点记录、可 serde 的 budget/trace DTO，以及不可 serde 的 live handle。
+3. 从 `src/agent/mod.rs` 导出必要 public API，并保持 runtime handle 不进入 serde data shape。
+4. 添加聚焦测试，覆盖取消传播、预算 step/token/cost/wall-clock 扣减和超限分类、trace parent 链、子 context 继承、`RunContext` 不可 serde、record DTO 可 serde。
+5. 运行格式化、严格 clippy、聚焦 context 测试、全量测试、rustdoc 和 diff check。
+6. 根据验证结果修复问题，随后更新 `TODO.md` 完成记录并提交。
 
-## 当前执行状态
+## 当前进度更新
 
-- 已新增 `agent` 模块、UUID identity newtype、`AgentSpec`、`WorktreeRef`、`ToolSetRef`、`ModelRef`、`LoopPolicy` 与聚焦单测。
-- 已更新 crate 根文档和 `README.md`，说明当前 Agent 模块只暴露 data-only 静态配置。
-- 已运行 `cargo fmt --all`，格式化完成。
-- 已运行并通过 `cargo clippy --all-targets -- -D warnings`。
-- 已运行并通过 `cargo test agent::`。
-- 已运行并通过 30 分钟上限包装的 `cargo test --all --all-targets`。
-- 已运行并通过 `cargo test --doc`，覆盖 Agent identity 的 compile-fail newtype 误用示例。
-- 已运行并通过 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
-- 已运行并通过 `git diff --check`。
-- 已将 `TODO.md` 中 M1-1 标记为 `[DONE]` 并补充完成记录。
-- 下一步复查 git 状态并提交本任务变更。
+- 已新增 `src/agent/context.rs`，包含 `RunContext`、`CancellationToken`、`BudgetHandle`、`TraceHandle`、预算/trace record DTO 与分类错误。
+- 已在 `src/agent/mod.rs` 导出 context API。
+- 已更新 `src/lib.rs` 和 `README.md` 的 Agent 当前能力描述。
+- 已完成格式化、严格 clippy、聚焦测试、全量测试、doctest、rustdoc 和 diff check，均通过。
+- 已将 `TODO.md` 中 `M1-2` 标记为 `[DONE]` 并补充完成记录。
+- 复查发现初版 `context.rs` 过长，已拆分为 `context.rs` 聚合模块和 `context/cancel.rs`、
+  `context/budget.rs`、`context/trace.rs`、`context/tests.rs`。
+- 拆分后已重新通过格式化、clippy、聚焦测试、全量测试、doctest 和 rustdoc。
+- 下一步运行最终 `git diff --check`，然后提交。

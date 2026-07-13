@@ -15,8 +15,9 @@
 //!   classified errors, requests, responses, and the dyn-safe client trait.
 //! - [`adapter`] implements the Anthropic Messages and OpenAI Responses HTTP
 //!   and SSE protocols.
-//! - [`agent`] defines the data-only Agent identity and static configuration
-//!   model used by future runtime layers.
+//! - [`agent`] defines data-only Agent identity/static configuration plus the
+//!   run-level cancellation, budget, and trace context handles used by future
+//!   runtime layers.
 //! - [`conversation`] adds externally supplied strong identities,
 //!   Conversation-level configuration, immutable message envelopes, the
 //!   canonical role/tool validator, an atomic closed-turn commit boundary, and
@@ -63,8 +64,9 @@
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are still separate runtime layers. The [`agent`] module currently exposes
-//! only serde-friendly static configuration and identity data, so those future
-//! layers can persist references without storing live handles.
+//! serde-friendly static configuration and identity data plus [`agent::RunContext`]
+//! handles for cancellation, budget, and trace propagation without making those
+//! live handles part of persisted state.
 //!
 //! # Conversation Core example
 //!
