@@ -46,6 +46,22 @@ impl Conversation {
     /// raw turns. Later parent and child commits, cancels, reverts, and derived
     /// index updates are independent.
     ///
+    /// ```
+    /// use agent_lib::conversation::{Conversation, ConversationConfig, ConversationId};
+    ///
+    /// let parent_id: ConversationId =
+    ///     "018f0d9c-7b6a-7c12-8f31-1234567890ab".parse().unwrap();
+    /// let child_id: ConversationId =
+    ///     "018f0d9c-7b6a-7c12-8f31-1234567890ac".parse().unwrap();
+    /// let parent = Conversation::new(parent_id, ConversationConfig::default());
+    ///
+    /// let child = parent
+    ///     .fork_at(parent.valid_boundaries()[0], child_id)
+    ///     .expect("zero-boundary fork is valid");
+    /// assert_eq!(child.origin().unwrap().parent(), parent.id());
+    /// assert_eq!(child.head().conversation_id(), child_id);
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns a classified boundary error for foreign, stale, pending,

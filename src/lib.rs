@@ -63,6 +63,87 @@
 //! are deliberately outside this crate. Those layers should persist and replay
 //! the normalized complete-state types instead of provider wire objects.
 //!
+//! # Conversation Core example
+//!
+//! Conversations receive every identity from the caller. A user payload enters
+//! the unique pending transaction first; only a complete, tool-free final
+//! assistant response can cross the closed-turn validator and become committed
+//! history.
+//!
+//! ```
+//! use agent_lib::{
+//!     client::Response,
+//!     conversation::{
+//!         AssistantFinish, Conversation, ConversationConfig, ConversationId,
+//!         MessageId, TurnId, TurnMeta,
+//!     },
+//!     model::{
+//!         content::ContentBlock,
+//!         message::{Message, Role},
+//!         normalized::StopReason,
+//!         usage::Usage,
+//!     },
+//! };
+//! use serde_json::Map;
+//!
+//! # fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let conversation_id: ConversationId =
+//!     "018f0d9c-7b6a-7c12-8f31-1234567890ab".parse()?;
+//! let turn_id: TurnId =
+//!     "018f0d9c-7b6a-7c12-8f31-1234567890ac".parse()?;
+//! let user_message_id: MessageId =
+//!     "018f0d9c-7b6a-7c12-8f31-1234567890ad".parse()?;
+//! let assistant_message_id: MessageId =
+//!     "018f0d9c-7b6a-7c12-8f31-1234567890ae".parse()?;
+//!
+//! let mut conversation = Conversation::new(
+//!     conversation_id,
+//!     ConversationConfig::new(Some("Answer briefly.".to_owned())),
+//! );
+//! conversation.begin_turn(
+//!     turn_id,
+//!     user_message_id,
+//!     Message {
+//!         role: Role::User,
+//!         content: vec![ContentBlock::Text {
+//!             text: "Explain the boundary.".to_owned(),
+//!             extra: Map::new(),
+//!         }],
+//!     },
+//! )?;
+//!
+//! conversation.start_assistant_response(Response {
+//!     message: Message {
+//!         role: Role::Assistant,
+//!         content: vec![ContentBlock::Text {
+//!             text: "Only complete turns are committed.".to_owned(),
+//!             extra: Map::new(),
+//!         }],
+//!     },
+//!     usage: Usage::default(),
+//!     stop_reason: StopReason::normalize("end_turn"),
+//!     extra: Map::new(),
+//! })?;
+//! assert_eq!(
+//!     conversation.finish_assistant(assistant_message_id)?,
+//!     AssistantFinish::ReadyToCommit
+//! );
+//! conversation.commit_pending(TurnMeta::default())?;
+//!
+//! let view = conversation.effective_view();
+//! assert_eq!(view.system(), Some("Answer briefly."));
+//! assert_eq!(view.messages().len(), 2);
+//! # Ok(())
+//! # }
+//! # run().unwrap();
+//! ```
+//!
+//! The repository also includes `cargo run --example conversation_core`, an
+//! offline end-to-end example covering tool round-trips, cancellation followed
+//! by continued feed, checked boundaries/forking, projection compaction, and
+//! snapshot restore. It uses normalized local fixtures and does not access
+//! network endpoints or runtime registries.
+//!
 //! # Complete-response example
 //!
 //! The endpoint configuration is independent of the normalized request. This

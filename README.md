@@ -73,9 +73,10 @@ facts，不复制共享祖先 message/turn payload。
   Turn/message rows 只 INSERT 不 UPDATE，annotation/评分应另表引用 `MessageId`，不能更新
   `MessageRecord.payload`。
 
-Conversation Core 正按任务顺序继续实现持久化端到端一致性验收；具体 summarizer、
-Agent loop、Tool registry、自动预算调度与多 agent 编排仍不在范围内。完整设计和当前阶段计划分别见
-[`DESIGN.md`](DESIGN.md) 与 [`PLAN.md`](PLAN.md)。
+Conversation Core 已覆盖 pending/cancel、branch、projection/compaction、snapshot/rows restore
+与跨 adapter effective-view 兼容验收；具体 summarizer、Agent loop、Tool registry、自动预算调度与
+多 agent 编排仍不在范围内。完整设计和当前阶段计划分别见 [`DESIGN.md`](DESIGN.md)、
+[`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。
 
 下面把调用方提供的稳定 UUID 与完整 Client message 组合成冻结 envelope。system prompt
 单独保存在配置中，不会被包装成 `Role::System` 历史消息：
@@ -312,6 +313,29 @@ fn inspect_turn(turn: &Turn) {
 }
 ```
 
+## Conversation Core 离线用法
+
+`examples/conversation_core.rs` 从公开 API 驱动一段完整离线会话，不访问真实 endpoint，也不创建
+Agent loop 或 tool registry。示例显式注入 deterministic `ConversationId`/`TurnId`/`MessageId`/
+`ToolCallId`/`ArtifactId`，并用 normalized `Response` 与 `ToolResponse` 模拟 Client 已完成的输出：
+
+```bash
+cargo run --example conversation_core
+```
+
+该示例依次断言：
+
+- user → assistant tool-use → tool-result → final assistant → `commit_pending` 会形成一个满足
+  I1--I4 的 closed Turn。
+- open tool call 被 `CancelDisposition::ResumeTurn` 合成 `ToolStatus::Cancelled` result 后，仍可继续
+  feed final assistant 并提交；partial 或 dangling call 不进入 committed `effective_view`。
+- `Boundary` 只能由当前 Conversation 签发和消费；`fork_at` 创建 child 时共享 fork 点之前的
+  immutable prefix，父子后续 commit 互相隔离。
+- `CompactionPlan` 只替换 projection overlay；raw Turn/message id 与 payload 保留，`effective_view`
+  渲染 summary artifact 加 head 以内 raw tail。
+- `Conversation::snapshot` 只在无 pending 的 committed 一致点成功；JSON restore 后的
+  `effective_view` 与 raw fact 数量保持一致。
+
 ## 环境与构建
 
 需要支持 Rust 2024 edition 的稳定版工具链。克隆仓库后执行：
@@ -336,7 +360,7 @@ agent-lib = { path = "../agent-lib" }
 任意自定义 header 或 `None`，因此 wire protocol 与部署环境的认证方式不会耦合。
 `EndpointConfig` 可序列化但包含凭据，不应写入日志或未经批准的持久化存储。
 
-仓库中的三个示例通过 `AGENT_LIB_PROVIDER` 选择 adapter，并采用已经过真实 Foundry
+仓库中的三个 Client endpoint 示例通过 `AGENT_LIB_PROVIDER` 选择 adapter，并采用已经过真实 Foundry
 endpoint 验证的默认值：
 
 | 变量 | Anthropic | OpenAI Responses |
@@ -406,7 +430,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 ## 可运行示例
 
-设置上表对应的环境变量后，三个示例可原样切换 Anthropic 或 OpenAI Responses：
+`conversation_core` 是完全离线的 Conversation 示例，无需任何环境变量：
+
+```bash
+cargo run --example conversation_core
+```
+
+设置上表对应的环境变量后，三个 Client endpoint 示例可原样切换 Anthropic 或 OpenAI Responses：
 
 ```bash
 export AGENT_LIB_PROVIDER=anthropic # 或 openai
@@ -420,9 +450,11 @@ cargo run --example tool_round_trip
   `Accumulator`，最后校验可折叠的完整响应。
 - `tool_round_trip`：声明 `get_weather` JSON Schema，读取模型产生的统一 `ToolUse`，模拟
   本地执行，再用同一个 call id 回灌 `ToolResult` 并取得最终文本。
+- `conversation_core`：用 normalized 本地 fixture 演示 Conversation identity、pending/commit/cancel、
+  Boundary/fork、projection/effective view 和 snapshot/restore，不访问网络。
 
 每个示例为单次 HTTP 操作配置 45 秒 timeout；缺少变量或 provider 值非法时会给出不含
-secret 的明确错误。
+secret 的明确错误。离线 `conversation_core` 示例不读取 endpoint 环境变量。
 
 ## 数据模型与逃生舱
 

@@ -214,6 +214,39 @@ impl Conversation {
     /// handles are intentionally omitted because they can be rebuilt or
     /// resolved from the persisted facts later.
     ///
+    /// ```
+    /// use agent_lib::{
+    ///     conversation::{
+    ///         Conversation, ConversationConfig, ConversationError, ConversationId, MessageId,
+    ///         SnapshotError, TurnId,
+    ///     },
+    ///     model::message::{Message, Role},
+    /// };
+    ///
+    /// let conversation_id: ConversationId =
+    ///     "018f0d9c-7b6a-7c12-8f31-1234567890ab".parse().unwrap();
+    /// let turn_id: TurnId =
+    ///     "018f0d9c-7b6a-7c12-8f31-1234567890ac".parse().unwrap();
+    /// let user_message_id: MessageId =
+    ///     "018f0d9c-7b6a-7c12-8f31-1234567890ad".parse().unwrap();
+    /// let mut conversation = Conversation::new(conversation_id, ConversationConfig::default());
+    /// conversation
+    ///     .begin_turn(
+    ///         turn_id,
+    ///         user_message_id,
+    ///         Message {
+    ///             role: Role::User,
+    ///             content: Vec::new(),
+    ///         },
+    ///     )
+    ///     .unwrap();
+    ///
+    /// assert!(matches!(
+    ///     conversation.snapshot(),
+    ///     Err(ConversationError::Snapshot(SnapshotError::PendingTurn { .. }))
+    /// ));
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`SnapshotError::PendingTurn`] when an uncommitted transaction

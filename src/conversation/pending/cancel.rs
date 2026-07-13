@@ -69,6 +69,31 @@ impl CancelledToolResult {
 }
 
 /// How cancellation should leave the unique pending transaction.
+///
+/// ```
+/// use agent_lib::conversation::{
+///     CancelDisposition, CancelledToolResult, MessageId, ToolCallId,
+/// };
+///
+/// let call_id: ToolCallId =
+///     "018f0d9c-7b6a-7c12-8f31-1234567890ab".parse().unwrap();
+/// let result_message_id: MessageId =
+///     "018f0d9c-7b6a-7c12-8f31-1234567890ac".parse().unwrap();
+/// let disposition = CancelDisposition::ResumeTurn {
+///     cancelled_results: vec![CancelledToolResult::new(
+///         "provider-call-1",
+///         call_id,
+///         result_message_id,
+///     )],
+/// };
+///
+/// match disposition {
+///     CancelDisposition::ResumeTurn { cancelled_results } => {
+///         assert_eq!(cancelled_results[0].provider_call_id(), "provider-call-1");
+///     }
+///     _ => unreachable!(),
+/// }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CancelDisposition {
     /// Atomically discard the entire transaction and return to committed history.

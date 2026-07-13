@@ -26,6 +26,19 @@ pub use head::RevertOutcome;
 /// not prove its own owner, version, range, or anchor merely because its JSON
 /// shape is valid.
 ///
+/// ```
+/// use agent_lib::conversation::{Boundary, Conversation, ConversationConfig, ConversationId};
+///
+/// let id: ConversationId =
+///     "018f0d9c-7b6a-7c12-8f31-1234567890ab".parse().unwrap();
+/// let conversation = Conversation::new(id, ConversationConfig::default());
+/// let zero = conversation.valid_boundaries()[0];
+///
+/// let encoded = serde_json::to_string(&zero).unwrap();
+/// let decoded: Boundary = serde_json::from_str(&encoded).unwrap();
+/// conversation.validate_boundary(&decoded).unwrap();
+/// ```
+///
 /// Boundary fields cannot be assembled directly:
 ///
 /// ```compile_fail
