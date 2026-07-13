@@ -1,6 +1,6 @@
 use super::{
     AgentRuntimeHandles, AgentState, AgentStateError, LoopCursor, LoopCursorKind, LoopDoneReason,
-    PivotSource, QueuedPivot, QueuedReconfig,
+    PivotSource, QueuedPivot, QueuedReconfig, ReconfigRequest, ToolSetPatch,
 };
 use crate::{
     agent::{
@@ -16,6 +16,7 @@ use crate::{
         content::ContentBlock,
         message::{Message, Role},
         normalized::StopReason,
+        tool::Tool,
         usage::Usage,
     },
 };
@@ -83,6 +84,14 @@ fn user_message(text: &str) -> Message {
     }
 }
 
+fn tool(name: &str) -> Tool {
+    Tool {
+        name: name.to_owned(),
+        description: format!("Tool {name}."),
+        input_schema: json!({"type": "object"}),
+    }
+}
+
 fn assistant_response(text: &str) -> Response {
     Response {
         message: Message {
@@ -139,7 +148,7 @@ fn agent_state_serde_round_trips_through_conversation_snapshot() {
         .expect("queue pivot");
     state
         .queue_reconfig(QueuedReconfig::ActivateSkill {
-            skill_id: skill_id(2),
+            skill_id: skill_id(4),
         })
         .expect("queue reconfig");
     state
@@ -306,6 +315,89 @@ fn queued_reconfig_rejects_duplicate_replacement_skills() {
         AgentStateError::DuplicateSkill {
             skill_id: skill_id(2)
         }
+    );
+}
+
+#[test]
+fn queued_reconfig_conflicts_do_not_partially_modify_state() {
+    let mut state = AgentState::new(spec(), committed_conversation());
+    state
+        .replace_active_skills(vec![skill_id(2)])
+        .expect("active skill set");
+
+    let duplicate = state
+        .queue_reconfig(ReconfigRequest::ActivateSkill {
+            skill_id: skill_id(2),
+        })
+        .expect_err("already-active skill is rejected");
+
+    assert_eq!(
+        duplicate,
+        AgentStateError::SkillAlreadyActive {
+            skill_id: skill_id(2)
+        }
+    );
+    assert!(state.queued_reconfigs().is_empty());
+    assert_eq!(state.active_skills(), &[skill_id(2)]);
+
+    state
+        .queue_reconfig(ReconfigRequest::set_system_prompt_overlay(
+            Some("first overlay".to_owned()),
+            0,
+        ))
+        .expect("first overlay is queued");
+    let stale = state
+        .queue_reconfig(ReconfigRequest::set_system_prompt_overlay(
+            Some("stale overlay".to_owned()),
+            0,
+        ))
+        .expect_err("stale overlay version is rejected against queued plan");
+
+    assert_eq!(
+        stale,
+        AgentStateError::SystemOverlayVersionConflict {
+            expected: 0,
+            actual: 1,
+        }
+    );
+    assert_eq!(state.queued_reconfigs().len(), 1);
+    assert_eq!(state.system_prompt_overlay(), None);
+    assert_eq!(state.system_prompt_overlay_version(), 0);
+}
+
+#[test]
+fn queued_tool_set_patch_applies_atomically_to_current_config() {
+    let initial_tools = ToolSetRef::new(tool_set_id(), vec![tool("old"), tool("keep")]);
+    let mut agent_spec = spec();
+    agent_spec = crate::agent::AgentSpec::new(
+        agent_spec.id(),
+        agent_spec.worktree().clone(),
+        agent_spec.system_prompt().map(ToOwned::to_owned),
+        initial_tools.clone(),
+        agent_spec.model().clone(),
+        *agent_spec.loop_policy(),
+    );
+    let mut state = AgentState::new(agent_spec, committed_conversation());
+    let patch = ToolSetPatch::new(
+        initial_tools.id(),
+        tool_set_id(),
+        vec!["old".to_owned()],
+        vec![tool("new")],
+    )
+    .expect("valid tool patch");
+    state
+        .queue_reconfig(ReconfigRequest::PatchToolSet { patch })
+        .expect("patch queues successfully");
+    let application = state
+        .queued_reconfig_application()
+        .expect("queued patch is valid")
+        .expect("application exists");
+    state.apply_reconfig_application(application);
+
+    assert!(state.queued_reconfigs().is_empty());
+    assert_eq!(
+        state.current_tool_set().tools(),
+        &[tool("keep"), tool("new")]
     );
 }
 

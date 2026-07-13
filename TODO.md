@@ -567,7 +567,7 @@ pending turn 追加 `Role::User` message。当前 Conversation 的 `begin_turn` 
   `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
   `cargo test --doc`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
-### M3-3 [TODO] Turn-boundary reconfig：skill/tool/system 变更排队
+### [DONE] M3-3 Turn-boundary reconfig：skill/tool/system 变更排队
 
 **前置依赖**：M3-2。
 
@@ -591,6 +591,36 @@ pending turn 追加 `Role::User` message。当前 Conversation 的 `begin_turn` 
 - 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦 reconfig 测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增 `ReconfigRequest`/`ReconfigQueue`/`ToolSetPatch`，覆盖 skill activate/deactivate、
+  active skill replace、tool set replace/patch、system prompt overlay、model 与 loop policy
+  可变项；保留 `QueuedReconfig` 兼容别名。
+- 扩展 `AgentState` 的 data-only 当前配置，保存 active skills、system overlay/version、
+  current tool set、current model 与 current loop policy；queued reconfig 会先对整条队列
+  预览校验，重复 skill、stale system overlay version、tool set patch 基线不匹配、重复/未知
+  tool name 等冲突均分类失败且不修改已生效配置或队列。
+- 新增 `ToolRegistryResolver`、`DeclaredOnlyToolRegistryResolver` 与
+  `StaticToolRegistryResolver`，使 turn-boundary `ToolSetRef` 变更可在应用前解析为 live
+  registry；未知 tool set 或声明不匹配会返回 `AgentErrorKind::Tool`，不会部分替换 runtime
+  registry。
+- 扩展对象安全 `AgentLoop` 与 `DefaultAgentLoop`，新增 `reconfigure` 入队入口；idle boundary
+  会在开始新 turn 前应用已有队列，pending turn 中途到达的 reconfig 会在最终 assistant
+  commit 后应用，并在 final `StepBoundary` metadata 中记录 `reconfigs`。
+- `DefaultAgentLoop` 的 Client request 现在读取当前 model、loop policy、system overlay 与当前
+  registry 声明；同一 pending turn 内的 tool execution 和 assistant continuation 继续使用该
+  turn 启动时的 registry snapshot，确保 turn 内工具集恒定。
+- 更新 `README.md`、crate 根文档与 `docs/agent-layer.md`，将 Agent 当前能力说明从 pivot queue
+  扩展到 turn-boundary reconfig queue。
+- 聚焦测试覆盖 reconfig 延迟到 turn boundary、下一 turn request 的 system/tool 变化、tool-use
+  turn 内 registry snapshot 恒定、pivot 与 reconfig 同 boundary metadata 并存、重复 skill、
+  stale system overlay version、未知 tool set 的失败原子性，以及 state 层 tool-set patch 应用。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test agent::state --all-targets`；`cargo test agent::loop_driver::default --all-targets`；
+  `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；`cargo test --doc`；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。完整测试后仅修改 Markdown 与 Rust doc
+  comment，并已重跑 `cargo fmt --all` 与 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
 ### M3-4 [TODO] Approval 挂起、responder 与 cancel 贯穿闭合
 

@@ -205,6 +205,10 @@ skill 启停、tool 增删、system prompt 变更都改的是 config/projection,
 - 若 reconfig 请求在 turn 进行中到达,**排队到当前 turn 结束后生效**(类比 pivot 的
   "软转向",只是生效边界更粗)。
 
+当前默认 loop 由 `ReconfigRequest`/`ReconfigQueue` 表达 skill、tool set、system overlay、
+model 与 loop policy 变更；`ToolRegistryResolver` 在应用前把新的 `ToolSetRef` 解析为 live
+registry，解析或版本校验失败会分类返回且不部分应用。
+
 ## 5. 垂直功能:API-first,tool 只是 adapter
 
 原始想法是"垂直功能只提供 api,通过 tool 暴露给 agent"。本稿把它**明确成 API-first**,

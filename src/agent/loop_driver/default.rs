@@ -10,10 +10,11 @@ use super::{AgentEventStream, AgentFeedGuard, AgentLoop, BoxAgentEventStream};
 use crate::{
     agent::{
         AgentError, AgentEvent, AgentInput, AgentOutcome, AgentState, DeclaredOnlyToolRegistry,
-        LoopCursor, NoToolExecutionIds, PivotMessage, RunContext, StepBoundary, StepId,
+        DeclaredOnlyToolRegistryResolver, LoopCursor, NoToolExecutionIds, PivotMessage,
+        ReconfigRequest, RunContext, StaticToolRegistryResolver, StepBoundary, StepId,
         ToolCallFinished, ToolCallStarted, ToolExecutionIds, ToolFailurePolicy, ToolRegistry,
-        ToolRuntimeError, TraceNodeId,
-        state::{CancelRecoveryReason, PivotSource, QueuedPivot},
+        ToolRegistryResolver, ToolRuntimeError, TraceNodeId,
+        state::{CancelRecoveryReason, PivotSource, QueuedPivot, ReconfigApplication},
     },
     client::{ChatRequest, ClientError, LlmClient, Response},
     conversation::{
@@ -38,6 +39,8 @@ use std::{
 
 type SharedAgentState = Arc<Mutex<AgentState>>;
 type SharedToolRegistry = Arc<dyn ToolRegistry>;
+type SharedToolRegistrySlot = Arc<Mutex<SharedToolRegistry>>;
+type SharedToolRegistryResolver = Arc<dyn ToolRegistryResolver>;
 type SharedToolExecutionIds = Arc<dyn ToolExecutionIds>;
 
 /// LLM transport mode used by [`DefaultAgentLoop`].
@@ -81,13 +84,15 @@ impl DefaultAgentLoop {
         mode: LlmStepMode,
     ) -> Self {
         let declarations = state.spec().initial_tools().tools().to_vec();
-        Self::with_tool_registry(
+        let resolver: SharedToolRegistryResolver = Arc::new(DeclaredOnlyToolRegistryResolver);
+        Self::with_tool_registry_resolver(
             client,
             state,
             context,
             mode,
             Arc::new(DeclaredOnlyToolRegistry::new(declarations)),
             Arc::new(NoToolExecutionIds),
+            resolver,
         )
     }
 
@@ -104,12 +109,40 @@ impl DefaultAgentLoop {
         tool_registry: SharedToolRegistry,
         tool_ids: SharedToolExecutionIds,
     ) -> Self {
+        let resolver: SharedToolRegistryResolver = Arc::new(StaticToolRegistryResolver::single(
+            state.current_tool_set().id(),
+            Arc::clone(&tool_registry),
+        ));
+        Self::with_tool_registry_resolver(
+            client,
+            state,
+            context,
+            mode,
+            tool_registry,
+            tool_ids,
+            resolver,
+        )
+    }
+
+    /// Creates a loop driver with a registry and a resolver for future tool
+    /// set replacements.
+    #[must_use]
+    pub fn with_tool_registry_resolver(
+        client: Arc<dyn LlmClient>,
+        state: AgentState,
+        context: RunContext,
+        mode: LlmStepMode,
+        tool_registry: SharedToolRegistry,
+        tool_ids: SharedToolExecutionIds,
+        tool_registry_resolver: SharedToolRegistryResolver,
+    ) -> Self {
         Self {
             runtime: LoopRuntime {
                 client,
                 state: Arc::new(Mutex::new(state)),
                 context,
-                tool_registry,
+                tool_registry: Arc::new(Mutex::new(tool_registry)),
+                tool_registry_resolver,
                 tool_ids,
             },
             mode,
@@ -213,6 +246,10 @@ impl AgentLoop for DefaultAgentLoop {
         let mut state = lock_agent_state(&self.runtime.state)?;
         state.queue_pivot(message).map_err(AgentError::from)
     }
+
+    fn reconfigure(&self, request: ReconfigRequest) -> Result<(), AgentError> {
+        self.runtime.queue_reconfig(request)
+    }
 }
 
 impl fmt::Debug for DefaultAgentLoop {
@@ -230,11 +267,87 @@ struct LoopRuntime {
     client: Arc<dyn LlmClient>,
     state: SharedAgentState,
     context: RunContext,
-    tool_registry: SharedToolRegistry,
+    tool_registry: SharedToolRegistrySlot,
+    tool_registry_resolver: SharedToolRegistryResolver,
     tool_ids: SharedToolExecutionIds,
 }
 
 impl LoopRuntime {
+    fn queue_reconfig(&self, request: ReconfigRequest) -> Result<(), AgentError> {
+        let mut state = lock_agent_state(&self.state)?;
+        let application = state.plan_reconfig_with(&request)?;
+        self.resolve_reconfig_registry(&state, &application)?;
+        state.queue_prevalidated_reconfig(request);
+        Ok(())
+    }
+
+    fn apply_queued_reconfigs_before_turn(&self, state: &mut AgentState) -> Result<(), AgentError> {
+        let Some(application) = state.queued_reconfig_application()? else {
+            return Ok(());
+        };
+        let replacement = self.resolve_reconfig_registry(state, &application)?;
+        state.apply_reconfig_application(application);
+        if let Some(registry) = replacement {
+            self.replace_tool_registry(registry)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_queued_reconfig_application(
+        &self,
+        state: &AgentState,
+    ) -> Result<Option<PreparedReconfigApplication>, AgentError> {
+        let Some(application) = state.queued_reconfig_application()? else {
+            return Ok(None);
+        };
+        let registry = self.resolve_reconfig_registry(state, &application)?;
+        Ok(Some(PreparedReconfigApplication {
+            records: reconfig_records(application.requests()),
+            application,
+            registry,
+        }))
+    }
+
+    fn resolve_reconfig_registry(
+        &self,
+        state: &AgentState,
+        application: &ReconfigApplication,
+    ) -> Result<Option<SharedToolRegistry>, AgentError> {
+        if application.current_tool_set() == state.current_tool_set() {
+            return Ok(None);
+        }
+
+        let registry = self
+            .tool_registry_resolver
+            .resolve_tool_set(application.current_tool_set())?;
+        let declarations = registry.declarations();
+        if declarations != application.current_tool_set().tools() {
+            return Err(AgentError::Tool(ToolRuntimeError::InvalidRegistry {
+                message: format!(
+                    "registry declarations for tool set {} do not match requested ToolSetRef",
+                    application.current_tool_set().id()
+                ),
+            }));
+        }
+        Ok(Some(registry))
+    }
+
+    fn replace_tool_registry(&self, registry: SharedToolRegistry) -> Result<(), AgentError> {
+        let mut active = self
+            .tool_registry
+            .lock()
+            .map_err(|_| AgentError::Other("tool registry mutex poisoned".to_owned()))?;
+        *active = registry;
+        Ok(())
+    }
+
+    fn active_tool_registry(&self) -> Result<SharedToolRegistry, AgentError> {
+        self.tool_registry
+            .lock()
+            .map(|registry| Arc::clone(&registry))
+            .map_err(|_| AgentError::Other("tool registry mutex poisoned".to_owned()))
+    }
+
     fn prepare_user_turn(
         &self,
         input: AgentInput,
@@ -280,6 +393,7 @@ impl LoopRuntime {
 
         {
             let mut state = lock_agent_state(&self.state)?;
+            self.apply_queued_reconfigs_before_turn(&mut state)?;
             if let Err(error) = state.conversation_mut().begin_turn(
                 initial.turn_id,
                 initial.message_id,
@@ -310,7 +424,8 @@ impl LoopRuntime {
         let request = {
             let mut state = lock_agent_state(&self.state)?;
             state.transition_cursor(LoopCursor::streaming_step(step_id))?;
-            build_chat_request(&state, self.tool_registry.as_ref(), stream)
+            let tool_registry = self.active_tool_registry()?;
+            build_chat_request(&state, tool_registry.as_ref(), stream)
         };
 
         if let Err(error) = self.context.charge_step() {
@@ -419,11 +534,19 @@ impl LoopRuntime {
 
         match finish {
             AssistantFinish::ReadyToCommit => {
+                let prepared_reconfig = self.prepare_queued_reconfig_application(&state)?;
                 state
                     .conversation_mut()
                     .commit_pending(TurnMeta::default())?;
                 let boundary = state.conversation().head();
-                let metadata = deferred_pivot_metadata(&state);
+                let mut metadata = deferred_pivot_metadata(&state);
+                if let Some(prepared_reconfig) = prepared_reconfig {
+                    state.apply_reconfig_application(prepared_reconfig.application);
+                    if let Some(registry) = prepared_reconfig.registry {
+                        self.replace_tool_registry(registry)?;
+                    }
+                    merge_metadata(&mut metadata, reconfig_metadata(prepared_reconfig.records));
+                }
                 state.transition_cursor(LoopCursor::Idle)?;
 
                 Ok(AssistantStepOutcome::Final(vec![
@@ -537,8 +660,8 @@ impl LoopRuntime {
     ) -> Result<ToolExecutionRecord, AgentError> {
         self.context.check_cancelled()?;
         let invocation = prepared.invocation;
-        let response = match self
-            .tool_registry
+        let tool_registry = self.active_tool_registry()?;
+        let response = match tool_registry
             .execute(invocation.call_id, invocation.call.clone())
             .await
         {
@@ -621,7 +744,7 @@ impl LoopRuntime {
     fn ensure_can_start_next_step(&self, assistant_steps_started: u32) -> Result<(), AgentError> {
         let max_steps = {
             let state = lock_agent_state(&self.state)?;
-            state.spec().loop_policy().max_steps().get()
+            state.current_loop_policy().max_steps().get()
         };
         if assistant_steps_started >= max_steps {
             return Err(AgentError::Other(format!(
@@ -633,12 +756,12 @@ impl LoopRuntime {
 
     fn max_parallel_tools(&self) -> Result<u32, AgentError> {
         let state = lock_agent_state(&self.state)?;
-        Ok(state.spec().loop_policy().max_parallel_tools().get())
+        Ok(state.current_loop_policy().max_parallel_tools().get())
     }
 
     fn tool_failure_policy(&self) -> Result<ToolFailurePolicy, AgentError> {
         let state = lock_agent_state(&self.state)?;
-        Ok(state.spec().loop_policy().tool_failure_policy())
+        Ok(state.current_loop_policy().tool_failure_policy())
     }
 
     fn record_tool_trace(
@@ -778,6 +901,12 @@ struct InitialUserTurn {
     queued_pivot: bool,
 }
 
+struct PreparedReconfigApplication {
+    application: ReconfigApplication,
+    registry: Option<SharedToolRegistry>,
+    records: Vec<Value>,
+}
+
 enum AssistantStepOutcome {
     Final(Vec<AgentEvent>),
     ToolCalls(Vec<ToolInvocation>),
@@ -813,17 +942,28 @@ fn build_chat_request(
     if let Some(pending) = state.conversation().pending_context() {
         messages.extend(pending.into_messages());
     }
-    let model = state.spec().model();
+    let model = state.current_model();
 
     ChatRequest {
         model: model.model().to_owned(),
         messages,
         tools: tool_registry.declarations(),
-        system: system.or_else(|| state.spec().system_prompt().map(ToOwned::to_owned)),
+        system: combine_system_prompt(
+            system.or_else(|| state.spec().system_prompt().map(ToOwned::to_owned)),
+            state.system_prompt_overlay(),
+        ),
         max_tokens: model.max_tokens().get(),
         temperature: model.temperature(),
         stream,
         provider_extras: model.provider_extras().cloned(),
+    }
+}
+
+fn combine_system_prompt(base: Option<String>, overlay: Option<&str>) -> Option<String> {
+    match (base, overlay) {
+        (Some(base), Some(overlay)) => Some(format!("{base}\n\n{overlay}")),
+        (None, Some(overlay)) => Some(overlay.to_owned()),
+        (base, None) => base,
     }
 }
 
@@ -845,6 +985,20 @@ fn pivot_metadata(records: Vec<Value>) -> Map<String, Value> {
     metadata
 }
 
+fn reconfig_metadata(records: Vec<Value>) -> Map<String, Value> {
+    let mut metadata = Map::new();
+    if !records.is_empty() {
+        metadata.insert("reconfigs".to_owned(), Value::Array(records));
+    }
+    metadata
+}
+
+fn merge_metadata(target: &mut Map<String, Value>, source: Map<String, Value>) {
+    for (key, value) in source {
+        target.insert(key, value);
+    }
+}
+
 fn pivot_record(
     pivot: &QueuedPivot,
     status: &'static str,
@@ -864,6 +1018,94 @@ fn pivot_record(
     );
     if let Some(error) = error {
         record.insert("error".to_owned(), Value::String(error));
+    }
+    Value::Object(record)
+}
+
+fn reconfig_records(requests: &[ReconfigRequest]) -> Vec<Value> {
+    requests
+        .iter()
+        .map(|request| reconfig_record(request, "applied"))
+        .collect()
+}
+
+fn reconfig_record(request: &ReconfigRequest, status: &'static str) -> Value {
+    let mut record = Map::new();
+    record.insert("status".to_owned(), Value::String(status.to_owned()));
+    match request {
+        ReconfigRequest::ActivateSkill { skill_id } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("activate_skill".to_owned()),
+            );
+            record.insert(
+                "skill_id".to_owned(),
+                serde_json::to_value(skill_id).expect("skill id serializes"),
+            );
+        }
+        ReconfigRequest::DeactivateSkill { skill_id } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("deactivate_skill".to_owned()),
+            );
+            record.insert(
+                "skill_id".to_owned(),
+                serde_json::to_value(skill_id).expect("skill id serializes"),
+            );
+        }
+        ReconfigRequest::ReplaceActiveSkills { skill_ids } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("replace_active_skills".to_owned()),
+            );
+            record.insert(
+                "skill_ids".to_owned(),
+                serde_json::to_value(skill_ids).expect("skill ids serialize"),
+            );
+        }
+        ReconfigRequest::SetSystemPromptOverlay {
+            expected_version, ..
+        } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("set_system_prompt_overlay".to_owned()),
+            );
+            record.insert(
+                "expected_version".to_owned(),
+                Value::from(*expected_version),
+            );
+        }
+        ReconfigRequest::ReplaceToolSet { tool_set } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("replace_tool_set".to_owned()),
+            );
+            record.insert(
+                "tool_set_id".to_owned(),
+                serde_json::to_value(tool_set.id()).expect("tool set id serializes"),
+            );
+        }
+        ReconfigRequest::PatchToolSet { patch } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("patch_tool_set".to_owned()),
+            );
+            record.insert(
+                "tool_set_id".to_owned(),
+                serde_json::to_value(patch.resulting_tool_set_id())
+                    .expect("tool set id serializes"),
+            );
+        }
+        ReconfigRequest::SetModel { model } => {
+            record.insert("kind".to_owned(), Value::String("set_model".to_owned()));
+            record.insert("model".to_owned(), Value::String(model.model().to_owned()));
+        }
+        ReconfigRequest::SetLoopPolicy { .. } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("set_loop_policy".to_owned()),
+            );
+        }
     }
     Value::Object(record)
 }

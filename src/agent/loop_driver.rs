@@ -4,7 +4,7 @@
 //! guarded event stream for each `feed` call; callers must finish or drop that
 //! stream before starting another feed segment for the same Agent.
 
-use crate::agent::{AgentError, AgentEvent, AgentInput, PivotMessage};
+use crate::agent::{AgentError, AgentEvent, AgentInput, PivotMessage, ReconfigRequest};
 use async_trait::async_trait;
 use futures::{Stream, stream::BoxStream};
 use std::{
@@ -51,6 +51,14 @@ pub trait AgentLoop: Send {
     /// Returns a classified [`AgentError`] when the loop cannot accept the
     /// pivot in its current runtime state.
     fn interject(&self, message: PivotMessage) -> Result<(), AgentError>;
+
+    /// Queues a configuration change for a future turn boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified [`AgentError`] when the request conflicts with the
+    /// current or already queued Agent configuration.
+    fn reconfigure(&self, request: ReconfigRequest) -> Result<(), AgentError>;
 }
 
 /// Shared guard that ensures only one feed stream is active.
@@ -173,7 +181,9 @@ impl fmt::Debug for AgentEventStream {
 #[cfg(test)]
 mod tests {
     use super::{AgentEventStream, AgentFeedGuard, AgentLoop, BoxAgentEventStream};
-    use crate::agent::{AgentError, AgentEvent, AgentInput, AgentOutcome, PivotMessage, StepId};
+    use crate::agent::{
+        AgentError, AgentEvent, AgentInput, AgentOutcome, PivotMessage, ReconfigRequest, StepId,
+    };
     use async_trait::async_trait;
     use futures::{StreamExt, stream};
 
@@ -203,6 +213,10 @@ mod tests {
         }
 
         fn interject(&self, _message: PivotMessage) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        fn reconfigure(&self, _request: ReconfigRequest) -> Result<(), AgentError> {
             Ok(())
         }
     }

@@ -14,9 +14,9 @@ mod runtime;
 mod tests;
 
 use crate::{
-    agent::{AgentId, AgentSpec, SkillId},
+    agent::{AgentId, AgentSpec, LoopPolicy, ModelRef, SkillId, ToolSetId, ToolSetRef},
     conversation::{Conversation, ConversationError, ConversationSnapshot, ToolCallId},
-    model::message::Role,
+    model::{message::Role, tool::Tool},
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
 use std::collections::BTreeSet;
@@ -26,7 +26,9 @@ pub use cursor::{
     ApprovalCursor, CancelRecoveryCursor, CancelRecoveryReason, DoneCursor, ErrorCursor,
     LoopCursor, LoopCursorKind, LoopDoneReason, StepCursor, ToolWaitCursor,
 };
-pub use queue::{PivotSource, QueuedPivot, QueuedReconfig};
+pub use queue::{
+    PivotSource, QueuedPivot, QueuedReconfig, ReconfigQueue, ReconfigRequest, ToolSetPatch,
+};
 pub use runtime::AgentRuntimeHandles;
 
 /// Data half of a running Agent.
@@ -41,7 +43,12 @@ pub struct AgentState {
     conversation: Conversation,
     active_skills: Vec<SkillId>,
     queued_pivots: Vec<QueuedPivot>,
-    queued_reconfigs: Vec<QueuedReconfig>,
+    queued_reconfigs: ReconfigQueue,
+    system_prompt_overlay: Option<String>,
+    system_prompt_overlay_version: u64,
+    current_tool_set: ToolSetRef,
+    current_model: ModelRef,
+    current_loop_policy: LoopPolicy,
     loop_cursor: LoopCursor,
 }
 
@@ -49,12 +56,20 @@ impl AgentState {
     /// Creates Agent state from a static spec and one active Conversation.
     #[must_use]
     pub fn new(spec: AgentSpec, conversation: Conversation) -> Self {
+        let current_tool_set = spec.initial_tools().clone();
+        let current_model = spec.model().clone();
+        let current_loop_policy = *spec.loop_policy();
         Self {
             spec,
             conversation,
             active_skills: Vec::new(),
             queued_pivots: Vec::new(),
-            queued_reconfigs: Vec::new(),
+            queued_reconfigs: ReconfigQueue::new(),
+            system_prompt_overlay: None,
+            system_prompt_overlay_version: 0,
+            current_tool_set,
+            current_model,
+            current_loop_policy,
             loop_cursor: LoopCursor::Idle,
         }
     }
@@ -97,7 +112,37 @@ impl AgentState {
     /// Returns queued reconfiguration intents waiting for a turn boundary.
     #[must_use]
     pub fn queued_reconfigs(&self) -> &[QueuedReconfig] {
-        &self.queued_reconfigs
+        self.queued_reconfigs.as_slice()
+    }
+
+    /// Returns the currently effective system-prompt overlay, if any.
+    #[must_use]
+    pub fn system_prompt_overlay(&self) -> Option<&str> {
+        self.system_prompt_overlay.as_deref()
+    }
+
+    /// Returns the optimistic version for the system-prompt overlay.
+    #[must_use]
+    pub const fn system_prompt_overlay_version(&self) -> u64 {
+        self.system_prompt_overlay_version
+    }
+
+    /// Returns the currently effective tool declarations.
+    #[must_use]
+    pub const fn current_tool_set(&self) -> &ToolSetRef {
+        &self.current_tool_set
+    }
+
+    /// Returns the currently effective model request settings.
+    #[must_use]
+    pub const fn current_model(&self) -> &ModelRef {
+        &self.current_model
+    }
+
+    /// Returns the currently effective loop policy.
+    #[must_use]
+    pub const fn current_loop_policy(&self) -> &LoopPolicy {
+        &self.current_loop_policy
     }
 
     /// Returns the data-only loop recovery cursor.
@@ -146,12 +191,71 @@ impl AgentState {
     ///
     /// # Errors
     ///
-    /// Returns [`AgentStateError::DuplicateSkill`] when a replacement active
-    /// skill list repeats a skill id.
+    /// Returns a classified [`AgentStateError`] when the request or the full
+    /// pending queue would conflict with the current Agent state.
     pub fn queue_reconfig(&mut self, reconfig: QueuedReconfig) -> Result<(), AgentStateError> {
-        reconfig.validate()?;
-        self.queued_reconfigs.push(reconfig);
+        let queue = self.queued_reconfigs.with_pushed(reconfig);
+        let _application = self.plan_reconfig_requests(queue.as_slice())?;
+        self.queued_reconfigs = queue;
         Ok(())
+    }
+
+    pub(crate) fn plan_reconfig_with(
+        &self,
+        reconfig: &ReconfigRequest,
+    ) -> Result<ReconfigApplication, AgentStateError> {
+        let queue = self.queued_reconfigs.with_pushed(reconfig.clone());
+        self.plan_reconfig_requests(queue.as_slice())
+    }
+
+    pub(crate) fn queue_prevalidated_reconfig(&mut self, reconfig: ReconfigRequest) {
+        let queue = self.queued_reconfigs.with_pushed(reconfig);
+        self.queued_reconfigs = queue;
+    }
+
+    pub(crate) fn queued_reconfig_application(
+        &self,
+    ) -> Result<Option<ReconfigApplication>, AgentStateError> {
+        if self.queued_reconfigs.is_empty() {
+            Ok(None)
+        } else {
+            self.plan_reconfig_requests(self.queued_reconfigs.as_slice())
+                .map(Some)
+        }
+    }
+
+    pub(crate) fn apply_reconfig_application(&mut self, application: ReconfigApplication) {
+        self.active_skills = application.active_skills;
+        self.system_prompt_overlay = application.system_prompt_overlay;
+        self.system_prompt_overlay_version = application.system_prompt_overlay_version;
+        self.current_tool_set = application.current_tool_set;
+        self.current_model = application.current_model;
+        self.current_loop_policy = application.current_loop_policy;
+        self.queued_reconfigs.clear();
+    }
+
+    fn plan_reconfig_requests(
+        &self,
+        requests: &[ReconfigRequest],
+    ) -> Result<ReconfigApplication, AgentStateError> {
+        let mut application = ReconfigApplication {
+            requests: requests.to_vec(),
+            active_skills: self.active_skills.clone(),
+            system_prompt_overlay: self.system_prompt_overlay.clone(),
+            system_prompt_overlay_version: self.system_prompt_overlay_version,
+            current_tool_set: self.current_tool_set.clone(),
+            current_model: self.current_model.clone(),
+            current_loop_policy: self.current_loop_policy,
+        };
+
+        for request in requests {
+            request.validate()?;
+            apply_reconfig_request(&mut application, request)?;
+        }
+
+        ensure_unique_skill_ids(&application.active_skills)?;
+        ensure_unique_tool_names(application.current_tool_set.tools())?;
+        Ok(application)
     }
 
     /// Advances the loop cursor through a checked state transition.
@@ -176,24 +280,159 @@ impl AgentState {
 
     fn from_record(record: AgentStateRecord) -> Result<Self, AgentStateError> {
         ensure_unique_skill_ids(&record.active_skills)?;
+        let current_tool_set = record
+            .current_tool_set
+            .unwrap_or_else(|| record.spec.initial_tools().clone());
+        ensure_unique_tool_names(current_tool_set.tools())?;
+        let current_model = record
+            .current_model
+            .unwrap_or_else(|| record.spec.model().clone());
+        let current_loop_policy = record
+            .current_loop_policy
+            .unwrap_or(*record.spec.loop_policy());
+        let queued_reconfigs = record.queued_reconfigs;
         for pivot in &record.queued_pivots {
             pivot.validate()?;
         }
-        for reconfig in &record.queued_reconfigs {
+        for reconfig in queued_reconfigs.as_slice() {
             reconfig.validate()?;
         }
         record.loop_cursor.validate()?;
 
         let conversation = Conversation::restore(record.conversation)?;
-        Ok(Self {
+        let state = Self {
             spec: record.spec,
             conversation,
             active_skills: record.active_skills,
             queued_pivots: record.queued_pivots,
-            queued_reconfigs: record.queued_reconfigs,
+            queued_reconfigs,
+            system_prompt_overlay: record.system_prompt_overlay,
+            system_prompt_overlay_version: record.system_prompt_overlay_version.unwrap_or(0),
+            current_tool_set,
+            current_model,
+            current_loop_policy,
             loop_cursor: record.loop_cursor,
-        })
+        };
+        let _application = state
+            .queued_reconfig_application()?
+            .map(|application| application.requests().len());
+        Ok(state)
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ReconfigApplication {
+    requests: Vec<ReconfigRequest>,
+    active_skills: Vec<SkillId>,
+    system_prompt_overlay: Option<String>,
+    system_prompt_overlay_version: u64,
+    current_tool_set: ToolSetRef,
+    current_model: ModelRef,
+    current_loop_policy: LoopPolicy,
+}
+
+impl ReconfigApplication {
+    pub(crate) fn requests(&self) -> &[ReconfigRequest] {
+        &self.requests
+    }
+
+    pub(crate) const fn current_tool_set(&self) -> &ToolSetRef {
+        &self.current_tool_set
+    }
+}
+
+fn apply_reconfig_request(
+    application: &mut ReconfigApplication,
+    request: &ReconfigRequest,
+) -> Result<(), AgentStateError> {
+    match request {
+        ReconfigRequest::ActivateSkill { skill_id } => {
+            if application.active_skills.contains(skill_id) {
+                return Err(AgentStateError::SkillAlreadyActive {
+                    skill_id: *skill_id,
+                });
+            }
+            application.active_skills.push(*skill_id);
+        }
+        ReconfigRequest::DeactivateSkill { skill_id } => {
+            let Some(index) = application
+                .active_skills
+                .iter()
+                .position(|active| active == skill_id)
+            else {
+                return Err(AgentStateError::SkillNotActive {
+                    skill_id: *skill_id,
+                });
+            };
+            application.active_skills.remove(index);
+        }
+        ReconfigRequest::ReplaceActiveSkills { skill_ids } => {
+            ensure_unique_skill_ids(skill_ids)?;
+            application.active_skills = skill_ids.clone();
+        }
+        ReconfigRequest::SetSystemPromptOverlay {
+            system_prompt,
+            expected_version,
+        } => {
+            if *expected_version != application.system_prompt_overlay_version {
+                return Err(AgentStateError::SystemOverlayVersionConflict {
+                    expected: *expected_version,
+                    actual: application.system_prompt_overlay_version,
+                });
+            }
+            application.system_prompt_overlay = system_prompt.clone();
+            application.system_prompt_overlay_version = application
+                .system_prompt_overlay_version
+                .checked_add(1)
+                .ok_or(AgentStateError::SystemOverlayVersionOverflow)?;
+        }
+        ReconfigRequest::ReplaceToolSet { tool_set } => {
+            ensure_unique_tool_names(tool_set.tools())?;
+            application.current_tool_set = tool_set.clone();
+        }
+        ReconfigRequest::PatchToolSet { patch } => {
+            application.current_tool_set =
+                apply_tool_set_patch(&application.current_tool_set, patch)?;
+        }
+        ReconfigRequest::SetModel { model } => {
+            application.current_model = model.clone();
+        }
+        ReconfigRequest::SetLoopPolicy { loop_policy } => {
+            application.current_loop_policy = *loop_policy;
+        }
+    }
+    Ok(())
+}
+
+fn apply_tool_set_patch(
+    current: &ToolSetRef,
+    patch: &ToolSetPatch,
+) -> Result<ToolSetRef, AgentStateError> {
+    if patch.expected_tool_set_id() != current.id() {
+        return Err(AgentStateError::ToolSetVersionConflict {
+            expected: patch.expected_tool_set_id(),
+            actual: current.id(),
+        });
+    }
+
+    let mut tools = current.tools().to_vec();
+    for name in patch.remove() {
+        let Some(index) = tools.iter().position(|tool| &tool.name == name) else {
+            return Err(AgentStateError::UnknownToolName { name: name.clone() });
+        };
+        tools.remove(index);
+    }
+
+    for tool in patch.add_or_replace() {
+        if let Some(existing) = tools.iter_mut().find(|existing| existing.name == tool.name) {
+            *existing = tool.clone();
+        } else {
+            tools.push(tool.clone());
+        }
+    }
+
+    ensure_unique_tool_names(&tools)?;
+    Ok(ToolSetRef::new(patch.resulting_tool_set_id(), tools))
 }
 
 impl Serialize for AgentState {
@@ -202,12 +441,25 @@ impl Serialize for AgentState {
         S: Serializer,
     {
         let conversation = self.conversation.snapshot().map_err(ser::Error::custom)?;
+        let current_tool_set = (&self.current_tool_set != self.spec.initial_tools())
+            .then(|| self.current_tool_set.clone());
+        let current_model =
+            (&self.current_model != self.spec.model()).then(|| self.current_model.clone());
+        let current_loop_policy = (&self.current_loop_policy != self.spec.loop_policy())
+            .then_some(self.current_loop_policy);
+        let system_prompt_overlay_version =
+            (self.system_prompt_overlay_version != 0).then_some(self.system_prompt_overlay_version);
         AgentStateRecord {
             spec: self.spec.clone(),
             conversation,
             active_skills: self.active_skills.clone(),
             queued_pivots: self.queued_pivots.clone(),
             queued_reconfigs: self.queued_reconfigs.clone(),
+            system_prompt_overlay: self.system_prompt_overlay.clone(),
+            system_prompt_overlay_version,
+            current_tool_set,
+            current_model,
+            current_loop_policy,
             loop_cursor: self.loop_cursor.clone(),
         }
         .serialize(serializer)
@@ -233,8 +485,18 @@ struct AgentStateRecord {
     active_skills: Vec<SkillId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     queued_pivots: Vec<QueuedPivot>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    queued_reconfigs: Vec<QueuedReconfig>,
+    #[serde(default, skip_serializing_if = "ReconfigQueue::is_empty")]
+    queued_reconfigs: ReconfigQueue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_prompt_overlay: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_prompt_overlay_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current_tool_set: Option<ToolSetRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current_model: Option<ModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    current_loop_policy: Option<LoopPolicy>,
     #[serde(default)]
     loop_cursor: LoopCursor,
 }
@@ -251,6 +513,49 @@ pub enum AgentStateError {
         /// Repeated skill identity.
         skill_id: SkillId,
     },
+    /// A reconfiguration attempted to activate an already-active skill.
+    #[error("skill id {skill_id} is already active")]
+    SkillAlreadyActive {
+        /// Already-active skill identity.
+        skill_id: SkillId,
+    },
+    /// A reconfiguration attempted to deactivate an inactive skill.
+    #[error("skill id {skill_id} is not active")]
+    SkillNotActive {
+        /// Inactive skill identity.
+        skill_id: SkillId,
+    },
+    /// A tool declaration list repeated a tool name.
+    #[error("tool name `{name}` appears more than once")]
+    DuplicateToolName {
+        /// Repeated tool name.
+        name: String,
+    },
+    /// A tool-set patch targeted a stale current tool-set identity.
+    #[error("tool set version conflict: expected {expected}, found {actual}")]
+    ToolSetVersionConflict {
+        /// Caller-observed tool-set identity.
+        expected: ToolSetId,
+        /// Current tool-set identity.
+        actual: ToolSetId,
+    },
+    /// A tool-set patch attempted to remove a tool that is not present.
+    #[error("tool `{name}` is not present in the current tool set")]
+    UnknownToolName {
+        /// Missing tool name.
+        name: String,
+    },
+    /// A system overlay request used a stale overlay version.
+    #[error("system overlay version conflict: expected {expected}, found {actual}")]
+    SystemOverlayVersionConflict {
+        /// Caller-observed overlay version.
+        expected: u64,
+        /// Current overlay version.
+        actual: u64,
+    },
+    /// A system overlay version counter overflowed.
+    #[error("system overlay version overflow")]
+    SystemOverlayVersionOverflow,
     /// A tool-wait cursor had no tool calls to wait for.
     #[error("awaiting-tool cursor must contain at least one tool call")]
     EmptyToolWait,
@@ -285,6 +590,18 @@ fn ensure_unique_skill_ids(skill_ids: &[SkillId]) -> Result<(), AgentStateError>
     } else {
         Ok(())
     }
+}
+
+fn ensure_unique_tool_names(tools: &[Tool]) -> Result<(), AgentStateError> {
+    let mut seen = BTreeSet::new();
+    for tool in tools {
+        if !seen.insert(tool.name.clone()) {
+            return Err(AgentStateError::DuplicateToolName {
+                name: tool.name.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn first_duplicate<T>(items: &[T]) -> Option<T>

@@ -23,7 +23,8 @@
 //!   it sends non-streaming or streaming Client requests, folds responses through
 //!   Conversation pending, executes provider-neutral tool calls through a live
 //!   [`agent::ToolRegistry`], applies queued [`agent::PivotMessage`] values at
-//!   checked step boundaries, and commits only after a tool-free final assistant
+//!   checked step boundaries, applies queued [`agent::ReconfigRequest`] values
+//!   only at turn boundaries, and commits only after a tool-free final assistant
 //!   response.
 //! - [`conversation`] adds externally supplied strong identities,
 //!   Conversation-level configuration, immutable message envelopes with
@@ -80,9 +81,11 @@
 //! Conversation snapshots, [`agent::RunContext`] handles for cancellation,
 //! budget, and trace propagation, the object-safe [`agent::AgentLoop`] event
 //! stream contract with [`agent::AgentFeedGuard`] backpressure support, minimal
-//! live [`agent::ToolRegistry`]/[`agent::ToolExecutor`] boundaries, and the
-//! [`agent::DefaultAgentLoop`] driver with `interject` soft-turning support,
-//! without making live handles part of persisted state.
+//! live [`agent::ToolRegistry`]/[`agent::ToolExecutor`] boundaries, a
+//! [`agent::ToolRegistryResolver`] for turn-boundary tool-set replacement, and
+//! the [`agent::DefaultAgentLoop`] driver with `interject` soft-turning plus
+//! `reconfigure` turn-boundary config application, without making live handles
+//! part of persisted state.
 //!
 //! # Conversation Core example
 //!

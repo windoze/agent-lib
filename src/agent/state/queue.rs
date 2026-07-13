@@ -1,13 +1,16 @@
 //! Data-only queued Agent boundary work.
 
 use crate::{
-    agent::{AgentId, SkillId, ToolSetRef},
+    agent::{AgentId, LoopPolicy, ModelRef, SkillId, ToolSetId, ToolSetRef},
     conversation::MessageId,
-    model::message::{Message, Role},
+    model::{
+        message::{Message, Role},
+        tool::Tool,
+    },
 };
 use serde::{Deserialize, Serialize};
 
-use super::{AgentStateError, ensure_unique_skill_ids};
+use super::{AgentStateError, ensure_unique_skill_ids, ensure_unique_tool_names};
 
 /// User-role message queued for a future step boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,14 +93,64 @@ pub enum PivotSource {
     },
 }
 
-/// Turn-boundary reconfiguration intent.
+/// FIFO queue of turn-boundary reconfiguration requests.
+///
+/// The queue is a data-only shape. Applying it is a separate checked
+/// transaction on [`super::AgentState`] so validation can happen before any
+/// active runtime registry is replaced.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReconfigQueue {
+    requests: Vec<ReconfigRequest>,
+}
+
+impl ReconfigQueue {
+    /// Creates an empty reconfiguration queue.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            requests: Vec::new(),
+        }
+    }
+
+    /// Returns queued requests in FIFO order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[ReconfigRequest] {
+        &self.requests
+    }
+
+    /// Returns whether no requests are queued.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    /// Returns the number of queued requests.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.requests.len()
+    }
+
+    pub(super) fn with_pushed(&self, request: ReconfigRequest) -> Self {
+        let mut requests = self.requests.clone();
+        requests.push(request);
+        Self { requests }
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.requests.clear();
+    }
+}
+
+/// Turn-boundary reconfiguration request.
 ///
 /// Reconfiguration data records future changes to skills, system prompt
-/// overlays, or tool declarations. It intentionally stores declarations, not a
-/// live tool registry.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// overlays, model settings, loop policy, or tool declarations. It
+/// intentionally stores declarations and version tokens, not a live tool
+/// registry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum QueuedReconfig {
+pub enum ReconfigRequest {
     /// Activate one skill at the next turn boundary.
     ActivateSkill {
         /// Skill identity to activate.
@@ -117,15 +170,35 @@ pub enum QueuedReconfig {
     SetSystemPromptOverlay {
         /// Overlay text, or `None` to clear the overlay.
         system_prompt: Option<String>,
+        /// Caller-observed overlay version that must still be current.
+        expected_version: u64,
     },
     /// Replace future tool declarations without storing a runtime registry.
     ReplaceToolSet {
         /// New static tool declarations.
         tool_set: ToolSetRef,
     },
+    /// Patch future tool declarations against an expected current tool set.
+    PatchToolSet {
+        /// Declarative patch to apply to the current tool set.
+        patch: ToolSetPatch,
+    },
+    /// Replace future model request settings.
+    SetModel {
+        /// New model request settings for future LLM calls.
+        model: ModelRef,
+    },
+    /// Replace future loop policy knobs.
+    SetLoopPolicy {
+        /// New loop policy for future feed segments.
+        loop_policy: LoopPolicy,
+    },
 }
 
-impl QueuedReconfig {
+/// Backwards-compatible name for a queued reconfiguration request.
+pub type QueuedReconfig = ReconfigRequest;
+
+impl ReconfigRequest {
     /// Creates a checked active-skill replacement intent.
     ///
     /// # Errors
@@ -138,10 +211,103 @@ impl QueuedReconfig {
         Ok(reconfig)
     }
 
+    /// Creates a checked system overlay update with optimistic versioning.
+    #[must_use]
+    pub fn set_system_prompt_overlay(system_prompt: Option<String>, expected_version: u64) -> Self {
+        Self::SetSystemPromptOverlay {
+            system_prompt,
+            expected_version,
+        }
+    }
+
     pub(super) fn validate(&self) -> Result<(), AgentStateError> {
-        if let Self::ReplaceActiveSkills { skill_ids } = self {
-            ensure_unique_skill_ids(skill_ids)?;
+        match self {
+            Self::ReplaceActiveSkills { skill_ids } => ensure_unique_skill_ids(skill_ids)?,
+            Self::ReplaceToolSet { tool_set } => ensure_unique_tool_names(tool_set.tools())?,
+            Self::PatchToolSet { patch } => patch.validate()?,
+            Self::ActivateSkill { .. }
+            | Self::DeactivateSkill { .. }
+            | Self::SetSystemPromptOverlay { .. }
+            | Self::SetModel { .. }
+            | Self::SetLoopPolicy { .. } => {}
         }
         Ok(())
     }
+}
+
+/// Declarative tool-set patch applied at a turn boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolSetPatch {
+    expected_tool_set_id: ToolSetId,
+    resulting_tool_set_id: ToolSetId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    remove: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    add_or_replace: Vec<Tool>,
+}
+
+impl ToolSetPatch {
+    /// Creates a tool-set patch from caller-supplied identities and tool edits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentStateError::DuplicateToolName`] when the patch repeats a
+    /// tool name in either list.
+    pub fn new(
+        expected_tool_set_id: ToolSetId,
+        resulting_tool_set_id: ToolSetId,
+        remove: Vec<String>,
+        add_or_replace: Vec<Tool>,
+    ) -> Result<Self, AgentStateError> {
+        let patch = Self {
+            expected_tool_set_id,
+            resulting_tool_set_id,
+            remove,
+            add_or_replace,
+        };
+        patch.validate()?;
+        Ok(patch)
+    }
+
+    /// Returns the tool-set identity that must still be current.
+    #[must_use]
+    pub const fn expected_tool_set_id(&self) -> ToolSetId {
+        self.expected_tool_set_id
+    }
+
+    /// Returns the identity assigned to the patched tool set.
+    #[must_use]
+    pub const fn resulting_tool_set_id(&self) -> ToolSetId {
+        self.resulting_tool_set_id
+    }
+
+    /// Returns tool names to remove.
+    #[must_use]
+    pub fn remove(&self) -> &[String] {
+        &self.remove
+    }
+
+    /// Returns tools to add or replace by name.
+    #[must_use]
+    pub fn add_or_replace(&self) -> &[Tool] {
+        &self.add_or_replace
+    }
+
+    fn validate(&self) -> Result<(), AgentStateError> {
+        ensure_unique_tool_name_strings(&self.remove)?;
+        ensure_unique_tool_names(&self.add_or_replace)
+    }
+}
+
+fn ensure_unique_tool_name_strings(names: &[String]) -> Result<(), AgentStateError> {
+    let tools = names
+        .iter()
+        .map(|name| Tool {
+            name: name.clone(),
+            description: String::new(),
+            input_schema: serde_json::Value::Null,
+        })
+        .collect::<Vec<_>>();
+    ensure_unique_tool_names(&tools)
 }

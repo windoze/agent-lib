@@ -4,9 +4,9 @@
 //! runtime boundary, [`RunContext`]. [`AgentState`] adds the single active
 //! Conversation and data-only loop cursor boundary. [`AgentLoop`] defines the
 //! guarded feed-to-event-stream contract; [`DefaultAgentLoop`] provides the
-//! current LLM/tool runtime path and pivot queue soft-turning. Approval
-//! responders and orchestration remain future layers. Live handles stay out of
-//! serde data shapes.
+//! current LLM/tool runtime path, pivot queue soft-turning, and turn-boundary
+//! reconfiguration queue. Approval responders and orchestration remain future
+//! layers. Live handles stay out of serde data shapes.
 
 pub mod context;
 pub mod event;
@@ -36,9 +36,11 @@ pub use spec::{AgentSpec, LoopPolicy, ModelRef, ToolFailurePolicy, ToolSetRef, W
 pub use state::{
     AgentRuntimeHandles, AgentState, AgentStateError, ApprovalCursor, CancelRecoveryCursor,
     CancelRecoveryReason, DoneCursor, ErrorCursor, LoopCursor, LoopCursorKind, LoopDoneReason,
-    PivotSource, QueuedPivot, QueuedReconfig, StepCursor, ToolWaitCursor,
+    PivotSource, QueuedPivot, QueuedReconfig, ReconfigQueue, ReconfigRequest, StepCursor,
+    ToolSetPatch, ToolWaitCursor,
 };
 pub use tool::{
-    DeclaredOnlyToolRegistry, NoToolExecutionIds, ToolExecutionIds, ToolExecutor, ToolRegistry,
+    DeclaredOnlyToolRegistry, DeclaredOnlyToolRegistryResolver, NoToolExecutionIds,
+    StaticToolRegistryResolver, ToolExecutionIds, ToolExecutor, ToolRegistry, ToolRegistryResolver,
     ToolRuntimeError,
 };

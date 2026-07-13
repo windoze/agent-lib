@@ -7,7 +7,7 @@
 //! Conversation bookkeeping boundary.
 
 use crate::{
-    agent::StepId,
+    agent::{StepId, ToolSetId, ToolSetRef},
     conversation::{MessageId, ToolCallId},
     model::{
         content::ContentBlock,
@@ -16,7 +16,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use serde_json::Map;
-use std::fmt;
+use std::{collections::BTreeMap, fmt, sync::Arc};
 use thiserror::Error;
 
 /// Runtime executor for one provider-neutral model tool.
@@ -56,6 +56,24 @@ pub trait ToolRegistry: Send + Sync + fmt::Debug {
         call_id: ToolCallId,
         call: ToolCall,
     ) -> Result<ToolResponse, ToolRuntimeError>;
+}
+
+/// Runtime resolver for replacing an Agent's active tool registry.
+///
+/// The request data carries a [`ToolSetRef`], but executable callbacks remain
+/// live runtime handles. A resolver is therefore responsible for mapping the
+/// declared set to a registry at a turn boundary.
+pub trait ToolRegistryResolver: Send + Sync + fmt::Debug {
+    /// Resolves one static tool-set declaration into an executable registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolRuntimeError::UnknownToolSet`] when the runtime has no
+    /// registry for the requested set.
+    fn resolve_tool_set(
+        &self,
+        tool_set: &ToolSetRef,
+    ) -> Result<Arc<dyn ToolRegistry>, ToolRuntimeError>;
 }
 
 /// Caller-supplied identity source for Agent tool orchestration.
@@ -112,6 +130,77 @@ impl DeclaredOnlyToolRegistry {
     #[must_use]
     pub fn new(declarations: Vec<Tool>) -> Self {
         Self { declarations }
+    }
+}
+
+/// Resolver that creates declared-only registries from supplied declarations.
+///
+/// This is appropriate for loops that only need to advertise tools. Hosts that
+/// need executable callbacks should supply a stricter resolver.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeclaredOnlyToolRegistryResolver;
+
+impl ToolRegistryResolver for DeclaredOnlyToolRegistryResolver {
+    fn resolve_tool_set(
+        &self,
+        tool_set: &ToolSetRef,
+    ) -> Result<Arc<dyn ToolRegistry>, ToolRuntimeError> {
+        Ok(Arc::new(DeclaredOnlyToolRegistry::new(
+            tool_set.tools().to_vec(),
+        )))
+    }
+}
+
+/// Resolver backed by a fixed registry catalog keyed by `ToolSetId`.
+#[derive(Clone, Debug, Default)]
+pub struct StaticToolRegistryResolver {
+    registries: BTreeMap<ToolSetId, Arc<dyn ToolRegistry>>,
+}
+
+impl StaticToolRegistryResolver {
+    /// Creates an empty registry catalog.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a runtime registry for one tool-set identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolRuntimeError::InvalidRegistry`] if the id is already
+    /// present.
+    pub fn insert(
+        &mut self,
+        tool_set_id: ToolSetId,
+        registry: Arc<dyn ToolRegistry>,
+    ) -> Result<(), ToolRuntimeError> {
+        if self.registries.insert(tool_set_id, registry).is_some() {
+            return Err(ToolRuntimeError::InvalidRegistry {
+                message: format!("duplicate registry for tool set {tool_set_id}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Creates a catalog with one known registry.
+    #[must_use]
+    pub fn single(tool_set_id: ToolSetId, registry: Arc<dyn ToolRegistry>) -> Self {
+        let mut registries = BTreeMap::new();
+        registries.insert(tool_set_id, registry);
+        Self { registries }
+    }
+}
+
+impl ToolRegistryResolver for StaticToolRegistryResolver {
+    fn resolve_tool_set(
+        &self,
+        tool_set: &ToolSetRef,
+    ) -> Result<Arc<dyn ToolRegistry>, ToolRuntimeError> {
+        self.registries
+            .get(&tool_set.id())
+            .cloned()
+            .ok_or(ToolRuntimeError::UnknownToolSet { id: tool_set.id() })
     }
 }
 
@@ -172,6 +261,12 @@ pub enum ToolRuntimeError {
     UnknownTool {
         /// Tool name selected by the model.
         name: String,
+    },
+    /// The runtime has no registry for a requested tool-set identity.
+    #[error("unknown tool set `{id}`")]
+    UnknownToolSet {
+        /// Tool-set identity selected by a reconfiguration request.
+        id: ToolSetId,
     },
     /// The host did not provide a stable identity required by the loop.
     #[error("missing externally supplied id for {purpose}")]

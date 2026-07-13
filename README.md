@@ -47,6 +47,10 @@ final assistant 后提交 Turn、发出 `StepBoundary` 与 `Done`；`interject` 
 接入 Agent pivot queue，运行中的 LLM 调用不会被打断，queued pivot 会在 tool-result step
 boundary 以 `Role::User` 注入同一 pending turn，或在纯文本/final boundary 记录为 deferred，
 由后续 `AgentInput::QueuedPivotTurn` 以调用方注入的 turn/assistant/step id 启动下一 turn；
+`reconfigure` 已作为 turn-boundary 配置入口接入 Agent loop，skill 启停、tool set replace/patch、
+system prompt overlay、model 与 loop policy 变更会排队到当前 Turn 完成后原子应用，下一次
+Client request 才会看到新的 system/tool/model/policy，当前 Turn 的 tool registry snapshot
+保持恒定；
 `AgentSpec` 用于记录 worktree、初始 system prompt、tool 声明、model 请求设置和 loop
 policy，不包含 live conversation、client、tool registry 或 runtime handle；`AgentState`
 通过 `Conversation::snapshot`/`Conversation::restore` 持久化唯一 conversation，并把
@@ -82,9 +86,12 @@ Agent 的前一段 feed stream 消费完或 drop 前不能再次 feed。
   区分 completed、budget exhausted、cancelled、error 与 waiting-for-external-recovery；
   `AgentLoop` 只定义 guarded feed stream 契约，不持久化 live stream；`ToolExecutor`/
   `ToolRegistry` 是最小 runtime trait，`ToolExecutionIds` 由调用方注入 tool-call、tool-result、
-  后续 assistant message 与 step identity；`DefaultAgentLoop` 作为当前基础实现支持 text-only
+  后续 assistant message 与 step identity；`ToolRegistryResolver` 把 turn-boundary
+  `ToolSetRef` 变更解析回 live registry；`DefaultAgentLoop` 作为当前基础实现支持 text-only
   与 tool-use LLM 往返，并支持 `interject` 软转向：pivot queue 按 FIFO 在合法 step boundary
   应用，tool-result 后注入同一 pending turn，无法插入当前 turn 的 pivot 保留到下一 turn；
+  `reconfigure` queue 只在 turn boundary 应用 skill/tool/system/model/policy 变更，失败时不部分
+  应用 queued config；
   调用方需在 `AgentInput::UserMessage` 中同时注入初始 user 与 assistant message id，或在
   `AgentInput::QueuedPivotTurn` 中为队首 pivot 的下一 turn 提供 turn/assistant/step id。
 - `conversation`：外部注入的强类型 id、独立 system 配置、不可原地修改的消息 envelope、
@@ -115,7 +122,8 @@ Conversation Core 已覆盖 pending/cancel、branch、projection/compaction、sn
 `AgentState`/`LoopCursor` 可恢复状态边界、`RunContext` 横切上下文边界，以及
 feed-to-`AgentEvent` stream 的公开契约与 reentrancy guard；基础 `DefaultAgentLoop` 已支持
 非流式/流式 LLM step、tool-use 执行编排、tool result 回灌、Conversation pending commit
-集成，以及 `interject` pivot queue 在 step boundary 的软转向应用；
+集成、`interject` pivot queue 在 step boundary 的软转向应用，以及 `reconfigure` queue 在
+turn boundary 的原子配置应用；
 approval policy、自动预算调度与多 agent 编排仍是后续计划范围，尚未作为已实现能力暴露。
 完整设计和当前阶段计划分别见
 [`DESIGN.md`](DESIGN.md)、

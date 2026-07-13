@@ -2,9 +2,9 @@ use super::{DefaultAgentLoop, LlmStepMode};
 use crate::{
     agent::{
         AgentErrorKind, AgentEvent, AgentInput, AgentLoop, AgentSpec, BudgetLimits, LoopCursorKind,
-        LoopPolicy, ModelRef, PivotSource, QueuedPivot, RunContext, RunId, StepId,
-        ToolExecutionIds, ToolFailurePolicy, ToolRegistry, ToolRuntimeError, ToolSetId, ToolSetRef,
-        TraceNodeId, WorktreeRef,
+        LoopPolicy, ModelRef, PivotSource, QueuedPivot, ReconfigRequest, RunContext, RunId,
+        StaticToolRegistryResolver, StepId, ToolExecutionIds, ToolFailurePolicy, ToolRegistry,
+        ToolRegistryResolver, ToolRuntimeError, ToolSetId, ToolSetRef, TraceNodeId, WorktreeRef,
     },
     client::{Capability, ChatRequest, ClientError, LlmClient, Response},
     conversation::{
@@ -81,8 +81,15 @@ struct FakeToolRegistry {
 
 impl FakeToolRegistry {
     fn new(results: Vec<Result<ToolResponse, ToolRuntimeError>>) -> Self {
+        Self::with_declarations(vec![weather_tool()], results)
+    }
+
+    fn with_declarations(
+        declarations: Vec<Tool>,
+        results: Vec<Result<ToolResponse, ToolRuntimeError>>,
+    ) -> Self {
         Self {
-            declarations: vec![weather_tool()],
+            declarations,
             results: Mutex::new(VecDeque::from(results)),
             calls: Mutex::new(Vec::new()),
         }
@@ -233,6 +240,12 @@ fn tool_set_id() -> ToolSetId {
         .expect("tool set id")
 }
 
+fn tool_set_id_seed(seed: u64) -> ToolSetId {
+    format!("018f0d9c-7b6a-7c12-8f31-{seed:012x}")
+        .parse()
+        .expect("tool set id")
+}
+
 fn run_id() -> RunId {
     "018f0d9c-7b6a-7c12-8f31-123456789003"
         .parse()
@@ -293,6 +306,12 @@ fn step_id_seed(seed: u64) -> StepId {
         .expect("step id")
 }
 
+fn skill_id_seed(seed: u64) -> crate::agent::SkillId {
+    format!("018f0d9c-7b6a-7c12-8f31-{seed:012x}")
+        .parse()
+        .expect("skill id")
+}
+
 fn weather_tool() -> Tool {
     Tool {
         name: "get_weather".to_owned(),
@@ -303,6 +322,20 @@ fn weather_tool() -> Tool {
                 "city": { "type": "string" }
             },
             "required": ["city"]
+        }),
+    }
+}
+
+fn calendar_tool() -> Tool {
+    Tool {
+        name: "read_calendar".to_owned(),
+        description: "Read calendar availability.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "day": { "type": "string" }
+            },
+            "required": ["day"]
         }),
     }
 }
@@ -427,6 +460,17 @@ fn input() -> AgentInput {
     .expect("valid user input")
 }
 
+fn input_seed(seed: u64, text: &str) -> AgentInput {
+    AgentInput::user_message(
+        turn_id_seed(seed),
+        message_id_seed(seed + 1),
+        user_message(text),
+        message_id_seed(seed + 2),
+        step_id_seed(seed + 3),
+    )
+    .expect("valid user input")
+}
+
 fn queued_pivot_turn_input(seed: u64) -> AgentInput {
     AgentInput::queued_pivot_turn(
         turn_id_seed(seed),
@@ -537,6 +581,15 @@ fn pivot_records(boundary: &crate::agent::StepBoundary) -> &[Value] {
         .expect("pivot metadata records")
 }
 
+fn reconfig_records(boundary: &crate::agent::StepBoundary) -> &[Value] {
+    boundary
+        .metadata()
+        .get("reconfigs")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .expect("reconfig metadata records")
+}
+
 fn tool_loop(
     client: Arc<FakeClient>,
     registry: Arc<FakeToolRegistry>,
@@ -553,6 +606,28 @@ fn tool_loop(
         LlmStepMode::NonStreaming,
         tool_registry,
         tool_ids,
+    )
+}
+
+fn tool_loop_with_resolver(
+    client: Arc<FakeClient>,
+    registry: Arc<FakeToolRegistry>,
+    ids: Arc<FakeToolIds>,
+    spec: AgentSpec,
+    resolver: Arc<dyn ToolRegistryResolver>,
+    mode: LlmStepMode,
+) -> DefaultAgentLoop {
+    let llm: Arc<dyn LlmClient> = client;
+    let tool_registry: Arc<dyn ToolRegistry> = registry;
+    let tool_ids: Arc<dyn ToolExecutionIds> = ids;
+    DefaultAgentLoop::with_tool_registry_resolver(
+        llm,
+        state_with_spec(spec),
+        context(),
+        mode,
+        tool_registry,
+        tool_ids,
+        resolver,
     )
 }
 
@@ -804,6 +879,317 @@ async fn interject_rejects_invalid_pivot_role_without_queueing() {
     assert_eq!(error.kind(), AgentErrorKind::AgentState);
     loop_impl
         .inspect_state(|state| assert!(state.queued_pivots().is_empty()))
+        .expect("inspect state");
+}
+
+#[tokio::test]
+async fn reconfig_queued_during_text_turn_applies_at_turn_boundary_and_next_request_changes() {
+    let client = Arc::new(FakeClient::with_streams(vec![
+        Ok(text_stream_events("first")),
+        Ok(text_stream_events("second")),
+    ]));
+    let llm: Arc<dyn LlmClient> = client.clone();
+    let mut loop_impl = DefaultAgentLoop::new(llm, state(), context(), LlmStepMode::Streaming);
+    let replacement_tools = ToolSetRef::new(tool_set_id_seed(1_400), vec![calendar_tool()]);
+
+    let mut stream = loop_impl.feed(input()).await.expect("feed starts");
+    let first = stream
+        .next()
+        .await
+        .expect("first event")
+        .expect("first event succeeds");
+    assert!(matches!(
+        first,
+        AgentEvent::Llm(StreamEvent::MessageStart { .. })
+    ));
+
+    loop_impl
+        .reconfigure(ReconfigRequest::set_system_prompt_overlay(
+            Some("Use calendar context.".to_owned()),
+            0,
+        ))
+        .expect("system overlay reconfig queued");
+    loop_impl
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement_tools.clone(),
+        })
+        .expect("tool set reconfig queued");
+
+    let mut events = vec![first];
+    while let Some(event) = stream.next().await {
+        events.push(event.expect("stream event succeeds"));
+    }
+
+    let AgentEvent::StepBoundary(boundary) = &events[events.len() - 2] else {
+        panic!("penultimate event is final boundary");
+    };
+    let records = reconfig_records(boundary);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["status"], json!("applied"));
+    assert_eq!(records[0]["kind"], json!("set_system_prompt_overlay"));
+    assert_eq!(records[1]["kind"], json!("replace_tool_set"));
+
+    loop_impl
+        .inspect_state(|state| {
+            assert!(state.queued_reconfigs().is_empty());
+            assert_eq!(state.system_prompt_overlay(), Some("Use calendar context."));
+            assert_eq!(state.system_prompt_overlay_version(), 1);
+            assert_eq!(state.current_tool_set(), &replacement_tools);
+        })
+        .expect("inspect state");
+
+    let second = collect_events(
+        loop_impl
+            .feed(input_seed(1_410, "next"))
+            .await
+            .expect("second feed starts"),
+    )
+    .await
+    .expect("second feed succeeds");
+    assert!(matches!(
+        second[second.len() - 2],
+        AgentEvent::StepBoundary(_)
+    ));
+
+    let requests = client.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].tools.is_empty());
+    assert_eq!(requests[1].tools, vec![calendar_tool()]);
+    assert_eq!(
+        requests[1].system.as_deref(),
+        Some("Conversation system.\n\nUse calendar context.")
+    );
+}
+
+#[tokio::test]
+async fn reconfig_during_tool_turn_keeps_current_turn_registry_snapshot() {
+    let client = Arc::new(FakeClient::with_streams(vec![
+        Ok(tool_use_stream_events("call-weather")),
+        Ok(text_stream_events("used old registry")),
+        Ok(text_stream_events("next turn")),
+    ]));
+    let old_registry = Arc::new(FakeToolRegistry::new(vec![Ok(tool_response(
+        "call-weather",
+        "Sunny",
+        ToolStatus::Ok,
+    ))]));
+    let new_registry = Arc::new(FakeToolRegistry::with_declarations(
+        vec![calendar_tool()],
+        Vec::new(),
+    ));
+    let new_tool_set = ToolSetRef::new(tool_set_id_seed(1_500), vec![calendar_tool()]);
+    let mut resolver = StaticToolRegistryResolver::new();
+    resolver
+        .insert(tool_set_id(), old_registry.clone())
+        .expect("initial registry inserted");
+    resolver
+        .insert(new_tool_set.id(), new_registry.clone())
+        .expect("replacement registry inserted");
+    let ids = Arc::new(FakeToolIds::new(
+        vec![tool_call_id_seed(1_510)],
+        vec![message_id_seed(1_511)],
+        vec![message_id_seed(1_512)],
+        vec![step_id_seed(1_513)],
+    ));
+    let mut loop_impl = tool_loop_with_resolver(
+        client.clone(),
+        old_registry.clone(),
+        ids,
+        spec_with_tools(1, ToolFailurePolicy::ReturnErrorToModel),
+        Arc::new(resolver),
+        LlmStepMode::Streaming,
+    );
+
+    let mut stream = loop_impl.feed(input()).await.expect("feed starts");
+    for _ in 0..7 {
+        stream
+            .next()
+            .await
+            .expect("tool-use stream event")
+            .expect("tool-use stream succeeds");
+    }
+    loop_impl
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: new_tool_set.clone(),
+        })
+        .expect("replacement queued during pending turn");
+    let events = collect_events(stream).await.expect("tool turn completes");
+    assert!(matches!(events[0], AgentEvent::ToolCallStarted(_)));
+
+    let requests = client.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].tools, vec![weather_tool()]);
+    assert_eq!(
+        requests[1].tools,
+        vec![weather_tool()],
+        "assistant continuation in the same turn keeps the old registry"
+    );
+    assert_eq!(old_registry.calls().len(), 1);
+    assert!(new_registry.calls().is_empty());
+    loop_impl
+        .inspect_state(|state| assert_eq!(state.current_tool_set(), &new_tool_set))
+        .expect("inspect state");
+
+    let _next = collect_events(
+        loop_impl
+            .feed(input_seed(1_520, "after reconfig"))
+            .await
+            .expect("next feed starts"),
+    )
+    .await
+    .expect("next turn succeeds");
+    let requests = client.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].tools, vec![calendar_tool()]);
+}
+
+#[tokio::test]
+async fn pivot_and_reconfig_queues_share_final_boundary_without_interfering() {
+    let client = Arc::new(FakeClient::with_streams(vec![
+        Ok(text_stream_events("first")),
+        Ok(text_stream_events("pivot turn")),
+    ]));
+    let llm: Arc<dyn LlmClient> = client.clone();
+    let mut loop_impl = DefaultAgentLoop::new(llm, state(), context(), LlmStepMode::Streaming);
+
+    let mut stream = loop_impl.feed(input()).await.expect("feed starts");
+    stream
+        .next()
+        .await
+        .expect("first event")
+        .expect("first event succeeds");
+    loop_impl
+        .interject(pivot(1_600, "queued pivot"))
+        .expect("pivot queued");
+    loop_impl
+        .reconfigure(ReconfigRequest::set_system_prompt_overlay(
+            Some("Overlay for pivot turn.".to_owned()),
+            0,
+        ))
+        .expect("reconfig queued");
+
+    let events = collect_events(stream).await.expect("first turn completes");
+    let AgentEvent::StepBoundary(boundary) = &events[events.len() - 2] else {
+        panic!("penultimate event is final boundary");
+    };
+    assert_eq!(pivot_records(boundary)[0]["status"], json!("deferred"));
+    assert_eq!(
+        reconfig_records(boundary)[0]["kind"],
+        json!("set_system_prompt_overlay")
+    );
+    loop_impl
+        .inspect_state(|state| {
+            assert_eq!(state.queued_pivots().len(), 1);
+            assert!(state.queued_reconfigs().is_empty());
+            assert_eq!(
+                state.system_prompt_overlay(),
+                Some("Overlay for pivot turn.")
+            );
+        })
+        .expect("inspect state");
+
+    let _pivot_events = collect_events(
+        loop_impl
+            .feed(queued_pivot_turn_input(1_610))
+            .await
+            .expect("queued pivot feed starts"),
+    )
+    .await
+    .expect("queued pivot turn succeeds");
+    let requests = client.requests();
+    assert_eq!(requests.len(), 2);
+    assert_text(
+        requests[1].messages.last().expect("pivot user message"),
+        "queued pivot",
+    );
+    assert_eq!(
+        requests[1].system.as_deref(),
+        Some("Conversation system.\n\nOverlay for pivot turn.")
+    );
+}
+
+#[tokio::test]
+async fn conflicting_reconfig_requests_are_rejected_atomically() {
+    let client = Arc::new(FakeClient::with_chat(Ok(assistant_response(
+        "unused",
+        usage(1, 1),
+    ))));
+    let llm: Arc<dyn LlmClient> = client.clone();
+    let active_skill = skill_id_seed(1_700);
+    let mut initial_state = state();
+    initial_state
+        .replace_active_skills(vec![active_skill])
+        .expect("active skill set");
+    let loop_impl = DefaultAgentLoop::new(llm, initial_state, context(), LlmStepMode::NonStreaming);
+
+    let duplicate_skill = loop_impl
+        .reconfigure(ReconfigRequest::ActivateSkill {
+            skill_id: active_skill,
+        })
+        .expect_err("duplicate skill activation is rejected");
+    assert_eq!(duplicate_skill.kind(), AgentErrorKind::AgentState);
+    loop_impl
+        .inspect_state(|state| {
+            assert_eq!(state.active_skills(), &[active_skill]);
+            assert!(state.queued_reconfigs().is_empty());
+        })
+        .expect("inspect state");
+
+    loop_impl
+        .reconfigure(ReconfigRequest::set_system_prompt_overlay(
+            Some("first overlay".to_owned()),
+            0,
+        ))
+        .expect("first overlay queued");
+    let stale_overlay = loop_impl
+        .reconfigure(ReconfigRequest::set_system_prompt_overlay(
+            Some("stale overlay".to_owned()),
+            0,
+        ))
+        .expect_err("stale overlay version is rejected");
+    assert_eq!(stale_overlay.kind(), AgentErrorKind::AgentState);
+    loop_impl
+        .inspect_state(|state| {
+            assert_eq!(state.queued_reconfigs().len(), 1);
+            assert_eq!(state.system_prompt_overlay(), None);
+            assert_eq!(state.system_prompt_overlay_version(), 0);
+        })
+        .expect("inspect state");
+
+    let strict_client = Arc::new(FakeClient::with_chat(Ok(assistant_response(
+        "unused",
+        usage(1, 1),
+    ))));
+    let strict_registry = Arc::new(FakeToolRegistry::new(Vec::new()));
+    let strict_ids = Arc::new(FakeToolIds::new(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let strict_loop = tool_loop_with_resolver(
+        strict_client,
+        strict_registry.clone(),
+        strict_ids,
+        spec_with_tools(1, ToolFailurePolicy::ReturnErrorToModel),
+        Arc::new(StaticToolRegistryResolver::single(
+            tool_set_id(),
+            strict_registry,
+        )),
+        LlmStepMode::NonStreaming,
+    );
+    let unknown_tool_set = ToolSetRef::new(tool_set_id_seed(1_710), vec![calendar_tool()]);
+    let unknown = strict_loop
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: unknown_tool_set,
+        })
+        .expect_err("unknown tool set is rejected");
+    assert_eq!(unknown.kind(), AgentErrorKind::Tool);
+    strict_loop
+        .inspect_state(|state| {
+            assert!(state.queued_reconfigs().is_empty());
+            assert_eq!(state.current_tool_set().id(), tool_set_id());
+        })
         .expect("inspect state");
 }
 
