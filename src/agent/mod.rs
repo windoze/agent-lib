@@ -10,6 +10,7 @@
 
 pub mod approval;
 pub mod context;
+pub mod drive;
 pub mod event;
 pub mod id;
 pub mod interaction;
@@ -30,6 +31,7 @@ pub use context::{
     BudgetUsage, CancellationToken, RunContext, RunContextError, TraceError, TraceHandle,
     TraceNodeId, TraceNodeKind, TraceRecord,
 };
+pub use drive::{HandlerScope, InteractionHandler, LlmHandler, SubagentHandler, ToolHandler};
 pub use event::{
     AgentError, AgentErrorKind, AgentEvent, AgentFailure, AgentInput, AgentOutcome,
     AgentOutcomeKind, AgentUserInput, ApprovalRequest, BudgetExhaustedOutcome,

@@ -646,7 +646,7 @@ StepInput) -> StepOutcome`,纯、同步、无 async。现有 `AgentInput`(`event
 
 ## Milestone 3 — driver + drain 单层（迁移文档阶段 2）
 
-### [TODO] M3-1 `HandlerScope` 与四个 handler trait
+### [DONE] M3-1 `HandlerScope` 与四个 handler trait
 
 **前置依赖**:M2-R。
 
@@ -670,6 +670,40 @@ handler 兑现时用现有资源:`client::LlmClient`、`agent::ToolRegistry`、`
 - 聚焦测试:一个把 `LlmClient`/`ToolRegistry`/`ToolApprovalPolicy` 包装成 handler 的最小
   fixture;断言 `HandlerScope` 缺省方法返回 `None`;handler 返回结果通过 `accepts` 校验。
 - 运行全套命令。
+
+**完成记录**:
+
+新建 `src/agent/drive.rs`(§6 机制层),从 `agent/mod.rs` 以 `pub mod drive` 导出并公开
+re-export `HandlerScope`/`LlmHandler`/`ToolHandler`/`InteractionHandler`/`SubagentHandler`。
+
+- **`HandlerScope`(`Send + Sync`)**:四个访问器 `llm()`/`tool()`/`interaction()`/`subagent()`
+  各**默认返回 `None`**(该家族 pop 到外层),分别返回
+  `Option<&dyn LlmHandler/ToolHandler/InteractionHandler/SubagentHandler>`。对象安全,供 M3-2
+  `drain` 以 `&dyn HandlerScope` 组合。
+- **四个 handler trait(`#[async_trait]`,`Send + Sync`)**:签名与 TODO 一致——
+  `LlmHandler::fulfill(&self, request: &ChatRequest, mode: LlmStepMode, ctx: &RunContext)`、
+  `ToolHandler::fulfill(&self, call_id: ToolCallId, call: &ToolCall, ctx: &RunContext)`、
+  `InteractionHandler::fulfill(&self, request: &Interaction, ctx: &RunContext)`,均返回
+  `RequirementResult`;`SubagentHandler::fulfill(&self, spec_ref: &AgentSpecRef, brief:
+  &Interaction, result_schema: Option<&Value>, ctx: &RunContext)` **仅定义签名**(唯一
+  scope-deepening 家族;派生 + 再开一层 drain 的实现留 M5,doc 标注)。所有 `await` 落在 handler
+  内(真正做 IO),`step` 仍纯同步。
+- **返回路径类型对齐**:模块 doc 写明"handler 返回的 `RequirementResult` 家族必须与其兑现的
+  requirement kind 一致,失败编码进结果内(如 `Llm(Err(..))`)而非返回错家族",由 driver(M3-2)
+  用 M1-1 `RequirementKind::accepts` 校验后再 `Resume`。
+- **范围边界**:本任务只交付 trait 定义;`drain`/`Pop`/`UnhandledRequirement` 归 M3-2,真正包装
+  client/registry/policy 的公共参考 driver + 复跑 50 集成测试归 M3-3。
+- **聚焦测试(`#[cfg(test)]`,5 个)**:`EmptyScope`(无覆盖)断言四访问器全 `None`;`WrappedScope`
+  挂 `LlmClient`/`ToolRegistry`/`ToolApprovalPolicy` 三个最小 fixture handler(不挂 subagent)断言
+  前三 `Some`、subagent `None`;三个 `#[tokio::test]` 分别调 llm/tool/interaction handler 的
+  `fulfill`,断言结果家族正确且通过对应 `RequirementKind::{NeedLlm/NeedTool/NeedInteraction}
+  ::accepts`。interaction fixture 真实消费 `ToolApprovalPolicy`(`AutoApprove→approve`、
+  `RequireApproval→deny`)。
+
+**验证命令(全绿)**:`cargo fmt --all`(clean);`cargo clippy --all-targets -- -D warnings`
+(clean);`cargo test --lib agent::drive`(5 passed);`cargo test --all --all-targets`
+(414 lib + 8 integration = 422 passed / 0 failed,较 M2-R 基线 +5 新测试,网络用例 ignored);
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --check`(clean)。
 
 ### [TODO] M3-2 `drain` 参考实现与 pop 路由
 
