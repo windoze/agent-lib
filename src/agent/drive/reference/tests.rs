@@ -19,9 +19,10 @@ use crate::{
         AgentInput, AgentSpec, ApprovalDecision, ApprovalRequirement, ApprovalResponse,
         BudgetLimits, DefaultAgentMachine, Interaction, InteractionKind, InteractionResponse,
         LlmStepMode, LoopCursor, LoopCursorKind, LoopPolicy, ModelRef, Notification,
-        RequirementError, RequirementId, RequirementIds, RequirementKindTag, RequirementResult,
-        RunContext, RunId, StepId, ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy,
-        ToolRegistry, ToolRuntimeError, ToolSetRef, TraceNodeId, WorktreeRef,
+        ReconfigRequest, RequirementError, RequirementId, RequirementIds, RequirementKindTag,
+        RequirementResult, RunContext, RunId, StaticToolRegistryResolver, StepId,
+        ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy, ToolRegistry, ToolRuntimeError,
+        ToolSetRef, TraceNodeId, WorktreeRef,
     },
     client::{Capability, ChatRequest, ClientError, LlmClient, Response},
     conversation::{
@@ -68,6 +69,10 @@ impl FakeClient {
     fn request_count(&self) -> usize {
         self.requests.lock().expect("requests mutex").len()
     }
+
+    fn requests(&self) -> Vec<ChatRequest> {
+        self.requests.lock().expect("requests mutex").clone()
+    }
 }
 
 #[async_trait]
@@ -106,6 +111,17 @@ impl FakeToolRegistry {
     fn new(results: Vec<Result<ToolResponse, ToolRuntimeError>>) -> Self {
         Self {
             declarations: vec![weather_tool()],
+            results: Mutex::new(VecDeque::from(results)),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_declarations(
+        declarations: Vec<Tool>,
+        results: Vec<Result<ToolResponse, ToolRuntimeError>>,
+    ) -> Self {
+        Self {
+            declarations,
             results: Mutex::new(VecDeque::from(results)),
             calls: Mutex::new(Vec::new()),
         }
@@ -406,6 +422,28 @@ fn weather_tool() -> Tool {
             "required": ["city"]
         }),
     }
+}
+
+fn calendar_tool() -> Tool {
+    Tool {
+        name: "read_calendar".to_owned(),
+        description: "Read calendar availability.".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": { "day": { "type": "string" } },
+            "required": ["day"]
+        }),
+    }
+}
+
+fn replacement_tool_set_id() -> crate::agent::ToolSetId {
+    "018f0d9c-7b6a-7c12-8f31-1234567890c1"
+        .parse()
+        .expect("replacement tool set id")
+}
+
+fn replacement_tool_set() -> ToolSetRef {
+    ToolSetRef::new(replacement_tool_set_id(), vec![calendar_tool()])
 }
 
 fn spec() -> AgentSpec {
@@ -1181,4 +1219,146 @@ async fn reference_new_turn_after_cancel_starts_fresh() {
     let turn = &conversation.turns()[0];
     assert_eq!(turn.messages().len(), 2);
     assert_text(turn.messages()[1].payload(), "hello again");
+}
+
+// ----- turn-boundary reconfiguration tests -----
+
+/// A reconfiguration queued while the machine is idle is applied at the start of
+/// the next turn: the driver resolves and installs the new registry through the
+/// [`ReconfigRegistryHandler`], and the opening request already reflects the new
+/// tool set and system-prompt overlay. A start-of-turn application writes no
+/// `reconfigs` boundary metadata (only a during-turn change does).
+#[tokio::test]
+async fn reference_idle_queued_reconfig_applies_at_next_turn_start() {
+    let client = Arc::new(FakeClient::with_chats(vec![Ok(assistant_response(
+        "done",
+        usage(3, 5),
+    ))]));
+    let registry = Arc::new(FakeToolRegistry::new(Vec::new()));
+    let ids = Arc::new(FakeToolIds::new(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let mut machine = machine_with(spec(), ids, Arc::new(crate::agent::NoApprovalPolicy));
+
+    // Queue the reconfiguration while idle, before the turn opens.
+    machine
+        .reconfigure(ReconfigRequest::set_system_prompt_overlay(
+            Some("Use calendar context.".to_owned()),
+            0,
+        ))
+        .expect("system overlay reconfig queued");
+    machine
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement_tool_set(),
+        })
+        .expect("tool set reconfig queued");
+
+    let scope = ReferenceScope::new(client.clone(), registry);
+    let ctx = context();
+    let done = drive_turn(&mut machine, input(), &scope, &ctx)
+        .await
+        .expect("the reconfigured turn completes");
+
+    assert!(matches!(done.cursor(), LoopCursor::Done(_)));
+
+    // The opening request already advertises the new tool set + overlay.
+    let requests = client.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].tools, vec![calendar_tool()]);
+    assert_eq!(
+        requests[0].system.as_deref(),
+        Some("Conversation system.\n\nUse calendar context.")
+    );
+
+    // A start-of-turn application carries no reconfig boundary metadata.
+    let boundaries: Vec<_> = done
+        .notifications()
+        .iter()
+        .filter_map(|event| match event {
+            Notification::StepBoundary(boundary) => Some(boundary),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(boundaries.len(), 1);
+    assert!(boundaries[0].metadata().get("reconfigs").is_none());
+
+    // State reflects the applied reconfiguration for subsequent turns.
+    assert!(machine.state().queued_reconfigs().is_empty());
+    assert_eq!(
+        machine.state().system_prompt_overlay(),
+        Some("Use calendar context.")
+    );
+    assert_eq!(machine.state().current_tool_set(), &replacement_tool_set());
+}
+
+/// A tool-set reconfiguration swaps the *executable* registry end-to-end: the
+/// reference driver resolves the queued set through a
+/// [`StaticToolRegistryResolver`], installs the resolved registry into the
+/// shared slot, and the ensuing tool call runs against the new registry while
+/// the old one is never touched.
+#[tokio::test]
+async fn reference_reconfig_swaps_executable_registry_end_to_end() {
+    let client = Arc::new(FakeClient::with_chats(vec![
+        Ok(tool_use_response(
+            vec![("call-cal", "read_calendar", json!({ "day": "Monday" }))],
+            usage(5, 2),
+        )),
+        Ok(assistant_response("checked calendar", usage(3, 5))),
+    ]));
+    let old_registry = Arc::new(FakeToolRegistry::new(vec![Ok(tool_response(
+        "call-weather",
+        "Sunny",
+        ToolStatus::Ok,
+    ))]));
+    let new_registry = Arc::new(FakeToolRegistry::with_declarations(
+        vec![calendar_tool()],
+        vec![Ok(tool_response(
+            "call-cal",
+            "Free all day",
+            ToolStatus::Ok,
+        ))],
+    ));
+    let mut resolver = StaticToolRegistryResolver::new();
+    resolver
+        .insert(tool_set_id(), old_registry.clone())
+        .expect("initial registry inserted");
+    resolver
+        .insert(replacement_tool_set_id(), new_registry.clone())
+        .expect("replacement registry inserted");
+
+    let ids = Arc::new(FakeToolIds::new(
+        vec![tool_call_id_seed(1_600)],
+        vec![message_id_seed(1_601)],
+        vec![message_id_seed(1_602)],
+        vec![step_id_seed(1_603)],
+    ));
+    let mut machine = machine_with(spec(), ids, Arc::new(crate::agent::NoApprovalPolicy));
+    machine
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement_tool_set(),
+        })
+        .expect("tool set reconfig queued while idle");
+
+    let scope = ReferenceScope::new(client.clone(), old_registry.clone())
+        .with_tool_registry_resolver(Arc::new(resolver));
+    let ctx = context();
+    let done = drive_turn(&mut machine, input(), &scope, &ctx)
+        .await
+        .expect("the reconfigured tool turn completes");
+
+    assert!(matches!(done.cursor(), LoopCursor::Done(_)));
+
+    // The swapped-in registry executed the call; the old registry never did.
+    assert_eq!(new_registry.calls().len(), 1);
+    assert!(old_registry.calls().is_empty());
+    assert_eq!(new_registry.calls()[0].1.name, "read_calendar");
+
+    // The opening request already advertised the new tool set.
+    let requests = client.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].tools, vec![calendar_tool()]);
+    assert_eq!(machine.state().current_tool_set(), &replacement_tool_set());
 }

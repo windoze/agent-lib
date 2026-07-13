@@ -9,7 +9,7 @@ use crate::{
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Map;
+use serde_json::{Map, Value};
 
 use super::{AgentStateError, ensure_unique_skill_ids, ensure_unique_tool_names};
 
@@ -343,4 +343,110 @@ fn ensure_unique_tool_name_strings(names: &[String]) -> Result<(), AgentStateErr
         })
         .collect::<Vec<_>>();
     ensure_unique_tool_names(&tools)
+}
+
+/// Builds the per-request "applied" step-boundary records for a reconfig batch.
+///
+/// Each record captures the request family and its salient identity so a step
+/// boundary can attribute the applied reconfiguration. Shared by both the
+/// legacy loop and the sans-io machine so their boundary metadata stays
+/// byte-for-byte identical.
+pub(crate) fn reconfig_boundary_records(requests: &[ReconfigRequest]) -> Vec<Value> {
+    requests
+        .iter()
+        .map(|request| reconfig_boundary_record(request, "applied"))
+        .collect()
+}
+
+/// Wraps applied reconfig records into step-boundary metadata under `reconfigs`.
+///
+/// Returns an empty map when there are no records, so a boundary without a
+/// reconfiguration carries no reconfig metadata key.
+pub(crate) fn reconfig_boundary_metadata(records: Vec<Value>) -> Map<String, Value> {
+    let mut metadata = Map::new();
+    if !records.is_empty() {
+        metadata.insert("reconfigs".to_owned(), Value::Array(records));
+    }
+    metadata
+}
+
+fn reconfig_boundary_record(request: &ReconfigRequest, status: &'static str) -> Value {
+    let mut record = Map::new();
+    record.insert("status".to_owned(), Value::String(status.to_owned()));
+    match request {
+        ReconfigRequest::ActivateSkill { skill_id } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("activate_skill".to_owned()),
+            );
+            record.insert(
+                "skill_id".to_owned(),
+                serde_json::to_value(skill_id).expect("skill id serializes"),
+            );
+        }
+        ReconfigRequest::DeactivateSkill { skill_id } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("deactivate_skill".to_owned()),
+            );
+            record.insert(
+                "skill_id".to_owned(),
+                serde_json::to_value(skill_id).expect("skill id serializes"),
+            );
+        }
+        ReconfigRequest::ReplaceActiveSkills { skill_ids } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("replace_active_skills".to_owned()),
+            );
+            record.insert(
+                "skill_ids".to_owned(),
+                serde_json::to_value(skill_ids).expect("skill ids serialize"),
+            );
+        }
+        ReconfigRequest::SetSystemPromptOverlay {
+            expected_version, ..
+        } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("set_system_prompt_overlay".to_owned()),
+            );
+            record.insert(
+                "expected_version".to_owned(),
+                Value::from(*expected_version),
+            );
+        }
+        ReconfigRequest::ReplaceToolSet { tool_set } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("replace_tool_set".to_owned()),
+            );
+            record.insert(
+                "tool_set_id".to_owned(),
+                serde_json::to_value(tool_set.id()).expect("tool set id serializes"),
+            );
+        }
+        ReconfigRequest::PatchToolSet { patch } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("patch_tool_set".to_owned()),
+            );
+            record.insert(
+                "tool_set_id".to_owned(),
+                serde_json::to_value(patch.resulting_tool_set_id())
+                    .expect("tool set id serializes"),
+            );
+        }
+        ReconfigRequest::SetModel { model } => {
+            record.insert("kind".to_owned(), Value::String("set_model".to_owned()));
+            record.insert("model".to_owned(), Value::String(model.model().to_owned()));
+        }
+        ReconfigRequest::SetLoopPolicy { .. } => {
+            record.insert(
+                "kind".to_owned(),
+                Value::String("set_loop_policy".to_owned()),
+            );
+        }
+    }
+    Value::Object(record)
 }

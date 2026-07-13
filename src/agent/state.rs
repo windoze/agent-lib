@@ -24,12 +24,13 @@ use thiserror::Error;
 
 pub use cursor::{
     ApprovalCursor, CancelRecoveryCursor, CancelRecoveryReason, CursorRequirement, DoneCursor,
-    ErrorCursor, LoopCursor, LoopCursorKind, LoopDoneReason, StepCursor, ToolWaitCursor,
-    ToolWaitRequirements,
+    ErrorCursor, LoopCursor, LoopCursorKind, LoopDoneReason, ReconfigCursor, StepCursor,
+    ToolWaitCursor, ToolWaitRequirements,
 };
 pub use queue::{
     PivotSource, QueuedPivot, QueuedReconfig, ReconfigQueue, ReconfigRequest, ToolSetPatch,
 };
+pub(crate) use queue::{reconfig_boundary_metadata, reconfig_boundary_records};
 pub use runtime::AgentRuntimeHandles;
 
 /// Data half of a running Agent.

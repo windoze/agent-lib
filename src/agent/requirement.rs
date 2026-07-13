@@ -29,7 +29,7 @@
 
 use crate::{
     agent::{
-        AgentError, AgentId, LlmStepMode,
+        AgentError, AgentId, LlmStepMode, ToolSetRef,
         interaction::{Interaction, InteractionError, InteractionResponse},
         tool::ToolRuntimeError,
     },
@@ -113,6 +113,8 @@ pub enum RequirementKindTag {
     Interaction,
     /// Deriving and driving a child agent.
     Subagent,
+    /// Resolving a live tool registry for a queued tool-set reconfiguration.
+    Reconfig,
 }
 
 impl fmt::Display for RequirementKindTag {
@@ -122,6 +124,7 @@ impl fmt::Display for RequirementKindTag {
             Self::Tool => "tool",
             Self::Interaction => "interaction",
             Self::Subagent => "subagent",
+            Self::Reconfig => "reconfig",
         };
         formatter.write_str(text)
     }
@@ -362,6 +365,17 @@ pub enum RequirementKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result_schema: Option<Value>,
     },
+    /// Resolving a live tool registry for a queued tool-set reconfiguration.
+    ///
+    /// Emitted at a turn boundary when a queued reconfiguration changes the
+    /// active tool set. The driver resolves `tool_set` to a live registry,
+    /// validates its declarations against the requested set, swaps it in, and
+    /// confirms with a [`RequirementResult::Reconfig`]. The machine itself holds
+    /// no registry, so the swap stays a driver-side side effect.
+    NeedReconfigRegistry {
+        /// The queued tool set whose live registry the driver must resolve.
+        tool_set: ToolSetRef,
+    },
 }
 
 impl RequirementKind {
@@ -373,6 +387,7 @@ impl RequirementKind {
             Self::NeedTool { .. } => RequirementKindTag::Tool,
             Self::NeedInteraction { .. } => RequirementKindTag::Interaction,
             Self::NeedSubagent { .. } => RequirementKindTag::Subagent,
+            Self::NeedReconfigRegistry { .. } => RequirementKindTag::Reconfig,
         }
     }
 
@@ -422,6 +437,12 @@ pub enum RequirementResult {
     Interaction(InteractionResponse),
     /// Result of a driven subagent.
     Subagent(Result<SubagentOutput, AgentError>),
+    /// Result of resolving a live registry for a tool-set reconfiguration.
+    ///
+    /// `Ok(())` confirms the driver swapped in a validated registry for the
+    /// requested tool set; `Err` reports a resolution or declaration-mismatch
+    /// failure, which fails the parked turn boundary.
+    Reconfig(Result<(), ToolRuntimeError>),
 }
 
 impl RequirementResult {
@@ -433,6 +454,7 @@ impl RequirementResult {
             Self::Tool(_) => RequirementKindTag::Tool,
             Self::Interaction(_) => RequirementKindTag::Interaction,
             Self::Subagent(_) => RequirementKindTag::Subagent,
+            Self::Reconfig(_) => RequirementKindTag::Reconfig,
         }
     }
 }
@@ -500,10 +522,10 @@ mod tests {
         RequirementKindTag, RequirementResolution, RequirementResult, SubagentOutput,
     };
     use crate::{
-        agent::{AgentId, LlmStepMode},
+        agent::{AgentId, LlmStepMode, ToolSetRef},
         client::{ChatRequest, Response},
         conversation::ToolCallId,
-        model::tool::{ToolCall, ToolResponse, ToolStatus},
+        model::tool::{Tool, ToolCall, ToolResponse, ToolStatus},
     };
     use serde::{Serialize, de::DeserializeOwned};
     use serde_json::{Map, json};
@@ -527,6 +549,20 @@ mod tests {
         "018f0d9c-7b6a-7c12-8f31-1234567890d1"
             .parse()
             .expect("agent id")
+    }
+
+    fn tool_set_ref() -> ToolSetRef {
+        let tool_set_id = "018f0d9c-7b6a-7c12-8f31-1234567890f2"
+            .parse()
+            .expect("tool set id");
+        ToolSetRef::new(
+            tool_set_id,
+            vec![Tool {
+                name: "get_weather".to_owned(),
+                description: "Look up weather.".to_owned(),
+                input_schema: json!({ "type": "object" }),
+            }],
+        )
     }
 
     fn step_id() -> crate::agent::StepId {
@@ -599,6 +635,9 @@ mod tests {
                 brief: interaction(),
                 result_schema: None,
             },
+            RequirementKindTag::Reconfig => RequirementKind::NeedReconfigRegistry {
+                tool_set: tool_set_ref(),
+            },
         }
     }
 
@@ -612,14 +651,16 @@ mod tests {
             RequirementKindTag::Subagent => RequirementResult::Subagent(Ok(SubagentOutput {
                 summary: "done".to_owned(),
             })),
+            RequirementKindTag::Reconfig => RequirementResult::Reconfig(Ok(())),
         }
     }
 
-    const ALL_TAGS: [RequirementKindTag; 4] = [
+    const ALL_TAGS: [RequirementKindTag; 5] = [
         RequirementKindTag::Llm,
         RequirementKindTag::Tool,
         RequirementKindTag::Interaction,
         RequirementKindTag::Subagent,
+        RequirementKindTag::Reconfig,
     ];
 
     fn assert_json_round_trip<T>(value: &T)

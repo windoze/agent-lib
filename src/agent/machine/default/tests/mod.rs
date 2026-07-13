@@ -442,4 +442,5 @@ fn abandon_without_outstanding_requirement_fails() {
     assert!(error.message().contains("no outstanding requirement"));
 }
 
+mod reconfig;
 mod tools;

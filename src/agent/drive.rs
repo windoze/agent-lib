@@ -78,7 +78,7 @@ use crate::{
     agent::{
         AgentError, AgentInput, AgentMachine, LlmStepMode, LoopCursor, LoopCursorKind,
         Notification, Requirement, RequirementKind, RequirementResolution, RequirementResult,
-        RunContext, StepInput,
+        RunContext, StepInput, ToolSetRef,
         interaction::Interaction,
         requirement::{AgentSpecRef, RequirementKindTag},
     },
@@ -93,7 +93,8 @@ use serde_json::Value;
 mod reference;
 
 pub use reference::{
-    ApprovalInteractionHandler, LlmClientHandler, ReferenceScope, ToolRegistryHandler, drive_turn,
+    ApprovalInteractionHandler, LlmClientHandler, ReconfigRegistryHandler, ReferenceScope,
+    ToolRegistryHandler, drive_turn,
 };
 
 /// One drain layer's set of effect handlers.
@@ -121,6 +122,12 @@ pub trait HandlerScope: Send + Sync {
 
     /// Returns this layer's [`SubagentHandler`], if it fulfills `NeedSubagent`.
     fn subagent(&self) -> Option<&dyn SubagentHandler> {
+        None
+    }
+
+    /// Returns this layer's [`ReconfigHandler`], if it fulfills
+    /// `NeedReconfigRegistry`.
+    fn reconfig(&self) -> Option<&dyn ReconfigHandler> {
         None
     }
 }
@@ -184,6 +191,22 @@ pub trait SubagentHandler: Send + Sync {
         result_schema: Option<&Value>,
         ctx: &RunContext,
     ) -> RequirementResult;
+}
+
+/// Fulfills a `NeedReconfigRegistry` requirement by swapping the active tool
+/// registry at a turn boundary.
+///
+/// The machine holds no live registry: when a queued reconfiguration changes the
+/// active tool set it reifies the swap as this requirement. The handler resolves
+/// `tool_set` to an executable registry, validates its declarations against the
+/// requested set, installs it as the registry future tool steps execute
+/// against, and confirms with an `Ok` [`RequirementResult::Reconfig`]. A
+/// resolution or declaration-mismatch failure is carried inside an `Err`
+/// [`RequirementResult::Reconfig`], which fails the parked boundary.
+#[async_trait]
+pub trait ReconfigHandler: Send + Sync {
+    /// Resolves and installs the registry for `tool_set`, returning confirmation.
+    async fn fulfill(&self, tool_set: &ToolSetRef, ctx: &RunContext) -> RequirementResult;
 }
 
 /// Outcome of draining one machine to the end of a turn.
@@ -369,6 +392,7 @@ fn scope_handles(scope: &dyn HandlerScope, tag: RequirementKindTag) -> bool {
         RequirementKindTag::Tool => scope.tool().is_some(),
         RequirementKindTag::Interaction => scope.interaction().is_some(),
         RequirementKindTag::Subagent => scope.subagent().is_some(),
+        RequirementKindTag::Reconfig => scope.reconfig().is_some(),
     }
 }
 
@@ -401,6 +425,9 @@ async fn fulfill_with_scope(
                 .fulfill(spec_ref, brief, result_schema.as_ref(), ctx)
                 .await,
         ),
+        RequirementKind::NeedReconfigRegistry { tool_set } => {
+            Some(scope.reconfig()?.fulfill(tool_set, ctx).await)
+        }
     }
 }
 

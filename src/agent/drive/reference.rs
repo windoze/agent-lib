@@ -35,11 +35,14 @@
 //! (migration doc §4.4 / §6). This module only builds the top, total layer;
 //! nested layers land with the subagent handler in M5.
 
-use super::{HandlerScope, InteractionHandler, LlmHandler, ToolHandler, TurnDone, drain};
+use super::{
+    HandlerScope, InteractionHandler, LlmHandler, ReconfigHandler, ToolHandler, TurnDone, drain,
+};
 use crate::{
     agent::{
-        AgentError, AgentInput, AgentMachine, ApprovalDecision, ApprovalResponse, LlmStepMode,
-        RequirementResult, RunContext, ToolRegistry,
+        AgentError, AgentInput, AgentMachine, ApprovalDecision, ApprovalResponse,
+        DeclaredOnlyToolRegistryResolver, LlmStepMode, RequirementResult, RunContext, ToolRegistry,
+        ToolRegistryResolver, ToolRuntimeError, ToolSetRef,
         interaction::{Interaction, InteractionKind, InteractionResponse},
     },
     client::{ChatRequest, ClientError, LlmClient},
@@ -48,7 +51,16 @@ use crate::{
     stream::accumulator::{CollectError, collect},
 };
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Shared, swappable active tool registry.
+///
+/// The [`ToolRegistryHandler`] reads the current registry from this slot for
+/// every tool step, and the [`ReconfigRegistryHandler`] installs a new registry
+/// into it when a queued reconfiguration changes the active tool set. Sharing
+/// one slot is how a turn-boundary registry swap becomes visible to subsequent
+/// tool steps.
+type SharedRegistry = Arc<Mutex<Arc<dyn ToolRegistry>>>;
 
 /// Fulfills a `NeedLlm` by running one generation on a shared [`LlmClient`].
 ///
@@ -102,19 +114,34 @@ impl LlmHandler for LlmClientHandler {
 
 /// Fulfills a `NeedTool` by executing one call through a shared [`ToolRegistry`].
 ///
-/// Execution failures are carried inside [`RequirementResult::Tool`]'s `Err`;
-/// the machine then applies its
-/// [`ToolFailurePolicy`](crate::agent::ToolFailurePolicy) on the return path.
+/// The registry is held behind a `SharedRegistry` slot so a turn-boundary
+/// reconfiguration ([`ReconfigRegistryHandler`]) can swap it out between steps;
+/// each tool step reads the currently-installed registry. Execution failures are
+/// carried inside [`RequirementResult::Tool`]'s `Err`; the machine then applies
+/// its [`ToolFailurePolicy`](crate::agent::ToolFailurePolicy) on the return path.
 #[derive(Clone)]
 pub struct ToolRegistryHandler {
-    registry: Arc<dyn ToolRegistry>,
+    registry: SharedRegistry,
 }
 
 impl ToolRegistryHandler {
-    /// Wraps `registry` as a [`ToolHandler`].
+    /// Wraps `registry` as a [`ToolHandler`] over a fresh, swappable slot.
     #[must_use]
     pub fn new(registry: Arc<dyn ToolRegistry>) -> Self {
+        Self {
+            registry: Arc::new(Mutex::new(registry)),
+        }
+    }
+
+    /// Wraps a shared registry slot, so swaps made through it are observed here.
+    fn from_slot(registry: SharedRegistry) -> Self {
         Self { registry }
+    }
+
+    /// Returns the currently-installed registry, cloning the handle out from
+    /// under the lock so no guard is held across the tool `await`.
+    fn current(&self) -> Arc<dyn ToolRegistry> {
+        self.registry.lock().expect("tool registry slot").clone()
     }
 }
 
@@ -126,7 +153,53 @@ impl ToolHandler for ToolRegistryHandler {
         call: &ToolCall,
         _ctx: &RunContext,
     ) -> RequirementResult {
-        RequirementResult::Tool(self.registry.execute(call_id, call.clone()).await)
+        let registry = self.current();
+        RequirementResult::Tool(registry.execute(call_id, call.clone()).await)
+    }
+}
+
+/// Fulfills a `NeedReconfigRegistry` by resolving and installing a new registry.
+///
+/// When a queued reconfiguration changes the active tool set, the machine parks
+/// on a `NeedReconfigRegistry` requirement rather than swapping a registry
+/// itself. This handler resolves the requested [`ToolSetRef`] through a
+/// [`ToolRegistryResolver`], validates that the resolved registry's declarations
+/// match the requested set, and installs it into the `SharedRegistry` slot the
+/// [`ToolRegistryHandler`] reads. The confirmation (or a resolution /
+/// declaration-mismatch failure) rides back inside
+/// [`RequirementResult::Reconfig`].
+#[derive(Clone)]
+pub struct ReconfigRegistryHandler {
+    resolver: Arc<dyn ToolRegistryResolver>,
+    registry: SharedRegistry,
+}
+
+impl ReconfigRegistryHandler {
+    /// Wires `resolver` and the shared registry slot into a reconfig handler.
+    fn new(resolver: Arc<dyn ToolRegistryResolver>, registry: SharedRegistry) -> Self {
+        Self { resolver, registry }
+    }
+
+    /// Resolves `tool_set`, validates its declarations, and installs the registry.
+    fn resolve_and_install(&self, tool_set: &ToolSetRef) -> Result<(), ToolRuntimeError> {
+        let registry = self.resolver.resolve_tool_set(tool_set)?;
+        if registry.declarations() != tool_set.tools() {
+            return Err(ToolRuntimeError::InvalidRegistry {
+                message: format!(
+                    "registry declarations for tool set {} do not match requested ToolSetRef",
+                    tool_set.id()
+                ),
+            });
+        }
+        *self.registry.lock().expect("tool registry slot") = registry;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ReconfigHandler for ReconfigRegistryHandler {
+    async fn fulfill(&self, tool_set: &ToolSetRef, _ctx: &RunContext) -> RequirementResult {
+        RequirementResult::Reconfig(self.resolve_and_install(tool_set))
     }
 }
 
@@ -191,22 +264,38 @@ impl InteractionHandler for ApprovalInteractionHandler {
 /// One drain layer wired to live runtime backends.
 ///
 /// Wraps an [`LlmClient`] and a [`ToolRegistry`] into their handlers, plus an
-/// optional [`ApprovalInteractionHandler`]. With an interaction backend the
-/// layer is attended (approvals resolve here); without one it is headless and
-/// approvals pop outward. Pass it to [`drain`] (or [`drive_turn`]).
+/// optional [`ApprovalInteractionHandler`]. The tool registry lives in a shared,
+/// swappable slot so a turn-boundary reconfiguration is fulfilled by resolving
+/// and installing a new registry through a [`ToolRegistryResolver`] (defaulting
+/// to [`DeclaredOnlyToolRegistryResolver`]; override with
+/// [`with_tool_registry_resolver`](Self::with_tool_registry_resolver)). With an
+/// interaction backend the layer is attended (approvals resolve here); without
+/// one it is headless and approvals pop outward. Pass it to [`drain`] (or
+/// [`drive_turn`]).
 pub struct ReferenceScope {
     llm: LlmClientHandler,
     tool: ToolRegistryHandler,
+    reconfig: ReconfigRegistryHandler,
     interaction: Option<ApprovalInteractionHandler>,
 }
 
 impl ReferenceScope {
     /// Wires `client` and `registry` into a scope with no interaction backend.
+    ///
+    /// The registry is installed into a shared slot; queued reconfigurations
+    /// resolve through a [`DeclaredOnlyToolRegistryResolver`] until a stricter
+    /// resolver is supplied via
+    /// [`with_tool_registry_resolver`](Self::with_tool_registry_resolver).
     #[must_use]
     pub fn new(client: Arc<dyn LlmClient>, registry: Arc<dyn ToolRegistry>) -> Self {
+        let slot: SharedRegistry = Arc::new(Mutex::new(registry));
         Self {
             llm: LlmClientHandler::new(client),
-            tool: ToolRegistryHandler::new(registry),
+            tool: ToolRegistryHandler::from_slot(slot.clone()),
+            reconfig: ReconfigRegistryHandler::new(
+                Arc::new(DeclaredOnlyToolRegistryResolver),
+                slot,
+            ),
             interaction: None,
         }
     }
@@ -215,6 +304,13 @@ impl ReferenceScope {
     #[must_use]
     pub fn with_interaction(mut self, interaction: ApprovalInteractionHandler) -> Self {
         self.interaction = Some(interaction);
+        self
+    }
+
+    /// Sets the resolver used to fulfill `NeedReconfigRegistry` requirements.
+    #[must_use]
+    pub fn with_tool_registry_resolver(mut self, resolver: Arc<dyn ToolRegistryResolver>) -> Self {
+        self.reconfig.resolver = resolver;
         self
     }
 }
@@ -232,6 +328,10 @@ impl HandlerScope for ReferenceScope {
         self.interaction
             .as_ref()
             .map(|handler| handler as &dyn InteractionHandler)
+    }
+
+    fn reconfig(&self) -> Option<&dyn ReconfigHandler> {
+        Some(&self.reconfig)
     }
 }
 

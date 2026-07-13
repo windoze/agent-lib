@@ -137,6 +137,9 @@ pub enum LoopCursor {
     AwaitingApproval(ApprovalCursor),
     /// Cancellation has interrupted the active step and pending state must be closed.
     CancelRecovery(CancelRecoveryCursor),
+    /// A queued tool-set reconfiguration is waiting for the driver to resolve a
+    /// live registry before the turn boundary can be applied.
+    AwaitingReconfig(ReconfigCursor),
     /// The current feed segment reached a normal terminal outcome.
     Done(DoneCursor),
     /// The current feed segment ended with a classified runtime error.
@@ -193,6 +196,19 @@ impl LoopCursor {
         Self::CancelRecovery(CancelRecoveryCursor::new(step_id, reason))
     }
 
+    /// Creates an awaiting-reconfig cursor stuck on an optional registry requirement.
+    ///
+    /// `step_id` is the committing assistant step for a during-turn
+    /// reconfiguration, or `None` when the reconfiguration is applied at the
+    /// start of a fresh user turn.
+    #[must_use]
+    pub const fn awaiting_reconfig(
+        step_id: Option<StepId>,
+        requirement: Option<CursorRequirement>,
+    ) -> Self {
+        Self::AwaitingReconfig(ReconfigCursor::new(step_id, requirement))
+    }
+
     /// Creates a done cursor.
     #[must_use]
     pub const fn done(reason: LoopDoneReason) -> Self {
@@ -217,6 +233,7 @@ impl LoopCursor {
             Self::AwaitingTool(_) => LoopCursorKind::AwaitingTool,
             Self::AwaitingApproval(_) => LoopCursorKind::AwaitingApproval,
             Self::CancelRecovery(_) => LoopCursorKind::CancelRecovery,
+            Self::AwaitingReconfig(_) => LoopCursorKind::AwaitingReconfig,
             Self::Done(_) => LoopCursorKind::Done,
             Self::Error(_) => LoopCursorKind::Error,
         }
@@ -236,6 +253,7 @@ impl LoopCursor {
                 .map(|requirements| requirements.ids().values().copied().collect())
                 .unwrap_or_default(),
             Self::AwaitingApproval(cursor) => cursor.requirement_id().into_iter().collect(),
+            Self::AwaitingReconfig(cursor) => cursor.requirement_id().into_iter().collect(),
             Self::Idle | Self::CancelRecovery(_) | Self::Done(_) | Self::Error(_) => Vec::new(),
         }
     }
@@ -246,22 +264,28 @@ impl LoopCursor {
                 Ok(())
             }
             Self::AwaitingTool(cursor) => cursor.validate(),
-            Self::CancelRecovery(_) => Ok(()),
+            Self::CancelRecovery(_) | Self::AwaitingReconfig(_) => Ok(()),
             Self::Error(cursor) => cursor.validate(),
         }
     }
 
     pub(super) fn can_transition_to(&self, next: &Self) -> bool {
         use LoopCursorKind::{
-            AwaitingApproval, AwaitingTool, CancelRecovery, Done, Error, Idle, StreamingStep,
+            AwaitingApproval, AwaitingReconfig, AwaitingTool, CancelRecovery, Done, Error, Idle,
+            StreamingStep,
         };
 
         matches!(
             (self.kind(), next.kind()),
-            (Idle, StreamingStep | Done | Error)
+            (Idle, StreamingStep | AwaitingReconfig | Done | Error)
                 | (
                     StreamingStep,
-                    Idle | AwaitingTool | AwaitingApproval | CancelRecovery | Done | Error
+                    Idle | AwaitingTool
+                        | AwaitingApproval
+                        | AwaitingReconfig
+                        | CancelRecovery
+                        | Done
+                        | Error
                 )
                 | (
                     AwaitingTool,
@@ -270,6 +294,10 @@ impl LoopCursor {
                 | (
                     AwaitingApproval,
                     AwaitingTool | CancelRecovery | Done | Error
+                )
+                | (
+                    AwaitingReconfig,
+                    StreamingStep | CancelRecovery | Done | Error
                 )
                 | (CancelRecovery, Idle | Done | Error)
         )
@@ -290,6 +318,8 @@ pub enum LoopCursorKind {
     AwaitingApproval,
     /// Cancellation recovery is closing pending state.
     CancelRecovery,
+    /// A queued reconfiguration is waiting for the driver to resolve a registry.
+    AwaitingReconfig,
     /// The feed segment completed.
     Done,
     /// The feed segment ended with an error.
@@ -331,6 +361,50 @@ impl StepCursor {
     }
 
     /// Returns the identity of the awaited `NeedLlm` requirement, if any.
+    #[must_use]
+    pub fn requirement_id(&self) -> Option<RequirementId> {
+        self.requirement.as_ref().map(CursorRequirement::id)
+    }
+}
+
+/// Cursor payload for a queued reconfiguration awaiting a live registry.
+///
+/// A during-turn reconfiguration parks at the committing assistant `step_id`;
+/// a start-of-turn reconfiguration has no step yet and carries `None`. The
+/// `requirement` addresses the emitted `NeedReconfigRegistry` requirement the
+/// driver must fulfill.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconfigCursor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    step_id: Option<StepId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requirement: Option<CursorRequirement>,
+}
+
+impl ReconfigCursor {
+    /// Creates a reconfig cursor from an optional committing step and requirement.
+    #[must_use]
+    pub const fn new(step_id: Option<StepId>, requirement: Option<CursorRequirement>) -> Self {
+        Self {
+            step_id,
+            requirement,
+        }
+    }
+
+    /// Returns the committing assistant step, if this is a during-turn reconfig.
+    #[must_use]
+    pub const fn step_id(&self) -> Option<StepId> {
+        self.step_id
+    }
+
+    /// Returns the addressed `NeedReconfigRegistry` requirement, if any.
+    #[must_use]
+    pub const fn requirement(&self) -> Option<&CursorRequirement> {
+        self.requirement.as_ref()
+    }
+
+    /// Returns the identity of the awaited registry requirement, if any.
     #[must_use]
     pub fn requirement_id(&self) -> Option<RequirementId> {
         self.requirement.as_ref().map(CursorRequirement::id)

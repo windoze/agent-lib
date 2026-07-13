@@ -33,8 +33,8 @@ pub use context::{
 };
 pub use drive::{
     ApprovalInteractionHandler, HandlerScope, InteractionHandler, LlmClientHandler, LlmHandler,
-    Pop, ReferenceScope, ScopePop, SubagentHandler, ToolHandler, ToolRegistryHandler, TurnDone,
-    drain, drive_turn,
+    Pop, ReconfigHandler, ReconfigRegistryHandler, ReferenceScope, ScopePop, SubagentHandler,
+    ToolHandler, ToolRegistryHandler, TurnDone, drain, drive_turn,
 };
 pub use event::{
     AgentError, AgentErrorKind, AgentEvent, AgentFailure, AgentInput, AgentOutcome,
@@ -60,8 +60,8 @@ pub use spec::{AgentSpec, LoopPolicy, ModelRef, ToolFailurePolicy, ToolSetRef, W
 pub use state::{
     AgentRuntimeHandles, AgentState, AgentStateError, ApprovalCursor, CancelRecoveryCursor,
     CancelRecoveryReason, CursorRequirement, DoneCursor, ErrorCursor, LoopCursor, LoopCursorKind,
-    LoopDoneReason, PivotSource, QueuedPivot, QueuedReconfig, ReconfigQueue, ReconfigRequest,
-    StepCursor, ToolSetPatch, ToolWaitCursor, ToolWaitRequirements,
+    LoopDoneReason, PivotSource, QueuedPivot, QueuedReconfig, ReconfigCursor, ReconfigQueue,
+    ReconfigRequest, StepCursor, ToolSetPatch, ToolWaitCursor, ToolWaitRequirements,
 };
 pub use tool::{
     DeclaredOnlyToolRegistry, DeclaredOnlyToolRegistryResolver, NoToolExecutionIds,

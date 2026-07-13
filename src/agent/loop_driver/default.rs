@@ -321,7 +321,7 @@ impl LoopRuntime {
         };
         let registry = self.resolve_reconfig_registry(state, &application)?;
         Ok(Some(PreparedReconfigApplication {
-            records: reconfig_records(application.requests()),
+            records: crate::agent::state::reconfig_boundary_records(application.requests()),
             application,
             registry,
         }))
@@ -571,7 +571,10 @@ impl LoopRuntime {
                     if let Some(registry) = prepared_reconfig.registry {
                         self.replace_tool_registry(registry)?;
                     }
-                    merge_metadata(&mut metadata, reconfig_metadata(prepared_reconfig.records));
+                    merge_metadata(
+                        &mut metadata,
+                        crate::agent::state::reconfig_boundary_metadata(prepared_reconfig.records),
+                    );
                 }
                 state.transition_cursor(LoopCursor::Idle)?;
 
@@ -1422,106 +1425,10 @@ async fn wait_for_approval(
     }
 }
 
-fn reconfig_metadata(records: Vec<Value>) -> Map<String, Value> {
-    let mut metadata = Map::new();
-    if !records.is_empty() {
-        metadata.insert("reconfigs".to_owned(), Value::Array(records));
-    }
-    metadata
-}
-
 fn merge_metadata(target: &mut Map<String, Value>, source: Map<String, Value>) {
     for (key, value) in source {
         target.insert(key, value);
     }
-}
-
-fn reconfig_records(requests: &[ReconfigRequest]) -> Vec<Value> {
-    requests
-        .iter()
-        .map(|request| reconfig_record(request, "applied"))
-        .collect()
-}
-
-fn reconfig_record(request: &ReconfigRequest, status: &'static str) -> Value {
-    let mut record = Map::new();
-    record.insert("status".to_owned(), Value::String(status.to_owned()));
-    match request {
-        ReconfigRequest::ActivateSkill { skill_id } => {
-            record.insert(
-                "kind".to_owned(),
-                Value::String("activate_skill".to_owned()),
-            );
-            record.insert(
-                "skill_id".to_owned(),
-                serde_json::to_value(skill_id).expect("skill id serializes"),
-            );
-        }
-        ReconfigRequest::DeactivateSkill { skill_id } => {
-            record.insert(
-                "kind".to_owned(),
-                Value::String("deactivate_skill".to_owned()),
-            );
-            record.insert(
-                "skill_id".to_owned(),
-                serde_json::to_value(skill_id).expect("skill id serializes"),
-            );
-        }
-        ReconfigRequest::ReplaceActiveSkills { skill_ids } => {
-            record.insert(
-                "kind".to_owned(),
-                Value::String("replace_active_skills".to_owned()),
-            );
-            record.insert(
-                "skill_ids".to_owned(),
-                serde_json::to_value(skill_ids).expect("skill ids serialize"),
-            );
-        }
-        ReconfigRequest::SetSystemPromptOverlay {
-            expected_version, ..
-        } => {
-            record.insert(
-                "kind".to_owned(),
-                Value::String("set_system_prompt_overlay".to_owned()),
-            );
-            record.insert(
-                "expected_version".to_owned(),
-                Value::from(*expected_version),
-            );
-        }
-        ReconfigRequest::ReplaceToolSet { tool_set } => {
-            record.insert(
-                "kind".to_owned(),
-                Value::String("replace_tool_set".to_owned()),
-            );
-            record.insert(
-                "tool_set_id".to_owned(),
-                serde_json::to_value(tool_set.id()).expect("tool set id serializes"),
-            );
-        }
-        ReconfigRequest::PatchToolSet { patch } => {
-            record.insert(
-                "kind".to_owned(),
-                Value::String("patch_tool_set".to_owned()),
-            );
-            record.insert(
-                "tool_set_id".to_owned(),
-                serde_json::to_value(patch.resulting_tool_set_id())
-                    .expect("tool set id serializes"),
-            );
-        }
-        ReconfigRequest::SetModel { model } => {
-            record.insert("kind".to_owned(), Value::String("set_model".to_owned()));
-            record.insert("model".to_owned(), Value::String(model.model().to_owned()));
-        }
-        ReconfigRequest::SetLoopPolicy { .. } => {
-            record.insert(
-                "kind".to_owned(),
-                Value::String("set_loop_policy".to_owned()),
-            );
-        }
-    }
-    Value::Object(record)
 }
 
 fn extract_last_tool_calls(state: &AgentState) -> Result<Vec<ToolCall>, AgentError> {
@@ -1572,7 +1479,9 @@ fn abort_pending_and_idle(state: &mut AgentState) -> Result<(), AgentError> {
         LoopCursor::StreamingStep(_) | LoopCursor::CancelRecovery(_) => {
             state.transition_cursor(LoopCursor::Idle)?;
         }
-        LoopCursor::AwaitingTool(_) | LoopCursor::AwaitingApproval(_) => {
+        LoopCursor::AwaitingTool(_)
+        | LoopCursor::AwaitingApproval(_)
+        | LoopCursor::AwaitingReconfig(_) => {
             state.transition_cursor(LoopCursor::cancel_recovery(
                 None,
                 CancelRecoveryReason::ToolInterrupted,

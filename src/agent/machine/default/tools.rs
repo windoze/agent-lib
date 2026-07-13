@@ -623,7 +623,7 @@ impl DefaultAgentMachine {
     /// that already resolved keeps its real result, which is what lets a partial
     /// tool batch be abandoned coherently. The turn then settles to
     /// [`LoopCursor::Idle`] via [`finish_cancel`](Self::finish_cancel).
-    pub(super) fn abandon_tool_phase(&mut self, step_id: StepId) -> StepOutcome {
+    pub(super) fn abandon_tool_phase(&mut self, step_id: Option<StepId>) -> StepOutcome {
         let Some(cancelled_results) = self.open_cancelled_results() else {
             return self.fail("abandon reached a tool cursor without an active tool phase");
         };
