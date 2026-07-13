@@ -1222,7 +1222,7 @@ ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --che
   `cargo test --all --all-targets`(lib 423 测试全过:removed ~18 loop 测试、新增 3 machine 测试)、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`git diff --check` 均通过。每测试 <1min。
 
-### [TODO] M4-R Milestone 4 Review
+### [DONE] M4-R Milestone 4 Review
 
 **前置依赖**:M4-1..M4-3(含 M4-2a)。
 
@@ -1235,6 +1235,57 @@ ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --che
 - 确认无 multishot / continuation 复制被引入;多路径路径仍指向 `fork_at`。
 
 **验证**:运行全套命令。Review 结论写入完成记录。
+
+**完成记录**:
+
+Milestone 4 三条验收全部通过,未发现遗漏或 workaround。纯 review 任务,仅改本文件文档,
+无源码改动;复跑全套验证确认 M4 收编后的机器/参考 driver 处于全绿态。
+
+- **核对点 1 — cancel = never-resume 的"受控丢弃 + 闭合"**:通过。
+  - 被弃子树都经**唯一** `Conversation::cancel_pending` 闭合裂缝(共 5 处生产调用):
+    LLM step abandon → `abandon_llm_step` 用 `DiscardTurn`(`machine/default/mod.rs:750`);
+    reconfig abandon → `abandon_reconfig` 用 `DiscardTurn`(`mod.rs:769`);tool/approval phase
+    abandon → `abandon_tool_phase` 用 `ResumeTurn { cancelled_results }`,由
+    `open_cancelled_results()` 对全部仍未闭合 slot(`auto_pending`+`running`+`approval_pending`+
+    `awaiting_approval`)合成 `CancelledToolResult`,已完成 call 保留真实 result(部分 abandon 也闭合;
+    `tools.rs:634`);`begin_user_turn` 残留 pending 先 `DiscardTurn` 再开新 turn(`mod.rs:300`);
+    `fail` 路径 `DiscardTurn` 收尾(`mod.rs:818`)。`abandon(id)` 先 `pending_requirement_ids()`
+    校验归属(不属即 `fail`)。
+  - 参考 driver `drain` 检查 `ctx.is_cancelled()`,命中即对 `pending[0]` 喂一次 `Abandon`,
+    `break` 返回 cursor=`Idle` 的 `TurnDone`;`CancellationToken` 仅作向下"该停了"信号,闭合由
+    never-resume + `cancel_pending` 完成(`drive.rs:357-366`)。
+  - "cancel 后仍可 feed"有测试:`abandon_streaming_step_then_user_message_opens_new_turn`
+    (`machine/default/tests/mod.rs:429`)、`abandon_tool_batch_then_user_message_opens_new_turn`
+    (`tests/tools.rs:953`)、参考 driver `reference_new_turn_after_cancel_starts_fresh`
+    (`drive/reference/tests.rs:1163`);另有 `reference_cancel_during_tool_wait_abandons_turn`
+    (`tests.rs:1115`)与 4 个 abandon 语义单测。集成层 `parallel_tool_cancel_resume_keeps_state_machine_usable`
+    (`tests/conversation_state_machine.rs`)亦通过。
+- **核对点 2 — pivot/approval/cancel 收编为 requirement + handler + 多喂 input**:通过。
+  - **旧三套并列机制已删除/降级**:
+    - pivot queue → 删除。`git grep` 确认无 `queued_pivots` 字段、`queue_pivot`/`dequeue_pivot`
+      方法、`AgentInput::QueuedPivotTurn`/`AgentInput::Resume` 变体。`AgentInput` 收敛为
+      `{ UserMessage, Pivot }`;`PivotSource`/`QueuedPivot`(=`PivotMessage`)保留为**数据类型**。
+    - approval responder → 删除。`git grep` 确认无 `respond_approval`/`ApprovalWaiters`。审批统一走
+      `RequirementKind::NeedInteraction { request: Interaction::approval(..) }`(`tools.rs:305,320`)
+      发出、`RequirementResult::Interaction(InteractionResponse::Approval(ApprovalResponse))` 回喂
+      (`tools.rs:400-457`);旧审批类型降级为 `InteractionKind::Approval` 内嵌的**数据后端**。
+      `ApprovalError` 仅作数据错误类型保留(`event.rs:726` `#[from]`),`AlreadyPending`/`ResponderGone`
+      已无生产构造点。
+    - cancel token 主体 → 降级为纯向下信号(见核对点 1),闭合逻辑不再依赖 token 内部状态。
+  - **整个 `loop_driver` 模块已删除**:`git grep` 确认 src 内无 `loop_driver`/`DefaultAgentLoop`/
+    `AgentLoop`/`AgentFeedGuard`/`AgentFeedPermit`/`FeedInProgress`。背压由机器 `&mut self` + 单活 turn
+    提供(决策 F)。三者现均为"发 requirement → handler 兑现 → `StepInput::Resume`/`Abandon` 回喂"的统一
+    表现:approval=Resume(Interaction)、pivot=多喂 `External(Pivot)`、cancel=Abandon(never-resume)。
+- **核对点 3 — 无 multishot / continuation 复制;多路径仍走 `fork_at`**:通过。
+  - `git grep` 确认无 `multishot`/`multi_shot`/`Multishot` 机制。"continuation" 仅为普通助手续写
+    消息/步骤的描述词(post-tool 同 turn 续写),非分支复制。机器不克隆自身 state 去并行探索多路径。
+  - 会话级多路径分支的唯一原语是 `Conversation::fork_at`(`conversation/boundary/fork.rs:71`),
+    cancel/pivot/approval 均为 feed 驱动的单机器推进,不引入 continuation 复制。
+
+**验证命令(全绿)**:`cargo fmt --all --check`(clean);`cargo clippy --all-targets -- -D warnings`
+(clean);`cargo test --all --all-targets`(423 lib + 2+3 integration state-machine/adapter 全过,网络用例
+ignored,与 M4-3 基线 423 一致);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean)。每测试 <1min。
+本任务仅改 `TODO.md`;因源码自 M4-3 全绿以来未变,全套结果为对该态的复核确认。
 
 ---
 
