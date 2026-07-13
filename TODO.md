@@ -1498,7 +1498,7 @@ handler 派生子 agent 并再开一层 drain 递归驱动,并从"当前 drain s
   每测试 <1min。既有 subagent / reference drain 测试(父子共享 trace 树、pop、cancel)全绿,证明新增
   记录不改行为、requirement id 在同一 trace 树内不冲突。
 
-### [TODO] M5-R Milestone 5 Review
+### [DONE] M5-R Milestone 5 Review
 
 **前置依赖**:M5-1..M5-3。
 
@@ -1510,6 +1510,56 @@ handler 派生子 agent 并再开一层 drain 递归驱动,并从"当前 drain s
 - 核对 trace resolved-by-scope + disposition 完整。
 
 **验证**:运行全套命令。Review 结论写入完成记录。
+
+**完成记录**:
+
+- **核对点 1 — 整树 serde + `id/origin` 路由 + 完成序回灌:通过**。`machine/nested.rs` 让
+  `NestedMachine` 整树可序列化(`impl Serialize` 借 own `AgentState` + 递归 `ChildStateRef`;
+  `MachineTreeState`/`ChildState` `Deserialize` + `deny_unknown_fields`;`from_state` 递归重建各节点
+  `path` 并重注入 live handle)。requirement **按 id 精确路由**:`route_by_id` 先看 own cursor 的
+  `pending_requirement_ids`,否则 `subtree_contains` 定位命中子树,无节点等待该 id 时投给 own 让其分类
+  报错;**origin** 由 `stamp_requirements` + `rebase_cursor_origin` 打真实绝对 `AgentPath`,使
+  `StepOutcome.requirements` 与持久化 cursor binding 同源一致,`outstanding_requirements()` 由结构
+  重建同一 `(id, path)` 视图。**父子并发按完成顺序回灌**由 `drive.rs::fulfill_batch` 的
+  `FuturesUnordered` 提供(本层集完成序收集;不可本层兑现者串行经 `resolve_requirement`)。测试:
+  `step_aggregates_parent_and_child_requirements_with_real_paths`、`resume_routes_by_id_to_the_child_only`、
+  `whole_tree_round_trips_and_each_cursor_restores_independently`、`attach_child_rejects_an_occupied_slot`、
+  `drain_resolves_a_concurrent_batch_out_of_order` 全绿。
+- **核对点 2 — 深度/预算/cancel 集中在 subagent handler:通过**。三护栏全部落在
+  `DrivingSubagentHandler::fulfill`(`drive/subagent.rs`)这一处:①深度守卫先行
+  (`ctx.depth() >= max_depth` → `AgentError::SubagentDepthExceeded`,不 mint id、不 spawn);
+  ②`RunContext::derive_child`(`context.rs`)以 `budget.clone()` 共享同一 ledger(预算继承)、
+  `cancellation.derive_child()` 派生子 token(cancel 传播)、`depth.saturating_add(1)`;
+  ③child drain 的 pop 目标为 handler 收到的 `outer`,子未兑现 requirement pop 到外层而非回到自身
+  (§7.3)。`CancellationToken`(`context/cancel.rs`)子观察父链,父 cancel 对所有后代可见。未在
+  machine/其它 handler 处重复实现。测试:`depth_guard_refuses_at_limit_without_spawning`、
+  `parent_cancel_propagates_and_abandons_child`、`child_token_charge_counts_against_parent_budget` 全绿。
+- **核对点 3 — attended/headless 自动切换有测试:通过(机制已测;完整同 spec 双跑验收下沉 M6-2)**。
+  `attended_parent_serves_headless_child_interaction_via_pop`(`drive/subagent/tests.rs`)证明**自动
+  切换的核心机制**:同一子机器,其 `NeedInteraction` 因子 scope **不挂** interaction(headless)而 pop
+  到**挂** interaction 的父 scope(attended)被兑现(count==1),子/父均 `Done`,父被 `Subagent` 结果
+  resume——即"由挂/不挂 interaction 决定 headless/attended,子无需任何配置"。attended-本层直服方向由
+  `drive.rs` 的 interaction handler 测试覆盖。**同一 subagent spec 用真实 `DefaultAgentMachine` + 离线
+  fake client 两种 scope 各跑一次**的完整端到端验收示例是下游 **M6-2** 的专属任务(依赖链已正确:
+  M6-2 ← M6-1 ← M5-R),本 Review 不重复该验收,亦无需新增 prerequisite。
+- **核对点 4 — trace resolved-by-scope + disposition 完整:通过**。`context/trace.rs` 有
+  `RequirementDisposition { Resumed, NeverResumed }`(Copy + serde snake_case)与
+  `TraceNodeKind::Requirement { kind_tag, resolved_at_scope, disposition }`,`TraceNodeKind` 仍 `Copy`、
+  `TraceRecord::kind()` 签名不变。记录集中在 `drive.rs::drain` 单处:Resumed 批经
+  `record_requirement_resolution(ctx, &resolution, resolved_at_scope, Resumed)`,cancel 分支经
+  `record_requirement(ctx, req, 0, NeverResumed)`(never-resume 是真实影响下层 Conversation 的事件,
+  必留痕);`resolved_at_scope` = pop 跳数,经 `Pop::pop` 返回 `(result, hops)` 沿 pop 链 `+1` 累加,
+  节点 id 复用 host-minted requirement id。测试:
+  `drain_records_resolved_at_scope_for_local_and_popped_requirements`(本层 0 / pop 一层 1,均 Resumed)、
+  `drain_records_never_resumed_disposition_on_cancel`(NeverResumed)、
+  `requirement_trace_node_round_trips_through_serde`(serde 形状)全绿。
+- **验证(本轮实跑,HEAD=f1ce9fb、工作树在核对前 clean、无源码改动)**:`cargo fmt --all -- --check`
+  (clean)、`cargo clippy --all-targets -- -D warnings`(0 warning)、`cargo test --all --all-targets`
+  (lib 435 passed / 0 failed;doctest 3 passed;集成/示例全绿;网络用例 ignored,需凭据;每测试 <1min)、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean)、`git diff --check`(clean)均通过。
+- **结论**:Milestone 5(嵌套机器 + subagent handler + observability)四项核对全部通过,无 spec 偏差、
+  无 workaround、无未排期失败测试,层次不变量(整树 serde、`id/origin` 路由、深度/预算/cancel 集中强制、
+  trace 归属与处置)与迁移文档 §7–§9 一致。未引入新 prerequisite。PLAN.md 阶段级计划无变化,不改。
 
 ---
 

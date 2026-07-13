@@ -1,62 +1,52 @@
-# 执行计划 — M5-3：Observability：trace 记 resolved-by-scope 与 disposition
+# 执行计划 — M5-R：Milestone 5 Review
 
 ## 选中的任务
-`TODO.md` 第一个未完成任务 = **M5-3**（M1..M5-2 全 `[DONE]`）。前置 M5-2 已完成。
+`TODO.md` 第一个未完成任务 = **M5-R**（M1..M5-3 全 `[DONE]`）。这是 Review 任务，不拆分。
+前置 M5-1..M5-3 均已 `[DONE]`。工作树在开始时 clean，HEAD=f1ce9fb（M5-3）。
 
-## 任务目标（TODO.md M5-3 / 迁移文档 §8/§11 / effect-model §8）
-动态作用域要求 trace 记录每个 requirement：
-1. 被哪层 scope 的 handler 兑现（resolved-at-scope）。
-2. 兑现结果是 resume 还是 never-resume（disposition）——never-resume（cancel）是真实发生、
-   影响下层 Conversation 的事件，必须留痕，不是 non-event。
-新增 `TraceNodeKind::Requirement { kind_tag, resolved_at_scope, disposition }`，
-`disposition ∈ { Resumed, NeverResumed }`。与旧 trace tree（run→step→llm/tool/sub-agent）对齐。
+## Review 四项核对点（TODO.md M5-R）
+1. 嵌套机器整树可序列化、requirement 按 `id + origin` 精确路由、父子并发兑现按完成顺序回灌。
+2. 深度上限、预算继承、cancel 传播全部在 subagent handler 强制（不散落别处）。
+3. "同一 spec 在挂/不挂 interaction 的 scope 下 attended/headless 自动切换"有端到端测试。
+4. trace resolved-by-scope + disposition 完整。
 
-## 关键设计决策
-### resolved_at_scope 的表示
-- 用 `u32` 表示「从 requirement 被 perform 的那层 scope 起，向外 pop 了几跳才被兑现」。
-  0 = 本层（emitting scope）自己兑现；1 = 向外 pop 一层兑现；依此类推。
-- 这是动态作用域下最直接可测的「哪层兑现」的相对表示，且天然经 pop 链累加。
+## 核对结论（逐项，均已通过代码走查确认）
+1. **通过**。`machine/nested.rs`:整树 serde（`Serialize for NestedMachine` + `MachineTreeState`/
+   `ChildState`，`deny_unknown_fields`；`from_state` 递归重建 path 与 handle）。按 id 路由:
+   `route_by_id` + `subtree_contains` 扫各 cursor `pending_requirement_ids`;origin 由
+   `stamp_requirements`/`rebase_cursor_origin` 打真实 `AgentPath`,`outstanding_requirements`
+   与 cursor binding 同源一致。并发按完成顺序:`drive.rs::fulfill_batch` 用 `FuturesUnordered`,
+   本层集完成序收集,不可本层兑现者串行经 `resolve_requirement`。
+   测试:`step_aggregates_parent_and_child_requirements_with_real_paths`、
+   `resume_routes_by_id_to_the_child_only`、`whole_tree_round_trips_and_each_cursor_restores_independently`、
+   `attach_child_rejects_an_occupied_slot`、`drain_resolves_a_concurrent_batch_out_of_order`。
+2. **通过**。三护栏集中在 `DrivingSubagentHandler::fulfill`(drive/subagent.rs):①深度守卫先行
+   (`ctx.depth() >= max_depth` → `SubagentDepthExceeded`,不 mint id 不 spawn);②`RunContext::derive_child`
+   (context.rs)共享 budget ledger(`budget.clone()`)+ 派生 cancel token(`cancellation.derive_child()`)+
+   `depth+1`,预算继承/cancel 传播天然获得;③child drain 的 pop 目标为 `outer`,子未兑现 requirement
+   pop 到外层。CancellationToken 子观察父链(cancel.rs)。
+   测试:`depth_guard_refuses_at_limit_without_spawning`、`parent_cancel_propagates_and_abandons_child`、
+   `child_token_charge_counts_against_parent_budget`。
+3. **通过(机制已测;完整同 spec 双跑验收为下游 M6-2)**。
+   `attended_parent_serves_headless_child_interaction_via_pop`:子 scope 不挂 interaction(headless)
+   → 子 `NeedInteraction` pop 到挂 interaction 的父 scope(attended)被兑现 count==1,子/父均完成。
+   attended-本层直服由 drive.rs 的 interaction handler 测试覆盖。"同一 subagent spec 在两种 scope 下
+   两跑"的完整离线端到端验收示例是 M6-2 的专属任务(依赖链已正确:M6-2←M6-1←M5-R),M5-R 不重复。
+4. **通过**。`context/trace.rs`:`RequirementDisposition{Resumed,NeverResumed}` +
+   `TraceNodeKind::Requirement{kind_tag,resolved_at_scope,disposition}` + `record_requirement`。
+   `drive.rs::drain` 单处记录:Resumed 批经 `record_requirement_resolution(...,resolved_at_scope,Resumed)`,
+   cancel 分支 `record_requirement(...,0,NeverResumed)`;`resolved_at_scope` = pop 跳数(经 `Pop::pop`
+   返回 `(result,hops)` 累加)。测试:`drain_records_resolved_at_scope_for_local_and_popped_requirements`、
+   `drain_records_never_resumed_disposition_on_cancel`、`requirement_trace_node_round_trips_through_serde`。
 
-### hop 计数如何穿过 pop 链（drive.rs）
-- `Pop::pop` 返回类型改为 `Result<(RequirementResult, u32), AgentError>`，
-  u32 = 从「本 pop 目标的 scope」起到真正兑现处的跳数。
-- `resolve_requirement` 返回 `Result<(RequirementResult, u32), AgentError>`：
-  - 本层兑现（subagent handler 或 fulfill_with_scope）→ `(result, 0)`。
-  - pop → `let (r, h) = parent.pop(req, ctx)?; (r, h + 1)`（+1 = 到 parent 的那一跳）。
-  - 顶层无 handler → `Err(UnhandledRequirement)`（不记录）。
-- `ScopePop::pop` → `resolve_requirement(req, self.scope, self.parent, ctx)`，原样返回（+1 由调用方加）。
-- `fulfill_batch` 返回 `Vec<Resolved{ resolution, resolved_at_scope }>`：
-  本层并发集 hop=0；串行集经 resolve_requirement 得 hop。
+## 验证结果（本轮实跑）
+- `cargo fmt --all -- --check`:clean。
+- `cargo clippy --all-targets -- -D warnings`:0 warning。
+- `cargo test --all --all-targets`:lib 435 passed / 0 failed;doctest 3 passed;集成/示例全绿;
+  网络用例 ignored(需凭据)。每测试 <1min。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`:clean。
+- `git diff --check`:clean。
 
-### 记录点集中在 drain（单处，且只记「真会被 Resume/Abandon」的）
-- `drain` 收到 `fulfill_batch` 的 `Vec<Resolved>`（都是 Ok、都会被 Resume）：
-  每个 `record_requirement(ctx, tag, resolved_at_scope, Resumed)` 后再 `Resume`。
-- cancel 分支：`record_requirement(ctx, tag, 0, NeverResumed)` 后再 `Abandon`。
-  （cancel = 本层的 never-resume handler，故 scope=0。）
-- trace 记录用 `ctx.trace()`（emitting 层的 trace parent：root 或 sub-agent 节点）。
-- trace 节点 id 复用 requirement 的 host-minted id（库不造 id 哲学）。
-- Trace 记录失败（重复 id / 未知 parent）→ `AgentError`（经 `RunContextError::Trace`，kind=Trace）。
-
-### trace.rs
-- 新增 `RequirementDisposition { Resumed, NeverResumed }`（Copy, serde snake_case）。
-- `TraceNodeKind` 增 `Requirement { kind_tag: RequirementKindTag, resolved_at_scope: u32,
-  disposition: RequirementDisposition }`。字段全 Copy → 枚举仍 `Copy`，`kind()` 不变。
-- `TraceHandle::record_requirement(id, kind_tag, resolved_at_scope, disposition)`。
-- context.rs / agent/mod.rs re-export `RequirementDisposition`。
-
-## 聚焦测试
-1. drive.rs：含 pop 的兑现在 trace 记录正确 `resolved_at_scope`（本层=0，pop 一层=1），disposition=Resumed。
-2. drive.rs：cancel 一次在 trace 记录 `NeverResumed`。
-3. context/tests.rs（或 trace.rs）：新 Requirement trace record serde round-trip。
-
-## 验证
-- `cargo fmt --all` → `cargo clippy --all-targets -- -D warnings` → `cargo test --all --all-targets`
-  → `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` → `git diff --check`。
-
-## 进度（完成）
-- [x] trace.rs：RequirementDisposition + TraceNodeKind::Requirement + record_requirement
-- [x] context.rs / mod.rs re-export
-- [x] drive.rs：Pop/resolve_requirement/fulfill_batch hop 穿透 + drain 记录
-- [x] 测试 1/2/3（drive.rs ×2 + context/tests.rs ×1）
-- [x] fmt(clean) / clippy(0 warning) / test(lib 435 passed) / doc(clean) / diff --check(clean)
-- [x] TODO.md 标记 [DONE] + 完成记录
+## 结论
+Milestone 5 四项核对全部通过,无 spec 偏差、无 workaround、无未排期失败测试。未引入新 prerequisite。
+标记 M5-R `[DONE]`,写完成记录,提交并停止。PLAN.md 无阶段级变更,不改。
