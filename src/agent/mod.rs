@@ -39,10 +39,8 @@ pub use drive::{
     TurnDone, drain, drive_turn,
 };
 pub use event::{
-    AgentError, AgentErrorKind, AgentEvent, AgentFailure, AgentInput, AgentOutcome,
-    AgentOutcomeKind, AgentUserInput, ApprovalRequest, BudgetExhaustedOutcome,
-    ExternalRecoveryKind, ExternalRecoveryOutcome, Notification, PivotMessage, StepBoundary,
-    ToolCallFinished, ToolCallStarted,
+    AgentError, AgentErrorKind, AgentInput, AgentUserInput, Notification, PivotMessage,
+    StepBoundary, ToolCallFinished, ToolCallStarted,
 };
 pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};
 pub use interaction::{

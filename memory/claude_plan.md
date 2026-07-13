@@ -1,48 +1,62 @@
-# 执行计划 — M6-2:端到端验收示例(attended 父 + headless 子)
+# 执行计划 — M6-R:Milestone 6 与迁移总 Review
 
 ## 选中的任务
-`TODO.md` 第一个未完成任务 = **M6-2**(M1..M6-1 全 `[DONE]`)。前置 M6-1 已 `[DONE]`。
-工作树起始 clean,HEAD=8d89171(M6-1)。不拆分。
+`TODO.md` 第一个未完成任务 = **M6-R**(M1..M6-2 全 `[DONE]`)。前置 M6-1..M6-2 已 `[DONE]`。
+工作树起始 clean,HEAD=615817c(M6-2)。这是 Review 任务,不拆分。
 
-## 任务要求(TODO.md M6-2)
-- 新增 `tests/agent_effect_e2e.rs`(选 tests/,用 crate 公共 API,`cargo test` 直接跑)。
-- 用离线 fake `LlmClient`/`ToolRegistry` + policy interaction 后端。
-- 父 agent(顶层 scope 挂 interaction=policy)派生 headless 子 agent(内层 scope 不挂 interaction);
-  子 `NeedInteraction` pop 到父被兑现;跑完一个含 tool 与 subagent 的 turn。
-- 覆盖父子并发兑现、cancel 传播、budget 聚合的端到端断言。
-- 证明"同一 subagent spec,attended vs headless 只是 scope wiring 不同,子无需配置"。
+## 任务要求(TODO.md M6-R)
+1. 回溯 PLAN.md 与 TODO.md 全文,逐条确认迁移不变量:
+   - sans-io `step` 不 await
+   - requirement/notification 二分
+   - `id + origin` 可寻址
+   - pop 路由与顶层 total(UnhandledRequirement)
+   - cancel=never-resume 接 `cancel_pending`
+   - 多路径 `fork_at` 无 multishot
+   - RunContext 由 scope 派生
+   - serde/runtime 分离
+2. 确认 Conversation Core 不变量(committed log、pending、tool pairing、Boundary、restore)
+   在 Agent 层未被重新实现或绕开。
+3. 确认旧 push API(respond_approval / pivot queue / AgentFeedGuard / AgentEvent::Done)
+   已删除或明确保留理由,文档与代码一致。
+4. 汇总遗留/后续项(决策 C 排序、决策 D token tee 最终形态)到"后续"小节。
 
-## 关键事实(已读代码)
-- `DefaultAgentMachine` 只发 `NeedLlm/NeedTool/NeedInteraction/NeedReconfigRegistry`,不发 `NeedSubagent`。
-  → 父机用小脚本机器 `ParentBatchMachine`(仿 `ScriptMachine`)发 `[NeedTool, NeedSubagent]`;
-  子机用真实 `DefaultAgentMachine`(weather 工具 + RequireApprovalPolicy),被 fake client/registry 驱动。
-- `drain(machine, input, scope, parent, ctx)`:批内本地可兑现的 requirement 用 FuturesUnordered 并发;
-  `NeedSubagent` 恒串行,handler 收到 `outer=ScopePop(本层 scope, 本层 parent)`。
-- 子 headless scope 无 interaction → 子 `NeedInteraction(approval)` pop 到父 scope 的 interaction handler。
-- budget:handler 侧充值(参考 `ChargingLlmHandler`);`derive_child` 共享 ledger → 子充值计到父。
-- cancel:`ctx` 取消后 drain 对首个 requirement 走 `Abandon`(never-resume)。
-- 公共 API 全部可用:drain/DrivingSubagentHandler/SubagentSpawner/SpawnedChild/ScopePop/HandlerScope/
-  ToolRegistryHandler/ApprovalInteractionHandler/RunContext/BudgetLimits/...
-- ids:共享 `AtomicU64` 生成唯一 uuid 串,实现 `RequirementIds` + `ToolExecutionIds`。
-
-## 测试设计(tests/agent_effect_e2e.rs,多个 #[tokio::test])
-共享 fakes + 子机构造 `build_child_machine()` + `child_scope(attended)` 两处共用 → 证明 same spec。
-1. attended_parent_headless_child_pop_and_budget(pop+层级+budget 聚合)
-2. same_child_spec_attended_resolves_in_place(same graph = scope wiring)
-3. batch_tool_requirements_fulfilled_concurrently(并发兑现,max in-flight==2)
-4. parent_cancel_propagates_and_abandons_child(cancel 传播)
+## 验证命令(全套)
+- cargo fmt --all
+- cargo clippy --all-targets -- -D warnings
+- cargo test --all --all-targets(超时 ≤30min)
+- RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+- git diff --check
 
 ## 步骤
-1. [x] 写 tests/agent_effect_e2e.rs。
-2. [x] fmt → clippy(-D warnings)→ 聚焦跑 → 全套 test → doc(-D warnings)→ git diff --check。
-3. [x] TODO.md 标 M6-2 [DONE] + 完成记录。
-4. [x] 提交,停止。
+1. [ ] 读关键 agent-layer 源码,逐条核对不变量(grep 旧 API 是否残留)。
+2. [ ] 后台跑 fmt+clippy+test+doc,收集结果。
+3. [ ] TODO.md 标 M6-R [DONE] + 写入 Review 结论 + 后续小节。
+4. [ ] 提交,停止(仅文档变更,若代码未变可复用绿测结果)。
+
+## 关键发现(Review)
+- fmt/clippy/test(lib 435 + e2e 4 + 其它,0 failed)/doc/diff --check 全绿。
+- 不变量核对:sans-io step(machine/mod.rs 纯同步不 await)、requirement/notification 二分、
+  id+origin 寻址、pop 路由+顶层 UnhandledRequirement、cancel=never-resume 接 cancel_pending、
+  fork_at 无 multishot、RunContext 由 scope 派生、serde/runtime 分离 —— 均已落地。
+- 旧 push API:respond_approval / pivot queue / AgentFeedGuard / DefaultAgentLoop / loop_driver
+  已从源码删除(仅存历史 archive 文档)。
+- **DEFECT(doc↔code 不一致)**:migration doc 头部与 M6-1 改写的 agent-layer.md §1.3 均**明列**
+  `AgentEvent 单一混装流`/`AwaitingApproval`/`Done(Outcome)` 为**已删除**旧 push API,
+  但 src/agent/event.rs 仍定义 `AgentEvent`+`ApprovalRequest`+`AgentOutcome(Kind)`+`AgentFailure`
+  +`BudgetExhaustedOutcome`+`ExternalRecoveryKind/Outcome`,且这些类型**仅**被自身 test 与
+  mod.rs re-export 引用(无任何 live 路径使用)。→ 死代码,与文档相悖。
+  **修复**:删除这些死 legacy 类型 + `non_empty` helper + `From<Notification> for AgentEvent` +
+  相关 test,重写 Notification/module doc 去掉 `[AgentEvent]` intra-doc link,更新 mod.rs re-export。
+  保留 live:AgentInput/AgentUserInput/Notification+payloads(StepBoundary/ToolCallStarted/
+  ToolCallFinished)/AgentError/AgentErrorKind。
 
 ## 进度
-- 完成。4 个 `#[tokio::test]` 全绿:attended_parent_serves_headless_child_via_pop /
-  same_child_spec_attended_resolves_in_place / batch_requirements_are_fulfilled_concurrently /
-  parent_cancel_propagates_and_abandons_child。
-- 验证:`cargo fmt --all`;`cargo clippy --all-targets -- -D warnings` 0 warning;
-  `cargo test --all --all-targets` 全绿(lib 435 + 集成含新增 4,0 failed);
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` clean;`git diff --check` clean。
-- TODO.md:M6-2 → [DONE] 并补完整完成记录;M6-R 仍 [TODO]。下一次调用处理 M6-R。
+- 完成。Review 八项不变量核对全通过;Conversation Core 不变量未被 Agent 层重实现/绕开。
+- 发现并修复唯一 doc↔code 不一致:删除死 legacy `AgentEvent`/`ApprovalRequest`/`AgentOutcome`
+  家族/`AgentFailure`/`ExternalRecovery*`/`non_empty`/`From<Notification> for AgentEvent`,
+  重写 Notification/module doc + mod.rs re-export + README。保留 live 类型。
+- 验证全绿:fmt clean;clippy 0 warning;test lib 434 + e2e 4 + 其它,0 failed;doctest 12;
+  doc clean;git diff --check clean。
+- TODO.md:M6-R → [DONE] + 完整 Review 结论 + 后续小节(决策 C 排序 / 决策 D token tee /
+  driver 编排归调用者)。PLAN.md 无阶段变更,不改。
+- M6-R 是最后一个任务 → 所有任务完成,提交后打 `endtag`。

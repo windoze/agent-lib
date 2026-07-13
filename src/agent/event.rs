@@ -1,18 +1,21 @@
 //! Agent loop input, event, outcome, and error contracts.
 //!
-//! The types in this module are data boundaries for a future runtime loop.
+//! The types in this module are data boundaries for the sans-io Agent machine.
 //! They carry provider-neutral Client stream events, Conversation boundaries,
 //! caller-supplied identities, and stable outcome classifications without
 //! storing live streams, responders, clients, or tool registries.
 //!
-//! [`AgentEvent`] is the legacy combined stream. [`Notification`] is the
-//! Agent-effect-model *notification* subset (skippable observe-only events);
-//! it coexists with [`AgentEvent`] during Stage 0 and bridges onto it through
-//! `From<Notification> for AgentEvent`.
+//! [`Notification`] is the Agent-effect-model *notification* subset: the
+//! skippable, observe-only facts a machine reports while it advances. The old
+//! combined `AgentEvent` push stream (with its `AwaitingApproval` request and
+//! `Done` terminal variants) has been removed; requests are now
+//! [`Requirement`](crate::agent::Requirement)s resolved on the return path, and
+//! turn completion is expressed by a quiescent
+//! [`StepOutcome`](crate::agent::StepOutcome) instead of a stream event.
 
 use crate::{
     agent::{
-        AgentStateError, ApprovalError, BudgetError, RunContextError, StepId, TraceNodeId,
+        AgentStateError, ApprovalError, RunContextError, StepId, TraceNodeId,
         requirement::{AgentPath, RequirementKindTag},
         state::QueuedPivot,
         tool::ToolRuntimeError,
@@ -177,88 +180,37 @@ impl<'de> Deserialize<'de> for AgentUserInput {
     }
 }
 
-/// Event emitted by an Agent loop while one feed segment is active.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum AgentEvent {
-    /// Provider-neutral LLM stream event, carried without Agent-side rewriting.
-    Llm(StreamEvent),
-    /// Agent step boundary where cross-cutting policies can be evaluated.
-    StepBoundary(StepBoundary),
-    /// Tool execution has started for a mapped tool call.
-    ToolCallStarted(ToolCallStarted),
-    /// Tool execution has finished and produced a complete response.
-    ToolCallFinished(ToolCallFinished),
-    /// The loop is waiting for external approval before executing a tool.
-    AwaitingApproval(ApprovalRequest),
-    /// The feed segment has ended with a classified outcome.
-    Done(AgentOutcome),
-}
-
-/// Pure notification emitted by an Agent loop that a `drain` may skip.
+/// Pure notification emitted by an Agent machine that a `drain` may skip.
 ///
-/// A [`Notification`] is the observe-only subset of [`AgentEvent`]: every
-/// variant here carries a fact the loop wants to report, never a request the
-/// loop is blocked on. A consumer that only advances the machine may therefore
-/// drop notifications without stalling progress. This is the Agent-effect-model
-/// split of [`AgentEvent`] into *notifications* (skippable) and *requirements*
-/// (must be resolved); see the Agent-effect migration doc §3.1.
+/// A [`Notification`] is the observe-only subset of the events a machine
+/// reports: every variant here carries a fact the machine wants to surface,
+/// never a request the machine is blocked on. A consumer that only advances the
+/// machine may therefore drop notifications without stalling progress. This is
+/// the Agent-effect-model split of the old combined event stream into
+/// *notifications* (skippable) and
+/// [*requirements*](crate::agent::Requirement) (must be resolved); see the
+/// Agent-effect migration doc §3.1.
 ///
-/// The payloads are the existing [`AgentEvent`] payload structs, reused rather
-/// than redefined, so a notification stays wire-compatible with the matching
-/// [`AgentEvent`] variant during the migration.
+/// The two kinds of events deliberately excluded here are requests or terminal
+/// states, not notifications, and map to the new model as follows:
 ///
-/// The two [`AgentEvent`] variants intentionally excluded here are requests or
-/// terminal states, not notifications, and map to the new model as follows:
-///
-/// - [`AgentEvent::AwaitingApproval`] is a request the loop blocks on; it
-///   becomes a `Requirement::NeedInteraction` (generalized approval, §4) and is
-///   resolved through the requirement return path, not observed as a
-///   notification.
-/// - [`AgentEvent::Done`] is no longer a stream event; turn completion is
-///   expressed by a quiescent step outcome (`StepOutcome.quiescent == true`)
-///   with an empty requirement set and the loop cursor reaching `Done`/`Error`
-///   (§3.1/§5).
-///
-/// This type coexists with [`AgentEvent`]; use the
-/// `From<Notification> for AgentEvent` bridge to render a notification as a
-/// legacy stream event. Because the excluded variants are not notifications,
-/// there is deliberately no reverse `From<AgentEvent> for Notification`.
+/// - Approval waits are requests the machine blocks on; each becomes a
+///   `Requirement::NeedInteraction` (generalized approval, §4) resolved through
+///   the requirement return path, not observed as a notification.
+/// - Turn completion is no longer a stream event; it is expressed by a quiescent
+///   step outcome (`StepOutcome.quiescent == true`) with an empty requirement
+///   set and the loop cursor reaching `Done`/`Error` (§3.1/§5).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Notification {
     /// Provider-neutral LLM stream event, carried without Agent-side rewriting.
-    ///
-    /// Mirrors [`AgentEvent::Llm`].
     Llm(StreamEvent),
     /// Agent step boundary where cross-cutting policies can be evaluated.
-    ///
-    /// Mirrors [`AgentEvent::StepBoundary`].
     StepBoundary(StepBoundary),
     /// Tool execution has started for a mapped tool call.
-    ///
-    /// Mirrors [`AgentEvent::ToolCallStarted`].
     ToolCallStarted(ToolCallStarted),
     /// Tool execution has finished and produced a complete response.
-    ///
-    /// Mirrors [`AgentEvent::ToolCallFinished`].
     ToolCallFinished(ToolCallFinished),
-}
-
-impl From<Notification> for AgentEvent {
-    /// Bridges a pure [`Notification`] onto the legacy [`AgentEvent`] stream.
-    ///
-    /// The mapping is variant-for-variant and payload-preserving, keeping the
-    /// notification subset wire-compatible with [`AgentEvent`] during the
-    /// migration.
-    fn from(notification: Notification) -> Self {
-        match notification {
-            Notification::Llm(event) => Self::Llm(event),
-            Notification::StepBoundary(boundary) => Self::StepBoundary(boundary),
-            Notification::ToolCallStarted(started) => Self::ToolCallStarted(started),
-            Notification::ToolCallFinished(finished) => Self::ToolCallFinished(finished),
-        }
-    }
 }
 
 /// Payload emitted at an Agent step boundary.
@@ -427,214 +379,6 @@ impl ToolCallFinished {
     }
 }
 
-/// Data emitted when a tool call is waiting for external approval.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApprovalRequest {
-    step_id: StepId,
-    call_id: ToolCallId,
-    call: ToolCall,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    trace_node_id: Option<TraceNodeId>,
-}
-
-impl ApprovalRequest {
-    /// Creates an approval-wait payload.
-    #[must_use]
-    pub fn new(
-        step_id: StepId,
-        call_id: ToolCallId,
-        call: ToolCall,
-        trace_node_id: Option<TraceNodeId>,
-    ) -> Self {
-        Self::with_reason(step_id, call_id, call, None, trace_node_id)
-    }
-
-    /// Creates an approval-wait payload with stable reason text.
-    #[must_use]
-    pub fn with_reason(
-        step_id: StepId,
-        call_id: ToolCallId,
-        call: ToolCall,
-        reason: Option<String>,
-        trace_node_id: Option<TraceNodeId>,
-    ) -> Self {
-        Self {
-            step_id,
-            call_id,
-            call,
-            reason: reason.and_then(non_empty),
-            trace_node_id,
-        }
-    }
-
-    /// Returns the step that requested approval.
-    #[must_use]
-    pub const fn step_id(&self) -> StepId {
-        self.step_id
-    }
-
-    /// Returns the framework-level tool-call identity awaiting approval.
-    #[must_use]
-    pub const fn call_id(&self) -> ToolCallId {
-        self.call_id
-    }
-
-    /// Returns the provider-neutral complete tool call awaiting approval.
-    #[must_use]
-    pub const fn call(&self) -> &ToolCall {
-        &self.call
-    }
-
-    /// Returns stable approval reason text, if one was supplied.
-    #[must_use]
-    pub fn reason(&self) -> Option<&str> {
-        self.reason.as_deref()
-    }
-
-    /// Returns the trace node associated with this approval wait, if any.
-    #[must_use]
-    pub const fn trace_node_id(&self) -> Option<&TraceNodeId> {
-        self.trace_node_id.as_ref()
-    }
-}
-
-/// Coarse terminal outcome category for a feed segment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentOutcomeKind {
-    /// The segment reached a normal final assistant response.
-    Completed,
-    /// The segment stopped because budget was exhausted.
-    BudgetExhausted,
-    /// The segment stopped because cancellation was observed and closed.
-    Cancelled,
-    /// The segment stopped with a classified runtime error.
-    Error,
-    /// The segment yielded until an external actor resumes it.
-    WaitingForExternalRecovery,
-}
-
-/// Classified terminal outcome for one feed segment.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", content = "data", rename_all = "snake_case")]
-pub enum AgentOutcome {
-    /// The segment reached a normal final assistant response.
-    Completed,
-    /// The segment stopped because a budget limit was exceeded.
-    BudgetExhausted(BudgetExhaustedOutcome),
-    /// The segment stopped because cancellation was observed and closed.
-    Cancelled,
-    /// The segment stopped with a classified runtime error.
-    Error(AgentFailure),
-    /// The segment yielded until a host, approver, or tool executor resumes it.
-    WaitingForExternalRecovery(ExternalRecoveryOutcome),
-}
-
-impl AgentOutcome {
-    /// Creates a budget-exhausted outcome from a classified budget error.
-    #[must_use]
-    pub const fn budget_exhausted(error: BudgetError) -> Self {
-        Self::BudgetExhausted(BudgetExhaustedOutcome::new(error))
-    }
-
-    /// Creates an error outcome from a classified Agent error.
-    #[must_use]
-    pub fn error(error: &AgentError) -> Self {
-        Self::Error(AgentFailure::from(error))
-    }
-
-    /// Creates an external-recovery outcome.
-    #[must_use]
-    pub fn waiting_for_external_recovery(
-        kind: ExternalRecoveryKind,
-        message: Option<String>,
-    ) -> Self {
-        Self::WaitingForExternalRecovery(ExternalRecoveryOutcome::new(kind, message))
-    }
-
-    /// Returns the coarse terminal outcome category.
-    #[must_use]
-    pub const fn kind(&self) -> AgentOutcomeKind {
-        match self {
-            Self::Completed => AgentOutcomeKind::Completed,
-            Self::BudgetExhausted(_) => AgentOutcomeKind::BudgetExhausted,
-            Self::Cancelled => AgentOutcomeKind::Cancelled,
-            Self::Error(_) => AgentOutcomeKind::Error,
-            Self::WaitingForExternalRecovery(_) => AgentOutcomeKind::WaitingForExternalRecovery,
-        }
-    }
-}
-
-/// Budget-exhausted outcome payload.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BudgetExhaustedOutcome {
-    error: BudgetError,
-}
-
-impl BudgetExhaustedOutcome {
-    /// Creates a budget-exhausted payload.
-    #[must_use]
-    pub const fn new(error: BudgetError) -> Self {
-        Self { error }
-    }
-
-    /// Returns the budget error that ended the segment.
-    #[must_use]
-    pub const fn error(&self) -> &BudgetError {
-        &self.error
-    }
-}
-
-/// External recovery category for a yielded feed segment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExternalRecoveryKind {
-    /// A tool call is waiting for approval.
-    AwaitingApproval,
-    /// One or more tool calls are waiting for host-side execution results.
-    AwaitingToolResults,
-    /// The host intentionally paused the loop at a recovery point.
-    Paused,
-    /// Cancellation recovery requires a later resume operation.
-    CancelRecovery,
-}
-
-/// External-recovery outcome payload.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExternalRecoveryOutcome {
-    kind: ExternalRecoveryKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
-}
-
-impl ExternalRecoveryOutcome {
-    /// Creates an external-recovery payload.
-    #[must_use]
-    pub fn new(kind: ExternalRecoveryKind, message: Option<String>) -> Self {
-        Self {
-            kind,
-            message: message.and_then(non_empty),
-        }
-    }
-
-    /// Returns the external-recovery category.
-    #[must_use]
-    pub const fn kind(&self) -> ExternalRecoveryKind {
-        self.kind
-    }
-
-    /// Returns stable diagnostic text, if one was supplied.
-    #[must_use]
-    pub fn message(&self) -> Option<&str> {
-        self.message.as_deref()
-    }
-}
-
 /// Stable error category usable in data-only outcomes and diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -664,43 +408,6 @@ pub enum AgentErrorKind {
     Subagent,
     /// The failure did not fit a more specific category.
     Other,
-}
-
-/// Data-only description of an Agent failure.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AgentFailure {
-    kind: AgentErrorKind,
-    message: String,
-}
-
-impl AgentFailure {
-    /// Creates failure data from a stable category and diagnostic message.
-    #[must_use]
-    pub fn new(kind: AgentErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-        }
-    }
-
-    /// Returns the stable error category.
-    #[must_use]
-    pub const fn kind(&self) -> AgentErrorKind {
-        self.kind
-    }
-
-    /// Returns the diagnostic message.
-    #[must_use]
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl From<&AgentError> for AgentFailure {
-    fn from(error: &AgentError) -> Self {
-        Self::new(error.kind(), error.to_string())
-    }
 }
 
 /// Classified Agent loop failure.
@@ -777,15 +484,10 @@ impl AgentError {
     }
 }
 
-fn non_empty(value: String) -> Option<String> {
-    if value.is_empty() { None } else { Some(value) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentError, AgentErrorKind, AgentEvent, AgentInput, AgentOutcome, AgentOutcomeKind,
-        ApprovalRequest, ExternalRecoveryKind, Notification, PivotMessage, StepBoundary,
+        AgentError, AgentErrorKind, AgentInput, Notification, PivotMessage, StepBoundary,
         ToolCallFinished, ToolCallStarted,
     };
     use crate::{
@@ -917,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_events_round_trip_as_data_shapes() {
+    fn notification_payloads_round_trip_as_data_shapes() {
         let mut metadata = Map::new();
         metadata.insert("budget_checked".to_owned(), Value::Bool(true));
         let boundary = StepBoundary::with_metadata(
@@ -926,95 +628,49 @@ mod tests {
             Some(TraceNodeId::new("step-trace")),
             metadata,
         );
-        let call = tool_call();
 
-        let events = [
-            AgentEvent::StepBoundary(boundary),
-            AgentEvent::ToolCallStarted(ToolCallStarted::new(
+        let notifications = [
+            Notification::StepBoundary(boundary),
+            Notification::ToolCallStarted(ToolCallStarted::new(
                 step_id(),
                 tool_call_id(),
-                call.clone(),
+                tool_call(),
                 Some(TraceNodeId::new("tool-trace")),
             )),
-            AgentEvent::AwaitingApproval(ApprovalRequest::new(
-                step_id(),
-                tool_call_id(),
-                call,
-                None,
-            )),
-            AgentEvent::ToolCallFinished(ToolCallFinished::new(
+            Notification::ToolCallFinished(ToolCallFinished::new(
                 step_id(),
                 tool_call_id(),
                 tool_response(),
                 None,
             )),
-            AgentEvent::Done(AgentOutcome::Completed),
-            AgentEvent::Done(AgentOutcome::waiting_for_external_recovery(
-                ExternalRecoveryKind::AwaitingApproval,
-                Some("waiting for human approval".to_owned()),
-            )),
         ];
 
-        for event in events {
-            assert_json_round_trip(event);
+        for notification in notifications {
+            assert_json_round_trip(notification);
         }
     }
 
     #[test]
-    fn llm_event_payload_is_transparent_stream_event_data() {
+    fn llm_notification_payload_is_transparent_stream_event_data() {
         let llm = StreamEvent::BlockDelta {
             id: BlockId::new("text-1"),
             delta: Delta::Text("hello".to_owned()),
         };
-        let event = AgentEvent::Llm(llm.clone());
+        let notification = Notification::Llm(llm.clone());
 
-        let encoded = serde_json::to_value(&event).expect("serialize agent event");
+        let encoded = serde_json::to_value(&notification).expect("serialize notification");
         assert_eq!(encoded["type"], json!("llm"));
         assert_eq!(
             encoded["data"],
             serde_json::to_value(&llm).expect("serialize stream event")
         );
 
-        let decoded: AgentEvent = serde_json::from_value(encoded).expect("decode agent event");
-        assert_eq!(decoded, event);
+        let decoded: Notification = serde_json::from_value(encoded).expect("decode notification");
+        assert_eq!(decoded, notification);
     }
 
     #[test]
-    fn done_outcomes_keep_distinct_terminal_classifications() {
-        let budget = BudgetError::Exceeded {
-            dimension: BudgetDimension::Steps,
-            limit: 2,
-            attempted: 3,
-            remaining: 0,
-        };
-        let outcomes = [
-            (AgentOutcome::Completed, AgentOutcomeKind::Completed),
-            (
-                AgentOutcome::budget_exhausted(budget),
-                AgentOutcomeKind::BudgetExhausted,
-            ),
-            (AgentOutcome::Cancelled, AgentOutcomeKind::Cancelled),
-            (
-                AgentOutcome::error(&AgentError::Client(crate::client::ClientError::Timeout)),
-                AgentOutcomeKind::Error,
-            ),
-            (
-                AgentOutcome::waiting_for_external_recovery(
-                    ExternalRecoveryKind::AwaitingToolResults,
-                    None,
-                ),
-                AgentOutcomeKind::WaitingForExternalRecovery,
-            ),
-        ];
-
-        for (outcome, expected_kind) in outcomes {
-            assert_eq!(outcome.kind(), expected_kind);
-            assert_json_round_trip(AgentEvent::Done(outcome));
-        }
-    }
-
-    #[test]
-    fn notifications_round_trip_and_bridge_to_agent_events() {
+    fn notifications_round_trip_and_keep_wire_shape() {
         let boundary = StepBoundary::new(
             step_id(),
             zero_boundary(),
@@ -1027,57 +683,38 @@ mod tests {
             delta: Delta::Text("hello".to_owned()),
         };
 
-        let cases = [
-            (Notification::Llm(llm.clone()), AgentEvent::Llm(llm)),
-            (
-                Notification::StepBoundary(boundary.clone()),
-                AgentEvent::StepBoundary(boundary),
-            ),
-            (
-                Notification::ToolCallStarted(started.clone()),
-                AgentEvent::ToolCallStarted(started),
-            ),
-            (
-                Notification::ToolCallFinished(finished.clone()),
-                AgentEvent::ToolCallFinished(finished),
-            ),
+        let notifications = [
+            Notification::Llm(llm),
+            Notification::StepBoundary(boundary),
+            Notification::ToolCallStarted(started),
+            Notification::ToolCallFinished(finished),
         ];
 
-        for (notification, expected_event) in cases {
+        for notification in notifications {
             assert_json_round_trip(notification.clone());
 
-            // The bridge maps each notification variant-for-variant onto the
-            // legacy stream, preserving its payload.
-            assert_eq!(AgentEvent::from(notification.clone()), expected_event);
-
-            // The notification stays wire-compatible with the bridged event.
-            assert_eq!(
-                serde_json::to_value(&notification).expect("serialize notification"),
-                serde_json::to_value(&expected_event).expect("serialize agent event"),
-            );
+            // Every notification serializes as a `{ "type", "data" }` tagged
+            // record, the wire shape the driver forwards downstream.
+            let encoded = serde_json::to_value(&notification).expect("serialize notification");
+            assert!(encoded.get("type").is_some());
         }
     }
 
     #[test]
-    fn notification_excludes_approval_and_done_variants() {
-        // AwaitingApproval is a request and Done is a terminal state, so
-        // neither has a Notification counterpart. Their tagged encodings must
-        // fail to decode as a Notification even though they still decode as an
-        // AgentEvent, which pins the notification variant set structurally.
-        let approval = AgentEvent::AwaitingApproval(ApprovalRequest::new(
-            step_id(),
-            tool_call_id(),
-            tool_call(),
-            None,
-        ));
-        let done = AgentEvent::Done(AgentOutcome::Completed);
+    fn notification_rejects_request_and_terminal_variants() {
+        // Approval waits are requests (now `Requirement::NeedInteraction`) and
+        // turn completion is a quiescent `StepOutcome`, so neither has a
+        // `Notification` counterpart. Their old tagged encodings must fail to
+        // decode as a notification, which pins the notification variant set
+        // structurally.
+        let excluded = [
+            json!({ "type": "awaiting_approval", "data": {} }),
+            json!({ "type": "done", "data": { "status": "completed" } }),
+        ];
 
-        for event in [approval, done] {
-            let encoded = serde_json::to_value(&event).expect("serialize agent event");
-            serde_json::from_value::<AgentEvent>(encoded.clone())
-                .expect("agent event still decodes");
+        for encoded in excluded {
             serde_json::from_value::<Notification>(encoded)
-                .expect_err("notification must not carry approval/done variants");
+                .expect_err("notification must not carry request/terminal variants");
         }
     }
 
@@ -1127,11 +764,11 @@ mod tests {
     }
 
     #[test]
-    fn llm_done_event_accepts_stream_stop_reason() {
-        let event = AgentEvent::Llm(StreamEvent::MessageStop {
+    fn llm_notification_accepts_stream_stop_reason() {
+        let notification = Notification::Llm(StreamEvent::MessageStop {
             stop_reason: StopReason::normalize("end_turn"),
         });
 
-        assert_json_round_trip(event);
+        assert_json_round_trip(notification);
     }
 }

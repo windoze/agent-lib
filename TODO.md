@@ -1680,7 +1680,7 @@ handler 派生子 agent 并再开一层 drain 递归驱动,并从"当前 drain s
   `cargo test --all --all-targets` 全绿(lib 435 + 集成含本文件新增 4 用例,0 failed);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` clean;`git diff --check` clean。
 
-### [TODO] M6-R Milestone 6 与迁移总 Review
+### [DONE] M6-R Milestone 6 与迁移总 Review
 
 **前置依赖**:M6-1..M6-2。
 
@@ -1703,3 +1703,74 @@ handler 派生子 agent 并再开一层 drain 递归驱动,并从"当前 drain s
 - 运行全套命令:`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check`。总 Review 结论与遗留项写入完成记录。
+
+**完成记录**:
+
+- **回溯 PLAN.md + TODO.md 全文 + 逐条不变量核对(全部通过)**:
+  - **sans-io `step` 不 await**:`machine/mod.rs` 的 `AgentMachine::step(&mut self, StepInput) ->
+    StepOutcome` 是纯同步签名(非 `async fn`、无 `.await`);`DefaultAgentMachine`
+    (`machine/default/mod.rs`)只 reify effect 不做 IO。`&mut self` 即天然背压(决策 B/§1)。
+  - **requirement/notification 二分**:`event.rs::Notification`(skippable 观测子集:Llm/StepBoundary/
+    ToolCallStarted/ToolCallFinished)与 `requirement.rs::Requirement`(不可跳过、带回程)分离;
+    turn 结束由 `StepOutcome.quiescent + cursor 到 Done/Error` 表达,不再是流事件(§3.1)。
+  - **`id + origin` 可寻址**:`Requirement { id: RequirementId, origin: AgentPath, kind }`
+    (`requirement.rs:308`),`RequirementResolution` 按 `id` 回程;`NestedMachine` 按 `id/origin`
+    精确路由(M5-1/M5-R 已验)。
+  - **pop 路由 + 顶层 total**:`drive.rs` 的 `Pop`/`resolve_requirement` 从发出者外层起查找,
+    顶层无 handler → `AgentError::UnhandledRequirement { kind, origin }`(`drive.rs:593`),
+    绝不静默跳过(§10)。
+  - **cancel = never-resume 接 `cancel_pending`**:`StepInput::Abandon(id)` 不回灌结果,machine
+    经 `Conversation::cancel_pending(CancelDisposition::DiscardTurn)` 闭合被弃 turn 回到可再喂的
+    `Idle`(`machine/default/mod.rs:310/760/779/828`、`drive.rs:391`);`CancellationToken` 仅作向下
+    信号(§6)。
+  - **多路径 `fork_at` 无 multishot**:Agent 层无 continuation 复制 / multishot;`fork_at` 仍属
+    Conversation Core,未在 Agent 层重实现或绕开(grep 无 `fork_at`/multishot 复制路径;trace 里
+    "continuation" 仅指"被 reify 成 requirement 的 delimited continuation",非多播复制)。
+  - **RunContext 由 scope 派生**:`context.rs::RunContext::derive_child`(:204)以 `budget.clone()`
+    共享 ledger、`cancellation.derive_child()` 派生子 token、`depth+1`;派生点集中在 subagent
+    handler,不散落别处(§9,M5-R 已验)。
+  - **serde/runtime 分离**:`StepOutcome`/机器状态/cursor(含 `RequirementId`/`AgentPath`)可序列化;
+    live `LlmClient`/`ToolRegistry`/handler/token/task 留在单独 runtime holder,不进 state JSON;
+    恢复走 `Conversation::restore`(§118–126)。
+- **Conversation Core 不变量未被 Agent 层重实现/绕开(通过)**:committed log、pending、tool
+  pairing、`Boundary`、restore 全部经 Conversation 既有入口(`begin_turn`/pending fold/`commit`/
+  `cancel_pending`/`snapshot`/`restore`);Agent 层只持有唯一活动 `Conversation` 并调用其受检 API,
+  未平行实现 I1–I4、pairing 或 Boundary 校验。
+- **旧 push API 核对 + 发现并修复一处 doc↔code 不一致**:
+  - 已从源码删除且仅存历史 archive 文档:`AgentLoop::feed`/`DefaultAgentLoop`/`loop_driver`/
+    `respond_approval`/pivot queue(`QueuedPivotTurn`/`interject`)/`AgentFeedGuard`(grep `src/`
+    均无)。cancel→`Abandon`、pivot→`AgentInput::Pivot`、审批→`NeedInteraction` 均已落地。
+  - **DEFECT(已修复)**:migration doc 头部与 M6-1 改写的 `agent-layer.md` §1.3 均**明列**
+    `AgentEvent 单一混装流`/`AwaitingApproval`/`Done(Outcome)` 为**已删除**旧 push API,但
+    `src/agent/event.rs` 仍定义 `AgentEvent`+`ApprovalRequest`+`AgentOutcome`/`AgentOutcomeKind`+
+    `AgentFailure`+`BudgetExhaustedOutcome`+`ExternalRecoveryKind`/`ExternalRecoveryOutcome`,
+    且这些类型**仅**被自身 test 与 `mod.rs` re-export 引用,无任何 live 机器/driver/context 路径
+    使用——即与文档相悖的死 legacy 代码。**修复(class-wide)**:删除上述死类型 + `non_empty`
+    helper + `From<Notification> for AgentEvent` bridge + 依赖它们的 test;重写 `Notification`/
+    module doc 去掉 `[AgentEvent]` intra-doc link(改述"旧混装流已删除,请求变 `NeedInteraction`、
+    turn 结束由 quiescent `StepOutcome` 表达");更新 `agent/mod.rs` re-export 与 `README.md`
+    §设计边界/概述(`AgentEvent::Llm`→`Notification::Llm`,去掉 `AgentOutcome` 当前 API 描述)。
+    保留 live:`AgentInput`/`AgentUserInput`/`Notification`+payloads(`StepBoundary`/
+    `ToolCallStarted`/`ToolCallFinished`)/`AgentError`/`AgentErrorKind`(`AgentErrorKind` 仍被
+    `drive.rs` live 使用)。删除后 code 与 doc 一致。
+- **验证(本轮实跑,HEAD 起点 615817c、工作树修复前 clean)**:`cargo fmt --all`(clean)、
+  `cargo clippy --all-targets -- -D warnings`(0 warning)、`cargo test --all --all-targets`
+  (lib **434** passed / 0 failed〔删 6 个 legacy test、新增 5 个 Notification test,净 -1〕;
+  `agent_effect_e2e` 4;`conversation_state_machine` 3;`capability_escape_hatches` 2;
+  `conversation_adapter_compat` 3;doctest 12;网络用例 ignored;每测试 <1min)、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean)、`git diff --check`(clean)均通过。
+- **结论**:Agent Effect Model 迁移(M1–M6)**完整落地**且未弱化 Conversation Core 不变量;
+  sans-io `step` / requirement-notification 二分 / `id+origin` 寻址 / pop 顶层 total /
+  cancel=never-resume 接 `cancel_pending` / 无 multishot / RunContext scope 派生 / serde-runtime
+  分离八项全部与迁移文档一致。本 Review 发现并修复了唯一一处 doc↔code 不一致(删除已声明删除的
+  死 `AgentEvent` legacy 类型)。PLAN.md 阶段级计划无变化,不改。
+
+- **后续(遗留 / 未来项,非阻塞,记录供追溯)**:
+  - **决策 C(§12-C)批 requirement 稳定顺序 / 优先级**:当前一批 requirement 由 driver 自行编排
+    (`drain` 用 `FuturesUnordered` 按完成序回灌,不强制 interaction 优先于 llm)。是否需要稳定
+    排序 / 优先级留到首批真实多 agent 用例再定(effect-model §11 第 2 条)。
+  - **决策 D(§12-D)token delta 的 tee**:`NeedLlm` 兑现目前由 `drain` 直接透传
+    `Notification::Llm`,未提供 `LlmHandler::fulfill` 的独立 `sink` 参数把 token 流 tee 给 UI。
+    最终形态(可选 sink vs. 透传)留到有真实流式 UI 消费需求时确定。
+  - **driver 编排归调用者**:join/select/串行等多 agent 调度不入库,库只提供 `step`/`drain`/
+    `HandlerScope`/`Pop`/`NestedMachine` 机制与 pop-total 不变量(§非目标)。
