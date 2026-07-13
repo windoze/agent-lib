@@ -1070,7 +1070,7 @@ client 与调度属于外部运行时，不能序列化进 Conversation 或把 A
   0 failed，所有 example targets passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
   `git diff --check`。
 
-### M4-R [TODO] Milestone 4 Review
+### M4-R [DONE] Milestone 4 Review
 
 **前置依赖**：M4-1 至 M4-4 全部完成。
 
@@ -1092,6 +1092,33 @@ client 与调度属于外部运行时，不能序列化进 Conversation 或把 A
   公共 API 只能通过 checked range 和原子 apply 改 projection。
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 对照规范 §6/§6.1 完成 M4 审查：projection 仍是 raw history 上的非破坏性 overlay；
+  `CheckedTurnRange` 只覆盖完整 Turn boundary；`effective_view` 以 logical head 为上界；
+  pending 不进入 committed projection/effective view，只能通过显式 `pending_context` 读取已冻结
+  payload；soft-limit 只产生可推迟的 data-only intent，turn 内 hard-limit 仍属 Agent loop 层职责。
+- 新增 `conversation::projection::tests::review` 组合矩阵回归：同一父会话串联首次 tiered
+  compaction、第二段 raw tail compaction、summary-of-summaries consolidate、revert 进入
+  compacted cover、redo、从 cover 内 fork child，以及 pending 时 apply 拒绝；逐项断言 raw
+  Turn/message id/payload 不变、旧 tier artifact 继续作为 provenance/audit 数据保留、consolidated
+  artifact 的 covers/strategy/token accounting 可追踪、head 落入 cover 时只渲染可见 raw 前缀且不
+  泄漏未来摘要，redo 后 compacted rendering 恢复。
+- 组合矩阵同时确认 fork child 只含 fork ceiling 以内 raw prefix，不继承父 projection artifact、
+  父 suffix 或摘要内容；pending active 时 `apply_compaction` 返回分类
+  `ProjectionError::PendingTurn`，旧 projection/raw history 原子不变，committed `effective_view`
+  不含 pending user，而 `pending_context` 只显式暴露已冻结 user payload。
+- strategy/trigger 审查确认 runtime `CompactionStrategy`/`CompactionTrigger`、resolver、client handle
+  与 Agent loop 均未进入 Conversation/Core 持久化事实；`CompactionPlan`/`CompactionStep`、artifact
+  与 provenance 仍是 data-only，并通过 `StrategyRef` 关联外部实现。阶段顺序、依赖和完成标准未
+  变化，因此未修改 `PLAN.md`。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test conversation::projection::tests::review -- --nocapture`（1 passed）；
+  `cargo test conversation::projection -- --nocapture`（25 passed）；1800 秒硬上限内
+  `cargo test --all --all-targets`（269 个库测试与 3 个离线集成测试 passed、7 ignored、
+  0 failed，所有 example targets passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
   `git diff --check`。
 
 ---
