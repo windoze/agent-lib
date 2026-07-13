@@ -1,103 +1,68 @@
-# 本次执行计划
+# 当前调用执行计划
 
-## 目标与边界
+> 本文件记录可审计的执行计划、关键判断依据、进度与验证结果；不记录模型的私有逐字推理。
 
-- 本次调用只完成 `TODO.md` 中按顺序出现的第一个标题未带 `[DONE]` 的任务，然后停止。
-- `TODO.md` 是任务顺序、依赖、验收要求与完成记录的唯一依据；只有阶段级计划发生变化时才更新 `PLAN.md`。
-- 不进行开放式历史缺陷扫描。只检查当前任务、最新提交直接提及且与当前任务相关的未完事项，以及验证过程中实际暴露的失败。
-- 不采用缩小范围、替代表示、临时兼容层或其他规避规范的做法。若出现无法在当前任务内正确解决的具体前置阻塞，则只添加最少的前置任务、提交该调整并停止。
-- 本文件记录可复核的计划、事实、决策与进度，不记录模型隐藏的逐字思维链。
+## 目标与约束
+
+- 以 `TODO.md` 为唯一任务顺序与验收来源，只处理标题中第一个未带 `[DONE]` 的任务。
+- 在选择该任务后，仅检查与该任务直接相关的最新提交、实现、测试和文档；不进行开放式历史缺陷扫描。
+- 若发现直接阻塞当前任务的既有缺陷或未建模前置条件，按要求在 `TODO.md` 中插入最少的前置任务、保持当前任务未完成、提交任务表调整后停止。
+- 若无阻塞，则完整实现、测试、更新完成记录、提交；不继续下一个任务。
+- 尊重现有未提交改动，先辨认其归属，不覆盖或丢弃用户改动；若这是上次中断留下的同一任务工作，最终提交需包含所有未提交文件。
 
 ## 分步计划
 
-1. 读取 `TODO.md`，按标题顺序找出第一个未带 `[DONE]` 的任务，完整读取其需求、依赖、测试要求和完成记录；同时读取相关的 `PLAN.md` 部分。
-2. 检查最新一次 Git 提交说明和当前工作区状态：
-   - 判断最新提交是否明确提到与当前任务直接相关的未完问题；
-   - 识别是否存在上次中断遗留的未提交改动；
-   - 保留用户已有的无关改动，不擅自回退或覆盖。
-3. 将识别出的任务编号、验收条件、相关文件和具体实施步骤补充到本文件，再开始实现。
-4. 检查当前任务涉及的实现与测试边界，确认没有必须先修复的规范偏差。若有直接阻塞：优先在当前任务内做类级修复；若确实必须成为独立前置任务，则更新 `TODO.md` 的依赖顺序、记录阻塞、提交并停止。
-5. 以小而聚焦的补丁完成实现；每个关键步骤后重新读取受影响代码，并同步更新本文件的进度和必要的计划调整。
-6. 添加或更新覆盖正常路径、边界条件、错误路径和回归场景的测试。任何新观察到且未被后续任务明确安排的失败，都必须在当前任务中修复或作为最少前置任务写入 `TODO.md`。
-7. 按规定顺序验证：
-   - `cargo fmt --all`
-   - `cargo clippy --all-targets -- -D warnings`
-   - `cargo test --all --all-targets`（最长 30 分钟）
-   - 按当前任务要求运行额外测试或文档构建；若任务要求完整交付验证，则运行 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
-8. 验证全部通过后，在 `TODO.md` 中把当前任务标题显式加上 `[DONE]`，填写包含实现内容和验证结果的完成记录。仅在阶段级依赖或完成标准改变时更新 `PLAN.md`。
-9. 复查 diff、任务边界、文档和 Git 状态，确保没有敏感信息、无关改动或未调度失败；若是恢复中断任务，则按要求将所有现存未提交文件纳入同一提交。
-10. 使用包含任务编号的清晰提交信息提交全部本次改动。确认提交成功、工作区符合预期后停止，不开始下一个任务。
+1. 读取 `TODO.md`，从上到下识别首个标题未带 `[DONE]` 的任务，完整摘取其需求、依赖、验收命令和完成记录格式。
+2. 查看工作树状态和最新提交摘要；只判断未提交内容及最新提交是否与当前任务直接相关，并据此确认是全新执行、恢复执行，还是存在必须先处理的前置问题。
+3. 阅读 `PLAN.md` 中与该任务所属阶段直接相关的部分，以及任务点名的代码、测试和文档；建立需求到实现与测试的对应关系。
+4. 在不缩窄规范、不引入临时兼容层的前提下，按小而聚焦的补丁实现任务；每完成关键实现或计划发生变化，立即更新本文件。
+5. 增补或调整覆盖正常路径、边界条件、错误分类、原子性/不变量（若任务涉及）的测试；先运行聚焦测试以快速定位问题。
+6. 按规定顺序验证：`cargo fmt --all`，然后 `cargo clippy --all-targets -- -D warnings`，最后在不超过 30 分钟的超时约束下运行 `cargo test --all --all-targets`；再执行任务要求的其他验证（例如文档构建）。任何未被后续任务明确安排的失败都必须在本次修复或转化为排在当前任务前的最小前置任务。
+7. 验证通过后，在 `TODO.md` 的任务标题前添加 `[DONE]`，填写准确的实现与验证记录。仅当阶段级顺序、依赖、假设或完成标准确实变化时才更新 `PLAN.md`。
+8. 复查差异、任务范围、格式与工作树，确认没有秘密、构建产物或无关改动；用包含任务编号的清晰信息创建一次 Git 提交。若属于恢复执行，按要求将当前所有未提交文件纳入同一提交。
+9. 记录最终提交哈希与完成状态，然后停止，不读取或执行下一个任务。
 
 ## 当前进度
 
-- [x] 在运行其他命令前建立本计划文件。
-- [x] 识别并完成本次任务：`M3-1 [DONE] 结构共享 raw history 与派生 ToolCallIndex`。
-- [x] 完成实现与测试。
-- [x] 更新 `TODO.md` 完成记录。
-- [ ] 提交并停止。
+- [x] 在任何检查、构建或代码命令前创建本计划文件。
+- [x] 识别首个未完成任务：`M3-2 受检 Boundary、version 与 stale/ABA 防护`。
+- [x] 确认工作树与直接相关上下文：当前为 `M3-2` 中断恢复，已有同任务未提交改动。
+- [x] 完成实现与聚焦测试。
+- [x] 完成格式化、严格 lint、完整测试及任务专属验证。
+- [x] 更新 `TODO.md` 完成记录并标记 `M3-2 [DONE]`。
+- [x] 完成最终差异审计；本文件将随全部 `M3-2` 恢复现场纳入任务提交，然后停止。
 
-## 当前任务的验收映射
+## 计划变更与关键结果
 
-- 结构共享 history 必须保存全部 raw `Turn`、parent 关系、当前 active lineage 和有效 tip；
-  clone/fork 所需路径不得遍历或深拷贝历史节点。
-- lineage 改道后，旧 suffix 仍须按 `TurnId` 保留和可读，但不得进入当前有效视图。
-- `ToolCallIndex` 只能由 closed turns 与 pending 派生，可按内部 `ToolCallId` 和 provider call
-  id 定位 call/result；增量更新必须与全量重建等价，且只反映 active lineage + 当前 pending。
-- validator 仍是 history 唯一写入口；Turn/Message/ToolCall 的重复 id 检查必须覆盖所有 retained
-  raw 节点，包括隐藏旧分支。
-- 测试需覆盖长历史节点共享、append 不改变旧节点、serial/parallel index 定位、增量/重建
-  等价，以及隐藏分支不进 index但 raw 节点仍存在。
-
-## 恢复现场记录
-
-- 最新提交 `59dbb24061429ca45e13115efd40db72c222eaa4` 仅完成 `M2-R`，没有明确提及与
-  `M3-1` 直接相关的额外未完问题。
-- 初始工作区已经有 `M3-1` 相关未提交改动：`src/conversation/history.rs`、
-  `src/conversation/history/`、`mod.rs`、pending cancel、Turn 测试和 validation 文件。
-  这次按中断续作处理：先审计而不是覆盖，并在任务完成时将所有当前未提交文件一起提交。
-- `memory/claude_plan.md` 是本次按要求首先更新的进度文件。
-
-## 接下来实施顺序
-
-1. 完整读取 `PLAN.md` 的 M3 约束、`docs/conversation-core.md` 的 raw/head/index 规范，以及现有
-   Conversation/Turn/Pending API；同时审查全部未提交 diff。
-2. 对照验收映射列出遗留实现的缺口，重点检查结构共享复杂度、隐藏分支 identity、pending
-   index 生命周期、commit/cancel 原子性以及 public API 是否提前泄漏 M3-2 功能。
-3. 以小补丁补齐实现与测试；每个关键阶段在本文件记录实际完成情况和计划变化。
-4. 按 format → clippy → 聚焦测试 → 全量测试 → rustdoc → diff check 顺序验证。
-5. 标记 `M3-1 [DONE]`、写完成记录、复核并提交；不触碰 `M3-2` 的实现。
-
-## 实施进度记录
-
-- 已完整读取 M3 阶段计划和 `docs/conversation-core.md` 中 raw history、parent tree、head、
-  fork 与派生 index 约束；确认本任务不提前引入受检 `Boundary` 或公开 revert/fork API。
-- 已审计中断遗留实现：`History` 用 `Arc<Lineage>`、`Arc<HistoryNode>` 和持久化 raw entry
-  链实现 O(1) clone；active prefix 改道后旧节点仍在 raw scope。commit validator、pending
-  identity 和 cancel identity 均已改为扫描 retained raw facts，而非读取派生 index。
-- 初次聚焦编译发现 `history/tests/mod.rs` 声明但缺少 `tests/index.rs`，同时全量重建函数仅在
-  测试配置使用会产生 dead-code warning。已补齐模块化 index 测试，并将只读
-  `ToolCallIndex::rebuild` 作为有 rustdoc 的公共派生构造公开，避免把 index 变成事实来源。
-- 已补充 4 类 index 回归：parallel + serial 生命周期逐步对比增量/重建、跨 Turn 重复
-  provider id 的有序多结果、缺省 persisted provider id 的受检 content-anchor 解析、cancel
-  Resume/Commit/Discard 的 pending suffix 同步。无效 mapping 另断言 index 原子不变。
-- 当前聚焦结果：`cargo test conversation::history --no-fail-fast`，6 passed、0 failed；最长
-  用例约 0.02 秒总计，满足单测时限。
-- 下一步：更新 README/crate 级能力说明，随后按规定从 `cargo fmt --all` 开始正式验证。
-
-## 最终验证进度
-
-- [x] `cargo fmt --all`。
-- [x] `cargo clippy --all-targets -- -D warnings`，0 warning。
-- [x] `cargo test conversation::history -- --nocapture`：6 passed、0 failed。
-- [x] `/opt/homebrew/bin/timeout 1800 cargo test --all --all-targets`：220 个库测试与 3 个
-  离线集成测试 passed，7 个需真实凭据的 endpoint 测试 ignored，所有 example targets passed。
-- [x] `cargo test --doc`：1 个正向 doctest 与 9 个 compile-fail doctest passed。
-- [x] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
-- [x] 已更新 README 与 crate 级文档，说明结构共享 raw history 和非事实来源的派生 index；
-  `PLAN.md` 的阶段顺序、依赖与完成标准未改变，故不修改。
-- [x] 按规模审计把 323 行 index 测试拆为 lifecycle/provider/cancellation 三个聚焦模块，
-  并在拆分后重新跑完上述整条验证链。
-- [x] 已在 `TODO.md` 标记 `M3-1 [DONE]` 并写完成记录。
-- [x] 最终 `git diff --check` 与状态/diff 审计。
-- [ ] 使用 `[M3-1] Implement shared history and derived tool-call index` 提交全部恢复现场改动，
-  确认工作区后停止。
+- `TODO.md` 中从上到下首个未带 `[DONE]` 的标题位于第 599 行：`M3-2 [TODO]`。
+- 当前任务要求新增私有字段的 `Boundary` token、合法边界枚举与按 Turn 查询、统一 owner /
+  structural version / anchor / range / pending 校验，以及稳定分类的 stale、ABA、跨会话、未知
+  Turn、fork ceiling 和伪造 serde token 负例。
+- `M3-3` 才负责真正的 head/revert/redo 操作，因此本次只建立边界模型与统一校验基础；测试所需
+  的 future suffix / fork ceiling 应在当前 history 内部能力上验证，不能提前公开或实现下一
+  任务的完整状态转换。
+- 最新提交 `72506520dfbc5998b06087cb61533ea79921afea` 是已完成的 `M3-1`，提交说明没有
+  M3-2 直接相关的未完成问题。
+- 工作树已有 `README.md`、`docs/conversation-core.md`、Conversation error/history/module、
+  crate root 及新 `boundary` 模块的未提交修改，形状与 M3-2 完全一致；`TODO.md` 尚未修改。
+  因此按“恢复同一任务”处理：逐项审计、修正、验证，并在最终提交中包含当前全部未提交文件。
+- 已对照 `PLAN.md` 与 `docs/conversation-core.md` §9 审计现有实现：`Boundary` 私有字段绑定
+  owner、`turn_count`、稳定 `after_turn` anchor 与 version；公开签发 API 覆盖 zero、每个
+  addressable Turn、revert 后 redo suffix；统一 resolver 按 owner/version/pending/range/
+  fork ceiling/anchor 校验，serde 仅恢复声明。
+- `History` 将 active head、addressable lineage ceiling 与共享 backing allocation 分离，既能让
+  root 的 future suffix 继续可寻址，也能让测试中的 fork child 精确拒绝 ceiling 以上位置；
+  真正的公开 head/revert/fork 转换仍留在 M3-3/M3-4，没有扩大本任务范围。
+- 现有正负测试已经覆盖任务列出的 empty/multi/zero/head/future redo、cross-owner、stale/ABA、
+  pending、unknown/detached、fork ceiling、伪造 range/anchor 与 serde round-trip，并对所有拒绝
+  路径快照比较 state 不变。现在按规定进入 format → clippy → 聚焦 → 全量 → rustdoc 验证链。
+- 正式验证全部通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；Boundary
+  聚焦测试 12 passed；1800 秒硬上限内全量测试为 232 个库测试与 3 个离线集成测试 passed、
+  7 ignored、0 failed，全部 example targets passed；doctest 为 1 个正向与 10 个
+  compile-fail passed；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；首次
+  `git diff --check`。
+- 已在 `TODO.md` 把标题更新为 `M3-2 [DONE]` 并填写实现、错误边界、测试矩阵与验证记录；
+  `PLAN.md` 的阶段顺序、依赖、假设和完成标准没有变化，按规则未修改。完成记录和本进度文件
+  是验证后的纯 Markdown 变更，无需重复运行编译测试；最终仍会重跑 diff check 并审计暂存内容。
+- 最终暂存审计包含 13 个文件，均属于 Boundary 实现、测试、相关 history/error 接线、规范/
+  README、TODO 与恢复进度；没有无关文件或构建产物，`git diff --cached --check` 通过。

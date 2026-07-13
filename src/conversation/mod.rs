@@ -8,8 +8,11 @@
 //! used by the pending layer. Cancellation discards active partials and either
 //! drops the whole pending turn, restores an assistant boundary with explicit
 //! cancelled tool results, or validates a caller-supplied final response before
-//! committing.
+//! committing. Complete-Turn cuts use Conversation-issued [`Boundary`] tokens
+//! whose owner, structural version, lineage position/anchor, fork ceiling, and
+//! pending consistency state are checked before consumption.
 
+pub mod boundary;
 pub mod config;
 pub mod error;
 mod history;
@@ -19,10 +22,11 @@ pub mod pending;
 pub mod turn;
 mod validation;
 
+pub use boundary::Boundary;
 pub use config::ConversationConfig;
 pub use error::{
-    CancelError, CommitError, ContentBlockKind, ConversationError, PairingMessageKind,
-    PendingMessageError, PendingTurnError,
+    BoundaryError, CancelError, CommitError, ContentBlockKind, ConversationError,
+    PairingMessageKind, PendingMessageError, PendingTurnError,
 };
 pub use history::{ToolCallIndex, ToolCallLocation, ToolCallLocationKind};
 pub use id::{ArtifactId, ConversationId, MessageId, ToolCallId, TurnId};
@@ -124,7 +128,11 @@ impl Conversation {
         self.pending.as_ref()
     }
 
-    /// Returns the monotonic version advanced by each successful commit.
+    /// Returns the monotonic version advanced by each structural history change.
+    ///
+    /// Successful commits currently advance it. Later checked head movement
+    /// and fork/restore transitions use the same structural-version domain so
+    /// previously issued [`Boundary`] tokens cannot survive an ABA change.
     #[must_use]
     pub const fn version(&self) -> u64 {
         self.version

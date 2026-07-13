@@ -247,15 +247,23 @@ Revert = **移动 `head`**,不物理删除任何 turn。
 ```rust
 /// 只能指向合法 Turn 边界的受检类型。由 Conversation 生成并校验。
 struct Boundary {
-    turn_idx: TurnIdx,   // "在第 turn_idx 个 turn 之后"
-    version: u64,        // 生成时的 conversation version;版本变了则失效(防 ABA)
+    conversation_id: ConversationId, // token owner;跨 Conversation 不可复用
+    turn_count: u64,                  // 此切割点之前有多少个完整 Turn
+    after_turn: Option<TurnId>,       // zero 为 None,其余位置的稳定 Turn 锚点
+    version: u64,                     // 生成时 structural version;变化即失效(防 ABA)
 }
 
 impl Conversation {
-    fn valid_boundaries(&self) -> Vec<Boundary>;  // 全部 turn 边界(全部天然合法)
-    fn boundary_after(&self, turn: TurnId) -> Option<Boundary>;
+    fn valid_boundaries(&self) -> Vec<Boundary>;  // zero + lineage ceiling 内全部 Turn 边界
+    fn boundary_after(&self, turn: TurnId) -> Result<Boundary, BoundaryError>;
+    fn validate_boundary(&self, boundary: &Boundary) -> Result<(), BoundaryError>;
 }
 ```
+
+`Boundary` 字段私有，只由 Conversation 签发。serde 反序列化只能恢复不可信 token；消费时
+统一检查 owner、version、位置/锚点、lineage/fork ceiling 与 `pending == None`。逻辑 revert
+后，`valid_boundaries` 仍可为同一 lineage 上 head 之后的 suffix 签发新版本 token 以支持
+redo；旧 token 即使再次落在相同位置也必须返回 `StaleBoundary`。
 
 | 功能 | 用法 |
 |---|---|

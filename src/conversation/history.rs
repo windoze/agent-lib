@@ -21,6 +21,7 @@ pub use index::{ToolCallIndex, ToolCallLocation, ToolCallLocationKind};
 pub(crate) struct History {
     raw: RawHistory,
     lineage: Arc<Lineage>,
+    lineage_len: usize,
     active_len: usize,
 }
 
@@ -31,6 +32,7 @@ impl History {
         Self {
             raw: RawHistory::new(lineage.clone()),
             lineage,
+            lineage_len: 0,
             active_len: 0,
         }
     }
@@ -38,6 +40,27 @@ impl History {
     /// Returns the current effective lineage as the legacy read-only slice.
     pub(crate) fn turns(&self) -> &[Turn] {
         &self.lineage.turns[..self.active_len]
+    }
+
+    /// Returns every addressable turn on this lineage, including redo suffixes.
+    ///
+    /// `lineage_len` is independent from the backing allocation so a fork can
+    /// share its parent's lineage while imposing a strict fork ceiling.
+    pub(crate) fn lineage_turns(&self) -> &[Turn] {
+        &self.lineage.turns[..self.lineage_len]
+    }
+
+    /// Returns the shared backing lineage, including turns beyond a fork ceiling.
+    ///
+    /// Boundary validation uses this only to distinguish an invalid raw range
+    /// from a parent suffix that a forked child is forbidden to address.
+    pub(crate) fn backing_lineage_turns(&self) -> &[Turn] {
+        &self.lineage.turns
+    }
+
+    /// Returns the number of turns addressable by this Conversation lineage.
+    pub(crate) const fn lineage_len(&self) -> usize {
+        self.lineage_len
     }
 
     /// Returns the effective tip node, or `None` at the zero-turn boundary.
@@ -76,6 +99,26 @@ impl History {
         turns.push(turn);
         self.lineage = Arc::new(Lineage { nodes, turns });
         self.active_len += 1;
+        self.lineage_len = self.active_len;
+    }
+
+    /// Shares an addressable lineage prefix without copying it in boundary tests.
+    ///
+    /// The returned history sees only the selected prefix as raw inherited
+    /// state. Turns later in the backing allocation remain useful for precise
+    /// fork-ceiling diagnostics but cannot be queried as child raw history.
+    #[cfg(test)]
+    pub(crate) fn shared_prefix(&self, lineage_len: usize) -> Option<Self> {
+        if lineage_len > self.lineage_len {
+            return None;
+        }
+
+        Some(Self {
+            raw: RawHistory::from_shared_lineage(self.lineage.clone(), lineage_len),
+            lineage: self.lineage.clone(),
+            lineage_len,
+            active_len: lineage_len,
+        })
     }
 
     /// Finds a retained raw turn by stable identity, including hidden suffixes.
@@ -116,12 +159,12 @@ impl History {
 
     /// Moves the effective tip in tests that exercise the M3-1 storage layer.
     ///
-    /// Public checked head movement is introduced by the later Boundary task;
+    /// Public checked head movement is introduced by the later revert task;
     /// this hook exists only to prove now that a replacement suffix leaves raw
     /// nodes intact and excluded from the effective lineage.
     #[cfg(test)]
-    fn set_active_len_for_test(&mut self, active_len: usize) {
-        assert!(active_len <= self.lineage.turns.len());
+    pub(crate) fn set_active_len_for_test(&mut self, active_len: usize) {
+        assert!(active_len <= self.lineage_len);
         self.active_len = active_len;
     }
 }
@@ -137,6 +180,7 @@ impl fmt::Debug for History {
         formatter
             .debug_struct("History")
             .field("raw_len", &self.raw.len())
+            .field("lineage_len", &self.lineage_len)
             .field("active_len", &self.active_len)
             .field("tip", &self.tip_id())
             .finish()
@@ -176,6 +220,18 @@ impl RawHistory {
         Self {
             base: empty_lineage,
             base_len: 0,
+            local_tip: None,
+            local_len: 0,
+        }
+    }
+
+    /// Creates a test fork scope over one immutable parent-lineage prefix.
+    #[cfg(test)]
+    fn from_shared_lineage(base: Arc<Lineage>, base_len: usize) -> Self {
+        debug_assert!(base_len <= base.turns.len());
+        Self {
+            base,
+            base_len,
             local_tip: None,
             local_len: 0,
         }

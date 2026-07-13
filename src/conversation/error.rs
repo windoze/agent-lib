@@ -1,7 +1,7 @@
 //! Classified errors produced by Conversation state transitions.
 
 use crate::{
-    conversation::{MessageId, ToolCallId, TurnId, pending::PendingTurnPhase},
+    conversation::{ConversationId, MessageId, ToolCallId, TurnId, pending::PendingTurnPhase},
     model::message::Role,
     stream::accumulator::AccumulatorError,
 };
@@ -559,9 +559,93 @@ pub enum CancelError {
     },
 }
 
+/// A boundary token was unknown or invalid for the current Conversation state.
+///
+/// Validation is deliberately Conversation-relative: serde can recover the
+/// token fields, but only the owning Conversation can prove their lineage,
+/// structural version, and consistency-point meaning.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum BoundaryError {
+    /// The token belongs to another Conversation identity.
+    #[error("boundary belongs to conversation {actual}, but this conversation is {expected}")]
+    OwnerMismatch {
+        /// Identity required by the validating Conversation.
+        expected: ConversationId,
+        /// Identity embedded in the supplied token.
+        actual: ConversationId,
+    },
+
+    /// The Conversation structure changed after this token was issued.
+    #[error(
+        "boundary was issued at structural version {boundary_version}, current version is {current_version}"
+    )]
+    StaleBoundary {
+        /// Structural version embedded in the token.
+        boundary_version: u64,
+        /// Structural version currently owned by the Conversation.
+        current_version: u64,
+    },
+
+    /// Boundary-consuming operations require a committed consistency point.
+    #[error("boundary cannot be consumed while pending turn {turn_id} is active")]
+    PendingTurn {
+        /// Uncommitted transaction preventing a history cut.
+        turn_id: TurnId,
+    },
+
+    /// A token position exceeds even the immutable backing lineage.
+    #[error("boundary after {turn_count} turns exceeds backing lineage length {backing_turns}")]
+    PositionOutOfRange {
+        /// Number of complete turns claimed before the boundary.
+        turn_count: u64,
+        /// Number of turns available in the backing lineage.
+        backing_turns: u64,
+    },
+
+    /// A token addresses a parent suffix hidden above a fork's ceiling.
+    #[error("boundary after {turn_count} turns exceeds this fork's lineage ceiling {fork_ceiling}")]
+    BeyondForkCeiling {
+        /// Number of complete turns claimed before the boundary.
+        turn_count: u64,
+        /// Largest inherited lineage position this fork may address.
+        fork_ceiling: u64,
+    },
+
+    /// The stable Turn anchor does not match the token's lineage position.
+    #[error(
+        "boundary anchor mismatch after {turn_count} turns: expected {expected:?}, found {actual:?}"
+    )]
+    AnchorMismatch {
+        /// Number of complete turns before the boundary.
+        turn_count: u64,
+        /// Turn that actually precedes this lineage position.
+        expected: Option<TurnId>,
+        /// Turn anchor embedded in the supplied token.
+        actual: Option<TurnId>,
+    },
+
+    /// `boundary_after` was asked about a Turn absent from retained raw history.
+    #[error("turn {turn_id} is unknown to this conversation")]
+    UnknownTurn {
+        /// Unknown Turn identity.
+        turn_id: TurnId,
+    },
+
+    /// The Turn is retained for debugging but belongs to another lineage.
+    #[error("turn {turn_id} is retained but not on the current lineage")]
+    TurnNotOnLineage {
+        /// Detached raw Turn identity.
+        turn_id: TurnId,
+    },
+}
+
 /// A Conversation operation failed without changing committed state.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ConversationError {
+    /// A boundary token failed owner/version/lineage consistency checks.
+    #[error("boundary operation rejected: {0}")]
+    Boundary(#[from] BoundaryError),
+
     /// The candidate turn failed closed-turn validation.
     #[error("turn commit rejected: {0}")]
     Commit(#[from] CommitError),

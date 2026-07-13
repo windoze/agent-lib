@@ -26,7 +26,10 @@
 //!   that transaction without touching previously committed turns. Committed
 //!   turns live in structurally shared raw history, while the rebuildable
 //!   [`conversation::ToolCallIndex`] accelerates framework/provider call lookup
-//!   for only the current lineage and pending transaction.
+//!   for only the current lineage and pending transaction. Versioned,
+//!   Conversation-owned [`conversation::Boundary`] tokens name only complete
+//!   Turn cuts; their position and stable anchor are revalidated against owner,
+//!   structural version, lineage/fork range, and pending state before use.
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are deliberately outside this crate. Those layers should persist and replay
