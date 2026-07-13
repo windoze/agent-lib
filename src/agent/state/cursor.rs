@@ -259,6 +259,41 @@ impl LoopCursor {
         }
     }
 
+    /// Re-stamps the [`AgentPath`] origin of this cursor's requirement
+    /// binding(s) to `base`, the absolute path of the machine that owns it.
+    ///
+    /// A single sans-io machine always stamps its bindings at the root; when
+    /// that machine sits inside a nested tree at `base`, the owning node
+    /// re-stamps the cursor so the persisted binding records the real path from
+    /// the tree root (migration doc §7.1). Requirement-free cursors
+    /// ([`Idle`](Self::Idle), [`CancelRecovery`](Self::CancelRecovery),
+    /// [`Done`](Self::Done), [`Error`](Self::Error)) are left unchanged.
+    pub(crate) fn rebase_origin(&mut self, base: &AgentPath) {
+        match self {
+            Self::StreamingStep(cursor) => {
+                if let Some(requirement) = cursor.requirement.as_mut() {
+                    requirement.origin = base.clone();
+                }
+            }
+            Self::AwaitingApproval(cursor) => {
+                if let Some(requirement) = cursor.requirement.as_mut() {
+                    requirement.origin = base.clone();
+                }
+            }
+            Self::AwaitingReconfig(cursor) => {
+                if let Some(requirement) = cursor.requirement.as_mut() {
+                    requirement.origin = base.clone();
+                }
+            }
+            Self::AwaitingTool(cursor) => {
+                if let Some(requirements) = cursor.requirements.as_mut() {
+                    requirements.origin = base.clone();
+                }
+            }
+            Self::Idle | Self::CancelRecovery(_) | Self::Done(_) | Self::Error(_) => {}
+        }
+    }
+
     pub(super) fn validate(&self) -> Result<(), AgentStateError> {
         match self {
             Self::Idle | Self::StreamingStep(_) | Self::AwaitingApproval(_) | Self::Done(_) => {

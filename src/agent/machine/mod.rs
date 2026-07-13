@@ -40,6 +40,10 @@ mod default;
 
 pub use default::DefaultAgentMachine;
 
+mod nested;
+
+pub use nested::{MachineTreeState, NestedMachine, NestedMachineError};
+
 /// A pure Agent state machine: it advances state and requests IO without doing
 /// IO, and without `async`.
 ///

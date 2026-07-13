@@ -14,7 +14,7 @@ mod runtime;
 mod tests;
 
 use crate::{
-    agent::{AgentId, AgentSpec, LoopPolicy, ModelRef, SkillId, ToolSetId, ToolSetRef},
+    agent::{AgentId, AgentPath, AgentSpec, LoopPolicy, ModelRef, SkillId, ToolSetId, ToolSetRef},
     conversation::{Conversation, ConversationError, ConversationSnapshot, ToolCallId},
     model::{message::Role, tool::Tool},
 };
@@ -249,6 +249,17 @@ impl AgentState {
         }
         self.loop_cursor = next;
         Ok(())
+    }
+
+    /// Re-stamps the loop cursor's requirement binding origin to `base`.
+    ///
+    /// Used by a nested machine to record the real [`AgentPath`] of the node
+    /// that owns this state: the sans-io machine always stamps its cursor
+    /// binding at the root, so the enclosing node re-bases it to the node's
+    /// absolute path (migration doc §7.1). This only rewrites addressing
+    /// metadata, so it does not go through transition validation.
+    pub(crate) fn rebase_cursor_origin(&mut self, base: &AgentPath) {
+        self.loop_cursor.rebase_origin(base);
     }
 
     fn from_record(record: AgentStateRecord) -> Result<Self, AgentStateError> {

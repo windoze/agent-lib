@@ -1291,7 +1291,7 @@ ignored,与 M4-3 基线 423 一致);`RUSTDOCFLAGS="-D warnings" cargo doc --no-d
 
 ## Milestone 5 — hierarchy / subagent（迁移文档阶段 4）
 
-### [TODO] M5-1 嵌套机器状态与 `AgentPath` 落位
+### [DONE] M5-1 嵌套机器状态与 `AgentPath` 落位
 
 **前置依赖**:M4-R。
 
@@ -1313,6 +1313,50 @@ state;整棵树可序列化。此前 `AgentPath` 恒为空,本任务让它真实
 - 聚焦测试:构造父+子两层机器,`step` 后聚合出分别带父/子 `AgentPath` 的 requirement;
   按 id 回灌到正确子机器;整棵树 serde round-trip;父子各自 cursor 独立恢复。
 - 运行全套命令。
+
+**完成记录**:
+
+- **新增 `src/agent/machine/nested.rs`**(+ `nested/tests.rs`):live `NestedMachine`(实现
+  `AgentMachine`)与可序列化快照 `MachineTreeState`。
+  `NestedMachine { own: DefaultAgentMachine, children: BTreeMap<AgentSlot, ChildNode>,
+  path: AgentPath }`,`ChildNode { machine: NestedMachine, pending_start: Option<AgentInput> }`
+  递归树;`path` 为节点在树中的**绝对路径**,不入 serde(由 `from_state` 按结构重建)。
+- **`step` 递归推进整树**:`step(External)` 经 `step_own` 喂 own,再 `start_pending_children`
+  用各子存的 opening `AgentInput` 开启所有未开子机器(一次 feed 推进整树);
+  `step(Resume)`/`step(Abandon)` 经 `route_by_id` 扫描各 cursor 的 `pending_requirement_ids`
+  与 `subtree_contains` 按 **id** 精确定位命中节点后投递,无节点等待该 id 时投给 own 让其分类报错。
+  `cursor()` 返回 root 的 `own.cursor()`。
+- **真实 `AgentPath` 落位(bullet 2 & 4,统一机制)**:单机 `DefaultAgentMachine` 恒把 emitted
+  `Requirement.origin` 与 cursor 绑定打在 root;每节点在 own 机步进后由 `step_own` 把 own 刚产出的
+  requirement(`stamp_requirements`)与 own cursor 绑定(`rebase_cursor_origin`)重打成本节点的
+  `path`,子节点递归自打故冒泡=纯 append。据此 `StepOutcome.requirements` 与持久化 cursor 绑定
+  **同源一致**地携带真实绝对路径;`outstanding_requirements()` 由结构重建同一 `(id, path)` 视图。
+- **cursor 打戳链(新增)**:`LoopCursor::rebase_origin(&AgentPath)`(同模块直改
+  `CursorRequirement`/`ToolWaitRequirements` 私有 origin,仅改寻址元数据不过 transition 校验)
+  ← `AgentState::rebase_cursor_origin`(`pub(crate)`)← `DefaultAgentMachine::rebase_cursor_origin`
+  (`pub(crate)`)。requirement-free cursor(Idle/CancelRecovery/Done/Error)不变。
+- **serde**:`impl Serialize for NestedMachine`(借用 `own.state()`,递归子树 `ChildStateRef`,含
+  `pending_start`;无子时跳过 `children`)+ `MachineTreeState`/`ChildState`(`Deserialize`,
+  `deny_unknown_fields`)+ `NestedMachine::from_state(state, make)` 递归 `from_state_at` 按结构
+  重建各节点 `path` 并重注入 handle。
+- **序列化边界(遵循既有不变量,非 workaround)**:单机 parked(卡在 NeedLlm)时 Conversation 有
+  pending turn,Conversation 核心明确拒绝快照(`serializing_state_with_pending_conversation_is_rejected`
+  等既有测试确立);故整树仅在 committed 边界(Idle/Done)可序列化,与既有
+  `agent_state_serde_round_trips_through_conversation_snapshot` 的 serde 模型一致。round-trip
+  聚焦测试遂以 parent=Done + child=Idle(保留 `pending_start`)两个不同 cursor 独立恢复,并验证
+  恢复后子机器凭 `pending_start` 在下一次 feed 以真实路径 `[slot]` 重新开启。
+- **导出**:`machine/mod.rs` `mod nested;` + re-export `MachineTreeState`/`NestedMachine`/
+  `NestedMachineError`;`agent/mod.rs` 同步 re-export。
+- **聚焦测试(nested,4 个全绿)**:`step_aggregates_parent_and_child_requirements_with_real_paths`
+  (父 origin=root、子 origin=`[slot]`,且各自 cursor 绑定 origin 落真实路径)、
+  `resume_routes_by_id_to_the_child_only`(按 id 只命中子,父保持 parked)、
+  `whole_tree_round_trips_and_each_cursor_restores_independently`、
+  `attach_child_rejects_an_occupied_slot`。移除随实现不再使用的 `AgentPath::prepend` 及其单测
+  (绝对打戳不需前缀一跳)。
+- **验证**:`cargo fmt --all`(clean)、`cargo clippy --all-targets -- -D warnings`(0 warning)、
+  `cargo test --all --all-targets`(lib 427 passed / 0 failed;新增 4 个 nested 聚焦测试、移除 1 个
+  `AgentPath::prepend` 单测;网络用例 ignored)、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean)、
+  `git diff --check`(clean)均通过。每测试 <1min。
 
 ### [TODO] M5-2 `SubagentHandler`:派生、再开一层 drain 与作用域强制
 

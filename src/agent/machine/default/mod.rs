@@ -42,10 +42,10 @@ mod tools;
 
 use crate::{
     agent::{
-        AgentError, AgentInput, AgentMachine, AgentState, AgentUserInput, CancelRecoveryReason,
-        CursorRequirement, DeclaredOnlyToolRegistryResolver, LlmStepMode, LoopCursor,
-        LoopDoneReason, NoApprovalPolicy, NoToolExecutionIds, Notification, PivotMessage,
-        ReconfigRequest, Requirement, RequirementId, RequirementIds, RequirementKind,
+        AgentError, AgentInput, AgentMachine, AgentPath, AgentState, AgentUserInput,
+        CancelRecoveryReason, CursorRequirement, DeclaredOnlyToolRegistryResolver, LlmStepMode,
+        LoopCursor, LoopDoneReason, NoApprovalPolicy, NoToolExecutionIds, Notification,
+        PivotMessage, ReconfigRequest, Requirement, RequirementId, RequirementIds, RequirementKind,
         RequirementKindTag, RequirementResolution, RequirementResult, StepBoundary, StepId,
         StepInput, StepOutcome, ToolApprovalPolicy, ToolExecutionIds, ToolRegistryResolver,
         ToolRuntimeError,
@@ -229,6 +229,16 @@ impl DefaultAgentMachine {
     #[must_use]
     pub fn into_state(self) -> AgentState {
         self.state
+    }
+
+    /// Re-stamps this machine's cursor requirement binding to the absolute
+    /// [`AgentPath`] `base`.
+    ///
+    /// A standalone machine always stamps its cursor at the root; a nested
+    /// machine that places this node at `base` calls this so the persisted
+    /// cursor records the node's real path in the tree (migration doc §7.1).
+    pub(crate) fn rebase_cursor_origin(&mut self, base: &AgentPath) {
+        self.state.rebase_cursor_origin(base);
     }
 
     /// Queues a turn-boundary reconfiguration, validating it eagerly.

@@ -48,6 +48,7 @@ pub use interaction::{
     Interaction, InteractionError, InteractionKind, InteractionKindTag, InteractionResponse,
 };
 pub use machine::{AgentMachine, DefaultAgentMachine, StepInput, StepOutcome};
+pub use machine::{MachineTreeState, NestedMachine, NestedMachineError};
 pub use requirement::{
     AgentPath, AgentSlot, AgentSpecRef, LlmStepMode, NoRequirementIds, Requirement,
     RequirementError, RequirementId, RequirementIds, RequirementKind, RequirementKindTag,
