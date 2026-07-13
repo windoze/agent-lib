@@ -1,58 +1,66 @@
-# 当前执行计划
+# 执行计划
 
-## 约束确认
+## 说明
 
-- 输出使用中文。
-- `TODO.md` 是唯一任务顺序与完成状态依据。
-- 本轮只完成 `TODO.md` 中第一个标题未带 `[DONE]` 的任务，然后停止。
-- 在读取和执行任务前，先在本文件记录可公开的计划、决策依据和进度。
-- 不进行开放式历史问题扫描；只处理当前任务需要的上下文、阻塞项和测试失败策略要求的问题。
-- 若发现当前任务被具体前置问题阻塞，则在 `TODO.md` 中加入最小必要前置任务，提交后停止。
-- 完成任务后需要更新 `TODO.md` 的标题 `[DONE]` 前缀和完成记录，并提交所有相关改动。
+我不会记录完整的隐藏推理链路；这里记录可审计的任务理解、决策依据、执行步骤和进度。
 
-## 初始执行步骤
+## 初始约束
 
-1. 读取 `TODO.md`，按文件顺序找出第一个标题未显式带 `[DONE]` 的任务。
-2. 读取该任务相关的 `PLAN.md` 片段和必要代码/测试上下文，避免扩大范围。
-3. 检查最新提交信息是否明确提到与该任务直接相关的未完成问题；若相关，将其纳入当前任务或作为前置任务写入 `TODO.md`。
-4. 根据任务要求实现代码或文档改动；若需要拆分，只在存在不可一起落地的明确前置条件时进行。
-5. 在关键实现步骤完成后更新本文件的进度记录。
-6. 按要求先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，最后在有代码影响时运行 `cargo test --all --all-targets`，完整测试超时不超过 30 分钟。
-7. 对发现的未计划测试失败：要么修复，要么在 `TODO.md` 中安排最小必要前置/后续任务，且不得把当前任务标记为完成。
-8. 任务完成后更新 `TODO.md`：标题加 `[DONE]`，补全完成记录和验证结果；仅在阶段级计划变化时更新 `PLAN.md`。
-9. 查看 git 状态，确保不回滚用户已有改动；把本轮相关改动和任何需要一起提交的未提交恢复工作纳入一次清晰 commit。
-10. 提交后停止，不继续下一个任务。
+- 以 `TODO.md` 为任务顺序和完成状态的唯一权威来源。
+- 首先定位第一个标题未带 `[DONE]` 的任务；只完成这一项，然后停止。
+- 在确认当前任务前不做开放式历史问题扫描。
+- 如遇阻塞当前任务的缺陷、测试失败或规格不匹配，先修复；若不能直接修复，则在 `TODO.md` 中插入最小必要前置任务并提交后停止。
+- 完成后必须更新 `TODO.md`，将任务标题显式加上 `[DONE]` 并填写完成记录。
+- 按要求先运行 `cargo fmt`，再运行 `cargo clippy --all-targets -- -D warnings`，再运行完整测试；若仅文档变化且已有可复用的绿色结果，可按规则说明跳过。
+- 完成当前任务后提交 Git commit，不继续下一个任务。
 
-## 当前进度
+## 步骤
 
-- 已创建本执行计划文件。
-- 已读取 `TODO.md` 并识别第一个未完成任务：`M2-3 Tool use 执行编排与 result 回灌`。
-- 已查看最新提交摘要：`[M2-2] Add default text-only LLM loop driver`，未发现需要在执行
-  M2-3 前单独处理的、提交信息明确指出的相关未完成 issue。
-- 已读取 M2-3 相关 Agent loop、事件、Conversation pending tool API、cursor、tool model 与
-  trace/budget API。
-- 设计选择：
-  - 新增最小 runtime tool 模块，包含 `ToolRegistry`、`ToolExecutor`、tool runtime error 和
-    外部注入的 `ToolExecutionIds`。
-  - `DefaultAgentLoop::new` 保持现有 text-only 行为；新增带 tool registry/id source 的构造入口。
-  - 第一次 assistant 的 ids 继续来自 `AgentInput`；工具映射、tool-result message id、后续
-    assistant message id 和 step id 由 `ToolExecutionIds` 提供，库不生成随机/时钟 id。
-  - 默认 loop 遇到 tool-use 后调用 Conversation 的 `register_tool_calls` 与
-    `append_tool_response`，不复制 pairing 校验。
-  - tool executor 的正常返回必须是完整 `ToolResponse`；执行错误在
-    `ReturnErrorToModel` 策略下转换为 `ToolStatus::Error` 结果，在 `StopRun` 策略下中止并丢弃
-    pending。
-  - 先支持串行与按 policy 并行执行；流式路径在 LLM event 透传后进入同一工具循环。
-- 下一步：增量添加 `agent::tool` 模块、导出类型，然后重构 default loop。
-- 已新增 `agent::tool` runtime 边界并导出。
-- 已重构 `DefaultAgentLoop`，保留既有 text-only 构造入口，新增
-  `DefaultAgentLoop::with_tool_registry`，并把非流式/流式路径接入工具循环。
-- 已运行 `cargo fmt --all` 和 `cargo test agent::loop_driver --all-targets`，现有 loop_driver
-  测试通过。
-- 已补充工具编排聚焦测试，覆盖单 tool、并行 tool、tool error/denied、Conversation
-  拒绝重复/未知 call id、tool 执行失败后模型继续自愈，以及 committed Turn 的 pairing。
-- 已更新 crate 根文档与 `README.md` 中关于 `DefaultAgentLoop` 和 tool runtime 边界的当前能力说明。
-- 已运行 `cargo fmt --all` 与 `cargo clippy --all-targets -- -D warnings`，均通过。
-- 已运行 M2-3 聚焦测试、完整测试、rustdoc、doctest 和 `git diff --check`，均通过。
-- 已更新 `TODO.md`，将 M2-3 标记为 `[DONE]` 并补全完成记录。
-- 下一步：检查 git 状态和 diff，确认改动范围后提交。
+1. 读取 `TODO.md`，识别第一个未完成任务及其验收要求。
+2. 检查最新提交信息是否明确提到与该任务直接相关的未完成问题。
+3. 阅读当前任务涉及的代码、测试和文档上下文。
+4. 根据任务要求做最小但完整的实现或审查修复。
+5. 补充或调整相关测试，避免绕过规格。
+6. 运行格式化、clippy 和测试验证。
+7. 更新 `TODO.md` 的任务标题与完成记录；仅在阶段计划变化时更新 `PLAN.md`。
+8. 查看 Git diff，确认只包含当前任务相关变更。
+9. 提交所有当前任务相关未提交文件。
+10. 停止并汇报本次完成内容、验证结果和 commit。
+
+## 当前状态
+
+- 状态：已定位首个未完成任务：`M2-R Milestone 2 Review`。
+
+## 当前任务计划：M2-R
+
+1. 阅读 `docs/agent-layer.md`、`PLAN.md` 中与 M2 Agent loop、事件流、tool 回灌、pending/commit
+   边界相关的要求。
+2. 阅读 `src/agent/event.rs`、`src/agent/loop_driver.rs`、`src/agent/tool.rs` 及其测试，确认
+   `AgentLoop::feed` stream 契约、重入保护、事件顺序、错误分类和 tool result 回灌是否符合 M2。
+3. 人工映射 text-only、streaming、single/parallel tool、tool error、client/conversation failure
+   路径，确认不会留下半提交 state，且 pairing 校验仍由 Conversation 承担。
+4. 明确 M3 可挂接的 step boundary、approval waiting 和 cancel hook 点，并记录在 `TODO.md`
+   的 M2-R 完成记录中。
+5. 按 M2-R 验证要求运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
+   M2 聚焦测试、完整测试、rustdoc 和 `git diff --check`。
+6. 如未发现必须先修复的问题，将 `M2-R` 标题标记为 `[DONE]` 并补充完成记录。
+7. 检查 diff 并提交本任务变更，然后停止。
+
+## 进度记录
+
+- 已确认首个未完成任务为 `M2-R Milestone 2 Review`，最新提交 `[M2-3] Add agent tool execution loop`
+  未明确提到与 M2-R 直接相关的未完成问题。
+- 已读取 M2 相关设计要求和实现文件：`docs/agent-layer.md`、`PLAN.md`、`src/agent/event.rs`、
+  `src/agent/loop_driver.rs`、`src/agent/loop_driver/default.rs`、`src/agent/tool.rs` 及默认 loop
+  聚焦测试索引。
+- 初步人工审查结论：`feed` stream guard、text/stream 基础路径、tool result 回灌、Conversation
+  pending/commit 顺序和失败清理均与 M2 边界一致；暂未发现需要插入前置任务的阻塞问题。
+- 已通过：`cargo fmt --all`。
+- 已通过：`cargo clippy --all-targets -- -D warnings`。
+- 已通过：`cargo test agent::event`。
+- 已通过：`cargo test agent::loop_driver --all-targets`。
+- 已通过：`perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`。
+- 已通过：`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
+- 已通过：`git diff --check`。
+- 已将 `TODO.md` 中 `M2-R Milestone 2 Review` 标记为 `[DONE]`，并补充 review 结论、M3 hook 点和验证记录。
+- 下一步：最终 diff/status 检查并提交本任务。
