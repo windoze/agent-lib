@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 mod cancel;
 mod errors;
+mod review;
 mod success;
 
 const UUID_BASE: u128 = 0x018f_0d9c_7b6a_7c12_8f32_0000_0000_0000;
