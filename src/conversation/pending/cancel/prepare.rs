@@ -31,19 +31,21 @@ struct ExpectedOpenCall {
     tool_call_index: Option<usize>,
 }
 
-/// Collects conversation-wide identities that synthetic facts cannot reuse.
-pub(super) fn committed_id_sets(
+/// Collects retained-raw identities that synthetic facts cannot reuse.
+pub(super) fn retained_id_sets(
     conversation: &Conversation,
 ) -> (HashSet<MessageId>, HashSet<ToolCallId>) {
     let message_ids = conversation
-        .turns()
-        .iter()
+        .history
+        .raw_turns()
+        .into_iter()
         .flat_map(crate::conversation::Turn::messages)
         .map(ConversationMessage::id)
         .collect();
     let call_ids = conversation
-        .turns()
-        .iter()
+        .history
+        .raw_turns()
+        .into_iter()
         .flat_map(crate::conversation::Turn::pairings)
         .map(crate::conversation::ToolPairing::call_id)
         .collect();

@@ -8,7 +8,7 @@
 mod prepare;
 
 use self::prepare::{
-    cancelled_turn_data, committed_id_sets, prepare_cancellation, validate_final_message_id,
+    cancelled_turn_data, prepare_cancellation, retained_id_sets, validate_final_message_id,
 };
 use super::{FrozenMessage, PendingMessage};
 use crate::{
@@ -181,6 +181,7 @@ impl Conversation {
         let pending = self.pending.take().ok_or(CancelError::NoPending)?;
         let turn_id = pending.id();
         drop(pending);
+        self.refresh_pending_index();
         Ok(CancelOutcome::Discarded { turn_id })
     }
 
@@ -189,7 +190,7 @@ impl Conversation {
         &mut self,
         cancelled_results: &[CancelledToolResult],
     ) -> Result<CancelOutcome, ConversationError> {
-        let (committed_message_ids, committed_call_ids) = committed_id_sets(self);
+        let (committed_message_ids, committed_call_ids) = retained_id_sets(self);
         let pending = self.pending.as_ref().ok_or(CancelError::NoPending)?;
         let turn_id = pending.id();
         let prepared = prepare_cancellation(
@@ -204,6 +205,7 @@ impl Conversation {
             .as_mut()
             .ok_or(CancelError::NoPending)?
             .resume_after_cancel(prepared.cancelled_messages, prepared.tool_calls);
+        self.refresh_pending_index();
         Ok(CancelOutcome::Resumed { turn_id })
     }
 
@@ -215,7 +217,7 @@ impl Conversation {
         final_response: Response,
         meta: TurnMeta,
     ) -> Result<CancelOutcome, ConversationError> {
-        let (committed_message_ids, committed_call_ids) = committed_id_sets(self);
+        let (committed_message_ids, committed_call_ids) = retained_id_sets(self);
         let pending = self.pending.as_ref().ok_or(CancelError::NoPending)?;
         let prepared = prepare_cancellation(
             pending,

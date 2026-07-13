@@ -10,7 +10,7 @@ mod sequence;
 
 use self::{
     identity::{
-        committed_message_ids, validate_completion, validate_message_ids, validate_parent,
+        retained_message_ids, validate_completion, validate_message_ids, validate_parent,
         validate_tool_call_ids, validate_turn_identity,
     },
     pairing::validate_pairings,
@@ -29,21 +29,22 @@ impl ValidatedTurnData {
 }
 
 /// Validates a candidate against its conversation and returns a live turn.
-pub(super) fn validate_turn_data(
+pub(super) fn validate_turn_data<'a>(
     data: TurnData,
-    committed: &[Turn],
+    retained: impl IntoIterator<Item = &'a Turn>,
     expected_parent: Option<TurnId>,
 ) -> Result<Turn, CommitError> {
+    let retained = retained.into_iter().collect::<Vec<_>>();
     validate_completion(&data)?;
-    validate_turn_identity(&data, committed)?;
+    validate_turn_identity(&data, &retained)?;
     validate_parent(&data, expected_parent)?;
 
-    let committed_messages = committed_message_ids(committed);
-    let current_messages = validate_message_ids(&data, &committed_messages)?;
-    validate_tool_call_ids(&data, committed)?;
+    let retained_messages = retained_message_ids(&retained);
+    let current_messages = validate_message_ids(&data, &retained_messages)?;
+    validate_tool_call_ids(&data, &retained)?;
 
     let facts = validate_role_sequence(&data)?;
-    validate_pairings(&data, &facts, &current_messages, &committed_messages)?;
+    validate_pairings(&data, &facts, &current_messages, &retained_messages)?;
 
     Ok(Turn::from_validated(ValidatedTurnData(data)))
 }

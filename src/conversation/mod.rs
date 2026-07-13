@@ -12,6 +12,7 @@
 
 pub mod config;
 pub mod error;
+mod history;
 pub mod id;
 pub mod message;
 pub mod pending;
@@ -23,6 +24,7 @@ pub use error::{
     CancelError, CommitError, ContentBlockKind, ConversationError, PairingMessageKind,
     PendingMessageError, PendingTurnError,
 };
+pub use history::{ToolCallIndex, ToolCallLocation, ToolCallLocationKind};
 pub use id::{ArtifactId, ConversationId, MessageId, ToolCallId, TurnId};
 pub use message::ConversationMessage;
 pub use pending::{
@@ -60,20 +62,22 @@ use turn::TurnData;
 pub struct Conversation {
     id: ConversationId,
     config: ConversationConfig,
-    turns: Vec<Turn>,
+    history: history::History,
     pending: Option<PendingTurn>,
+    tool_call_index: ToolCallIndex,
     version: u64,
 }
 
 impl Conversation {
     /// Creates an empty conversation under an externally supplied identity.
     #[must_use]
-    pub const fn new(id: ConversationId, config: ConversationConfig) -> Self {
+    pub fn new(id: ConversationId, config: ConversationConfig) -> Self {
         Self {
             id,
             config,
-            turns: Vec::new(),
+            history: history::History::new(),
             pending: None,
+            tool_call_index: ToolCallIndex::default(),
             version: 0,
         }
     }
@@ -90,10 +94,28 @@ impl Conversation {
         &self.config
     }
 
-    /// Returns all closed turns in committed order through a read-only slice.
+    /// Returns the current closed lineage in order through a read-only slice.
+    ///
+    /// Raw nodes detached by a later branch remain available through
+    /// [`raw_turn`](Self::raw_turn), but do not enter this effective view.
     #[must_use]
     pub fn turns(&self) -> &[Turn] {
-        &self.turns
+        self.history.turns()
+    }
+
+    /// Finds an immutable retained raw turn, including a detached suffix.
+    ///
+    /// This is a debug/persistence lookup only. Returning a shared reference
+    /// does not make raw history a second commit or mutation path.
+    #[must_use]
+    pub fn raw_turn(&self, turn_id: TurnId) -> Option<&Turn> {
+        self.history.raw_turn(turn_id)
+    }
+
+    /// Returns the rebuildable tool-call index for the current lineage/pending.
+    #[must_use]
+    pub const fn tool_call_index(&self) -> &ToolCallIndex {
+        &self.tool_call_index
     }
 
     /// Returns the unique uncommitted transaction through a read-only view.
@@ -125,19 +147,20 @@ impl Conversation {
             }
             .into());
         }
-        if self.turns.iter().any(|turn| turn.id() == turn_id) {
+        if self.history.contains_turn_id(turn_id) {
             return Err(PendingTurnError::DuplicateTurnId { turn_id }.into());
         }
-        if self.committed_message_exists(user_message_id) {
+        if self.retained_message_exists(user_message_id) {
             return Err(PendingTurnError::DuplicateMessageId {
                 message_id: user_message_id,
             }
             .into());
         }
 
-        let parent = self.turns.last().map(Turn::id);
+        let parent = self.history.tip_id();
         let pending = PendingTurn::new(turn_id, parent, user_message_id, user_payload)?;
         self.pending = Some(pending);
+        self.refresh_pending_index();
         Ok(())
     }
 
@@ -170,10 +193,12 @@ impl Conversation {
         &mut self,
         message_id: MessageId,
     ) -> Result<AssistantFinish, ConversationError> {
-        if self.committed_message_exists(message_id) {
+        if self.retained_message_exists(message_id) {
             return Err(PendingTurnError::DuplicateMessageId { message_id }.into());
         }
-        self.pending_mut()?.finish_assistant(message_id)
+        let outcome = self.pending_mut()?.finish_assistant(message_id)?;
+        self.refresh_pending_index();
+        Ok(outcome)
     }
 
     /// Registers framework identities for every tool use in the last assistant.
@@ -185,15 +210,14 @@ impl Conversation {
         &mut self,
         mappings: Vec<ToolCallMapping>,
     ) -> Result<(), ConversationError> {
-        let committed_call_ids = self
-            .turns
-            .iter()
-            .flat_map(Turn::pairings)
-            .map(ToolPairing::call_id)
+        let retained_call_ids = self
+            .history
+            .retained_tool_call_ids()
             .collect::<HashSet<_>>();
         self.pending_mut()?
-            .register_tool_calls(mappings, &committed_call_ids)
-            .map_err(Into::into)
+            .register_tool_calls(mappings, &retained_call_ids)?;
+        self.refresh_pending_index();
+        Ok(())
     }
 
     /// Adds a complete tool response as one immutable tool-role message.
@@ -206,12 +230,15 @@ impl Conversation {
         message_id: MessageId,
         response: ToolResponse,
     ) -> Result<ToolCallId, ConversationError> {
-        if self.committed_message_exists(message_id) {
+        if self.retained_message_exists(message_id) {
             return Err(PendingTurnError::DuplicateMessageId { message_id }.into());
         }
-        self.pending_mut()?
+        let call_id = self
+            .pending_mut()?
             .append_tool_response(message_id, response)
-            .map_err(Into::into)
+            .map_err(ConversationError::from)?;
+        self.refresh_pending_index();
+        Ok(call_id)
     }
 
     /// Adds one already-normalized complete tool-result content block.
@@ -223,12 +250,15 @@ impl Conversation {
         message_id: MessageId,
         block: ContentBlock,
     ) -> Result<ToolCallId, ConversationError> {
-        if self.committed_message_exists(message_id) {
+        if self.retained_message_exists(message_id) {
             return Err(PendingTurnError::DuplicateMessageId { message_id }.into());
         }
-        self.pending_mut()?
+        let call_id = self
+            .pending_mut()?
             .append_tool_result(message_id, block)
-            .map_err(Into::into)
+            .map_err(ConversationError::from)?;
+        self.refresh_pending_index();
+        Ok(call_id)
     }
 
     /// Validates and atomically commits a ready pending turn.
@@ -255,12 +285,14 @@ impl Conversation {
             .ok_or_else(|| PendingTurnError::NoPending.into())
     }
 
-    /// Scans immutable history for a conversation-wide message identity.
-    fn committed_message_exists(&self, message_id: MessageId) -> bool {
-        self.turns
-            .iter()
-            .flat_map(Turn::messages)
-            .any(|message| message.id() == message_id)
+    /// Scans all retained raw branches for a conversation-wide message id.
+    fn retained_message_exists(&self, message_id: MessageId) -> bool {
+        self.history.contains_message_id(message_id)
+    }
+
+    /// Synchronizes only the transaction-local suffix of the derived index.
+    pub(in crate::conversation) fn refresh_pending_index(&mut self) {
+        self.tool_call_index.replace_pending(self.pending.as_ref());
     }
 
     /// Validates a complete draft and advances history/version as one operation.
@@ -275,11 +307,17 @@ impl Conversation {
                 .ok_or(ConversationError::NonAtomicCommit {
                     current_version: self.version,
                 })?;
-        let expected_parent = self.turns.last().map(Turn::id);
-        let turn = validation::validate_turn_data(data, &self.turns, expected_parent)?;
+        let expected_parent = self.history.tip_id();
+        let turn = validation::validate_turn_data(data, self.history.raw_turns(), expected_parent)?;
         let turn_id = turn.id();
 
-        self.turns.push(turn);
+        self.history.append(turn);
+        let committed = self
+            .history
+            .turns()
+            .last()
+            .expect("an appended history has one effective tip");
+        self.tool_call_index.push_committed_turn(committed);
         self.version = next_version;
         Ok(turn_id)
     }

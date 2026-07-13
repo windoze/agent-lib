@@ -23,7 +23,10 @@
 //!   repeated and parallel tool round-trips while keeping partial Client data
 //!   outside immutable history. [`conversation::CancelDisposition`] can discard,
 //!   resume with explicit cancelled tool results, or atomically close and commit
-//!   that transaction without touching previously committed turns.
+//!   that transaction without touching previously committed turns. Committed
+//!   turns live in structurally shared raw history, while the rebuildable
+//!   [`conversation::ToolCallIndex`] accelerates framework/provider call lookup
+//!   for only the current lineage and pending transaction.
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are deliberately outside this crate. Those layers should persist and replay

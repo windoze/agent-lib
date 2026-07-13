@@ -20,9 +20,9 @@ pub(super) fn validate_completion(data: &TurnData) -> Result<(), CommitError> {
 /// Enforces conversation-wide uniqueness for the candidate turn id.
 pub(super) fn validate_turn_identity(
     data: &TurnData,
-    committed: &[Turn],
+    retained: &[&Turn],
 ) -> Result<(), CommitError> {
-    if committed.iter().any(|turn| turn.id() == data.id) {
+    if retained.iter().any(|turn| turn.id() == data.id) {
         return Err(CommitError::DuplicateTurnId { turn_id: data.id });
     }
     Ok(())
@@ -42,9 +42,9 @@ pub(super) fn validate_parent(
     Ok(())
 }
 
-/// Collects message ids already frozen in committed history.
-pub(super) fn committed_message_ids(committed: &[Turn]) -> HashSet<MessageId> {
-    committed
+/// Collects message ids from every retained raw history node.
+pub(super) fn retained_message_ids(retained: &[&Turn]) -> HashSet<MessageId> {
+    retained
         .iter()
         .flat_map(|turn| turn.messages())
         .map(super::super::ConversationMessage::id)
@@ -54,12 +54,12 @@ pub(super) fn committed_message_ids(committed: &[Turn]) -> HashSet<MessageId> {
 /// Enforces message-id uniqueness both within the draft and across history.
 pub(super) fn validate_message_ids(
     data: &TurnData,
-    committed: &HashSet<MessageId>,
+    retained: &HashSet<MessageId>,
 ) -> Result<HashSet<MessageId>, CommitError> {
     let mut current = HashSet::with_capacity(data.messages.len());
     for message in &data.messages {
         let id = message.id();
-        if committed.contains(&id) || !current.insert(id) {
+        if retained.contains(&id) || !current.insert(id) {
             return Err(CommitError::DuplicateMessageId { message_id: id });
         }
     }
@@ -69,9 +69,9 @@ pub(super) fn validate_message_ids(
 /// Enforces framework tool-call identity uniqueness for the whole conversation.
 pub(super) fn validate_tool_call_ids(
     data: &TurnData,
-    committed: &[Turn],
+    retained: &[&Turn],
 ) -> Result<(), CommitError> {
-    let committed_ids = committed
+    let retained_ids = retained
         .iter()
         .flat_map(|turn| turn.pairings())
         .map(super::super::ToolPairing::call_id)
@@ -79,7 +79,7 @@ pub(super) fn validate_tool_call_ids(
     let mut current = HashSet::<ToolCallId>::with_capacity(data.pairings.len());
 
     for pairing in &data.pairings {
-        if committed_ids.contains(&pairing.call_id) || !current.insert(pairing.call_id) {
+        if retained_ids.contains(&pairing.call_id) || !current.insert(pairing.call_id) {
             return Err(CommitError::DuplicateToolCallId {
                 call_id: pairing.call_id,
             });

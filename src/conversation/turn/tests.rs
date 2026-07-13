@@ -160,7 +160,7 @@ fn closed_turn() -> Turn {
         completion: TurnCompletion::Complete,
     };
 
-    crate::conversation::validation::validate_turn_data(data, &[], Some(parent))
+    crate::conversation::validation::validate_turn_data(data, std::iter::empty(), Some(parent))
         .expect("fixture must pass the sole closed-turn validator")
 }
 
