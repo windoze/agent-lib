@@ -1,61 +1,62 @@
-# 执行计划 — M5-2：`SubagentHandler`：派生、再开一层 drain 与作用域强制
+# 执行计划 — M5-3：Observability：trace 记 resolved-by-scope 与 disposition
 
 ## 选中的任务
-`TODO.md` 第一个未完成任务 = **M5-2**（M1..M5-1 全 `[DONE]`；M5-2 起为 TODO）。前置 M5-1 已完成。
+`TODO.md` 第一个未完成任务 = **M5-3**（M1..M5-2 全 `[DONE]`）。前置 M5-2 已完成。
 
-## 任务目标（TODO.md M5-2）
-1. 实现 `SubagentHandler`：接收 `NeedSubagent{spec_ref,brief,result_schema}`（只有 data），
-   `RunContext::derive_child` 派生子上下文，构造子机器，`drain` 递归驱动；子机器本内层 scope
-   兜不了的 requirement（如 `NeedInteraction`）pop 到外层。
-2. 深度上限：每加深一层在 handler 检查，超限分类报错。
-3. 预算继承 / cancel 传播：子上下文共享父 budget ledger、继承 cancel 链；父 cancel → 子
-   `Abandon` 并 `cancel_pending` 收尾。
-4. 子 turn 结束把 `SubagentOutput` 作为 `RequirementResult::Subagent(..)` `Resume` 回父。
-5. pop 从外层起（§7.3）：subagent handler 内部 perform 的同类 requirement 不回到它自己。
+## 任务目标（TODO.md M5-3 / 迁移文档 §8/§11 / effect-model §8）
+动态作用域要求 trace 记录每个 requirement：
+1. 被哪层 scope 的 handler 兑现（resolved-at-scope）。
+2. 兑现结果是 resume 还是 never-resume（disposition）——never-resume（cancel）是真实发生、
+   影响下层 Conversation 的事件，必须留痕，不是 non-event。
+新增 `TraceNodeKind::Requirement { kind_tag, resolved_at_scope, disposition }`，
+`disposition ∈ { Resumed, NeverResumed }`。与旧 trace tree（run→step→llm/tool/sub-agent）对齐。
 
 ## 关键设计决策
-- trait 签名变更：`SubagentHandler::fulfill` 增加 `outer: &mut dyn Pop`（= 发出 NeedSubagent 那层
-  scope 作为 pop 目标 ScopePop{scope,parent}）。子机器 drain 时把 outer 作为 parent，故子的
-  NeedInteraction 兜不住时 pop 到父 attended scope 兑现。§7.3 由 drain(先试本层再 pop) 天然满足。
-- drain 管道（drive.rs）：fulfill_with_scope 对 NeedSubagent 返回 None；resolve_requirement 特判
-  NeedSubagent（有 handler 则构造 outer=ScopePop::new(scope,parent) 调 fulfill，否则 pop）；
-  fulfill_batch 把 subagent 从并发集排除，与 popped 一起串行经 resolve_requirement。
-- 深度（context.rs）：RunContext 加 depth:u32，new_root=0，derive_child=+1，depth() 访问器；
-  handler 检查 ctx.depth()>=max_depth 拒绝。
-- 分类报错（event.rs）：新增 AgentErrorKind::Subagent + AgentError::SubagentDepthExceeded{limit}。
-- 参考实现（新 drive/subagent.rs）：SubagentSpawner(child_ids/spawn/summarize) +
-  SpawnedChild{machine:Box<dyn AgentMachine+Send>,scope:Box<dyn HandlerScope>,opening:AgentInput} +
-  DrivingSubagentHandler{spawner,max_depth}。fulfill：深度护栏→derive_child(共享 budget/派生
-  cancel/记 sub-agent trace)→spawn→drain(child,opening,child_scope,Some(outer),&child_ctx)→
-  summarize→Subagent(Ok/Err)。预算继承/cancel 传播由 child_ctx 共享父 ledger+派生 cancel 天然获得。
+### resolved_at_scope 的表示
+- 用 `u32` 表示「从 requirement 被 perform 的那层 scope 起，向外 pop 了几跳才被兑现」。
+  0 = 本层（emitting scope）自己兑现；1 = 向外 pop 一层兑现；依此类推。
+- 这是动态作用域下最直接可测的「哪层兑现」的相对表示，且天然经 pop 链累加。
 
-## 聚焦测试（drive/subagent/tests.rs）
-1. attended 父 scope 经 drain 驱动 mock 父机(发 NeedSubagent)→handler 驱动 mock 子机(发
-   NeedInteraction, headless 子 scope)→子 interaction pop 到父兑现(counting==1)，父/子完成。
-2. 深度超限：ctx.depth()==max_depth 调 fulfill→Subagent(Err(SubagentDepthExceeded))。
-3. cancel 传播：父 ctx 已 cancel，fulfill 用真实 DefaultAgentMachine 子机→drain 见 cancel→
-   Abandon→cancel_pending→子 cursor 落 Idle、子 LLM handler 调用 0 次。
-4. budget 继承：真实 DefaultAgentMachine 子机正常完成，子 LLM handler 在 ctx 上 charge_tokens(N)→
-   父 ctx budget snapshot tokens==N（derive_child 共享 ledger）。
+### hop 计数如何穿过 pop 链（drive.rs）
+- `Pop::pop` 返回类型改为 `Result<(RequirementResult, u32), AgentError>`，
+  u32 = 从「本 pop 目标的 scope」起到真正兑现处的跳数。
+- `resolve_requirement` 返回 `Result<(RequirementResult, u32), AgentError>`：
+  - 本层兑现（subagent handler 或 fulfill_with_scope）→ `(result, 0)`。
+  - pop → `let (r, h) = parent.pop(req, ctx)?; (r, h + 1)`（+1 = 到 parent 的那一跳）。
+  - 顶层无 handler → `Err(UnhandledRequirement)`（不记录）。
+- `ScopePop::pop` → `resolve_requirement(req, self.scope, self.parent, ctx)`，原样返回（+1 由调用方加）。
+- `fulfill_batch` 返回 `Vec<Resolved{ resolution, resolved_at_scope }>`：
+  本层并发集 hop=0；串行集经 resolve_requirement 得 hop。
+
+### 记录点集中在 drain（单处，且只记「真会被 Resume/Abandon」的）
+- `drain` 收到 `fulfill_batch` 的 `Vec<Resolved>`（都是 Ok、都会被 Resume）：
+  每个 `record_requirement(ctx, tag, resolved_at_scope, Resumed)` 后再 `Resume`。
+- cancel 分支：`record_requirement(ctx, tag, 0, NeverResumed)` 后再 `Abandon`。
+  （cancel = 本层的 never-resume handler，故 scope=0。）
+- trace 记录用 `ctx.trace()`（emitting 层的 trace parent：root 或 sub-agent 节点）。
+- trace 节点 id 复用 requirement 的 host-minted id（库不造 id 哲学）。
+- Trace 记录失败（重复 id / 未知 parent）→ `AgentError`（经 `RunContextError::Trace`，kind=Trace）。
+
+### trace.rs
+- 新增 `RequirementDisposition { Resumed, NeverResumed }`（Copy, serde snake_case）。
+- `TraceNodeKind` 增 `Requirement { kind_tag: RequirementKindTag, resolved_at_scope: u32,
+  disposition: RequirementDisposition }`。字段全 Copy → 枚举仍 `Copy`，`kind()` 不变。
+- `TraceHandle::record_requirement(id, kind_tag, resolved_at_scope, disposition)`。
+- context.rs / agent/mod.rs re-export `RequirementDisposition`。
+
+## 聚焦测试
+1. drive.rs：含 pop 的兑现在 trace 记录正确 `resolved_at_scope`（本层=0，pop 一层=1），disposition=Resumed。
+2. drive.rs：cancel 一次在 trace 记录 `NeverResumed`。
+3. context/tests.rs（或 trace.rs）：新 Requirement trace record serde round-trip。
 
 ## 验证
-cargo fmt --all → clippy --all-targets -D warnings → test --all --all-targets → RUSTDOCFLAGS=-D
-warnings cargo doc --no-deps → git diff --check。每测试 <1min。
+- `cargo fmt --all` → `cargo clippy --all-targets -- -D warnings` → `cargo test --all --all-targets`
+  → `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` → `git diff --check`。
 
-## 进度（恢复上一轮中断的工作）
-- [x] 选中 M5-2，读 TODO/PLAN/迁移文档 §7.2/§7.3/§8、drive/context/requirement/nested/spec
-- [x] context.rs depth（已在工作区）
-- [x] event.rs 深度错误分类（已在工作区）
-- [x] drive.rs trait 签名 + 管道（已在工作区，但引入生命周期编译错误）
-- [x] drive/subagent.rs 参考实现 + 导出（已在工作区，声明 `mod tests;` 但文件缺失）
-- [ ] **修复编译错误**：ScopePop 单一 `'a` 让 scope 与 parent 可变引用 pointee 统一（invariant）→
-      在 resolve_requirement 内构造 ScopePop 无法统一。解法：ScopePop 加第二个生命周期 `'p`
-      解耦 parent pointee；resolve_requirement 恢复独立省略生命周期。
-- [x] **修复编译错误**：ScopePop 加第二个生命周期 `'p` 解耦 parent pointee；
-      resolve_requirement 恢复独立省略生命周期。lib 编译通过。
-- [x] 补齐 drive/subagent/tests.rs 聚焦测试 4 个（mock 机器/scope）：全绿
-- [x] 全套验证：fmt(clean)→clippy(0 warn)→test(lib 432/0)→doc(-D warnings clean)→diff --check(clean)
-- [x] TODO.md M5-2 标 [DONE] + 完成记录
-- [x] 一次性提交所有未提交文件（恢复上一轮中断的工作）
-
-## 状态：M5-2 完成，等待提交。
+## 进度（完成）
+- [x] trace.rs：RequirementDisposition + TraceNodeKind::Requirement + record_requirement
+- [x] context.rs / mod.rs re-export
+- [x] drive.rs：Pop/resolve_requirement/fulfill_batch hop 穿透 + drain 记录
+- [x] 测试 1/2/3（drive.rs ×2 + context/tests.rs ×1）
+- [x] fmt(clean) / clippy(0 warning) / test(lib 435 passed) / doc(clean) / diff --check(clean)
+- [x] TODO.md 标记 [DONE] + 完成记录

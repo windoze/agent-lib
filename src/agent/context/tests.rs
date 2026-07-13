@@ -1,9 +1,13 @@
 use super::{
-    BudgetDimension, BudgetError, BudgetLimits, BudgetSnapshot, BudgetUsage, RunContext,
-    RunContextError, TraceError, TraceNodeId, TraceNodeKind, TraceRecord,
+    BudgetDimension, BudgetError, BudgetLimits, BudgetSnapshot, BudgetUsage,
+    RequirementDisposition, RunContext, RunContextError, TraceError, TraceNodeId, TraceNodeKind,
+    TraceRecord,
 };
 use crate::{
-    agent::id::{RunId, StepId},
+    agent::{
+        RequirementKindTag,
+        id::{RunId, StepId},
+    },
     model::usage::Usage,
 };
 use serde_json::{Map, json};
@@ -283,5 +287,35 @@ fn budget_and_trace_records_are_serializable_data() {
     assert_eq!(encoded["label"], json!("primary-model"));
 
     let decoded: TraceRecord = serde_json::from_value(encoded).expect("deserialize trace record");
+    assert_eq!(decoded, record);
+}
+
+#[test]
+fn requirement_trace_node_round_trips_through_serde() {
+    let record = TraceRecord::new(
+        node_id("req-1"),
+        Some(node_id("root")),
+        TraceNodeKind::Requirement {
+            kind_tag: RequirementKindTag::Interaction,
+            resolved_at_scope: 1,
+            disposition: RequirementDisposition::NeverResumed,
+        },
+        None,
+    );
+
+    let encoded = serde_json::to_value(&record).expect("serialize requirement trace record");
+    assert_eq!(encoded["id"], json!("req-1"));
+    assert_eq!(encoded["parent"], json!("root"));
+    assert_eq!(
+        encoded["kind"]["requirement"],
+        json!({
+            "kind_tag": "interaction",
+            "resolved_at_scope": 1,
+            "disposition": "never_resumed",
+        })
+    );
+
+    let decoded: TraceRecord =
+        serde_json::from_value(encoded).expect("deserialize requirement trace record");
     assert_eq!(decoded, record);
 }

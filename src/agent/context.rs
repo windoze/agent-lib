@@ -36,7 +36,9 @@ pub use budget::{
     BudgetUsage,
 };
 pub use cancel::CancellationToken;
-pub use trace::{TraceError, TraceHandle, TraceNodeId, TraceNodeKind, TraceRecord};
+pub use trace::{
+    RequirementDisposition, TraceError, TraceHandle, TraceNodeId, TraceNodeKind, TraceRecord,
+};
 
 /// Live run context passed through Agent loop, tool, and child-agent calls.
 ///

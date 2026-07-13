@@ -77,8 +77,9 @@
 use crate::{
     agent::{
         AgentError, AgentInput, AgentMachine, LlmStepMode, LoopCursor, LoopCursorKind,
-        Notification, Requirement, RequirementKind, RequirementResolution, RequirementResult,
-        RunContext, StepInput, ToolSetRef,
+        Notification, Requirement, RequirementDisposition, RequirementId, RequirementKind,
+        RequirementResolution, RequirementResult, RunContext, RunContextError, StepInput,
+        ToolSetRef, TraceNodeId,
         interaction::Interaction,
         requirement::{AgentSpecRef, RequirementKindTag},
     },
@@ -269,10 +270,19 @@ impl TurnDone {
 /// that cannot fulfill a requirement hands it to its parent's `pop`; the parent
 /// resolves it against the *outer* scope (see the [module docs](self#pop-routing)).
 /// The concrete outer layer is a [`ScopePop`].
+///
+/// The returned `u32` is the number of additional pop hops taken *from this pop
+/// target's own scope* to the scope that actually settled the requirement (`0`
+/// when this target's scope settled it in place). Each layer the requirement
+/// passes through adds one on the way back up, so the emitting layer learns how
+/// many scopes out its requirement was resolved — the `resolved_at_scope` a
+/// [`TraceNodeKind::Requirement`](crate::agent::TraceNodeKind) records
+/// (migration doc §8).
 #[async_trait]
 pub trait Pop: Send {
     /// Fulfills `requirement` at this outer layer (or pops it further outward),
-    /// returning a type-aligned [`RequirementResult`].
+    /// returning a type-aligned [`RequirementResult`] and the pop distance to
+    /// the resolving scope.
     ///
     /// # Errors
     ///
@@ -282,7 +292,7 @@ pub trait Pop: Send {
         &mut self,
         requirement: &Requirement,
         ctx: &RunContext,
-    ) -> Result<RequirementResult, AgentError>;
+    ) -> Result<(RequirementResult, u32), AgentError>;
 }
 
 /// An outer drain layer viewed as a [`Pop`] target.
@@ -316,7 +326,9 @@ impl Pop for ScopePop<'_, '_> {
         &mut self,
         requirement: &Requirement,
         ctx: &RunContext,
-    ) -> Result<RequirementResult, AgentError> {
+    ) -> Result<(RequirementResult, u32), AgentError> {
+        // The hop distance this returns is measured from `self.scope`; the
+        // popping layer adds one for the hop it took to reach this target.
         resolve_requirement(requirement, self.scope, self.parent.as_deref_mut(), ctx).await
     }
 }
@@ -377,9 +389,13 @@ where
         // the token never resumes a requirement, it decides to abandon one. A
         // single `Abandon` closes the whole in-flight turn via the machine's
         // never-resume path (`cancel_pending`), settling the cursor to a
-        // feedable rest state, so we stop driving this turn once it lands.
+        // feedable rest state, so we stop driving this turn once it lands. A
+        // never-resume is a real event that mutates the underlying Conversation
+        // (§6.3), so it is recorded in the trace, settled at the performing
+        // layer (`resolved_at_scope == 0`) with a `NeverResumed` disposition.
         if ctx.is_cancelled() {
             if let Some(requirement) = pending.first() {
+                record_requirement(ctx, requirement, 0, RequirementDisposition::NeverResumed)?;
                 let mut outcome = machine.step(StepInput::Abandon(requirement.id));
                 notifications.append(&mut outcome.notifications);
             }
@@ -389,7 +405,20 @@ where
         let resolutions = fulfill_batch(&pending, scope, parent.as_deref_mut(), ctx).await?;
 
         pending = Vec::new();
-        for resolution in resolutions {
+        for Resolved {
+            resolution,
+            resolved_at_scope,
+        } in resolutions
+        {
+            // Every resolution here was settled by a handler and will be fed
+            // back, so it is recorded `Resumed` at the scope distance that
+            // fulfilled it (migration doc §8).
+            record_requirement_resolution(
+                ctx,
+                &resolution,
+                resolved_at_scope,
+                RequirementDisposition::Resumed,
+            )?;
             let mut outcome = machine.step(StepInput::Resume(resolution));
             notifications.append(&mut outcome.notifications);
             pending.extend(outcome.requirements);
@@ -397,6 +426,62 @@ where
     }
 
     Ok(TurnDone::new(notifications, machine.cursor().clone()))
+}
+
+/// Records a settled requirement (identified by its own `Requirement`) in the
+/// trace under the performing layer's parent (migration doc §8).
+///
+/// The trace node id reuses the host-minted requirement id, keeping the library
+/// out of the id-minting business (mirroring every other Agent identity).
+fn record_requirement(
+    ctx: &RunContext,
+    requirement: &Requirement,
+    resolved_at_scope: u32,
+    disposition: RequirementDisposition,
+) -> Result<(), AgentError> {
+    record_requirement_node(
+        ctx,
+        requirement.tag(),
+        requirement.id,
+        resolved_at_scope,
+        disposition,
+    )
+}
+
+/// Records a settled requirement identified by its [`RequirementResolution`].
+fn record_requirement_resolution(
+    ctx: &RunContext,
+    resolution: &RequirementResolution,
+    resolved_at_scope: u32,
+    disposition: RequirementDisposition,
+) -> Result<(), AgentError> {
+    record_requirement_node(
+        ctx,
+        resolution.tag(),
+        resolution.id,
+        resolved_at_scope,
+        disposition,
+    )
+}
+
+/// Appends a `Requirement` trace node, mapping a trace failure to an
+/// [`AgentError`].
+fn record_requirement_node(
+    ctx: &RunContext,
+    kind_tag: RequirementKindTag,
+    id: RequirementId,
+    resolved_at_scope: u32,
+    disposition: RequirementDisposition,
+) -> Result<(), AgentError> {
+    ctx.trace()
+        .record_requirement(
+            TraceNodeId::new(id.to_string()),
+            kind_tag,
+            resolved_at_scope,
+            disposition,
+        )
+        .map_err(|error| AgentError::from(RunContextError::from(error)))?;
+    Ok(())
 }
 
 /// Returns whether `cursor` marks the end of a turn.
@@ -459,6 +544,11 @@ fn validate(requirement: &Requirement, result: &RequirementResult) -> Result<(),
 
 /// Resolves a single requirement: fulfill it in `scope`, else pop to `parent`.
 ///
+/// Returns the fulfilled result together with the number of pop hops from
+/// `scope` to the scope that settled it (`0` = `scope` settled it in place, each
+/// pop outward adds one). This hop count is the `resolved_at_scope` recorded on
+/// the requirement's trace node (migration doc §8).
+///
 /// The top layer (`parent = None`) with no matching handler yields
 /// [`AgentError::UnhandledRequirement`].
 async fn resolve_requirement(
@@ -466,7 +556,7 @@ async fn resolve_requirement(
     scope: &dyn HandlerScope,
     parent: Option<&mut (dyn Pop + '_)>,
     ctx: &RunContext,
-) -> Result<RequirementResult, AgentError> {
+) -> Result<(RequirementResult, u32), AgentError> {
     // A subagent deepens the scope chain: its handler drives the child with a
     // nested drain whose pop target is *this* layer (the scope that emitted the
     // requirement, plus that scope's own parents). Build that outer layer as a
@@ -485,20 +575,36 @@ async fn resolve_requirement(
                 .fulfill(spec_ref, brief, result_schema.as_ref(), &mut outer, ctx)
                 .await;
             validate(requirement, &result)?;
-            return Ok(result);
+            return Ok((result, 0));
         }
     } else if let Some(result) = fulfill_with_scope(requirement, scope, ctx).await {
         validate(requirement, &result)?;
-        return Ok(result);
+        return Ok((result, 0));
     }
 
     match parent {
-        Some(pop) => pop.pop(requirement, ctx).await,
+        // The requirement crosses one scope boundary to reach `parent`, so the
+        // hop measured from `parent`'s scope gains one to become the hop from
+        // `scope`.
+        Some(pop) => {
+            let (result, hops) = pop.pop(requirement, ctx).await?;
+            Ok((result, hops + 1))
+        }
         None => Err(AgentError::UnhandledRequirement {
             kind: requirement.tag(),
             origin: requirement.origin.clone(),
         }),
     }
+}
+
+/// A requirement resolution paired with the scope distance that settled it.
+///
+/// `resolved_at_scope` is the pop hop count from the layer that performed the
+/// requirement (`0` = the emitting scope settled it in place); [`drain`] records
+/// it on the requirement's trace node (migration doc §8).
+struct Resolved {
+    resolution: RequirementResolution,
+    resolved_at_scope: u32,
 }
 
 /// Fulfills a batch of requirements against `scope`, popping the rest.
@@ -509,12 +615,16 @@ async fn resolve_requirement(
 /// is always resolved serially — even when this scope handles it — because its
 /// handler needs the outer layer (`&mut parent`) as a pop target and so cannot
 /// join the concurrent set.
+///
+/// Each resolution carries the `resolved_at_scope` hop distance: the concurrent
+/// local set is always settled in place (`0`), while a serially resolved
+/// requirement reports how many scopes out it was popped to.
 async fn fulfill_batch(
     requirements: &[Requirement],
     scope: &dyn HandlerScope,
     mut parent: Option<&mut (dyn Pop + '_)>,
     ctx: &RunContext,
-) -> Result<Vec<RequirementResolution>, AgentError> {
+) -> Result<Vec<Resolved>, AgentError> {
     let mut local = FuturesUnordered::new();
     let mut serial: Vec<&Requirement> = Vec::new();
 
@@ -526,7 +636,10 @@ async fn fulfill_batch(
                     .await
                     .expect("scope_handles confirmed a handler for this family");
                 validate(requirement, &result)?;
-                Ok::<_, AgentError>(RequirementResolution::new(requirement.id, result))
+                Ok::<_, AgentError>(Resolved {
+                    resolution: RequirementResolution::new(requirement.id, result),
+                    resolved_at_scope: 0,
+                })
             });
         } else {
             serial.push(requirement);
@@ -539,8 +652,12 @@ async fn fulfill_batch(
     }
 
     for requirement in serial {
-        let result = resolve_requirement(requirement, scope, parent.as_deref_mut(), ctx).await?;
-        resolutions.push(RequirementResolution::new(requirement.id, result));
+        let (result, resolved_at_scope) =
+            resolve_requirement(requirement, scope, parent.as_deref_mut(), ctx).await?;
+        resolutions.push(Resolved {
+            resolution: RequirementResolution::new(requirement.id, result),
+            resolved_at_scope,
+        });
     }
 
     Ok(resolutions)
@@ -553,8 +670,9 @@ mod tests {
         agent::{
             AgentError, AgentErrorKind, AgentInput, AgentMachine, ApprovalDecision,
             ApprovalRequirement, ApprovalResponse, BudgetLimits, LlmStepMode, LoopCursor,
-            LoopCursorKind, LoopDoneReason, Requirement, RequirementId, RunContext, RunId,
-            StepInput, StepOutcome, ToolApprovalPolicy, TraceNodeId,
+            LoopCursorKind, LoopDoneReason, Requirement, RequirementDisposition, RequirementId,
+            RunContext, RunId, StepInput, StepOutcome, ToolApprovalPolicy, TraceNodeId,
+            TraceNodeKind,
             interaction::{Interaction, InteractionKind, InteractionResponse},
             requirement::{RequirementKind, RequirementKindTag, RequirementResult},
             tool::{ToolRegistry, ToolRuntimeError},
@@ -1271,5 +1389,102 @@ mod tests {
 
         // Terminal state is reached regardless of the reordering.
         assert_eq!(machine.cursor().kind(), LoopCursorKind::Done);
+    }
+
+    // ----- M5-3: trace records resolved-by-scope and disposition -----
+
+    /// Extracts the `(resolved_at_scope, disposition)` of the trace node whose id
+    /// is the string form of `id`, asserting it is a `Requirement` node whose
+    /// `kind_tag` matches `expected_tag`.
+    fn requirement_trace(
+        ctx: &RunContext,
+        id: RequirementId,
+        expected_tag: RequirementKindTag,
+    ) -> (u32, RequirementDisposition) {
+        let records = ctx.trace().records();
+        let record = records
+            .iter()
+            .find(|record| record.id().as_str() == id.to_string())
+            .expect("a trace node was recorded for the requirement");
+        match record.kind() {
+            TraceNodeKind::Requirement {
+                kind_tag,
+                resolved_at_scope,
+                disposition,
+            } => {
+                assert_eq!(kind_tag, expected_tag);
+                (resolved_at_scope, disposition)
+            }
+            other => panic!("expected a requirement trace node, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_records_resolved_at_scope_for_local_and_popped_requirements() {
+        // Inner layer handles tools locally; interaction must pop to the outer
+        // layer. One batch exercises both a hop-0 (local) and a hop-1 (popped)
+        // resolution.
+        let inner_tool = CountingToolHandler::default();
+        let inner = TestScope {
+            tool: Some(inner_tool.clone()),
+            ..TestScope::default()
+        };
+        let outer_interaction = CountingInteractionHandler::default();
+        let outer = TestScope {
+            interaction: Some(outer_interaction.clone()),
+            ..TestScope::default()
+        };
+        let mut parent = ScopePop::new(&outer, None);
+        let mut machine =
+            BatchMachine::new(vec![tool_requirement(1, 0), interaction_requirement(2)]);
+        let ctx = run_context();
+
+        let done = drain(
+            &mut machine,
+            external_input(),
+            &inner,
+            Some(&mut parent),
+            &ctx,
+        )
+        .await
+        .expect("drain completes");
+        assert!(matches!(done.cursor(), LoopCursor::Done(_)));
+
+        // The tool was settled in place by the emitting (inner) scope: hop 0.
+        assert_eq!(
+            requirement_trace(&ctx, requirement_id_n(1), RequirementKindTag::Tool),
+            (0, RequirementDisposition::Resumed)
+        );
+        // The interaction popped one layer out to the attended parent: hop 1.
+        assert_eq!(
+            requirement_trace(&ctx, requirement_id_n(2), RequirementKindTag::Interaction),
+            (1, RequirementDisposition::Resumed)
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_records_never_resumed_disposition_on_cancel() {
+        let tool = CountingToolHandler::default();
+        let scope = TestScope {
+            tool: Some(tool.clone()),
+            ..TestScope::default()
+        };
+        let mut machine = BatchMachine::new(vec![tool_requirement(7, 0)]);
+        let ctx = run_context();
+        // A cancelled context abandons the batch's first requirement instead of
+        // fulfilling it: a never-resume that must still be traced.
+        ctx.cancellation().cancel();
+
+        drain(&mut machine, external_input(), &scope, None, &ctx)
+            .await
+            .expect("cancelled drain closes the turn");
+
+        // The requirement was never fulfilled by the handler.
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        // The never-resume is recorded, settled at the performing layer (hop 0).
+        assert_eq!(
+            requirement_trace(&ctx, requirement_id_n(7), RequirementKindTag::Tool),
+            (0, RequirementDisposition::NeverResumed)
+        );
     }
 }

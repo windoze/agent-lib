@@ -29,8 +29,8 @@ pub use approval::{
 };
 pub use context::{
     BudgetCharge, BudgetDimension, BudgetError, BudgetHandle, BudgetLimits, BudgetSnapshot,
-    BudgetUsage, CancellationToken, RunContext, RunContextError, TraceError, TraceHandle,
-    TraceNodeId, TraceNodeKind, TraceRecord,
+    BudgetUsage, CancellationToken, RequirementDisposition, RunContext, RunContextError,
+    TraceError, TraceHandle, TraceNodeId, TraceNodeKind, TraceRecord,
 };
 pub use drive::{
     ApprovalInteractionHandler, DrivingSubagentHandler, HandlerScope, InteractionHandler,

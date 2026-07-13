@@ -1431,7 +1431,7 @@ handler 派生子 agent 并再开一层 drain 递归驱动,并从"当前 drain s
   聚焦测试;网络用例 ignored)、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean)、
   `git diff --check`(clean)均通过。每测试 <1min。
 
-### [TODO] M5-3 Observability:trace 记 resolved-by-scope 与 disposition
+### [DONE] M5-3 Observability:trace 记 resolved-by-scope 与 disposition
 
 **前置依赖**:M5-2。
 
@@ -1452,6 +1452,51 @@ handler 派生子 agent 并再开一层 drain 递归驱动,并从"当前 drain s
 - 聚焦测试:一次含 pop 的兑现在 trace 记录了正确 `resolved_at_scope`;一次 cancel 在 trace
   记录 `NeverResumed`;trace record serde round-trip。
 - 运行全套命令。
+
+**完成记录**:
+
+- **`RequirementDisposition` 与 `TraceNodeKind::Requirement`(`context/trace.rs`)**:新增
+  `pub enum RequirementDisposition { Resumed, NeverResumed }`(Copy + serde `snake_case`),并给
+  `TraceNodeKind` 补 `Requirement { kind_tag: RequirementKindTag, resolved_at_scope: u32,
+  disposition: RequirementDisposition }` 结构变体。三字段全 `Copy`,故 `TraceNodeKind` 仍 `Copy`、
+  `TraceRecord::kind()` 签名不变(零破坏)。`trace.rs` 引 `crate::agent::requirement::RequirementKindTag`。
+  新增 `TraceHandle::record_requirement(id, kind_tag, resolved_at_scope, disposition)` 走既有
+  `record_node`(沿用 dup-id / unknown-parent 校验),节点挂在**执行该 requirement 的那层** trace
+  parent(root 或 sub-agent 节点)下。`context.rs` / `agent/mod.rs` 同步 re-export
+  `RequirementDisposition`。
+- **`resolved_at_scope` 语义 = pop 跳数**:从「perform 该 requirement 的那层 scope」向外 pop 到
+  真正兑现处的跳数(0 = 本层就地兑现,每向外一层 +1)。这是动态作用域下最直接可测的「被哪层兑现」
+  相对表示,天然经 pop 链累加,且与 trace 节点归属(挂在 emitting 层)组合后完整定位兑现位置。
+- **hop 计数经 pop 链回传(`drive.rs`)**:
+  - `Pop::pop` 返回类型 `Result<RequirementResult, AgentError>` → `Result<(RequirementResult,
+    u32), AgentError>`,u32 = 从「本 pop 目标 scope」起到兑现处的跳数;唯一实现 `ScopePop` 原样透传。
+  - `resolve_requirement` 同步改返回 `(RequirementResult, u32)`:本层兑现(subagent handler /
+    `fulfill_with_scope`)返回 `(result, 0)`;pop 时 `let (r,h)=parent.pop(..)?; (r, h+1)`(+1 =
+    跨到 parent 的那一跳);顶层无 handler 仍 `UnhandledRequirement`(不记录)。
+  - 新增内部结构 `Resolved { resolution, resolved_at_scope }`;`fulfill_batch` 返回
+    `Vec<Resolved>`:并发本层集 hop=0,串行集经 `resolve_requirement` 得 hop。
+- **记录集中在 `drain`(单处、且只记「真会被 Resume/Abandon」的)**:`fulfill_batch` 只返回 Ok
+  兑现(错误经 `?` 上抛、不记录半途失败),故 `drain` 对每个 `Resolved` 先
+  `record_requirement_resolution(ctx, &resolution, resolved_at_scope, Resumed)` 再 `Resume`;
+  cancel 分支对 `pending.first()` 先 `record_requirement(ctx, req, 0, NeverResumed)` 再 `Abandon`
+  (cancel = 本层 never-resume handler,故 scope=0)。trace 节点 id **复用 host-minted requirement
+  id**(库不造 id 哲学);记录失败经 `RunContextError::Trace` → `AgentError`(kind=`Trace`)。
+  新增 `record_requirement` / `record_requirement_resolution` / `record_requirement_node` 三个私有
+  helper。
+- **聚焦测试**:
+  - `drive.rs` `drain_records_resolved_at_scope_for_local_and_popped_requirements`:一批
+    `[tool(本层), interaction(pop 到外层)]` → tool 节点 `resolved_at_scope==0`+`Resumed`、
+    interaction 节点 `resolved_at_scope==1`+`Resumed`,kind_tag 分别为 Tool/Interaction。
+  - `drive.rs` `drain_records_never_resumed_disposition_on_cancel`:cancel 的 ctx → 首个 requirement
+    被 `Abandon`,tool handler 零调用,trace 记 `resolved_at_scope==0`+`NeverResumed`。
+  - `context/tests.rs` `requirement_trace_node_round_trips_through_serde`:`Requirement` 变体
+    serde round-trip,并核对 JSON 形状(`kind.requirement.{kind_tag,resolved_at_scope,disposition}`,
+    disposition `never_resumed`)。
+- **验证**:`cargo fmt --all`(clean)、`cargo clippy --all-targets -- -D warnings`(0 warning)、
+  `cargo test --all --all-targets`(lib 435 passed / 0 failed;较上轮 +3 新测试;网络用例 ignored)、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean)、`git diff --check`(clean)均通过。
+  每测试 <1min。既有 subagent / reference drain 测试(父子共享 trace 树、pop、cancel)全绿,证明新增
+  记录不改行为、requirement id 在同一 trace 树内不冲突。
 
 ### [TODO] M5-R Milestone 5 Review
 

@@ -1,6 +1,9 @@
 //! Trace record DTOs and append-only trace handles.
 
-use crate::agent::id::{RunId, StepId};
+use crate::agent::{
+    id::{RunId, StepId},
+    requirement::RequirementKindTag,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -37,6 +40,28 @@ impl fmt::Display for TraceNodeId {
     }
 }
 
+/// Whether a reified requirement's continuation was resumed or never resumed.
+///
+/// A requirement is a delimited continuation the machine reified when it needed
+/// IO. Every requirement is settled in exactly one of two ways, and both are
+/// recorded because a never-resume is a real event that mutates the underlying
+/// [`Conversation`](crate::conversation::Conversation), not a non-event
+/// (migration doc §8 / effect-model §6.3):
+///
+/// - [`Resumed`](Self::Resumed): a handler fulfilled the requirement and its
+///   result was fed back into the machine.
+/// - [`NeverResumed`](Self::NeverResumed): the continuation was abandoned
+///   (cancellation is a never-resume handler), so the machine settles through
+///   its `cancel_pending` closure path instead of receiving a result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequirementDisposition {
+    /// A handler fulfilled the requirement and the machine was resumed with it.
+    Resumed,
+    /// The requirement's continuation was abandoned and never resumed (cancel).
+    NeverResumed,
+}
+
 /// Kind of node recorded in an Agent trace tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +76,24 @@ pub enum TraceNodeKind {
     Tool,
     /// Child Agent run node.
     SubAgent,
+    /// A reified requirement, annotated with where and how it was settled.
+    ///
+    /// Dynamic scoping means a requirement performed at one drain layer may be
+    /// fulfilled at an outer one; recording the resolving scope and the
+    /// disposition is what makes an otherwise ambiguous pull path auditable
+    /// (migration doc §8 / effect-model §8).
+    Requirement {
+        /// Requirement family (llm / tool / interaction / subagent / reconfig).
+        kind_tag: RequirementKindTag,
+        /// Pop hops from the performing layer to the scope that settled it.
+        ///
+        /// `0` means the emitting scope settled it in place; each pop outward
+        /// adds one. A never-resume (cancel) is settled at the performing layer,
+        /// so it records `0`.
+        resolved_at_scope: u32,
+        /// Whether the requirement was resumed or never resumed.
+        disposition: RequirementDisposition,
+    },
 }
 
 /// Serializable trace record for reconstructing a run tree.
@@ -214,6 +257,37 @@ impl TraceHandle {
         run_id: RunId,
     ) -> Result<TraceRecord, TraceError> {
         self.record_node(id, TraceNodeKind::SubAgent, Some(run_id.to_string()))
+    }
+
+    /// Records a settled requirement node under the current parent.
+    ///
+    /// `resolved_at_scope` is the number of pop hops from the layer that
+    /// performed the requirement to the scope that settled it (`0` = settled in
+    /// place); `disposition` is whether it was resumed or never resumed. The
+    /// node lives under the *performing* layer's trace parent, annotated with
+    /// the resolving scope, so the pull path is reconstructable (migration doc
+    /// §8).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TraceError`] when the node id is duplicate or the current
+    /// parent is not present.
+    pub fn record_requirement(
+        &self,
+        id: TraceNodeId,
+        kind_tag: RequirementKindTag,
+        resolved_at_scope: u32,
+        disposition: RequirementDisposition,
+    ) -> Result<TraceRecord, TraceError> {
+        self.record_node(
+            id,
+            TraceNodeKind::Requirement {
+                kind_tag,
+                resolved_at_scope,
+                disposition,
+            },
+            None,
+        )
     }
 
     fn record_node(
