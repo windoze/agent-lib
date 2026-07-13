@@ -36,7 +36,9 @@ Arc/lock、client/registry handle 和 strategy/trigger object；`ConversationRow
 snapshot 分解为 DB-neutral parent-tree rows，使用稳定 PK/FK、parent Turn pointer 与显式
 sequence 表达 conversation/turn/message/pairing/projection/artifact facts，重组后仍必须走
 `Conversation::restore` 校验，fork child 的导出只新增 child metadata/association 和本地 suffix
-facts，不复制共享祖先 message/turn payload。
+facts，不复制共享祖先 message/turn payload；Agent 层已开始暴露 data-only 的强类型
+identity 与静态 `AgentSpec` 配置模型，用于记录 worktree、初始 system prompt、tool 声明、
+model 请求设置和 loop policy，不包含 live conversation、client、tool registry 或 runtime handle。
 已完成的 Client 层实施记录见
 [`docs/archive/2026-07-13-client-layer/TODO.md`](docs/archive/2026-07-13-client-layer/TODO.md)；
 已完成的 Conversation Core 计划和任务记录见
@@ -53,6 +55,9 @@ facts，不复制共享祖先 message/turn payload。
 - `model::extras`：绑定 `ProviderId`、仅在最终请求序列化阶段合并的方言字段。
 - `stream`：用稳定 block id 关联增量事件，并通过统一 accumulator 折叠为完整响应。
 - `client`：dyn-safe `LlmClient`、分类错误、结构化 capability、endpoint 与请求配置。
+- `agent`：外部注入的强类型 Agent/Run/Step/ToolSet/Skill/Plan/Blackboard id，以及字段私有、
+  可 serde 的静态 `AgentSpec`、`WorktreeRef`、`ToolSetRef`、`ModelRef` 和 `LoopPolicy`；
+  该层当前只保存可恢复的配置数据，不持有运行时句柄。
 - `conversation`：外部注入的强类型 id、独立 system 配置、不可原地修改的消息 envelope、
   共享只读 message 的 closed `Turn`、分类 commit 错误、唯一 I1--I4 校验门，以及复用 Client
   `Accumulator` 的单消息 pending/freeze 状态机、唯一 `PendingTurn` 事务状态机和原子 cancel
@@ -76,8 +81,9 @@ facts，不复制共享祖先 message/turn payload。
   `MessageRecord.payload`。
 
 Conversation Core 已覆盖 pending/cancel、branch、projection/compaction、snapshot/rows restore
-与跨 adapter effective-view 兼容验收；具体 Agent loop、Tool registry、自动预算调度与
-多 agent 编排是当前 Agent 层计划范围，尚未作为已实现能力暴露。完整设计和当前阶段计划分别见 [`DESIGN.md`](DESIGN.md)、
+与跨 adapter effective-view 兼容验收；Agent 层当前只完成静态 identity/spec 数据模型，
+具体 Agent loop、Tool registry、自动预算调度与多 agent 编排仍是后续计划范围，尚未作为
+已实现能力暴露。完整设计和当前阶段计划分别见 [`DESIGN.md`](DESIGN.md)、
 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。
 
 下面把调用方提供的稳定 UUID 与完整 Client message 组合成冻结 envelope。system prompt

@@ -19,7 +19,7 @@
 
 ## Milestone 1 — Agent 基础数据与 RunContext
 
-### M1-1 [TODO] Agent identity、`AgentSpec` 与静态配置模型
+### [DONE] M1-1 Agent identity、`AgentSpec` 与静态配置模型
 
 **前置依赖**：Conversation Core 已完成并归档；直接复用 `client::ChatRequest` 可表达的
 model/system/tool 声明边界，不改 Client wire 模型。
@@ -45,6 +45,26 @@ model/system/tool 声明边界，不改 Client wire 模型。
 - 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦 agent spec 测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增 `src/agent/` 模块并从 crate 根导出，包含 `id.rs`、`spec.rs` 和 `mod.rs`。
+- 新增 `AgentId`、`RunId`、`StepId`、`ToolSetId`、`SkillId`、`PlanId`、`BlackboardId`
+  UUID newtype；仅提供外部 UUID 构造/解析、serde、显示和只读 UUID 访问，不提供 RNG、
+  时钟或自增路径。
+- 新增字段私有的 `AgentSpec` 静态配置模型，以及 `WorktreeRef`、`ToolSetRef`、`ModelRef`、
+  `LoopPolicy`、`ToolFailurePolicy`；`ToolSetRef` 复用 provider-neutral `model::tool::Tool`
+  声明，`ModelRef` 只保存可复制进 `client::ChatRequest` 的 data-only 请求设置。
+- 为公开 Agent 类型补充 rustdoc，明确 `AgentSpec` 是模板/配方，不持有
+  `Conversation`、`LlmClient`、tool registry、stream、task handle、cancel handle 或其他
+  runtime handle。
+- 更新 crate 根文档和 `README.md`，把新增 Agent 静态配置模块纳入当前公开能力说明。
+- 聚焦测试覆盖 Agent id serde/parse round-trip、非法 UUID 拒绝、compile-fail newtype 误用、
+  `AgentSpec` serde 保留外部提供值、非零策略字段反序列化校验，以及静态配置 JSON 不含
+  runtime handle 字段。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test agent::`；`perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
+  `cargo test --doc`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
 ### M1-2 [TODO] `RunContext`、取消、预算与 trace handle 边界
 
