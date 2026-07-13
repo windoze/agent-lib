@@ -19,7 +19,10 @@
 //! raw/debug/persistence facts. [`Projection`] is a non-destructive overlay on
 //! raw history: its spans cover complete Turn ranges checked through
 //! [`CheckedTurnRange`], compacted spans point at provenance-carrying
-//! [`Artifact`] values, [`Conversation::effective_view`] renders a head-clipped
+//! [`Artifact`] values, [`CompactionPlan`] stores data-only overlay rewrite
+//! intent, [`Conversation::apply_compaction`] validates owner/version/head,
+//! targets, artifacts, and provenance before atomically replacing the
+//! projection, [`Conversation::effective_view`] renders a head-clipped
 //! Client-ready committed context, and [`Conversation::pending_context`] keeps
 //! frozen pending payloads separate from active partials. Raw messages remain
 //! unchanged.
@@ -50,8 +53,9 @@ pub use pending::{
     PendingTurnPhase, ToolCallMapping,
 };
 pub use projection::{
-    Artifact, ArtifactProvenance, CheckedTurnRange, EffectiveView, PendingContext, Projection,
-    Span, StrategyRef, TokenAccounting,
+    Artifact, ArtifactProvenance, CheckedTurnRange, CompactionPlan, CompactionStep,
+    CompactionTarget, EffectiveView, PendingContext, Projection, Span, StrategyRef,
+    TokenAccounting,
 };
 pub use turn::{ToolPairing, Turn, TurnMeta, TurnResponseMeta};
 
@@ -171,10 +175,10 @@ impl Conversation {
 
     /// Returns the monotonic version advanced by each structural history change.
     ///
-    /// Successful commits and real logical-head moves advance it. Forked
-    /// children start their own version domain at zero, so parent and child
-    /// [`Boundary`] owners remain distinct even when their numeric versions
-    /// match.
+    /// Successful commits, real logical-head moves, and atomic projection
+    /// compaction updates advance it. Forked children start their own version
+    /// domain at zero, so parent and child [`Boundary`] owners remain distinct
+    /// even when their numeric versions match.
     #[must_use]
     pub const fn version(&self) -> u64 {
         self.version
@@ -366,9 +370,15 @@ impl Conversation {
         let expected_parent = self.history.tip_id();
         let turn = validation::validate_turn_data(data, self.history.raw_turns(), expected_parent)?;
         let turn_id = turn.id();
+        let previous_active_len = self.history.turns().len();
+        let previous_projection = self.projection.clone();
 
         self.history.append(turn);
-        self.projection = Projection::raw_for_active_turns(self.id, self.history.turns());
+        self.projection = previous_projection.extend_after_commit(
+            self.id,
+            self.history.turns(),
+            previous_active_len,
+        );
         let committed = self
             .history
             .turns()

@@ -1,8 +1,8 @@
 //! Projection model and checked range tests.
 
 use super::{
-    Artifact, ArtifactProvenance, CheckedTurnRange, Projection, RangeEndpoint, Span, StrategyRef,
-    TokenAccounting,
+    Artifact, ArtifactProvenance, CheckedTurnRange, CompactionPlan, CompactionStep, Projection,
+    RangeEndpoint, Span, StrategyRef, TokenAccounting,
 };
 use crate::{
     client::Response,
@@ -22,6 +22,9 @@ use serde_json::{Map, json};
 use uuid::Uuid;
 
 const UUID_BASE: u128 = 0x018f_0d9c_7b6a_7c12_8f60_0000_0000_0000;
+
+type RawMessageSnapshot = (MessageId, Role, String);
+type RawTurnSnapshot = (TurnId, Vec<RawMessageSnapshot>);
 
 fn conversation_id(seed: u128) -> ConversationId {
     ConversationId::new(Uuid::from_u128(UUID_BASE + seed))
@@ -134,6 +137,38 @@ fn artifact(
     .expect("valid artifact")
 }
 
+fn raw_compaction_plan(
+    conversation: &Conversation,
+    range: CheckedTurnRange,
+    id_seed: u128,
+    produced_by: StrategyRef,
+    label: &str,
+) -> (CompactionPlan, Artifact) {
+    let artifact = artifact(id_seed, range.clone(), produced_by.clone(), label);
+    let plan = CompactionPlan::new(
+        conversation,
+        vec![CompactionStep::raw(range, artifact.id(), produced_by)],
+        vec![artifact.clone()],
+    );
+    (plan, artifact)
+}
+
+fn span_compaction_plan(
+    conversation: &Conversation,
+    range: CheckedTurnRange,
+    id_seed: u128,
+    produced_by: StrategyRef,
+    label: &str,
+) -> (CompactionPlan, Artifact) {
+    let artifact = artifact(id_seed, range.clone(), produced_by.clone(), label);
+    let plan = CompactionPlan::new(
+        conversation,
+        vec![CompactionStep::spans(range, artifact.id(), produced_by)],
+        vec![artifact.clone()],
+    );
+    (plan, artifact)
+}
+
 fn install_projection(conversation: &mut Conversation, projection: Projection) {
     conversation.projection = projection;
 }
@@ -173,6 +208,27 @@ fn message_labels(messages: &[Message]) -> Vec<(Role, String)> {
                 panic!("projection test messages contain one text block");
             };
             (message.role, text.clone())
+        })
+        .collect()
+}
+
+fn raw_history_snapshot(conversation: &Conversation) -> Vec<RawTurnSnapshot> {
+    conversation
+        .raw_turns()
+        .into_iter()
+        .map(|turn| {
+            let messages = turn
+                .messages()
+                .iter()
+                .map(|message| {
+                    let [ContentBlock::Text { text, .. }] = message.payload().content.as_slice()
+                    else {
+                        panic!("projection test messages contain one text block");
+                    };
+                    (message.id(), message.payload().role, text.clone())
+                })
+                .collect();
+            (turn.id(), messages)
         })
         .collect()
 }
@@ -509,6 +565,456 @@ fn frozen_pending_messages_only_appear_through_pending_context() {
         2,
         "owned Client payloads can be appended explicitly by the caller"
     );
+}
+
+#[test]
+fn apply_compaction_handles_first_pass_tiered_tail_and_revert_redo() {
+    let mut conversation = conversation(16);
+    commit_text_turn(&mut conversation, 161);
+    commit_text_turn(&mut conversation, 162);
+    commit_text_turn(&mut conversation, 163);
+    commit_text_turn(&mut conversation, 164);
+    let raw_before = raw_history_snapshot(&conversation);
+    let initial_version = conversation.version();
+
+    let first_range = range(&conversation, 0, 2);
+    let (first_plan, first_artifact) = raw_compaction_plan(
+        &conversation,
+        first_range,
+        1610,
+        strategy("apply-first"),
+        "turns 161-162 summary",
+    );
+    let encoded_plan = serde_json::to_string(&first_plan).expect("serialize compaction plan");
+    let decoded_plan: CompactionPlan =
+        serde_json::from_str(&encoded_plan).expect("deserialize compaction plan");
+    assert_eq!(decoded_plan, first_plan);
+
+    conversation
+        .apply_compaction(&first_plan)
+        .expect("first raw range compaction applies");
+    assert_eq!(conversation.version(), initial_version + 1);
+    assert_eq!(conversation.projection().spans().len(), 2);
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::Assistant, "turns 161-162 summary".to_owned()),
+            (Role::User, "question:163".to_owned()),
+            (Role::Assistant, "answer:163".to_owned()),
+            (Role::User, "question:164".to_owned()),
+            (Role::Assistant, "answer:164".to_owned()),
+        ]
+    );
+
+    let tail_prefix = range(&conversation, 2, 3);
+    let (tail_plan, tail_artifact) = raw_compaction_plan(
+        &conversation,
+        tail_prefix,
+        1611,
+        strategy("apply-tail"),
+        "turn 163 summary",
+    );
+    conversation
+        .apply_compaction(&tail_plan)
+        .expect("raw target can split the remaining raw tail");
+
+    assert_eq!(conversation.projection().spans().len(), 3);
+    assert!(
+        conversation
+            .projection()
+            .artifact(first_artifact.id())
+            .is_some()
+    );
+    assert!(
+        conversation
+            .projection()
+            .artifact(tail_artifact.id())
+            .is_some()
+    );
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::Assistant, "turns 161-162 summary".to_owned()),
+            (Role::Assistant, "turn 163 summary".to_owned()),
+            (Role::User, "question:164".to_owned()),
+            (Role::Assistant, "answer:164".to_owned()),
+        ]
+    );
+    assert_eq!(raw_history_snapshot(&conversation), raw_before);
+
+    let inside_first_summary = conversation.valid_boundaries()[1];
+    let redo = conversation
+        .revert_to(inside_first_summary)
+        .expect("revert into compacted cover")
+        .old_head();
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::User, "question:161".to_owned()),
+            (Role::Assistant, "answer:161".to_owned()),
+        ]
+    );
+    conversation
+        .revert_to(redo)
+        .expect("redo to full compacted projection");
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::Assistant, "turns 161-162 summary".to_owned()),
+            (Role::Assistant, "turn 163 summary".to_owned()),
+            (Role::User, "question:164".to_owned()),
+            (Role::Assistant, "answer:164".to_owned()),
+        ]
+    );
+    assert_eq!(raw_history_snapshot(&conversation), raw_before);
+}
+
+#[test]
+fn apply_compaction_consolidates_existing_spans_and_retains_replaced_artifacts() {
+    let mut conversation = conversation(17);
+    commit_text_turn(&mut conversation, 171);
+    commit_text_turn(&mut conversation, 172);
+    commit_text_turn(&mut conversation, 173);
+    commit_text_turn(&mut conversation, 174);
+    let raw_before = raw_history_snapshot(&conversation);
+
+    let first = range(&conversation, 0, 2);
+    let (first_plan, first_artifact) = raw_compaction_plan(
+        &conversation,
+        first,
+        1710,
+        strategy("tier-a"),
+        "turns 171-172 summary",
+    );
+    conversation
+        .apply_compaction(&first_plan)
+        .expect("first tier applies");
+    let second = range(&conversation, 2, 3);
+    let (second_plan, second_artifact) = raw_compaction_plan(
+        &conversation,
+        second,
+        1711,
+        strategy("tier-b"),
+        "turn 173 summary",
+    );
+    conversation
+        .apply_compaction(&second_plan)
+        .expect("second tier applies");
+
+    let consolidated = range(&conversation, 0, 3);
+    let (consolidate_plan, consolidated_artifact) = span_compaction_plan(
+        &conversation,
+        consolidated,
+        1712,
+        strategy("consolidate"),
+        "turns 171-173 consolidated summary",
+    );
+    conversation
+        .apply_compaction(&consolidate_plan)
+        .expect("span target can consolidate existing summaries plus raw tail");
+
+    assert_eq!(conversation.projection().spans().len(), 2);
+    assert!(
+        conversation
+            .projection()
+            .artifact(first_artifact.id())
+            .is_some()
+    );
+    assert!(
+        conversation
+            .projection()
+            .artifact(second_artifact.id())
+            .is_some()
+    );
+    assert!(
+        conversation
+            .projection()
+            .artifact(consolidated_artifact.id())
+            .is_some()
+    );
+    assert_eq!(conversation.projection().artifacts().len(), 3);
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (
+                Role::Assistant,
+                "turns 171-173 consolidated summary".to_owned(),
+            ),
+            (Role::User, "question:174".to_owned()),
+            (Role::Assistant, "answer:174".to_owned()),
+        ]
+    );
+    assert_eq!(raw_history_snapshot(&conversation), raw_before);
+}
+
+#[test]
+fn commit_after_compaction_preserves_overlay_and_adds_raw_tail() {
+    let mut conversation = conversation(18);
+    commit_text_turn(&mut conversation, 181);
+    commit_text_turn(&mut conversation, 182);
+    let compacted = range(&conversation, 0, 2);
+    let (plan, artifact) = raw_compaction_plan(
+        &conversation,
+        compacted,
+        1810,
+        strategy("keep-on-commit"),
+        "turns 181-182 summary",
+    );
+    conversation
+        .apply_compaction(&plan)
+        .expect("compaction applies before the next turn");
+
+    commit_text_turn(&mut conversation, 183);
+
+    assert!(conversation.projection().artifact(artifact.id()).is_some());
+    assert_eq!(conversation.projection().spans().len(), 2);
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::Assistant, "turns 181-182 summary".to_owned()),
+            (Role::User, "question:183".to_owned()),
+            (Role::Assistant, "answer:183".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn apply_compaction_rejects_stale_pending_and_invalid_plan_shapes_atomically() {
+    let mut conversation = conversation(19);
+    commit_text_turn(&mut conversation, 191);
+    commit_text_turn(&mut conversation, 192);
+
+    let stale_range = range(&conversation, 0, 1);
+    let (stale_plan, _) = raw_compaction_plan(
+        &conversation,
+        stale_range,
+        1910,
+        strategy("stale"),
+        "stale summary",
+    );
+    let projection_before_stale = conversation.projection().clone();
+    commit_text_turn(&mut conversation, 193);
+    assert_eq!(
+        conversation
+            .apply_compaction(&stale_plan)
+            .expect_err("version mismatch rejects stale plans"),
+        ConversationError::Projection(ProjectionError::StaleCompactionPlan {
+            plan_version: 2,
+            current_version: 3,
+        })
+    );
+    assert_eq!(
+        conversation.projection(),
+        &projection_before_stale.extend_after_commit(conversation.id(), conversation.turns(), 2,)
+    );
+
+    let pending_range = range(&conversation, 0, 1);
+    let (pending_plan, _) = raw_compaction_plan(
+        &conversation,
+        pending_range,
+        1911,
+        strategy("pending"),
+        "pending summary",
+    );
+    let projection_before_pending = conversation.projection().clone();
+    begin_pending(&mut conversation, 194);
+    assert_eq!(
+        conversation
+            .apply_compaction(&pending_plan)
+            .expect_err("pending apply is deferred by rejection"),
+        ConversationError::Projection(ProjectionError::PendingTurn {
+            turn_id: turn_id(194),
+        })
+    );
+    assert_eq!(conversation.projection(), &projection_before_pending);
+}
+
+#[test]
+fn apply_compaction_rejects_target_and_artifact_mismatches_atomically() {
+    let mut conversation = conversation(20);
+    commit_text_turn(&mut conversation, 201);
+    commit_text_turn(&mut conversation, 202);
+    commit_text_turn(&mut conversation, 203);
+    commit_text_turn(&mut conversation, 204);
+    let first = range(&conversation, 0, 2);
+    let (first_plan, _) = raw_compaction_plan(
+        &conversation,
+        first,
+        2010,
+        strategy("existing"),
+        "turns 201-202 summary",
+    );
+    conversation
+        .apply_compaction(&first_plan)
+        .expect("seed compacted span");
+    let unchanged_projection = conversation.projection().clone();
+    let unchanged_raw = raw_history_snapshot(&conversation);
+
+    let raw_inside_compacted = range(&conversation, 1, 2);
+    let (raw_inside_plan, _) = raw_compaction_plan(
+        &conversation,
+        raw_inside_compacted,
+        2011,
+        strategy("bad-raw"),
+        "bad raw target",
+    );
+    assert_eq!(
+        conversation
+            .apply_compaction(&raw_inside_plan)
+            .expect_err("raw targets cannot intersect compacted spans"),
+        ConversationError::Projection(ProjectionError::CompactionTargetNotRaw { start: 1, end: 2 })
+    );
+    assert_eq!(conversation.projection(), &unchanged_projection);
+
+    let partial_span = range(&conversation, 1, 3);
+    let (partial_span_plan, _) = span_compaction_plan(
+        &conversation,
+        partial_span,
+        2012,
+        strategy("bad-span"),
+        "bad span target",
+    );
+    assert_eq!(
+        conversation
+            .apply_compaction(&partial_span_plan)
+            .expect_err("span targets must align with current span boundaries"),
+        ConversationError::Projection(ProjectionError::CompactionTargetNotSpanAligned {
+            start: 1,
+            end: 3,
+        })
+    );
+    assert_eq!(conversation.projection(), &unchanged_projection);
+
+    let tail_one = range(&conversation, 2, 3);
+    let missing_artifact_plan = CompactionPlan::new(
+        &conversation,
+        vec![CompactionStep::raw(
+            tail_one.clone(),
+            artifact_id(2013),
+            strategy("missing-artifact"),
+        )],
+        Vec::new(),
+    );
+    assert_eq!(
+        conversation
+            .apply_compaction(&missing_artifact_plan)
+            .expect_err("step artifact must be supplied by the plan"),
+        ConversationError::Projection(ProjectionError::MissingArtifact {
+            artifact_id: artifact_id(2013),
+        })
+    );
+
+    let wrong_range_artifact = artifact(
+        2014,
+        range(&conversation, 3, 4),
+        strategy("wrong-range"),
+        "wrong range",
+    );
+    let wrong_range_plan = CompactionPlan::new(
+        &conversation,
+        vec![CompactionStep::raw(
+            tail_one.clone(),
+            wrong_range_artifact.id(),
+            strategy("wrong-range"),
+        )],
+        vec![wrong_range_artifact.clone()],
+    );
+    assert_eq!(
+        conversation
+            .apply_compaction(&wrong_range_plan)
+            .expect_err("artifact provenance must cover the target"),
+        ConversationError::Projection(ProjectionError::ArtifactRangeMismatch {
+            artifact_id: wrong_range_artifact.id(),
+        })
+    );
+
+    let wrong_strategy_artifact = artifact(
+        2015,
+        tail_one.clone(),
+        strategy("actual-strategy"),
+        "wrong strategy",
+    );
+    let wrong_strategy_plan = CompactionPlan::new(
+        &conversation,
+        vec![CompactionStep::raw(
+            tail_one.clone(),
+            wrong_strategy_artifact.id(),
+            strategy("declared-strategy"),
+        )],
+        vec![wrong_strategy_artifact.clone()],
+    );
+    assert_eq!(
+        conversation
+            .apply_compaction(&wrong_strategy_plan)
+            .expect_err("step strategy must match artifact provenance"),
+        ConversationError::Projection(ProjectionError::ArtifactStrategyMismatch {
+            artifact_id: wrong_strategy_artifact.id(),
+        })
+    );
+
+    let overlap_a = artifact(2016, tail_one.clone(), strategy("overlap-a"), "overlap a");
+    let overlap_b_range = range(&conversation, 2, 4);
+    let overlap_b = artifact(
+        2017,
+        overlap_b_range.clone(),
+        strategy("overlap-b"),
+        "overlap b",
+    );
+    let overlap_plan = CompactionPlan::new(
+        &conversation,
+        vec![
+            CompactionStep::raw(tail_one, overlap_a.id(), strategy("overlap-a")),
+            CompactionStep::raw(overlap_b_range, overlap_b.id(), strategy("overlap-b")),
+        ],
+        vec![overlap_a, overlap_b],
+    );
+    assert_eq!(
+        conversation
+            .apply_compaction(&overlap_plan)
+            .expect_err("later overlapping step rejects the whole plan"),
+        ConversationError::Projection(ProjectionError::SpanOverlap {
+            expected_start: 3,
+            actual_start: 2,
+        })
+    );
+
+    let extra_range = range(&conversation, 3, 4);
+    let extra_artifact = artifact(
+        2018,
+        extra_range,
+        strategy("extra"),
+        "extra unreferenced artifact",
+    );
+    let valid_tail = range(&conversation, 2, 3);
+    let valid_artifact = artifact(2019, valid_tail.clone(), strategy("valid"), "valid tail");
+    let unreferenced_plan = CompactionPlan::new(
+        &conversation,
+        vec![CompactionStep::raw(
+            valid_tail,
+            valid_artifact.id(),
+            strategy("valid"),
+        )],
+        vec![valid_artifact, extra_artifact.clone()],
+    );
+    assert_eq!(
+        conversation
+            .apply_compaction(&unreferenced_plan)
+            .expect_err("plan artifacts must be referenced by a step"),
+        ConversationError::Projection(ProjectionError::UnreferencedCompactionArtifact {
+            artifact_id: extra_artifact.id(),
+        })
+    );
+
+    let empty_plan = CompactionPlan::new(&conversation, Vec::new(), Vec::new());
+    assert_eq!(
+        conversation
+            .apply_compaction(&empty_plan)
+            .expect_err("empty plans do not update projection"),
+        ConversationError::Projection(ProjectionError::EmptyCompactionPlan)
+    );
+
+    assert_eq!(conversation.projection(), &unchanged_projection);
+    assert_eq!(raw_history_snapshot(&conversation), unchanged_raw);
 }
 
 #[test]

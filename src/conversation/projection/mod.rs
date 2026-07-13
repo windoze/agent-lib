@@ -5,8 +5,10 @@
 //! or [`ConversationMessage`](crate::conversation::ConversationMessage) data.
 
 mod artifact;
+mod compaction;
 
 pub use artifact::{Artifact, ArtifactProvenance, StrategyRef, TokenAccounting};
+pub use compaction::{CompactionPlan, CompactionStep, CompactionTarget};
 
 use super::{
     ArtifactId, Boundary, Conversation, ConversationError, ConversationId, ProjectionError, TurnId,
@@ -383,6 +385,45 @@ impl Projection {
             artifacts: Vec::new(),
         }
     }
+
+    /// Preserves the current active overlay and appends one newly committed raw Turn.
+    ///
+    /// When a commit happens after a revert into a compacted cover, the
+    /// visible prefix of that cover is materialized as raw spans for the new
+    /// branch. Artifacts whose provenance still matches the retained prefix are
+    /// kept as audit data; raw history itself remains untouched.
+    pub(crate) fn extend_after_commit(
+        self,
+        conversation_id: ConversationId,
+        turns: &[super::Turn],
+        previous_active_len: usize,
+    ) -> Self {
+        debug_assert_eq!(turns.len(), previous_active_len + 1);
+
+        let mut spans = active_projection_spans(conversation_id, &self, turns, previous_active_len);
+        push_raw_span(
+            &mut spans,
+            conversation_id,
+            turns,
+            previous_active_len,
+            previous_active_len + 1,
+        );
+
+        let artifacts = self
+            .artifacts
+            .into_iter()
+            .filter(|artifact| {
+                range_matches_turns(
+                    artifact.provenance().input_range(),
+                    conversation_id,
+                    turns,
+                    previous_active_len,
+                )
+            })
+            .collect();
+
+        Self { spans, artifacts }
+    }
 }
 
 impl Conversation {
@@ -607,14 +648,128 @@ fn endpoint_from_turns(turns: &[super::Turn], position: usize) -> RangeEndpoint 
     RangeEndpoint::new(turn_count, after_turn)
 }
 
-/// Resolves stored span endpoints against an addressable lineage length.
-fn span_bounds(range: &CheckedTurnRange, lineage_len: usize) -> (usize, usize) {
+/// Builds the projection spans that are valid for the supplied active prefix.
+fn active_projection_spans(
+    conversation_id: ConversationId,
+    projection: &Projection,
+    turns: &[super::Turn],
+    active_len: usize,
+) -> Vec<Span> {
+    debug_assert!(active_len <= turns.len());
+
+    let mut spans = Vec::new();
+    for span in projection.spans() {
+        let (start, end) = checked_range_positions(span.range());
+        if start >= active_len {
+            break;
+        }
+
+        let visible_end = end.min(active_len);
+        if start >= visible_end {
+            continue;
+        }
+
+        match span {
+            Span::Raw { .. } => {
+                push_raw_span(&mut spans, conversation_id, turns, start, visible_end);
+            }
+            Span::Compacted { covers, .. }
+                if end <= active_len
+                    && range_matches_turns(covers, conversation_id, turns, active_len) =>
+            {
+                spans.push(span.clone());
+            }
+            Span::Compacted { .. } => {
+                push_raw_span(&mut spans, conversation_id, turns, start, visible_end);
+            }
+        }
+    }
+
+    spans
+}
+
+/// Appends a raw span and merges it with a preceding adjacent raw span.
+fn push_raw_span(
+    spans: &mut Vec<Span>,
+    conversation_id: ConversationId,
+    turns: &[super::Turn],
+    start: usize,
+    end: usize,
+) {
+    if start == end {
+        return;
+    }
+
+    if let Some(Span::Raw { turns: previous }) = spans.last_mut() {
+        let previous_end = usize::try_from(previous.end_turn_count())
+            .expect("checked projection end fits in memory");
+        if previous_end == start {
+            let previous_start = usize::try_from(previous.start_turn_count())
+                .expect("checked projection start fits in memory");
+            *previous =
+                CheckedTurnRange::from_positions(conversation_id, turns, previous_start, end);
+            return;
+        }
+    }
+
+    spans.push(Span::raw(CheckedTurnRange::from_positions(
+        conversation_id,
+        turns,
+        start,
+        end,
+    )));
+}
+
+/// Checks whether a stored range still matches a lineage prefix by anchors.
+fn range_matches_turns(
+    range: &CheckedTurnRange,
+    conversation_id: ConversationId,
+    turns: &[super::Turn],
+    head_len: usize,
+) -> bool {
+    if range.conversation_id != conversation_id {
+        return false;
+    }
+    if range.start_turn_count() >= range.end_turn_count() {
+        return false;
+    }
+
+    let Ok(start) = usize::try_from(range.start_turn_count()) else {
+        return false;
+    };
+    let Ok(end) = usize::try_from(range.end_turn_count()) else {
+        return false;
+    };
+    if end > head_len || end > turns.len() {
+        return false;
+    }
+
+    endpoint_matches(turns, start, range.start_after_turn())
+        && endpoint_matches(turns, end, range.end_after_turn())
+}
+
+/// Checks one endpoint anchor against a materialized lineage.
+fn endpoint_matches(turns: &[super::Turn], position: usize, after_turn: Option<TurnId>) -> bool {
+    let expected = position
+        .checked_sub(1)
+        .and_then(|index| turns.get(index))
+        .map(super::Turn::id);
+    after_turn == expected
+}
+
+/// Converts a checked range to in-memory positions.
+fn checked_range_positions(range: &CheckedTurnRange) -> (usize, usize) {
     let start =
         usize::try_from(range.start_turn_count()).expect("checked projection start fits in memory");
     let end =
         usize::try_from(range.end_turn_count()).expect("checked projection end fits in memory");
-
     debug_assert!(start <= end);
+    (start, end)
+}
+
+/// Resolves stored span endpoints against an addressable lineage length.
+fn span_bounds(range: &CheckedTurnRange, lineage_len: usize) -> (usize, usize) {
+    let (start, end) = checked_range_positions(range);
     debug_assert!(end <= lineage_len);
     (start, end)
 }

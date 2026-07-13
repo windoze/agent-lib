@@ -655,6 +655,41 @@ pub enum ForkError {
 /// A projection range, artifact, or span set failed checked construction.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ProjectionError {
+    /// A compaction plan was prepared for another Conversation.
+    #[error(
+        "compaction plan belongs to conversation {actual}, but this conversation is {expected}"
+    )]
+    CompactionOwnerMismatch {
+        /// Identity required by the applying Conversation.
+        expected: ConversationId,
+        /// Identity embedded in the plan.
+        actual: ConversationId,
+    },
+
+    /// A compaction plan was prepared against an older structural version.
+    #[error(
+        "compaction plan version {plan_version} is stale; current version is {current_version}"
+    )]
+    StaleCompactionPlan {
+        /// Version embedded in the plan.
+        plan_version: u64,
+        /// Current Conversation structural version.
+        current_version: u64,
+    },
+
+    /// A compaction plan's recorded head no longer matches the Conversation.
+    #[error("compaction plan head {plan_head} does not match current head {current_head}")]
+    CompactionHeadMismatch {
+        /// Head size embedded in the plan.
+        plan_head: u64,
+        /// Current logical head size.
+        current_head: u64,
+    },
+
+    /// A compaction plan must contain at least one replacement step.
+    #[error("compaction plan has no steps")]
+    EmptyCompactionPlan,
+
     /// A persisted or caller-supplied range belongs to another Conversation.
     #[error(
         "projection range belongs to conversation {actual}, but this conversation is {expected}"
@@ -799,6 +834,31 @@ pub enum ProjectionError {
         /// End boundary reached by the supplied spans.
         actual_end: u64,
     },
+
+    /// A raw compaction target intersects an already compacted span.
+    #[error("raw compaction target {start}..{end} intersects an existing compacted span")]
+    CompactionTargetNotRaw {
+        /// Target start boundary.
+        start: u64,
+        /// Target end boundary.
+        end: u64,
+    },
+
+    /// A span compaction target cuts through an existing projection span.
+    #[error("span compaction target {start}..{end} is not aligned to existing span boundaries")]
+    CompactionTargetNotSpanAligned {
+        /// Target start boundary.
+        start: u64,
+        /// Target end boundary.
+        end: u64,
+    },
+
+    /// A compaction plan supplied an artifact that no step references.
+    #[error("compaction artifact {artifact_id} is not referenced by any step")]
+    UnreferencedCompactionArtifact {
+        /// Supplied artifact that is not used by a replacement step.
+        artifact_id: ArtifactId,
+    },
 }
 
 /// A Conversation operation failed without changing committed state.
@@ -846,6 +906,15 @@ pub enum ConversationError {
     /// Head and version cannot be advanced together because the version is exhausted.
     #[error("head cannot move atomically from exhausted structural version {current_version}")]
     NonAtomicHeadMove {
+        /// Exhausted current version.
+        current_version: u64,
+    },
+
+    /// Projection and version cannot be advanced together because the version is exhausted.
+    #[error(
+        "projection cannot update atomically from exhausted structural version {current_version}"
+    )]
+    NonAtomicProjectionUpdate {
         /// Exhausted current version.
         current_version: u64,
     },

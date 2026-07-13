@@ -945,7 +945,7 @@ head 为上界；若 revert 落进一个 compacted cover，不能使用包含未
   0 failed，所有 example targets passed）；`cargo test --doc`（1 个正向与 10 个 compile-fail
   passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
-### M4-3 [TODO] 原子 `apply_compaction` 与 tiered/consolidated 更新
+### M4-3 [DONE] 原子 `apply_compaction` 与 tiered/consolidated 更新
 
 **前置依赖**：M4-2。
 
@@ -974,6 +974,40 @@ head 为上界；若 revert 落进一个 compacted cover，不能使用包含未
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、apply compaction
   聚焦测试、`cargo test --all --all-targets`、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增可序列化 `CompactionPlan`、`CompactionStep` 与 `CompactionTarget`，plan 只保存
+  Conversation owner、structural version、head、目标 range、`StrategyRef` 和外部生成的
+  `Artifact` 数据，不携带 client、closure、registry handle 或 runtime strategy 实例。
+  raw target 可在 Turn 边界切分当前 raw span；span target 必须对齐当前 projection span
+  边界，用于 consolidate 旧 summary spans 与 raw tail。
+- 新增 `Conversation::apply_compaction(&CompactionPlan)` 两阶段原子流程：先验证 plan
+  owner/version/head、pending、一组 step 的顺序与重叠、target 与当前 projection 类型/边界、
+  artifact presence、duplicate/unreferenced artifact、provenance range 与 strategy 一致性，
+  再在临时状态中生成新 `Projection` 并一次性替换；成功后推进 structural version，任何失败
+  都保持旧 projection、artifacts、raw history、head、index 与 version 不变。
+- 支持首次 raw range 压缩、连续 tiered raw tail 压缩、部分 raw tail 切分，以及
+  summary-of-summaries consolidate；consolidate 后被替换 artifact 继续留在 projection
+  artifacts 中作为 provenance/audit 数据。`effective_view` 仍按 head clipping 防止 revert
+  落入 compacted cover 时泄漏未来摘要；raw `Turn`、message id 和 payload 在 apply 前后逐项
+  相等。
+- 修正 commit 后 projection 维护：新 Turn 提交不再无条件重置 all-raw projection，而是保留
+  当前有效 overlay 并追加/合并新 raw tail；若从 reverted head 内部提交，新分支只保留当前
+  head 可见且 anchor 仍匹配的 overlay/artifact，半个 compacted cover 回退为 raw prefix。
+- 新增 M4-3 聚焦测试 5 个，覆盖首次压缩、连续 tiered、summary-of-summaries consolidate、
+  部分 raw tail、commit 后 raw tail 保留、revert 穿过压缩点与 redo，以及 stale plan、
+  pending apply、raw target 命中 compacted span、span target 切 span、缺失 artifact、
+  provenance range/strategy mismatch、overlapping multi-step、中途失败、unreferenced artifact
+  和 empty plan 的原子拒绝。
+- 同步 README、crate rustdoc 与 conversation 模块 rustdoc 的当前能力描述；阶段顺序与完成
+  标准未变化，故未修改 `PLAN.md`。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test conversation::projection -- --nocapture`（19 passed）；1800 秒硬上限内
+  `cargo test --all --all-targets`（263 个库测试与 3 个离线集成测试 passed、7 ignored、
+  0 failed，所有 example targets passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
+  `git diff --check`；额外 `cargo test --doc`（1 个正向 doctest 与 10 个 compile-fail doctest
+  passed）。
 
 ### M4-4 [TODO] Compaction strategy/trigger 扩展点与数据/行为分离
 
