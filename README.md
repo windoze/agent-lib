@@ -57,7 +57,12 @@ overlay、model 与 loop policy 变更会排队到当前 Turn 完成后原子应
 或 `ToolStatus::Cancelled` result；cancel 走 `StepInput::Abandon` 的 never-resume 关闭，经
 `Conversation::cancel_pending` 丢弃在途 turn 并回到可再喂的 `Idle`；`agent::drive` 参考 driver
 （`drain` / `drive_turn` / `ReferenceScope`）把这些 requirement 兑现到 live
-`LlmClient`/`ToolRegistry`/interaction 后端；`AgentSpec` 用于记录 worktree、初始 system prompt、
+`LlmClient`/`ToolRegistry`/interaction 后端：一个 `HandlerScope` 按 requirement 家族提供
+handler，本层不挂 handler 的 requirement 经 `Pop` 逐级向上路由到外层 scope（顶层无人处理则
+`UnhandledRequirement`）；`NestedMachine` 与 `SubagentHandler` 把同一 pull/pop 机制扩展成按
+`AgentPath` 寻址的父子 agent 树，headless 子 scope 的 `NeedInteraction` 会 pop 到 attended 父
+scope 兑现，depth 上限、budget 继承与 cancel 传播由 subagent handler 强制；`AgentSpec` 用于记录
+worktree、初始 system prompt、
 tool 声明、model 请求设置和 loop policy，不包含 live conversation、client、tool registry 或
 runtime handle；`AgentState` 通过 `Conversation::snapshot`/`Conversation::restore` 持久化唯一
 conversation，并把 client、tool registry、MCP session、approval policy 和 task handle 留在单独
@@ -137,6 +142,10 @@ Conversation Core 已覆盖 pending/cancel、branch、projection/compaction、sn
 turn boundary 的原子配置应用、`NeedInteraction` 审批回程和 `Abandon` cancel 闭合；`agent::drive`
 参考 driver 把这些 requirement 兑现到 live Client/registry/interaction 后端；
 自动预算调度与多 agent 编排仍是后续计划范围，尚未作为已实现能力暴露。
+Agent 层的 sans-io + effect-handler 模型详见
+[`docs/agent-layer.md`](docs/agent-layer.md)、
+[`docs/agent-effect-model.md`](docs/agent-effect-model.md) 与
+[`docs/agent-effect-migration.md`](docs/agent-effect-migration.md)。
 完整设计和当前阶段计划分别见
 [`DESIGN.md`](DESIGN.md)、
 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。

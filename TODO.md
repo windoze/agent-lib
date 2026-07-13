@@ -1565,7 +1565,7 @@ handler 派生子 agent 并再开一层 drain 递归驱动,并从"当前 drain s
 
 ## Milestone 6 — 文档并轨与端到端验收（迁移文档阶段 5）
 
-### [TODO] M6-1 更新主文档与 PLAN/TODO 交叉引用
+### [DONE] M6-1 更新主文档与 PLAN/TODO 交叉引用
 
 **前置依赖**:M5-R。
 
@@ -1586,6 +1586,48 @@ handler 派生子 agent 并再开一层 drain 递归驱动,并从"当前 drain s
 - 文档变更以 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 校验 rustdoc 链接;
   `git diff --check`;人工核对与代码一致。运行 `cargo fmt --all`、`cargo clippy`、
   `cargo test --all --all-targets`(确保 doctest/示例引用未失效)。
+
+**完成记录**:
+
+- **改写 `docs/agent-layer.md`**:标题去掉"草稿";顶部 banner 新增"迁移状态:已落地"
+  说明(push/自驱 `feed → AgentEvent stream` 已被 sans-io + effect-handler 取代,并链接
+  两份 effect 文档)。§1 组合图把 `AgentLoop` 换成"`AgentMachine`(sans-io 机)+ 库外
+  Driver + `HandlerScope`"。**§1.3** 整节改写为 pull 契约:`AgentMachine::step(&mut self,
+  StepInput) -> StepOutcome`(不 await、不做 IO)、`StepInput`{External/Resume/Abandon}、
+  `StepOutcome`{notifications, requirements, quiescent}、`Notification` 与 `Requirement`
+  ({`NeedLlm`,`NeedTool`,`NeedInteraction`,`NeedSubagent`,`NeedReconfigRegistry`},带
+  `id + origin: AgentPath`)二分,并明列已删的旧 API(`AwaitingApproval`/`respond_approval`/
+  `interject`/`Done(Outcome)`/单一混装流)。§1.4 改为 RunContext 由驱动 scope 派生。§2
+  改为 driver 反复 `step` 的推进模型。**§3** 从"三种并列机制"改写为"审批/pivot/cancel =
+  同一 requirement+handler 机制的三种表现"(审批→`NeedInteraction`+`InteractionHandler`
+  可 pop;pivot→`StepInput::External(AgentInput::Pivot)`;cancel→`StepInput::Abandon`
+  never-resume 接 `cancel_pending`),并说明交互向上路由、attended/headless 同图两跑、
+  driver 决定驱动方式三点收益。**§4** 对齐 pivot 走 `AgentInput::Pivot`/机器静止
+  `quiescent`/reconfig 的 `NeedReconfigRegistry` handler。§8 新增需求标注"现均已落地",
+  第 2 条改为整台 sans-io 机可序列化。所有改写点均加实现文件链接
+  (`src/agent/machine/`、`src/agent/drive.rs`、`src/agent/requirement.rs`、
+  `src/agent/event.rs`、`src/agent/context.rs`)。
+- **`docs/agent-effect-model.md` / `docs/agent-effect-migration.md`**:顶部状态块由
+  "草稿/尚未落地" 改为"已落地",逐项链接到实现位置(machine/drive/requirement/event/
+  context/interaction),并说明迁移文档 §1 映射表左列旧 push API 已删、右列为当前代码,
+  预估路径与最终落位的差异指向实际文件。
+- **`src/lib.rs`**:扩写 `agent` 模块两处能力说明,纳入 effect-handler 模型
+  (`HandlerScope`/`drain`/`Pop` 路由、`StepInput::Abandon` never-resume cancel、
+  `NestedMachine`/`SubagentHandler` 按 `AgentPath` 寻址的父子树、headless 子 pop 到
+  attended 父);无 push API 描述残留。均为 `//!` prose + 有效 intra-doc link,未改任何
+  doctest 代码块。
+- **`README.md`**:扩写 driver 段落,补 `HandlerScope`/`Pop` 逐级路由与
+  `NestedMachine`/`SubagentHandler` 父子 agent 树、headless→attended pop、depth/budget/
+  cancel 护栏;概述段新增指向 `agent-layer.md`/`agent-effect-model.md`/
+  `agent-effect-migration.md` 的链接。
+- **`PLAN.md`**:仅更正一处交叉引用——`agent-layer.md` §1.3/§3/§4 已在 M6-1 按 pull 契约
+  并轨、不再与迁移文档冲突(非阶段计划变更,阶段/依赖结构不变)。
+- **验证**:`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` clean(新增 intra-doc link
+  全部解析);`git diff --check` clean;`cargo fmt --all -- --check` clean;
+  `cargo clippy --all-targets -- -D warnings` 0 warning;`cargo test --doc` 12 passed。
+  本任务仅改 `*.md` 与 `src/lib.rs` 的 `//!` 注释(comments-only,不影响 compiled output,
+  未改任何 doctest 代码块),按文档变更规则复用 M5-R 的最近一次全绿 `cargo test --all
+  --all-targets` 结果,不重跑全套。
 
 ### [TODO] M6-2 端到端验收示例:attended 父 + headless 子
 

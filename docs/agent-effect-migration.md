@@ -1,11 +1,18 @@
 # Agent Effect Model —— 落地设计与迁移方案
 
-> **状态**:迁移设计草案。本文把 [`docs/agent-effect-model.md`](agent-effect-model.md) 的
-> 抽象计算模型翻译成**具体 Rust 接口形状**与**分阶段迁移路径**,目标是"接口先定死、
-> 再动手改代码"。本文只定形状与顺序,不在本文改动任何既有代码。
+> **状态:已落地。** 本文把 [`docs/agent-effect-model.md`](agent-effect-model.md) 的抽象
+> 计算模型翻译成**具体 Rust 接口形状**与**分阶段迁移路径**;这些接口与迁移(Milestone
+> 1–5)均已实现,主文档 [`agent-layer.md`](agent-layer.md) §1.3 / §3 / §4 也已按新模型
+> 改写。下文 §1 映射表左列的旧 push API(`AgentLoop::feed`/`DefaultAgentLoop`/`AgentEvent`
+> 混装流/pivot queue/`respond_approval`/`AgentFeedGuard` 等)已删除;右列的目标形状为
+> 当前代码。**注意**:本文写作时预估的部分文件路径与最终落位略有差异 —— 实际实现见
+> `src/agent/machine/`(机器契约与默认/嵌套机)、`src/agent/drive.rs` 与
+> `src/agent/drive/`(handler/drain/pop/subagent)、`src/agent/requirement.rs`(寻址)、
+> `src/agent/event.rs`(`Notification`/`AgentInput`)、`src/agent/context.rs` 及
+> `src/agent/context/`(`RunContext`/budget/cancel/trace)。历史阶段划分与验收保留供追溯。
 >
 > 前置阅读:[`agent-effect-model.md`](agent-effect-model.md)(为什么),
-> [`agent-layer.md`](agent-layer.md) §1.3 / §3 / §4(被翻转的旧契约),
+> [`agent-layer.md`](agent-layer.md) §1.3 / §3 / §4(已改写的落地契约),
 > [`conversation-core.md`](conversation-core.md)(`cancel_pending` / `fork_at` 地基)。
 
 ## 0. 本文要定死的东西

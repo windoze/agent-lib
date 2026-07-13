@@ -29,7 +29,15 @@
 //!   [`agent::PivotMessage`] injections at the checked post-tool step boundary,
 //!   applies queued [`agent::ReconfigRequest`] values only at turn boundaries,
 //!   and commits only after a tool-free final assistant response. The
-//!   [`agent::drive`] reference driver fulfils those requirements out of band.
+//!   [`agent::drive`] reference driver fulfils those requirements out of band: a
+//!   [`agent::HandlerScope`] offers per-family handlers, [`agent::drain`] pulls
+//!   the machine one step at a time and either serves each [`agent::Requirement`]
+//!   locally or [`agent::Pop`]s it to an outer scope, and cancellation is a
+//!   never-resume [`agent::StepInput::Abandon`] rather than a separate channel.
+//!   [`agent::NestedMachine`] and [`agent::SubagentHandler`] extend the same
+//!   pull/pop mechanism to an addressable ([`agent::AgentPath`]) parent/child
+//!   agent tree so that, for example, a headless child's interaction request
+//!   pops to an attended parent scope.
 //! - [`conversation`] adds externally supplied strong identities,
 //!   Conversation-level configuration, immutable message envelopes with
 //!   optional envelope-local metadata, the
@@ -91,7 +99,10 @@
 //! [`agent::ToolRegistryResolver`] for turn-boundary tool-set replacement, and
 //! the [`agent::DefaultAgentMachine`] state machine with
 //! `reconfigure` turn-boundary config application, approval requirements, and
-//! cancellation closure, without making live handles part of persisted state.
+//! cancellation closure, the [`agent::drive`] reference driver
+//! ([`agent::HandlerScope`] plus [`agent::drain`]/[`agent::Pop`] routing), and
+//! the [`agent::NestedMachine`]/[`agent::SubagentHandler`] parent/child agent
+//! tree, without making live handles part of persisted state.
 //!
 //! # Conversation Core example
 //!

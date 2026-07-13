@@ -1,13 +1,23 @@
 # Agent Effect Model —— sans-io 状态机与 effect-handler 编排
 
-> **状态**：设计增补草稿。本文是一次设计讨论的固化产物，**尚未落地实现**，也
-> **尚未并入** [`docs/agent-layer.md`](agent-layer.md) 主文档。它记录的是一个比现有
-> `agent-layer.md` §1.3 更基础的计算模型;若被采纳,会**翻转** `agent-layer.md` §1.3
-> 的 loop 契约与 `PLAN.md`/`TODO.md` 中 M2/M3 的核心形状(见 §9)。
+> **状态:已落地。** 本文记录的 sans-io + effect-handler 计算模型已实现并成为 agent 层的
+> 当前形状,主文档 [`docs/agent-layer.md`](agent-layer.md) §1.3 / §3 / §4 已按本模型改写。
+> 本文所述"若被采纳会翻转"的旧 loop 契约(push / 自驱 `feed → AgentEvent stream`)已被
+> 移除。实现落位:
 >
-> 本文不修改任何既有文档或代码,只提出模型供审阅。它复用而非重造 Conversation 层
-> 已落地的 committed log + pending + `Boundary` + `cancel_pending` 裂缝闭合 + `fork_at`
-> 共享前缀能力。
+> - sans-io `step` 契约与 `StepInput` / `StepOutcome`:`src/agent/machine/mod.rs`;
+>   默认 LLM/tool 机:`src/agent/machine/default/`;嵌套机器树:`src/agent/machine/nested.rs`。
+> - `Notification` / `AgentInput`:`src/agent/event.rs`;`Requirement` / `RequirementKind`
+>   ({`NeedLlm`,`NeedTool`,`NeedInteraction`,`NeedSubagent`,`NeedReconfigRegistry`})/
+>   `RequirementId` / `AgentPath` 寻址:`src/agent/requirement.rs`;交互:`src/agent/interaction.rs`。
+> - effect handler、`HandlerScope`、`drain` / `drive_turn` 参考 driver 与 `Pop` 路由:
+>   `src/agent/drive.rs`;subagent 派生与作用域强制:`src/agent/drive/subagent.rs`。
+> - never-resume cancel 接 `Conversation::cancel_pending`:`src/agent/context/cancel.rs` +
+>   `src/agent/drive.rs`;`RunContext` 派生:`src/agent/context.rs`。
+>
+> 本模型复用而非重造 Conversation 层已落地的 committed log + pending + `Boundary` +
+> `cancel_pending` 裂缝闭合 + `fork_at` 共享前缀能力。分阶段迁移与接口形状见
+> [`docs/agent-effect-migration.md`](agent-effect-migration.md)。
 
 ## 0. 一句话
 
