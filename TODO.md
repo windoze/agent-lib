@@ -583,7 +583,7 @@ StepInput) -> StepOutcome`,纯、同步、无 async。现有 `AgentInput`(`event
   `cargo test --all --all-targets`(417 passed / 0 failed,较 M2-3 的 396 之基线增量,网络用例 ignored);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --check`(clean)。
 
-### [TODO] M2-R Milestone 2 Review
+### [DONE] M2-R Milestone 2 Review
 
 **前置依赖**:M2-1..M2-4。
 
@@ -599,6 +599,48 @@ StepInput) -> StepOutcome`,纯、同步、无 async。现有 `AgentInput`(`event
 **验证**:
 
 - 运行全套命令(见通用约束)。Review 结论写入完成记录。
+
+**完成记录**:
+
+纯审阅任务,未发现 spec 违背/缺陷,零代码改动。四项审计结论:
+
+- **① sans-io 纯度(通过)**:对整个 `src/agent/machine/` grep `await`/`async fn`/`async move`/
+  `tokio::`/`spawn`/`block_on`/`.send(`/`.recv(` 无任何真命中(仅有 doc 文字、方法名 `block_on_llm`、
+  字段 `awaiting_approval` 的形近误报);grep `LlmClient`/`ToolRegistry`/`.execute(`/`.generate(`/
+  `.stream(`/`.chat(`/`reqwest`/`std::process`/`Command::`/`.invoke(`/`.run(` **零命中**。`step` 及其
+  调用链(`begin_user_turn`/`block_on_llm`/`resume*`/`fold_llm_response`/`begin_tool_phase`/
+  `advance_tool_phase`/`emit_tool_batch`/`emit_approval`/`resume_tool`/`resume_approval`/
+  `finish_tool_phase`)全部同步纯函数,只吐 `Requirement`、park 到 `LoopCursor`,IO 由 driver 兑现。
+- **② requirement/notification 二分 + 无 `Done` 事件(通过)**:机器只吐 `Notification`
+  (`Llm`/`StepBoundary`/`ToolCallStarted`/`ToolCallFinished`,event.rs 第 348 行 enum,**无 `Done` 变体**)
+  与 `Requirement`(`NeedLlm`/`NeedTool`/`NeedInteraction`);`RequirementResult`
+  (`Llm`/`Tool`/`Interaction`/`Subagent`)与 kind 一一对齐,resume 路径显式校验错配结果类型(`other.tag()`
+  分类 fail)并有 `tool_resume_with_wrong_result_kind_fails` 覆盖。turn 结束由 `commit_text_turn`/
+  `finish_tool_phase` 走 `LoopCursor::done(Completed)`(成功)或 `LoopCursor::error`(失败)+
+  `StepOutcome.quiescent==true`+空 requirement 表达,机器从不构造 `AgentEvent::Done`/`AgentOutcome`
+  (grep 确认 machine 模块无 `AgentEvent`/`AgentOutcome` 命中,`Done` 仅出现在 legacy `AgentEvent` 与
+  event.rs 的迁移说明 doc 中)。
+- **③ 乱序回灌确定性 + approval 三态等价(通过)**:一批 `NeedTool` 各自 `RequirementId`,
+  `ToolPhase.running: BTreeMap<RequirementId, ToolSlot>` 按 `resolution.id` 定位(`resume_tool` 的
+  `running.remove(&resolution.id)`);每个 slot 持**预分配** `result_message_id`,`append_tool_response`
+  按该固定 message id 落位,故最终 Conversation 与回灌顺序无关;仅当 `tool_batch_idle()`
+  (running 空且无 awaiting_approval)才 `advance_tool_phase`。`parallel_tool_batch_resumes_out_of_order`
+  测试断言乱序回灌结果一致。approval 三态:`approve` 转吐单个 `NeedTool`;`deny/timeout/cancel` 复用
+  **与 legacy loop 同一** `approval::approval_response_for_decision`(grep 确认 legacy
+  `loop_driver/default.rs:1136` 与 machine `tools.rs:455` 共用),合成 `ToolResponse` 追加走同一 append 路径,
+  语义等价、非重复实现。
+- **④ 受检 append,无 bypass(通过)**:机器对 Conversation 的**全部**变更仅经公共受检 API——
+  `begin_turn`/`start_assistant_response`/`finish_assistant`/`register_tool_calls`/
+  `append_tool_response`(真实结果 + 合成拒绝各一处)/`commit_pending`/`cancel_pending(DiscardTurn)`
+  (失败清 pending);只读用 `head()`/`pending()`。grep 确认**无** `history_mut`/`committed_mut`/
+  `push_message`/直接 `.history` 访问。`append_tool_response`(conversation/mod.rs:307)拒重复 message id、
+  按 provider call id 关联开放调用、每调用只关一次——受检边界与 legacy 完全一致。
+
+**验证命令(全绿)**:`cargo fmt --all -- --check`(clean);`cargo clippy --all-targets -- -D warnings`
+(clean);`cargo test --lib agent::machine`(26 passed:13 tool + 13 既有);`cargo test --all --all-targets`
+(409 lib + 8 integration = 417 passed / 0 failed,网络用例 ignored,较 M2-4 基线一致);
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --check`(clean)。M2 sans-io step
+里程碑(text/tool/approval)审阅通过,可进入 M3 driver + drain。
 
 ---
 
