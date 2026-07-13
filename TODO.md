@@ -1596,7 +1596,7 @@ registry/multi-agent 非目标边界。
   conversation state machine 集成测试通过；7 个真实 endpoint 测试按配置 ignored；4 个 example
   test target 编译通过）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
-### M6-R [TODO] Milestone 6 / Conversation Core 总 Review
+### M6-R [DONE] Milestone 6 / Conversation Core 总 Review
 
 **前置依赖**：M6-1 至 M6-3 全部完成。
 
@@ -1623,6 +1623,49 @@ registry/multi-agent 非目标边界。
   `cargo test --all --all-targets`、`cargo test --doc`、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`git diff --check`；所有 case 少于 1 分钟，
   完整 suite 少于 30 分钟。
+
+**完成记录（2026-07-13）**：
+
+- 对照 `docs/conversation-core.md` §0--§11 与根 `PLAN.md` 完成 Conversation Core 总 Review：
+  immutable message envelope、closed Turn/I1--I4、pending/cancel、外部注入 identity、
+  `Boundary`/head/revert/fork、Projection/effective view、compaction、snapshot/restore 与
+  DB-neutral rows 均已有实现、公开文档和可判定测试覆盖；Client `Message` 仍 provider-neutral
+  且不含 Conversation id，system prompt 继续单列在 config/effective view 中。
+- 高风险承诺逐项核对通过：O(1) fork 有 `Arc::ptr_eq`/clone-free sharing 测试；
+  raw history 与 compaction 均为非破坏性，revert/redo/branch 后 retained raw facts 不变；
+  cancel 只闭合或丢弃 pending，`ToolStatus::Cancelled` 能持久保留且 cancel 后可继续 feed；
+  Projection/Compaction 只覆盖完整 Turn boundary，pending 与 active partial 被隔离；
+  JSON snapshot 与 DB-neutral rows 的存盘→恢复→`effective_view` 端到端一致性覆盖 tool、
+  compaction、revert、fork 与 parent/child 隔离组合。
+- 审查公共 API 与模块边界：live `Turn`/`ConversationMessage`/`Boundary` 字段私有且无 public
+  unchecked constructor、裸 raw push、`turns_mut`、`payload_mut` 或直接 `Deserialize`；
+  `commit_draft`、`validate_turn_data` 与结构共享 fork primitive 均保持 crate-private；
+  `ToolCallIndex`、Accumulator、runtime strategy/trigger/client/registry handle 不进入持久化事实。
+  检索到的 `todo!()` 仅位于 compile-fail rustdoc 示例，未发现生产路径中的 workaround 或未排期
+  blocker；职责边界仍未混入 Agent loop、Tool registry、具体 summarizer、数据库 driver 或多
+  agent 编排。
+- 手工核对并运行 Conversation 聚焦/组合/持久化/adapter 兼容测试与离线示例：`cargo test
+  conversation` 覆盖 147 个 Conversation 单元测试；`cargo test --test conversation_state_machine`
+  覆盖 parallel cancel resume、compacted revert/fork、stale boundary 与坏 snapshot 后继续使用；
+  `cargo test --test conversation_adapter_compat` 验证同一 effective view 可被 Anthropic 与
+  OpenAI Responses request mapper 接受；`cargo run --example conversation_core` 离线断言完整
+  tool round-trip、cancel、boundary/fork、compaction 和 snapshot restore。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test conversation::pending -- --nocapture`（40 passed）；
+  `cargo test conversation::boundary -- --nocapture`（23 passed）；
+  `cargo test conversation::projection -- --nocapture`（25 passed）；
+  `cargo test conversation::persistence -- --nocapture`（18 passed）；
+  `cargo test --test conversation_state_machine -- --nocapture`（3 passed）；
+  `cargo test --test conversation_adapter_compat -- --nocapture`（2 passed）；
+  `cargo run --example conversation_core`（输出 `conversation_core example ok: parent_turns=2,
+  child_turns=2, snapshot_bytes=8854`）；`cargo test conversation -- --nocapture`（147 passed）；
+  1800 秒硬上限内 `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`
+  （287 个库测试、3 个 capability 集成测试、2 个 adapter 兼容集成测试、3 个状态机集成测试
+  passed；7 个真实 endpoint 测试 ignored；所有 example test target 编译通过）；
+  `cargo test --doc`（6 个正向 doctest 与 10 个 compile-fail doctest passed）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
+- `M1-1` 至 `M6-R` 的 Conversation Core 任务标题已全部 `[DONE]`；根 `TODO.md` 仍有后续
+  `M7-1 [TODO]` 交接任务，因此按项目级完成规则本轮不创建 `endtag`，tag 留待所有任务完成后创建。
 
 ---
 
