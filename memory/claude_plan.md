@@ -1,45 +1,34 @@
-# 执行计划
+# 本轮执行计划
 
-说明：本文件记录可公开的执行计划、关键决策和进度更新；不记录私密推理链。
+## 约束确认
+- 以 `TODO.md` 为唯一任务顺序和完成状态来源。
+- 只处理第一个标题未带 `[DONE]` 的任务，完成后提交并停止。
+- 不做开放式历史问题扫描；只处理会阻塞当前任务或由当前任务引入的缺陷。
+- 若发现未被明确排期的测试失败，必须修复或在 `TODO.md` 中加入最小前置任务，不能把当前任务标记完成。
+- 常规任务进度只更新 `TODO.md`，只有阶段级计划变化才更新 `PLAN.md`。
 
-## 当前目标
+## 步骤计划
+1. 读取 `TODO.md`，按文档顺序识别第一个标题未带 `[DONE]` 的任务，并记录任务编号、要求、依赖和验证标准。
+2. 检查最近一次提交信息，只有当它明确提到与当前任务直接相关的未完成事项时，才纳入当前任务或作为前置任务写入 `TODO.md`。
+3. 针对当前任务读取必要代码、测试和文档，限定范围到完成该任务所需内容。
+4. 实现任务要求；如遇到阻塞当前任务的规格不匹配或缺失前置能力，先更新 `TODO.md` 加入最小前置任务并停止。
+5. 添加或更新聚焦测试，覆盖当前任务要求和关键边界。
+6. 按要求运行验证：先 `cargo fmt --all`，再 `cargo clippy --all-targets -- -D warnings`，最后在需要时运行 `cargo test --all --all-targets`（完整测试超时不超过 30 分钟）。
+7. 若验证通过，在 `TODO.md` 将当前任务标题前缀改为 `[DONE]`，更新完成记录、实现摘要和验证命令。
+8. 查看工作区差异，确认只包含当前任务相关改动；提交所有当前未提交改动，提交信息包含任务编号和简洁说明。
+9. 停止，不继续处理下一个任务。
 
-- 按 `TODO.md` 的顺序识别第一个标题未以 `[DONE]` 标记的任务。
-- 完整实现该任务，运行要求的格式化、lint 和测试验证。
-- 在 `TODO.md` 中将该任务标题标记为 `[DONE]` 并补充 completion record。
-- 提交本次任务涉及的所有变更，然后停止，不继续下一个任务。
-
-## 初始步骤
-
-1. 读取 `TODO.md`，只定位第一个未完成任务，不做开放式历史问题扫查。
-2. 查看该任务相关的 `PLAN.md`、源码、测试和最近提交信息，确认任务边界与直接依赖。
-3. 若发现阻塞当前任务的具体前置问题，按要求把最小前置任务插入 `TODO.md`、提交并停止。
-4. 若无阻塞，按现有代码结构实现任务，优先沿用本仓库模式。
-5. 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`，通过后运行相关测试和必要的完整测试。
-6. 更新 `TODO.md` completion record；仅当阶段计划发生真实变化时才更新 `PLAN.md`。
-7. 检查 git diff，提交清晰的任务 commit。
-
-## 进度
-
-- 已读取 `TODO.md` 并定位首个未完成任务：`M5-4 [TODO] 存盘→恢复→effective_view 端到端一致性`。
-- 已检查最近提交：`[M5-3] Implement DB-neutral persistence rows`，未发现直接阻塞 M5-4 的未完成事项。
-- 已新增 `src/conversation/persistence/tests/e2e.rs` 并在 persistence tests 中挂载模块。
-- 已实现两组 M5-4 端到端验收：
-  - snapshot/rows 两条路径恢复复杂 multi-tool + compaction + revert/redo + fork 父子会话，并比较 effective view、raw facts、boundaries、projection/provenance、usage 与 rebuilt index。
-  - pending snapshot 拒绝后分别经 cancel discard 与 cancel commit 回到 committed consistency point，再执行 snapshot/rows restore。
-- 已运行 `cargo fmt --all` 与 `cargo test conversation::persistence -- --nocapture`，结果通过（18 passed）。
-- 已运行严格 clippy、全量测试、rustdoc 和 diff check，均通过。
-- 已将 `TODO.md` 的 `M5-4` 标记为 `[DONE]` 并写入完成记录。
-- 下一步检查最终 diff 与 git 状态，然后提交本次任务变更。
-
-## M5-4 执行计划
-
-1. 检查 `git status` 与最近提交，确认是否存在直接影响 M5-4 的未完成事项或未提交状态。
-2. 阅读 `src/conversation/persistence`、projection/effective view 相关测试与 helper，复用现有 fixture 风格。
-3. 新增模块化端到端 persistence integration 聚焦测试，覆盖：
-   - 多 Turn、serial/parallel tools、tiered/consolidated compaction、revert/redo、fork 父子分别推进。
-   - JSON snapshot 与 DB-neutral rows 两条路径 restore 后，对 system、effective messages、raw facts、head/boundaries、origin、projection/provenance、usage、ToolCallIndex 做一致性断言。
-   - pending snapshot 拒绝后，分别经 cancel→commit 或 discard 到达可 snapshot 状态。
-   - 全部 fixture 使用显式 id/timestamp，无网络、随机源、时钟或 runtime registry。
-4. 运行 `cargo fmt --all`、严格 clippy、聚焦 persistence 测试、全量测试、rustdoc 和 `git diff --check`。
-5. 将 `M5-4` 标记为 `[DONE]` 并补充完成记录，提交本次变更后停止。
+## 进度日志
+- 已创建本计划文件，下一步读取 `TODO.md` 定位第一个未完成任务。
+- 已识别首个未完成任务：`M5-R [TODO] Milestone 5 Review`。
+- 最近提交 `1d4d76e [M5-4] Add persistence effective view e2e acceptance` 未明确声明与 M5-R 直接相关的未完成阻塞项。
+- 本轮将聚焦审查 persistence snapshot/rows/restore/effective_view 信任边界、运行 corruption 与端到端恢复测试，并在通过后只标记 M5-R 完成。
+- 已完成 M5-R 代码边界初审：`Conversation::snapshot` 拒绝 pending，`Conversation::restore` 先 schema gate 再校验 raw Turn/I1--I4、parent graph、lineage/head/fork origin、projection，并重建派生 index。
+- 已完成 rows 边界初审：`ConversationRows::into_snapshot` 只做 row-level PK/FK/sequence/projection data-shape 检查并返回 data snapshot，不构造 live Conversation；insert-only diff 对同 PK 不同 immutable fact 返回 conflict。
+- 验证进度：`cargo fmt --all` 通过；`cargo clippy --all-targets -- -D warnings` 通过，无 warning。
+- 聚焦验证通过：`cargo test conversation::persistence -- --nocapture`，18 passed，覆盖 corruption、pending snapshot gate、rows、fork/compaction/effective_view e2e。
+- 全量验证通过：`perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`，287 个库测试与 3 个离线集成测试 passed，7 ignored，0 failed。
+- 文档与 diff 验证通过：`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过；`git diff --check` 通过。
+- 下一步更新 `TODO.md`，把 M5-R 标记为 `[DONE]` 并写入 review 完成记录。
+- 已更新 `TODO.md`：M5-R 标题改为 `[DONE]`，完成记录包含审查结论和验证结果。更新后 `git diff --check` 仍通过。
+- 下一步检查 diff/status，然后提交本轮所有未提交改动并停止。
