@@ -27,7 +27,8 @@ pub use event::{
 };
 pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};
 pub use loop_driver::{
-    AgentEventStream, AgentFeedGuard, AgentFeedPermit, AgentLoop, BoxAgentEventStream, BoxAgentLoop,
+    AgentEventStream, AgentFeedGuard, AgentFeedPermit, AgentLoop, BoxAgentEventStream,
+    BoxAgentLoop, DefaultAgentLoop, LlmStepMode,
 };
 pub use spec::{AgentSpec, LoopPolicy, ModelRef, ToolFailurePolicy, ToolSetRef, WorktreeRef};
 pub use state::{

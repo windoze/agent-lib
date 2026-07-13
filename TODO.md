@@ -276,7 +276,7 @@ done；stream 消费完之前不得再次 feed。
   `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；`cargo test --doc`；
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
-### M2-2 [TODO] 基础 LLM step 驱动与 Conversation pending 集成
+### [DONE] M2-2 基础 LLM step 驱动与 Conversation pending 集成
 
 **前置依赖**：M2-1。
 
@@ -301,6 +301,34 @@ done；stream 消费完之前不得再次 feed。
 - 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦 loop text 测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 扩展 `AgentUserInput`/`AgentInput::user_message`，要求调用方同时注入 user message id 与
+  assistant message id；默认 driver 不生成、不复用其他 id，继续遵守 id 外部注入边界。
+- 新增 `DefaultAgentLoop` 与 `LlmStepMode` 并从 `agent` 模块导出；driver 接收
+  `LlmClient`、`AgentState` 与 `RunContext`，使用 `AgentFeedGuard` 保持同一 Agent 只有一个
+  活跃 feed stream。
+- 非流式路径调用 `LlmClient::chat`，流式路径调用 `LlmClient::chat_stream` 并逐个透传为
+  `AgentEvent::Llm`，同时把同一 `StreamEvent` 推入 Conversation pending accumulator。
+- Client request 由 `Conversation::effective_view()` 加显式 `pending_context()` 构造，复用
+  `AgentSpec` 中的 model/tool 请求设置；system 优先采用 Conversation 配置，缺省时回退到
+  `AgentSpec` 初始 system prompt。
+- text-only final assistant 通过 `start_assistant_response` 或 `start_assistant`/
+  `push_assistant_event`、`finish_assistant`、`commit_pending` 进入 committed history；提交后重新
+  取得 `Conversation::head()` 作为 `StepBoundary` 的合法 `Boundary`，随后发出
+  `Done(Completed)`。
+- Client、Conversation 或当前未实现的 tool-use 路径失败时，默认 driver 会丢弃本次 pending 并把
+  `LoopCursor` 恢复到 `Idle`，保证不留下 partial committed state。
+- 新增 fake `LlmClient` 聚焦测试，覆盖 text-only 非流式成功、流式成功、事件顺序、
+  committed turn、usage、boundary version、request shape、client 失败原子性和无效 assistant
+  响应失败原子性。
+- 更新 `README.md` 与 crate 根文档，说明当前 Agent 层已包含 text-only `DefaultAgentLoop`，
+  Tool registry、approval policy、自动预算调度和多 agent 编排仍是后续范围。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test agent::loop_driver`；
+  `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`；`cargo test --doc`。
 
 ### M2-3 [TODO] Tool use 执行编排与 result 回灌
 

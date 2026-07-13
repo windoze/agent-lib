@@ -40,6 +40,9 @@ facts，不复制共享祖先 message/turn payload；Agent 层已开始暴露 da
 identity、静态 `AgentSpec` 配置模型、持有唯一活动 `Conversation` 的 `AgentState`、
 data-only `LoopCursor`、run 级 `RunContext` 取消、预算和 trace handle 边界，以及
 `AgentInput`/`AgentEvent`/`AgentOutcome` 与对象安全 `AgentLoop` 的 guarded stream 契约；
+`DefaultAgentLoop` 已打通 text-only 的 Client → Conversation pending 基础路径，支持
+非流式完整响应与流式 `StreamEvent` 透传，并在无 tool-use 的 final assistant 后提交 Turn、
+发出 `StepBoundary` 与 `Done`；
 `AgentSpec` 用于记录 worktree、初始 system prompt、tool 声明、model 请求设置和 loop
 policy，不包含 live conversation、client、tool registry 或 runtime handle；`AgentState`
 通过 `Conversation::snapshot`/`Conversation::restore` 持久化唯一 conversation，并把
@@ -73,7 +76,9 @@ Agent 的前一段 feed stream 消费完或 drop 前不能再次 feed。
   live handle 不进入持久化形状；`AgentEvent::Llm` 透明承载 Client `StreamEvent`，
   `StepBoundary` 携带 Conversation `Boundary`、`StepId` 和 trace metadata，`AgentOutcome`
   区分 completed、budget exhausted、cancelled、error 与 waiting-for-external-recovery；
-  `AgentLoop` 只定义 guarded feed stream 契约，不持久化 live stream。
+  `AgentLoop` 只定义 guarded feed stream 契约，不持久化 live stream；`DefaultAgentLoop`
+  作为当前基础实现只处理 text-only LLM step，调用方需在 `AgentInput::UserMessage` 中同时
+  注入 user 与 assistant message id，tool-use 编排留给后续 Tool runtime。
 - `conversation`：外部注入的强类型 id、独立 system 配置、不可原地修改的消息 envelope、
   共享只读 message 的 closed `Turn`、分类 commit 错误、唯一 I1--I4 校验门，以及复用 Client
   `Accumulator` 的单消息 pending/freeze 状态机、唯一 `PendingTurn` 事务状态机和原子 cancel
@@ -99,8 +104,9 @@ Agent 的前一段 feed stream 消费完或 drop 前不能再次 feed。
 Conversation Core 已覆盖 pending/cancel、branch、projection/compaction、snapshot/rows restore
 与跨 adapter effective-view 兼容验收；Agent 层当前完成静态 identity/spec 数据模型、
 `AgentState`/`LoopCursor` 可恢复状态边界、`RunContext` 横切上下文边界，以及
-feed-to-`AgentEvent` stream 的公开契约与 reentrancy guard；具体默认 Agent loop driver、
-Tool registry、自动预算调度与多 agent 编排仍是后续计划范围，尚未作为已实现能力暴露。
+feed-to-`AgentEvent` stream 的公开契约与 reentrancy guard；基础 `DefaultAgentLoop` 已支持
+text-only 的非流式/流式 LLM step 与 Conversation pending commit 集成；Tool registry、
+自动预算调度与多 agent 编排仍是后续计划范围，尚未作为已实现能力暴露。
 完整设计和当前阶段计划分别见
 [`DESIGN.md`](DESIGN.md)、
 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。

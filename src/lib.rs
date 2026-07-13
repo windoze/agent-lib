@@ -19,7 +19,10 @@
 //!   single-Conversation [`agent::AgentState`] and [`agent::LoopCursor`]
 //!   recovery boundary, run-level cancellation, budget, and trace context
 //!   handles, plus the guarded [`agent::AgentLoop`] feed-to-[`agent::AgentEvent`]
-//!   stream contract used by future runtime drivers.
+//!   stream contract. [`agent::DefaultAgentLoop`] is the current text-only
+//!   runtime driver: it sends non-streaming or streaming Client requests, folds
+//!   the result through Conversation pending, emits a fresh step boundary, and
+//!   commits only tool-free final assistant responses.
 //! - [`conversation`] adds externally supplied strong identities,
 //!   Conversation-level configuration, immutable message envelopes, the
 //!   canonical role/tool validator, an atomic closed-turn commit boundary, and
@@ -64,14 +67,14 @@
 //!   Turn/message facts; row reassembly returns a snapshot that still must pass
 //!   normal restore validation.
 //!
-//! Concrete Agent loop drivers, tool registries, approval policy, and
-//! multi-agent orchestration are still separate runtime layers. The [`agent`]
-//! module currently exposes serde-friendly static configuration and identity
-//! data, [`agent::AgentState`] persistence through Conversation snapshots,
-//! [`agent::RunContext`] handles for cancellation, budget, and trace
-//! propagation, and the object-safe [`agent::AgentLoop`] event stream contract
-//! with [`agent::AgentFeedGuard`] backpressure support, without making live
-//! handles part of persisted state.
+//! Tool registries, approval policy, and multi-agent orchestration are still
+//! separate future runtime layers. The [`agent`] module currently exposes
+//! serde-friendly static configuration and identity data, [`agent::AgentState`]
+//! persistence through Conversation snapshots, [`agent::RunContext`] handles
+//! for cancellation, budget, and trace propagation, the object-safe
+//! [`agent::AgentLoop`] event stream contract with [`agent::AgentFeedGuard`]
+//! backpressure support, and the text-only [`agent::DefaultAgentLoop`] driver
+//! without making live handles part of persisted state.
 //!
 //! # Conversation Core example
 //!

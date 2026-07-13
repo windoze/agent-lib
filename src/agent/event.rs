@@ -49,10 +49,15 @@ impl AgentInput {
         turn_id: TurnId,
         message_id: MessageId,
         message: Message,
+        assistant_message_id: MessageId,
         step_id: StepId,
     ) -> Result<Self, AgentError> {
         Ok(Self::UserMessage(AgentUserInput::new(
-            turn_id, message_id, message, step_id,
+            turn_id,
+            message_id,
+            message,
+            assistant_message_id,
+            step_id,
         )?))
     }
 
@@ -70,6 +75,7 @@ pub struct AgentUserInput {
     turn_id: TurnId,
     message_id: MessageId,
     message: Message,
+    assistant_message_id: MessageId,
     step_id: StepId,
 }
 
@@ -84,6 +90,7 @@ impl AgentUserInput {
         turn_id: TurnId,
         message_id: MessageId,
         message: Message,
+        assistant_message_id: MessageId,
         step_id: StepId,
     ) -> Result<Self, AgentError> {
         if message.role != Role::User {
@@ -94,6 +101,7 @@ impl AgentUserInput {
             turn_id,
             message_id,
             message,
+            assistant_message_id,
             step_id,
         })
     }
@@ -108,6 +116,12 @@ impl AgentUserInput {
     #[must_use]
     pub const fn message_id(&self) -> MessageId {
         self.message_id
+    }
+
+    /// Returns the caller-supplied assistant message identity for this step.
+    #[must_use]
+    pub const fn assistant_message_id(&self) -> MessageId {
+        self.assistant_message_id
     }
 
     /// Returns the complete user message payload.
@@ -134,6 +148,7 @@ impl<'de> Deserialize<'de> for AgentUserInput {
             turn_id: TurnId,
             message_id: MessageId,
             message: Message,
+            assistant_message_id: MessageId,
             step_id: StepId,
         }
 
@@ -142,6 +157,7 @@ impl<'de> Deserialize<'de> for AgentUserInput {
             record.turn_id,
             record.message_id,
             record.message,
+            record.assistant_message_id,
             record.step_id,
         )
         .map_err(de::Error::custom)
@@ -700,6 +716,12 @@ mod tests {
             .expect("message id")
     }
 
+    fn assistant_message_id() -> MessageId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890f6"
+            .parse()
+            .expect("assistant message id")
+    }
+
     fn step_id() -> StepId {
         "018f0d9c-7b6a-7c12-8f31-1234567890f4"
             .parse()
@@ -755,6 +777,7 @@ mod tests {
                 role: Role::Assistant,
                 content: Vec::new(),
             },
+            assistant_message_id(),
             step_id(),
         )
         .expect_err("assistant input must not start a user turn");
@@ -767,6 +790,7 @@ mod tests {
                 "turn_id": turn_id(),
                 "message_id": message_id(),
                 "message": { "role": "system", "content": [] },
+                "assistant_message_id": assistant_message_id(),
                 "step_id": step_id()
             }
         });
@@ -899,8 +923,14 @@ mod tests {
     #[test]
     fn agent_input_round_trips_for_checked_user_and_resume_shapes() {
         assert_json_round_trip(
-            AgentInput::user_message(turn_id(), message_id(), user_message("hello"), step_id())
-                .expect("valid user input"),
+            AgentInput::user_message(
+                turn_id(),
+                message_id(),
+                user_message("hello"),
+                assistant_message_id(),
+                step_id(),
+            )
+            .expect("valid user input"),
         );
         assert_json_round_trip(AgentInput::resume(step_id()));
     }

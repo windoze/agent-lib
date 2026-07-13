@@ -77,6 +77,11 @@ impl AgentState {
         &self.conversation
     }
 
+    /// Returns the unique active Conversation to crate-internal checked drivers.
+    pub(crate) const fn conversation_mut(&mut self) -> &mut Conversation {
+        &mut self.conversation
+    }
+
     /// Returns active skill identities in their caller-controlled order.
     #[must_use]
     pub fn active_skills(&self) -> &[SkillId] {

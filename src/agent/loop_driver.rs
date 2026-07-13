@@ -17,6 +17,10 @@ use std::{
     task::{Context, Poll},
 };
 
+mod default;
+
+pub use default::{DefaultAgentLoop, LlmStepMode};
+
 /// Boxed Agent event stream item type used by object-safe loop implementations.
 pub type BoxAgentEventStream = BoxStream<'static, Result<AgentEvent, AgentError>>;
 
