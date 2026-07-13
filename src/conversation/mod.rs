@@ -57,7 +57,7 @@ pub use error::{
 };
 pub use history::{ToolCallIndex, ToolCallLocation, ToolCallLocationKind};
 pub use id::{ArtifactId, ConversationId, MessageId, ToolCallId, TurnId};
-pub use message::ConversationMessage;
+pub use message::{ConversationMessage, MessageMeta};
 pub use pending::{
     AssistantFinish, CANCELLED_TOOL_RESULT_TEXT, CancelDisposition, CancelOutcome,
     CancelledToolResult, FrozenMessage, PendingMessage, PendingToolCall, PendingTurn,
@@ -338,6 +338,38 @@ impl Conversation {
             .map_err(ConversationError::from)?;
         self.refresh_pending_index();
         Ok(call_id)
+    }
+
+    /// Injects a user message at a checked pending step boundary.
+    ///
+    /// This is the Conversation-side primitive used by Agent pivot handling.
+    /// It does not change committed history and does not relax
+    /// [`validate_boundary`](Self::validate_boundary), which continues to
+    /// reject all pending transactions. The supplied token must name the
+    /// current committed head under the current structural version, and the
+    /// pending turn must be waiting for the next assistant after a complete
+    /// tool-result batch. Initial user input, pure text final turns, active
+    /// assistant partials, open tool calls, and non-user payloads are rejected
+    /// before any pending message is appended.
+    pub fn inject_user_message(
+        &mut self,
+        boundary: Boundary,
+        message_id: MessageId,
+        user_payload: Message,
+        meta: MessageMeta,
+    ) -> Result<(), ConversationError> {
+        self.resolve_pending_step_boundary(&boundary)?;
+        if self.pending.is_none() {
+            return Err(PendingTurnError::NoPending.into());
+        }
+        if self.retained_message_exists(message_id) {
+            return Err(PendingTurnError::DuplicateMessageId { message_id }.into());
+        }
+
+        self.pending_mut()?
+            .inject_user_message(message_id, user_payload, meta)?;
+        self.refresh_pending_index();
+        Ok(())
     }
 
     /// Validates and atomically commits a ready pending turn.

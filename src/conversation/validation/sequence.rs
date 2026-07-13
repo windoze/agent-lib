@@ -23,12 +23,12 @@ struct MessageFacts {
 
 /// The only legal next role while walking a candidate turn.
 enum RoleState {
-    ExpectAssistant,
+    ExpectAssistant { allow_user_injection: bool },
     AwaitToolResults(HashMap<String, MessageId>),
     Closed,
 }
 
-/// Runs the canonical user→assistant→tool*→assistant state machine.
+/// Runs the canonical user→assistant→tool*→user*→assistant state machine.
 pub(super) fn validate_role_sequence(data: &TurnData) -> Result<BlockFacts, CommitError> {
     if let Some(system) = data
         .messages
@@ -51,12 +51,14 @@ pub(super) fn validate_role_sequence(data: &TurnData) -> Result<BlockFacts, Comm
 
     let mut facts = BlockFacts::default();
     inspect_message(first, &mut facts)?;
-    let mut state = RoleState::ExpectAssistant;
+    let mut state = RoleState::ExpectAssistant {
+        allow_user_injection: false,
+    };
 
     for message in data.messages.iter().skip(1) {
         let message_facts = inspect_message(message, &mut facts)?;
         state = match state {
-            RoleState::ExpectAssistant if message.payload().role == Role::Assistant => {
+            RoleState::ExpectAssistant { .. } if message.payload().role == Role::Assistant => {
                 if message_facts.calls.is_empty() {
                     RoleState::Closed
                 } else {
@@ -68,6 +70,11 @@ pub(super) fn validate_role_sequence(data: &TurnData) -> Result<BlockFacts, Comm
                     RoleState::AwaitToolResults(open)
                 }
             }
+            RoleState::ExpectAssistant {
+                allow_user_injection: true,
+            } if message.payload().role == Role::User => RoleState::ExpectAssistant {
+                allow_user_injection: true,
+            },
             RoleState::AwaitToolResults(mut open) if message.payload().role == Role::Tool => {
                 if message_facts.results.is_empty() {
                     return Err(CommitError::EmptyToolMessage {
@@ -83,12 +90,16 @@ pub(super) fn validate_role_sequence(data: &TurnData) -> Result<BlockFacts, Comm
                     }
                 }
                 if open.is_empty() {
-                    RoleState::ExpectAssistant
+                    RoleState::ExpectAssistant {
+                        allow_user_injection: true,
+                    }
                 } else {
                     RoleState::AwaitToolResults(open)
                 }
             }
-            RoleState::ExpectAssistant => {
+            RoleState::ExpectAssistant {
+                allow_user_injection,
+            } => {
                 if let Some(provider_call_id) = message_facts.results.first() {
                     return Err(CommitError::OrphanToolResult {
                         provider_call_id: provider_call_id.clone(),
@@ -98,7 +109,11 @@ pub(super) fn validate_role_sequence(data: &TurnData) -> Result<BlockFacts, Comm
                 return Err(CommitError::UnexpectedRole {
                     message_id: message.id(),
                     actual: message.payload().role,
-                    expected: "assistant after the user or all tool results",
+                    expected: if allow_user_injection {
+                        "assistant or injected user after all tool results"
+                    } else {
+                        "assistant after the user or all tool results"
+                    },
                 });
             }
             RoleState::AwaitToolResults(_) => {
@@ -126,7 +141,7 @@ pub(super) fn validate_role_sequence(data: &TurnData) -> Result<BlockFacts, Comm
 
     match state {
         RoleState::Closed => Ok(facts),
-        RoleState::ExpectAssistant => Err(CommitError::InvalidEndState {
+        RoleState::ExpectAssistant { .. } => Err(CommitError::InvalidEndState {
             last_role: data.messages.last().map(|message| message.payload().role),
             has_open_calls: false,
         }),

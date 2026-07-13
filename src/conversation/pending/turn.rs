@@ -4,8 +4,8 @@ use super::PendingMessage;
 use crate::{
     client::Response,
     conversation::{
-        ContentBlockKind, ConversationError, ConversationMessage, MessageId, PendingTurnError,
-        TurnId, TurnMeta, TurnResponseMeta,
+        ContentBlockKind, ConversationError, ConversationMessage, MessageId, MessageMeta,
+        PendingTurnError, TurnId, TurnMeta, TurnResponseMeta,
         turn::{TurnCompletion, TurnData},
     },
     model::{
@@ -79,21 +79,7 @@ impl PendingTurn {
         user_message_id: MessageId,
         user_payload: Message,
     ) -> Result<Self, PendingTurnError> {
-        if user_payload.role != Role::User {
-            return Err(PendingTurnError::InvalidUserRole {
-                actual: user_payload.role,
-            });
-        }
-        if let Some(block) = user_payload.content.iter().find(|block| {
-            !matches!(
-                block,
-                ContentBlock::Text { .. } | ContentBlock::Image { .. }
-            )
-        }) {
-            return Err(PendingTurnError::InvalidUserBlock {
-                block: content_kind(block),
-            });
-        }
+        validate_user_payload(&user_payload)?;
 
         Ok(Self {
             id,
@@ -311,6 +297,55 @@ impl PendingTurn {
         self.state = PendingTurnState::AssistantInProgress(pending);
         Ok(())
     }
+
+    /// Appends a user message at a checked pending step boundary.
+    pub(in crate::conversation) fn inject_user_message(
+        &mut self,
+        message_id: MessageId,
+        user_payload: Message,
+        meta: MessageMeta,
+    ) -> Result<(), PendingTurnError> {
+        if self.contains_message_id(message_id) {
+            return Err(PendingTurnError::DuplicateMessageId { message_id });
+        }
+        validate_user_payload(&user_payload)?;
+
+        if self.phase() != PendingTurnPhase::AwaitingAssistant {
+            return Err(PendingTurnError::InvalidTransition {
+                operation: "inject a user message",
+                expected: "awaiting_assistant after closed tool results",
+                actual: self.phase(),
+            });
+        }
+        if !self.is_after_closed_tool_result_step() {
+            return Err(PendingTurnError::InvalidTransition {
+                operation: "inject a user message",
+                expected: "a closed tool-result step boundary",
+                actual: self.phase(),
+            });
+        }
+
+        self.messages.push(ConversationMessage::new_with_meta(
+            message_id,
+            user_payload,
+            meta,
+        ));
+        Ok(())
+    }
+
+    /// Returns true after tool results have closed and before the next assistant.
+    fn is_after_closed_tool_result_step(&self) -> bool {
+        let mut saw_tool_result_message = false;
+        for message in self.messages.iter().rev() {
+            match message.payload().role {
+                Role::User => {}
+                Role::Tool => saw_tool_result_message = true,
+                Role::Assistant => return saw_tool_result_message,
+                Role::System => return false,
+            }
+        }
+        false
+    }
 }
 
 impl std::fmt::Debug for PendingTurn {
@@ -346,6 +381,26 @@ fn content_kind(block: &ContentBlock) -> ContentBlockKind {
         ContentBlock::ToolResult { .. } => ContentBlockKind::ToolResult,
         ContentBlock::Thinking { .. } => ContentBlockKind::Thinking,
     }
+}
+
+/// Validates a complete user-authored message payload.
+fn validate_user_payload(user_payload: &Message) -> Result<(), PendingTurnError> {
+    if user_payload.role != Role::User {
+        return Err(PendingTurnError::InvalidUserRole {
+            actual: user_payload.role,
+        });
+    }
+    if let Some(block) = user_payload.content.iter().find(|block| {
+        !matches!(
+            block,
+            ContentBlock::Text { .. } | ContentBlock::Image { .. }
+        )
+    }) {
+        return Err(PendingTurnError::InvalidUserBlock {
+            block: content_kind(block),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

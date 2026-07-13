@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 mod cancel;
 mod errors;
+mod injection;
 mod review;
 mod success;
 

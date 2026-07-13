@@ -10,7 +10,8 @@ Anthropic Messages 与 OpenAI Responses 的非流式/流式适配器、真实 en
 provider 归一化验收，以及 Conversation Core 的强类型 identity、独立 system 配置、
 immutable message envelope、只读 closed Turn、I1--I4 validator、原子 commit 数据边界，
 不暴露 partial 的 stream/non-stream `PendingMessage` 冻结边界，以及可容纳任意多轮工具往返、
-显式记录 open call 并只在最终 assistant 后提交的 `PendingTurn` 事务；pending cancel 可选择
+显式记录 open call、可在闭合 tool-result step boundary 受检注入带来源 metadata 的
+`Role::User` 消息并只在最终 assistant 后提交的 `PendingTurn` 事务；pending cancel 可选择
 整体丢弃、合成 `Cancelled` tool results 后继续，或补入完整最终 assistant 后原子提交；
 committed Turn 已进入保留全部 raw 分支节点的结构共享 history，当前 lineage 与隐藏旧 suffix
 彼此分离，并由可从 closed turns + pending 重建的 `ToolCallIndex` 提供只读定位加速；
@@ -83,8 +84,9 @@ Agent 的前一段 feed stream 消费完或 drop 前不能再次 feed。
   message id。
 - `conversation`：外部注入的强类型 id、独立 system 配置、不可原地修改的消息 envelope、
   共享只读 message 的 closed `Turn`、分类 commit 错误、唯一 I1--I4 校验门，以及复用 Client
-  `Accumulator` 的单消息 pending/freeze 状态机、唯一 `PendingTurn` 事务状态机和原子 cancel
-  disposition；raw history 采用 parent-pointer/`Arc` 节点结构共享，派生 `ToolCallIndex`
+  `Accumulator` 的单消息 pending/freeze 状态机、唯一 `PendingTurn` 事务状态机、闭合
+  tool-result 后的 step-boundary user 注入入口和原子 cancel disposition；raw history 采用
+  parent-pointer/`Arc` 节点结构共享，派生 `ToolCallIndex`
   可按框架或 provider call id 查询当前 lineage 与 pending，而不参与事实校验；字段私有的
   `Boundary` 只由 Conversation 签发，并统一校验 owner/version/anchor/range/pending；
   `head`、`revert_to` 和 `RevertOutcome` 提供无损 revert/redo，`turns`、`lineage_turns` 与
@@ -329,9 +331,9 @@ fn freeze_response(
 }
 ```
 
-validator 接受的 canonical Turn 必须从一条 user message 开始，只允许完整闭合的
-assistant tool-use → 一条或多条 tool-result → assistant 往返，并以不含 tool-use 的
-assistant message 结束；system message、partial marker、重复 identity、孤儿/悬空/重复
+validator 接受的 canonical Turn 必须从一条 user message 开始，允许完整闭合的
+assistant tool-use → 一条或多条 tool-result → 可选 user 注入 → assistant 往返，并以不含
+tool-use 的 assistant message 结束；system message、partial marker、重复 identity、孤儿/悬空/重复
 provider call 以及跨 Turn pairing 都会被拒绝。调用方可依赖如下 closed 只读边界：
 
 ```rust

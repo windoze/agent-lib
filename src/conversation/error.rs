@@ -614,6 +614,17 @@ pub enum BoundaryError {
         fork_ceiling: u64,
     },
 
+    /// A step-boundary operation received a token that does not name the current head.
+    #[error(
+        "boundary after {boundary_turn_count} turns is not the current head after {head_turn_count} turns"
+    )]
+    NotCurrentHead {
+        /// Number of complete turns claimed before the supplied boundary.
+        boundary_turn_count: u64,
+        /// Number of turns currently visible at the logical head.
+        head_turn_count: u64,
+    },
+
     /// The stable Turn anchor does not match the token's lineage position.
     #[error(
         "boundary anchor mismatch after {turn_count} turns: expected {expected:?}, found {actual:?}"

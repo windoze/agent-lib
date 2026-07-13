@@ -25,11 +25,13 @@
 //!   [`agent::ToolRegistry`], and commits only after a tool-free final assistant
 //!   response.
 //! - [`conversation`] adds externally supplied strong identities,
-//!   Conversation-level configuration, immutable message envelopes, the
+//!   Conversation-level configuration, immutable message envelopes with
+//!   optional envelope-local metadata, the
 //!   canonical role/tool validator, an atomic closed-turn commit boundary, and
 //!   a non-serializable [`conversation::PendingMessage`] freeze boundary inside
 //!   the unique [`conversation::PendingTurn`] transaction. Pending turns support
-//!   repeated and parallel tool round-trips while keeping partial Client data
+//!   repeated and parallel tool round-trips plus checked user-message injection
+//!   after closed tool-result step boundaries, while keeping partial Client data
 //!   outside immutable history. [`conversation::CancelDisposition`] can discard,
 //!   resume with explicit cancelled tool results, or atomically close and commit
 //!   that transaction without touching previously committed turns. Committed
@@ -39,6 +41,9 @@
 //!   Conversation-owned [`conversation::Boundary`] tokens name only complete
 //!   Turn cuts; their position and stable anchor are revalidated against owner,
 //!   structural version, lineage/fork range, and pending state before use.
+//!   [`conversation::Conversation::inject_user_message`] uses a separate
+//!   pending-step check that accepts only the current head token while a pending
+//!   turn waits after a complete tool-result batch.
 //!   [`conversation::Conversation::revert_to`] moves a logical head backward or
 //!   forward, rescopes derived lookup state, and retains every raw branch.
 //!   [`conversation::Conversation::fork_at`] creates a child Conversation with

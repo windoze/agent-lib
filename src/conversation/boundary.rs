@@ -177,6 +177,35 @@ impl Conversation {
     /// old token is stale even if an ABA transition later recreates the same
     /// numeric position and Turn anchor.
     pub(crate) fn resolve_boundary(&self, boundary: &Boundary) -> Result<usize, BoundaryError> {
+        self.resolve_boundary_claims(boundary, false)
+    }
+
+    /// Resolves a token for an operation that happens inside the active pending turn.
+    ///
+    /// This deliberately does not weaken [`validate_boundary`](Self::validate_boundary):
+    /// complete-Turn operations still reject any pending transaction. Step
+    /// operations use the same owner/version/range/anchor checks, then require
+    /// the token to name the current logical head.
+    pub(crate) fn resolve_pending_step_boundary(
+        &self,
+        boundary: &Boundary,
+    ) -> Result<usize, BoundaryError> {
+        let position = self.resolve_boundary_claims(boundary, true)?;
+        if position != self.history.active_len() {
+            return Err(BoundaryError::NotCurrentHead {
+                boundary_turn_count: boundary.turn_count,
+                head_turn_count: self.active_len_u64(),
+            });
+        }
+        Ok(position)
+    }
+
+    /// Resolves the owner, version, range, fork ceiling, and anchor claims.
+    fn resolve_boundary_claims(
+        &self,
+        boundary: &Boundary,
+        allow_pending: bool,
+    ) -> Result<usize, BoundaryError> {
         if boundary.conversation_id != self.id {
             return Err(BoundaryError::OwnerMismatch {
                 expected: self.id,
@@ -189,7 +218,7 @@ impl Conversation {
                 current_version: self.version,
             });
         }
-        if let Some(pending) = &self.pending {
+        if !allow_pending && let Some(pending) = &self.pending {
             return Err(BoundaryError::PendingTurn {
                 turn_id: pending.id(),
             });
@@ -253,6 +282,12 @@ impl Conversation {
     fn lineage_len_u64(&self) -> u64 {
         u64::try_from(self.history.lineage_len())
             .expect("an in-memory lineage length cannot exceed u64")
+    }
+
+    /// Converts the active head length to the token's stable width.
+    fn active_len_u64(&self) -> u64 {
+        u64::try_from(self.history.active_len())
+            .expect("an in-memory active lineage length cannot exceed u64")
     }
 
     /// Converts the backing allocation length to the token's stable width.
