@@ -13,6 +13,7 @@ pub mod context;
 pub mod event;
 pub mod id;
 pub mod loop_driver;
+pub mod requirement;
 pub mod spec;
 pub mod state;
 pub mod tool;
@@ -36,6 +37,11 @@ pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};
 pub use loop_driver::{
     AgentEventStream, AgentFeedGuard, AgentFeedPermit, AgentLoop, BoxAgentEventStream,
     BoxAgentLoop, DefaultAgentLoop, LlmStepMode,
+};
+pub use requirement::{
+    AgentPath, AgentSlot, AgentSpecRef, Interaction, InteractionResponse, NoRequirementIds,
+    Requirement, RequirementError, RequirementId, RequirementIds, RequirementKind,
+    RequirementKindTag, RequirementResolution, RequirementResult, SubagentOutput,
 };
 pub use spec::{AgentSpec, LoopPolicy, ModelRef, ToolFailurePolicy, ToolSetRef, WorktreeRef};
 pub use state::{

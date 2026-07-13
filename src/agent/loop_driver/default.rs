@@ -52,7 +52,8 @@ type SharedApprovalWaiters = Arc<Mutex<ApprovalWaiters>>;
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// LLM transport mode used by [`DefaultAgentLoop`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LlmStepMode {
     /// Use [`LlmClient::chat`] and fold a complete response into Conversation.
     NonStreaming,
