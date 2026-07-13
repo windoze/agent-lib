@@ -16,7 +16,10 @@
 //! available to read-only raw-history queries. A checked fork creates a new
 //! Conversation identity and [`ForkOrigin`] while sharing immutable prefix
 //! storage; parent suffixes above the fork point stay outside the child
-//! raw/debug/persistence facts.
+//! raw/debug/persistence facts. [`Projection`] is a non-destructive overlay on
+//! raw history: its spans cover complete Turn ranges checked through
+//! [`CheckedTurnRange`], compacted spans point at provenance-carrying
+//! [`Artifact`] values, and raw messages remain unchanged.
 
 pub mod boundary;
 pub mod config;
@@ -25,6 +28,7 @@ mod history;
 pub mod id;
 pub mod message;
 pub mod pending;
+pub mod projection;
 pub mod turn;
 mod validation;
 
@@ -32,7 +36,7 @@ pub use boundary::{Boundary, ForkOrigin, RevertOutcome};
 pub use config::ConversationConfig;
 pub use error::{
     BoundaryError, CancelError, CommitError, ContentBlockKind, ConversationError, ForkError,
-    PairingMessageKind, PendingMessageError, PendingTurnError,
+    PairingMessageKind, PendingMessageError, PendingTurnError, ProjectionError,
 };
 pub use history::{ToolCallIndex, ToolCallLocation, ToolCallLocationKind};
 pub use id::{ArtifactId, ConversationId, MessageId, ToolCallId, TurnId};
@@ -41,6 +45,9 @@ pub use pending::{
     AssistantFinish, CANCELLED_TOOL_RESULT_TEXT, CancelDisposition, CancelOutcome,
     CancelledToolResult, FrozenMessage, PendingMessage, PendingToolCall, PendingTurn,
     PendingTurnPhase, ToolCallMapping,
+};
+pub use projection::{
+    Artifact, ArtifactProvenance, CheckedTurnRange, Projection, Span, StrategyRef, TokenAccounting,
 };
 pub use turn::{ToolPairing, Turn, TurnMeta, TurnResponseMeta};
 
@@ -73,6 +80,7 @@ pub struct Conversation {
     id: ConversationId,
     config: ConversationConfig,
     history: history::History,
+    projection: Projection,
     pending: Option<PendingTurn>,
     tool_call_index: ToolCallIndex,
     version: u64,
@@ -87,6 +95,7 @@ impl Conversation {
             id,
             config,
             history: history::History::new(),
+            projection: Projection::default(),
             pending: None,
             tool_call_index: ToolCallIndex::default(),
             version: 0,
@@ -355,6 +364,7 @@ impl Conversation {
         let turn_id = turn.id();
 
         self.history.append(turn);
+        self.projection = Projection::raw_for_active_turns(self.id, self.history.turns());
         let committed = self
             .history
             .turns()

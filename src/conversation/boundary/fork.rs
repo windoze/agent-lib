@@ -73,11 +73,16 @@ impl Conversation {
             .tool_call_index
             .fork_scope(fork_position)
             .expect("resolved boundary position has a committed index scope");
+        let projection = crate::conversation::Projection::raw_for_active_turns(
+            new_conversation_id,
+            history.turns(),
+        );
 
         Ok(Self {
             id: new_conversation_id,
             config: self.config.clone(),
             history,
+            projection,
             pending: None,
             tool_call_index,
             version: 0,

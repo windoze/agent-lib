@@ -827,7 +827,7 @@ immutable message/turn；不 clone prefix、不重分配历史 id。父子分支
 
 ## Milestone 4 — Projection 与 Compaction
 
-### M4-1 [TODO] `Projection`、`Span`、`Artifact` 与受检覆盖范围
+### M4-1 [DONE] `Projection`、`Span`、`Artifact` 与受检覆盖范围
 
 **前置依赖**：M3-R。
 
@@ -857,6 +857,38 @@ artifact 必须带 provenance；运行时 Boundary version token 不能未经解
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、projection model
   聚焦测试、`cargo test --all --all-targets`、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增 `conversation::projection` 模块并公开 `Projection`、`Span::{Raw, Compacted}`、
+  `CheckedTurnRange`、`Artifact`、`ArtifactProvenance`、`StrategyRef` 与
+  `TokenAccounting`。Artifact 使用外部 `ArtifactId`，持有一条或多条完整 Client `Message`
+  作为渲染内容，并通过 provenance 记录输入 Turn range、策略引用与压缩前后 token usage；
+  不修改 raw `ConversationMessage` 或 closed `Turn`。
+- `CheckedTurnRange` 只能从同一 Conversation 当前有效的 start/end `Boundary` 受检创建；创建时
+  拒绝跨 owner、pending、反向、空 range 和越过当前 head 的 redo suffix。持久化形状保存
+  `ConversationId`、Turn 位置与稳定 `TurnId` anchor，不保存一次性 structural version；后续
+  `validate_checked_turn_range` 会按当前 lineage 重新核对 owner、pending、head、anchor、
+  unknown/detached Turn，而不会把反序列化 range 当作自证事实。
+- `Projection::new` 对 supplied spans/artifacts 做完整校验：span 必须从 0 到当前 head 连续、
+  有序、无重叠且不留 gap；compacted span 必须引用已提供 artifact，且 artifact provenance 的
+  covers 与 `produced_by` 必须和 span 一致；重复 `ArtifactId`、空 artifact messages、缺失
+  artifact、未知/脱离当前分支的 Turn anchor 均分类拒绝。serde 可恢复声明，但进入
+  Conversation 使用前仍需重新校验。
+- `Conversation` 现持有只读 `projection()`；新建、成功 commit 和 fork child 默认维护 all-raw
+  projection，fork child 的 projection owner 与范围只覆盖自己的 fork prefix。M4-1 未提前实现
+  M4-2 `effective_view` 或 M4-3 `apply_compaction`；阶段顺序与完成标准未变化，故未修改
+  `PLAN.md`。
+- 新增 8 个 projection 聚焦测试，覆盖 raw 默认 projection、raw+compacted+raw serde
+  round-trip、多个 compacted/tiered artifact、provenance/token accounting、range 在
+  structural version 改变后按 Turn anchor 重验证，以及跨 owner、pending、反向、越 head、
+  gap、overlap、incomplete、missing/duplicate artifact、provenance mismatch、empty artifact、
+  unknown Turn、detached branch，以及 artifact/projection serde 路径的本地 shape 拒绝。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test conversation::projection -- --nocapture`（8 passed）；1800 秒硬上限内
+  `cargo test --all --all-targets`（252 个库测试与 3 个离线集成测试 passed、7 ignored、
+  0 failed，所有 example targets passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
+  `git diff --check`。
 
 ### M4-2 [TODO] `effective_view`、head clipping 与 pending 隔离
 

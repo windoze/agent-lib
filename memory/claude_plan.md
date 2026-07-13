@@ -1,42 +1,74 @@
-# 本轮执行计划
+# 执行计划
 
-## 目标
+## 说明
 
-按 `TODO.md` 的顺序完成第一个标题未标记 `[DONE]` 的任务，完成后更新任务记录、运行要求的验证、提交 Git commit，然后停止。
+用户要求在执行任何代码或命令前先写入计划文件。当前计划是在尚未读取仓库文件的前提下形成的公开执行计划；读取 `TODO.md` 后会立即更新本文件，补充实际选中的第一个未完成任务、验证要求和执行步骤。
 
-## 执行原则
+我不会在此文件中写入不可公开的内部推理链；本文件记录可审计的判断依据、步骤、进度和结果。
 
-- `TODO.md` 是任务排序和验收要求的唯一权威来源；`PLAN.md` 仅在阶段级计划变化时更新。
-- 任务只有标题带 `[DONE]` 才视为完成；已有完成记录但标题未标记的任务仍按未完成处理。
-- 不做开放式历史问题扫描；只处理当前任务直接要求的问题、阻塞当前任务的问题，以及验证中新观察到且未被明确排期的失败。
-- 不通过缩小范围或绕过规格来完成任务；若发现必要前置条件缺失，则在 `TODO.md` 中插入最小必要前置任务并提交后停止。
-- 任何计划变化或关键步骤完成时，更新本文件。
+## 初始步骤
 
-## 步骤
-
-1. 读取 `TODO.md`，定位第一个未完成任务，并记录任务编号、范围、依赖与验证要求。
-2. 查看最新提交信息，判断是否明确提到与当前任务直接相关的未完成事项；若有，将其纳入当前任务或作为前置任务写入 `TODO.md`。
-3. 只读取当前任务需要的相关设计、源码和测试，确认现有实现边界。
-4. 按任务要求实现代码或文档变更；编辑前先说明将修改的文件和目的。
-5. 添加或调整聚焦测试，覆盖任务指定行为和发现的相关边界。
-6. 按要求运行验证：先 `cargo fmt --all`，再 `cargo clippy --all-targets -- -D warnings`，最后在需要时运行 `cargo test --all --all-targets`，完整测试超时不超过 30 分钟。
-7. 若验证发现未排期失败，立即修复；若无法在当前任务内正确修复，则在 `TODO.md` 插入最小必要前置任务，保持当前任务未完成，提交后停止。
-8. 任务完成后，在 `TODO.md` 给任务标题加 `[DONE]` 并更新完成记录；仅在阶段计划实际变化时更新 `PLAN.md`。
-9. 检查工作区变更，提交本轮所有相关未提交文件，提交信息包含任务编号和清晰描述。
-10. 停止，不继续下一个任务。
+1. 读取 `TODO.md`，按标题是否带 `[DONE]` 判断第一个未完成任务。
+2. 只围绕第一个未完成任务工作，不做开放式历史问题扫描。
+3. 查看该任务相关的设计、代码和测试上下文；必要时检查最近提交是否明确提到与该任务直接相关的未完成事项。
+4. 若任务可直接完成，按现有项目风格实现，并补充或调整针对性测试。
+5. 先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，最后在需要时运行 `cargo test --all --all-targets`，完整测试超时不超过 30 分钟。
+6. 若发现未被安排且会导致测试失败或阻塞当前任务的真实问题，先修复；若无法在当前任务内正确修复，则在 `TODO.md` 中插入最小必要前置任务并停止。
+7. 完成任务后，在 `TODO.md` 中给任务标题加 `[DONE]`，更新 completion record。
+8. 仅当阶段级计划或依赖变化时更新 `PLAN.md`。
+9. 提交本轮所有相关变更到 Git，然后停止，不继续下一个任务。
 
 ## 当前状态
 
-- 状态：已读取 `TODO.md`，首个未完成任务为 `M3-R [TODO] Milestone 3 Review`。
-- 最新提交：`8002649 [M3-4] Implement O(1) conversation fork`，与当前 Review 直接相关；本轮将把 M3-4 的 fork 实现作为审查对象之一，不新增前置任务，除非发现会阻塞 Review 验收的具体缺陷。
+- 已读取 `TODO.md` 并定位首个未完成任务：
+  `M4-1 [TODO] Projection、Span、Artifact 与受检覆盖范围`。
+- 前置依赖 `M3-R` 已在 `TODO.md` 中标记 `[DONE]`。
 
-## 当前任务计划：M3-R Milestone 3 Review
+## M4-1 执行计划
 
-1. 读取 `docs/conversation-core.md` 中 §7--§9，以及 M3 相关 `PLAN.md` 摘要，确认 Review 的规范检查点。（已完成）
-2. 审查 `conversation` 中 history、boundary、revert/head、fork 与 `ToolCallIndex` 的公开 API 和 crate-private 边界，确认没有 raw mutation、unchecked boundary 消费或 index 事实化。（已完成，未发现需要前置修复的阻塞问题）
-3. 检查已有 M3 测试覆盖，定位 branch/revert/fork 组合矩阵是否已有缺口。（已完成：已有单点覆盖充分，但缺少跨 branch/revert/fork/pending 的一体化 Review 矩阵）
-4. 若覆盖不足，新增聚焦 Review 回归测试，组合验证 parent tree、raw retention、active view、fork ceiling、stale/ABA、pending boundary 禁止和 index 隔离。（已完成：新增 `src/conversation/boundary/tests/review.rs` 并挂载模块）
-5. 必要时补充 rustdoc/README 中 M3 Review 发现的边界说明；若阶段计划无变化，不更新 `PLAN.md`。（当前未发现需要修改阶段计划或公共文档的规格缺口）
-6. 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、M3 聚焦测试、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 与 `git diff --check`。（已完成：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test conversation::boundary::tests::review -- --nocapture`、`cargo test conversation::boundary -- --nocapture`、1800 秒上限内 `cargo test --all --all-targets`、`cargo test --doc`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`git diff --check`）
-7. 更新 `TODO.md`：将 `M3-R` 标题改为 `[DONE]` 并写入完成记录。（已完成；之后只有 Markdown 记录变化，不需要重跑 Rust 测试）
-8. 检查工作区并提交本轮变更，提交信息使用 `[M3-R] ...`。（已完成：创建 `[M3-R] Review boundary branching invariants` 提交；提交后工作区干净）
+1. 检查 `git status` 与最近提交，确认是否有与 M4-1 直接相关的未完成事项或脏工作区。
+2. 阅读 `PLAN.md`、`docs/conversation-core.md` 中 Projection/Compaction 相关规范，以及现有
+   `src/conversation` 模块结构。
+3. 设计并实现 `conversation/projection/`：
+   - `Projection`
+   - `Span::Raw`
+   - `Span::Compacted`
+   - `Artifact`
+   - `StrategyRef`
+   - token accounting / provenance
+   - `CheckedTurnRange`
+4. 将 Projection 挂接到 `Conversation` 的持久状态与公开 API，保持 raw history 不变；所有
+   构造入口必须受检，serde DTO 不能绕过校验。
+5. 实现范围解析与重验证：
+   - start/end Boundary 必须同 owner、当前有效、无 pending、按顺序、非空。
+   - 内部保存稳定 Turn anchor/id，后续使用时按当前 lineage 重新校验，不能依赖旧
+     structural version token 自证合法。
+6. 添加聚焦测试：
+   - raw、单层 compacted、多层/tiered artifact、provenance 和 serde round-trip。
+   - version 改变后按 Turn anchors 重验证。
+   - 跨 owner、越 head、pending、反向/重叠 span、未知 Turn/artifact、detached branch 等负例。
+7. 更新 `TODO.md` 完成记录；仅在阶段级计划变化时更新 `PLAN.md`。
+8. 按要求运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、projection 聚焦测试、
+   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
+   `git diff --check`。
+9. 提交本轮所有相关变更，然后停止。
+
+## 进度更新
+
+- 已确认最近提交为 `[M3-R] Review boundary branching invariants`，没有发现与 M4-1 直接相关的未完成提交说明。
+- 当前脏工作区仅包含本计划文件。
+- 已读取 Projection 相关规范与现有 `Conversation`/`Boundary`/`History`/`Turn`/错误模块。
+- 实现边界调整为：本轮只新增 projection 数据模型、受检 `CheckedTurnRange`、受检 span/projection/artifact 构造和 `Conversation` 只读挂接；不提前实现 M4-2 的 `effective_view` 或 M4-3 的 `apply_compaction`。
+- 已新增 `conversation::projection` 模块，包含 `Projection`、`Span`、`CheckedTurnRange`、
+  `Artifact`、`ArtifactProvenance`、`StrategyRef` 与 `TokenAccounting`。
+- 已将 `Projection` 挂到 `Conversation`；新建/commit/fork 默认维护 all-raw overlay，失败路径不应改动 projection。
+- 已新增 `ProjectionError` 并接入 `ConversationError`。
+- 验证进度：
+  - `cargo fmt --all`：通过。
+  - `cargo clippy --all-targets -- -D warnings`：通过。
+  - `cargo test conversation::projection -- --nocapture`：8 passed。
+  - `cargo test --all --all-targets`（1800 秒上限）：252 个库测试与 3 个离线集成测试 passed，7 ignored。
+  - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：通过。
+  - `git diff --check`：通过。
+- 已更新 `TODO.md`，将 M4-1 标记为 `[DONE]` 并补完成记录。
+- 已更新 README 与 crate/conversation rustdoc，说明 M4-1 已完成的数据模型边界；未修改 `PLAN.md`。

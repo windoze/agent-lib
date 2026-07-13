@@ -1,7 +1,9 @@
 //! Classified errors produced by Conversation state transitions.
 
 use crate::{
-    conversation::{ConversationId, MessageId, ToolCallId, TurnId, pending::PendingTurnPhase},
+    conversation::{
+        ArtifactId, ConversationId, MessageId, ToolCallId, TurnId, pending::PendingTurnPhase,
+    },
     model::message::Role,
     stream::accumulator::AccumulatorError,
 };
@@ -650,6 +652,155 @@ pub enum ForkError {
     },
 }
 
+/// A projection range, artifact, or span set failed checked construction.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ProjectionError {
+    /// A persisted or caller-supplied range belongs to another Conversation.
+    #[error(
+        "projection range belongs to conversation {actual}, but this conversation is {expected}"
+    )]
+    RangeOwnerMismatch {
+        /// Identity required by the validating Conversation.
+        expected: ConversationId,
+        /// Identity embedded in the range.
+        actual: ConversationId,
+    },
+
+    /// Projection construction requires a committed consistency point.
+    #[error("projection range cannot be checked while pending turn {turn_id} is active")]
+    PendingTurn {
+        /// Uncommitted transaction preventing a checked Turn range.
+        turn_id: TurnId,
+    },
+
+    /// The start boundary is after the end boundary.
+    #[error("projection range start {start} is after end {end}")]
+    ReversedRange {
+        /// Number of complete turns before the start boundary.
+        start: u64,
+        /// Number of complete turns before the end boundary.
+        end: u64,
+    },
+
+    /// Zero-length projection ranges must be requested through an explicit API.
+    #[error("projection range is empty at turn boundary {turn_count}")]
+    EmptyRange {
+        /// Boundary position shared by start and end.
+        turn_count: u64,
+    },
+
+    /// The range includes turns beyond the current logical head.
+    #[error("projection range end {end} exceeds current head {head}")]
+    RangeBeyondHead {
+        /// Number of turns covered by the end boundary.
+        end: u64,
+        /// Number of turns visible at the current logical head.
+        head: u64,
+    },
+
+    /// A range endpoint cannot be represented in the current lineage.
+    #[error("projection endpoint after {turn_count} turns exceeds lineage length {lineage_turns}")]
+    RangePositionOutOfRange {
+        /// Claimed number of complete turns before the endpoint.
+        turn_count: u64,
+        /// Number of turns in the current lineage.
+        lineage_turns: u64,
+    },
+
+    /// A range endpoint references a raw Turn outside the current lineage.
+    #[error("projection endpoint references detached turn {turn_id}")]
+    DetachedTurn {
+        /// Retained raw Turn that is no longer on the current lineage.
+        turn_id: TurnId,
+    },
+
+    /// A range endpoint references no retained Turn.
+    #[error("projection endpoint references unknown turn {turn_id}")]
+    UnknownTurn {
+        /// Unknown Turn identity.
+        turn_id: TurnId,
+    },
+
+    /// The stable endpoint anchor no longer matches the current lineage.
+    #[error(
+        "projection endpoint anchor mismatch after {turn_count} turns: expected {expected:?}, found {actual:?}"
+    )]
+    RangeAnchorMismatch {
+        /// Number of complete turns before the endpoint.
+        turn_count: u64,
+        /// Current lineage Turn immediately before the endpoint.
+        expected: Option<TurnId>,
+        /// Anchor embedded in the checked range.
+        actual: Option<TurnId>,
+    },
+
+    /// Two artifacts use the same identity in one projection data set.
+    #[error("projection artifact id {artifact_id} is duplicated")]
+    DuplicateArtifactId {
+        /// Reused artifact identity.
+        artifact_id: ArtifactId,
+    },
+
+    /// An artifact must render at least one complete Client message.
+    #[error("projection artifact {artifact_id} has no render messages")]
+    EmptyArtifactMessages {
+        /// Artifact without render content.
+        artifact_id: ArtifactId,
+    },
+
+    /// A compacted span references no supplied artifact.
+    #[error("projection compacted span references missing artifact {artifact_id}")]
+    MissingArtifact {
+        /// Artifact required by the span.
+        artifact_id: ArtifactId,
+    },
+
+    /// A compacted span and its artifact disagree about the covered range.
+    #[error("projection artifact {artifact_id} provenance range does not match its compacted span")]
+    ArtifactRangeMismatch {
+        /// Artifact whose provenance is inconsistent with the span.
+        artifact_id: ArtifactId,
+    },
+
+    /// A compacted span and its artifact disagree about the producing strategy.
+    #[error(
+        "projection artifact {artifact_id} provenance strategy does not match its compacted span"
+    )]
+    ArtifactStrategyMismatch {
+        /// Artifact whose provenance is inconsistent with the span.
+        artifact_id: ArtifactId,
+    },
+
+    /// Projection spans left a raw Turn range undescribed.
+    #[error("projection has a gap: expected next span at {expected_start}, found {actual_start}")]
+    SpanGap {
+        /// Boundary where the next span should have started.
+        expected_start: u64,
+        /// Boundary where the next span actually started.
+        actual_start: u64,
+    },
+
+    /// Projection spans overlap a previously described raw Turn range.
+    #[error(
+        "projection spans overlap: expected next span no earlier than {expected_start}, found {actual_start}"
+    )]
+    SpanOverlap {
+        /// First boundary not already covered.
+        expected_start: u64,
+        /// Boundary where the overlapping span starts.
+        actual_start: u64,
+    },
+
+    /// Projection spans do not cover the complete current head range.
+    #[error("projection ends at {actual_end}, but current head is {expected_end}")]
+    IncompleteProjection {
+        /// Current logical head.
+        expected_end: u64,
+        /// End boundary reached by the supplied spans.
+        actual_end: u64,
+    },
+}
+
 /// A Conversation operation failed without changing committed state.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ConversationError {
@@ -680,6 +831,10 @@ pub enum ConversationError {
     /// A fork request could not create an independent child conversation.
     #[error("fork rejected: {0}")]
     Fork(#[from] ForkError),
+
+    /// A projection range, artifact, or span set failed checked construction.
+    #[error("projection rejected: {0}")]
+    Projection(#[from] ProjectionError),
 
     /// History and version cannot be advanced together because the version is exhausted.
     #[error("commit cannot advance history and version atomically from version {current_version}")]

@@ -34,7 +34,11 @@
 //!   forward, rescopes derived lookup state, and retains every raw branch.
 //!   [`conversation::Conversation::fork_at`] creates a child Conversation with
 //!   its own owner/version metadata while sharing immutable prefix history and
-//!   recording [`conversation::ForkOrigin`] provenance.
+//!   recording [`conversation::ForkOrigin`] provenance. Non-destructive
+//!   [`conversation::Projection`] spans describe raw or compacted complete-Turn
+//!   ranges; [`conversation::CheckedTurnRange`] stores stable Turn anchors so
+//!   restored overlay data can be revalidated without trusting old Boundary
+//!   versions.
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are deliberately outside this crate. Those layers should persist and replay
