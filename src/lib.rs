@@ -17,8 +17,9 @@
 //!   and SSE protocols.
 //! - [`agent`] defines data-only Agent identity/static configuration, the
 //!   single-Conversation [`agent::AgentState`] and [`agent::LoopCursor`]
-//!   recovery boundary, plus run-level cancellation, budget, and trace context
-//!   handles used by future runtime layers.
+//!   recovery boundary, run-level cancellation, budget, and trace context
+//!   handles, plus the guarded [`agent::AgentLoop`] feed-to-[`agent::AgentEvent`]
+//!   stream contract used by future runtime drivers.
 //! - [`conversation`] adds externally supplied strong identities,
 //!   Conversation-level configuration, immutable message envelopes, the
 //!   canonical role/tool validator, an atomic closed-turn commit boundary, and
@@ -63,12 +64,14 @@
 //!   Turn/message facts; row reassembly returns a snapshot that still must pass
 //!   normal restore validation.
 //!
-//! Agent loops, concrete tool registries, approval policy, and multi-agent
-//! orchestration are still separate runtime layers. The [`agent`] module
-//! currently exposes serde-friendly static configuration and identity data,
-//! [`agent::AgentState`] persistence through Conversation snapshots, and
-//! [`agent::RunContext`] handles for cancellation, budget, and trace propagation
-//! without making live handles part of persisted state.
+//! Concrete Agent loop drivers, tool registries, approval policy, and
+//! multi-agent orchestration are still separate runtime layers. The [`agent`]
+//! module currently exposes serde-friendly static configuration and identity
+//! data, [`agent::AgentState`] persistence through Conversation snapshots,
+//! [`agent::RunContext`] handles for cancellation, budget, and trace
+//! propagation, and the object-safe [`agent::AgentLoop`] event stream contract
+//! with [`agent::AgentFeedGuard`] backpressure support, without making live
+//! handles part of persisted state.
 //!
 //! # Conversation Core example
 //!
