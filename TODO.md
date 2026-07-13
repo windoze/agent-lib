@@ -845,7 +845,7 @@ re-export `HandlerScope`/`LlmHandler`/`ToolHandler`/`InteractionHandler`/`Subage
 (425 lib + 8 integration = 433 passed / 0 failed,较 M3-2 基线 +6 新测试,网络用例 ignored);
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --check`(clean)。
 
-### [TODO] M3-R Milestone 3 Review
+### [DONE] M3-R Milestone 3 Review
 
 **前置依赖**:M3-1..M3-3。
 
@@ -857,6 +857,51 @@ re-export `HandlerScope`/`LlmHandler`/`ToolHandler`/`InteractionHandler`/`Subage
 - 确认 `UnhandledRequirement` 是分类错误、不静默跳过或挂起。
 
 **验证**:运行全套命令。Review 结论写入完成记录。
+
+**完成记录(Review 结论)**:
+
+里程碑 3(`HandlerScope` + 四 handler trait / `drain` + pop 路由 / 单层参考 driver)通过评审。逐条核对:
+
+- **pop 路由四条规则均有专测**(`src/agent/drive.rs` 单测):
+  1. *本层兑现不冒泡* → `drain_fulfills_locally_without_popping`:`parent=None`、两个 tool
+     requirement 在本层并发兑现,`tool.calls==2`、cursor `Done`,无 pop。
+  2. *本层无 handler → pop* → `drain_pops_to_parent_when_local_scope_lacks_handler`:inner 仅
+     handle tool,interaction 弹到 outer(`outer_interaction.calls==1`、`inner_tool.calls==0`)。
+  3. *顶层无 handler → 分类错误* → `drain_top_scope_without_handler_is_unhandled_requirement`:
+     空顶层 scope 上的 interaction 返回 `AgentError::UnhandledRequirement { kind:Interaction,
+     origin:root }`,`error.kind()==UnhandledRequirement`。
+  4. *从外层起防即时环* → `pop_starts_from_outer_scope_skipping_the_emitter`:弹出的 interaction
+     只在 outer 兑现一次,inner/outer 的 tool handler 均未被回绕触达。
+     机制层面 `ScopePop::pop` → `resolve_requirement(.., self.scope, self.parent, ..)` 只对*外层*
+     scope 兑现、失败再向外弹,从不回到发出者自身 scope;并发批次乱序回灌另有
+     `drain_resolves_a_concurrent_batch_out_of_order` 佐证。
+- **"运行模式 = scope 差异"有测试**:同一 `DefaultAgentMachine` + `RequireApprovalPolicy` 配置下,
+  挂 interaction 后端(`ReferenceScope::with_interaction(approve())`)时审批在本层兑现、工具执行、
+  turn 收束(`reference_approval_approve_matches_default_loop`);本次新增
+  `reference_headless_scope_surfaces_unhandled_approval`——**同一 machine**改用 headless 顶层
+  scope(无 interaction 后端)时,审批 requirement 冒泡到顶层无兜底,得到分类
+  `UnhandledRequirement { kind:Interaction }`,被守卫的工具从不执行(`registry.calls().is_empty()`),
+  直接对照 attended 路径证明"行为差异仅由 scope 接线决定"。
+- **参考 driver 与 `DefaultAgentLoop` 等价性证据充分**:6 个 `reference_*_matches_default_loop`
+  覆盖 text-only / single tool / parallel tools / tool-failure self-heal / approval-approve /
+  approval-deny,逐一断言 committed `Conversation` 终态(消息、pairing、`ToolStatus`、usage)与
+  `Notification` 序列(`StepBoundary` / `ToolCallStarted` / `ToolCallFinished`)与 legacy 用例一致;
+  `DefaultAgentLoop` 及其原集成测试保持不动、并存。
+- **`UnhandledRequirement` 为分类错误**:`drain` / `fulfill_batch` / `resolve_requirement` 在
+  `parent=None` 且无 handler 时一律返回 `AgentError::UnhandledRequirement { kind, origin }`(带
+  family tag + origin 可寻址),绝不静默跳过或挂起;`AgentErrorKind::UnhandledRequirement` 分类由
+  上述三处顶层测试断言。
+
+评审中发现 check #2 的字面要求("同一 machine 挂/不挂 interaction 的行为差异")此前仅由
+`BatchMachine` 机制测 + attended 参考测分别覆盖,缺少"同一 `DefaultAgentMachine` headless 变体"
+的直接对照,遂在参考等价性测试中补齐 `reference_headless_scope_surfaces_unhandled_approval`(非
+workaround,属评审范围内的覆盖补全)。
+
+**验证命令(全绿)**:`cargo fmt --all`(clean);`cargo clippy --all-targets -- -D warnings`
+(clean);`cargo test --lib agent::drive`(17 passed,含新增 1);`cargo test --all --all-targets`
+(426 lib + 3+2+3 integration = 434 passed / 0 failed,较 M3-3 基线 +1 新测试,网络用例 ignored);
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --check`(clean)。里程碑 3 验收
+通过,下一未完成任务 = M4-1。
 
 ---
 

@@ -866,6 +866,55 @@ async fn reference_approval_approve_matches_default_loop() {
 }
 
 #[tokio::test]
+async fn reference_headless_scope_surfaces_unhandled_approval() {
+    // Run mode = scope wiring (migration doc §4.4 / §6): the *same* machine
+    // `reference_approval_approve_matches_default_loop` drives to completion under
+    // an attended scope instead surfaces a classified `UnhandledRequirement` under
+    // a headless top-level scope with no interaction backend — never a silent skip
+    // or hang, and the guarded tool never runs.
+    let client = Arc::new(FakeClient::with_chats(vec![Ok(tool_use_response(
+        vec![("call-weather", "get_weather", json!({ "city": "Shanghai" }))],
+        usage(5, 2),
+    ))]));
+    let registry = Arc::new(FakeToolRegistry::new(vec![Ok(tool_response(
+        "call-weather",
+        "Sunny",
+        ToolStatus::Ok,
+    ))]));
+    let ids = Arc::new(FakeToolIds::new(
+        vec![tool_call_id_seed(710)],
+        vec![message_id_seed(711)],
+        vec![message_id_seed(712)],
+        vec![step_id_seed(713)],
+    ));
+    let mut machine = machine_with(
+        spec_with_tools(1, ToolFailurePolicy::ReturnErrorToModel),
+        ids,
+        Arc::new(RequireApprovalPolicy::new("human approval required")),
+    );
+    // Headless: identical wiring to the approve test, minus the interaction backend.
+    let scope = ReferenceScope::new(client, registry.clone());
+    let ctx = context();
+
+    let error = drive_turn(&mut machine, input(), &scope, &ctx)
+        .await
+        .expect_err("a headless top scope cannot fulfill the approval");
+
+    assert_eq!(
+        error.kind(),
+        crate::agent::AgentErrorKind::UnhandledRequirement
+    );
+    match error {
+        crate::agent::AgentError::UnhandledRequirement { kind, .. } => {
+            assert_eq!(kind, RequirementKindTag::Interaction);
+        }
+        other => panic!("expected UnhandledRequirement, got {other:?}"),
+    }
+    // The approval was neither auto-granted nor skipped: the guarded tool never ran.
+    assert!(registry.calls().is_empty());
+}
+
+#[tokio::test]
 async fn reference_approval_deny_matches_default_loop() {
     let client = Arc::new(FakeClient::with_chats(vec![
         Ok(tool_use_response(
