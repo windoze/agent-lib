@@ -13,6 +13,7 @@ pub mod id;
 pub mod loop_driver;
 pub mod spec;
 pub mod state;
+pub mod tool;
 
 pub use context::{
     BudgetCharge, BudgetDimension, BudgetError, BudgetHandle, BudgetLimits, BudgetSnapshot,
@@ -35,4 +36,8 @@ pub use state::{
     AgentRuntimeHandles, AgentState, AgentStateError, ApprovalCursor, CancelRecoveryCursor,
     CancelRecoveryReason, DoneCursor, ErrorCursor, LoopCursor, LoopCursorKind, LoopDoneReason,
     PivotSource, QueuedPivot, QueuedReconfig, StepCursor, ToolWaitCursor,
+};
+pub use tool::{
+    DeclaredOnlyToolRegistry, NoToolExecutionIds, ToolExecutionIds, ToolExecutor, ToolRegistry,
+    ToolRuntimeError,
 };

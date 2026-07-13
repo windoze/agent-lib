@@ -8,6 +8,7 @@
 use crate::{
     agent::{
         AgentStateError, BudgetError, RunContextError, StepId, TraceNodeId, state::QueuedPivot,
+        tool::ToolRuntimeError,
     },
     client::ClientError,
     conversation::{Boundary, ConversationError, MessageId, ToolCallId, TurnId},
@@ -576,6 +577,8 @@ pub enum AgentErrorKind {
     Trace,
     /// Agent state or cursor validation failed.
     AgentState,
+    /// Tool registry, tool execution, or tool identity injection failed.
+    Tool,
     /// The failure did not fit a more specific category.
     Other,
 }
@@ -638,6 +641,9 @@ pub enum AgentError {
     /// Agent state validation failed.
     #[error("agent state operation failed: {0}")]
     State(#[from] AgentStateError),
+    /// Tool runtime operation failed.
+    #[error("tool runtime operation failed: {0}")]
+    Tool(#[from] ToolRuntimeError),
     /// A loop implementation returned an uncategorized failure.
     #[error("agent runtime error: {0}")]
     Other(String),
@@ -656,6 +662,7 @@ impl AgentError {
             Self::RunContext(RunContextError::Budget(_)) => AgentErrorKind::Budget,
             Self::RunContext(RunContextError::Trace(_)) => AgentErrorKind::Trace,
             Self::State(_) => AgentErrorKind::AgentState,
+            Self::Tool(_) => AgentErrorKind::Tool,
             Self::Other(_) => AgentErrorKind::Other,
         }
     }

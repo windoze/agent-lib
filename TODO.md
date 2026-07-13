@@ -330,7 +330,7 @@ done；stream 消费完之前不得再次 feed。
   `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`；`cargo test --doc`。
 
-### M2-3 [TODO] Tool use 执行编排与 result 回灌
+### [DONE] M2-3 Tool use 执行编排与 result 回灌
 
 **前置依赖**：M2-2。
 
@@ -355,6 +355,45 @@ done；stream 消费完之前不得再次 feed。
 - 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦 loop tool 测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增 `src/agent/tool.rs` 并从 `agent` 模块导出最小 runtime tool 边界：
+  `ToolExecutor`、`ToolRegistry`、`ToolExecutionIds`、`DeclaredOnlyToolRegistry`、
+  `NoToolExecutionIds` 与分类 `ToolRuntimeError`；这些都是 live runtime handle，不进入
+  `AgentState` serde data shape。
+- 扩展 `AgentErrorKind`/`AgentError` 增加 tool runtime 分类，避免 tool registry、tool execution
+  或外部 id 注入失败落入泛化 `Other`。
+- 重构 `DefaultAgentLoop`：保留 `new` 的既有 text/stream 使用方式，并新增
+  `with_tool_registry` 让调用方注入 live `ToolRegistry` 与 `ToolExecutionIds`；默认构造使用
+  `DeclaredOnlyToolRegistry` 保留 `AgentSpec` 的静态 tool declaration request shape，但不伪造
+  可执行工具。
+- 默认 loop 在 assistant 返回 tool-use 后，从 frozen assistant message 提取 provider-neutral
+  `ToolCall`，通过 `ToolExecutionIds` 获取外部注入的 `ToolCallId`、tool-result `MessageId`、
+  后续 assistant `MessageId` 与后续 `StepId`；库不生成随机、时钟或自增 identity。
+- tool-use 路径复用 Conversation 的 `register_tool_calls` 与 `append_tool_response`，不复制
+  pairing validator；重复 framework call id、未知 provider result id、重复 message id 等错误
+  由 Conversation 拒绝，并通过 discard cancel 清理 pending，保持 committed history 原子不变。
+- 根据 `LoopPolicy::max_parallel_tools` 分批串行或并行执行 tool，发出
+  `ToolCallStarted`/`ToolCallFinished` 事件并记录 tool trace node；`ToolStatus::Denied`/
+  `Cancelled`/`Error` 均作为 `ToolResponse.status` 回灌，不写入 provider 私有 `extra`。
+- `ToolFailurePolicy::ReturnErrorToModel` 会把 executor failure 转换成 `ToolStatus::Error`
+  result，让下一条 assistant 有机会自愈；`StopRun` 保留为分类中止路径。tool result 回灌后
+  loop 会继续下一次 LLM request，直到无 tool-use 的 final assistant 后 `commit_pending`、
+  发出 `StepBoundary` 与 `Done(Completed)`。
+- 修正默认 loop 的失败清理：`AwaitingTool`/`AwaitingApproval` cursor 先进入
+  `CancelRecovery(ToolInterrupted)` 再回到 `Idle`，遵守既有 `LoopCursor` 状态机而不放宽全局校验。
+- 更新 crate 根文档与 `README.md`，说明当前 Agent 层已包含最小 `ToolRegistry`/
+  `ToolExecutor` runtime 边界和支持 tool-use 往返的 `DefaultAgentLoop`；approval policy、
+  自动预算调度与多 agent 编排仍是后续范围。
+- 新增 fake `LlmClient`/`ToolRegistry`/`ToolExecutionIds` 聚焦测试，覆盖单 tool、parallel tool、
+  tool error/denied status、executor failure 后模型继续自愈、重复 framework call id 拒绝、
+  未知 provider result id 拒绝、事件顺序、request shape、committed messages/pairings 和失败
+  原子性。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test agent::loop_driver --all-targets`；
+  `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`cargo test --doc`；`git diff --check`。
 
 ### M2-R [TODO] Milestone 2 Review
 

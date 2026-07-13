@@ -1,77 +1,58 @@
-# 执行计划
+# 当前执行计划
 
-## 当前约束
+## 约束确认
 
-- 输出、记录和后续进展说明使用中文。
-- `TODO.md` 是任务顺序、任务要求、验证要求和完成记录的唯一权威来源。
-- 本轮只完成第一个标题未带 `[DONE]` 的任务，然后停止。
-- 不做开放式历史问题扫描；只处理当前任务所需范围内的问题。
-- 若遇到阻塞当前任务的既有缺陷、规格不匹配或测试失败，先修复；若无法在本轮直接修复，则在 `TODO.md` 中插入最小必要前置任务并提交后停止。
-- 不接受绕过式实现；若实现无法匹配规格，必须把缺口转化为明确任务。
-- 代码改动后按要求先格式化，再严格 lint，再运行相关/完整测试；完整 Rust 测试不超过 30 分钟。
-- 完成任务后必须在 `TODO.md` 的任务标题前加 `[DONE]`，更新完成记录，并提交 Git commit。
+- 输出使用中文。
+- `TODO.md` 是唯一任务顺序与完成状态依据。
+- 本轮只完成 `TODO.md` 中第一个标题未带 `[DONE]` 的任务，然后停止。
+- 在读取和执行任务前，先在本文件记录可公开的计划、决策依据和进度。
+- 不进行开放式历史问题扫描；只处理当前任务需要的上下文、阻塞项和测试失败策略要求的问题。
+- 若发现当前任务被具体前置问题阻塞，则在 `TODO.md` 中加入最小必要前置任务，提交后停止。
+- 完成任务后需要更新 `TODO.md` 的标题 `[DONE]` 前缀和完成记录，并提交所有相关改动。
 
-## 执行步骤
+## 初始执行步骤
 
-1. 读取 `TODO.md`，按文件顺序找出第一个标题没有 `[DONE]` 前缀的任务。
-2. 检查最新 commit 信息是否明确提到与该任务直接相关的未完成问题；只在直接相关时纳入当前任务或作为前置任务写入 `TODO.md`。
-3. 读取当前任务引用的设计、计划、测试和代码上下文；必要时读取 `PLAN.md`，但不把它作为日常任务日志。
-4. 明确当前任务的实现边界、依赖、验证要求和可能影响的模块，并更新本文件记录已确定的任务目标。
-5. 在编辑前说明即将修改的文件和原因；使用小而集中的补丁逐步实现。
-6. 为新增或变更行为补充聚焦测试；若发现同类根因影响多个场景，一并修复该类问题。
-7. 按顺序运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`，再根据任务要求运行相关测试或完整 `cargo test --all --all-targets`。
-8. 若测试失败且失败未被后续任务明确排期，立即修复；若必须新增前置任务，则更新 `TODO.md` 后提交并停止。
-9. 验证通过后，在 `TODO.md` 中将当前任务标题标记为 `[DONE]`，更新完成记录；仅在阶段级计划变化时更新 `PLAN.md`。
-10. 查看 Git 状态，确认包含本轮必要文件，提交一个清晰描述当前任务的 commit。
-11. 停止，不继续处理下一个任务。
+1. 读取 `TODO.md`，按文件顺序找出第一个标题未显式带 `[DONE]` 的任务。
+2. 读取该任务相关的 `PLAN.md` 片段和必要代码/测试上下文，避免扩大范围。
+3. 检查最新提交信息是否明确提到与该任务直接相关的未完成问题；若相关，将其纳入当前任务或作为前置任务写入 `TODO.md`。
+4. 根据任务要求实现代码或文档改动；若需要拆分，只在存在不可一起落地的明确前置条件时进行。
+5. 在关键实现步骤完成后更新本文件的进度记录。
+6. 按要求先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，最后在有代码影响时运行 `cargo test --all --all-targets`，完整测试超时不超过 30 分钟。
+7. 对发现的未计划测试失败：要么修复，要么在 `TODO.md` 中安排最小必要前置/后续任务，且不得把当前任务标记为完成。
+8. 任务完成后更新 `TODO.md`：标题加 `[DONE]`，补全完成记录和验证结果；仅在阶段级计划变化时更新 `PLAN.md`。
+9. 查看 git 状态，确保不回滚用户已有改动；把本轮相关改动和任何需要一起提交的未提交恢复工作纳入一次清晰 commit。
+10. 提交后停止，不继续下一个任务。
 
-## 进展记录
+## 当前进度
 
-- 初始计划已写入。下一步读取 `TODO.md` 以确定本轮第一个未完成任务。
-- 已读取 `TODO.md`：Milestone 1 与 `M2-1` 均已标记 `[DONE]`，本轮首个未完成任务是
-  `M2-2 [TODO] 基础 LLM step 驱动与 Conversation pending 集成`。
-- 已查看最新提交：`42fa9f5 [M2-1] Add agent loop event stream contract`，提交信息未声明与
-  `M2-2` 直接相关的未完成阻塞项。
-- 下一步读取 `PLAN.md`、`docs/agent-layer.md` 中与 M2 loop 相关的内容，以及现有
-  `src/agent`、`src/conversation`、`src/client` API，确定默认 loop driver 应复用的公共边界。
-
-## 本轮任务目标：M2-2
-
-- 实现默认 loop driver 的 text-only 非流式与流式基础路径。
-- 由 `AgentInput` 构造 user `Message`，调用 `Conversation::begin_turn`。
-- 将非流式 `Response` 交给 `Conversation::start_assistant_response`；将流式
-  `StreamEvent` 交给 Conversation pending/accumulator 路径。
-- 当 `finish_assistant` 返回 `AssistantFinish::ReadyToCommit` 时提交 pending turn，重新取得合法
-  `Boundary`，并发出 `AgentEvent::StepBoundary` 与最终 `Done`。
-- Client 或 Conversation 错误必须转换为分类 `AgentError`，且不能留下 partial committed state。
-- 增加 fake `LlmClient` 聚焦测试，覆盖 text-only 非流式、流式、事件顺序、committed turns、
-  usage、boundary version 和失败原子性。
-
-## 已确认的实现决策
-
-- Client 请求上下文使用 `Conversation::effective_view()` 的 committed projection，再显式追加
-  `Conversation::pending_context()` 中已冻结的 pending user payload；不直接读取或复制 raw history。
-- 默认 driver 需要在 `finish_assistant` 时绑定 assistant `MessageId`。当前 `AgentInput::UserMessage`
-  没有该 id，若由 driver 生成或复用其他 id 会违反“id 由调用方注入”的约束。因此本轮会扩展
-  `AgentUserInput`，要求调用方显式提供 `assistant_message_id`。
-- 本轮只处理 text-only 的单次 LLM step：若 assistant response 包含 tool use，则返回分类错误并丢弃
-  本次 pending，M2-3 再实现 tool mapping/execution/result 回灌。
-
-## 当前进展
-
-- 已扩展 `AgentUserInput`，新增调用方显式提供的 `assistant_message_id`，并同步 serde restore 与测试。
-- 已新增 `DefaultAgentLoop` 与 `LlmStepMode`，支持 text-only 非流式和流式基础 LLM step。
-- 默认 driver 会从 `effective_view()` 加 `pending_context()` 构造 `ChatRequest`，使用 spec model/tool
-  配置，优先采用 Conversation system，缺省时回退到 AgentSpec system。
-- 成功路径会调用 Conversation pending/freeze/commit API，提交后重新取得 `head()` 作为
-  `StepBoundary` 的合法 `Boundary`，并发出 `Done(Completed)`。
-- 失败路径会丢弃本次 pending 并把 cursor 回到 `Idle`，避免留下半提交状态。
-- 已新增 fake `LlmClient` 聚焦测试，覆盖非流式成功、流式成功、client 失败原子性和无效 assistant
-  响应失败原子性。
-- 已通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
-  `cargo test agent::loop_driver`。
-- 完整验证已通过：`perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`；`cargo test --doc`。
-- 已更新 `TODO.md`：`M2-2` 已标记 `[DONE]` 并写入完成记录。
-- 已再次通过 `git diff --check`。
-- 下一步提交本轮 M2-2 相关变更，然后停止。
+- 已创建本执行计划文件。
+- 已读取 `TODO.md` 并识别第一个未完成任务：`M2-3 Tool use 执行编排与 result 回灌`。
+- 已查看最新提交摘要：`[M2-2] Add default text-only LLM loop driver`，未发现需要在执行
+  M2-3 前单独处理的、提交信息明确指出的相关未完成 issue。
+- 已读取 M2-3 相关 Agent loop、事件、Conversation pending tool API、cursor、tool model 与
+  trace/budget API。
+- 设计选择：
+  - 新增最小 runtime tool 模块，包含 `ToolRegistry`、`ToolExecutor`、tool runtime error 和
+    外部注入的 `ToolExecutionIds`。
+  - `DefaultAgentLoop::new` 保持现有 text-only 行为；新增带 tool registry/id source 的构造入口。
+  - 第一次 assistant 的 ids 继续来自 `AgentInput`；工具映射、tool-result message id、后续
+    assistant message id 和 step id 由 `ToolExecutionIds` 提供，库不生成随机/时钟 id。
+  - 默认 loop 遇到 tool-use 后调用 Conversation 的 `register_tool_calls` 与
+    `append_tool_response`，不复制 pairing 校验。
+  - tool executor 的正常返回必须是完整 `ToolResponse`；执行错误在
+    `ReturnErrorToModel` 策略下转换为 `ToolStatus::Error` 结果，在 `StopRun` 策略下中止并丢弃
+    pending。
+  - 先支持串行与按 policy 并行执行；流式路径在 LLM event 透传后进入同一工具循环。
+- 下一步：增量添加 `agent::tool` 模块、导出类型，然后重构 default loop。
+- 已新增 `agent::tool` runtime 边界并导出。
+- 已重构 `DefaultAgentLoop`，保留既有 text-only 构造入口，新增
+  `DefaultAgentLoop::with_tool_registry`，并把非流式/流式路径接入工具循环。
+- 已运行 `cargo fmt --all` 和 `cargo test agent::loop_driver --all-targets`，现有 loop_driver
+  测试通过。
+- 已补充工具编排聚焦测试，覆盖单 tool、并行 tool、tool error/denied、Conversation
+  拒绝重复/未知 call id、tool 执行失败后模型继续自愈，以及 committed Turn 的 pairing。
+- 已更新 crate 根文档与 `README.md` 中关于 `DefaultAgentLoop` 和 tool runtime 边界的当前能力说明。
+- 已运行 `cargo fmt --all` 与 `cargo clippy --all-targets -- -D warnings`，均通过。
+- 已运行 M2-3 聚焦测试、完整测试、rustdoc、doctest 和 `git diff --check`，均通过。
+- 已更新 `TODO.md`，将 M2-3 标记为 `[DONE]` 并补全完成记录。
+- 下一步：检查 git 状态和 diff，确认改动范围后提交。
