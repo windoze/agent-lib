@@ -1,90 +1,59 @@
-# 执行计划
+本轮可审查推理摘要与执行计划
 
-## 当前约束
+约束摘要
+- `TODO.md` 是任务顺序、需求、依赖、验证和完成记录的唯一权威来源。
+- 本轮只完成第一个标题未带 `[DONE]` 的任务，完成后提交 Git commit 并停止。
+- 若遇到会阻塞当前任务的规格不匹配、已有缺陷或失败测试，必须修复，或在 `TODO.md` 中插入最小必要的前置任务并提交后停止。
+- 不做开放式历史问题扫描；只处理当前任务和直接阻塞当前任务的问题。
+- 修改前后需持续更新本文件，记录计划变化和关键步骤完成状态。
 
-- 以 `TODO.md` 为唯一任务顺序和完成状态来源。
-- 只完成第一个标题未带 `[DONE]` 的任务，完成后提交并停止。
-- 在开始任何代码检查、构建或测试前，先维护本文件作为可审阅的计划与进度记录。
-- 记录可公开的执行计划、关键决策和进度；不记录私有推理链。
+初始步骤计划
+1. 读取 `TODO.md`，按标题 `[DONE]` 前缀识别第一个未完成任务。
+2. 查看该任务的具体要求、依赖、验证要求和完成记录；必要时查看 `PLAN.md` 获取阶段背景，但不把它当作执行日志。
+3. 检查最新提交信息是否明确提到与该任务直接相关的未完成事项；若相关，将其纳入当前任务或作为前置任务写入 `TODO.md`。
+4. 针对选定任务读取相关源码、测试和文档，限定在完成该任务所需范围内。
+5. 实现任务，优先沿用现有模块结构、类型和测试风格；若发现必须新增前置任务，更新 `TODO.md` 后停止。
+6. 运行要求的验证，顺序为 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`，然后在需要时运行 `cargo test --all --all-targets`，完整测试超时不超过 30 分钟。
+7. 若验证失败，按测试失败策略修复或在 `TODO.md` 中安排明确任务；不能留下未排期失败。
+8. 完成后在 `TODO.md` 的任务标题前加 `[DONE]`，更新 completion record；仅在阶段计划变化时更新 `PLAN.md`。
+9. 查看 Git 状态，提交本轮所有相关未提交变更，提交信息包含任务编号或明确任务描述。
+10. 提交后停止，不继续下一个任务。
 
-## 初始步骤
+当前状态
+- 已读取 `TODO.md` 并按标题 `[DONE]` 前缀确认当前第一个未完成任务为：
+  `M6-2 [TODO] 两家 Client request mapper 兼容性验收`。
+- 已确认更早的 M1--M5、M6-1 均标为 `[DONE]`；M6-3、M6-R、M7-1 仍在后续，不属于本轮执行范围。
 
-1. 读取 `TODO.md`，按文件顺序找到第一个标题未带 `[DONE]` 的任务。
-2. 查看该任务的正文、依赖、验证要求和完成记录；必要时只读取与该任务直接相关的 `PLAN.md` 或源码上下文。
-3. 检查当前 git 状态，确认是否存在未提交改动；对用户已有改动只读取和配合，不回退。
-4. 若最新提交明确提到与当前任务直接相关的未完成问题，将其纳入当前任务或作为前置任务写入 `TODO.md`。
-
-## 执行步骤
-
-1. 根据任务要求定位相关模块和测试。
-2. 做最小但完整的实现，不通过缩小范围或临时绕过规避规格问题。
-3. 为当前任务新增或更新聚焦测试；若发现阻塞当前任务的规格缺口，先修复或在 `TODO.md` 插入最小前置任务后停止。
-4. 运行验证，顺序为：
-   - `cargo fmt --all`
-   - `cargo clippy --all-targets -- -D warnings`
-   - `cargo test --all --all-targets`，完整测试超时不超过 30 分钟
-5. 若验证发现未明确排期的失败测试，修复或在 `TODO.md` 中排入合适任务，不能把当前任务标记完成。
-6. 任务完成后，在 `TODO.md` 对任务标题加 `[DONE]`，更新完成记录；只有阶段级计划改变时才更新 `PLAN.md`。
-7. 提交所有与本次任务相关的改动，提交信息包含任务编号和简明说明。
-8. 停止，不继续下一个任务。
-
-## 进度记录
-
-- 已建立本计划文件，下一步读取 `TODO.md` 识别当前任务。
-- 已读取 `TODO.md`，首个未完成任务是 `M6-1 [TODO] Conversation 状态机组合验收`。
-
-## 当前任务：M6-1 Conversation 状态机组合验收
-
-### 任务目标
-
-- 新增确定性状态机/表驱动 integration tests，只通过公共 API 驱动 Conversation。
-- 覆盖 begin、stream freeze、tool results、commit、cancel、boundary、revert/redo、fork、
-  compaction、snapshot/restore 等组合 transition。
-- 每次 transition 后验证 closed history 不变量、message immutability、parent/head、
-  effective index 和 projection；失败操作需验证原子不变。
-- 至少覆盖：
-  - parallel calls 中途 cancel 后新 feed；
-  - compacted history 内 revert 后 fork；
-  - 父子分别 compaction/restore；
-  - stale boundary 与坏 snapshot 恢复失败后原会话继续可用。
-
-### 计划步骤
-
-1. 检查最新提交与 git 状态，确认是否存在直接影响 M6-1 的未完成问题或未提交改动。
-2. 阅读 `src/conversation` 的现有测试结构，优先复用 persistence/projection/pending fixtures，
-   保持新增组合验收模块化，避免复制大段 fixture。
-3. 设计一个公共 API 驱动的状态机测试 helper：
-   - 提供 deterministic ids 与 normalized `Response`/`StreamEvent` 构造；
-   - 在每个 transition 后检查 I1--I4、parent/head、index lookup、projection/effective view；
-   - 记录操作序列，便于失败输出复现。
-4. 实现 M6-1 要求的组合场景测试：
-   - parallel tool calls cancel/resume 或 cancel/commit 后继续 feed；
-   - compaction 后 revert 到 cover 内并 fork，确认无未来摘要泄漏；
-   - parent/child 各自 compaction、snapshot/rows restore 后保持隔离；
-   - stale boundary、伪造/损坏 snapshot restore 失败后原 Conversation 仍可继续纯文本 Turn。
-5. 运行格式化、clippy、聚焦测试、全量测试、rustdoc 和 diff check。
-6. 通过后将 `TODO.md` 的 M6-1 标题改为 `[DONE]` 并补完成记录。
-7. 提交本次所有相关改动并停止。
-
-### 当前进度
-
-- 已新增 `tests/conversation_state_machine.rs`，使用 crate 公共 API 构造 deterministic
-  Conversation 状态机组合验收。
-- 测试覆盖 parallel tool cancel/resume、stream freeze、compaction/revert/fork、父子独立
-  compaction + JSON/rows restore、stale boundary 和坏 snapshot restore 失败后的继续使用。
-- 已修正测试 helper 对 pending 状态下 Boundary / projection range 消费规则的断言：pending 时
-  这些消费入口应分类拒绝，而不是成功验证。
-- 验证已通过：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
-  `cargo test --test conversation_state_machine -- --nocapture`（3 passed）。
-- 已通过 1800 秒硬上限内 `cargo test --all --all-targets`：287 个库测试、3 个
-  `capability_escape_hatches` 集成测试、3 个新增 `conversation_state_machine` 集成测试通过；
-  7 个真实 endpoint 测试按环境要求 ignored；examples test targets 编译通过。
-- 已通过 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 与 `git diff --check`。
-- 已将 `TODO.md` 中 `M6-1` 标题改为 `[DONE]`，并补写完成记录。
-- 根据任务的模块化要求，已把状态机场景入口保留在 `tests/conversation_state_machine.rs`，
-  并将 fixture/helper 与断言分别拆到 `tests/conversation_state_machine/support.rs` 和
-  `tests/conversation_state_machine/assertions.rs`。
-- 拆分后已重新通过：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
-  `cargo test --test conversation_state_machine -- --nocapture`（3 passed）。
-- 拆分后已重新通过 1800 秒硬上限内 `cargo test --all --all-targets`、
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 与 `git diff --check`。
+当前任务执行计划
+1. [完成] 检查最新 Git 提交信息：最新提交为 `[M6-1] Add conversation state machine acceptance`，
+   未明确提出与 M6-2 直接相关的未完成事项；当前未提交变更仅有本计划文件。
+2. [完成] 阅读 M6-2 相关设计与代码：`docs/conversation-core.md`/`docs/agent-layer.md` 仅在必要时参考，
+   重点读取 adapter request mapper、`EffectiveView`、Conversation state machine fixtures 和
+   现有跨 adapter 测试。
+   已确认可复用 `tests/conversation_state_machine/support.rs` 的 deterministic public-API fixture；
+   两家 adapter 均提供无网络 `build_request(&ChatRequest)`。
+3. [完成] 构造只通过 public Conversation API 得到的 canonical `EffectiveView`，覆盖 system、多轮、
+   parallel tool、cancelled tool result、reasoning 和 compaction artifact。
+4. [完成] 用本地 dummy endpoint 组装 Anthropic Messages 与 OpenAI Responses 的 `ChatRequest`，
+   调用两家现有 request builder，确保无网络访问。
+5. [完成] 在统一断言中检查相同 view 的 role/content/tool pairing 语义；在 adapter 专属 helper 中仅检查
+   Anthropic/OpenAI wire 字段差异，特别是 `Denied/Cancelled` 的 error/incomplete 映射。
+6. [完成] 增加非法 Conversation 数据无法通过 public API 构造或无法绕过 Core 不变量的回归；避免依赖
+   adapter 作为最后防线。
+7. [进行中] 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、跨 adapter 聚焦测试、
+   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+   `git diff --check`。
+   - `cargo fmt --all` 已通过。
+   - `cargo test --test conversation_adapter_compat -- --nocapture` 已通过（2 passed，无 warning）。
+   - `cargo clippy --all-targets -- -D warnings` 已通过。
+   - `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets` 已通过：
+     287 个库测试、3 个 capability 集成测试、2 个新增 adapter compat 集成测试、3 个
+     state machine 集成测试通过；7 个真实 endpoint 测试按配置 ignored；examples test target 编译通过。
+   - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 已通过。
+   - `git diff --check` 已通过。
+8. [完成] 成功后将 `TODO.md` 中 M6-2 标题改为 `[DONE]` 并补 completion record。
+   完整测试后仅修改了 Markdown 记录与本计划文件，按任务规则无需重跑全量测试；需要重新执行
+   `git diff --check` 确认最终文档 diff 无 whitespace 问题。
+   - 最终 `git diff --check` 已通过。
+9. [完成] 提交本轮相关变更后停止。
+   - 提交信息：`[M6-2] Add cross-adapter conversation request acceptance`。
