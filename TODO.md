@@ -768,7 +768,7 @@ re-export `HandlerScope`/`LlmHandler`/`ToolHandler`/`InteractionHandler`/`Subage
 (419 lib + 8 integration = 427 passed / 0 failed,较 M3-1 基线 +5 新测试,网络用例 ignored);
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --check`(clean)。
 
-### [TODO] M3-3 参考 driver：复跑现有 loop 集成测试
+### [DONE] M3-3 参考 driver：复跑现有 loop 集成测试
 
 **前置依赖**:M3-2。
 
@@ -791,6 +791,59 @@ re-export `HandlerScope`/`LlmHandler`/`ToolHandler`/`InteractionHandler`/`Subage
 - 聚焦测试:参考 driver 复跑上述 turn 类型,Conversation committed 结果与 `DefaultAgentLoop`
   对应用例一致;通知序列包含预期 StepBoundary/ToolCall* 事件。
 - 运行 `cargo test --all --all-targets` 确认新旧两套测试同时全绿;其余全套命令。
+
+**完成记录**:
+
+新增 `src/agent/drive/reference.rs` 生产模块——把 M3-1 的四个 handler trait 落到真实运行时后端上,
+构成迁移文档 §10 阶段 2 的“单层参考 driver”。从 `agent/mod.rs` re-export
+`LlmClientHandler` / `ToolRegistryHandler` / `ApprovalInteractionHandler` / `ReferenceScope` /
+`drive_turn`。
+
+- **`LlmClientHandler`(impl `LlmHandler`)**:包 `Arc<dyn LlmClient>`;按 requirement 携带的
+  `LlmStepMode` 分流——`NonStreaming` 走 `chat`,`Streaming` 走 `chat_stream` 再用
+  `stream::accumulator::collect` 折回完整 `Response`;传输错误装在 `RequirementResult::Llm` 的
+  `Err` 里(不改变结果家族)。
+- **`ToolRegistryHandler`(impl `ToolHandler`)**:包 `Arc<dyn ToolRegistry>`,`execute(call_id,
+  call)` 兑现 `NeedTool`;执行失败装在 `RequirementResult::Tool` 的 `Err`,由 machine 在回程按
+  `ToolFailurePolicy` 处理。
+- **`ApprovalInteractionHandler`(impl `InteractionHandler`)**:以固定 `ApprovalDecision` 应答
+  approval interaction(`approve()` / `deny(msg)` / `new(decision,msg)`)。它是返回路径的决策源
+  (attended UI 或 unattended 默认处置);“哪些调用需要审批”仍由 machine 自身的
+  `ToolApprovalPolicy`(auto vs require 分流)在上游决定,与 legacy loop 完全一致。非审批
+  interaction 以同族平凡应答对齐类型(machine 从不发)。
+- **`ReferenceScope`(impl `HandlerScope`)**:`new(client, registry)` 建无 interaction 的 headless
+  层;`with_interaction(handler)` 挂上后成为 attended 层(§4.4 / §6 “运行模式 = scope 差异”);
+  顶层 total,未兜的 requirement 即 `UnhandledRequirement`。
+- **`drive_turn(machine, input, scope, ctx)`**:`drain(.., None, ..)` 的薄封装,把一个
+  `AgentInput` 跑完一个 turn,返回 `TurnDone`(通知汇总 + 终态 cursor)。
+- **范围边界**:嵌套 scope 与 `SubagentHandler`(唯一 scope-deepening,§7.2)仍归 M5;本任务只建
+  顶层单层。
+
+**等价性测试(`src/agent/drive/reference/tests.rs`,新增 6 个)**:复用从
+`loop_driver/default/tests.rs` 迁移来的 fake(`FakeClient` / `FakeToolRegistry` /
+`RequireApprovalPolicy` / `FakeToolIds` / `ScriptedRequirementIds`),逐一对照
+`DefaultAgentLoop` 对应用例的 Conversation committed 终态与通知序列:
+
+- `reference_text_only_matches_default_loop`:纯文本 turn,cursor=Done(text),committed 两条消息
+  (user + assistant),`usage` 一致;通知 `[StepBoundary(turn_count=1)]`。
+- `reference_single_tool_matches_default_loop`:单工具调用→结果→收束文本,pairing 的
+  `call_id`/`result_msg` 一致;通知含 `ToolCallStarted`/`ToolCallFinished` 与两个 `StepBoundary`。
+- `reference_parallel_tools_matches_default_loop`:一批两工具并发兑现(`FakeToolRegistry` 无内部
+  await,按 push=call 序完成),两 pairing 按 `[a,b]` 对齐,机器 Done。
+- `reference_tool_failure_self_heal_matches_default_loop`:工具执行失败→错误结果回灌→模型自愈续跑,
+  committed 序列与通知与 loop 用例一致。
+- `reference_approval_approve_matches_default_loop`:`ReferenceScope::with_interaction(approve())`,
+  require-approval 的调用经 interaction 批准后执行。
+- `reference_approval_deny_matches_default_loop`:用 `ScriptedApprovalInteraction`(按 `call_id`
+  逐调用给 deny/timeout/cancel 决策)+ 复用 `ReferenceScope` llm/tool 的 `ComposedScope`,断言
+  三调用分别 Denied/Denied/Cancelled、无实际执行、模型收束文本一致。
+
+`DefaultAgentLoop` 及其原 50 个集成测试保持不动(并存),新参考 driver 测试作为等价性证据。
+
+**验证命令(全绿)**:`cargo fmt --all`(clean);`cargo clippy --all-targets -- -D warnings`
+(clean);`cargo test --lib agent::drive::reference`(6 passed);`cargo test --all --all-targets`
+(425 lib + 8 integration = 433 passed / 0 failed,较 M3-2 基线 +6 新测试,网络用例 ignored);
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --check`(clean)。
 
 ### [TODO] M3-R Milestone 3 Review
 

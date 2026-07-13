@@ -90,6 +90,12 @@ use async_trait::async_trait;
 use futures::{StreamExt, stream::FuturesUnordered};
 use serde_json::Value;
 
+mod reference;
+
+pub use reference::{
+    ApprovalInteractionHandler, LlmClientHandler, ReferenceScope, ToolRegistryHandler, drive_turn,
+};
+
 /// One drain layer's set of effect handlers.
 ///
 /// A scope exposes up to four handlers, one per requirement family. Each

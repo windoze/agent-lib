@@ -32,8 +32,9 @@ pub use context::{
     TraceNodeId, TraceNodeKind, TraceRecord,
 };
 pub use drive::{
-    HandlerScope, InteractionHandler, LlmHandler, Pop, ScopePop, SubagentHandler, ToolHandler,
-    TurnDone, drain,
+    ApprovalInteractionHandler, HandlerScope, InteractionHandler, LlmClientHandler, LlmHandler,
+    Pop, ReferenceScope, ScopePop, SubagentHandler, ToolHandler, ToolRegistryHandler, TurnDone,
+    drain, drive_turn,
 };
 pub use event::{
     AgentError, AgentErrorKind, AgentEvent, AgentFailure, AgentInput, AgentOutcome,

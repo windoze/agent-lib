@@ -1,39 +1,37 @@
-# 执行计划 — M3-2 `drain` 参考实现与 pop 路由
+# 执行计划 — M3-3 参考 driver:复跑现有 loop 集成测试
 
 ## 选中的任务
-`TODO.md` 第一个未完成任务 = **M3-2**(M3-1 及之前全部 `[DONE]`)。里程碑 3 driver+drain 阶段 2。
-非 review 实现任务,不拆分。前置 M3-1 已完成(drive.rs 有 HandlerScope + 四 handler trait)。
+`TODO.md` 第一个未完成任务 = **M3-3**(M3-2 及之前全部 `[DONE]`)。里程碑 3 阶段 2 验收。
+非 review 实现任务,不拆分。前置 M3-2 已完成(drive.rs 有 drain / Pop / ScopePop / TurnDone)。
 
-## 目标(TODO M3-2 "做什么")
-1. `trait Pop`:向外层转交一个 requirement 并取回其 `RequirementResult`。
-2. `async fn drain<M: AgentMachine>(machine, input, scope, parent: Option<&mut dyn Pop>, ctx)
-   -> Result<TurnDone, AgentError>`:循环 step → 每个 requirement 查 scope handler,
-   有则兑现+校验(accepts)+Resume;无则 pop 给 parent;parent=None 且无 handler →
-   `AgentError::UnhandledRequirement { kind, origin }`。直至 quiescent && 无 requirement &&
-   cursor ∈ {Done, Error}。
-3. pop 查找从"发出者 scope 的外层"开始(跳过自身,防 §7.3 即时环)。→ 用 `ScopePop` 表示外层。
-4. 决策 B:一次 step 吐一批 → 本层能兜的并发兑现(FuturesUnordered),按完成顺序 Resume。
-5. 新增 `AgentError::UnhandledRequirement`(+ `AgentErrorKind::UnhandledRequirement`)于 event.rs。
+## 目标(TODO M3-3 "做什么")
+1. 在 `src/agent/drive/reference.rs` 提供参考 driver:单层 `HandlerScope`,
+   llm = `LlmClient` 包装、tool = `ToolRegistry` 包装、interaction = approval 决策后端;
+   对一个 `AgentInput` 调 `drain`(parent=None)跑完一个 turn,返回 `TurnDone`(通知 + 终态)。
+2. 复用 default 测试里可迁移的 fake(FakeClient/FakeToolRegistry/FakeToolIds/RequireApprovalPolicy)
+   与 builder(assistant_response/tool_use_response/...)到参考 driver 测试;逐一对照
+   text-only / single tool / parallel tool / tool failure self-heal / approval approve / approval deny
+   的 Conversation 终态与通知序列。
+3. 保留 `DefaultAgentLoop` 与其原测试不动(并存)。
 
 ## 设计
-- event.rs:import `AgentPath`, `RequirementKindTag`;加 `AgentErrorKind::UnhandledRequirement`
-  与 `AgentError::UnhandledRequirement { kind: RequirementKindTag, origin: AgentPath }`,扩展 kind()。
-- drive.rs 新增:
-  - `TurnDone { notifications, cursor }`(+accessors)。
-  - `trait Pop: Send`(async fn pop(&mut self, req, ctx) -> Result<RequirementResult, AgentError>)。
-  - `struct ScopePop<'a> { scope, parent }` impl Pop:resolve_requirement(scope, parent)。
-  - `pub async fn drain(...)`。
-  - helpers:`scope_handles`, `fulfill_with_scope`(Option), `resolve_requirement`(单个:本层→pop),
-    `fulfill_batch`(本层并发 FuturesUnordered + popped 顺序), `validate`(accepts), `is_terminal`。
-- mod.rs re-export:加 `drain, Pop, ScopePop, TurnDone`。
-
-## 测试(聚焦,在 drive.rs #[cfg(test)],加在 M3-1 5 个之上)
-- 本层有 handler → 兑现不冒泡(drain BatchMachine + WrappedScope,parent=None → Done)。
-- 本层无 → pop 到 parent 兑现(inner EmptyScope + ScopePop(outer WrappedScope))。
-- 顶层无 → UnhandledRequirement(EmptyScope, parent=None)。
-- §7.3 skip-self:两层 scope,popped req 走 ScopePop(outer) 命中 outer handler,inner 同类
-  handler 计数为 0。
-- 一批并发乱序:多 NeedTool,handler yield 反序完成,按 id 路由结果一致,机器 Done。
+- `src/agent/drive.rs` 顶部加 `mod reference; pub use reference::{...}`(file-module 子模块解析到
+  `src/agent/drive/reference.rs`)。
+- `reference.rs`(生产代码):
+  - `LlmClientHandler { client: Arc<dyn LlmClient> }` impl `LlmHandler`(chat / chat_stream+collect,
+    mode 由 requirement 传入)。
+  - `ToolRegistryHandler { registry: Arc<dyn ToolRegistry> }` impl `ToolHandler`。
+  - `ApprovalInteractionHandler { decision, message }` impl `InteractionHandler`:对 approval 交互用固定
+    `ApprovalDecision` 应答(attended UI / unattended 默认处置)。approve()/deny()/new()。
+  - `ReferenceScope { llm, tool, interaction: Option<ApprovalInteractionHandler> }` impl `HandlerScope`。
+    `new(client, registry)` + `with_interaction(handler)`。
+  - `drive_turn(machine, input, scope, ctx) -> Result<TurnDone, AgentError>` = `drain(.., None, ..)`。
+- `agent/mod.rs` 扩 `pub use drive::{...}` 增 `ApprovalInteractionHandler, LlmClientHandler,
+  ReferenceScope, ToolRegistryHandler, drive_turn`。
+- 测试 `src/agent/drive/reference/tests.rs`(`#[cfg(test)] mod tests;`):复制最小 fake +
+  ScriptedRequirementIds/ScriptedToolIds(seed 与 legacy 对齐),`DefaultAgentMachine` 驱动,断言
+  committed Conversation 与通知序列与 legacy 一致。deny turn 用按 call_id 脚本化交互 handler
+  复现 deny/timeout/cancel。
 
 ## 验证命令(顺序)
 1. `cargo fmt --all`
@@ -44,18 +42,16 @@
 6. `git diff --check`
 
 ## 进度
-- [ ] event.rs 加 UnhandledRequirement
-- [ ] drive.rs 加 Pop/ScopePop/drain/TurnDone/helpers + docs
-- [ ] mod.rs re-export
-- [ ] 测试
-- [ ] 全套验证
-- [ ] TODO.md 标 [DONE] + 完成记录,提交
+- [x] reference.rs 生产代码 + 文档(编译通过,rustdoc clean)
+- [x] drive.rs 声明子模块 + re-export
+- [x] mod.rs re-export
+- [x] reference/tests.rs 等价测试(6 类 turn,全部通过)
+- [x] 全套验证(fmt/clippy/lib/all-targets/doc/diff --check 全绿,433 passed)
+- [x] TODO.md 标 [DONE] + 完成记录,提交
 
-## 执行结果(已完成)
-M3-2 完成:drive.rs 新增 `Pop`/`ScopePop`/`drain`/`TurnDone` + helpers;event.rs 新增
-`AgentError::UnhandledRequirement`(+ Kind);mod.rs re-export。
-- drain:喂 External→循环 step,本层批用 FuturesUnordered 并发兑现(完成顺序 Resume,决策 B),
-  兜不了顺序 pop 给 parent(ScopePop 表示外层,§7.3 skip-self),accepts 校验,直至 cursor Done/Error。
-- 顶层无 handler → UnhandledRequirement。新增 5 聚焦测试(合计 10 全过)。
-- 全套验证全绿:fmt/clippy 干净;lib 419 + integration 8 = 427 passed/0 failed;doc -D warnings 干净;
-  git diff --check 干净。已标 TODO.md [DONE] + 完成记录。
+## 结果
+M3-3 完成。`src/agent/drive/reference.rs` 提供单层参考 driver(`LlmClientHandler` /
+`ToolRegistryHandler` / `ApprovalInteractionHandler` / `ReferenceScope` / `drive_turn`),
+6 个等价性测试对照 `DefaultAgentLoop` 的 text/single-tool/parallel/failure-self-heal/
+approval-approve/approval-deny 用例,Conversation 终态与通知序列一致。全套验证全绿
+(425 lib + 8 integration = 433 passed)。下一个未完成任务 = M3-R(本次不启动)。
