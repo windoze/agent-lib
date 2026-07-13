@@ -93,6 +93,27 @@ impl ConversationSnapshot {
             projection: conversation.projection.clone(),
         }
     }
+
+    /// Rebuilds a snapshot from already checked persistence rows.
+    pub(crate) fn from_parts(
+        schema_version: u32,
+        id: ConversationId,
+        config: ConversationConfig,
+        structural_version: u64,
+        origin: Option<ForkOrigin>,
+        history: ConversationSnapshotHistory,
+        projection: Projection,
+    ) -> Self {
+        Self {
+            schema_version,
+            id,
+            config,
+            structural_version,
+            origin,
+            history,
+            projection,
+        }
+    }
 }
 
 /// Retained raw Turn facts plus the active lineage metadata needed for restore.
@@ -121,6 +142,11 @@ impl ConversationSnapshotHistory {
     /// Iterates retained raw Turn identities in deterministic insertion order.
     pub fn raw_turn_ids(&self) -> impl Iterator<Item = TurnId> + '_ {
         self.raw_turns.iter().map(|turn| turn.id)
+    }
+
+    /// Returns retained raw Turn DTOs for sibling persistence modules.
+    pub(crate) fn raw_turns(&self) -> &[TurnData] {
+        &self.raw_turns
     }
 
     /// Returns the current addressable lineage as stable Turn identities.
@@ -160,6 +186,21 @@ impl ConversationSnapshotHistory {
             lineage_turns,
             head_turn_count: usize_to_u64(conversation.history.active_len()),
             fork_ceiling_turn_count: usize_to_u64(conversation.history.lineage_len()),
+        }
+    }
+
+    /// Rebuilds history metadata from already grouped persistence rows.
+    pub(crate) fn from_parts(
+        raw_turns: Vec<TurnData>,
+        lineage_turns: Vec<TurnId>,
+        head_turn_count: u64,
+        fork_ceiling_turn_count: u64,
+    ) -> Self {
+        Self {
+            raw_turns,
+            lineage_turns,
+            head_turn_count,
+            fork_ceiling_turn_count,
         }
     }
 }

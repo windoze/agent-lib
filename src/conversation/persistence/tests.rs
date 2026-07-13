@@ -1,12 +1,13 @@
 //! Snapshot consistency-point tests.
 
-use super::{CONVERSATION_SNAPSHOT_SCHEMA_VERSION, ConversationSnapshot};
+use super::{CONVERSATION_SNAPSHOT_SCHEMA_VERSION, ConversationRows, ConversationSnapshot};
 use crate::{
     client::Response,
     conversation::{
         AssistantFinish, CommitError, Conversation, ConversationConfig, ConversationError,
         ConversationId, MessageId, PendingTurnPhase, Projection, ProjectionError, RestoreError,
-        SnapshotError, Span, ToolCallId, ToolCallIndex, ToolCallMapping, Turn, TurnId, TurnMeta,
+        RowMappingError, SnapshotError, Span, ToolCallId, ToolCallIndex, ToolCallMapping, Turn,
+        TurnId, TurnMeta,
         projection::{
             Artifact, ArtifactProvenance, CheckedTurnRange, CompactionPlan, CompactionStep,
             StrategyRef, TokenAccounting,
@@ -850,6 +851,243 @@ fn snapshot_preserves_projection_artifacts_and_provenance() {
     let decoded: ConversationSnapshot =
         serde_json::from_str(&encoded).expect("deserialize compacted snapshot");
     assert_eq!(decoded, snapshot);
+}
+
+fn scramble_rows(rows: &mut ConversationRows) {
+    rows.raw_turns.reverse();
+    rows.lineage_turns.reverse();
+    rows.turns.reverse();
+    rows.messages.reverse();
+    rows.tool_pairings.reverse();
+    rows.projection_spans.reverse();
+    rows.artifacts.reverse();
+}
+
+#[test]
+fn rows_round_trip_snapshot_in_any_read_order_and_restore() {
+    let mut conversation = conversation(16);
+    commit_text_turn(&mut conversation, 160);
+    commit_tool_turn(&mut conversation, 161, "call-row-round-trip", 16_100);
+    commit_text_turn(&mut conversation, 162);
+
+    let covers = range(&conversation, 0, 2);
+    let produced_by = strategy("rows-v1");
+    let artifact = summary_artifact(
+        &conversation,
+        covers.clone(),
+        16_500,
+        produced_by.clone(),
+        "summary:160-161",
+    );
+    let plan = CompactionPlan::new(
+        &conversation,
+        vec![CompactionStep::raw(covers, artifact.id(), produced_by)],
+        vec![artifact],
+    );
+    conversation
+        .apply_compaction(&plan)
+        .expect("apply projection before row export");
+
+    let snapshot = conversation.snapshot().expect("snapshot");
+    let mut rows = snapshot.to_rows().expect("snapshot decomposes to rows");
+    let encoded = serde_json::to_string(&rows).expect("serialize rows");
+    let mut decoded: ConversationRows = serde_json::from_str(&encoded).expect("deserialize rows");
+    assert_eq!(decoded, rows);
+
+    scramble_rows(&mut rows);
+    scramble_rows(&mut decoded);
+
+    let rebuilt = ConversationSnapshot::from_rows(rows).expect("rows rebuild snapshot");
+    let decoded_rebuilt =
+        ConversationSnapshot::from_rows(decoded).expect("serde rows rebuild snapshot");
+    assert_eq!(rebuilt, snapshot);
+    assert_eq!(decoded_rebuilt, snapshot);
+
+    let restored = Conversation::restore(rebuilt).expect("restore row-built snapshot");
+    assert_eq!(runtime_state(&restored), runtime_state(&conversation));
+    assert_eq!(restored.effective_view(), conversation.effective_view());
+}
+
+#[test]
+fn fork_row_insert_set_references_shared_ancestors_without_duplicate_facts() {
+    let mut parent = conversation(17);
+    commit_text_turn(&mut parent, 170);
+    commit_tool_turn(&mut parent, 171, "call-parent-row", 17_100);
+
+    let fork_point = parent.valid_boundaries()[2];
+    let mut child = parent
+        .fork_at(fork_point, conversation_id(17_000))
+        .expect("fork child");
+    commit_text_turn(&mut child, 172);
+
+    let parent_rows = parent
+        .snapshot()
+        .expect("parent snapshot")
+        .to_rows()
+        .expect("parent rows");
+    let child_rows = child
+        .snapshot()
+        .expect("child snapshot")
+        .to_rows()
+        .expect("child rows");
+
+    let inserts = child_rows
+        .insert_set_against(&parent_rows)
+        .expect("child rows are insert-only relative to parent rows");
+
+    assert_eq!(inserts.conversations.len(), 1);
+    assert_eq!(inserts.conversations[0].conversation_id, child.id());
+    assert_eq!(inserts.raw_turns.len(), 3);
+    assert_eq!(inserts.lineage_turns.len(), 3);
+    assert!(
+        inserts
+            .raw_turns
+            .iter()
+            .any(|row| row.turn_id == turn_id(170)),
+        "child raw membership references shared parent ancestor by id"
+    );
+    assert_eq!(
+        inserts
+            .turns
+            .iter()
+            .map(|row| row.turn_id)
+            .collect::<Vec<_>>(),
+        vec![turn_id(172)]
+    );
+    assert!(
+        inserts
+            .messages
+            .iter()
+            .all(|row| row.turn_id == turn_id(172)),
+        "shared ancestor messages are not duplicated for the child insert set"
+    );
+    assert!(
+        inserts
+            .tool_pairings
+            .iter()
+            .all(|row| row.turn_id == turn_id(172)),
+        "shared ancestor pairings are not duplicated for the child insert set"
+    );
+}
+
+#[test]
+fn rows_reject_duplicate_primary_keys_missing_fks_and_bad_sequences() {
+    let mut conversation = conversation(18);
+    commit_text_turn(&mut conversation, 180);
+    commit_text_turn(&mut conversation, 181);
+    let rows = conversation
+        .snapshot()
+        .expect("snapshot")
+        .to_rows()
+        .expect("rows");
+
+    let mut duplicate_message = rows.clone();
+    let duplicate = duplicate_message.messages[0].clone();
+    duplicate_message.messages.push(duplicate);
+    assert!(matches!(
+        duplicate_message
+            .into_snapshot()
+            .expect_err("duplicate message rejected"),
+        RowMappingError::DuplicatePrimaryKey {
+            table: "message_records",
+            ..
+        }
+    ));
+
+    let mut missing_turn_fk = rows.clone();
+    missing_turn_fk.messages[0].turn_id = turn_id(18_999);
+    assert!(matches!(
+        missing_turn_fk.into_snapshot().expect_err("missing turn rejected"),
+        RowMappingError::MissingTurnRow {
+            turn_id: missing_id,
+            ..
+        } if missing_id == turn_id(18_999)
+    ));
+
+    let mut bad_sequence = rows.clone();
+    bad_sequence.messages[0].message_sequence = 4;
+    assert!(matches!(
+        bad_sequence
+            .into_snapshot()
+            .expect_err("message sequence gap rejected"),
+        RowMappingError::SequenceGap {
+            table: "message_records",
+            expected: 0,
+            actual: 1 | 4,
+            ..
+        }
+    ));
+
+    let mut missing_messages = rows;
+    let removed_turn = missing_messages.raw_turns[0].turn_id;
+    missing_messages
+        .messages
+        .retain(|row| row.turn_id != removed_turn);
+    assert!(matches!(
+        missing_messages.into_snapshot().expect_err("missing messages rejected"),
+        RowMappingError::MissingMessageRows { turn_id, .. } if turn_id == removed_turn
+    ));
+}
+
+#[test]
+fn rows_reject_projection_artifact_corruption_and_restore_catches_parent_cycles() {
+    let mut conversation = conversation(19);
+    commit_text_turn(&mut conversation, 190);
+    commit_text_turn(&mut conversation, 191);
+
+    let covers = range(&conversation, 0, 1);
+    let produced_by = strategy("rows-corruption");
+    let artifact = summary_artifact(
+        &conversation,
+        covers.clone(),
+        19_500,
+        produced_by.clone(),
+        "summary:190",
+    );
+    let plan = CompactionPlan::new(
+        &conversation,
+        vec![CompactionStep::raw(covers, artifact.id(), produced_by)],
+        vec![artifact],
+    );
+    conversation
+        .apply_compaction(&plan)
+        .expect("apply projection before corruption tests");
+    let rows = conversation
+        .snapshot()
+        .expect("snapshot")
+        .to_rows()
+        .expect("rows");
+
+    let mut missing_artifact = rows.clone();
+    missing_artifact.artifacts.clear();
+    assert!(matches!(
+        missing_artifact
+            .into_snapshot()
+            .expect_err("missing artifact rejected"),
+        RowMappingError::InvalidProjectionRows {
+            source: ProjectionError::MissingArtifact { .. },
+            ..
+        }
+    ));
+
+    let mut wrong_artifact_owner = rows.clone();
+    wrong_artifact_owner.artifacts[0].conversation_id = conversation_id(19_999);
+    assert!(matches!(
+        wrong_artifact_owner.into_snapshot().expect_err("foreign artifact rejected"),
+        RowMappingError::ConversationMismatch { actual, expected, .. }
+            if expected == conversation.id() && actual == conversation_id(19_999)
+    ));
+
+    let mut cycle = rows;
+    cycle.turns[0].parent_turn_id = Some(turn_id(191));
+    cycle.turns[1].parent_turn_id = Some(turn_id(190));
+    let snapshot = cycle
+        .into_snapshot()
+        .expect("row shape can rebuild cyclic parent facts");
+    assert!(matches!(
+        Conversation::restore(snapshot).expect_err("restore rejects cycle"),
+        ConversationError::Restore(RestoreError::ParentCycle { .. })
+    ));
 }
 
 #[test]

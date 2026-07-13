@@ -1243,7 +1243,7 @@ data snapshot，再验证全部事实和 projection，最后构建 runtime histo
   0 failed，所有 example targets passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
   `git diff --check`。
 
-### M5-3 [TODO] DB-neutral parent-tree row 映射
+### M5-3 [DONE] DB-neutral parent-tree row 映射
 
 **前置依赖**：M5-2。
 
@@ -1272,6 +1272,41 @@ data snapshot，再验证全部事实和 projection，最后构建 runtime histo
 - 缺行、重复 PK、错误 FK/seq/cycle 和 orphan artifact rows 明确失败。
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、row mapping 聚焦测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增 `conversation::persistence::rows` 并公开 DB-neutral row DTO：
+  `ConversationRecord`、`ConversationTurnRecord`、`ConversationLineageTurnRecord`、
+  `TurnRecord`、`MessageRecord`、`ToolPairingRecord`、`ProjectionRecord`、
+  `ProjectionSpanRecord`、`ArtifactRecord`、`ConversationRows` 与
+  `ConversationRowInsertSet`。row schema 明确保存 conversation owner、origin、structural
+  version、head/fork ceiling、parent Turn pointer、message/pairing/projection/artifact dense
+  sequence、稳定 PK/FK 和 projection/artifact provenance；不引入 SQL、migration runner 或
+  具体数据库连接。
+- `ConversationSnapshot::to_rows`/`ConversationRows::from_snapshot` 将 snapshot facts
+  确定性分解为 immutable global facts 与 per-Conversation association rows；
+  `ConversationRows::into_snapshot`/`ConversationSnapshot::from_rows` 会在忽略读取顺序的情况下
+  重新按显式 sequence 分组，检查 owner、schema、duplicate PK、sequence gap、缺失 FK、orphan
+  rows 与 projection data shape，然后只生成 data snapshot，恢复 live Conversation 仍必须继续
+  走 M5-2 `Conversation::restore` validator。
+- 新增 insert-only diff：`ConversationRows::insert_set_against` 会先验证两边 row set，再只返回
+  缺失 rows；若同一 PK 已存在但 immutable fact 不同，则返回 `RowMappingError::InsertConflict`
+  而不是描述 UPDATE。fork child 相对 parent 的导出会插入 child conversation/raw/lineage/
+  projection association rows 和 child 本地 suffix facts，已存在的共享 ancestor Turn/Message/
+  ToolPairing rows 按稳定 id 引用且不会复制或 re-id。
+- 新增分类化 `RowMappingError` 并导出；README、crate docs、conversation/persistence rustdoc
+  同步说明 row mapping 仍是 data-only 边界，annotation/评分应另表引用 `MessageId`，不能更新
+  immutable `MessageRecord.payload`。阶段顺序和完成标准未变化，故未修改 `PLAN.md`。
+- 新增 4 个 row mapping 聚焦测试并扩展 persistence 测试到 16 个：覆盖线性 + tool +
+  projection 的 snapshot→rows→serde→打乱读取顺序→snapshot→restore、fork child insert-only
+  diff 不复制 shared ancestor payload、duplicate PK、missing FK、message seq gap、missing
+  message rows、missing/foreign artifact rows，以及 parent cycle 由 restore validator 明确拒绝。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test conversation::persistence -- --nocapture`（16 passed）；1800 秒硬上限内
+  `cargo test --all --all-targets`（285 个库测试与 3 个离线集成测试 passed、7 ignored、
+  0 failed，所有 example targets passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
+  额外 `cargo test --doc`（1 个正向 doctest 与 10 个 compile-fail doctest passed）；
   `git diff --check`。
 
 ### M5-4 [TODO] 存盘→恢复→`effective_view` 端到端一致性

@@ -30,8 +30,11 @@
 //! records committed consistency-point facts for persistence without serializing
 //! pending state, derived indexes, shared-memory handles, clients, registries,
 //! or runtime strategy/trigger objects; [`Conversation::restore`] revalidates
-//! those facts before rebuilding runtime history and derived indexes. Raw
-//! messages remain unchanged.
+//! those facts before rebuilding runtime history and derived indexes.
+//! [`ConversationRows`] can decompose that snapshot into DB-neutral rows and
+//! reassemble the same data snapshot, but it does not construct live history or
+//! permit updates to immutable message payload rows. Raw messages remain
+//! unchanged.
 
 pub mod boundary;
 pub mod config;
@@ -50,7 +53,7 @@ pub use config::ConversationConfig;
 pub use error::{
     BoundaryError, CancelError, CommitError, CompactionError, ContentBlockKind, ConversationError,
     ForkError, PairingMessageKind, PendingMessageError, PendingTurnError, ProjectionError,
-    RestoreError, SnapshotError,
+    RestoreError, RowMappingError, SnapshotError,
 };
 pub use history::{ToolCallIndex, ToolCallLocation, ToolCallLocationKind};
 pub use id::{ArtifactId, ConversationId, MessageId, ToolCallId, TurnId};
@@ -61,7 +64,10 @@ pub use pending::{
     PendingTurnPhase, ToolCallMapping,
 };
 pub use persistence::{
-    CONVERSATION_SNAPSHOT_SCHEMA_VERSION, ConversationSnapshot, ConversationSnapshotHistory,
+    ArtifactRecord, CONVERSATION_ROW_SCHEMA_VERSION, CONVERSATION_SNAPSHOT_SCHEMA_VERSION,
+    ConversationLineageTurnRecord, ConversationRecord, ConversationRowInsertSet, ConversationRows,
+    ConversationSnapshot, ConversationSnapshotHistory, ConversationTurnRecord, MessageRecord,
+    ProjectionRecord, ProjectionSpanKind, ProjectionSpanRecord, ToolPairingRecord, TurnRecord,
 };
 pub use projection::{
     Artifact, ArtifactDraft, ArtifactProvenance, CheckedTurnRange, CompactCtx, CompactionInput,

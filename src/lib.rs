@@ -53,7 +53,11 @@
 //!   [`conversation::Conversation::snapshot`] exports versioned
 //!   [`conversation::ConversationSnapshot`] data only at committed consistency
 //!   points, excluding pending state, accumulators, derived indexes, and
-//!   runtime strategy/trigger/client handles.
+//!   runtime strategy/trigger/client handles. [`conversation::ConversationRows`]
+//!   decomposes the same snapshot facts into DB-neutral parent-tree rows with
+//!   stable PK/FK fields, explicit sequences, and insert-only immutable
+//!   Turn/message facts; row reassembly returns a snapshot that still must pass
+//!   normal restore validation.
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are deliberately outside this crate. Those layers should persist and replay

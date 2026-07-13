@@ -32,7 +32,11 @@ consolidate，同时保留 raw history 和已替换 artifact provenance；dyn-sa
 `ConversationSnapshot` 已作为 committed boundary 上的 versioned data-only 一致点接入，
 保存 id/config、retained raw Turn facts、lineage/head、fork origin/ceiling、structural
 version 与 projection/artifact provenance，同时拒绝 pending 并排除 Accumulator、派生 index、
-Arc/lock、client/registry handle 和 strategy/trigger object。
+Arc/lock、client/registry handle 和 strategy/trigger object；`ConversationRows` 可把同一
+snapshot 分解为 DB-neutral parent-tree rows，使用稳定 PK/FK、parent Turn pointer 与显式
+sequence 表达 conversation/turn/message/pairing/projection/artifact facts，重组后仍必须走
+`Conversation::restore` 校验，fork child 的导出只新增 child metadata/association 和本地 suffix
+facts，不复制共享祖先 message/turn payload。
 已完成的 Client 层实施记录见
 [`docs/archive/2026-07-13-client-layer/TODO.md`](docs/archive/2026-07-13-client-layer/TODO.md)；
 当前 Conversation Core 阶段计划和任务见 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。
@@ -64,9 +68,12 @@ Arc/lock、client/registry handle 和 strategy/trigger object。
   或 compaction apply 而改写；`CompactionStrategy`/`CompactionTrigger` 只在运行时观察只读
   spans、effective context、Conversation 和 usage，并把结果落回 data-only plan/artifact；
   `ConversationSnapshot` 只在无 pending 的 committed 一致点导出 versioned data-only facts，
-  不把 pending、Accumulator、派生 index 或 runtime handles 写入持久化形状。
+  不把 pending、Accumulator、派生 index 或 runtime handles 写入持久化形状；
+  `ConversationRows` 提供不绑定数据库驱动的 row DTO 与受检 snapshot 重组，immutable
+  Turn/message rows 只 INSERT 不 UPDATE，annotation/评分应另表引用 `MessageId`，不能更新
+  `MessageRecord.payload`。
 
-Conversation Core 正按任务顺序继续实现 restore 与 DB-neutral row mapping；具体 summarizer、
+Conversation Core 正按任务顺序继续实现持久化端到端一致性验收；具体 summarizer、
 Agent loop、Tool registry、自动预算调度与多 agent 编排仍不在范围内。完整设计和当前阶段计划分别见
 [`DESIGN.md`](DESIGN.md) 与 [`PLAN.md`](PLAN.md)。
 

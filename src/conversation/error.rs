@@ -1118,6 +1118,127 @@ pub enum RestoreError {
     },
 }
 
+/// DB-neutral row facts could not be decomposed or recomposed safely.
+///
+/// Row mapping errors describe storage-shape failures before a live
+/// [`Conversation`](super::Conversation) is restored. Once rows produce a
+/// [`ConversationSnapshot`](super::ConversationSnapshot), the normal
+/// [`RestoreError`] validator remains responsible for closed-turn, parent-tree,
+/// fork, and projection semantics.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum RowMappingError {
+    /// A row belongs to another Conversation than the row set's owner.
+    #[error(
+        "row mapping rejected {path}: row belongs to conversation {actual}, expected {expected}"
+    )]
+    ConversationMismatch {
+        /// JSON-like row path.
+        path: String,
+        /// Conversation identity owning the row set.
+        expected: ConversationId,
+        /// Conversation identity found on the row.
+        actual: ConversationId,
+    },
+
+    /// Two rows use the same primary key.
+    #[error("row mapping rejected {path}: duplicate primary key in {table}: {key}")]
+    DuplicatePrimaryKey {
+        /// JSON-like row path.
+        path: String,
+        /// Logical row table name.
+        table: &'static str,
+        /// Stable textual representation of the duplicated key.
+        key: String,
+    },
+
+    /// Two rows use the same per-parent sequence number.
+    #[error("row mapping rejected {path}: duplicate sequence {sequence} in {table}")]
+    DuplicateSequence {
+        /// JSON-like row path.
+        path: String,
+        /// Logical row table name.
+        table: &'static str,
+        /// Reused sequence value.
+        sequence: u64,
+    },
+
+    /// A sequence list is not dense from zero.
+    #[error("row mapping rejected {path}: {table} sequence expected {expected}, found {actual}")]
+    SequenceGap {
+        /// JSON-like row path.
+        path: String,
+        /// Logical row table name.
+        table: &'static str,
+        /// Next expected sequence value.
+        expected: u64,
+        /// Actual sequence value encountered.
+        actual: u64,
+    },
+
+    /// A row references a Turn fact that is absent from retained raw rows.
+    #[error("row mapping rejected {path}: missing turn row {turn_id}")]
+    MissingTurnRow {
+        /// JSON-like row path.
+        path: String,
+        /// Referenced Turn identity.
+        turn_id: TurnId,
+    },
+
+    /// A retained Turn has no message rows to pass through the validator.
+    #[error("row mapping rejected {path}: turn {turn_id} has no message rows")]
+    MissingMessageRows {
+        /// JSON-like row path.
+        path: String,
+        /// Turn identity missing message facts.
+        turn_id: TurnId,
+    },
+
+    /// A row is not reachable from any retained raw Turn membership.
+    #[error("row mapping rejected {path}: orphan {table} row {key}")]
+    OrphanRow {
+        /// JSON-like row path.
+        path: String,
+        /// Logical row table name.
+        table: &'static str,
+        /// Stable textual representation of the orphan row key.
+        key: String,
+    },
+
+    /// A row has an internally inconsistent field combination.
+    #[error("row mapping rejected {path}: invalid {table} row: {reason}")]
+    InvalidRow {
+        /// JSON-like row path.
+        path: String,
+        /// Logical row table name.
+        table: &'static str,
+        /// Stable diagnostic for the invalid field combination.
+        reason: &'static str,
+    },
+
+    /// Projection rows could not be assembled into a valid data shape.
+    #[error("row mapping rejected {path}: invalid projection rows: {source}")]
+    InvalidProjectionRows {
+        /// JSON-like row path.
+        path: String,
+        /// Projection data-shape error.
+        #[source]
+        source: ProjectionError,
+    },
+
+    /// A row insert set would need to update an existing immutable fact.
+    #[error(
+        "row mapping rejected {path}: existing {table} row {key} has different immutable facts"
+    )]
+    InsertConflict {
+        /// JSON-like row path.
+        path: String,
+        /// Logical row table name.
+        table: &'static str,
+        /// Stable textual representation of the conflicting key.
+        key: String,
+    },
+}
+
 /// A Conversation operation failed without changing committed state.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ConversationError {

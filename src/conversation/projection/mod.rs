@@ -229,6 +229,21 @@ impl CheckedTurnRange {
             end: endpoint_from_turns(turns, end),
         }
     }
+
+    /// Rebuilds a persisted range claim from row fields.
+    pub(crate) const fn from_persisted_parts(
+        conversation_id: ConversationId,
+        start_turn_count: u64,
+        start_after_turn: Option<TurnId>,
+        end_turn_count: u64,
+        end_after_turn: Option<TurnId>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            start: RangeEndpoint::new(start_turn_count, start_after_turn),
+            end: RangeEndpoint::new(end_turn_count, end_after_turn),
+        }
+    }
 }
 
 /// One ordered projection span over a complete raw Turn range.
@@ -374,6 +389,15 @@ impl Projection {
         self.artifacts
             .iter()
             .find(|artifact| artifact.id() == artifact_id)
+    }
+
+    /// Rebuilds projection data from persistence rows before restore-time validation.
+    pub(crate) fn from_persisted_parts(
+        spans: Vec<Span>,
+        artifacts: Vec<Artifact>,
+    ) -> Result<Self, ProjectionError> {
+        validate_projection_shape(&spans, &artifacts)?;
+        Ok(Self { spans, artifacts })
     }
 
     /// Builds the default all-raw projection for the current effective Turns.
