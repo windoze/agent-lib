@@ -411,6 +411,8 @@ StepInput) -> StepOutcome`,纯、同步、无 async。现有 `AgentInput`(`event
   (lib 388 passed / 0 failed,较 M2-1 的 380 +8;网络用例 ignored);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过;`git diff --check` 干净。
 
+### [TODO] M2-3 抽出 LLM step:`NeedLlm` 与 text-only turn 折叠
+
 **前置依赖**:M2-2。
 
 **上下文**:迁移文档 §2/§3。现有 `src/agent/loop_driver/default.rs` 的推进逻辑分散在
