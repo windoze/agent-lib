@@ -8,8 +8,10 @@
 use super::{BoundaryError, Conversation, ConversationId, TurnId};
 use serde::{Deserialize, Serialize};
 
+mod fork;
 mod head;
 
+pub use fork::ForkOrigin;
 pub use head::RevertOutcome;
 
 /// A Conversation-issued token naming one complete-Turn cut.

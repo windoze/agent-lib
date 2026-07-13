@@ -1,7 +1,7 @@
 //! Logical-head movement over one checked Conversation lineage.
 
 use super::{Boundary, Conversation};
-use crate::conversation::{ConversationError, ToolCallIndex};
+use crate::conversation::ConversationError;
 
 /// Observable result of one checked logical-head operation.
 ///
@@ -86,11 +86,8 @@ impl Conversation {
                 .ok_or(ConversationError::NonAtomicHeadMove {
                     current_version: self.version,
                 })?;
-        let rebuilt_index =
-            ToolCallIndex::rebuild(&self.history.lineage_turns()[..target_position], None);
-
         self.history.move_head_to(target_position);
-        self.tool_call_index = rebuilt_index;
+        self.tool_call_index.scope_committed_turns(target_position);
         self.version = next_version;
 
         let old_head = self.issue_boundary_at(old_position);

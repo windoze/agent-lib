@@ -46,7 +46,7 @@ fn replacement_lineage_hides_old_suffix_but_retains_raw_and_all_identities() {
         .expect("first turn has a checked boundary");
     conversation
         .revert_to(first_turn)
-        .expect("checked head movement rebuilds the index");
+        .expect("checked head movement rescopes the index");
     assert_eq!(conversation.turns().len(), 1);
     assert!(conversation.raw_turn(turn_id(11)).is_some());
     assert!(

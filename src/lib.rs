@@ -31,7 +31,10 @@
 //!   Turn cuts; their position and stable anchor are revalidated against owner,
 //!   structural version, lineage/fork range, and pending state before use.
 //!   [`conversation::Conversation::revert_to`] moves a logical head backward or
-//!   forward, rebuilds derived lookup state, and retains every raw branch.
+//!   forward, rescopes derived lookup state, and retains every raw branch.
+//!   [`conversation::Conversation::fork_at`] creates a child Conversation with
+//!   its own owner/version metadata while sharing immutable prefix history and
+//!   recording [`conversation::ForkOrigin`] provenance.
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are deliberately outside this crate. Those layers should persist and replay

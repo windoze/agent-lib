@@ -18,6 +18,7 @@ use crate::{
 use serde_json::{Map, json};
 use uuid::Uuid;
 
+mod fork;
 mod index;
 mod retention;
 mod sharing;

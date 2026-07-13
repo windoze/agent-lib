@@ -13,7 +13,10 @@
 //! pending consistency state are checked before consumption. The logical head
 //! can move backward or forward without deleting raw Turns; committing from a
 //! reverted head creates a new parent-pointer suffix while the old branch stays
-//! available to read-only raw-history queries.
+//! available to read-only raw-history queries. A checked fork creates a new
+//! Conversation identity and [`ForkOrigin`] while sharing immutable prefix
+//! storage; parent suffixes above the fork point stay outside the child
+//! raw/debug/persistence facts.
 
 pub mod boundary;
 pub mod config;
@@ -25,10 +28,10 @@ pub mod pending;
 pub mod turn;
 mod validation;
 
-pub use boundary::{Boundary, RevertOutcome};
+pub use boundary::{Boundary, ForkOrigin, RevertOutcome};
 pub use config::ConversationConfig;
 pub use error::{
-    BoundaryError, CancelError, CommitError, ContentBlockKind, ConversationError,
+    BoundaryError, CancelError, CommitError, ContentBlockKind, ConversationError, ForkError,
     PairingMessageKind, PendingMessageError, PendingTurnError,
 };
 pub use history::{ToolCallIndex, ToolCallLocation, ToolCallLocationKind};
@@ -73,6 +76,7 @@ pub struct Conversation {
     pending: Option<PendingTurn>,
     tool_call_index: ToolCallIndex,
     version: u64,
+    origin: Option<ForkOrigin>,
 }
 
 impl Conversation {
@@ -86,6 +90,7 @@ impl Conversation {
             pending: None,
             tool_call_index: ToolCallIndex::default(),
             version: 0,
+            origin: None,
         }
     }
 
@@ -153,12 +158,19 @@ impl Conversation {
 
     /// Returns the monotonic version advanced by each structural history change.
     ///
-    /// Successful commits and real logical-head moves advance it. Future
-    /// fork/restore transitions use the same structural-version domain so
-    /// previously issued [`Boundary`] tokens cannot survive an ABA change.
+    /// Successful commits and real logical-head moves advance it. Forked
+    /// children start their own version domain at zero, so parent and child
+    /// [`Boundary`] owners remain distinct even when their numeric versions
+    /// match.
     #[must_use]
     pub const fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Returns the parent Conversation and checked cut that created this fork.
+    #[must_use]
+    pub const fn origin(&self) -> Option<ForkOrigin> {
+        self.origin
     }
 
     /// Begins one transaction from a complete external user payload.
@@ -399,5 +411,6 @@ mod tests {
         assert_eq!(conversation.config(), &config);
         assert!(conversation.turns().is_empty());
         assert_eq!(conversation.version(), 0);
+        assert_eq!(conversation.origin(), None);
     }
 }

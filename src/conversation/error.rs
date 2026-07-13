@@ -639,6 +639,17 @@ pub enum BoundaryError {
     },
 }
 
+/// A checked fork request was rejected before child state was created.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ForkError {
+    /// A fork must receive a distinct child Conversation identity from its caller.
+    #[error("fork child conversation id {conversation_id} matches its parent")]
+    DuplicateConversationId {
+        /// Reused Conversation identity.
+        conversation_id: ConversationId,
+    },
+}
+
 /// A Conversation operation failed without changing committed state.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ConversationError {
@@ -665,6 +676,10 @@ pub enum ConversationError {
     /// A pending cancellation could not be prepared or applied atomically.
     #[error("pending turn cancellation failed: {0}")]
     Cancel(#[from] CancelError),
+
+    /// A fork request could not create an independent child conversation.
+    #[error("fork rejected: {0}")]
+    Fork(#[from] ForkError),
 
     /// History and version cannot be advanced together because the version is exhausted.
     #[error("commit cannot advance history and version atomically from version {current_version}")]

@@ -4,7 +4,7 @@ use super::super::Boundary;
 use crate::{
     client::Response,
     conversation::{
-        AssistantFinish, Conversation, ConversationConfig, ConversationId, MessageId,
+        AssistantFinish, Conversation, ConversationConfig, ConversationId, ForkOrigin, MessageId,
         PendingTurnPhase, ToolCallId, ToolCallIndex, ToolCallMapping, Turn, TurnId, TurnMeta,
     },
     model::{
@@ -18,6 +18,7 @@ use crate::{
 use serde_json::{Map, json};
 use uuid::Uuid;
 
+mod fork;
 mod negative;
 mod positive;
 mod revert;
@@ -35,6 +36,7 @@ pub(super) struct StateSnapshot {
     raw_turns: Vec<Turn>,
     pending: Option<(TurnId, PendingTurnPhase, Vec<MessageId>)>,
     tool_call_index: ToolCallIndex,
+    origin: Option<ForkOrigin>,
 }
 
 /// Creates one deterministic external Conversation identity.
@@ -219,6 +221,7 @@ pub(super) fn snapshot(conversation: &Conversation) -> StateSnapshot {
             )
         }),
         tool_call_index: conversation.tool_call_index().clone(),
+        origin: conversation.origin(),
     }
 }
 
@@ -250,17 +253,12 @@ pub(super) fn shared_prefix_child(
     child_id: ConversationId,
     lineage_len: usize,
 ) -> Conversation {
-    let history = parent
-        .history
-        .shared_prefix(lineage_len)
+    let boundary = parent
+        .valid_boundaries()
+        .get(lineage_len)
+        .copied()
         .expect("fork ceiling belongs to parent lineage");
-    let tool_call_index = ToolCallIndex::rebuild(history.turns(), None);
-    Conversation {
-        id: child_id,
-        config: parent.config.clone(),
-        history,
-        pending: None,
-        tool_call_index,
-        version: 0,
-    }
+    parent
+        .fork_at(boundary, child_id)
+        .expect("shared-prefix child is a valid fork")
 }

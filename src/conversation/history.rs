@@ -107,12 +107,11 @@ impl History {
         self.lineage_len = self.active_len;
     }
 
-    /// Shares an addressable lineage prefix without copying it in boundary tests.
+    /// Shares an addressable lineage prefix without copying retained turns.
     ///
     /// The returned history sees only the selected prefix as raw inherited
     /// state. Turns later in the backing allocation remain useful for precise
     /// fork-ceiling diagnostics but cannot be queried as child raw history.
-    #[cfg(test)]
     pub(crate) fn shared_prefix(&self, lineage_len: usize) -> Option<Self> {
         if lineage_len > self.lineage_len {
             return None;
@@ -229,8 +228,7 @@ impl RawHistory {
         }
     }
 
-    /// Creates a test fork scope over one immutable parent-lineage prefix.
-    #[cfg(test)]
+    /// Creates a fork scope over one immutable parent-lineage prefix.
     fn from_shared_lineage(base: Arc<Lineage>, base_len: usize) -> Self {
         debug_assert!(base_len <= base.turns.len());
         Self {

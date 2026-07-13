@@ -6,7 +6,11 @@ use crate::{
     },
     model::content::ContentBlock,
 };
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 /// Whether a tool-call location comes from closed history or current pending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +28,7 @@ pub enum ToolCallLocationKind {
 /// let one read the same index while a pending transaction advances.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallLocation {
+    turn_position: usize,
     kind: ToolCallLocationKind,
     turn_id: TurnId,
     call_id: Option<ToolCallId>,
@@ -77,38 +82,47 @@ impl ToolCallLocation {
 /// location in current-lineage order. This value is never a pairing source of
 /// truth: it can always be rebuilt from closed turns plus the current pending
 /// transaction.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ToolCallIndex {
-    entries: Vec<ToolCallLocation>,
-    committed_len: usize,
-    by_call_id: HashMap<ToolCallId, usize>,
-    by_provider_call_id: HashMap<String, Vec<usize>>,
+    committed: Arc<CommittedIndex>,
+    visible_committed_turns: usize,
+    visible_committed_entries: usize,
+    pending: Vec<ToolCallLocation>,
+    pending_by_call_id: HashMap<ToolCallId, usize>,
+    pending_by_provider_call_id: HashMap<String, Vec<usize>>,
 }
 
 impl ToolCallIndex {
     /// Returns the number of calls visible in the current lineage and pending.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.visible_committed_entries + self.pending.len()
     }
 
     /// Reports whether the current lineage and pending contain no tool calls.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
     /// Iterates through committed calls and then pending calls in message order.
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = &ToolCallLocation> {
-        self.entries.iter()
+    pub fn iter(&self) -> impl Iterator<Item = &ToolCallLocation> {
+        self.committed.entries[..self.visible_committed_entries]
+            .iter()
+            .chain(self.pending.iter())
     }
 
     /// Finds one mapped call by its framework-owned stable identity.
     #[must_use]
     pub fn by_call_id(&self, call_id: ToolCallId) -> Option<&ToolCallLocation> {
-        self.by_call_id
+        if let Some(index) = self.committed.by_call_id.get(&call_id)
+            && *index < self.visible_committed_entries
+        {
+            return Some(&self.committed.entries[*index]);
+        }
+        self.pending_by_call_id
             .get(&call_id)
-            .map(|index| &self.entries[*index])
+            .map(|index| &self.pending[*index])
     }
 
     /// Finds every current call carrying the provider id.
@@ -119,11 +133,21 @@ impl ToolCallIndex {
         &'a self,
         provider_call_id: &str,
     ) -> impl Iterator<Item = &'a ToolCallLocation> + 'a {
-        self.by_provider_call_id
+        let committed = self
+            .committed
+            .by_provider_call_id
             .get(provider_call_id)
             .into_iter()
             .flatten()
-            .map(|index| &self.entries[*index])
+            .filter(|index| **index < self.visible_committed_entries)
+            .map(|index| &self.committed.entries[*index]);
+        let pending = self
+            .pending_by_provider_call_id
+            .get(provider_call_id)
+            .into_iter()
+            .flatten()
+            .map(|index| &self.pending[*index]);
+        committed.chain(pending)
     }
 
     /// Reconstructs the entire derived index from authoritative facts.
@@ -133,32 +157,178 @@ impl ToolCallIndex {
     /// the result remains an acceleration value rather than validation proof.
     #[must_use]
     pub fn rebuild(turns: &[Turn], pending: Option<&PendingTurn>) -> Self {
-        let mut index = Self::default();
-        for turn in turns {
-            index.push_committed_turn(turn);
-        }
+        let committed = Arc::new(CommittedIndex::from_turns(turns));
+        let visible_committed_entries = committed.entries.len();
+        let mut index = Self {
+            committed,
+            visible_committed_turns: turns.len(),
+            visible_committed_entries,
+            pending: Vec::new(),
+            pending_by_call_id: HashMap::new(),
+            pending_by_provider_call_id: HashMap::new(),
+        };
         index.replace_pending(pending);
         index
     }
 
     /// Adds one newly committed turn without rescanning older closed turns.
     pub(crate) fn push_committed_turn(&mut self, turn: &Turn) {
-        self.remove_pending();
-        self.extend(turn_locations(turn));
-        self.committed_len = self.entries.len();
+        self.clear_pending();
+        let turn_position = self.visible_committed_turns;
+        if self.visible_committed_turns == self.committed.turn_end_entries.len()
+            && Arc::strong_count(&self.committed) == 1
+        {
+            let committed = Arc::make_mut(&mut self.committed);
+            committed.push_turn(turn, turn_position);
+        } else {
+            let mut committed = self
+                .committed
+                .visible_prefix(self.visible_committed_turns, self.visible_committed_entries);
+            committed.push_turn(turn, turn_position);
+            self.committed = Arc::new(committed);
+        }
+        self.visible_committed_turns += 1;
+        self.visible_committed_entries = self
+            .committed
+            .entry_count_for_turns(self.visible_committed_turns)
+            .expect("the appended turn count is present in the committed index");
     }
 
     /// Replaces only transaction-local records after a pending transition.
     pub(crate) fn replace_pending(&mut self, pending: Option<&PendingTurn>) {
-        self.remove_pending();
+        self.clear_pending();
         if let Some(pending) = pending {
-            self.extend(pending_locations(pending));
+            self.extend_pending(pending_locations(pending));
         }
     }
 
-    /// Adds records while maintaining both lookup tables.
-    fn extend(&mut self, locations: impl IntoIterator<Item = ToolCallLocation>) {
+    /// Moves the visible committed prefix without rebuilding the shared index.
+    pub(crate) fn scope_committed_turns(&mut self, turn_count: usize) {
+        self.visible_committed_entries = self
+            .committed
+            .entry_count_for_turns(turn_count)
+            .expect("lineage position has a committed index entry count");
+        self.visible_committed_turns = turn_count;
+        self.clear_pending();
+    }
+
+    /// Creates an independent index view over a shared committed prefix.
+    pub(crate) fn fork_scope(&self, turn_count: usize) -> Option<Self> {
+        let visible_committed_entries = self.committed.entry_count_for_turns(turn_count)?;
+        Some(Self {
+            committed: self.committed.clone(),
+            visible_committed_turns: turn_count,
+            visible_committed_entries,
+            pending: Vec::new(),
+            pending_by_call_id: HashMap::new(),
+            pending_by_provider_call_id: HashMap::new(),
+        })
+    }
+
+    /// Reports whether two indexes share the same committed backing allocation.
+    #[cfg(test)]
+    pub(crate) fn committed_ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.committed, &other.committed)
+    }
+
+    /// Returns the committed turn ceiling currently visible through this index.
+    #[cfg(test)]
+    pub(crate) const fn visible_committed_turns(&self) -> usize {
+        self.visible_committed_turns
+    }
+
+    /// Adds pending records while maintaining transaction-local lookup tables.
+    fn extend_pending(&mut self, locations: impl IntoIterator<Item = ToolCallLocation>) {
         for location in locations {
+            let index = self.pending.len();
+            if let Some(call_id) = location.call_id {
+                debug_assert!(self.by_call_id(call_id).is_none());
+                let previous = self.pending_by_call_id.insert(call_id, index);
+                debug_assert!(previous.is_none(), "pending framework call ids are unique");
+            }
+            self.pending_by_provider_call_id
+                .entry(location.provider_call_id.clone())
+                .or_default()
+                .push(index);
+            self.pending.push(location);
+        }
+    }
+
+    /// Removes transaction-local records while preserving shared committed data.
+    fn clear_pending(&mut self) {
+        self.pending.clear();
+        self.pending_by_call_id.clear();
+        self.pending_by_provider_call_id.clear();
+    }
+}
+
+impl Default for ToolCallIndex {
+    fn default() -> Self {
+        Self {
+            committed: Arc::new(CommittedIndex::default()),
+            visible_committed_turns: 0,
+            visible_committed_entries: 0,
+            pending: Vec::new(),
+            pending_by_call_id: HashMap::new(),
+            pending_by_provider_call_id: HashMap::new(),
+        }
+    }
+}
+
+impl fmt::Debug for ToolCallIndex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolCallIndex")
+            .field("visible_committed_turns", &self.visible_committed_turns)
+            .field("entries", &self.iter().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl PartialEq for ToolCallIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for ToolCallIndex {}
+
+/// Shared committed-call index for one addressable lineage.
+#[derive(Clone, Debug, Default)]
+struct CommittedIndex {
+    entries: Vec<ToolCallLocation>,
+    by_call_id: HashMap<ToolCallId, usize>,
+    by_provider_call_id: HashMap<String, Vec<usize>>,
+    turn_end_entries: Vec<usize>,
+}
+
+impl CommittedIndex {
+    /// Builds a complete committed index from already-ordered lineage turns.
+    fn from_turns(turns: &[Turn]) -> Self {
+        let mut index = Self::default();
+        for (turn_position, turn) in turns.iter().enumerate() {
+            index.push_turn(turn, turn_position);
+        }
+        index
+    }
+
+    /// Copies only the currently visible prefix when a new branch is committed.
+    fn visible_prefix(&self, visible_turns: usize, visible_entries: usize) -> Self {
+        debug_assert!(visible_turns <= self.turn_end_entries.len());
+        debug_assert!(visible_entries <= self.entries.len());
+        let mut index = Self {
+            entries: self.entries[..visible_entries].to_vec(),
+            by_call_id: HashMap::new(),
+            by_provider_call_id: HashMap::new(),
+            turn_end_entries: self.turn_end_entries[..visible_turns].to_vec(),
+        };
+        index.rebuild_lookup_tables();
+        index
+    }
+
+    /// Adds every tool call from one committed turn at a known lineage position.
+    fn push_turn(&mut self, turn: &Turn, turn_position: usize) {
+        for location in turn_locations(turn, turn_position) {
             let index = self.entries.len();
             if let Some(call_id) = location.call_id {
                 let previous = self.by_call_id.insert(call_id, index);
@@ -173,30 +343,43 @@ impl ToolCallIndex {
                 .push(index);
             self.entries.push(location);
         }
+        self.turn_end_entries.push(self.entries.len());
     }
 
-    /// Removes the previous pending suffix while preserving committed lookups.
-    fn remove_pending(&mut self) {
-        if self.entries.len() == self.committed_len {
-            return;
+    /// Returns how many committed call entries fall inside `turn_count` turns.
+    fn entry_count_for_turns(&self, turn_count: usize) -> Option<usize> {
+        if turn_count == 0 {
+            return Some(0);
         }
-        for location in self.entries.drain(self.committed_len..) {
+        self.turn_end_entries.get(turn_count - 1).copied()
+    }
+
+    /// Rebuilds lookup maps after prefix copying.
+    fn rebuild_lookup_tables(&mut self) {
+        self.by_call_id.clear();
+        self.by_provider_call_id.clear();
+        for (index, location) in self.entries.iter().enumerate() {
             if let Some(call_id) = location.call_id {
-                self.by_call_id.remove(&call_id);
+                let previous = self.by_call_id.insert(call_id, index);
+                debug_assert!(
+                    previous.is_none(),
+                    "validated framework call ids are unique"
+                );
             }
+            self.by_provider_call_id
+                .entry(location.provider_call_id.clone())
+                .or_default()
+                .push(index);
         }
-        self.by_provider_call_id.retain(|_, indices| {
-            indices.retain(|index| *index < self.committed_len);
-            !indices.is_empty()
-        });
     }
 }
 
 /// Derives complete call locations from one validator-certified turn.
-fn turn_locations(turn: &Turn) -> Vec<ToolCallLocation> {
+fn turn_locations(turn: &Turn, turn_position: usize) -> Vec<ToolCallLocation> {
     turn.pairings()
         .iter()
         .map(|pairing| ToolCallLocation {
+            turn_position,
             kind: ToolCallLocationKind::Committed,
             turn_id: turn.id(),
             call_id: Some(pairing.call_id()),
@@ -256,6 +439,7 @@ fn pending_locations(pending: &PendingTurn) -> Vec<ToolCallLocation> {
         .tool_calls()
         .iter()
         .map(|call| ToolCallLocation {
+            turn_position: usize::MAX,
             kind: ToolCallLocationKind::Pending,
             turn_id: pending.id(),
             call_id: Some(call.call_id()),
@@ -276,6 +460,7 @@ fn pending_locations(pending: &PendingTurn) -> Vec<ToolCallLocation> {
                 .unmapped_provider_call_ids()
                 .iter()
                 .map(|provider_call_id| ToolCallLocation {
+                    turn_position: usize::MAX,
                     kind: ToolCallLocationKind::Pending,
                     turn_id: pending.id(),
                     call_id: None,
