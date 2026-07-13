@@ -1,50 +1,45 @@
 # 执行计划
 
-## 当前约束
+说明：本文件记录可公开的执行计划、关键决策和进度更新；不记录私密推理链。
 
-- 使用中文记录进展与对外说明。
-- `TODO.md` 是任务顺序和完成状态的唯一权威来源。
-- 本次只完成第一个标题未带 `[DONE]` 的任务，完成后更新 `TODO.md`、验证、提交并停止。
-- 不做开放式历史问题清扫；只处理当前任务直接需要或测试暴露且未排期的问题。
-- 不使用 workaround。若发现当前任务被缺失前置条件阻塞，应在 `TODO.md` 插入最小必要前置任务，提交后停止。
+## 当前目标
 
-## 初始执行步骤
+- 按 `TODO.md` 的顺序识别第一个标题未以 `[DONE]` 标记的任务。
+- 完整实现该任务，运行要求的格式化、lint 和测试验证。
+- 在 `TODO.md` 中将该任务标题标记为 `[DONE]` 并补充 completion record。
+- 提交本次任务涉及的所有变更，然后停止，不继续下一个任务。
 
-1. 读取 `TODO.md`，按文件顺序定位第一个标题未带 `[DONE]` 的任务。
-2. 检查最新提交信息是否明确提到与该任务直接相关的未完成问题；若相关，将其纳入当前任务或作为前置任务写入 `TODO.md`。
-3. 只围绕当前任务阅读必要代码、测试和设计文档，避免无边界排查。
-4. 根据任务要求实施代码或文档改动；编辑前更新本文件说明将要修改的范围。
-5. 按要求先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，最后运行必要测试；如需完整测试，使用不超过 30 分钟的超时。
-6. 若发现未排期失败测试，修复或在 `TODO.md` 中加入最小必要前置任务，不能在失败未处理时标记当前任务完成。
-7. 完成后在 `TODO.md` 中给当前任务标题加 `[DONE]` 并补充完成记录；仅当阶段计划实际改变时才更新 `PLAN.md`。
-8. 查看 git 状态，提交本次相关所有未提交改动，提交信息包含当前任务编号和清晰描述。
-9. 提交后停止，不继续处理下一个任务。
+## 初始步骤
 
-## 进展记录
+1. 读取 `TODO.md`，只定位第一个未完成任务，不做开放式历史问题扫查。
+2. 查看该任务相关的 `PLAN.md`、源码、测试和最近提交信息，确认任务边界与直接依赖。
+3. 若发现阻塞当前任务的具体前置问题，按要求把最小前置任务插入 `TODO.md`、提交并停止。
+4. 若无阻塞，按现有代码结构实现任务，优先沿用本仓库模式。
+5. 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`，通过后运行相关测试和必要的完整测试。
+6. 更新 `TODO.md` completion record；仅当阶段计划发生真实变化时才更新 `PLAN.md`。
+7. 检查 git diff，提交清晰的任务 commit。
 
-- 已建立本计划文件。
-- 已读取 `TODO.md`，第一个未完成任务是 `M5-3 [TODO] DB-neutral parent-tree row 映射`。
-- 最新提交为 `[M5-2] Implement checked conversation restore`，未发现提交信息中有直接要求先处理的未完成问题。
+## 进度
 
-## M5-3 执行计划
+- 已读取 `TODO.md` 并定位首个未完成任务：`M5-4 [TODO] 存盘→恢复→effective_view 端到端一致性`。
+- 已检查最近提交：`[M5-3] Implement DB-neutral persistence rows`，未发现直接阻塞 M5-4 的未完成事项。
+- 已新增 `src/conversation/persistence/tests/e2e.rs` 并在 persistence tests 中挂载模块。
+- 已实现两组 M5-4 端到端验收：
+  - snapshot/rows 两条路径恢复复杂 multi-tool + compaction + revert/redo + fork 父子会话，并比较 effective view、raw facts、boundaries、projection/provenance、usage 与 rebuilt index。
+  - pending snapshot 拒绝后分别经 cancel discard 与 cancel commit 回到 committed consistency point，再执行 snapshot/rows restore。
+- 已运行 `cargo fmt --all` 与 `cargo test conversation::persistence -- --nocapture`，结果通过（18 passed）。
+- 已运行严格 clippy、全量测试、rustdoc 和 diff check，均通过。
+- 已将 `TODO.md` 的 `M5-4` 标记为 `[DONE]` 并写入完成记录。
+- 下一步检查最终 diff 与 git 状态，然后提交本次任务变更。
 
-1. 阅读现有 `conversation::persistence`、snapshot/restore、projection、history 相关实现和测试，确认 snapshot data shape、restore validator 入口和当前模块拆分。
-2. 设计 DB-neutral row DTO：conversation、turn、message、tool pairing、artifact、projection/span 等记录需要包含稳定 PK/FK、parent pointer、message sequence、owner/origin、schema version，并避免任何数据库驱动绑定。
-3. 实现 snapshot/history 到 rows 的确定性分解，以及打乱顺序后 rows 到 snapshot 的受检重组；重组结果必须继续走 M5-2 restore validator。
-4. 为 fork/export 场景提供 insert-set/row 分解能力，证明共享祖先只引用稳定 id，不重新分配 message id 或要求 UPDATE。
-5. 增加聚焦测试：线性、tool、fork、projection round-trip，打乱 rows 读取顺序后 restore 等价；缺行、重复 PK、错误 FK/seq/cycle、orphan artifact rows 明确失败。
-6. 更新 rustdoc/README/TODO 完成记录；若阶段计划未变，不修改 `PLAN.md`。
-7. 按顺序验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、row mapping 聚焦测试、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`git diff --check`。
-8. 提交全部相关改动后停止。
+## M5-4 执行计划
 
-## M5-3 当前进展
-
-- 已新增 `conversation::persistence::rows`，包含 DB-neutral row DTO、snapshot → rows、rows → snapshot 和 insert-only diff API。
-- 已为 snapshot/projection 增加 crate-private 重组入口，row 层只生成 data snapshot，不构造 live Conversation。
-- 已补充 row mapping 聚焦测试和 README/rustdoc。
-- 已完成验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
-  `cargo test conversation::persistence -- --nocapture`、1800 秒上限内
-  `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
-  额外 `cargo test --doc`、`git diff --check`。
-- 已将 `TODO.md` 的 M5-3 标为 `[DONE]` 并填写完成记录。
-- 下一步查看 git diff/status，提交本次改动后停止。
+1. 检查 `git status` 与最近提交，确认是否存在直接影响 M5-4 的未完成事项或未提交状态。
+2. 阅读 `src/conversation/persistence`、projection/effective view 相关测试与 helper，复用现有 fixture 风格。
+3. 新增模块化端到端 persistence integration 聚焦测试，覆盖：
+   - 多 Turn、serial/parallel tools、tiered/consolidated compaction、revert/redo、fork 父子分别推进。
+   - JSON snapshot 与 DB-neutral rows 两条路径 restore 后，对 system、effective messages、raw facts、head/boundaries、origin、projection/provenance、usage、ToolCallIndex 做一致性断言。
+   - pending snapshot 拒绝后，分别经 cancel→commit 或 discard 到达可 snapshot 状态。
+   - 全部 fixture 使用显式 id/timestamp，无网络、随机源、时钟或 runtime registry。
+4. 运行 `cargo fmt --all`、严格 clippy、聚焦 persistence 测试、全量测试、rustdoc 和 `git diff --check`。
+5. 将 `M5-4` 标记为 `[DONE]` 并补充完成记录，提交本次变更后停止。

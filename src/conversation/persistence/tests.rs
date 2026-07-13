@@ -1,5 +1,7 @@
 //! Snapshot consistency-point tests.
 
+mod e2e;
+
 use super::{CONVERSATION_SNAPSHOT_SCHEMA_VERSION, ConversationRows, ConversationSnapshot};
 use crate::{
     client::Response,

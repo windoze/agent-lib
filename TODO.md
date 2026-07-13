@@ -1309,7 +1309,7 @@ data snapshot，再验证全部事实和 projection，最后构建 runtime histo
   额外 `cargo test --doc`（1 个正向 doctest 与 10 个 compile-fail doctest passed）；
   `git diff --check`。
 
-### M5-4 [TODO] 存盘→恢复→`effective_view` 端到端一致性
+### M5-4 [DONE] 存盘→恢复→`effective_view` 端到端一致性
 
 **前置依赖**：M5-3。
 
@@ -1335,6 +1335,33 @@ head、fork 和 compaction 的组合，并以实际 Client-ready effective view 
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、persistence integration
   聚焦测试、`cargo test --all --all-targets`、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增模块化端到端验收 `conversation::persistence::tests::e2e`，复用现有 persistence fixture
+  并把复杂场景拆到 `src/conversation/persistence/tests/e2e.rs`，避免继续膨胀主测试文件。fixture
+  全部使用显式 `ConversationId`/`TurnId`/`MessageId`/`ToolCallId` 和 caller-supplied
+  timestamp/source，不访问网络、随机源、时钟、runtime registry 或真实 endpoint。
+- 新增 `snapshot_and_rows_restore_effective_view_across_compaction_revert_fork_and_tools`：构造
+  多 Turn 会话，覆盖 serial 两轮 tool、parallel tool 分批返回、tiered raw compaction、
+  summary-of-summaries consolidate、revert 落入 compacted cover 后 redo，以及从 cover 内 fork
+  后父子分别追加本地 suffix。每个一致点同时走 JSON snapshot 与 DB-neutral rows（含 rows
+  serde 和打乱读取顺序）两条路径恢复为新 `Conversation`。
+- 端到端断言恢复前后 `system`、`effective_view` messages、raw/current lineage facts、
+  `head`/valid boundaries、fork origin、projection spans/artifact provenance、turn usage 和
+  rebuilt `ToolCallIndex` 全结构一致；额外断言 head 落入 compacted cover 时只渲染可见 raw
+  prefix、不泄漏未来摘要或未来 Turn，redo 后 artifact rendering 恢复，fork child 不继承父
+  summary/父 suffix，父子后续推进互相隔离且共享历史 id 不变。
+- 新增 `pending_snapshot_rejection_can_be_followed_by_cancel_commit_or_discard_then_restore`：
+  覆盖 active partial snapshot 拒绝后 `CancelDisposition::DiscardTurn` 成功回到 committed
+  consistency point，以及 open tool call snapshot 拒绝后 `CancelDisposition::commit_turn` 合成
+  `ToolStatus::Cancelled` result、追加 final assistant 并成功 commit；两条路径随后均可 snapshot、
+  rows rebuild、restore，并保持 partial 不落入 committed effective view。
+- 验证通过：`cargo fmt --all`；`cargo test conversation::persistence -- --nocapture`
+  （18 passed）；`cargo clippy --all-targets -- -D warnings`；1800 秒硬上限内
+  `cargo test --all --all-targets`（287 个库测试与 3 个离线集成测试 passed、7 ignored、
+  0 failed，所有 example targets passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
+  `git diff --check`。
 
 ### M5-R [TODO] Milestone 5 Review
 
