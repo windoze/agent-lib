@@ -23,8 +23,9 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 
 pub use cursor::{
-    ApprovalCursor, CancelRecoveryCursor, CancelRecoveryReason, DoneCursor, ErrorCursor,
-    LoopCursor, LoopCursorKind, LoopDoneReason, StepCursor, ToolWaitCursor,
+    ApprovalCursor, CancelRecoveryCursor, CancelRecoveryReason, CursorRequirement, DoneCursor,
+    ErrorCursor, LoopCursor, LoopCursorKind, LoopDoneReason, StepCursor, ToolWaitCursor,
+    ToolWaitRequirements,
 };
 pub use queue::{
     PivotSource, QueuedPivot, QueuedReconfig, ReconfigQueue, ReconfigRequest, ToolSetPatch,
@@ -563,6 +564,12 @@ pub enum AgentStateError {
     #[error("tool call id {call_id} appears more than once in the cursor")]
     DuplicateToolCall {
         /// Repeated tool-call identity.
+        call_id: ToolCallId,
+    },
+    /// A tool-wait cursor's requirement binding did not cover the tool-call set exactly.
+    #[error("tool call id {call_id} is not consistently bound to a requirement in the cursor")]
+    ToolRequirementMismatch {
+        /// Tool-call identity that is unbound or bound without an awaited call.
         call_id: ToolCallId,
     },
     /// A pivot attempted to inject a non-user message.

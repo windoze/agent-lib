@@ -338,7 +338,7 @@ StepInput) -> StepOutcome`,纯、同步、无 async。现有 `AgentInput`(`event
   (较上一轮 375 +5 为本任务新增,网络用例 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
   通过;`git diff --check` 干净。
 
-### [TODO] M2-2 `LoopCursor` 升格为整台机器的可序列化状态
+### [DONE] M2-2 `LoopCursor` 升格为整台机器的可序列化状态
 
 **前置依赖**:M2-1。
 
@@ -368,7 +368,48 @@ StepInput) -> StepOutcome`,纯、同步、无 async。现有 `AgentInput`(`event
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check`。
 
-### [TODO] M2-3 抽出 LLM step:`NeedLlm` 与通知产出
+**完成记录**:
+
+- **设计决策(requirement 寻址在 stage-0 为可选)**:legacy `DefaultAgentLoop` 直接 await IO、
+  不 reify requirement,也没有 `RequirementIds` 供给器(默认 `NoRequirementIds` 会报错,强注入
+  会破坏所有 legacy 测试)。迁移原则要求 M1–M3 legacy 仍可编译可测,故 cursor 的 requirement
+  绑定为 `Option`:legacy/测试传 `None`,未来 sans-io 机器(M2-3/M2-4)传 `Some(..)` 并在其测试
+  断言可读回 id。这是对“新旧路径并存”的忠实建模,**非**弱化不变量(新机器强不变量在 M2-3/M2-4
+  强制)。`AgentPath` 阶段 0 恒为根,但类型随绑定一起就位,避免阶段 4 改签名。
+- **新增类型(`src/agent/state/cursor.rs`)**:
+  - `CursorRequirement { id: RequirementId, origin: AgentPath }`(单 requirement 绑定,Step/Approval
+    用);构造器 `new(id, origin)`/`root(id)`,访问器 `id()`(Copy 返回值)/`origin()`;origin
+    `#[serde(default, skip_serializing_if = "AgentPath::is_root")]`,根路径不落 wire。
+  - `ToolWaitRequirements { origin: AgentPath, ids: BTreeMap<ToolCallId, RequirementId> }`(一批 tool
+    requirement 绑定,共享 origin);`new`/`root`/`origin()`/`ids()`/`get(call_id)`。
+- **cursor 结构升格(字段私有 + 受检构造器 + serde)**:
+  - `StepCursor { step_id, requirement: Option<CursorRequirement> }` + `requirement()`/`requirement_id()`。
+  - `ToolWaitCursor { step_id, tool_call_ids, requirements: Option<ToolWaitRequirements> }` + `requirements()`。
+  - `ApprovalCursor { step_id, tool_call_id, requirement: Option<CursorRequirement> }` +
+    `requirement()`/`requirement_id()`。
+  - 三处 Option 绑定均 `skip_serializing_if = "Option::is_none"`,故既有 `AgentState` snapshot wire
+    shape 不变(legacy cursor 不新增字段,旧快照仍可反序列化)。
+- **构造器更新(任务点名)**:`LoopCursor::streaming_step(step_id, Option<CursorRequirement>)`、
+  `awaiting_tool(step_id, tool_call_ids, Option<ToolWaitRequirements>)`、
+  `awaiting_approval(step_id, tool_call_id, Option<CursorRequirement>)`。保留既有校验(空 tool set、
+  重复 call id);新增:`requirements` 为 `Some` 时其 map 键集必须与 `tool_call_ids` 集合**完全一致**
+  (缺失或多余都拒),新增 `AgentStateError::ToolRequirementMismatch { call_id }`。
+- **读回未决登记**:`LoopCursor::pending_requirement_ids(&self) -> Vec<RequirementId>`
+  (StreamingStep→step 绑定 id;AwaitingTool→map values;AwaitingApproval→approval 绑定 id;其余空),
+  供 driver 跨进程恢复重建未决登记表。
+- **调用点更新**:legacy `default.rs` 四处(streaming_step/awaiting_tool×2/awaiting_approval)传 `None`;
+  `machine.rs` `#[cfg(test)] FakeMachine` 传 `None`;`state/tests.rs` 既有 cursor 单测更新签名。live
+  handle(`AgentRuntimeHandles`)仍在机器 serde 之外(既有 `runtime_handles_are_kept_outside_agent_state_serde`
+  断言不变);模块 rustdoc 写明 cursor 现为“整台机器可序列化状态”核心与 live handle 边界。
+- **导出**:`state.rs` 与 `agent/mod.rs` 追加 `CursorRequirement`、`ToolWaitRequirements`。
+- **聚焦测试(state,+8 全绿)**:streaming/approval/awaiting_tool 带 `RequirementId`/`AgentPath` 的 serde
+  round-trip、root origin 省略 wire 且默认回根、legacy 无绑定省略、`pending_requirement_ids` 读回集合、
+  tool 绑定不覆盖 call 集(缺失/多余)双向拒 `ToolRequirementMismatch`、requirement-free cursor 报空、
+  `AgentState` 携升格 cursor 端到端 round-trip。
+- **验证**:`cargo fmt --all` 通过;`cargo clippy --all-targets -- -D warnings` 通过;
+  `cargo test --lib agent::state`(21 passed,含 8 新);`cargo test --all --all-targets`
+  (lib 388 passed / 0 failed,较 M2-1 的 380 +8;网络用例 ignored);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过;`git diff --check` 干净。
 
 **前置依赖**:M2-2。
 

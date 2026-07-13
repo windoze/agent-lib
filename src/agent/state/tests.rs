@@ -1,11 +1,12 @@
 use super::{
-    AgentRuntimeHandles, AgentState, AgentStateError, LoopCursor, LoopCursorKind, LoopDoneReason,
-    PivotSource, QueuedPivot, QueuedReconfig, ReconfigRequest, ToolSetPatch,
+    AgentRuntimeHandles, AgentState, AgentStateError, CursorRequirement, LoopCursor,
+    LoopCursorKind, LoopDoneReason, PivotSource, QueuedPivot, QueuedReconfig, ReconfigRequest,
+    ToolSetPatch, ToolWaitRequirements,
 };
 use crate::{
     agent::{
-        AgentId, LoopPolicy, ModelRef, SkillId, StepId, ToolFailurePolicy, ToolSetId, ToolSetRef,
-        WorktreeRef,
+        AgentId, AgentPath, AgentSlot, LoopPolicy, ModelRef, RequirementId, SkillId, StepId,
+        ToolFailurePolicy, ToolSetId, ToolSetRef, WorktreeRef,
     },
     client::Response,
     conversation::{
@@ -55,6 +56,22 @@ fn tool_call_id() -> crate::conversation::ToolCallId {
     "018f0d9c-7b6a-7c12-8f31-1234567890d5"
         .parse()
         .expect("tool call id")
+}
+
+fn tool_call_id_2() -> crate::conversation::ToolCallId {
+    "018f0d9c-7b6a-7c12-8f31-1234567890e9"
+        .parse()
+        .expect("second tool call id")
+}
+
+fn requirement_id(offset: u8) -> RequirementId {
+    format!("018f0d9c-7b6a-7c12-8f31-1234567890c{offset:x}")
+        .parse()
+        .expect("requirement id")
+}
+
+fn non_root_origin() -> AgentPath {
+    AgentPath::from_slots(vec![AgentSlot::new(2), AgentSlot::new(7)])
 }
 
 fn message_id(offset: u8) -> MessageId {
@@ -152,7 +169,7 @@ fn agent_state_serde_round_trips_through_conversation_snapshot() {
         })
         .expect("queue reconfig");
     state
-        .transition_cursor(LoopCursor::streaming_step(step_id()))
+        .transition_cursor(LoopCursor::streaming_step(step_id(), None))
         .expect("start streaming step");
 
     let encoded = serde_json::to_value(&state).expect("serialize agent state");
@@ -236,7 +253,7 @@ fn duplicate_active_skills_are_rejected() {
 #[test]
 fn illegal_cursor_transition_is_rejected() {
     let mut state = AgentState::new(spec(), committed_conversation());
-    let awaiting_tool = LoopCursor::awaiting_tool(step_id(), vec![tool_call_id()])
+    let awaiting_tool = LoopCursor::awaiting_tool(step_id(), vec![tool_call_id()], None)
         .expect("valid awaiting-tool cursor");
 
     let error = state
@@ -252,13 +269,13 @@ fn illegal_cursor_transition_is_rejected() {
     );
 
     state
-        .transition_cursor(LoopCursor::streaming_step(step_id()))
+        .transition_cursor(LoopCursor::streaming_step(step_id(), None))
         .expect("idle can start streaming");
     state
         .transition_cursor(LoopCursor::done(LoopDoneReason::Completed))
         .expect("streaming can finish");
     let terminal_error = state
-        .transition_cursor(LoopCursor::streaming_step(step_id()))
+        .transition_cursor(LoopCursor::streaming_step(step_id(), None))
         .expect_err("terminal cursor cannot restart unchecked");
     assert_eq!(
         terminal_error,
@@ -271,12 +288,13 @@ fn illegal_cursor_transition_is_rejected() {
 
 #[test]
 fn awaiting_tool_cursor_requires_non_empty_unique_calls() {
-    let empty =
-        LoopCursor::awaiting_tool(step_id(), Vec::new()).expect_err("empty tool wait must fail");
+    let empty = LoopCursor::awaiting_tool(step_id(), Vec::new(), None)
+        .expect_err("empty tool wait must fail");
     assert_eq!(empty, AgentStateError::EmptyToolWait);
 
-    let duplicate = LoopCursor::awaiting_tool(step_id(), vec![tool_call_id(), tool_call_id()])
-        .expect_err("duplicate call ids must fail");
+    let duplicate =
+        LoopCursor::awaiting_tool(step_id(), vec![tool_call_id(), tool_call_id()], None)
+            .expect_err("duplicate call ids must fail");
     assert_eq!(
         duplicate,
         AgentStateError::DuplicateToolCall {
@@ -459,4 +477,158 @@ fn state_json_has_expected_top_level_data_shape() {
     assert_eq!(keys, vec!["conversation", "loop_cursor", "spec"]);
     assert_eq!(encoded["loop_cursor"], json!({"state": "idle"}));
     assert_eq!(encoded["active_skills"], Value::Null);
+}
+
+#[test]
+fn streaming_step_cursor_round_trips_requirement_binding() {
+    let cursor = LoopCursor::streaming_step(
+        step_id(),
+        Some(CursorRequirement::new(requirement_id(1), non_root_origin())),
+    );
+
+    let encoded = serde_json::to_value(&cursor).expect("serialize streaming cursor");
+    assert_eq!(encoded["state"], json!("streaming_step"));
+    assert_eq!(
+        encoded["data"]["requirement"]["id"],
+        json!(requirement_id(1).to_string())
+    );
+    assert_eq!(encoded["data"]["requirement"]["origin"], json!([2, 7]));
+
+    let decoded: LoopCursor =
+        serde_json::from_value(encoded).expect("deserialize streaming cursor");
+    assert_eq!(decoded, cursor);
+    assert_eq!(decoded.pending_requirement_ids(), vec![requirement_id(1)]);
+}
+
+#[test]
+fn root_requirement_origin_is_omitted_from_wire() {
+    let cursor =
+        LoopCursor::streaming_step(step_id(), Some(CursorRequirement::root(requirement_id(2))));
+
+    let encoded = serde_json::to_value(&cursor).expect("serialize rooted cursor");
+    assert!(encoded["data"]["requirement"].get("origin").is_none());
+
+    let decoded: LoopCursor = serde_json::from_value(encoded).expect("deserialize rooted cursor");
+    assert_eq!(decoded, cursor);
+    assert!(
+        match &decoded {
+            LoopCursor::StreamingStep(step) =>
+                step.requirement().expect("bound").origin().is_root(),
+            _ => false,
+        },
+        "restored origin defaults to root"
+    );
+}
+
+#[test]
+fn legacy_streaming_step_cursor_omits_requirement() {
+    let cursor = LoopCursor::streaming_step(step_id(), None);
+    let encoded = serde_json::to_value(&cursor).expect("serialize legacy cursor");
+    assert!(encoded["data"].get("requirement").is_none());
+    assert!(cursor.pending_requirement_ids().is_empty());
+
+    let decoded: LoopCursor = serde_json::from_value(encoded).expect("deserialize legacy cursor");
+    assert_eq!(decoded, cursor);
+}
+
+#[test]
+fn awaiting_tool_cursor_round_trips_requirement_ids() {
+    let mut ids = std::collections::BTreeMap::new();
+    ids.insert(tool_call_id(), requirement_id(3));
+    ids.insert(tool_call_id_2(), requirement_id(4));
+    let cursor = LoopCursor::awaiting_tool(
+        step_id(),
+        vec![tool_call_id(), tool_call_id_2()],
+        Some(ToolWaitRequirements::root(ids)),
+    )
+    .expect("valid awaiting-tool cursor");
+
+    let encoded = serde_json::to_value(&cursor).expect("serialize awaiting-tool cursor");
+    let decoded: LoopCursor =
+        serde_json::from_value(encoded).expect("deserialize awaiting-tool cursor");
+    assert_eq!(decoded, cursor);
+
+    let mut pending = decoded.pending_requirement_ids();
+    pending.sort();
+    assert_eq!(pending, vec![requirement_id(3), requirement_id(4)]);
+}
+
+#[test]
+fn awaiting_tool_requirement_binding_must_cover_call_set() {
+    let mut ids = std::collections::BTreeMap::new();
+    ids.insert(tool_call_id(), requirement_id(3));
+    let missing = LoopCursor::awaiting_tool(
+        step_id(),
+        vec![tool_call_id(), tool_call_id_2()],
+        Some(ToolWaitRequirements::root(ids)),
+    )
+    .expect_err("missing binding for a call must fail");
+    assert_eq!(
+        missing,
+        AgentStateError::ToolRequirementMismatch {
+            call_id: tool_call_id_2(),
+        }
+    );
+
+    let mut extra = std::collections::BTreeMap::new();
+    extra.insert(tool_call_id(), requirement_id(3));
+    extra.insert(tool_call_id_2(), requirement_id(4));
+    let stray = LoopCursor::awaiting_tool(
+        step_id(),
+        vec![tool_call_id()],
+        Some(ToolWaitRequirements::root(extra)),
+    )
+    .expect_err("binding for an unawaited call must fail");
+    assert_eq!(
+        stray,
+        AgentStateError::ToolRequirementMismatch {
+            call_id: tool_call_id_2(),
+        }
+    );
+}
+
+#[test]
+fn awaiting_approval_cursor_round_trips_requirement_binding() {
+    let cursor = LoopCursor::awaiting_approval(
+        step_id(),
+        tool_call_id(),
+        Some(CursorRequirement::root(requirement_id(5))),
+    );
+
+    let encoded = serde_json::to_value(&cursor).expect("serialize approval cursor");
+    let decoded: LoopCursor = serde_json::from_value(encoded).expect("deserialize approval cursor");
+    assert_eq!(decoded, cursor);
+    assert_eq!(decoded.pending_requirement_ids(), vec![requirement_id(5)]);
+}
+
+#[test]
+fn requirement_free_cursors_report_no_pending_requirements() {
+    assert!(LoopCursor::Idle.pending_requirement_ids().is_empty());
+    assert!(
+        LoopCursor::done(LoopDoneReason::Completed)
+            .pending_requirement_ids()
+            .is_empty()
+    );
+    let cursor = LoopCursor::awaiting_tool(step_id(), vec![tool_call_id()], None)
+        .expect("legacy awaiting-tool cursor");
+    assert!(cursor.pending_requirement_ids().is_empty());
+}
+
+#[test]
+fn agent_state_round_trips_streaming_cursor_requirement() {
+    let mut state = AgentState::new(spec(), committed_conversation());
+    state
+        .transition_cursor(LoopCursor::streaming_step(
+            step_id(),
+            Some(CursorRequirement::new(requirement_id(6), non_root_origin())),
+        ))
+        .expect("start streaming step");
+
+    let encoded = serde_json::to_value(&state).expect("serialize agent state");
+    let decoded: AgentState = serde_json::from_value(encoded).expect("deserialize agent state");
+    assert_eq!(decoded.loop_cursor(), state.loop_cursor());
+    assert_eq!(
+        decoded.loop_cursor().pending_requirement_ids(),
+        vec![requirement_id(6)]
+    );
 }

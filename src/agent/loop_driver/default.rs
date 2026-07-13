@@ -500,7 +500,7 @@ impl LoopRuntime {
 
         let request = {
             let mut state = lock_agent_state(&self.state)?;
-            state.transition_cursor(LoopCursor::streaming_step(step_id))?;
+            state.transition_cursor(LoopCursor::streaming_step(step_id, None))?;
             let tool_registry = self.active_tool_registry()?;
             build_chat_request(&state, tool_registry.as_ref(), stream)
         };
@@ -654,7 +654,11 @@ impl LoopRuntime {
                     });
                 }
 
-                state.transition_cursor(LoopCursor::awaiting_tool(prepared.step_id, call_ids)?)?;
+                state.transition_cursor(LoopCursor::awaiting_tool(
+                    prepared.step_id,
+                    call_ids,
+                    None,
+                )?)?;
                 Ok(AssistantStepOutcome::ToolCalls(invocations))
             }
         }
@@ -738,7 +742,7 @@ impl LoopRuntime {
         call_ids: Vec<ToolCallId>,
     ) -> Result<(), AgentError> {
         let mut state = lock_agent_state(&self.state)?;
-        state.transition_cursor(LoopCursor::awaiting_tool(step_id, call_ids)?)?;
+        state.transition_cursor(LoopCursor::awaiting_tool(step_id, call_ids, None)?)?;
         Ok(())
     }
 
@@ -990,6 +994,7 @@ impl ToolBatchSegment {
                 state.transition_cursor(LoopCursor::awaiting_approval(
                     prepared_tool.step_id,
                     prepared_tool.invocation.call_id,
+                    None,
                 ))?;
             }
             self.waiting = Some(PendingApproval {

@@ -264,7 +264,7 @@ mod tests {
         fn step(&mut self, input: StepInput) -> StepOutcome {
             match input {
                 StepInput::External(_) => {
-                    self.cursor = LoopCursor::streaming_step(step_id());
+                    self.cursor = LoopCursor::streaming_step(step_id(), None);
                     StepOutcome::new(
                         vec![started_notification()],
                         vec![need_tool_requirement()],
