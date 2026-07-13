@@ -19,7 +19,10 @@
 //! raw/debug/persistence facts. [`Projection`] is a non-destructive overlay on
 //! raw history: its spans cover complete Turn ranges checked through
 //! [`CheckedTurnRange`], compacted spans point at provenance-carrying
-//! [`Artifact`] values, and raw messages remain unchanged.
+//! [`Artifact`] values, [`Conversation::effective_view`] renders a head-clipped
+//! Client-ready committed context, and [`Conversation::pending_context`] keeps
+//! frozen pending payloads separate from active partials. Raw messages remain
+//! unchanged.
 
 pub mod boundary;
 pub mod config;
@@ -47,7 +50,8 @@ pub use pending::{
     PendingTurnPhase, ToolCallMapping,
 };
 pub use projection::{
-    Artifact, ArtifactProvenance, CheckedTurnRange, Projection, Span, StrategyRef, TokenAccounting,
+    Artifact, ArtifactProvenance, CheckedTurnRange, EffectiveView, PendingContext, Projection,
+    Span, StrategyRef, TokenAccounting,
 };
 pub use turn::{ToolPairing, Turn, TurnMeta, TurnResponseMeta};
 

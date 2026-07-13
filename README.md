@@ -21,7 +21,9 @@ revert/redo，移动只裁剪当前有效视图和派生 index scope，不删除
 `ForkOrigin` 的 child Conversation，O(1) 共享 immutable prefix，父子随后独立推进；
 `Projection`/`Span`/`Artifact` 已作为 raw history 上的非破坏性 overlay 数据模型接入，
 `CheckedTurnRange` 会把 Boundary 解析为可按 Turn anchor 重验证的稳定覆盖范围，默认
-projection 为当前 head 以内的 all-raw spans。
+projection 为当前 head 以内的 all-raw spans；`effective_view` 会输出 Client-ready 的
+system prompt 与投影后完整消息，并在 head 落入 compacted cover 时回退 raw 前缀以防摘要
+泄漏未来 Turn，pending 中已冻结的完整消息只能通过单独 `pending_context` 显式取得。
 已完成的 Client 层实施记录见
 [`docs/archive/2026-07-13-client-layer/TODO.md`](docs/archive/2026-07-13-client-layer/TODO.md)；
 当前 Conversation Core 阶段计划和任务见 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。
@@ -46,10 +48,11 @@ projection 为当前 head 以内的 all-raw spans。
   `raw_turns` 分别公开有效前缀、可 redo lineage 和 retained raw 分支的只读视图；`fork_at`
   记录 `ForkOrigin`，共享 fork 点祖先，并让 child 拥有自己的 boundary owner、version 与
   raw/debug 可见范围；`Projection`、`Span`、`Artifact` 与 `CheckedTurnRange` 提供受检
-  projection 覆盖范围、artifact provenance 和 token accounting，raw history 不因 overlay
-  改写。
+  projection 覆盖范围、artifact provenance 和 token accounting；`effective_view` 渲染
+  committed projection，`pending_context` 单独暴露已冻结 pending payload，raw history 不因
+  overlay 或视图生成而改写。
 
-Conversation Core 正按任务顺序继续实现 effective view、compaction apply 与
+Conversation Core 正按任务顺序继续实现 compaction apply、strategy/trigger 扩展点与
 持久化；Agent loop、Tool registry 与多 agent 编排仍不在范围内。完整设计和当前阶段
 计划分别见 [`DESIGN.md`](DESIGN.md) 与 [`PLAN.md`](PLAN.md)。
 

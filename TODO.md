@@ -890,7 +890,7 @@ artifact 必须带 provenance；运行时 Boundary version token 不能未经解
   0 failed，所有 example targets passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
   `git diff --check`。
 
-### M4-2 [TODO] `effective_view`、head clipping 与 pending 隔离
+### M4-2 [DONE] `effective_view`、head clipping 与 pending 隔离
 
 **前置依赖**：M4-1。
 
@@ -919,6 +919,31 @@ head 为上界；若 revert 落进一个 compacted cover，不能使用包含未
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、effective view
   聚焦测试、`cargo test --all --all-targets`、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增并导出 `EffectiveView` 与 `PendingContext`；`Conversation::effective_view()` 现在单列
+  system prompt，并把 committed projection 渲染为有序完整 Client `Message` payload。视图生成
+  只在 Client-request 边界 clone payload，不暴露或修改 `ConversationMessage` identity、
+  pairing、raw Turn storage 或 projection facts。
+- `effective_view` 遍历当前 projection spans 并以 logical head 为上界：Raw span 渲染 head
+  以内 raw Turn messages；完整位于 head 前的 Compacted span 渲染 artifact messages；当 head
+  落入 compacted cover 内时，该可见前缀自动回退 raw Turns，避免摘要包含 head 后未来 Turn。
+  redo 到完整 cover 后会再次使用 artifact；zero head 与 fork child ceiling 都只渲染各自可见
+  范围。
+- 新增 `Conversation::pending_context()`，committed `effective_view` 永不包含 pending；调用方
+  需要 in-flight 上下文时必须显式读取 pending context。该 context 只返回 pending 中已冻结的
+  完整 payload（包括 user、已冻结 assistant/tool messages），active `PendingMessage`
+  accumulator、partial text/reasoning/tool JSON 始终不可见。
+- 新增 6 个 M4-2 聚焦回归，覆盖纯 raw 默认 projection、raw+compacted+raw、多个 compacted
+  tier、zero head、head 在 compacted span 前/内/后、revert→redo、fork child ceiling，以及
+  pending ready/active-streaming partial 隔离；同步更新 README、crate rustdoc 与
+  conversation 模块 rustdoc。阶段顺序与完成标准未变化，故未修改 `PLAN.md`。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test conversation::projection -- --nocapture`（14 passed）；1800 秒硬上限内
+  `cargo test --all --all-targets`（258 个库测试与 3 个离线集成测试 passed、7 ignored、
+  0 failed，所有 example targets passed）；`cargo test --doc`（1 个正向与 10 个 compile-fail
+  passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
 ### M4-3 [TODO] 原子 `apply_compaction` 与 tiered/consolidated 更新
 

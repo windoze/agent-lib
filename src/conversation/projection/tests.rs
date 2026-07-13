@@ -16,6 +16,7 @@ use crate::{
         normalized::StopReason,
         usage::Usage,
     },
+    stream::{BlockId, BlockKind, Delta, StreamEvent},
 };
 use serde_json::{Map, json};
 use uuid::Uuid;
@@ -133,6 +134,10 @@ fn artifact(
     .expect("valid artifact")
 }
 
+fn install_projection(conversation: &mut Conversation, projection: Projection) {
+    conversation.projection = projection;
+}
+
 fn range(conversation: &Conversation, start_index: usize, end_index: usize) -> CheckedTurnRange {
     let boundaries = conversation.valid_boundaries();
     conversation
@@ -158,6 +163,352 @@ fn forged_range(
             after_turn: end_after_turn,
         },
     }
+}
+
+fn message_labels(messages: &[Message]) -> Vec<(Role, String)> {
+    messages
+        .iter()
+        .map(|message| {
+            let [ContentBlock::Text { text, .. }] = message.content.as_slice() else {
+                panic!("projection test messages contain one text block");
+            };
+            (message.role, text.clone())
+        })
+        .collect()
+}
+
+#[test]
+fn effective_view_renders_system_and_default_raw_history() {
+    let mut conversation = conversation(10);
+
+    let empty = conversation.effective_view();
+    assert_eq!(empty.system(), Some("Project carefully."));
+    assert!(empty.is_empty());
+    assert!(empty.messages().is_empty());
+
+    commit_text_turn(&mut conversation, 101);
+    commit_text_turn(&mut conversation, 102);
+    let view = conversation.effective_view();
+
+    assert_eq!(view.system(), Some("Project carefully."));
+    assert_eq!(view.len(), 4);
+    assert_eq!(
+        message_labels(view.messages()),
+        vec![
+            (Role::User, "question:101".to_owned()),
+            (Role::Assistant, "answer:101".to_owned()),
+            (Role::User, "question:102".to_owned()),
+            (Role::Assistant, "answer:102".to_owned()),
+        ]
+    );
+
+    let (system, messages) = view.into_parts();
+    assert_eq!(system, Some("Project carefully.".to_owned()));
+    assert_eq!(messages.len(), 4);
+}
+
+#[test]
+fn effective_view_uses_artifacts_only_for_complete_compacted_spans() {
+    let mut conversation = conversation(11);
+    commit_text_turn(&mut conversation, 111);
+    commit_text_turn(&mut conversation, 112);
+    commit_text_turn(&mut conversation, 113);
+    commit_text_turn(&mut conversation, 114);
+
+    let first = range(&conversation, 0, 1);
+    let compacted = range(&conversation, 1, 3);
+    let last = range(&conversation, 3, 4);
+    let strategy_v1 = strategy("view-v1");
+    let compacted_artifact = artifact(
+        1110,
+        compacted.clone(),
+        strategy_v1.clone(),
+        "turns 112-113 summary",
+    );
+    let projection = Projection::new(
+        &conversation,
+        vec![
+            Span::raw(first),
+            Span::compacted(compacted, compacted_artifact.id(), strategy_v1),
+            Span::raw(last),
+        ],
+        vec![compacted_artifact],
+    )
+    .expect("projection with a compacted middle span");
+    install_projection(&mut conversation, projection);
+
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::User, "question:111".to_owned()),
+            (Role::Assistant, "answer:111".to_owned()),
+            (Role::Assistant, "turns 112-113 summary".to_owned()),
+            (Role::User, "question:114".to_owned()),
+            (Role::Assistant, "answer:114".to_owned()),
+        ]
+    );
+
+    let boundary_inside_compacted = conversation.valid_boundaries()[2];
+    let redo = conversation
+        .revert_to(boundary_inside_compacted)
+        .expect("move head into the compacted cover")
+        .old_head();
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::User, "question:111".to_owned()),
+            (Role::Assistant, "answer:111".to_owned()),
+            (Role::User, "question:112".to_owned()),
+            (Role::Assistant, "answer:112".to_owned()),
+        ]
+    );
+
+    conversation
+        .revert_to(redo)
+        .expect("redo to the full compacted cover");
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::User, "question:111".to_owned()),
+            (Role::Assistant, "answer:111".to_owned()),
+            (Role::Assistant, "turns 112-113 summary".to_owned()),
+            (Role::User, "question:114".to_owned()),
+            (Role::Assistant, "answer:114".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn effective_view_clips_zero_head_and_multiple_compacted_tiers() {
+    let mut conversation = conversation(12);
+    commit_text_turn(&mut conversation, 121);
+    commit_text_turn(&mut conversation, 122);
+    commit_text_turn(&mut conversation, 123);
+    commit_text_turn(&mut conversation, 124);
+
+    let first = range(&conversation, 0, 1);
+    let middle = range(&conversation, 1, 3);
+    let last = range(&conversation, 3, 4);
+    let first_strategy = strategy("tier-a");
+    let middle_strategy = strategy("tier-b");
+    let first_artifact = artifact(
+        1210,
+        first.clone(),
+        first_strategy.clone(),
+        "turn 121 summary",
+    );
+    let middle_artifact = artifact(
+        1211,
+        middle.clone(),
+        middle_strategy.clone(),
+        "turns 122-123 summary",
+    );
+    let projection = Projection::new(
+        &conversation,
+        vec![
+            Span::compacted(first, first_artifact.id(), first_strategy),
+            Span::compacted(middle, middle_artifact.id(), middle_strategy),
+            Span::raw(last),
+        ],
+        vec![first_artifact, middle_artifact],
+    )
+    .expect("tiered compacted projection");
+    install_projection(&mut conversation, projection);
+
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::Assistant, "turn 121 summary".to_owned()),
+            (Role::Assistant, "turns 122-123 summary".to_owned()),
+            (Role::User, "question:124".to_owned()),
+            (Role::Assistant, "answer:124".to_owned()),
+        ]
+    );
+
+    let boundary_inside_second_tier = conversation.valid_boundaries()[2];
+    conversation
+        .revert_to(boundary_inside_second_tier)
+        .expect("move into second compacted tier");
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::Assistant, "turn 121 summary".to_owned()),
+            (Role::User, "question:122".to_owned()),
+            (Role::Assistant, "answer:122".to_owned()),
+        ]
+    );
+
+    let zero = conversation.valid_boundaries()[0];
+    conversation.revert_to(zero).expect("move to zero head");
+    let zero_view = conversation.effective_view();
+    assert_eq!(zero_view.system(), Some("Project carefully."));
+    assert!(zero_view.messages().is_empty());
+
+    let full_head = conversation.valid_boundaries()[4];
+    conversation
+        .revert_to(full_head)
+        .expect("redo to full head");
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::Assistant, "turn 121 summary".to_owned()),
+            (Role::Assistant, "turns 122-123 summary".to_owned()),
+            (Role::User, "question:124".to_owned()),
+            (Role::Assistant, "answer:124".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn fork_child_effective_view_is_limited_to_child_ceiling() {
+    let mut parent = conversation(13);
+    commit_text_turn(&mut parent, 131);
+    commit_text_turn(&mut parent, 132);
+    commit_text_turn(&mut parent, 133);
+
+    let compacted = range(&parent, 0, 3);
+    let strategy_v1 = strategy("parent-only");
+    let parent_artifact = artifact(
+        1310,
+        compacted.clone(),
+        strategy_v1.clone(),
+        "parent summary including turn 133",
+    );
+    let parent_projection = Projection::new(
+        &parent,
+        vec![Span::compacted(
+            compacted,
+            parent_artifact.id(),
+            strategy_v1,
+        )],
+        vec![parent_artifact],
+    )
+    .expect("parent full projection");
+    install_projection(&mut parent, parent_projection);
+
+    let child = parent
+        .fork_at(parent.valid_boundaries()[2], conversation_id(1300))
+        .expect("fork at the second turn");
+
+    assert_eq!(
+        message_labels(child.effective_view().messages()),
+        vec![
+            (Role::User, "question:131".to_owned()),
+            (Role::Assistant, "answer:131".to_owned()),
+            (Role::User, "question:132".to_owned()),
+            (Role::Assistant, "answer:132".to_owned()),
+        ]
+    );
+    assert!(
+        !message_labels(child.effective_view().messages())
+            .iter()
+            .any(|(_, text)| text.contains("133") || text.contains("parent summary"))
+    );
+}
+
+#[test]
+fn pending_context_is_explicit_and_never_includes_active_partial() {
+    let mut conversation = conversation(14);
+    commit_text_turn(&mut conversation, 141);
+    assert!(conversation.pending_context().is_none());
+
+    begin_pending(&mut conversation, 142);
+    assert_eq!(
+        message_labels(
+            conversation
+                .pending_context()
+                .expect("pending context exists")
+                .messages()
+        ),
+        vec![(Role::User, "pending".to_owned())]
+    );
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::User, "question:141".to_owned()),
+            (Role::Assistant, "answer:141".to_owned()),
+        ]
+    );
+
+    conversation
+        .start_assistant()
+        .expect("start streaming assistant");
+    let block_id = BlockId::new("partial-text");
+    conversation
+        .push_assistant_event(StreamEvent::MessageStart {
+            role: Role::Assistant,
+        })
+        .expect("message start");
+    conversation
+        .push_assistant_event(StreamEvent::BlockStart {
+            id: block_id.clone(),
+            kind: BlockKind::Text,
+        })
+        .expect("block start");
+    conversation
+        .push_assistant_event(StreamEvent::BlockDelta {
+            id: block_id,
+            delta: Delta::Text("partial should stay hidden".to_owned()),
+        })
+        .expect("partial delta");
+
+    let active_context = conversation
+        .pending_context()
+        .expect("pending context still exists");
+    assert_eq!(active_context.len(), 1);
+    assert_eq!(
+        message_labels(active_context.messages()),
+        vec![(Role::User, "pending".to_owned())]
+    );
+    assert!(
+        !message_labels(active_context.messages())
+            .iter()
+            .any(|(_, text)| text.contains("partial"))
+    );
+}
+
+#[test]
+fn frozen_pending_messages_only_appear_through_pending_context() {
+    let mut conversation = conversation(15);
+    commit_text_turn(&mut conversation, 151);
+    begin_pending(&mut conversation, 152);
+    conversation
+        .start_assistant_response(Response {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![text("pending final answer")],
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::normalize("end_turn"),
+            extra: Map::new(),
+        })
+        .expect("start complete assistant");
+    conversation
+        .finish_assistant(message_id(1521))
+        .expect("freeze final assistant");
+
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::User, "question:151".to_owned()),
+            (Role::Assistant, "answer:151".to_owned()),
+        ]
+    );
+    let pending_context = conversation
+        .pending_context()
+        .expect("ready pending still has an explicit context");
+    assert_eq!(
+        message_labels(pending_context.messages()),
+        vec![
+            (Role::User, "pending".to_owned()),
+            (Role::Assistant, "pending final answer".to_owned()),
+        ]
+    );
+    assert_eq!(
+        pending_context.into_messages().len(),
+        2,
+        "owned Client payloads can be appended explicitly by the caller"
+    );
 }
 
 #[test]

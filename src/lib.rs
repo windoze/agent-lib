@@ -38,7 +38,10 @@
 //!   [`conversation::Projection`] spans describe raw or compacted complete-Turn
 //!   ranges; [`conversation::CheckedTurnRange`] stores stable Turn anchors so
 //!   restored overlay data can be revalidated without trusting old Boundary
-//!   versions.
+//!   versions. [`conversation::Conversation::effective_view`] renders the
+//!   head-clipped committed projection into Client-ready system/messages, while
+//!   [`conversation::Conversation::pending_context`] exposes only frozen pending
+//!   payloads through an explicit separate view.
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are deliberately outside this crate. Those layers should persist and replay

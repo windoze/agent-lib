@@ -11,11 +11,101 @@ pub use artifact::{Artifact, ArtifactProvenance, StrategyRef, TokenAccounting};
 use super::{
     ArtifactId, Boundary, Conversation, ConversationError, ConversationId, ProjectionError, TurnId,
 };
+use crate::model::message::Message;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
 };
+
+/// Client-ready committed view rendered from system configuration plus projection.
+///
+/// The view owns cloned provider-neutral [`Message`] payloads so callers can
+/// move it directly into a Client request without gaining access to
+/// Conversation message identities or mutable raw history.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EffectiveView {
+    system: Option<String>,
+    messages: Vec<Message>,
+}
+
+impl EffectiveView {
+    /// Creates a view from already-rendered Client payloads.
+    fn new(system: Option<String>, messages: Vec<Message>) -> Self {
+        Self { system, messages }
+    }
+
+    /// Returns the system instructions kept outside committed message history.
+    #[must_use]
+    pub fn system(&self) -> Option<&str> {
+        self.system.as_deref()
+    }
+
+    /// Returns the projected complete Client messages in request order.
+    #[must_use]
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Reports whether no committed messages are visible.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// Returns the number of projected complete Client messages.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Consumes the view into Client-request fields.
+    #[must_use]
+    pub fn into_parts(self) -> (Option<String>, Vec<Message>) {
+        (self.system, self.messages)
+    }
+}
+
+/// Frozen pending messages that can be appended to an effective view explicitly.
+///
+/// Active stream/non-stream partials remain hidden inside
+/// [`PendingTurn`](crate::conversation::PendingTurn); this context only owns
+/// cloned payloads that have already crossed a complete freeze boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PendingContext {
+    messages: Vec<Message>,
+}
+
+impl PendingContext {
+    /// Creates a context from frozen pending payloads.
+    fn new(messages: Vec<Message>) -> Self {
+        Self { messages }
+    }
+
+    /// Returns the complete frozen pending Client messages in turn order.
+    #[must_use]
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Reports whether the pending turn has no frozen messages.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// Returns the number of frozen pending Client messages.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Consumes the context into owned Client messages.
+    #[must_use]
+    pub fn into_messages(self) -> Vec<Message> {
+        self.messages
+    }
+}
 
 /// One stable Turn-boundary endpoint without a structural version.
 ///
@@ -306,6 +396,67 @@ impl Conversation {
         &self.projection
     }
 
+    /// Renders committed history into Client-ready system and message fields.
+    ///
+    /// Rendering is capped at the current logical head. Raw spans clone the
+    /// underlying Client payloads from immutable Turns; complete compacted
+    /// spans clone their artifact messages. If the head falls inside a
+    /// compacted cover, that visible prefix is rendered as raw Turns instead,
+    /// so a summary that also covers future Turns is never exposed early.
+    #[must_use]
+    pub fn effective_view(&self) -> EffectiveView {
+        let system = self.config.system().map(ToOwned::to_owned);
+        let mut messages = Vec::new();
+        let active_len = self.history.active_len();
+        let lineage_len = self.history.lineage_len();
+        let lineage_turns = self.history.lineage_turns();
+
+        for span in self.projection.spans() {
+            let (start, end) = span_bounds(span.range(), lineage_len);
+            if start >= active_len {
+                break;
+            }
+
+            let visible_end = end.min(active_len);
+            match span {
+                Span::Raw { .. } => {
+                    extend_raw_messages(&mut messages, &lineage_turns[start..visible_end]);
+                }
+                Span::Compacted { artifact, .. } if end <= active_len => {
+                    let artifact = self
+                        .projection
+                        .artifact(*artifact)
+                        .expect("validated projection compacted span references an artifact");
+                    messages.extend(artifact.messages().iter().cloned());
+                }
+                Span::Compacted { .. } => {
+                    extend_raw_messages(&mut messages, &lineage_turns[start..visible_end]);
+                }
+            }
+        }
+
+        EffectiveView::new(system, messages)
+    }
+
+    /// Returns frozen pending messages without exposing the active partial.
+    ///
+    /// The committed [`effective_view`](Self::effective_view) intentionally
+    /// excludes pending state. Callers that need to build an in-flight context
+    /// can append this context explicitly; it contains only complete frozen
+    /// payloads from the current pending turn, never the active accumulator.
+    #[must_use]
+    pub fn pending_context(&self) -> Option<PendingContext> {
+        self.pending.as_ref().map(|pending| {
+            PendingContext::new(
+                pending
+                    .messages()
+                    .iter()
+                    .map(|message| message.payload().clone())
+                    .collect(),
+            )
+        })
+    }
+
     /// Creates a stable checked range from two current complete-Turn boundaries.
     ///
     /// The resulting value omits the boundary structural version and stores
@@ -454,6 +605,28 @@ fn endpoint_from_turns(turns: &[super::Turn], position: usize) -> RangeEndpoint 
         .and_then(|index| turns.get(index))
         .map(super::Turn::id);
     RangeEndpoint::new(turn_count, after_turn)
+}
+
+/// Resolves stored span endpoints against an addressable lineage length.
+fn span_bounds(range: &CheckedTurnRange, lineage_len: usize) -> (usize, usize) {
+    let start =
+        usize::try_from(range.start_turn_count()).expect("checked projection start fits in memory");
+    let end =
+        usize::try_from(range.end_turn_count()).expect("checked projection end fits in memory");
+
+    debug_assert!(start <= end);
+    debug_assert!(end <= lineage_len);
+    (start, end)
+}
+
+/// Appends raw Turn payloads without exposing their Conversation identities.
+fn extend_raw_messages(messages: &mut Vec<Message>, turns: &[super::Turn]) {
+    messages.extend(
+        turns
+            .iter()
+            .flat_map(super::Turn::messages)
+            .map(|message| message.payload().clone()),
+    );
 }
 
 /// Converts an in-memory length to the stable serialized width.
