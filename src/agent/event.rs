@@ -13,7 +13,9 @@
 use crate::{
     agent::{
         AgentStateError, ApprovalError, BudgetError, RunContextError, StepId, TraceNodeId,
-        state::QueuedPivot, tool::ToolRuntimeError,
+        requirement::{AgentPath, RequirementKindTag},
+        state::QueuedPivot,
+        tool::ToolRuntimeError,
     },
     client::ClientError,
     conversation::{Boundary, ConversationError, MessageId, ToolCallId, TurnId},
@@ -778,6 +780,8 @@ pub enum AgentErrorKind {
     Tool,
     /// Tool approval policy or responder handling failed.
     Approval,
+    /// A requirement reached the top scope with no handler to fulfill it.
+    UnhandledRequirement,
     /// The failure did not fit a more specific category.
     Other,
 }
@@ -852,6 +856,18 @@ pub enum AgentError {
     /// Approval runtime operation failed.
     #[error("approval operation failed: {0}")]
     Approval(#[from] ApprovalError),
+    /// A requirement popped past the top scope with no handler to fulfill it.
+    ///
+    /// The scope chain must be *total* at its root: a headless driver that omits
+    /// (for example) an interaction handler turns any deep interaction request
+    /// into this classified error at start-up rather than a silent hang.
+    #[error("no handler for `{kind}` requirement at the top scope (origin: {origin:?})")]
+    UnhandledRequirement {
+        /// Requirement family that reached the top scope unhandled.
+        kind: RequirementKindTag,
+        /// Path of the machine that emitted the requirement.
+        origin: AgentPath,
+    },
     /// A loop implementation returned an uncategorized failure.
     #[error("agent runtime error: {0}")]
     Other(String),
@@ -874,6 +890,7 @@ impl AgentError {
             Self::State(_) => AgentErrorKind::AgentState,
             Self::Tool(_) => AgentErrorKind::Tool,
             Self::Approval(_) => AgentErrorKind::Approval,
+            Self::UnhandledRequirement { .. } => AgentErrorKind::UnhandledRequirement,
             Self::Other(_) => AgentErrorKind::Other,
         }
     }

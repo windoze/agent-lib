@@ -705,7 +705,7 @@ re-export `HandlerScope`/`LlmHandler`/`ToolHandler`/`InteractionHandler`/`Subage
 (414 lib + 8 integration = 422 passed / 0 failed,较 M2-R 基线 +5 新测试,网络用例 ignored);
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --check`(clean)。
 
-### [TODO] M3-2 `drain` 参考实现与 pop 路由
+### [DONE] M3-2 `drain` 参考实现与 pop 路由
 
 **前置依赖**:M3-1。
 
@@ -731,6 +731,42 @@ re-export `HandlerScope`/`LlmHandler`/`ToolHandler`/`InteractionHandler`/`Subage
   `UnhandledRequirement`;handler 自身 perform 同类 requirement 时不回到自身(用两层 scope
   构造并断言);一批 requirement 并发兑现、乱序回灌结果一致。
 - 运行全套命令。
+
+**完成记录**:
+
+`src/agent/drive.rs` 在 M3-1 的 trait 之上新增 §6 机制层的 drain/pop 参考实现,从 `agent/mod.rs`
+以 `drain` / `Pop` / `ScopePop` / `TurnDone` 公开 re-export。
+
+- **`AgentError::UnhandledRequirement { kind: RequirementKindTag, origin: AgentPath }`**
+  (+ `AgentErrorKind::UnhandledRequirement`,`event.rs`):requirement 冒泡到顶层仍无 handler
+  时的分类错误(顶层 scope 必须 total,§4.3),`kind()` 已接线。
+- **`trait Pop`(`#[async_trait]`,`Send`)**:`pop(&mut self, requirement, ctx) ->
+  Result<RequirementResult, AgentError>`,向外层转交一个 requirement 并取回其结果。
+- **`struct ScopePop<'a> { scope, parent }` impl `Pop`**:把"外层 drain"表示成 pop 目标——
+  先用本外层 scope 兑现,兜不了再向自身 parent 继续 pop,故 popped requirement **绝不回到
+  它 pop 出来的那层**(§7.3 即时环防护)。
+- **`pub async fn drain<M: AgentMachine + ?Sized>(machine, input, scope, parent, ctx) ->
+  Result<TurnDone, AgentError>`**:喂 `External(input)` 后循环——每步收集 `Notification`,对
+  本步 requirement 批:本层能兜的用 `FuturesUnordered` **并发兑现、按完成顺序** `Resume`(决策
+  B),兜不了的顺序 pop 给 parent;`RequirementKind::accepts` 校验返回家族对齐(错则
+  `AgentError::Other`),直至 `pending` 空且 cursor ∈ {Done, Error} 返回 `TurnDone`。
+- **`struct TurnDone { notifications, cursor }`**:一趟 drain 的通知汇总 + 终态 cursor
+  (阶段 2 直接透传通知,§12 决策 C)。
+- **范围边界**:真正包装 `LlmClient`/`ToolRegistry`/`ToolApprovalPolicy` 的公共参考 driver +
+  复跑 50 集成测试归 M3-3;`SubagentHandler` 实现(唯一 scope-deepening,§7.2)归 M5。
+- **聚焦测试(`#[cfg(test)]`,新增 5 个,合计 10)**:`BatchMachine` fake 机器一次吐一批、按 id
+  路由乱序 resume;`drain_fulfills_locally_without_popping`(本层兑现不冒泡)、
+  `drain_pops_to_parent_when_local_scope_lacks_handler`(本层无→pop 到 parent 兑现)、
+  `drain_top_scope_without_handler_is_unhandled_requirement`(顶层无→`UnhandledRequirement`,
+  断言 kind/origin)、`pop_starts_from_outer_scope_skipping_the_emitter`(§4.4/§7.3:headless
+  内层无 interaction→pop 到 attended 外层兑现,内层不回灌)、
+  `drain_resolves_a_concurrent_batch_out_of_order`(三 `NeedTool` 按 delay 反序完成,按完成
+  顺序 resume,结果按 id 一致、机器 Done)。
+
+**验证命令(全绿)**:`cargo fmt --all`(clean);`cargo clippy --all-targets -- -D warnings`
+(clean);`cargo test --lib agent::drive`(10 passed);`cargo test --all --all-targets`
+(419 lib + 8 integration = 427 passed / 0 failed,较 M3-1 基线 +5 新测试,网络用例 ignored);
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --check`(clean)。
 
 ### [TODO] M3-3 参考 driver：复跑现有 loop 集成测试
 

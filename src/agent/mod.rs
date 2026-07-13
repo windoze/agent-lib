@@ -31,7 +31,10 @@ pub use context::{
     BudgetUsage, CancellationToken, RunContext, RunContextError, TraceError, TraceHandle,
     TraceNodeId, TraceNodeKind, TraceRecord,
 };
-pub use drive::{HandlerScope, InteractionHandler, LlmHandler, SubagentHandler, ToolHandler};
+pub use drive::{
+    HandlerScope, InteractionHandler, LlmHandler, Pop, ScopePop, SubagentHandler, ToolHandler,
+    TurnDone, drain,
+};
 pub use event::{
     AgentError, AgentErrorKind, AgentEvent, AgentFailure, AgentInput, AgentOutcome,
     AgentOutcomeKind, AgentUserInput, ApprovalRequest, BudgetExhaustedOutcome,
