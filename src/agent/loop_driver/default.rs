@@ -62,7 +62,7 @@ pub enum LlmStepMode {
 }
 
 impl LlmStepMode {
-    const fn request_stream_flag(self) -> bool {
+    pub(crate) const fn request_stream_flag(self) -> bool {
         matches!(self, Self::Streaming)
     }
 }
@@ -502,7 +502,7 @@ impl LoopRuntime {
             let mut state = lock_agent_state(&self.state)?;
             state.transition_cursor(LoopCursor::streaming_step(step_id, None))?;
             let tool_registry = self.active_tool_registry()?;
-            build_chat_request(&state, tool_registry.as_ref(), stream)
+            crate::agent::request::build_chat_request(&state, tool_registry.declarations(), stream)
         };
 
         if let Err(error) = self.context.charge_step() {
@@ -1518,41 +1518,6 @@ fn approval_response_for_decision(
         }],
         status,
         extra: Map::new(),
-    }
-}
-
-fn build_chat_request(
-    state: &AgentState,
-    tool_registry: &dyn ToolRegistry,
-    stream: bool,
-) -> ChatRequest {
-    let effective = state.conversation().effective_view();
-    let (system, mut messages) = effective.into_parts();
-    if let Some(pending) = state.conversation().pending_context() {
-        messages.extend(pending.into_messages());
-    }
-    let model = state.current_model();
-
-    ChatRequest {
-        model: model.model().to_owned(),
-        messages,
-        tools: tool_registry.declarations(),
-        system: combine_system_prompt(
-            system.or_else(|| state.spec().system_prompt().map(ToOwned::to_owned)),
-            state.system_prompt_overlay(),
-        ),
-        max_tokens: model.max_tokens().get(),
-        temperature: model.temperature(),
-        stream,
-        provider_extras: model.provider_extras().cloned(),
-    }
-}
-
-fn combine_system_prompt(base: Option<String>, overlay: Option<&str>) -> Option<String> {
-    match (base, overlay) {
-        (Some(base), Some(overlay)) => Some(format!("{base}\n\n{overlay}")),
-        (None, Some(overlay)) => Some(overlay.to_owned()),
-        (base, None) => base,
     }
 }
 

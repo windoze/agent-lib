@@ -15,6 +15,7 @@ pub mod id;
 pub mod interaction;
 pub mod loop_driver;
 pub mod machine;
+mod request;
 pub mod requirement;
 pub mod spec;
 pub mod state;
@@ -43,7 +44,7 @@ pub use loop_driver::{
     AgentEventStream, AgentFeedGuard, AgentFeedPermit, AgentLoop, BoxAgentEventStream,
     BoxAgentLoop, DefaultAgentLoop, LlmStepMode,
 };
-pub use machine::{AgentMachine, StepInput, StepOutcome};
+pub use machine::{AgentMachine, DefaultAgentMachine, StepInput, StepOutcome};
 pub use requirement::{
     AgentPath, AgentSlot, AgentSpecRef, NoRequirementIds, Requirement, RequirementError,
     RequirementId, RequirementIds, RequirementKind, RequirementKindTag, RequirementResolution,

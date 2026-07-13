@@ -16,11 +16,11 @@
 //!
 //! # What this module defines
 //!
-//! This is the Stage-1 type skeleton (migration doc §2): the [`AgentMachine`]
-//! trait plus the [`StepInput`] / [`StepOutcome`] data boundaries. Concrete
-//! `step` logic for the LLM and tool paths lands in later milestones (M2-3 /
-//! M2-4), and elevating the machine's own serializable state onto
-//! [`LoopCursor`] lands in M2-2.
+//! This module defines the [`AgentMachine`] trait plus the [`StepInput`] /
+//! [`StepOutcome`] data boundaries (migration doc §2), and the concrete
+//! [`DefaultAgentMachine`] that implements the sans-io LLM step: a text-only
+//! turn advances `begin_turn → NeedLlm → fold Response → commit → quiescent`
+//! (M2-3). The tool-execution and interaction paths land in M2-4.
 //!
 //! # Persistence boundary
 //!
@@ -35,6 +35,10 @@ use crate::agent::{
     AgentInput, LoopCursor, Notification, Requirement, RequirementId, RequirementResolution,
 };
 use serde::{Deserialize, Serialize};
+
+mod default;
+
+pub use default::DefaultAgentMachine;
 
 /// A pure Agent state machine: it advances state and requests IO without doing
 /// IO, and without `async`.

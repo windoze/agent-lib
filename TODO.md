@@ -411,7 +411,7 @@ StepInput) -> StepOutcome`,纯、同步、无 async。现有 `AgentInput`(`event
   (lib 388 passed / 0 failed,较 M2-1 的 380 +8;网络用例 ignored);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过;`git diff --check` 干净。
 
-### [TODO] M2-3 抽出 LLM step:`NeedLlm` 与 text-only turn 折叠
+### [DONE] M2-3 抽出 LLM step:`NeedLlm` 与 text-only turn 折叠
 
 **前置依赖**:M2-2。
 
@@ -444,6 +444,57 @@ StepInput) -> StepOutcome`,纯、同步、无 async。现有 `AgentInput`(`event
 - 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦 machine 测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check`。
+
+**完成记录**:
+
+- **结构性修复(前置)**:M2-3 的标题行 `### [TODO] M2-3 …` 在 `TODO.md`(含 HEAD)中丢失,
+  任务正文完好夹在 M2-2 完成记录与 M2-4 之间,使 M2-3 不可见为"第一个未完成任务"。按"任务条目
+  本身错误须结构性修复"的例外先补回标题(commit `[M2-3] Restore dropped M2-3 heading …`),再实现。
+- **可复用请求构造(class-wide 重构)**:新增 `src/agent/request.rs`,把 `build_chat_request` +
+  `combine_system_prompt` 从 `loop_driver/default.rs` 抽出为 `pub(crate)`;签名由 `&dyn ToolRegistry`
+  改为数据 `Vec<Tool>`(sans-io 机器传 `state.current_tool_set().tools()`,legacy loop 传
+  `tool_registry.declarations()`),使纯机器无需持 live registry 即可构造 `ChatRequest`。
+  `LlmStepMode::request_stream_flag` 提升为 `pub(crate)`;`agent/mod.rs` 加私有 `mod request;`
+  (后代模块可见)。default.rs 删除两个本地函数并改调共享版本,legacy 行为不变。
+- **模块化**:`git mv src/agent/machine.rs → src/agent/machine/mod.rs`(trait `AgentMachine`/
+  `StepInput`/`StepOutcome` 与既有 FakeMachine 契约测试留 mod.rs);新增 `src/agent/machine/default.rs`
+  承载具体机器与其纯测试。`machine/mod.rs` 追加 `mod default; pub use default::DefaultAgentMachine;`,
+  `agent/mod.rs` 追加导出 `DefaultAgentMachine`。
+- **`DefaultAgentMachine`(sans-io,text-only turn)**:字段 `state: AgentState`、`mode: LlmStepMode`、
+  `requirement_ids: Arc<dyn RequirementIds>`(唯一非序列化字段,与 `ToolExecutionIds` 同一"库不造 id"
+  边界)、`pending_assistant_message_id: Option<MessageId>`(mirror 现有 `PreparedAssistantCall` 的
+  assistant id:cursor 只记 `RequirementId`,折叠所需的 caller 供给 assistant id 在单个在飞 step 内暂存)。
+  `step` 分派:
+  - `External(UserMessage)`:`requirement_ids.next(Llm)` 取 id → `begin_turn` →
+    `build_chat_request(state, current_tool_set().tools(), mode.stream_flag)` → cursor
+    `StreamingStep(step_id, Some(CursorRequirement::root(id)))` → 记 assistant id → 吐单个
+    `NeedLlm { request, mode }`,`quiescent=true`,无通知。
+  - `Resume(Llm(Ok(response)))`:校验 cursor=`StreamingStep` 且 `resolution.id` 与 cursor 记的
+    `RequirementId` 一致 → `start_assistant_response` + `finish_assistant(assistant_id)`;
+    `ReadyToCommit` → `commit_pending(TurnMeta::default())` → boundary=`conversation().head()` →
+    cursor `Done(Completed)` → 吐 `Notification::StepBoundary`,quiescent 无 requirement。
+  - `Resume(Llm(Err(e)))`:分类错误 → cursor `Error`(discard pending),quiescent。
+  - `fail(msg)` 助手:`cancel_pending(DiscardTurn)` 清 pending → cursor→`Error`(best-effort)→
+    清 assistant id → 返回 quiescent 空 outcome(`step` 无 `Result`,运行期失败以 Error cursor 表达)。
+- **tool 分支未实现(留 M2-4,占位处理已写明)**:`finish_assistant` 返回 `RequiresToolCallMappings`
+  (即 response 含 tool call)时,machine **不** 静默跳过,而是 `fail("tool orchestration is not
+  implemented until M2-4")`——明确的分类错误 + discard pending。M2-4 将在此接 `NeedTool`/`NeedInteraction`。
+  同理 `External(Pivot)`/legacy `QueuedPivotTurn`/`Resume(ResumeInput)`/`Abandon` 均分类为
+  "M4 实现"错误,不默默无视(遵守"无 workaround、不静默跳过")。
+- **决策 D(streaming delta tee)本任务不做**:文本折叠统一走 `Resume` 的完整 `Response`;streaming
+  模式仅体现在 `NeedLlm.mode = Streaming` 且 `request.stream = true`,delta 的 `Notification::Llm`
+  由未来 driver 从兑现里透传(migration §3.1 决策 D),不在纯机器内合成。
+- **聚焦测试(纯,无 tokio,+8 全绿)**:`External(UserMessage)` 吐 `NeedLlm`(id/root origin、
+  request.model/max_tokens/messages、mode、stream 标志)、cursor `StreamingStep`、
+  `pending_requirement_ids` 读回该 id;`Resume(Llm(Ok(text)))` → cursor `Done`、committed history
+  追加 assistant message(user/assistant 两条)、吐 `StepBoundary(step_id)`、quiescent 无 requirement;
+  `Resume(Llm(Err))` → cursor `Error` 且 pending 被 discard;`Resume` id 不匹配 → Error;
+  `Resume` 结果类型不符(Interaction)→ Error;tool-use response → Error(未实现,pending discard);
+  streaming 模式 → `request.stream=true`;Idle 直接 `Resume` → Error。
+- **验证**:`cargo fmt --all`(clean);`cargo clippy --all-targets -- -D warnings`(clean,含折叠
+  `collapsible_if`);`cargo test --lib agent::machine`(13 passed:8 新 default + 5 既有 mod);
+  `cargo test --all --all-targets`(lib 396 passed / 0 failed,较 M2-2 的 388 +8;网络用例 ignored);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --check`(clean)。
 
 ### [TODO] M2-4 抽出 tool step:`NeedTool` 与 `NeedInteraction`
 
