@@ -4,9 +4,9 @@ use super::{CONVERSATION_SNAPSHOT_SCHEMA_VERSION, ConversationSnapshot};
 use crate::{
     client::Response,
     conversation::{
-        AssistantFinish, Conversation, ConversationConfig, ConversationError, ConversationId,
-        MessageId, PendingTurnPhase, Projection, SnapshotError, Span, ToolCallId, ToolCallIndex,
-        ToolCallMapping, Turn, TurnId, TurnMeta,
+        AssistantFinish, CommitError, Conversation, ConversationConfig, ConversationError,
+        ConversationId, MessageId, PendingTurnPhase, Projection, ProjectionError, RestoreError,
+        SnapshotError, Span, ToolCallId, ToolCallIndex, ToolCallMapping, Turn, TurnId, TurnMeta,
         projection::{
             Artifact, ArtifactProvenance, CheckedTurnRange, CompactionPlan, CompactionStep,
             StrategyRef, TokenAccounting,
@@ -363,6 +363,29 @@ fn json_keys_do_not_contain_runtime_objects(value: &Value) {
     }
 }
 
+fn snapshot_json(conversation: &Conversation) -> Value {
+    serde_json::to_value(conversation.snapshot().expect("committed snapshot"))
+        .expect("snapshot JSON")
+}
+
+fn restore_error_from_json(value: Value) -> RestoreError {
+    let snapshot: ConversationSnapshot =
+        serde_json::from_value(value).expect("corrupted snapshot remains data-shaped");
+    match Conversation::restore(snapshot).expect_err("restore rejects corrupted snapshot") {
+        ConversationError::Restore(error) => error,
+        other => panic!("expected restore error, got {other:?}"),
+    }
+}
+
+fn assert_snapshot_deserialize_rejected(value: Value) {
+    let error =
+        serde_json::from_value::<ConversationSnapshot>(value).expect_err("snapshot shape rejects");
+    assert!(
+        !error.to_string().is_empty(),
+        "serde rejection should keep a useful diagnostic"
+    );
+}
+
 #[test]
 fn linear_snapshot_round_trips_and_records_each_fact_once() {
     let mut conversation = conversation(1);
@@ -406,6 +429,305 @@ fn linear_snapshot_round_trips_and_records_each_fact_once() {
     let decoded: ConversationSnapshot =
         serde_json::from_value(json).expect("snapshot serde round trip");
     assert_eq!(decoded, snapshot);
+}
+
+#[test]
+fn restore_round_trips_json_and_rebuilds_runtime_index() {
+    let mut conversation = conversation(9);
+    commit_text_turn(&mut conversation, 90);
+    commit_tool_turn(&mut conversation, 91, "call-restore", 990);
+    let before = runtime_state(&conversation);
+
+    let encoded = serde_json::to_string(&conversation.snapshot().expect("snapshot"))
+        .expect("serialize snapshot");
+    let decoded: ConversationSnapshot =
+        serde_json::from_str(&encoded).expect("deserialize snapshot");
+    let restored = Conversation::restore(decoded).expect("restore snapshot");
+
+    assert_eq!(runtime_state(&restored), before);
+    assert_eq!(restored.id(), conversation.id());
+    assert_eq!(restored.config(), conversation.config());
+    assert_eq!(restored.origin(), conversation.origin());
+    assert!(restored.pending().is_none());
+    assert_eq!(restored.effective_view(), conversation.effective_view());
+    assert_eq!(
+        restored.tool_call_index(),
+        &ToolCallIndex::rebuild(restored.turns(), restored.pending())
+    );
+
+    let try_from_restored =
+        Conversation::try_from(conversation.snapshot().expect("snapshot")).expect("try_from");
+    assert_eq!(runtime_state(&try_from_restored), before);
+}
+
+#[test]
+fn restore_preserves_fork_origin_reverted_head_and_compacted_projection() {
+    let mut parent = conversation(10);
+    commit_text_turn(&mut parent, 100);
+    commit_text_turn(&mut parent, 101);
+    commit_text_turn(&mut parent, 102);
+
+    let fork_point = parent.valid_boundaries()[2];
+    let mut child = parent
+        .fork_at(fork_point, conversation_id(10_000))
+        .expect("fork child");
+    commit_tool_turn(&mut child, 103, "call-child-restore", 9_103);
+
+    let covers = range(&child, 0, 2);
+    let produced_by = strategy("restore-v1");
+    let artifact = summary_artifact(
+        &child,
+        covers.clone(),
+        10_400,
+        produced_by.clone(),
+        "summary:100-101",
+    );
+    let plan = CompactionPlan::new(
+        &child,
+        vec![CompactionStep::raw(
+            covers.clone(),
+            artifact.id(),
+            produced_by.clone(),
+        )],
+        vec![artifact],
+    );
+    child
+        .apply_compaction(&plan)
+        .expect("compact inherited prefix");
+    child
+        .revert_to(child.valid_boundaries()[1])
+        .expect("revert inside compacted span before snapshot");
+
+    let before = runtime_state(&child);
+    let snapshot = child.snapshot().expect("reverted compacted snapshot");
+    assert_eq!(snapshot.origin().expect("origin").fork_point(), fork_point);
+    assert_eq!(snapshot.history().head_turn_count(), 1);
+    assert_eq!(snapshot.history().fork_ceiling_turn_count(), 3);
+    assert_eq!(snapshot.projection().artifacts().len(), 1);
+
+    let restored = Conversation::restore(snapshot).expect("restore reverted compacted child");
+    assert_eq!(runtime_state(&restored), before);
+    assert_eq!(restored.origin(), child.origin());
+    assert_eq!(restored.projection(), child.projection());
+    assert_eq!(restored.effective_view(), child.effective_view());
+}
+
+#[test]
+fn restore_rejects_schema_duplicate_ids_and_invalid_turn_facts() {
+    let mut conversation = conversation(11);
+    commit_text_turn(&mut conversation, 110);
+    commit_text_turn(&mut conversation, 111);
+    let value = snapshot_json(&conversation);
+
+    let mut bad_schema = value.clone();
+    bad_schema["schema_version"] = json!(CONVERSATION_SNAPSHOT_SCHEMA_VERSION + 1);
+    assert!(matches!(
+        restore_error_from_json(bad_schema),
+        RestoreError::UnsupportedSchemaVersion {
+            path,
+            expected: CONVERSATION_SNAPSHOT_SCHEMA_VERSION,
+            actual,
+        } if path == "$.schema_version" && actual == CONVERSATION_SNAPSHOT_SCHEMA_VERSION + 1
+    ));
+
+    let mut duplicate_turn = value.clone();
+    let first_turn = duplicate_turn["history"]["raw_turns"][0].clone();
+    duplicate_turn["history"]["raw_turns"]
+        .as_array_mut()
+        .expect("raw turn array")
+        .push(first_turn);
+    assert!(matches!(
+        restore_error_from_json(duplicate_turn),
+        RestoreError::DuplicateRawTurnId { path, turn_id: duplicate_id }
+            if path == "$.history.raw_turns[2].id" && duplicate_id == turn_id(110)
+    ));
+
+    let mut invalid_turn = value;
+    invalid_turn["history"]["raw_turns"][0]["messages"][0]["payload"]["role"] = json!("assistant");
+    assert!(matches!(
+        restore_error_from_json(invalid_turn),
+        RestoreError::InvalidTurn {
+            path,
+            source: CommitError::InvalidStartState {
+                first_role: Some(Role::Assistant),
+            },
+        } if path == "$.history.raw_turns[0]"
+    ));
+}
+
+#[test]
+fn restore_rejects_missing_and_cyclic_parents() {
+    let mut conversation = conversation(12);
+    commit_text_turn(&mut conversation, 120);
+    commit_text_turn(&mut conversation, 121);
+    let value = snapshot_json(&conversation);
+
+    let missing_parent_id = turn_id(12_999);
+    let mut missing_parent = value.clone();
+    missing_parent["history"]["raw_turns"][1]["parent"] = json!(missing_parent_id);
+    assert!(matches!(
+        restore_error_from_json(missing_parent),
+        RestoreError::MissingParent {
+            path,
+            turn_id: restored_turn_id,
+            parent,
+        } if path == "$.history.raw_turns[1].parent"
+            && restored_turn_id == turn_id(121)
+            && parent == missing_parent_id
+    ));
+
+    let mut cycle = value;
+    cycle["history"]["raw_turns"][0]["parent"] = json!(turn_id(121));
+    cycle["history"]["raw_turns"][1]["parent"] = json!(turn_id(120));
+    assert!(matches!(
+        restore_error_from_json(cycle),
+        RestoreError::ParentCycle { path, turn_id: cycle_turn_id }
+            if path == "$.history.raw_turns[0].parent" && cycle_turn_id == turn_id(120)
+    ));
+}
+
+#[test]
+fn restore_rejects_bad_lineage_head_and_fork_origin() {
+    let mut base = conversation(13);
+    commit_text_turn(&mut base, 130);
+    commit_text_turn(&mut base, 131);
+    let value = snapshot_json(&base);
+
+    let unknown_lineage_id = turn_id(13_999);
+    let mut unknown_lineage = value.clone();
+    unknown_lineage["history"]["lineage_turns"][1] = json!(unknown_lineage_id);
+    assert!(matches!(
+        restore_error_from_json(unknown_lineage),
+        RestoreError::UnknownLineageTurn { path, turn_id }
+            if path == "$.history.lineage_turns[1]" && turn_id == unknown_lineage_id
+    ));
+
+    let mut bad_head = value;
+    bad_head["history"]["head_turn_count"] = json!(3);
+    assert!(matches!(
+        restore_error_from_json(bad_head),
+        RestoreError::HeadOutOfRange {
+            path,
+            head: 3,
+            fork_ceiling: 2,
+        } if path == "$.history.head_turn_count"
+    ));
+
+    let mut parent = conversation(14);
+    commit_text_turn(&mut parent, 140);
+    commit_text_turn(&mut parent, 141);
+    let child = parent
+        .fork_at(parent.valid_boundaries()[2], conversation_id(14_000))
+        .expect("fork child");
+    let child_value = snapshot_json(&child);
+
+    let mut self_parent = child_value.clone();
+    self_parent["origin"]["parent"] = json!(child.id());
+    assert!(matches!(
+        restore_error_from_json(self_parent),
+        RestoreError::ForkOriginSelfParent {
+            path,
+            conversation_id,
+        } if path == "$.origin.parent" && conversation_id == child.id()
+    ));
+
+    let mut wrong_owner = child_value.clone();
+    let wrong_parent = conversation_id(14_001);
+    wrong_owner["origin"]["fork_point"]["conversation_id"] = json!(wrong_parent);
+    assert!(matches!(
+        restore_error_from_json(wrong_owner),
+        RestoreError::ForkPointOwnerMismatch {
+            path,
+            expected,
+            actual,
+        } if path == "$.origin.fork_point.conversation_id"
+            && expected == parent.id()
+            && actual == wrong_parent
+    ));
+
+    let mut wrong_anchor = child_value;
+    wrong_anchor["origin"]["fork_point"]["after_turn"] = json!(turn_id(140));
+    assert!(matches!(
+        restore_error_from_json(wrong_anchor),
+        RestoreError::ForkPointAnchorMismatch {
+            path,
+            turn_count: 2,
+            expected,
+            actual,
+        } if path == "$.origin.fork_point.after_turn"
+            && expected == Some(turn_id(141))
+            && actual == Some(turn_id(140))
+    ));
+}
+
+#[test]
+fn restore_rejects_projection_mismatches_and_derived_snapshot_fields() {
+    let mut conversation = conversation(15);
+    commit_text_turn(&mut conversation, 150);
+    commit_text_turn(&mut conversation, 151);
+    commit_text_turn(&mut conversation, 152);
+
+    let covers = range(&conversation, 0, 2);
+    let produced_by = strategy("projection-corruption");
+    let artifact = summary_artifact(
+        &conversation,
+        covers.clone(),
+        15_000,
+        produced_by.clone(),
+        "summary:150-151",
+    );
+    let plan = CompactionPlan::new(
+        &conversation,
+        vec![CompactionStep::raw(covers, artifact.id(), produced_by)],
+        vec![artifact],
+    );
+    conversation
+        .apply_compaction(&plan)
+        .expect("apply compacted projection");
+    let value = snapshot_json(&conversation);
+
+    let mut wrong_owner = value.clone();
+    let wrong_projection_owner = conversation_id(15_999);
+    wrong_owner["projection"]["spans"][0]["covers"]["conversation_id"] =
+        json!(wrong_projection_owner);
+    wrong_owner["projection"]["artifacts"][0]["provenance"]["input_range"]["conversation_id"] =
+        json!(wrong_projection_owner);
+    assert!(matches!(
+        restore_error_from_json(wrong_owner),
+        RestoreError::InvalidProjection {
+            path,
+            source: ProjectionError::RangeOwnerMismatch { .. },
+        } if path == "$.projection"
+    ));
+
+    let mut wrong_anchor = value.clone();
+    wrong_anchor["projection"]["spans"][0]["covers"]["end"]["after_turn"] = json!(turn_id(150));
+    wrong_anchor["projection"]["artifacts"][0]["provenance"]["input_range"]["end"]["after_turn"] =
+        json!(turn_id(150));
+    assert!(matches!(
+        restore_error_from_json(wrong_anchor),
+        RestoreError::InvalidProjection {
+            path,
+            source: ProjectionError::RangeAnchorMismatch { .. },
+        } if path == "$.projection"
+    ));
+
+    let mut overlap = value.clone();
+    overlap["projection"]["spans"][1]["turns"]["start"]["turn_count"] = json!(1);
+    assert_snapshot_deserialize_rejected(overlap);
+
+    let mut missing_artifact = value.clone();
+    missing_artifact["projection"]["artifacts"] = json!([]);
+    assert_snapshot_deserialize_rejected(missing_artifact);
+
+    let mut wrong_covers = value.clone();
+    wrong_covers["projection"]["artifacts"][0]["provenance"]["input_range"]["end"]["turn_count"] =
+        json!(1);
+    assert_snapshot_deserialize_rejected(wrong_covers);
+
+    let mut derived_field = value;
+    derived_field["tool_call_index"] = json!({ "entries": [] });
+    assert_snapshot_deserialize_rejected(derived_field);
 }
 
 #[test]

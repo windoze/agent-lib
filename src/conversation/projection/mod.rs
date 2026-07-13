@@ -641,6 +641,22 @@ impl Conversation {
 
         Ok(position)
     }
+
+    /// Revalidates a snapshot-restored projection against the addressable lineage.
+    ///
+    /// Normal projection construction checks complete coverage of the current
+    /// logical head. A valid snapshot may have been taken after a revert, where
+    /// the stored overlay still covers redo suffix turns beyond the head and
+    /// `effective_view` clips rendering. Restore therefore validates owner,
+    /// anchors, ordering, artifacts, and complete coverage of the restored
+    /// lineage ceiling.
+    pub(crate) fn validate_restored_projection(
+        &self,
+        projection: &Projection,
+    ) -> Result<(), ProjectionError> {
+        let artifact_index = validate_artifacts_for_lineage(self, projection.artifacts())?;
+        validate_spans_for_lineage(self, projection.spans(), &artifact_index)
+    }
 }
 
 /// Builds an endpoint from a materialized active-lineage slice.
@@ -818,6 +834,28 @@ fn validate_artifacts<'a>(
     Ok(index)
 }
 
+/// Checks artifact facts against the complete addressable lineage during restore.
+fn validate_artifacts_for_lineage<'a>(
+    conversation: &Conversation,
+    artifacts: &'a [Artifact],
+) -> Result<HashMap<ArtifactId, &'a Artifact>, ProjectionError> {
+    let mut seen = HashSet::new();
+    let mut index = HashMap::new();
+
+    for artifact in artifacts {
+        artifact.validate_messages()?;
+        if !seen.insert(artifact.id()) {
+            return Err(ProjectionError::DuplicateArtifactId {
+                artifact_id: artifact.id(),
+            });
+        }
+        conversation.resolve_range_against_lineage(artifact.provenance().input_range())?;
+        index.insert(artifact.id(), artifact);
+    }
+
+    Ok(index)
+}
+
 /// Checks serde-restored projection facts that do not need a Conversation.
 fn validate_projection_shape(
     spans: &[Span],
@@ -953,6 +991,150 @@ fn validate_spans(
     }
 
     Ok(())
+}
+
+/// Checks restored spans over the complete addressable lineage.
+fn validate_spans_for_lineage(
+    conversation: &Conversation,
+    spans: &[Span],
+    artifacts: &HashMap<ArtifactId, &Artifact>,
+) -> Result<(), ProjectionError> {
+    let mut expected_start = 0usize;
+
+    for span in spans {
+        let resolved = conversation.resolve_range_against_lineage(span.range())?;
+        if resolved.start < expected_start {
+            return Err(ProjectionError::SpanOverlap {
+                expected_start: usize_to_u64(expected_start),
+                actual_start: usize_to_u64(resolved.start),
+            });
+        }
+        if resolved.start > expected_start {
+            return Err(ProjectionError::SpanGap {
+                expected_start: usize_to_u64(expected_start),
+                actual_start: usize_to_u64(resolved.start),
+            });
+        }
+
+        if let Span::Compacted {
+            covers,
+            artifact,
+            produced_by,
+        } = span
+        {
+            let artifact_value =
+                artifacts
+                    .get(artifact)
+                    .ok_or(ProjectionError::MissingArtifact {
+                        artifact_id: *artifact,
+                    })?;
+            if artifact_value.provenance().input_range() != covers {
+                return Err(ProjectionError::ArtifactRangeMismatch {
+                    artifact_id: *artifact,
+                });
+            }
+            if artifact_value.provenance().produced_by() != produced_by {
+                return Err(ProjectionError::ArtifactStrategyMismatch {
+                    artifact_id: *artifact,
+                });
+            }
+        }
+
+        expected_start = resolved.end;
+    }
+
+    let lineage_len = conversation.history.lineage_len();
+    if expected_start != lineage_len {
+        return Err(ProjectionError::IncompleteProjection {
+            expected_end: usize_to_u64(lineage_len),
+            actual_end: usize_to_u64(expected_start),
+        });
+    }
+
+    Ok(())
+}
+
+impl Conversation {
+    /// Resolves one checked range against the complete restored lineage ceiling.
+    fn resolve_range_against_lineage(
+        &self,
+        range: &CheckedTurnRange,
+    ) -> Result<Range<usize>, ProjectionError> {
+        if range.conversation_id != self.id {
+            return Err(ProjectionError::RangeOwnerMismatch {
+                expected: self.id,
+                actual: range.conversation_id,
+            });
+        }
+        if let Some(pending) = &self.pending {
+            return Err(ProjectionError::PendingTurn {
+                turn_id: pending.id(),
+            });
+        }
+        if range.start.turn_count > range.end.turn_count {
+            return Err(ProjectionError::ReversedRange {
+                start: range.start.turn_count,
+                end: range.end.turn_count,
+            });
+        }
+        if range.start.turn_count == range.end.turn_count {
+            return Err(ProjectionError::EmptyRange {
+                turn_count: range.start.turn_count,
+            });
+        }
+
+        let start = self.resolve_lineage_endpoint(range.start)?;
+        let end = self.resolve_lineage_endpoint(range.end)?;
+        debug_assert!(start < end);
+        Ok(start..end)
+    }
+
+    /// Resolves one stored endpoint against the full addressable lineage.
+    fn resolve_lineage_endpoint(&self, endpoint: RangeEndpoint) -> Result<usize, ProjectionError> {
+        let lineage_len = self.history.lineage_len();
+        let lineage_len_u64 = usize_to_u64(lineage_len);
+        if endpoint.turn_count > lineage_len_u64 {
+            return Err(ProjectionError::RangePositionOutOfRange {
+                turn_count: endpoint.turn_count,
+                lineage_turns: lineage_len_u64,
+            });
+        }
+
+        let position = usize::try_from(endpoint.turn_count).map_err(|_| {
+            ProjectionError::RangePositionOutOfRange {
+                turn_count: endpoint.turn_count,
+                lineage_turns: lineage_len_u64,
+            }
+        })?;
+        let expected = position
+            .checked_sub(1)
+            .and_then(|index| self.history.lineage_turns().get(index))
+            .map(super::Turn::id);
+
+        if endpoint.after_turn != expected {
+            if let Some(turn_id) = endpoint.after_turn {
+                if self.history.contains_turn_id(turn_id) {
+                    let on_lineage = self
+                        .history
+                        .lineage_turns()
+                        .iter()
+                        .any(|turn| turn.id() == turn_id);
+                    if !on_lineage {
+                        return Err(ProjectionError::DetachedTurn { turn_id });
+                    }
+                } else {
+                    return Err(ProjectionError::UnknownTurn { turn_id });
+                }
+            }
+            return Err(ProjectionError::RangeAnchorMismatch {
+                turn_count: endpoint.turn_count,
+                expected,
+                actual: endpoint.after_turn,
+            });
+        }
+
+        Ok(position)
+    }
 }
 
 #[cfg(test)]

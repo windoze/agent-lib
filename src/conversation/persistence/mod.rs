@@ -1,9 +1,9 @@
 //! Data-only persistence boundaries for Conversation state.
 //!
-//! Snapshotting is intentionally separate from restore. A
-//! [`ConversationSnapshot`] records committed facts at a consistency point, but
-//! a later restore task must still validate those facts before constructing
-//! live runtime state.
+//! [`ConversationSnapshot`] records committed facts at a consistency point.
+//! Restore revalidates those data facts before constructing live history,
+//! projection, and derived indexes; runtime-only pending state, accumulators,
+//! clients, registries, and strategy objects stay outside the persisted shape.
 
 mod snapshot;
 

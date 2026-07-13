@@ -1182,7 +1182,7 @@ client 与调度属于外部运行时，不能序列化进 Conversation 或把 A
   0 failed，所有 example targets passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
   `git diff --check`。
 
-### M5-2 [TODO] 受检 restore 与派生索引重建
+### M5-2 [DONE] 受检 restore 与派生索引重建
 
 **前置依赖**：M5-1。
 
@@ -1210,6 +1210,38 @@ data snapshot，再验证全部事实和 projection，最后构建 runtime histo
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、restore/corruption
   聚焦测试、`cargo test --all --all-targets`、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增公开 `Conversation::restore(snapshot)` 与 `TryFrom<ConversationSnapshot>`，通过
+  schema-version 分发入口恢复当前 v1 snapshot；未知未来版本明确返回带路径的
+  `RestoreError::UnsupportedSchemaVersion`，不猜测字段含义。`ConversationError` 新增
+  `Restore` 分类，`RestoreError` 覆盖 schema、count、raw Turn id、parent missing/cycle、
+  disconnected raw tree、lineage/head/ceiling、fork origin、Turn validator、projection 与派生
+  index mismatch，所有错误都携带 JSON-like path。
+- restore 不直接反序列化 live `Conversation`/`Turn`。raw `TurnData` 先逐条复用唯一
+  I1--I4 `validate_turn_data` 门，再校验 retained parent graph 存在、无环且属于同一 root，
+  active lineage 的 parent 顺序、head/fork ceiling 和 fork origin boundary owner/anchor；全部
+  通过后才调用 crate-private `History::from_restored` 建立 parent-pointer runtime nodes，恢复
+  logical head、structural version、fork origin，并保证 pending 为空。
+- 新增 projection restore-time 校验，针对完整 addressable lineage/fork ceiling 重新检查 range
+  owner、Turn anchors、artifact messages/provenance、span gap/overlap 和完整覆盖；因此合法的
+  revert/head-clipping snapshot 可恢复，而 owner/anchor/provenance 损坏会在 restore 阶段拒绝。
+  snapshot schema 仍通过 `deny_unknown_fields` 拒绝 `tool_call_index` 等冗余派生字段，restore
+  只从 closed facts 重建 `ToolCallIndex` 并与独立全量 scan 比较，不把派生字段作为事实来源。
+- 新增 restore/corruption 聚焦测试：正向覆盖 snapshot→JSON→snapshot→restore、`TryFrom`、
+  raw/current lineage/head/version/origin/projection/artifacts/effective_view/index 全结构等价，
+  以及 fork child 在 compacted span 内 revert 后的恢复；损坏数据覆盖未知 schema version、
+  duplicate raw Turn id、非法 Turn、missing/cyclic parent、unknown lineage turn、head 越界、
+  fork origin self-parent/owner/anchor 错误、projection owner/anchor 错误、overlap span、
+  missing artifact、错误 covers 和冗余 derived field 拒绝。
+- 同步更新 persistence 与 conversation 模块 rustdoc；阶段计划和依赖结构未变化，故未修改
+  `PLAN.md`。
+- 验证通过：`cargo fmt --all`；`cargo test conversation::persistence -- --nocapture`
+  （12 passed）；`cargo clippy --all-targets -- -D warnings`；30 分钟硬上限内
+  `cargo test --all --all-targets`（281 个库测试与 3 个离线集成测试 passed、7 ignored、
+  0 failed，所有 example targets passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
+  `git diff --check`。
 
 ### M5-3 [TODO] DB-neutral parent-tree row 映射
 

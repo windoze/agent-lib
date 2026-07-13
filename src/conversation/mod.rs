@@ -29,7 +29,9 @@
 //! pending payloads separate from active partials. [`ConversationSnapshot`]
 //! records committed consistency-point facts for persistence without serializing
 //! pending state, derived indexes, shared-memory handles, clients, registries,
-//! or runtime strategy/trigger objects. Raw messages remain unchanged.
+//! or runtime strategy/trigger objects; [`Conversation::restore`] revalidates
+//! those facts before rebuilding runtime history and derived indexes. Raw
+//! messages remain unchanged.
 
 pub mod boundary;
 pub mod config;
@@ -48,7 +50,7 @@ pub use config::ConversationConfig;
 pub use error::{
     BoundaryError, CancelError, CommitError, CompactionError, ContentBlockKind, ConversationError,
     ForkError, PairingMessageKind, PendingMessageError, PendingTurnError, ProjectionError,
-    SnapshotError,
+    RestoreError, SnapshotError,
 };
 pub use history::{ToolCallIndex, ToolCallLocation, ToolCallLocationKind};
 pub use id::{ArtifactId, ConversationId, MessageId, ToolCallId, TurnId};

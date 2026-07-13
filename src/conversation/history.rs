@@ -6,7 +6,7 @@
 //! the raw log retains nodes that are no longer on that lineage.
 
 use crate::conversation::{MessageId, ToolCallId, Turn, TurnId};
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 mod index;
 
@@ -123,6 +123,69 @@ impl History {
             lineage_len,
             active_len: lineage_len,
         })
+    }
+
+    /// Rebuilds runtime history from already-validated persisted facts.
+    ///
+    /// Restore validation owns all semantic checks before calling this helper:
+    /// raw turn identities are unique, every parent exists, parent pointers are
+    /// acyclic, the lineage ids exist, and `active_len <= lineage_turn_ids.len()`.
+    /// This function only recreates the append-only raw scope and addressable
+    /// lineage storage without exposing a second public commit path.
+    pub(crate) fn from_restored(
+        raw_turns: Vec<Turn>,
+        lineage_turn_ids: &[TurnId],
+        active_len: usize,
+    ) -> Self {
+        debug_assert!(active_len <= lineage_turn_ids.len());
+
+        let empty = Arc::new(Lineage::default());
+        let turns_by_id = raw_turns
+            .iter()
+            .cloned()
+            .map(|turn| (turn.id(), turn))
+            .collect::<HashMap<_, _>>();
+        let mut nodes_by_id = HashMap::<TurnId, Arc<HistoryNode>>::new();
+
+        for turn in &raw_turns {
+            build_restored_node(turn.id(), &turns_by_id, &mut nodes_by_id);
+        }
+
+        let mut raw = RawHistory::new(empty);
+        for turn in &raw_turns {
+            let node = nodes_by_id
+                .get(&turn.id())
+                .expect("restore validation made every raw turn node buildable")
+                .clone();
+            raw.append(node);
+        }
+
+        let nodes = lineage_turn_ids
+            .iter()
+            .map(|turn_id| {
+                nodes_by_id
+                    .get(turn_id)
+                    .expect("restore validation made every lineage id a raw turn")
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        let turns = lineage_turn_ids
+            .iter()
+            .map(|turn_id| {
+                turns_by_id
+                    .get(turn_id)
+                    .expect("restore validation made every lineage id a raw turn")
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        let lineage_len = turns.len();
+
+        Self {
+            raw,
+            lineage: Arc::new(Lineage { nodes, turns }),
+            lineage_len,
+            active_len,
+        }
     }
 
     /// Finds a retained raw turn by stable identity, including hidden suffixes.
@@ -290,6 +353,28 @@ impl RawHistory {
 struct RawEntry {
     node: Arc<HistoryNode>,
     previous: Option<Arc<RawEntry>>,
+}
+
+/// Recursively recreates a parent-pointer node from validated turn facts.
+fn build_restored_node(
+    turn_id: TurnId,
+    turns_by_id: &HashMap<TurnId, Turn>,
+    nodes_by_id: &mut HashMap<TurnId, Arc<HistoryNode>>,
+) -> Arc<HistoryNode> {
+    if let Some(node) = nodes_by_id.get(&turn_id) {
+        return node.clone();
+    }
+
+    let turn = turns_by_id
+        .get(&turn_id)
+        .expect("restore validation made every parent reference a raw turn")
+        .clone();
+    let parent = turn
+        .parent()
+        .map(|parent_id| build_restored_node(parent_id, turns_by_id, nodes_by_id));
+    let node = Arc::new(HistoryNode { turn, parent });
+    nodes_by_id.insert(turn_id, node.clone());
+    node
 }
 
 #[cfg(test)]

@@ -906,6 +906,218 @@ pub enum SnapshotError {
     },
 }
 
+/// A versioned snapshot could not be restored into live runtime state.
+///
+/// Restore errors carry a stable JSON-like path so callers can identify the
+/// persisted fact that failed schema, history, turn, origin, projection, or
+/// derived-runtime validation. No live [`Conversation`](super::Conversation)
+/// is produced on any restore error.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum RestoreError {
+    /// The snapshot schema version has no migration or restore handler.
+    #[error("restore rejected {path}: unsupported schema version {actual}, expected {expected}")]
+    UnsupportedSchemaVersion {
+        /// JSON-like path of the rejected field.
+        path: String,
+        /// Version understood by this crate.
+        expected: u32,
+        /// Version found in the snapshot.
+        actual: u32,
+    },
+
+    /// A serialized count cannot fit in this process's address space.
+    #[error("restore rejected {path}: count {value} cannot be represented in memory")]
+    CountOutOfRange {
+        /// JSON-like path of the rejected field.
+        path: String,
+        /// Serialized count value.
+        value: u64,
+    },
+
+    /// Two retained raw turn fact records used the same identity.
+    #[error("restore rejected {path}: duplicate raw turn id {turn_id}")]
+    DuplicateRawTurnId {
+        /// JSON-like path of the duplicate id.
+        path: String,
+        /// Reused turn identity.
+        turn_id: TurnId,
+    },
+
+    /// One retained raw turn points at a parent absent from the snapshot.
+    #[error("restore rejected {path}: turn {turn_id} references missing parent {parent}")]
+    MissingParent {
+        /// JSON-like path of the invalid parent reference.
+        path: String,
+        /// Turn containing the parent reference.
+        turn_id: TurnId,
+        /// Missing parent identity.
+        parent: TurnId,
+    },
+
+    /// Parent pointers form a cycle instead of an immutable tree.
+    #[error("restore rejected {path}: parent cycle reaches turn {turn_id}")]
+    ParentCycle {
+        /// JSON-like path of the cyclic parent reference.
+        path: String,
+        /// Turn where the cycle was detected.
+        turn_id: TurnId,
+    },
+
+    /// A retained raw turn is disconnected from the conversation's root tree.
+    #[error("restore rejected {path}: raw turn {turn_id} is disconnected from root {root:?}")]
+    DisconnectedRawTurn {
+        /// JSON-like path of the disconnected turn.
+        path: String,
+        /// Disconnected raw turn identity.
+        turn_id: TurnId,
+        /// Expected root turn identity, if any raw history exists.
+        root: Option<TurnId>,
+    },
+
+    /// A lineage entry names no retained raw turn fact.
+    #[error("restore rejected {path}: lineage references unknown turn {turn_id}")]
+    UnknownLineageTurn {
+        /// JSON-like path of the invalid lineage entry.
+        path: String,
+        /// Missing retained raw turn identity.
+        turn_id: TurnId,
+    },
+
+    /// A lineage repeats the same turn identity.
+    #[error("restore rejected {path}: lineage repeats turn {turn_id}")]
+    DuplicateLineageTurn {
+        /// JSON-like path of the repeated lineage entry.
+        path: String,
+        /// Repeated turn identity.
+        turn_id: TurnId,
+    },
+
+    /// Raw facts exist but no addressable lineage describes them.
+    #[error("restore rejected {path}: raw history is non-empty but lineage is empty")]
+    EmptyLineageWithRawTurns {
+        /// JSON-like path of the invalid lineage field.
+        path: String,
+    },
+
+    /// The active lineage is not ordered by each turn's parent pointer.
+    #[error(
+        "restore rejected {path}: lineage turn {turn_id} parent mismatch: expected {expected:?}, found {actual:?}"
+    )]
+    LineageParentMismatch {
+        /// JSON-like path of the invalid lineage entry.
+        path: String,
+        /// Turn whose parent does not match the previous lineage entry.
+        turn_id: TurnId,
+        /// Expected parent identity at this lineage position.
+        expected: Option<TurnId>,
+        /// Parent identity stored on the turn fact.
+        actual: Option<TurnId>,
+    },
+
+    /// The fork ceiling does not match the addressable lineage fact list.
+    #[error(
+        "restore rejected {path}: fork ceiling {fork_ceiling} does not match lineage length {lineage_len}"
+    )]
+    ForkCeilingMismatch {
+        /// JSON-like path of the invalid ceiling field.
+        path: String,
+        /// Serialized fork ceiling.
+        fork_ceiling: u64,
+        /// Number of turn ids in the addressable lineage.
+        lineage_len: u64,
+    },
+
+    /// The logical head lies beyond the addressable lineage ceiling.
+    #[error("restore rejected {path}: head {head} exceeds fork ceiling {fork_ceiling}")]
+    HeadOutOfRange {
+        /// JSON-like path of the invalid head field.
+        path: String,
+        /// Serialized logical head position.
+        head: u64,
+        /// Largest addressable lineage position.
+        fork_ceiling: u64,
+    },
+
+    /// A raw turn fact failed the canonical I1--I4 validator.
+    #[error("restore rejected {path}: invalid turn fact: {source}")]
+    InvalidTurn {
+        /// JSON-like path of the invalid turn fact.
+        path: String,
+        /// Underlying closed-turn validation error.
+        #[source]
+        source: CommitError,
+    },
+
+    /// Fork provenance contradicts the child snapshot's own facts.
+    #[error(
+        "restore rejected {path}: fork origin parent matches child conversation {conversation_id}"
+    )]
+    ForkOriginSelfParent {
+        /// JSON-like path of the invalid origin parent.
+        path: String,
+        /// Child conversation identity.
+        conversation_id: ConversationId,
+    },
+
+    /// The stored fork boundary is not owned by the recorded parent.
+    #[error(
+        "restore rejected {path}: fork point belongs to conversation {actual}, expected parent {expected}"
+    )]
+    ForkPointOwnerMismatch {
+        /// JSON-like path of the invalid fork boundary owner.
+        path: String,
+        /// Parent conversation recorded in the origin.
+        expected: ConversationId,
+        /// Conversation identity embedded in the fork boundary.
+        actual: ConversationId,
+    },
+
+    /// The stored fork boundary points beyond the restored lineage.
+    #[error(
+        "restore rejected {path}: fork point {turn_count} exceeds lineage length {lineage_len}"
+    )]
+    ForkPointOutOfRange {
+        /// JSON-like path of the invalid fork boundary position.
+        path: String,
+        /// Fork boundary turn count.
+        turn_count: u64,
+        /// Restored addressable lineage length.
+        lineage_len: u64,
+    },
+
+    /// The fork boundary anchor does not match the restored lineage prefix.
+    #[error(
+        "restore rejected {path}: fork point anchor mismatch after {turn_count} turns: expected {expected:?}, found {actual:?}"
+    )]
+    ForkPointAnchorMismatch {
+        /// JSON-like path of the invalid fork boundary anchor.
+        path: String,
+        /// Fork boundary turn count.
+        turn_count: u64,
+        /// Restored lineage anchor at that position.
+        expected: Option<TurnId>,
+        /// Anchor embedded in the fork boundary.
+        actual: Option<TurnId>,
+    },
+
+    /// The projection overlay failed restore-time range or artifact validation.
+    #[error("restore rejected {path}: invalid projection: {source}")]
+    InvalidProjection {
+        /// JSON-like path of the invalid projection field.
+        path: String,
+        /// Underlying projection validation error.
+        #[source]
+        source: ProjectionError,
+    },
+
+    /// A derived runtime index did not match an independent rebuild.
+    #[error("restore rejected {path}: rebuilt tool-call index does not match full scan")]
+    DerivedIndexMismatch {
+        /// JSON-like path of the facts used to derive the index.
+        path: String,
+    },
+}
+
 /// A Conversation operation failed without changing committed state.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ConversationError {
@@ -948,6 +1160,10 @@ pub enum ConversationError {
     /// A consistency-point snapshot could not be produced.
     #[error("snapshot rejected: {0}")]
     Snapshot(#[from] SnapshotError),
+
+    /// A versioned snapshot could not be restored.
+    #[error("restore rejected: {0}")]
+    Restore(#[from] RestoreError),
 
     /// History and version cannot be advanced together because the version is exhausted.
     #[error("commit cannot advance history and version atomically from version {current_version}")]
