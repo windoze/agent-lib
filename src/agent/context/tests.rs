@@ -60,6 +60,23 @@ fn child_cancellation_does_not_cancel_parent() {
 }
 
 #[test]
+fn depth_starts_at_zero_and_increments_per_derived_child() {
+    let root = context_with_limits(BudgetLimits::unbounded());
+    assert_eq!(root.depth(), 0);
+
+    let child = root
+        .derive_child(run_id("c2"), node_id("sub-agent"))
+        .expect("derive child");
+    assert_eq!(child.depth(), 1);
+
+    let grandchild = child
+        .derive_child(run_id("c3"), node_id("sub-sub-agent"))
+        .expect("derive grandchild");
+    assert_eq!(grandchild.depth(), 2);
+    assert_eq!(root.depth(), 0);
+}
+
+#[test]
 fn budget_charges_steps_tokens_cost_and_preserves_state_on_exceed() {
     let context = context_with_limits(BudgetLimits::new(
         Some(2),

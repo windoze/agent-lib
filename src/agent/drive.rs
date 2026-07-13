@@ -91,11 +91,13 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use serde_json::Value;
 
 mod reference;
+mod subagent;
 
 pub use reference::{
     ApprovalInteractionHandler, LlmClientHandler, ReconfigRegistryHandler, ReferenceScope,
     ToolRegistryHandler, drive_turn,
 };
+pub use subagent::{DrivingSubagentHandler, SpawnedChild, SubagentSpawner};
 
 /// One drain layer's set of effect handlers.
 ///
@@ -177,18 +179,29 @@ pub trait InteractionHandler: Send + Sync {
 /// Fulfills a `NeedSubagent` requirement by deriving and driving a child agent.
 ///
 /// This is the only scope-deepening handler: fulfilling it opens another drain
-/// layer for the child machine. Only the signature is defined in this stage
-/// (M3-1); the derivation, nested drain, and scope enforcement land in M5. The
+/// layer for the child machine. The handler derives a child [`RunContext`]
+/// (cancel ↓ / budget ↕ / trace ↓), builds the child machine, and drives it with
+/// a nested [`drain`]. The `outer` layer it receives is the pop target for
+/// requirements the child's own scope cannot serve (migration doc §7.3): a
+/// child `NeedInteraction` that its headless scope omits pops to `outer` — the
+/// scope that emitted the `NeedSubagent` plus that scope's parents — so the
+/// handler's own layer serves it rather than re-entering the handler. The
 /// returned [`RequirementResult`] must be a [`RequirementResult::Subagent`].
 #[async_trait]
 pub trait SubagentHandler: Send + Sync {
     /// Derives the child agent named by `spec_ref`, drives it against `brief`
     /// (optionally constrained by `result_schema`), and returns its result.
+    ///
+    /// `outer` is the layer requirements the child cannot serve pop to; it is a
+    /// [`ScopePop`] over the scope that emitted this `NeedSubagent` and that
+    /// scope's own parents, so a popped requirement never re-enters this handler
+    /// (§7.3).
     async fn fulfill(
         &self,
         spec_ref: &AgentSpecRef,
         brief: &Interaction,
         result_schema: Option<&Value>,
+        outer: &mut dyn Pop,
         ctx: &RunContext,
     ) -> RequirementResult;
 }
@@ -278,21 +291,27 @@ pub trait Pop: Send {
 /// requirement arrives, it is fulfilled against this scope if possible, and
 /// otherwise popped further outward — so the requirement never re-enters the
 /// scope it originally popped from (migration doc §7.3).
-pub struct ScopePop<'a> {
+///
+/// The parent's pointee lifetime `'p` is a distinct parameter from the borrow
+/// lifetime `'a`. Keeping them separate lets an outer layer be reborrowed to a
+/// short `'a` while preserving the (invariant) `&mut dyn Pop` pointee lifetime —
+/// which is what lets a subagent handler build a `ScopePop` over the emitting
+/// scope and *its* parent without unifying those two independent lifetimes.
+pub struct ScopePop<'a, 'p> {
     scope: &'a dyn HandlerScope,
-    parent: Option<&'a mut dyn Pop>,
+    parent: Option<&'a mut (dyn Pop + 'p)>,
 }
 
-impl<'a> ScopePop<'a> {
+impl<'a, 'p> ScopePop<'a, 'p> {
     /// Wraps `scope` (and its own `parent`) as an outer [`Pop`] target.
     #[must_use]
-    pub fn new(scope: &'a dyn HandlerScope, parent: Option<&'a mut dyn Pop>) -> Self {
+    pub fn new(scope: &'a dyn HandlerScope, parent: Option<&'a mut (dyn Pop + 'p)>) -> Self {
         Self { scope, parent }
     }
 }
 
 #[async_trait]
-impl Pop for ScopePop<'_> {
+impl Pop for ScopePop<'_, '_> {
     async fn pop(
         &mut self,
         requirement: &Requirement,
@@ -415,16 +434,13 @@ async fn fulfill_with_scope(
         RequirementKind::NeedInteraction { request } => {
             Some(scope.interaction()?.fulfill(request, ctx).await)
         }
-        RequirementKind::NeedSubagent {
-            spec_ref,
-            brief,
-            result_schema,
-        } => Some(
-            scope
-                .subagent()?
-                .fulfill(spec_ref, brief, result_schema.as_ref(), ctx)
-                .await,
-        ),
+        // A subagent opens another drain layer and needs the outer layer as a
+        // pop target for the child's unhandled requirements (§7.3). That outer
+        // layer is only reachable in `resolve_requirement`, which builds a
+        // `ScopePop` over this scope and its parent, so `NeedSubagent` is never
+        // fulfilled here — it is always routed serially through
+        // `resolve_requirement`.
+        RequirementKind::NeedSubagent { .. } => None,
         RequirementKind::NeedReconfigRegistry { tool_set } => {
             Some(scope.reconfig()?.fulfill(tool_set, ctx).await)
         }
@@ -451,7 +467,27 @@ async fn resolve_requirement(
     parent: Option<&mut (dyn Pop + '_)>,
     ctx: &RunContext,
 ) -> Result<RequirementResult, AgentError> {
-    if let Some(result) = fulfill_with_scope(requirement, scope, ctx).await {
+    // A subagent deepens the scope chain: its handler drives the child with a
+    // nested drain whose pop target is *this* layer (the scope that emitted the
+    // requirement, plus that scope's own parents). Build that outer layer as a
+    // `ScopePop` and hand it to the handler so the child's unhandled
+    // requirements pop outward without re-entering the handler (§7.3). When this
+    // scope has no subagent handler, fall through to the normal pop path.
+    if let RequirementKind::NeedSubagent {
+        spec_ref,
+        brief,
+        result_schema,
+    } = &requirement.kind
+    {
+        if let Some(handler) = scope.subagent() {
+            let mut outer = ScopePop::new(scope, parent);
+            let result = handler
+                .fulfill(spec_ref, brief, result_schema.as_ref(), &mut outer, ctx)
+                .await;
+            validate(requirement, &result)?;
+            return Ok(result);
+        }
+    } else if let Some(result) = fulfill_with_scope(requirement, scope, ctx).await {
         validate(requirement, &result)?;
         return Ok(result);
     }
@@ -469,7 +505,10 @@ async fn resolve_requirement(
 ///
 /// Requirements this scope handles are run concurrently and collected in
 /// completion order (migration decision B); requirements it cannot handle are
-/// popped to `parent` one at a time, since a [`Pop`] target is `&mut`.
+/// resolved one at a time, since a [`Pop`] target is `&mut`. A `NeedSubagent`
+/// is always resolved serially — even when this scope handles it — because its
+/// handler needs the outer layer (`&mut parent`) as a pop target and so cannot
+/// join the concurrent set.
 async fn fulfill_batch(
     requirements: &[Requirement],
     scope: &dyn HandlerScope,
@@ -477,10 +516,11 @@ async fn fulfill_batch(
     ctx: &RunContext,
 ) -> Result<Vec<RequirementResolution>, AgentError> {
     let mut local = FuturesUnordered::new();
-    let mut popped: Vec<&Requirement> = Vec::new();
+    let mut serial: Vec<&Requirement> = Vec::new();
 
     for requirement in requirements {
-        if scope_handles(scope, requirement.tag()) {
+        let tag = requirement.tag();
+        if tag != RequirementKindTag::Subagent && scope_handles(scope, tag) {
             local.push(async move {
                 let result = fulfill_with_scope(requirement, scope, ctx)
                     .await
@@ -489,7 +529,7 @@ async fn fulfill_batch(
                 Ok::<_, AgentError>(RequirementResolution::new(requirement.id, result))
             });
         } else {
-            popped.push(requirement);
+            serial.push(requirement);
         }
     }
 
@@ -498,16 +538,8 @@ async fn fulfill_batch(
         resolutions.push(resolution?);
     }
 
-    for requirement in popped {
-        let result = match parent.as_deref_mut() {
-            Some(pop) => pop.pop(requirement, ctx).await?,
-            None => {
-                return Err(AgentError::UnhandledRequirement {
-                    kind: requirement.tag(),
-                    origin: requirement.origin.clone(),
-                });
-            }
-        };
+    for requirement in serial {
+        let result = resolve_requirement(requirement, scope, parent.as_deref_mut(), ctx).await?;
         resolutions.push(RequirementResolution::new(requirement.id, result));
     }
 

@@ -1,48 +1,61 @@
-# 执行计划 — M5-1：嵌套机器状态与 `AgentPath` 落位
+# 执行计划 — M5-2：`SubagentHandler`：派生、再开一层 drain 与作用域强制
 
 ## 选中的任务
-`TODO.md` 第一个未完成任务 = **M5-1**（M1..M4-R 全 `[DONE]`；M5-1 起为 TODO）。
-前置 M4-R 已完成。
+`TODO.md` 第一个未完成任务 = **M5-2**（M1..M5-1 全 `[DONE]`；M5-2 起为 TODO）。前置 M5-1 已完成。
 
-## 任务目标（TODO.md M5-1）
-1. 扩展机器状态：一个节点可持有零或多个子机器（`BTreeMap<AgentSlot, ChildMachineState>`），
-   整棵树 serde；live handle 仍在 driver 侧。
-2. `step` 递归推进整棵树到静止；树上任意位置 outstanding requirement 聚合进
-   `StepOutcome.requirements`，每个带真实 `origin: AgentPath`。
-3. requirement 兑现结果 `Resume` 按 `id`(+`origin`) 精确路由回对应子机器。
-4. `LoopCursor` 各 cursor 的 `AgentPath` 字段（M2-2 已留）填真实路径。
+## 任务目标（TODO.md M5-2）
+1. 实现 `SubagentHandler`：接收 `NeedSubagent{spec_ref,brief,result_schema}`（只有 data），
+   `RunContext::derive_child` 派生子上下文，构造子机器，`drain` 递归驱动；子机器本内层 scope
+   兜不了的 requirement（如 `NeedInteraction`）pop 到外层。
+2. 深度上限：每加深一层在 handler 检查，超限分类报错。
+3. 预算继承 / cancel 传播：子上下文共享父 budget ledger、继承 cancel 链；父 cancel → 子
+   `Abandon` 并 `cancel_pending` 收尾。
+4. 子 turn 结束把 `SubagentOutput` 作为 `RequirementResult::Subagent(..)` `Resume` 回父。
+5. pop 从外层起（§7.3）：subagent handler 内部 perform 的同类 requirement 不回到它自己。
 
-## 关键设计决策（最终实现）
-- 新建 `src/agent/machine/nested.rs`，定义 live `NestedMachine`（实现 `AgentMachine`）与
-  可序列化快照 `MachineTreeState`。
-- `NestedMachine { own: DefaultAgentMachine, children: BTreeMap<AgentSlot, ChildNode>,
-  path: AgentPath }`，`ChildNode { machine: NestedMachine, pending_start: Option<AgentInput> }`
-  （递归树）。`path` = 该节点在树中的**绝对路径**，不入 serde（由结构重建）。
-- **绝对路径打戳**（统一机制，满足 bullet 4）：单机 `DefaultAgentMachine` 恒把 cursor 绑定与
-  emitted `Requirement.origin` 打在 root；每个节点在自己 own 机步进后，用 `step_own` 把 own
-  刚产出的 requirement 与 own cursor 绑定重打成本节点的 `path`。子节点递归自打，故冒泡=纯 append。
-- delta 语义（与 `AgentMachine` “本步新增 requirement” 契约一致）：
-  - `step(External)`：`step_own` 喂 own，再 `start_pending_children` 启动所有 `pending_start`
-    子机器（一次 feed 推进整树），子机器自打绝对路径。
-  - `step(Resume)`/`step(Abandon)`：`route_by_id` 按 `id` 定位命中的节点（扫描各 cursor 的
-    `pending_requirement_ids`，递归 `subtree_contains`），投递给该节点；命中 own 走 `step_own`，
-    命中子树直接 append（子已自打）。无节点等待该 id → 投给 own 让其分类报错。
-  - `cursor()` 返回 root 的 `own.cursor()`；`quiescent = !has_pending_starts()`。
-- cursor 打戳 API：`LoopCursor::rebase_origin(&AgentPath)`（同模块直改私有 origin 字段）→
-  `AgentState::rebase_cursor_origin`（`pub(crate)`）→ `DefaultAgentMachine::rebase_cursor_origin`
-  （`pub(crate)`）。只改寻址元数据，不过 transition 校验。
-- serde：`impl Serialize for NestedMachine`（借用 `own.state()`，递归子树，含 `pending_start`）；
-  `MachineTreeState: Deserialize` + `NestedMachine::from_state(state, make_fn)` 递归 `from_state_at`
-  按结构重建每节点 `path`，重注入 handle。
-- **序列化边界**：单机 parked（NeedLlm 卡住）时 Conversation 有 pending turn，Conversation 核心
-  拒绝快照（既有不变量），故整树只能在 committed 边界（Idle/Done）序列化。round-trip 测试用
-  parent=Done + child=Idle（保留 pending_start）两个不同 cursor 独立恢复。
+## 关键设计决策
+- trait 签名变更：`SubagentHandler::fulfill` 增加 `outer: &mut dyn Pop`（= 发出 NeedSubagent 那层
+  scope 作为 pop 目标 ScopePop{scope,parent}）。子机器 drain 时把 outer 作为 parent，故子的
+  NeedInteraction 兜不住时 pop 到父 attended scope 兑现。§7.3 由 drain(先试本层再 pop) 天然满足。
+- drain 管道（drive.rs）：fulfill_with_scope 对 NeedSubagent 返回 None；resolve_requirement 特判
+  NeedSubagent（有 handler 则构造 outer=ScopePop::new(scope,parent) 调 fulfill，否则 pop）；
+  fulfill_batch 把 subagent 从并发集排除，与 popped 一起串行经 resolve_requirement。
+- 深度（context.rs）：RunContext 加 depth:u32，new_root=0，derive_child=+1，depth() 访问器；
+  handler 检查 ctx.depth()>=max_depth 拒绝。
+- 分类报错（event.rs）：新增 AgentErrorKind::Subagent + AgentError::SubagentDepthExceeded{limit}。
+- 参考实现（新 drive/subagent.rs）：SubagentSpawner(child_ids/spawn/summarize) +
+  SpawnedChild{machine:Box<dyn AgentMachine+Send>,scope:Box<dyn HandlerScope>,opening:AgentInput} +
+  DrivingSubagentHandler{spawner,max_depth}。fulfill：深度护栏→derive_child(共享 budget/派生
+  cancel/记 sub-agent trace)→spawn→drain(child,opening,child_scope,Some(outer),&child_ctx)→
+  summarize→Subagent(Ok/Err)。预算继承/cancel 传播由 child_ctx 共享父 ledger+派生 cancel 天然获得。
 
-## 进度
-- [x] 选中 M5-1，读 TODO/PLAN/迁移文档 §7/§9
-- [x] cursor 打戳链：LoopCursor::rebase_origin / AgentState / DefaultAgentMachine
-- [x] 实现 NestedMachine（绝对路径打戳）+ serde + from_state
-- [x] 导出 + 聚焦测试（4 个全绿：聚合真实路径 / 按 id 路由 / 整树 round-trip / slot 占用报错）
-- [x] 全套验证：fmt clean、clippy 0 warning、`cargo test --all` lib 427 passed/0 failed、
-      `RUSTDOCFLAGS=-D warnings cargo doc` clean、`git diff --check` clean
-- [x] TODO.md [DONE] + 提交
+## 聚焦测试（drive/subagent/tests.rs）
+1. attended 父 scope 经 drain 驱动 mock 父机(发 NeedSubagent)→handler 驱动 mock 子机(发
+   NeedInteraction, headless 子 scope)→子 interaction pop 到父兑现(counting==1)，父/子完成。
+2. 深度超限：ctx.depth()==max_depth 调 fulfill→Subagent(Err(SubagentDepthExceeded))。
+3. cancel 传播：父 ctx 已 cancel，fulfill 用真实 DefaultAgentMachine 子机→drain 见 cancel→
+   Abandon→cancel_pending→子 cursor 落 Idle、子 LLM handler 调用 0 次。
+4. budget 继承：真实 DefaultAgentMachine 子机正常完成，子 LLM handler 在 ctx 上 charge_tokens(N)→
+   父 ctx budget snapshot tokens==N（derive_child 共享 ledger）。
+
+## 验证
+cargo fmt --all → clippy --all-targets -D warnings → test --all --all-targets → RUSTDOCFLAGS=-D
+warnings cargo doc --no-deps → git diff --check。每测试 <1min。
+
+## 进度（恢复上一轮中断的工作）
+- [x] 选中 M5-2，读 TODO/PLAN/迁移文档 §7.2/§7.3/§8、drive/context/requirement/nested/spec
+- [x] context.rs depth（已在工作区）
+- [x] event.rs 深度错误分类（已在工作区）
+- [x] drive.rs trait 签名 + 管道（已在工作区，但引入生命周期编译错误）
+- [x] drive/subagent.rs 参考实现 + 导出（已在工作区，声明 `mod tests;` 但文件缺失）
+- [ ] **修复编译错误**：ScopePop 单一 `'a` 让 scope 与 parent 可变引用 pointee 统一（invariant）→
+      在 resolve_requirement 内构造 ScopePop 无法统一。解法：ScopePop 加第二个生命周期 `'p`
+      解耦 parent pointee；resolve_requirement 恢复独立省略生命周期。
+- [x] **修复编译错误**：ScopePop 加第二个生命周期 `'p` 解耦 parent pointee；
+      resolve_requirement 恢复独立省略生命周期。lib 编译通过。
+- [x] 补齐 drive/subagent/tests.rs 聚焦测试 4 个（mock 机器/scope）：全绿
+- [x] 全套验证：fmt(clean)→clippy(0 warn)→test(lib 432/0)→doc(-D warnings clean)→diff --check(clean)
+- [x] TODO.md M5-2 标 [DONE] + 完成记录
+- [x] 一次性提交所有未提交文件（恢复上一轮中断的工作）
+
+## 状态：M5-2 完成，等待提交。

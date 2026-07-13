@@ -50,6 +50,7 @@ pub struct RunContext {
     cancellation: CancellationToken,
     budget: BudgetHandle,
     trace: TraceHandle,
+    depth: u32,
 }
 
 impl RunContext {
@@ -65,6 +66,7 @@ impl RunContext {
             cancellation: CancellationToken::new(),
             budget: BudgetHandle::new(budget_limits),
             trace: TraceHandle::new_root(trace_root_id, run_id),
+            depth: 0,
         }
     }
 
@@ -90,6 +92,18 @@ impl RunContext {
     #[must_use]
     pub const fn trace(&self) -> &TraceHandle {
         &self.trace
+    }
+
+    /// Returns the subagent nesting depth of this context.
+    ///
+    /// A root context created by [`RunContext::new_root`] has depth `0`; each
+    /// [`RunContext::derive_child`] adds one. A subagent handler uses this to
+    /// enforce a maximum hierarchy depth (migration doc §7.2 / `agent-layer.md`
+    /// §6.3): the guard belongs in the one handler that deepens the scope chain,
+    /// not scattered elsewhere.
+    #[must_use]
+    pub const fn depth(&self) -> u32 {
+        self.depth
     }
 
     /// Returns whether this context has been cancelled by itself or an ancestor.
@@ -178,7 +192,8 @@ impl RunContext {
     /// The child shares the same budget ledger, so child charges consume the
     /// parent run's limits. Parent cancellation propagates through the derived
     /// cancellation token. A sub-agent trace node is recorded and becomes the
-    /// parent for records created through the child context.
+    /// parent for records created through the child context. The child's
+    /// [`depth`](Self::depth) is one greater than this context's.
     ///
     /// # Errors
     ///
@@ -202,6 +217,7 @@ impl RunContext {
                 .trace
                 .with_parent(sub_agent.id().clone())
                 .map_err(RunContextError::from)?,
+            depth: self.depth.saturating_add(1),
         })
     }
 }

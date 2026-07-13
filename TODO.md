@@ -1358,7 +1358,7 @@ state;整棵树可序列化。此前 `AgentPath` 恒为空,本任务让它真实
   `AgentPath::prepend` 单测;网络用例 ignored)、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean)、
   `git diff --check`(clean)均通过。每测试 <1min。
 
-### [TODO] M5-2 `SubagentHandler`:派生、再开一层 drain 与作用域强制
+### [DONE] M5-2 `SubagentHandler`:派生、再开一层 drain 与作用域强制
 
 **前置依赖**:M5-1。
 
@@ -1383,6 +1383,53 @@ handler 派生子 agent 并再开一层 drain 递归驱动,并从"当前 drain s
   → 子 `NeedInteraction` pop 到父被兑现;深度超限报错;父 cancel 传播到子并 `cancel_pending`;
   子消耗计入父 budget ledger。
 - 运行全套命令。
+
+**完成记录**:
+
+- **`RunContext` 加深度(`context.rs`)**:新增私有 `depth: u32`,`new_root=0`,`derive_child`
+  `saturating_add(1)`,`pub const fn depth()` 访问器。深度护栏语义集中在派生链的唯一加深处
+  (迁移文档 §7.2 / `agent-layer.md` §6.3),不散落别处。新增单测
+  `depth_starts_at_zero_and_increments_per_derived_child`(root=0、child=1、grandchild=2,父不受影响)。
+- **深度错误分类(`event.rs`)**:新增 `AgentErrorKind::Subagent` 与
+  `AgentError::SubagentDepthExceeded { limit, depth }`,`AgentError::kind()` 映射到 `Subagent`。
+- **drain 管道让 `NeedSubagent` 走「构造 outer 后串行兑现」路径(`drive.rs`)**:
+  - `SubagentHandler::fulfill` 签名新增 `outer: &mut dyn Pop`(= 发出 `NeedSubagent` 那层 scope 及其
+    父,作为子机器未兑现 requirement 的 pop 目标,§7.3)。
+  - `fulfill_with_scope` 对 `NeedSubagent` 返回 `None`(它需要 outer,只能在 `resolve_requirement`
+    构造),`resolve_requirement` 特判 `NeedSubagent`:有 handler 则 `ScopePop::new(scope, parent)`
+    构造 outer 调 `fulfill`,否则落到既有 pop 路径。
+  - `fulfill_batch` 把 `Subagent` 从并发集排除、与不可本层兑现者一起串行经 `resolve_requirement`
+    (subagent handler 需要 `&mut parent` 作 pop 目标,无法进 `FuturesUnordered` 并发集)。
+- **生命周期修复(恢复上一轮中断留下的编译错误)**:`ScopePop` 单一 `'a` 让 `scope` 与
+  `parent: &mut dyn Pop` 的 pointee 生命周期被迫统一(`&mut` pointee 不变),导致在
+  `resolve_requirement` 内为 subagent 构造 `ScopePop` 无法统一 scope/parent 两个独立生命周期。改为
+  **双生命周期 `ScopePop<'a, 'p>`**(`parent: Option<&'a mut (dyn Pop + 'p)>`)解耦借用寿命与 pointee
+  寿命;`resolve_requirement` 恢复独立省略生命周期。既有 `ScopePop::new(&outer, None)` 调用点不变。
+- **参考实现 `src/agent/drive/subagent.rs`**(+ `subagent/tests.rs`):
+  - `SpawnedChild { machine: Box<dyn AgentMachine + Send>, scope: Box<dyn HandlerScope>, opening:
+    AgentInput }`——子机器、其**自有** drain 层、开启子 turn 的输入。
+  - `trait SubagentSpawner`(host 策略,`Send+Sync`):`child_ids`(供 `derive_child` 的 run/trace id)、
+    `spawn`(把 `AgentSpecRef` 解析为可驱动子)、`summarize`(把 `TurnDone` 收敛为 `SubagentOutput`)。
+    库只拥有加深作用域的**机制**,把「spec→机器/scope」的**策略**留给 host。
+  - `DrivingSubagentHandler { spawner, max_depth }` 实现 `SubagentHandler`:①深度护栏先行
+    (`ctx.depth() >= max_depth` → `Subagent(Err(SubagentDepthExceeded))`,不 mint id 不 spawn);
+    ②`derive_child`(共享父 budget ledger + 派生 cancel 链 + 记 sub-agent trace,预算继承/cancel 传播
+    天然获得);③`spawn` 子;④`drain(child, opening, child_scope, Some(outer), child_ctx)` 再开一层;
+    ⑤`Ok→summarize→Subagent(Ok)`,`Err→Subagent(Err)`。`max_depth==0` 即禁用 subagent。
+- **导出**:`drive.rs` `mod subagent;` + `pub use subagent::{DrivingSubagentHandler, SpawnedChild,
+  SubagentSpawner}`;`agent/mod.rs` 同步 re-export。
+- **聚焦测试(subagent,4 个全绿,均用 mock 机器/scope 精确观测 handler 自身接线)**:
+  `attended_parent_serves_headless_child_interaction_via_pop`(§7.3:headless 子 `NeedInteraction`
+  pop 到 attended 父 scope 被兑现 count==1,父/子均完成,父被 `Subagent` 结果 resume)、
+  `depth_guard_refuses_at_limit_without_spawning`(depth==max_depth==1 → `SubagentDepthExceeded
+  {limit:1,depth:1}`,spawner 零调用)、`parent_cancel_propagates_and_abandons_child`(父 ctx cancel
+  → 子 drain 见 cancel → `Abandon` 首个 requirement 的 never-resume 收尾,子 LLM handler 零调用、零
+  resume)、`child_token_charge_counts_against_parent_budget`(子 LLM handler 在派生 ctx 上
+  `charge_tokens(42)` → 父 ctx budget snapshot tokens==42,证明共享 ledger)。
+- **验证**:`cargo fmt --all`(clean)、`cargo clippy --all-targets -- -D warnings`(0 warning)、
+  `cargo test --all --all-targets`(lib 432 passed / 0 failed;含新增 1 个 depth 单测 + 4 个 subagent
+  聚焦测试;网络用例 ignored)、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean)、
+  `git diff --check`(clean)均通过。每测试 <1min。
 
 ### [TODO] M5-3 Observability:trace 记 resolved-by-scope 与 disposition
 

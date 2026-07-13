@@ -659,6 +659,9 @@ pub enum AgentErrorKind {
     Approval,
     /// A requirement reached the top scope with no handler to fulfill it.
     UnhandledRequirement,
+    /// A subagent orchestration guard failed (for example the maximum
+    /// hierarchy depth was exceeded).
+    Subagent,
     /// The failure did not fit a more specific category.
     Other,
 }
@@ -739,6 +742,18 @@ pub enum AgentError {
     /// A machine or driver returned an uncategorized failure.
     #[error("agent runtime error: {0}")]
     Other(String),
+    /// A subagent would deepen the scope chain past the configured limit.
+    ///
+    /// The only scope-deepening handler (`NeedSubagent`) enforces a maximum
+    /// hierarchy depth so a coordinator that can spawn subagents cannot recurse
+    /// without bound (migration doc §7.2 / `agent-layer.md` §6.3).
+    #[error("subagent depth limit {limit} exceeded (context depth {depth})")]
+    SubagentDepthExceeded {
+        /// Maximum nesting depth the subagent handler allows.
+        limit: u32,
+        /// Depth of the context that requested a further child.
+        depth: u32,
+    },
 }
 
 impl AgentError {
@@ -756,6 +771,7 @@ impl AgentError {
             Self::Tool(_) => AgentErrorKind::Tool,
             Self::Approval(_) => AgentErrorKind::Approval,
             Self::UnhandledRequirement { .. } => AgentErrorKind::UnhandledRequirement,
+            Self::SubagentDepthExceeded { .. } => AgentErrorKind::Subagent,
             Self::Other(_) => AgentErrorKind::Other,
         }
     }
