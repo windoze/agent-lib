@@ -772,7 +772,7 @@ immutable message/turn；不 clone prefix、不重分配历史 id。父子分支
   0 failed，所有 example targets passed）；`cargo test --doc`（1 个正向与 10 个
   compile-fail passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
-### M3-R [TODO] Milestone 3 Review
+### M3-R [DONE] Milestone 3 Review
 
 **前置依赖**：M3-1 至 M3-4 全部完成。
 
@@ -795,6 +795,33 @@ immutable message/turn；不 clone prefix、不重分配历史 id。父子分支
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
   `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 对照规范 §7--§9 完成 M3 审查：Conversation/Turn/Message/ToolCall 两级 identity 仍由外部
+  注入且共享历史不 re-id；raw history 通过 parent-pointer/`Arc` 节点保留，逻辑 head 只裁剪
+  当前有效视图；`Boundary` 字段私有、serde token 不自证合法，消费统一校验 owner、version、
+  pending、range、fork ceiling 与 anchor；`ForkOrigin` 只记录父 Conversation 与父签发 cut，
+  child 使用独立 owner/version 域。
+- 审查确认 O(1) fork 有实现和测试保证：`History::shared_prefix` 只 clone 共享 handle 与
+  O(1) 元数据，`Turn`/`ConversationMessage` storage、`TurnId` 与 `MessageId` 原样共享；child
+  raw/debug/persistence 可见范围只含 fork 点祖先与 child 本地 suffix，父 suffix 不进入 child
+  `turns()`、`lineage_turns()`、`raw_turns()`、boundary 或 index 可观察事实。
+- 审查确认 `ToolCallIndex` 仍是可从 current-lineage closed turns + pending 重建的派生缓存：
+  revert 只移动 committed scope，fork 只共享并裁剪 committed backing，branch commit 从有效
+  prefix 生成新 suffix；detached/父 suffix call 不泄漏到 active view 或 provider/framework
+  lookup，identity 唯一性仍以 retained raw facts 而非 index 为事实来源。
+- 新增 `conversation::boundary::tests::review` 组合矩阵回归：同一场景串联 parent revert 后改道、
+  从共享中间 boundary fork child、父子各自推进、child revert/redo 和 parent pending 时
+  `validate_boundary`/`fork_at`/`revert_to` 拒绝；逐项断言 parent tree、raw retention、active
+  view、fork ceiling、shared message storage、index rebuild 等价和 pending 禁止规则。阶段顺序、
+  依赖与完成标准未变化，因此未修改 `PLAN.md`。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test conversation::boundary::tests::review -- --nocapture`（1 passed）；
+  `cargo test conversation::boundary -- --nocapture`（23 passed）；1800 秒硬上限内
+  `cargo test --all --all-targets`（244 个库测试与 3 个离线集成测试 passed、7 ignored、
+  0 failed，所有 example targets passed）；`cargo test --doc`（1 个正向与 10 个 compile-fail
+  passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
 ---
 
