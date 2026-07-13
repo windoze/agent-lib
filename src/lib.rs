@@ -42,10 +42,14 @@
 //!   [`conversation::CompactionStep`] describe data-only overlay rewrites that
 //!   [`conversation::Conversation::apply_compaction`] validates against the
 //!   current owner/version/head before atomically replacing the projection
-//!   without editing raw Turns. [`conversation::Conversation::effective_view`]
-//!   renders the head-clipped committed projection into Client-ready
-//!   system/messages, while [`conversation::Conversation::pending_context`]
-//!   exposes only frozen pending payloads through an explicit separate view.
+//!   without editing raw Turns. Runtime [`conversation::CompactionStrategy`]
+//!   instances, [`conversation::CompactionStrategyResolver`] registries, and
+//!   [`conversation::CompactionTrigger`] observers stay outside serde and
+//!   produce only data plans, artifact drafts, or deferred boundary markers.
+//!   [`conversation::Conversation::effective_view`] renders the head-clipped
+//!   committed projection into Client-ready system/messages, while
+//!   [`conversation::Conversation::pending_context`] exposes only frozen
+//!   pending payloads through an explicit separate view.
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are deliberately outside this crate. Those layers should persist and replay

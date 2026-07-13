@@ -1009,7 +1009,7 @@ head 为上界；若 revert 落进一个 compacted cover，不能使用包含未
   `git diff --check`；额外 `cargo test --doc`（1 个正向 doctest 与 10 个 compile-fail doctest
   passed）。
 
-### M4-4 [TODO] Compaction strategy/trigger 扩展点与数据/行为分离
+### M4-4 [DONE] Compaction strategy/trigger 扩展点与数据/行为分离
 
 **前置依赖**：M4-3。
 
@@ -1036,6 +1036,39 @@ client 与调度属于外部运行时，不能序列化进 Conversation 或把 A
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、strategy/trigger
   聚焦测试、`cargo test --all --all-targets`、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增 `conversation::projection::strategy` 运行时扩展点模块并从 `conversation` 顶层导出：
+  `#[async_trait]` dyn-safe `CompactionStrategy`、只读 `CompactionStrategyResolver`、
+  同步 `CompactionTrigger`、`CompactionInput`、`CompactCtx`、`ArtifactDraft`、
+  `CompactionTriggerOutcome` 和可 serde 的 `DeferredUntilBoundary`。strategy 只接收只读 spans、
+  `EffectiveView` 与 data-only ctx，返回未持久化 artifact draft；artifact id、covers 与
+  `StrategyRef` 由 ctx 绑定成 provenance，运行时对象不能改写持久化事实。
+- 新增分类化 `CompactionError` 并接入 `ConversationError`，覆盖无 registry/缺失 strategy 的
+  `UnresolvedStrategy`、resolver 返回错误实例的 `StrategyReferenceMismatch` 和 strategy 自身
+  `StrategyFailed`；`run_compaction_strategy`/`materialize_compaction_plan` 不使用既有 artifact
+  作为 fallback，缺失或错误 `StrategyRef` 会显式失败。`StrategyRef` 增加稳定 display，错误和
+  测试断言可读。
+- `CompactionPlan::with_artifacts` 支持 trigger 先产出不含 artifacts 的 data-only plan intent，
+  异步 strategy 后续按相同 owner/version/head/steps 物化 artifacts；
+  `Conversation::evaluate_compaction_trigger` 在 pending 时不调用 trigger，直接返回 `DeferredUntilBoundary`，
+  在完整 Turn boundary 只以 immutable `&Conversation` 与 `Usage` 调用 trigger，trigger 不能直接
+  修改 projection。
+- 新增 5 个 M4-4 聚焦测试，覆盖 mock async strategy trait object、plan serde round-trip 后按同一
+  `StrategyRef` 解析并 apply、raw tiered 与 span consolidated 两种 trigger 使用不同策略引用、
+  pending deferred 且 runtime trigger 未被调用、无 registry/缺失 strategy/错误 strategy ref/
+  strategy failure 明确分类失败，以及 runtime trigger/strategy/client marker 不进入 data plan 或
+  materialized artifacts 的 serde 输出；空 draft 仍由 projection artifact 校验拒绝。
+- 同步 README、crate rustdoc 与 conversation 模块 rustdoc 的当前能力描述；具体 LLM summarizer、
+  budget loop、registry 实现、Agent loop、Tool registry 和多 agent 编排仍保持在本 crate 范围外。
+  阶段顺序和完成标准未变化，故未修改 `PLAN.md`。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test conversation::projection::tests::strategy -- --nocapture`（5 passed）；
+  `cargo test conversation::projection -- --nocapture`（24 passed）；1800 秒硬上限内
+  `cargo test --all --all-targets`（268 个库测试与 3 个离线集成测试 passed、7 ignored、
+  0 failed，所有 example targets passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
+  `git diff --check`。
 
 ### M4-R [TODO] Milestone 4 Review
 

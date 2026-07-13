@@ -20,11 +20,13 @@
 //! raw history: its spans cover complete Turn ranges checked through
 //! [`CheckedTurnRange`], compacted spans point at provenance-carrying
 //! [`Artifact`] values, [`CompactionPlan`] stores data-only overlay rewrite
-//! intent, [`Conversation::apply_compaction`] validates owner/version/head,
-//! targets, artifacts, and provenance before atomically replacing the
-//! projection, [`Conversation::effective_view`] renders a head-clipped
-//! Client-ready committed context, and [`Conversation::pending_context`] keeps
-//! frozen pending payloads separate from active partials. Raw messages remain
+//! intent, dyn-safe [`CompactionStrategy`] and synchronous
+//! [`CompactionTrigger`] values live only in the runtime layer,
+//! [`Conversation::apply_compaction`] validates owner/version/head, targets,
+//! artifacts, and provenance before atomically replacing the projection,
+//! [`Conversation::effective_view`] renders a head-clipped Client-ready
+//! committed context, and [`Conversation::pending_context`] keeps frozen
+//! pending payloads separate from active partials. Raw messages remain
 //! unchanged.
 
 pub mod boundary;
@@ -41,8 +43,8 @@ mod validation;
 pub use boundary::{Boundary, ForkOrigin, RevertOutcome};
 pub use config::ConversationConfig;
 pub use error::{
-    BoundaryError, CancelError, CommitError, ContentBlockKind, ConversationError, ForkError,
-    PairingMessageKind, PendingMessageError, PendingTurnError, ProjectionError,
+    BoundaryError, CancelError, CommitError, CompactionError, ContentBlockKind, ConversationError,
+    ForkError, PairingMessageKind, PendingMessageError, PendingTurnError, ProjectionError,
 };
 pub use history::{ToolCallIndex, ToolCallLocation, ToolCallLocationKind};
 pub use id::{ArtifactId, ConversationId, MessageId, ToolCallId, TurnId};
@@ -53,9 +55,11 @@ pub use pending::{
     PendingTurnPhase, ToolCallMapping,
 };
 pub use projection::{
-    Artifact, ArtifactProvenance, CheckedTurnRange, CompactionPlan, CompactionStep,
-    CompactionTarget, EffectiveView, PendingContext, Projection, Span, StrategyRef,
-    TokenAccounting,
+    Artifact, ArtifactDraft, ArtifactProvenance, CheckedTurnRange, CompactCtx, CompactionInput,
+    CompactionPlan, CompactionStep, CompactionStrategy, CompactionStrategyResolver,
+    CompactionTarget, CompactionTrigger, CompactionTriggerOutcome, DeferredUntilBoundary,
+    EffectiveView, PendingContext, Projection, Span, StrategyRef, TokenAccounting,
+    materialize_compaction_plan, run_compaction_strategy,
 };
 pub use turn::{ToolPairing, Turn, TurnMeta, TurnResponseMeta};
 

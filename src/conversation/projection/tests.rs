@@ -1,5 +1,7 @@
 //! Projection model and checked range tests.
 
+mod strategy;
+
 use super::{
     Artifact, ArtifactProvenance, CheckedTurnRange, CompactionPlan, CompactionStep, Projection,
     RangeEndpoint, Span, StrategyRef, TokenAccounting,

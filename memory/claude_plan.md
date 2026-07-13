@@ -1,61 +1,57 @@
 # 执行计划
 
-## 当前约束
+## 约束说明
 
-- 输出使用中文。
-- 以 `TODO.md` 为任务顺序和完成状态的唯一权威来源。
-- 本轮只完成第一个标题未带 `[DONE]` 的任务，然后停止。
-- 不做开放式历史问题清扫；只有阻塞当前任务或测试失败策略要求时才处理或登记问题。
-- 完成后需要更新 `TODO.md` 的任务标题和完成记录，必要时才更新 `PLAN.md`。
-- 修改代码后按顺序运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`，完整测试超时不超过 30 分钟。
-- 最终需要提交 Git commit。
+- 本文件记录可公开检查的执行计划、关键决策和进度更新。
+- 我不会写入私有逐步思考内容；会用明确的计划摘要和决策依据替代。
+- 本轮只完成 `TODO.md` 中第一个标题未带 `[DONE]` 的任务，然后停止。
 
-## 步骤计划
+## 初始计划
 
-1. 读取 `TODO.md`，找到第一个标题未带 `[DONE]` 的任务。
-2. 查看最新提交信息，判断是否明确提到与该任务直接相关的未完成问题。
-3. 读取当前任务涉及的设计文件和源码上下文，只收集实现该任务所需的信息。
-4. 如发现当前任务被具体前置问题阻塞，则在 `TODO.md` 插入最小必要前置任务并停止；否则直接实现当前任务。
-5. 增加或调整聚焦测试，覆盖任务要求和风险点。
-6. 运行格式化、严格 lint、完整测试；如出现未安排的失败，修复或按策略登记前置任务。
-7. 更新 `TODO.md`：给完成的任务标题加 `[DONE]`，补充完成记录、验证命令和结果。
-8. 检查工作区 diff，确认没有误改无关内容。
-9. 用清晰任务消息提交所有本轮相关改动。
-10. 停止，不继续处理下一个任务。
+1. 读取 `TODO.md`，按文件顺序识别第一个未完成任务，并确认其依赖、验收条件和 completion record 要求。
+2. 查看最近一次提交信息；仅当它明确提到与当前任务直接相关的未完成问题时，将其纳入当前任务或作为前置任务写入 `TODO.md`。
+3. 根据当前任务读取必要的设计、计划、源码和测试上下文；避免无边界历史问题扫查。
+4. 实现当前任务要求；若发现阻塞当前任务的规格缺口或测试失败，优先修复，或在 `TODO.md` 中插入最小必要前置任务后停止。
+5. 运行验证：先 `cargo fmt --all`，再 `cargo clippy --all-targets -- -D warnings`，最后在需要时运行 `cargo test --all --all-targets`，完整测试超时不超过 30 分钟。
+6. 验证通过后，将当前任务标题加上 `[DONE]`，更新 `TODO.md` completion record；仅当阶段计划发生真实变化时才更新 `PLAN.md`。
+7. 提交本轮所有相关变更，提交信息包含任务编号和清晰描述。
+8. 停止，不继续下一个任务。
 
-## 进度记录
+## 当前状态
 
-- 已写入初始计划。
-- 已读取 `TODO.md` 任务标题列表；首个未完成任务是 `M4-3 [TODO] 原子 apply_compaction 与 tiered/consolidated 更新`。
-- 已查看最新提交：`8ce12f3 [M4-2] Implement effective conversation view`；该提交直接完成前置任务，未从提交标题/stat 中发现需要先处理的相关未完成事项。
-- 已读取 `M4-3` 任务正文、`PLAN.md` 和 `docs/conversation-core.md` 中 projection/compaction 相关章节。
-- 已阅读 `src/conversation/projection`、`Conversation`、`Boundary`、`History` 和 `ProjectionError` 的现有实现。
-- 实施计划细化：
-  1. 新增纯数据 `CompactionPlan`、`CompactionStep`、`CompactionTarget`，plan 记录 conversation id、structural version、head 和外部生成 artifact 列表。
-  2. 在 `Conversation::apply_compaction(&CompactionPlan)` 中实现两阶段验证与原子 projection 替换；成功后推进 structural version，使旧 plan/boundary token 失效。
-  3. 支持 raw target（可切 raw span）和 spans target（必须对齐现有 span 边界），从而覆盖首次压缩、tiered raw tail 和 consolidate summary-of-summaries。
-  4. 保留当前 projection 中仍属于当前 head 的旧 artifacts；consolidate 替换掉的 artifact 作为未引用 provenance/audit 数据继续留在 projection artifacts 中。
-  5. 调整 commit 后 projection 维护：提交新 turn 时保留当前有效 overlay 并追加 raw tail，避免已应用 compaction 在下一次 commit 后被重置为 all-raw。
-  6. 增加 M4-3 聚焦测试，包括正向 compaction 场景、pending/stale/mismatch/overlap/partial compacted span 等负向原子性，以及 raw turns/message payload 不变。
-  7. 更新 `TODO.md` 完成记录、README/rustdoc 当前能力描述，随后执行格式化、clippy、聚焦测试、全量测试、rustdoc、diff check 并提交。
-- 已实现初版 compaction 数据模型、`Conversation::apply_compaction`、commit 后 overlay 保留逻辑和 M4-3 聚焦测试。
-- 已运行 `cargo fmt --all` 成功。
-- 已运行 `cargo test conversation::projection -- --nocapture` 成功：19 passed。
-- `cargo clippy --all-targets -- -D warnings` 首次发现测试 helper 类型复杂度问题，已用测试内 type alias 修正。
-- 已重新运行 `cargo fmt --all` 成功。
-- 已重新运行 `cargo clippy --all-targets -- -D warnings` 成功。
-- 已按验证顺序重新运行聚焦测试：`cargo test conversation::projection -- --nocapture`，19 passed。
-- 已运行 1800 秒硬上限内完整测试：`perl -e 'alarm shift; exec @ARGV' 1800 cargo test --all --all-targets`，263 个库测试与 3 个离线集成测试 passed，7 ignored，examples 0-test targets passed。
-- 已运行 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 成功。
-- 已运行 `git diff --check` 成功。
-- 已额外运行 `cargo test --doc` 成功：1 个正向 doctest 与 10 个 compile-fail doctest passed。
-- 已更新 `TODO.md`：M4-3 标题改为 `[DONE]`，并补充完成记录；未修改 `PLAN.md`。
-- 已在 TODO 更新后重新运行 `git diff --check` 成功；最后只改 Markdown，因此不重跑 Rust 套件。
-- 审查时补充了 `CompactionPlan` serde round-trip 断言。
-- 补充测试后重新完成验证链：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
-  `cargo test conversation::projection -- --nocapture`（19 passed）；
-  `perl -e 'alarm shift; exec @ARGV' 1800 cargo test --all --all-targets`
-  （263 个库测试与 3 个离线集成测试 passed、7 ignored、examples 通过）；
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`；
-  额外 `cargo test --doc`（1 个正向 doctest 与 10 个 compile-fail doctest passed）。
-- 下一步查看工作区并提交本轮改动。
+- 状态：已读取 `TODO.md` 并确认首个未完成任务为 `M4-4 [TODO] Compaction strategy/trigger 扩展点与数据/行为分离`。
+- 最近提交：`fe6065a [M4-3] Implement atomic compaction apply`，未点名与 M4-4 直接相关的未完成阻塞。
+- 已读取上下文：`PLAN.md`、`docs/conversation-core.md` projection/compaction 章节、`projection::{mod,artifact,compaction}`、`Conversation` 与错误枚举。
+
+## M4-4 实施计划
+
+1. 新增 `conversation::projection::strategy` 模块：
+   - `CompactionStrategy`：`#[async_trait]` dyn-safe trait，按 `StrategyRef` 解析运行时实例。
+   - `CompactionStrategyResolver`：只读解析接口，缺失或返回错误引用时产生分类错误，不 fallback。
+   - `CompactionInput`/`CompactCtx`：只读 source spans、effective context 与目标 artifact/strategy 数据。
+   - `ArtifactDraft`：策略返回的未校验 artifact draft，最终由 ctx 组装成带 provenance 的 `Artifact`。
+   - `CompactionTrigger`、`CompactionTriggerOutcome`、`DeferredUntilBoundary`：同步 trigger 只观察 `&Conversation` 和 `Usage`，返回 data-only plan 或 deferred。
+2. 扩展错误类型：
+   - 新增 `CompactionError`，覆盖 unresolved strategy、resolver 返回错误 strategy ref、strategy failed。
+   - 接入 `ConversationError` 并从 crate/conversation 导出。
+3. 扩展现有 compaction 数据 API：
+   - 为 `CompactionPlan` 增加保留 header/steps、替换 artifacts 的 helper，便于 trigger 先返回 plan intent，strategy 后填入 artifacts。
+4. 给 `Conversation` 增加 trigger evaluation 方法：
+   - pending 时直接返回 `DeferredUntilBoundary`，不调用 trigger。
+   - boundary 状态下以 immutable `&Conversation` 调用 trigger，trigger 不能直接修改 projection。
+5. 添加聚焦测试：
+   - mock async strategy 通过 trait object/resolver 生成 artifact，plan serde round-trip 后可按相同 `StrategyRef` 填入 artifacts 并 apply。
+   - 两个 trigger 分别产生 tiered raw plan 与 consolidated span plan，证明不同 `StrategyRef` 可用。
+   - pending 状态返回 deferred 且不调用 trigger。
+   - 无 registry、缺失 strategy、错误 strategy reference 明确失败。
+   - serde 输出只包含 data plan/artifact/provenance，不包含 mock runtime/client handle。
+6. 更新 README、crate/conversation rustdoc 与 `TODO.md` completion record；除非阶段计划变化，否则不改 `PLAN.md`。
+7. 验证顺序：`cargo fmt --all` → `cargo clippy --all-targets -- -D warnings` → M4-4 聚焦测试 → `cargo test --all --all-targets`（1800 秒内）→ `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` → `git diff --check`。
+
+## 进度更新
+
+- 已完成代码实现：新增 `projection::strategy` 模块、`CompactionError`、trigger evaluation 方法、`CompactionPlan::with_artifacts` 和顶层导出。
+- 已完成聚焦测试：`cargo test conversation::projection::tests::strategy -- --nocapture` 通过（5 passed）。
+- 已完成文档与台账：README、crate/conversation rustdoc 和 `TODO.md` 已更新，M4-4 标记为 `[DONE]`。
+- 已完成验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、M4-4 聚焦测试、完整 projection 聚焦测试、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`git diff --check` 均通过。
+- 提交：已创建 `[M4-4] Add compaction strategy trigger extension points`，本轮任务完成后停止。

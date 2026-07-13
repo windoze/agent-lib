@@ -174,6 +174,23 @@ impl CompactionPlan {
     pub fn artifacts(&self) -> &[Artifact] {
         &self.artifacts
     }
+
+    /// Returns the same data-only plan header and steps with replacement artifacts.
+    ///
+    /// This is useful when a synchronous trigger first emits a plan intent and
+    /// an asynchronous runtime strategy later materializes the artifacts for
+    /// those exact steps. Existing artifacts are replaced rather than used as a
+    /// fallback.
+    #[must_use]
+    pub fn with_artifacts(&self, artifacts: Vec<Artifact>) -> Self {
+        Self {
+            conversation_id: self.conversation_id,
+            version: self.version,
+            head_turn_count: self.head_turn_count,
+            steps: self.steps.clone(),
+            artifacts,
+        }
+    }
 }
 
 impl Conversation {

@@ -11,6 +11,7 @@ use crate::{
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
 use serde_json::{Map, Value};
+use std::fmt;
 
 /// Serializable reference to an external compaction strategy implementation.
 ///
@@ -44,6 +45,12 @@ impl StrategyRef {
     #[must_use]
     pub fn version(&self) -> &str {
         &self.version
+    }
+}
+
+impl fmt::Display for StrategyRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}@{}", self.name, self.version)
     }
 }
 

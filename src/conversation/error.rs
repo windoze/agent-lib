@@ -3,6 +3,7 @@
 use crate::{
     conversation::{
         ArtifactId, ConversationId, MessageId, ToolCallId, TurnId, pending::PendingTurnPhase,
+        projection::StrategyRef,
     },
     model::message::Role,
     stream::accumulator::AccumulatorError,
@@ -861,6 +862,39 @@ pub enum ProjectionError {
     },
 }
 
+/// A runtime compaction extension could not produce artifact data.
+///
+/// These errors are separate from [`ProjectionError`] because they describe
+/// behavior resolution before a data-only [`CompactionPlan`](super::CompactionPlan)
+/// is applied. Conversation state remains unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum CompactionError {
+    /// No runtime strategy registry or matching strategy instance was supplied.
+    #[error("compaction strategy {strategy} is unresolved")]
+    UnresolvedStrategy {
+        /// Strategy reference requested by the compaction step.
+        strategy: StrategyRef,
+    },
+
+    /// A resolver returned an instance whose identity does not match the request.
+    #[error("compaction resolver returned strategy {actual}, but {expected} was requested")]
+    StrategyReferenceMismatch {
+        /// Strategy reference requested by the compaction step.
+        expected: StrategyRef,
+        /// Strategy reference reported by the resolved runtime instance.
+        actual: StrategyRef,
+    },
+
+    /// A runtime strategy failed before producing a draft artifact.
+    #[error("compaction strategy {strategy} failed: {message}")]
+    StrategyFailed {
+        /// Strategy that reported the failure.
+        strategy: StrategyRef,
+        /// Stable, caller-supplied failure detail.
+        message: String,
+    },
+}
+
 /// A Conversation operation failed without changing committed state.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ConversationError {
@@ -895,6 +929,10 @@ pub enum ConversationError {
     /// A projection range, artifact, or span set failed checked construction.
     #[error("projection rejected: {0}")]
     Projection(#[from] ProjectionError),
+
+    /// A runtime compaction extension failed before projection application.
+    #[error("compaction runtime failed: {0}")]
+    Compaction(#[from] CompactionError),
 
     /// History and version cannot be advanced together because the version is exhausted.
     #[error("commit cannot advance history and version atomically from version {current_version}")]

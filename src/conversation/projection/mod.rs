@@ -6,9 +6,15 @@
 
 mod artifact;
 mod compaction;
+mod strategy;
 
 pub use artifact::{Artifact, ArtifactProvenance, StrategyRef, TokenAccounting};
 pub use compaction::{CompactionPlan, CompactionStep, CompactionTarget};
+pub use strategy::{
+    ArtifactDraft, CompactCtx, CompactionInput, CompactionStrategy, CompactionStrategyResolver,
+    CompactionTrigger, CompactionTriggerOutcome, DeferredUntilBoundary,
+    materialize_compaction_plan, run_compaction_strategy,
+};
 
 use super::{
     ArtifactId, Boundary, Conversation, ConversationError, ConversationId, ProjectionError, TurnId,
