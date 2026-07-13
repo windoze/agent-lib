@@ -4,6 +4,11 @@
 //! They carry provider-neutral Client stream events, Conversation boundaries,
 //! caller-supplied identities, and stable outcome classifications without
 //! storing live streams, responders, clients, or tool registries.
+//!
+//! [`AgentEvent`] is the legacy combined stream. [`Notification`] is the
+//! Agent-effect-model *notification* subset (skippable observe-only events);
+//! it coexists with [`AgentEvent`] during Stage 0 and bridges onto it through
+//! `From<Notification> for AgentEvent`.
 
 use crate::{
     agent::{
@@ -261,6 +266,73 @@ pub enum AgentEvent {
     AwaitingApproval(ApprovalRequest),
     /// The feed segment has ended with a classified outcome.
     Done(AgentOutcome),
+}
+
+/// Pure notification emitted by an Agent loop that a `drain` may skip.
+///
+/// A [`Notification`] is the observe-only subset of [`AgentEvent`]: every
+/// variant here carries a fact the loop wants to report, never a request the
+/// loop is blocked on. A consumer that only advances the machine may therefore
+/// drop notifications without stalling progress. This is the Agent-effect-model
+/// split of [`AgentEvent`] into *notifications* (skippable) and *requirements*
+/// (must be resolved); see the Agent-effect migration doc §3.1.
+///
+/// The payloads are the existing [`AgentEvent`] payload structs, reused rather
+/// than redefined, so a notification stays wire-compatible with the matching
+/// [`AgentEvent`] variant during the migration.
+///
+/// The two [`AgentEvent`] variants intentionally excluded here are requests or
+/// terminal states, not notifications, and map to the new model as follows:
+///
+/// - [`AgentEvent::AwaitingApproval`] is a request the loop blocks on; it
+///   becomes a `Requirement::NeedInteraction` (generalized approval, §4) and is
+///   resolved through the requirement return path, not observed as a
+///   notification.
+/// - [`AgentEvent::Done`] is no longer a stream event; turn completion is
+///   expressed by a quiescent step outcome (`StepOutcome.quiescent == true`)
+///   with an empty requirement set and the loop cursor reaching `Done`/`Error`
+///   (§3.1/§5).
+///
+/// During Stage 0 this type coexists with [`AgentEvent`]; use the
+/// `From<Notification> for AgentEvent` bridge to feed a notification onto the
+/// legacy stream still consumed by `DefaultAgentLoop`. Because the excluded
+/// variants are not notifications, there is deliberately no reverse
+/// `From<AgentEvent> for Notification`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum Notification {
+    /// Provider-neutral LLM stream event, carried without Agent-side rewriting.
+    ///
+    /// Mirrors [`AgentEvent::Llm`].
+    Llm(StreamEvent),
+    /// Agent step boundary where cross-cutting policies can be evaluated.
+    ///
+    /// Mirrors [`AgentEvent::StepBoundary`].
+    StepBoundary(StepBoundary),
+    /// Tool execution has started for a mapped tool call.
+    ///
+    /// Mirrors [`AgentEvent::ToolCallStarted`].
+    ToolCallStarted(ToolCallStarted),
+    /// Tool execution has finished and produced a complete response.
+    ///
+    /// Mirrors [`AgentEvent::ToolCallFinished`].
+    ToolCallFinished(ToolCallFinished),
+}
+
+impl From<Notification> for AgentEvent {
+    /// Bridges a pure [`Notification`] onto the legacy [`AgentEvent`] stream.
+    ///
+    /// The mapping is variant-for-variant and payload-preserving, keeping the
+    /// notification subset wire-compatible with [`AgentEvent`] during the
+    /// migration.
+    fn from(notification: Notification) -> Self {
+        match notification {
+            Notification::Llm(event) => Self::Llm(event),
+            Notification::StepBoundary(boundary) => Self::StepBoundary(boundary),
+            Notification::ToolCallStarted(started) => Self::ToolCallStarted(started),
+            Notification::ToolCallFinished(finished) => Self::ToolCallFinished(finished),
+        }
+    }
 }
 
 /// Payload emitted at an Agent step boundary.
@@ -770,7 +842,7 @@ fn non_empty(value: String) -> Option<String> {
 mod tests {
     use super::{
         AgentError, AgentErrorKind, AgentEvent, AgentInput, AgentOutcome, AgentOutcomeKind,
-        ApprovalRequest, ExternalRecoveryKind, QueuedPivotTurnInput, StepBoundary,
+        ApprovalRequest, ExternalRecoveryKind, Notification, QueuedPivotTurnInput, StepBoundary,
         ToolCallFinished, ToolCallStarted,
     };
     use crate::{
@@ -1001,6 +1073,74 @@ mod tests {
         for (outcome, expected_kind) in outcomes {
             assert_eq!(outcome.kind(), expected_kind);
             assert_json_round_trip(AgentEvent::Done(outcome));
+        }
+    }
+
+    #[test]
+    fn notifications_round_trip_and_bridge_to_agent_events() {
+        let boundary = StepBoundary::new(
+            step_id(),
+            zero_boundary(),
+            Some(TraceNodeId::new("step-trace")),
+        );
+        let started = ToolCallStarted::new(step_id(), tool_call_id(), tool_call(), None);
+        let finished = ToolCallFinished::new(step_id(), tool_call_id(), tool_response(), None);
+        let llm = StreamEvent::BlockDelta {
+            id: BlockId::new("text-1"),
+            delta: Delta::Text("hello".to_owned()),
+        };
+
+        let cases = [
+            (Notification::Llm(llm.clone()), AgentEvent::Llm(llm)),
+            (
+                Notification::StepBoundary(boundary.clone()),
+                AgentEvent::StepBoundary(boundary),
+            ),
+            (
+                Notification::ToolCallStarted(started.clone()),
+                AgentEvent::ToolCallStarted(started),
+            ),
+            (
+                Notification::ToolCallFinished(finished.clone()),
+                AgentEvent::ToolCallFinished(finished),
+            ),
+        ];
+
+        for (notification, expected_event) in cases {
+            assert_json_round_trip(notification.clone());
+
+            // The bridge maps each notification variant-for-variant onto the
+            // legacy stream, preserving its payload.
+            assert_eq!(AgentEvent::from(notification.clone()), expected_event);
+
+            // The notification stays wire-compatible with the bridged event.
+            assert_eq!(
+                serde_json::to_value(&notification).expect("serialize notification"),
+                serde_json::to_value(&expected_event).expect("serialize agent event"),
+            );
+        }
+    }
+
+    #[test]
+    fn notification_excludes_approval_and_done_variants() {
+        // AwaitingApproval is a request and Done is a terminal state, so
+        // neither has a Notification counterpart. Their tagged encodings must
+        // fail to decode as a Notification even though they still decode as an
+        // AgentEvent, which pins the notification variant set structurally.
+        let approval = AgentEvent::AwaitingApproval(ApprovalRequest::new(
+            step_id(),
+            tool_call_id(),
+            tool_call(),
+            None,
+        ));
+        let done = AgentEvent::Done(AgentOutcome::Completed);
+
+        for event in [approval, done] {
+            let encoded = serde_json::to_value(&event).expect("serialize agent event");
+            serde_json::from_value::<AgentEvent>(encoded.clone())
+                .expect("agent event still decodes");
+            serde_json::from_value::<Notification>(encoded)
+                .expect_err("notification must not carry approval/done variants");
         }
     }
 
