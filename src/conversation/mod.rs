@@ -26,8 +26,10 @@
 //! artifacts, and provenance before atomically replacing the projection,
 //! [`Conversation::effective_view`] renders a head-clipped Client-ready
 //! committed context, and [`Conversation::pending_context`] keeps frozen
-//! pending payloads separate from active partials. Raw messages remain
-//! unchanged.
+//! pending payloads separate from active partials. [`ConversationSnapshot`]
+//! records committed consistency-point facts for persistence without serializing
+//! pending state, derived indexes, shared-memory handles, clients, registries,
+//! or runtime strategy/trigger objects. Raw messages remain unchanged.
 
 pub mod boundary;
 pub mod config;
@@ -36,6 +38,7 @@ mod history;
 pub mod id;
 pub mod message;
 pub mod pending;
+pub mod persistence;
 pub mod projection;
 pub mod turn;
 mod validation;
@@ -45,6 +48,7 @@ pub use config::ConversationConfig;
 pub use error::{
     BoundaryError, CancelError, CommitError, CompactionError, ContentBlockKind, ConversationError,
     ForkError, PairingMessageKind, PendingMessageError, PendingTurnError, ProjectionError,
+    SnapshotError,
 };
 pub use history::{ToolCallIndex, ToolCallLocation, ToolCallLocationKind};
 pub use id::{ArtifactId, ConversationId, MessageId, ToolCallId, TurnId};
@@ -53,6 +57,9 @@ pub use pending::{
     AssistantFinish, CANCELLED_TOOL_RESULT_TEXT, CancelDisposition, CancelOutcome,
     CancelledToolResult, FrozenMessage, PendingMessage, PendingToolCall, PendingTurn,
     PendingTurnPhase, ToolCallMapping,
+};
+pub use persistence::{
+    CONVERSATION_SNAPSHOT_SCHEMA_VERSION, ConversationSnapshot, ConversationSnapshotHistory,
 };
 pub use projection::{
     Artifact, ArtifactDraft, ArtifactProvenance, CheckedTurnRange, CompactCtx, CompactionInput,

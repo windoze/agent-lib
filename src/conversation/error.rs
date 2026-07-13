@@ -895,6 +895,17 @@ pub enum CompactionError {
     },
 }
 
+/// A consistency-point snapshot request was rejected before reading runtime state.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum SnapshotError {
+    /// Snapshotting requires a committed boundary and cannot include pending work.
+    #[error("snapshot cannot be created while pending turn {turn_id} is active")]
+    PendingTurn {
+        /// Uncommitted transaction preventing a snapshot.
+        turn_id: TurnId,
+    },
+}
+
 /// A Conversation operation failed without changing committed state.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ConversationError {
@@ -933,6 +944,10 @@ pub enum ConversationError {
     /// A runtime compaction extension failed before projection application.
     #[error("compaction runtime failed: {0}")]
     Compaction(#[from] CompactionError),
+
+    /// A consistency-point snapshot could not be produced.
+    #[error("snapshot rejected: {0}")]
+    Snapshot(#[from] SnapshotError),
 
     /// History and version cannot be advanced together because the version is exhausted.
     #[error("commit cannot advance history and version atomically from version {current_version}")]

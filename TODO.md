@@ -1125,7 +1125,7 @@ client 与调度属于外部运行时，不能序列化进 Conversation 或把 A
 
 ## Milestone 5 — Serde 与持久化
 
-### M5-1 [TODO] Boundary 一致点 `ConversationSnapshot`
+### M5-1 [DONE] Boundary 一致点 `ConversationSnapshot`
 
 **前置依赖**：M4-R。
 
@@ -1152,6 +1152,34 @@ client 与调度属于外部运行时，不能序列化进 Conversation 或把 A
   runtime-only 字段不出现在 JSON。
 - 依次通过 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、snapshot 聚焦测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和
+  `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增 `conversation::persistence` 模块并公开 versioned
+  `ConversationSnapshot`、`ConversationSnapshotHistory` 与
+  `CONVERSATION_SNAPSHOT_SCHEMA_VERSION`。snapshot 记录 id/config、structural version、
+  retained raw closed Turn facts、当前 addressable lineage、logical head、fork ceiling、
+  `ForkOrigin`、projection spans 及 retained artifacts/provenance；raw Turn 通过
+  validator-facing data shape 写入，每个 retained Turn/message fact 在同一 snapshot 中只出现一次。
+- 新增 `Conversation::snapshot()` 和分类 `SnapshotError::PendingTurn`。snapshot 只在
+  `pending == None` 的 committed consistency point 成功；存在 active text/tool partial、
+  open call 或 ready-to-commit pending 时均拒绝，不自动 finish、cancel、discard，也不改变
+  Conversation 的 history/head/projection/index/pending/version。
+- snapshot serde 形状明确排除 `PendingTurn`、`PendingMessage`、Accumulator、`ToolCallIndex`、
+  `Arc`/lock、client/registry handle 和 runtime strategy/trigger object；projection 内只保留
+  data-only `StrategyRef`、artifact messages、covers 和 token accounting。M5-1 未实现 restore
+  或 DB-neutral rows，后续仍须按 M5-2/M5-3 重新校验事实并重建派生 index。
+- 新增 6 个 persistence snapshot 聚焦测试，覆盖线性 text+tool history round-trip、revert 后
+  detached raw suffix 与 current lineage 分离、fork child origin/ceiling 且不包含父 suffix、
+  compaction artifact/provenance round-trip、runtime-only JSON key 缺席，以及 active partial、
+  open call、ready-to-commit pending 的原子拒绝。
+- 同步 README、crate docs 与 conversation 模块 rustdoc 的当前能力描述；阶段顺序和完成标准
+  未变化，故未修改 `PLAN.md`。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test conversation::persistence -- --nocapture`（6 passed）；1800 秒硬上限内
+  `cargo test --all --all-targets`（275 个库测试与 3 个离线集成测试 passed、7 ignored、
+  0 failed，所有 example targets passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；
   `git diff --check`。
 
 ### M5-2 [TODO] 受检 restore 与派生索引重建

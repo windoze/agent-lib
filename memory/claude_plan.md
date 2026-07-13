@@ -1,50 +1,42 @@
-# 执行计划与进度记录
+# 执行计划
 
-日期：2026-07-13
+## 约束理解
 
-说明：本文件记录本次调用的可审计执行计划、关键决策、进度和验证结果。不会记录逐字隐含思维链，但会保留足够详细的步骤与依据，便于检查执行过程。
+- 本轮只处理 `TODO.md` 中第一个标题未带 `[DONE]` 的任务，完成后停止。
+- `TODO.md` 是任务排序、验收要求和完成记录的唯一权威来源；`PLAN.md` 只在阶段级计划变化时更新。
+- 在选择当前任务前不做开放式问题扫查；只处理会阻塞当前任务、使当前任务行为无效，或由当前任务引入的直接回归。
+- 任何观察到且未被明确排期的测试失败都必须修复，或在 `TODO.md` 中加入最小必要的前置任务，且不能把当前任务标记完成。
+- 不接受 workaround；如发现规格不匹配且阻塞当前任务，先修复或加入前置任务并提交后停止。
+- 输出、进度记录和最终答复使用中文。
 
-## 当前目标
+## 步骤计划
 
-按照 `TODO.md` 的权威顺序，完成第一个标题未带 `[DONE]` 的任务，然后停止；完成后必须更新 `TODO.md` 的完成记录并提交 Git commit。
+1. 读取 `TODO.md`，按标题顺序找出第一个未带 `[DONE]` 的任务。
+2. 检查最近一次提交信息；若它明确提到与当前任务直接相关的未完成问题，将其纳入当前任务或作为前置项记录到 `TODO.md`。
+3. 只读取当前任务所需的相关代码、测试和文档，确认验收要求、依赖和现有实现边界。
+4. 如任务可直接完成，按仓库现有结构实施；如发现必须先补的具体前置问题，更新 `TODO.md` 后提交并停止。
+5. 在编辑前记录即将修改的范围；使用小而聚焦的补丁更新代码、测试和必要文档。
+6. 按要求先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，通过后运行相关测试和必要的完整测试套件；完整测试套件超时不超过 30 分钟。
+7. 若测试失败，判断是否与当前任务相关或未被明确排期；修复或在 `TODO.md` 中加入前置任务，不能忽略。
+8. 验证通过后，在 `TODO.md` 当前任务标题加 `[DONE]`，并更新完成记录，记录实现摘要和验证命令。
+9. 检查工作区变更，提交本轮所有相关未提交文件，提交信息包含任务 id 和清晰说明。
+10. 停止，不继续处理下一个任务。
 
-## 初始执行计划
+## 当前状态
 
-1. 读取 `TODO.md`，按标题前缀 `[DONE]` 判断第一个未完成任务。
-2. 检查最新 commit 信息，只在其明确提到且与当前任务直接相关的未完成问题时，把该问题纳入当前任务或作为前置项写入 `TODO.md`。
-3. 读取当前任务相关的 `PLAN.md`、源码、测试和文档上下文，避免开放式历史问题扫描。
-4. 判断任务是否可以作为现有执行单元完成；除非存在具体不可绕过的前置阻塞，否则不拆分任务。
-5. 实现当前任务要求，优先沿用仓库现有模块边界、类型和测试风格。
-6. 在编辑前记录将修改的范围；使用小而集中的补丁逐步修改，并在关键步骤后更新本文件。
-7. 按要求先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，通过后运行 `cargo test --all --all-targets`，完整测试超时不超过 30 分钟。
-8. 若发现未被后续任务明确覆盖的失败测试，必须修复，或把最小前置修复任务插入 `TODO.md` 后提交并停止。
-9. 任务完成后，将 `TODO.md` 中当前任务标题加上 `[DONE]` 并补充完成记录；只有阶段计划确实改变时才更新 `PLAN.md`。
-10. 查看 Git 状态，提交本次任务相关的全部未提交更改；若是恢复先前未完成任务，则把当前未提交文件一起纳入同一次提交。
-11. 停止，不推进下一个任务。
+- 已读取 `TODO.md` 并定位到本轮唯一任务：`M5-1 [TODO] Boundary 一致点 ConversationSnapshot`。
+- 该任务要求新增 versioned `ConversationSnapshot` schema 与 `Conversation::snapshot()`，只在无 pending 的 committed boundary 成功，保存恢复有效视图所需 data-only facts，并排除 pending、Accumulator、ToolCallIndex、runtime strategy/trigger/client 等运行时资源。
+- 已检查最新提交：`4ac511f [M4-R] Review projection compaction boundaries`，没有直接相关的未完成事项。
+- 工作区存在未跟踪 `docs/agent-layer.md`，当前判断与 M5-1 无关，本轮不改动也不纳入提交。
+- 设计决策：新增 `conversation::persistence` 模块，snapshot 公开 versioned data shape 与只读 getter，内部使用 validator-facing `TurnData` 复制 live closed Turn facts；记录 raw turn facts 一次、当前 lineage turn ids、head turn count、fork ceiling turn count、structural version、origin、projection/artifacts。
 
-## 进度
+## M5-1 细化计划
 
-- 已建立本次执行计划文件，下一步读取 `TODO.md` 识别第一个未完成任务。
-- 已读取 `TODO.md`：首个标题未带 `[DONE]` 的任务是 `M4-R [TODO] Milestone 4 Review`。
-- 下一步检查最新 commit 是否明确提到与 M4-R 直接相关的未完成问题；随后只围绕 projection/compaction/revert/fork Review 范围读取源码与测试。
-- 最新 commit 为 `[M4-4] Add compaction strategy trigger extension points`，未在提交标题/统计中显示 M4-R 直接相关的未完成事项。
-- 当前工作树已有未跟踪 `docs/agent-layer.md`，暂判定与 M4-R 无关并保持不动；本次计划只提交 M4-R 相关改动和本进度文件。
-- 已新增 M4-R Review 组合矩阵测试 `src/conversation/projection/tests/review.rs`，并在 projection 测试模块挂载。
-- 新测试覆盖：tiered + consolidated compaction 不改 raw、旧 artifact provenance 保留、revert 进入 compacted cover 时 head-clipped raw 回退、redo 后摘要恢复、fork child 不继承父摘要/未来 suffix、pending 时 `apply_compaction` 原子拒绝且 pending 只能通过 `pending_context` 显式可见。
-- 下一步执行 `cargo fmt --all` 和聚焦测试 `cargo test conversation::projection::tests::review -- --nocapture`。
-- `cargo fmt --all` 已通过。
-- `cargo test conversation::projection::tests::review -- --nocapture` 已通过：1 passed。
-- 下一步执行 `cargo clippy --all-targets -- -D warnings`。
-- `cargo clippy --all-targets -- -D warnings` 已通过。
-- 下一步执行 projection 聚焦测试和完整测试套件。
-- `cargo test conversation::projection -- --nocapture` 已通过：25 passed。
-- `cargo test --all --all-targets` 已通过：269 个库测试与 3 个离线集成测试 passed，7 ignored，examples test targets passed。
-- 下一步执行 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 已通过。
-- `git diff --check` 已通过。
-- 下一步将 `TODO.md` 中 `M4-R` 标记为 `[DONE]` 并补充完成记录；不更新 `PLAN.md`，因为没有阶段级计划变化。
-- `TODO.md` 已将 `M4-R` 标记为 `[DONE]` 并补充完成记录；`PLAN.md` 未修改。
-- 下一步重新执行 `git diff --check`，然后查看 Git 状态并提交 M4-R 相关文件。
-- 最终 `git diff --check` 已通过。
-- 当前待提交的 M4-R 相关文件：`TODO.md`、`memory/claude_plan.md`、`src/conversation/projection/tests.rs`、`src/conversation/projection/tests/review.rs`。
-- 未跟踪 `docs/agent-layer.md` 仍判定为与本任务无关，保持不提交。
+1. [DONE] 检查最近提交信息，确认是否有直接关联 M5-1 的未完成事项。
+2. [DONE] 阅读当前 conversation/history/projection/boundary 模块和相关测试，找出 snapshot 应使用的内部事实来源与公开/私有边界。
+3. [DONE] 设计并实现 `ConversationSnapshot` 数据结构：显式 schema version，包含 id/config、raw closed turns、active lineage/head、structural version、fork origin/ceiling、projection 与 artifacts/provenance。
+4. [DONE] 实现 `Conversation::snapshot()` 与分类错误：有 pending 时拒绝且不改变原状态；snapshot 不序列化 pending、Accumulator、ToolCallIndex、Arc/lock、client/registry/strategy/trigger object，只保存 data-only `StrategyRef` 等事实。
+5. [DONE] 添加聚焦测试：线性历史、revert 后 detached suffix、fork origin、projection/artifacts serde round-trip、共享事实不重复，以及 text/tool/open/ready pending 下 snapshot 拒绝与 runtime-only 字段 JSON 缺席。
+6. [DONE] 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、snapshot 聚焦测试、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 和 `git diff --check`。
+7. [DONE] 验证通过后更新 `TODO.md`：将 `M5-1` 标题标为 `[DONE]` 并补充完成记录。
+8. [DONE] 检查工作区并提交本轮相关变更后停止。
