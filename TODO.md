@@ -1629,7 +1629,7 @@ handler 派生子 agent 并再开一层 drain 递归驱动,并从"当前 drain s
   未改任何 doctest 代码块),按文档变更规则复用 M5-R 的最近一次全绿 `cargo test --all
   --all-targets` 结果,不重跑全套。
 
-### [TODO] M6-2 端到端验收示例:attended 父 + headless 子
+### [DONE] M6-2 端到端验收示例:attended 父 + headless 子
 
 **前置依赖**:M6-1。
 
@@ -1651,6 +1651,34 @@ handler 派生子 agent 并再开一层 drain 递归驱动,并从"当前 drain s
 
 - 聚焦运行该示例/测试并断言终态;`cargo test --all --all-targets` 含新端到端用例全绿;
   其余全套命令。
+
+**完成记录**:
+
+- 新增 `tests/agent_effect_e2e.rs`(选 `tests/`,仅用 crate 公共 API,`cargo test` 直接可跑),
+  4 个 `#[tokio::test]`,全部离线 fake(`FakeClient: LlmClient`、`FakeToolRegistry: ToolRegistry`、
+  `RequireApprovalPolicy`、policy interaction 后端 `CountingApproveInteraction`)。子 agent 用真实
+  `DefaultAgentMachine` 跑一个受审批门控的 weather 工具往返;`SeqIds` 用单一共享 `AtomicU64`
+  给父机、每个子机与 sub-agent trace 节点铸唯一 uuid id(避免 trace-node id 撞车)。
+- **同图两跑(核心验收)**:
+  - `attended_parent_serves_headless_child_via_pop`:脚本父机 `ParentBatchMachine` 在一个 turn 内
+    发 `[NeedTool, NeedSubagent]`;父 scope 挂 tool+interaction(policy)+`DrivingSubagentHandler`;
+    子 scope **headless**(charging LLM + `ToolRegistryHandler`,不挂 interaction)。子
+    `NeedInteraction(approval)` pop 到父 policy 后端被批准 → 受控 weather 工具才执行。断言:父
+    Done;父 tool 兑现 1 次;父 interaction 服务 1 次;子 registry 执行 1 次、client 2 次请求;
+    含 tool 与 subagent 的一个 turn。
+  - `same_child_spec_attended_resolves_in_place`:**同一子 spec/机器**改挂 interaction=policy 后
+    直接驱动,审批就地兑现(0 pop),committed 会话为 user/assistant-tooluse/tool-result/终答
+    四条,终答文本一致。证明"attended vs headless = 仅 scope wiring 不同,子无需任何配置"。
+- **并发兑现**:`batch_requirements_are_fulfilled_concurrently`——模型一次请求两个工具调用,
+  `ConcurrentToolHandler` 记录峰值在飞数=2(串行只会是 1),验证 decision B 的批并发兑现。
+- **cancel 传播**:`parent_cancel_propagates_and_abandons_child`——父 ctx 取消后经
+  `DrivingSubagentHandler::fulfill` 派生子;子 drain 走 never-resume 放弃首个 requirement,
+  子 client 0 次、registry 0 次、共享 ledger 0 token,结果 `Subagent(Ok)`。
+- **budget 聚合**:核心用例中 `ChargingLlmHandler` 把子模型 usage(18 tokens)充到 `derive_child`
+  共享 ledger;断言父 ctx `budget().snapshot().used().tokens() == 18`。
+- **验证全绿**:`cargo fmt --all`;`cargo clippy --all-targets -- -D warnings` 0 warning;
+  `cargo test --all --all-targets` 全绿(lib 435 + 集成含本文件新增 4 用例,0 failed);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` clean;`git diff --check` clean。
 
 ### [TODO] M6-R Milestone 6 与迁移总 Review
 
