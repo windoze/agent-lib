@@ -12,20 +12,24 @@ use crate::{
         AgentError, AgentEvent, AgentInput, AgentOutcome, AgentState, DeclaredOnlyToolRegistry,
         LoopCursor, NoToolExecutionIds, PivotMessage, RunContext, StepBoundary, StepId,
         ToolCallFinished, ToolCallStarted, ToolExecutionIds, ToolFailurePolicy, ToolRegistry,
-        ToolRuntimeError, TraceNodeId, state::CancelRecoveryReason,
+        ToolRuntimeError, TraceNodeId,
+        state::{CancelRecoveryReason, PivotSource, QueuedPivot},
     },
     client::{ChatRequest, ClientError, LlmClient, Response},
     conversation::{
-        AssistantFinish, CancelDisposition, MessageId, ToolCallId, ToolCallMapping, TurnMeta,
+        AssistantFinish, CancelDisposition, MessageId, MessageMeta, ToolCallId, ToolCallMapping,
+        TurnId, TurnMeta,
     },
     model::{
         content::ContentBlock,
+        message::Message,
         tool::{ToolCall, ToolResponse},
     },
     stream::StreamEvent,
 };
 use async_trait::async_trait;
 use futures::{StreamExt, future::join_all, stream};
+use serde_json::{Map, Value};
 use std::{
     collections::VecDeque,
     fmt,
@@ -236,8 +240,37 @@ impl LoopRuntime {
         input: AgentInput,
         stream: bool,
     ) -> Result<PreparedAssistantCall, AgentError> {
-        let user = match input {
-            AgentInput::UserMessage(user) => user,
+        let initial = match input {
+            AgentInput::UserMessage(user) => {
+                let state = lock_agent_state(&self.state)?;
+                if !state.queued_pivots().is_empty() {
+                    return Err(AgentError::QueuedPivotPending);
+                }
+                InitialUserTurn {
+                    turn_id: user.turn_id(),
+                    message_id: user.message_id(),
+                    message: user.message().clone(),
+                    assistant_message_id: user.assistant_message_id(),
+                    step_id: user.step_id(),
+                    queued_pivot: false,
+                }
+            }
+            AgentInput::QueuedPivotTurn(input) => {
+                let state = lock_agent_state(&self.state)?;
+                let pivot = state
+                    .queued_pivots()
+                    .first()
+                    .cloned()
+                    .ok_or(AgentError::NoQueuedPivot)?;
+                InitialUserTurn {
+                    turn_id: input.turn_id(),
+                    message_id: pivot.message_id(),
+                    message: pivot.message().clone(),
+                    assistant_message_id: input.assistant_message_id(),
+                    step_id: input.step_id(),
+                    queued_pivot: true,
+                }
+            }
             AgentInput::Resume(_) => {
                 return Err(AgentError::Other(
                     "resume feed input is not supported by the default LLM driver".to_owned(),
@@ -248,16 +281,22 @@ impl LoopRuntime {
         {
             let mut state = lock_agent_state(&self.state)?;
             if let Err(error) = state.conversation_mut().begin_turn(
-                user.turn_id(),
-                user.message_id(),
-                user.message().clone(),
+                initial.turn_id,
+                initial.message_id,
+                initial.message.clone(),
             ) {
                 state.transition_cursor(LoopCursor::Idle)?;
                 return Err(AgentError::Conversation(error));
             }
+            if initial.queued_pivot {
+                let removed = state
+                    .dequeue_pivot()
+                    .expect("queued pivot was peeked before begin_turn");
+                debug_assert_eq!(removed.message_id(), initial.message_id);
+            }
         }
 
-        self.prepare_assistant_call(user.step_id(), user.assistant_message_id(), stream)
+        self.prepare_assistant_call(initial.step_id, initial.assistant_message_id, stream)
     }
 
     fn prepare_assistant_call(
@@ -384,13 +423,15 @@ impl LoopRuntime {
                     .conversation_mut()
                     .commit_pending(TurnMeta::default())?;
                 let boundary = state.conversation().head();
+                let metadata = deferred_pivot_metadata(&state);
                 state.transition_cursor(LoopCursor::Idle)?;
 
                 Ok(AssistantStepOutcome::Final(vec![
-                    AgentEvent::StepBoundary(StepBoundary::new(
+                    AgentEvent::StepBoundary(StepBoundary::with_metadata(
                         prepared.step_id,
                         boundary,
                         prepared.trace_node_id.clone(),
+                        metadata,
                     )),
                     AgentEvent::Done(AgentOutcome::Completed),
                 ]))
@@ -465,6 +506,7 @@ impl LoopRuntime {
         }
 
         self.append_tool_results(results)?;
+        events.push(self.apply_pivots_at_pending_step_boundary(prepared)?);
         Ok(events)
     }
 
@@ -534,6 +576,37 @@ impl LoopRuntime {
                 .append_tool_response(message_id, response)?;
         }
         Ok(())
+    }
+
+    fn apply_pivots_at_pending_step_boundary(
+        &self,
+        prepared: &PreparedAssistantCall,
+    ) -> Result<AgentEvent, AgentError> {
+        let mut state = lock_agent_state(&self.state)?;
+        let boundary = state.conversation().head();
+        let mut records = Vec::new();
+
+        while let Some(pivot) = state.dequeue_pivot() {
+            let record = match state.conversation_mut().inject_user_message(
+                boundary,
+                pivot.message_id(),
+                pivot.message().clone(),
+                pivot_message_meta(&pivot),
+            ) {
+                Ok(()) => pivot_record(&pivot, "applied", "pending_turn", None),
+                Err(error) => {
+                    pivot_record(&pivot, "rejected", "pending_turn", Some(error.to_string()))
+                }
+            };
+            records.push(record);
+        }
+
+        Ok(AgentEvent::StepBoundary(StepBoundary::with_metadata(
+            prepared.step_id,
+            boundary,
+            prepared.trace_node_id.clone(),
+            pivot_metadata(records),
+        )))
     }
 
     fn prepare_next_assistant_call(
@@ -696,6 +769,15 @@ struct PreparedAssistantCall {
     trace_node_id: Option<TraceNodeId>,
 }
 
+struct InitialUserTurn {
+    turn_id: TurnId,
+    message_id: MessageId,
+    message: Message,
+    assistant_message_id: MessageId,
+    step_id: StepId,
+    queued_pivot: bool,
+}
+
 enum AssistantStepOutcome {
     Final(Vec<AgentEvent>),
     ToolCalls(Vec<ToolInvocation>),
@@ -742,6 +824,65 @@ fn build_chat_request(
         temperature: model.temperature(),
         stream,
         provider_extras: model.provider_extras().cloned(),
+    }
+}
+
+fn deferred_pivot_metadata(state: &AgentState) -> Map<String, Value> {
+    pivot_metadata(
+        state
+            .queued_pivots()
+            .iter()
+            .map(|pivot| pivot_record(pivot, "deferred", "next_turn", None))
+            .collect(),
+    )
+}
+
+fn pivot_metadata(records: Vec<Value>) -> Map<String, Value> {
+    let mut metadata = Map::new();
+    if !records.is_empty() {
+        metadata.insert("pivots".to_owned(), Value::Array(records));
+    }
+    metadata
+}
+
+fn pivot_record(
+    pivot: &QueuedPivot,
+    status: &'static str,
+    target: &'static str,
+    error: Option<String>,
+) -> Value {
+    let mut record = Map::new();
+    record.insert("status".to_owned(), Value::String(status.to_owned()));
+    record.insert("target".to_owned(), Value::String(target.to_owned()));
+    record.insert(
+        "message_id".to_owned(),
+        serde_json::to_value(pivot.message_id()).expect("message id serializes"),
+    );
+    record.insert(
+        "source".to_owned(),
+        serde_json::to_value(pivot.source()).expect("pivot source serializes"),
+    );
+    if let Some(error) = error {
+        record.insert("error".to_owned(), Value::String(error));
+    }
+    Value::Object(record)
+}
+
+fn pivot_message_meta(pivot: &QueuedPivot) -> MessageMeta {
+    let mut extra = Map::new();
+    extra.insert(
+        "pivot_source".to_owned(),
+        serde_json::to_value(pivot.source()).expect("pivot source serializes"),
+    );
+    MessageMeta::new(Some(pivot_source_label(pivot.source())), extra)
+}
+
+fn pivot_source_label(source: &PivotSource) -> String {
+    match source {
+        PivotSource::Human => "pivot:human".to_owned(),
+        PivotSource::Coordinator { agent_id } => format!("pivot:coordinator:{agent_id}"),
+        PivotSource::Skill { skill_id } => format!("pivot:skill:{skill_id}"),
+        PivotSource::Host { label } => format!("pivot:host:{label}"),
     }
 }
 

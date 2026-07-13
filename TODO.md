@@ -513,7 +513,7 @@ pending turn 追加 `Role::User` message。当前 Conversation 的 `begin_turn` 
   `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
   `cargo test --doc`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
-### M3-2 [TODO] Pivot queue 与 `interject` 软转向
+### [DONE] M3-2 Pivot queue 与 `interject` 软转向
 
 **前置依赖**：M3-1。
 
@@ -537,6 +537,35 @@ pending turn 追加 `Role::User` message。当前 Conversation 的 `begin_turn` 
 - 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦 pivot 测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 扩展 `AgentInput`，新增 `QueuedPivotTurnInput`/`AgentInput::QueuedPivotTurn`；queued pivot
+  自身仍只携带 `MessageId`、`Role::User` payload 和来源 metadata，下一 turn 所需的
+  `TurnId`、assistant message id 与 `StepId` 继续由调用方显式注入。
+- `DefaultAgentLoop::interject` 通过共享 `AgentState` mutex 将 `PivotMessage` 按 FIFO 入队，
+  不打断当前 LLM stream；从 unchecked serde 构造出的非 user pivot 会在入队时被
+  `AgentState` 校验拒绝并返回分类 `AgentErrorKind::AgentState`。
+- 默认 loop 在 tool results 全部回灌之后、下一次 assistant request 之前发出 step-boundary
+  求值点，drain queued pivots 并调用 `Conversation::inject_user_message` 注入同一 pending turn；
+  注入消息的来源写入 `MessageMeta`，不改 provider-neutral `Message` payload。
+- final assistant commit 后若仍有 queued pivots，`StepBoundary` metadata 会记录
+  `status=deferred,target=next_turn`，队列保持不变；后续 `AgentInput::QueuedPivotTurn`
+  会从队首 pivot 启动下一 turn。若普通 `AgentInput::UserMessage` 在队列未清空时启动，
+  loop 会返回 `QueuedPivotPending`，避免绕过 FIFO。
+- `StepBoundary` metadata 以 `pivots` 数组记录 `applied`、`deferred` 或 `rejected`，包含
+  pivot `message_id`、来源和目标；重复 message id 等 Conversation 注入失败会记录为
+  rejected 并从队列移除，当前 pending turn 继续推进，不把无效 pivot 留在队列中反复阻塞。
+- 更新 crate 根文档、`README.md` 与 `docs/agent-layer.md`，说明 Agent 层当前已支持
+  `interject` pivot queue、tool-result 同 turn 注入、纯文本/final boundary 下一 turn defer
+  和 queued-pivot turn 输入边界；未发现需要更新 `PLAN.md` 的阶段级计划变化。
+- 聚焦测试覆盖 streaming text 中 interject 延迟生效、queued pivot 作为下一 turn 初始 user、
+  tool-result boundary 同 turn FIFO 注入、多 pivot 顺序、rejected pivot 记录并丢弃、非法
+  pivot role 入队错误、事件 metadata 与 committed Conversation messages/request shape。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test agent::loop_driver::default --all-targets`；`cargo test agent::event --all-targets`；
+  `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
+  `cargo test --doc`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
 ### M3-3 [TODO] Turn-boundary reconfig：skill/tool/system 变更排队
 

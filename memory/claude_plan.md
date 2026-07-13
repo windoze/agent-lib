@@ -1,43 +1,66 @@
 # 执行计划
 
-## 约束说明
+## 约束
 
-- 本文件记录可审计的执行计划、决策依据、关键进展和验证结果。
-- 不记录不可公开的隐藏推理过程；后续如计划变化或关键步骤完成，会及时更新本文件。
-- 本轮只完成 `TODO.md` 中第一个标题未带 `[DONE]` 的任务，然后提交并停止。
+- 输出和过程记录使用中文。
+- `TODO.md` 是任务顺序和完成状态的权威来源。
+- 本轮只完成第一个标题未带 `[DONE]` 的任务，完成后提交并停止。
+- 不做开放式历史问题扫描；只处理当前任务及其直接阻塞项。
+- 不公开内部推理链；本文件记录可审计的执行计划、依据、进度和变更。
 
-## 初始步骤
+## 初始计划
 
-1. 读取 `TODO.md`，按文件顺序定位第一个标题未带 `[DONE]` 的任务。
-2. 查看最新提交信息，仅当最新提交明确提到与当前任务直接相关的未完成问题时，将其纳入当前任务或作为前置任务写回 `TODO.md`。
-3. 阅读当前任务相关的 `PLAN.md`、代码、测试和文档上下文，确认实现边界、依赖、验收要求和是否存在阻塞项。
-4. 如任务可直接完成，则按现有架构和项目风格实现；如发现必须先修复的具体前置问题，则在 `TODO.md` 中插入最小前置任务，提交后停止。
-5. 运行要求的格式化、lint 和测试：优先 `cargo fmt --all`，再 `cargo clippy --all-targets -- -D warnings`，最后在需要时运行 `cargo test --all --all-targets`，完整测试超时不超过 30 分钟。
-6. 若验证通过，更新 `TODO.md`：给当前任务标题加 `[DONE]`，填写完成记录；仅在阶段计划实际变化时更新 `PLAN.md`。
-7. 检查 git diff，提交本轮全部相关变更，提交信息包含任务编号和简洁说明。
-8. 停止，不继续处理下一个任务。
+1. 读取 `TODO.md`，按标题是否带 `[DONE]` 判断第一个未完成任务。
+2. 查看与该任务直接相关的 `PLAN.md`、源码和测试，确认范围、依赖和验收要求。
+3. 检查当前工作区状态，避免覆盖用户已有改动。
+4. 实现该任务；如果发现当前任务被具体前置缺陷阻塞，则把最小前置任务插入 `TODO.md`，提交并停止。
+5. 按要求先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，最后在需要时运行 `cargo test --all --all-targets`，完整测试超时不超过 30 分钟。
+6. 若测试发现未被后续任务明确覆盖的失败，修复失败或把最小修复任务排到当前任务完成前。
+7. 更新 `TODO.md`：任务完成时在标题前加 `[DONE]`，并填写完成记录；只有阶段级计划变化时才更新 `PLAN.md`。
+8. 提交本轮所有相关改动，提交信息包含任务编号和清晰说明。
+9. 停止，不继续下一个任务。
 
-## 当前状态
+## 进度
 
-- 状态：已读取 `TODO.md` 并定位首个未完成任务。
-- 当前任务：`M3-1 Conversation step-boundary user 注入入口`。
-- 任务目标：在 Conversation pending 层增加受 Boundary/phase 校验的 user 注入入口，允许 canonical Turn 在 tool result 闭合后的 step boundary 接收额外 `Role::User` 消息并继续 assistant，同时保持纯文本 turn 行为和既有 single-user turn 行为不被破坏。
+- 已创建本计划文件。
+- 已读取 `TODO.md`，确认第一个未完成任务是 `M3-2 Pivot queue 与 interject 软转向`。
 
-## M3-1 执行步骤
+## 当前任务计划：M3-2 Pivot queue 与 `interject` 软转向
 
-1. 检查最新提交信息，确认是否有与 M3-1 直接相关的未完成问题需要纳入。结果：最新提交为 `[M2-R] Review agent loop step model`，未提到 M3-1 相关未完成缺陷。
-2. 阅读 `PLAN.md`、`docs/agent-layer.md` 中 M3-1 相关章节，以及 Conversation pending/validator/metadata 的现有实现。结果：现有 `validate_boundary` 正确地拒绝 pending turn，不能为 M3-1 放宽；需要新增 step-boundary 专用校验。
-3. 设计最小公开 API：调用方提供 `Boundary`、`MessageId`、完整 user `Message` 与注入来源 metadata；API 只在合法 pending step boundary 成功。设计：新增 `Conversation::inject_user_message`，内部使用 pending step-boundary 校验、`PendingTurn::inject_user_message` 和 envelope 级 `MessageMeta`。
-4. 更新 PendingTurn 状态机和 canonical Turn validator，使 tool results 闭合后的同 turn user 注入合法，并拒绝 active partial、open tool call、非法 role、stale/cross-conversation boundary、重复 message id 等情况。
-5. 保存注入来源 metadata，不新增 role，不暴露 raw history 或 unchecked pending mutation。
-6. 增加聚焦测试覆盖任务要求的正反路径和失败原子性。结果：`cargo test conversation::pending::turn::tests::injection --all-targets` 已通过，覆盖 8 个新增用例。
-7. 运行格式化、严格 clippy、聚焦测试、全量测试、rustdoc 和 diff check。结果：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test conversation::pending::turn --all-targets`、`cargo test conversation::validation --all-targets`、`perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`、`cargo test --doc`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`git diff --check` 均已通过；新增第 8 个 injection 测试后已重跑 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test conversation::pending::turn::tests::injection --all-targets`、完整 `cargo test --all --all-targets` 和 `git diff --check`。
-8. 更新 `TODO.md` 完成记录并提交本轮变更。状态：下一步执行。
+1. 检查最近提交信息与当前工作区状态，确认是否存在与 M3-2 直接相关的未完成前置问题或用户改动。
+2. 阅读 `docs/agent-layer.md` 中 pivot/interject/step-boundary 相关段落，以及 `src/agent`、`src/conversation` 中 M2 loop、M3-1 injection、state queue/event 定义。
+3. 设计并实现 Agent runtime 的 pivot queue 与 `AgentLoop::interject` 边界，保证入队是 thread-safe/async-safe，且只接受合法 `PivotMessage`。
+4. 在默认 loop 的合法 step boundary 求值点应用 pivot：无 pending turn 时转为下一 turn 初始 user input；tool result 后合法 boundary 时调用 Conversation 的 user injection API 注入同一 pending turn。
+5. 增加事件或 step-boundary metadata 记录 pivot accepted/applied/rejected 结果，按 `TODO.md` 要求覆盖延迟生效、顺序、text turn 下一轮、tool-result 同 turn 注入、queue cancel/drop 和非法消息。
+6. 按要求运行格式化、严格 clippy、聚焦测试、全量测试、rustdoc 和 diff check。
+7. 成功后更新 `TODO.md` 的 M3-2 标题为 `[DONE]` 并填写完成记录，提交本轮改动后停止。
 
-## M3-1 当前设计决策
+## 当前实现选择
 
-- `ConversationMessage` 增加可选 envelope metadata：`MessageMeta { source, extra }`；默认构造保持旧 JSON 形状，注入入口使用 `ConversationMessage::new_with_meta` 保存来源。
-- `Boundary::validate_boundary` 继续保持 committed-boundary 语义并拒绝 pending；新增 crate-private `Conversation::resolve_pending_step_boundary` 仅供 pending step 注入使用。
-- pending step 注入只接受当前 head boundary，且必须有 active pending turn；Boundary owner、version、position、anchor、fork ceiling 仍逐项校验。
-- `PendingTurn` 注入条件为 `AwaitingAssistant` 且当前 pending 位置位于已闭合 tool-result batch 之后；初始 user 后、active partial、awaiting mappings、awaiting results、ready-to-commit 都拒绝。
-- closed-turn validator 允许 `assistant(tool_use) -> tool_result+ -> user+ -> assistant`，但仍拒绝初始 `user -> user` 和 final assistant 后的 user。
+- `interject` 继续只接收并校验 `PivotMessage`，在 `DefaultAgentLoop` 的共享 `AgentState`
+  mutex 内按 FIFO 入队，不直接打断 active LLM stream。
+- tool-result 全部回灌之后、下一次 assistant request 之前作为 turn 内 step boundary；此处会
+  drain queued pivots 并调用 `Conversation::inject_user_message` 注入同一 pending turn。
+- final assistant commit 后没有 pending turn；此处只在 `StepBoundary` metadata 记录 queued pivots
+  已推迟到下一 turn，队列不被移除。
+- 新增显式 queued-pivot feed 输入用于下一 turn：调用方仍提供 `TurnId`、assistant message id
+  和 `StepId`，loop 从队列 FIFO 取出 pivot 的 `MessageId`/payload 作为该 turn 的初始 user。
+- 若 pivot 已成功注入 pending，随后该 pending 因错误被 discard，则该 pivot 随 pending 一起丢弃；
+  未到达边界或只是 final boundary deferred 的 pivot 保留在队列中。
+
+## 已完成步骤
+
+- 已扩展 `AgentInput`，新增 queued-pivot turn 输入，让调用方显式提供下一 turn 所需的
+  `TurnId`、assistant message id 与 `StepId`。
+- 已在 `DefaultAgentLoop` 中实现 FIFO pivot 出队、tool-result step boundary 注入、final
+  boundary deferred metadata，以及非法 queued pivot 入队错误。
+- 已新增/调整聚焦测试，覆盖 streaming text 延迟生效、queued pivot 下一 turn、tool-result
+  同 turn FIFO 注入、rejected pivot 记录和 invalid role 拒绝。
+- 已通过：`cargo fmt --all`；`cargo test agent::loop_driver::default --all-targets`；
+  `cargo test agent::event --all-targets`。
+- 已通过严格 lint：`cargo clippy --all-targets -- -D warnings`。
+- 已通过全量验证：`cargo test agent::loop_driver::default --all-targets`；
+  `cargo test agent::event --all-targets`；
+  `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
+  `cargo test --doc`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
+- 已将 `TODO.md` 中 M3-2 标题改为 `[DONE]` 并补充完成记录；`PLAN.md` 无阶段级变化，未更新。

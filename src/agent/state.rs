@@ -133,6 +133,15 @@ impl AgentState {
         Ok(())
     }
 
+    /// Removes and returns the oldest queued pivot for checked loop drivers.
+    pub(crate) fn dequeue_pivot(&mut self) -> Option<QueuedPivot> {
+        if self.queued_pivots.is_empty() {
+            None
+        } else {
+            Some(self.queued_pivots.remove(0))
+        }
+    }
+
     /// Queues a turn-boundary reconfiguration intent.
     ///
     /// # Errors

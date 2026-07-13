@@ -2,8 +2,9 @@ use super::{DefaultAgentLoop, LlmStepMode};
 use crate::{
     agent::{
         AgentErrorKind, AgentEvent, AgentInput, AgentLoop, AgentSpec, BudgetLimits, LoopCursorKind,
-        LoopPolicy, ModelRef, RunContext, RunId, StepId, ToolExecutionIds, ToolFailurePolicy,
-        ToolRegistry, ToolRuntimeError, ToolSetId, ToolSetRef, TraceNodeId, WorktreeRef,
+        LoopPolicy, ModelRef, PivotSource, QueuedPivot, RunContext, RunId, StepId,
+        ToolExecutionIds, ToolFailurePolicy, ToolRegistry, ToolRuntimeError, ToolSetId, ToolSetRef,
+        TraceNodeId, WorktreeRef,
     },
     client::{Capability, ChatRequest, ClientError, LlmClient, Response},
     conversation::{
@@ -54,10 +55,14 @@ impl FakeClient {
     }
 
     fn with_stream(events: Vec<Result<StreamEvent, ClientError>>) -> Self {
+        Self::with_streams(vec![Ok(events)])
+    }
+
+    fn with_streams(results: Vec<FakeStreamResult>) -> Self {
         Self {
             capability: Capability::default(),
             chat_results: Mutex::new(VecDeque::new()),
-            stream_results: Mutex::new(VecDeque::from([Ok(events)])),
+            stream_results: Mutex::new(VecDeque::from(results)),
             requests: Mutex::new(Vec::new()),
         }
     }
@@ -246,6 +251,12 @@ fn turn_id() -> TurnId {
         .expect("turn id")
 }
 
+fn turn_id_seed(seed: u64) -> TurnId {
+    format!("018f0d9c-7b6a-7c12-8f31-{seed:012x}")
+        .parse()
+        .expect("turn id")
+}
+
 fn user_message_id() -> MessageId {
     "018f0d9c-7b6a-7c12-8f31-123456789006"
         .parse()
@@ -416,6 +427,74 @@ fn input() -> AgentInput {
     .expect("valid user input")
 }
 
+fn queued_pivot_turn_input(seed: u64) -> AgentInput {
+    AgentInput::queued_pivot_turn(
+        turn_id_seed(seed),
+        message_id_seed(seed + 1),
+        step_id_seed(seed + 2),
+    )
+}
+
+fn pivot(seed: u64, text: &str) -> QueuedPivot {
+    QueuedPivot::new(
+        message_id_seed(seed),
+        user_message(text),
+        PivotSource::Human,
+    )
+    .expect("valid pivot")
+}
+
+fn tool_use_stream_events(provider_call_id: &str) -> Vec<Result<StreamEvent, ClientError>> {
+    let tool = BlockId::new(format!("tool-{provider_call_id}"));
+    vec![
+        Ok(StreamEvent::MessageStart {
+            role: Role::Assistant,
+        }),
+        Ok(StreamEvent::BlockStart {
+            id: tool.clone(),
+            kind: BlockKind::ToolInput {
+                tool_name: "get_weather".to_owned(),
+                tool_call_id: provider_call_id.to_owned(),
+            },
+        }),
+        Ok(StreamEvent::BlockDelta {
+            id: tool.clone(),
+            delta: Delta::Json("{\"city\":\"Shanghai\"}".to_owned()),
+        }),
+        Ok(StreamEvent::ToolInputAvailable {
+            id: tool.clone(),
+            input: json!({ "city": "Shanghai" }),
+        }),
+        Ok(StreamEvent::BlockStop { id: tool }),
+        Ok(StreamEvent::Usage(usage(5, 2))),
+        Ok(StreamEvent::MessageStop {
+            stop_reason: StopReason::normalize("tool_use"),
+        }),
+    ]
+}
+
+fn text_stream_events(text: &str) -> Vec<Result<StreamEvent, ClientError>> {
+    let block = BlockId::new(format!("text-{text}"));
+    vec![
+        Ok(StreamEvent::MessageStart {
+            role: Role::Assistant,
+        }),
+        Ok(StreamEvent::BlockStart {
+            id: block.clone(),
+            kind: BlockKind::Text,
+        }),
+        Ok(StreamEvent::BlockDelta {
+            id: block.clone(),
+            delta: Delta::Text(text.to_owned()),
+        }),
+        Ok(StreamEvent::BlockStop { id: block }),
+        Ok(StreamEvent::Usage(usage(7, 4))),
+        Ok(StreamEvent::MessageStop {
+            stop_reason: StopReason::normalize("end_turn"),
+        }),
+    ]
+}
+
 async fn collect_events(
     mut events: crate::agent::AgentEventStream,
 ) -> Result<Vec<AgentEvent>, crate::agent::AgentError> {
@@ -449,6 +528,15 @@ fn assert_tool_result(message: &Message, expected_call_id: &str, expected_status
     assert_eq!(*status, expected_status);
 }
 
+fn pivot_records(boundary: &crate::agent::StepBoundary) -> &[Value] {
+    boundary
+        .metadata()
+        .get("pivots")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .expect("pivot metadata records")
+}
+
 fn tool_loop(
     client: Arc<FakeClient>,
     registry: Arc<FakeToolRegistry>,
@@ -463,6 +551,25 @@ fn tool_loop(
         state_with_spec(spec),
         context(),
         LlmStepMode::NonStreaming,
+        tool_registry,
+        tool_ids,
+    )
+}
+
+fn streaming_tool_loop(
+    client: Arc<FakeClient>,
+    registry: Arc<FakeToolRegistry>,
+    ids: Arc<FakeToolIds>,
+    spec: AgentSpec,
+) -> DefaultAgentLoop {
+    let llm: Arc<dyn LlmClient> = client;
+    let tool_registry: Arc<dyn ToolRegistry> = registry;
+    let tool_ids: Arc<dyn ToolExecutionIds> = ids;
+    DefaultAgentLoop::with_tool_registry(
+        llm,
+        state_with_spec(spec),
+        context(),
+        LlmStepMode::Streaming,
         tool_registry,
         tool_ids,
     )
@@ -591,6 +698,116 @@ async fn streaming_text_response_forwards_llm_events_and_commits_turn() {
 }
 
 #[tokio::test]
+async fn streaming_interject_does_not_interrupt_text_and_starts_next_pivot_turn() {
+    let client = Arc::new(FakeClient::with_streams(vec![
+        Ok(text_stream_events("first")),
+        Ok(text_stream_events("pivot acknowledged")),
+    ]));
+    let llm: Arc<dyn LlmClient> = client.clone();
+    let mut loop_impl = DefaultAgentLoop::new(llm, state(), context(), LlmStepMode::Streaming);
+
+    let mut stream = loop_impl.feed(input()).await.expect("feed starts");
+    let first = stream
+        .next()
+        .await
+        .expect("first event")
+        .expect("first event succeeds");
+    assert!(matches!(
+        first,
+        AgentEvent::Llm(StreamEvent::MessageStart { .. })
+    ));
+
+    loop_impl
+        .interject(pivot(900, "change direction"))
+        .expect("pivot accepted");
+
+    let mut events = vec![first];
+    while let Some(event) = stream.next().await {
+        events.push(event.expect("stream event succeeds"));
+    }
+
+    let AgentEvent::StepBoundary(boundary) = &events[events.len() - 2] else {
+        panic!("penultimate event is final boundary");
+    };
+    let records = pivot_records(boundary);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status"], json!("deferred"));
+    assert_eq!(records[0]["target"], json!("next_turn"));
+
+    loop_impl
+        .inspect_state(|state| {
+            assert_eq!(state.queued_pivots().len(), 1);
+            assert_eq!(state.conversation().turns().len(), 1);
+            let turn = &state.conversation().turns()[0];
+            assert_eq!(turn.messages().len(), 2);
+            assert_text(turn.messages()[0].payload(), "hello");
+            assert_text(turn.messages()[1].payload(), "first");
+        })
+        .expect("inspect state");
+
+    let pivot_events = collect_events(
+        loop_impl
+            .feed(queued_pivot_turn_input(910))
+            .await
+            .expect("queued pivot feed starts"),
+    )
+    .await
+    .expect("queued pivot turn succeeds");
+    assert!(matches!(
+        pivot_events[pivot_events.len() - 2],
+        AgentEvent::StepBoundary(_)
+    ));
+
+    loop_impl
+        .inspect_state(|state| {
+            assert!(state.queued_pivots().is_empty());
+            assert_eq!(state.conversation().turns().len(), 2);
+            let turn = &state.conversation().turns()[1];
+            assert_eq!(turn.messages().len(), 2);
+            assert_text(turn.messages()[0].payload(), "change direction");
+            assert_text(turn.messages()[1].payload(), "pivot acknowledged");
+        })
+        .expect("inspect state");
+
+    let requests = client.requests();
+    assert_eq!(requests.len(), 2);
+    assert_text(&requests[0].messages[0], "hello");
+    assert_text(
+        requests[1].messages.last().expect("current pivot user"),
+        "change direction",
+    );
+}
+
+#[tokio::test]
+async fn interject_rejects_invalid_pivot_role_without_queueing() {
+    let client = Arc::new(FakeClient::with_chat(Ok(assistant_response(
+        "unused",
+        usage(1, 1),
+    ))));
+    let llm: Arc<dyn LlmClient> = client;
+    let loop_impl = DefaultAgentLoop::new(llm, state(), context(), LlmStepMode::NonStreaming);
+    let invalid: QueuedPivot = serde_json::from_value(json!({
+        "message_id": message_id_seed(950),
+        "message": {
+            "role": "assistant",
+            "content": []
+        },
+        "source": {
+            "source": "human"
+        }
+    }))
+    .expect("raw serde can construct unchecked queued pivot data");
+
+    let error = loop_impl
+        .interject(invalid)
+        .expect_err("invalid pivot role is rejected");
+    assert_eq!(error.kind(), AgentErrorKind::AgentState);
+    loop_impl
+        .inspect_state(|state| assert!(state.queued_pivots().is_empty()))
+        .expect("inspect state");
+}
+
+#[tokio::test]
 async fn client_error_discards_pending_without_committing() {
     let client = Arc::new(FakeClient::with_chat(Err(ClientError::Timeout)));
     let llm: Arc<dyn LlmClient> = client;
@@ -674,7 +891,7 @@ async fn non_streaming_single_tool_executes_result_and_commits_final_assistant()
         .await
         .expect("tool loop succeeds");
 
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), 5);
     let AgentEvent::ToolCallStarted(started) = &events[0] else {
         panic!("first event starts tool");
     };
@@ -688,9 +905,18 @@ async fn non_streaming_single_tool_executes_result_and_commits_final_assistant()
     assert_eq!(finished.step_id(), step_id());
     assert_eq!(finished.call_id(), tool_call_id_seed(100));
     assert_eq!(finished.response().status, ToolStatus::Ok);
-    assert!(matches!(events[2], AgentEvent::StepBoundary(_)));
+    let AgentEvent::StepBoundary(tool_boundary) = &events[2] else {
+        panic!("third event is tool-result step boundary");
+    };
+    assert_eq!(tool_boundary.step_id(), step_id());
+    assert_eq!(tool_boundary.boundary().turn_count(), 0);
+    assert!(tool_boundary.metadata().is_empty());
+    let AgentEvent::StepBoundary(final_boundary) = &events[3] else {
+        panic!("fourth event is final step boundary");
+    };
+    assert_eq!(final_boundary.boundary().turn_count(), 1);
     assert_eq!(
-        events[3],
+        events[4],
         AgentEvent::Done(crate::agent::AgentOutcome::Completed)
     );
 
@@ -721,6 +947,169 @@ async fn non_streaming_single_tool_executes_result_and_commits_final_assistant()
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, tool_call_id_seed(100));
     assert_eq!(calls[0].1.name, "get_weather");
+}
+
+#[tokio::test]
+async fn streaming_tool_result_boundary_injects_queued_pivots_fifo_in_same_turn() {
+    let client = Arc::new(FakeClient::with_streams(vec![
+        Ok(tool_use_stream_events("call-weather")),
+        Ok(text_stream_events("used the pivot")),
+    ]));
+    let registry = Arc::new(FakeToolRegistry::new(vec![Ok(tool_response(
+        "call-weather",
+        "Sunny",
+        ToolStatus::Ok,
+    ))]));
+    let ids = Arc::new(FakeToolIds::new(
+        vec![tool_call_id_seed(1_000)],
+        vec![message_id_seed(1_001)],
+        vec![message_id_seed(1_002)],
+        vec![step_id_seed(1_003)],
+    ));
+    let mut loop_impl = streaming_tool_loop(
+        client.clone(),
+        registry,
+        ids,
+        spec_with_tools(1, ToolFailurePolicy::ReturnErrorToModel),
+    );
+
+    let mut stream = loop_impl.feed(input()).await.expect("feed starts");
+    let mut events = Vec::new();
+    for _ in 0..7 {
+        events.push(
+            stream
+                .next()
+                .await
+                .expect("first stream event")
+                .expect("first stream event succeeds"),
+        );
+    }
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Llm(StreamEvent::MessageStop { .. }))
+    ));
+
+    loop_impl
+        .interject(pivot(1_100, "first pivot"))
+        .expect("first pivot accepted");
+    loop_impl
+        .interject(pivot(1_101, "second pivot"))
+        .expect("second pivot accepted");
+
+    while let Some(event) = stream.next().await {
+        events.push(event.expect("stream event succeeds"));
+    }
+
+    let boundary = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::StepBoundary(boundary) if boundary.metadata().contains_key("pivots") => {
+                Some(boundary)
+            }
+            _ => None,
+        })
+        .expect("tool boundary carries pivot metadata");
+    assert_eq!(boundary.step_id(), step_id());
+    assert_eq!(boundary.boundary().turn_count(), 0);
+    let records = pivot_records(boundary);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["status"], json!("applied"));
+    assert_eq!(records[0]["target"], json!("pending_turn"));
+    assert_eq!(records[0]["message_id"], json!(message_id_seed(1_100)));
+    assert_eq!(records[1]["message_id"], json!(message_id_seed(1_101)));
+
+    loop_impl
+        .inspect_state(|state| {
+            assert!(state.queued_pivots().is_empty());
+            let turn = &state.conversation().turns()[0];
+            assert_eq!(turn.messages().len(), 6);
+            assert_text(turn.messages()[0].payload(), "hello");
+            assert_tool_result(turn.messages()[2].payload(), "call-weather", ToolStatus::Ok);
+            assert_text(turn.messages()[3].payload(), "first pivot");
+            assert_text(turn.messages()[4].payload(), "second pivot");
+            assert_text(turn.messages()[5].payload(), "used the pivot");
+        })
+        .expect("inspect state");
+
+    let requests = client.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].messages.len(), 5);
+    assert_text(&requests[1].messages[3], "first pivot");
+    assert_text(&requests[1].messages[4], "second pivot");
+}
+
+#[tokio::test]
+async fn rejected_pivot_is_reported_and_dropped_without_blocking_recovery() {
+    let client = Arc::new(FakeClient::with_streams(vec![
+        Ok(tool_use_stream_events("call-weather")),
+        Ok(text_stream_events("continued")),
+    ]));
+    let registry = Arc::new(FakeToolRegistry::new(vec![Ok(tool_response(
+        "call-weather",
+        "Sunny",
+        ToolStatus::Ok,
+    ))]));
+    let ids = Arc::new(FakeToolIds::new(
+        vec![tool_call_id_seed(1_200)],
+        vec![message_id_seed(1_201)],
+        vec![message_id_seed(1_202)],
+        vec![step_id_seed(1_203)],
+    ));
+    let mut loop_impl = streaming_tool_loop(
+        client,
+        registry,
+        ids,
+        spec_with_tools(1, ToolFailurePolicy::ReturnErrorToModel),
+    );
+
+    let mut stream = loop_impl.feed(input()).await.expect("feed starts");
+    for _ in 0..7 {
+        stream
+            .next()
+            .await
+            .expect("first stream event")
+            .expect("first stream event succeeds");
+    }
+
+    let duplicate_id_pivot = QueuedPivot::new(
+        user_message_id(),
+        user_message("duplicate id"),
+        PivotSource::Human,
+    )
+    .expect("role is valid");
+    loop_impl
+        .interject(duplicate_id_pivot)
+        .expect("pivot accepted into runtime queue");
+
+    let events = collect_events(stream).await.expect("loop continues");
+    let boundary = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::StepBoundary(boundary) if boundary.metadata().contains_key("pivots") => {
+                Some(boundary)
+            }
+            _ => None,
+        })
+        .expect("rejection is recorded at boundary");
+    let records = pivot_records(boundary);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status"], json!("rejected"));
+    assert_eq!(records[0]["target"], json!("pending_turn"));
+    assert!(
+        records[0]["error"]
+            .as_str()
+            .expect("error text")
+            .contains("message id")
+    );
+
+    loop_impl
+        .inspect_state(|state| {
+            assert!(state.queued_pivots().is_empty());
+            let turn = &state.conversation().turns()[0];
+            assert_eq!(turn.messages().len(), 4);
+            assert_text(turn.messages()[3].payload(), "continued");
+        })
+        .expect("inspect state");
 }
 
 #[tokio::test]

@@ -3,9 +3,10 @@
 //! This module contains the static, serde-friendly Agent data and the first
 //! runtime boundary, [`RunContext`]. [`AgentState`] adds the single active
 //! Conversation and data-only loop cursor boundary. [`AgentLoop`] defines the
-//! guarded feed-to-event-stream contract used by future runtime drivers;
-//! concrete LLM drivers, tool registries, approval responders, and orchestration
-//! remain future layers. Live handles stay out of serde data shapes.
+//! guarded feed-to-event-stream contract; [`DefaultAgentLoop`] provides the
+//! current LLM/tool runtime path and pivot queue soft-turning. Approval
+//! responders and orchestration remain future layers. Live handles stay out of
+//! serde data shapes.
 
 pub mod context;
 pub mod event;
@@ -23,8 +24,8 @@ pub use context::{
 pub use event::{
     AgentError, AgentErrorKind, AgentEvent, AgentFailure, AgentInput, AgentOutcome,
     AgentOutcomeKind, AgentUserInput, ApprovalRequest, BudgetExhaustedOutcome,
-    ExternalRecoveryKind, ExternalRecoveryOutcome, PivotMessage, ResumeInput, StepBoundary,
-    ToolCallFinished, ToolCallStarted,
+    ExternalRecoveryKind, ExternalRecoveryOutcome, PivotMessage, QueuedPivotTurnInput, ResumeInput,
+    StepBoundary, ToolCallFinished, ToolCallStarted,
 };
 pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};
 pub use loop_driver::{
