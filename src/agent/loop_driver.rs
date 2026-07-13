@@ -4,7 +4,10 @@
 //! guarded event stream for each `feed` call; callers must finish or drop that
 //! stream before starting another feed segment for the same Agent.
 
-use crate::agent::{AgentError, AgentEvent, AgentInput, PivotMessage, ReconfigRequest};
+use crate::agent::{
+    AgentError, AgentEvent, AgentInput, ApprovalError, ApprovalResponse, PivotMessage,
+    ReconfigRequest,
+};
 use async_trait::async_trait;
 use futures::{Stream, stream::BoxStream};
 use std::{
@@ -59,6 +62,23 @@ pub trait AgentLoop: Send {
     /// Returns a classified [`AgentError`] when the request conflicts with the
     /// current or already queued Agent configuration.
     fn reconfigure(&self, request: ReconfigRequest) -> Result<(), AgentError>;
+
+    /// Responds to a pending tool approval request.
+    ///
+    /// Event payloads remain data-only; live responder state belongs to the
+    /// loop runtime and is addressed by the response's step/tool identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified [`AgentError`] when no pending approval matches the
+    /// supplied response or when the live responder has already been closed.
+    fn respond_approval(&self, response: ApprovalResponse) -> Result<(), AgentError> {
+        Err(ApprovalError::NoPending {
+            step_id: response.step_id(),
+            call_id: response.call_id(),
+        }
+        .into())
+    }
 }
 
 /// Shared guard that ensures only one feed stream is active.

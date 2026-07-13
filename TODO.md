@@ -622,7 +622,7 @@ pending turn 追加 `Role::User` message。当前 Conversation 的 `begin_turn` 
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。完整测试后仅修改 Markdown 与 Rust doc
   comment，并已重跑 `cargo fmt --all` 与 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
-### M3-4 [TODO] Approval 挂起、responder 与 cancel 贯穿闭合
+### [DONE] M3-4 Approval 挂起、responder 与 cancel 贯穿闭合
 
 **前置依赖**：M3-3。
 
@@ -647,6 +647,35 @@ cancel 通过 `RunContext` 的 cancellation token 立即打断 LLM/tool/sub-agen
 - 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、聚焦 approval/cancel 测试、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 新增 `agent::approval` 模块并从 `agent` 导出 `ToolApprovalPolicy`、`ApprovalRequirement`、
+  `ApprovalDecision`、`ApprovalResponse`、`ApprovalError` 与 `NoApprovalPolicy`；approval policy
+  是 live runtime handle，不进入 serde，response/decision 是 data-only 形状。
+- 扩展 `AgentLoop`，新增对象安全 `respond_approval` 入口；`DefaultAgentLoop` 维护 runtime
+  approval waiter map，`AgentEvent::AwaitingApproval` 只携带 `ApprovalRequest` data payload
+  和可选 reason，不暴露 live responder。
+- 重构 `DefaultAgentLoop` 的非流式路径为懒执行 event stream，使 approval 可以在 `feed()`
+  返回后挂起当前 stream；tool-use 批次由 `ToolBatchSegment` 推进，无 approval 时保留既有并行
+  start/finish 事件顺序，遇到审批时保存 continuation 并设置 data-only
+  `LoopCursor::AwaitingApproval`。
+- approval 决策接入 tool result 回灌：approve 后执行 tool；deny/timeout 生成
+  `ToolStatus::Denied` result；approval cancel 生成 `ToolStatus::Cancelled` result；这些结果都
+  通过 Conversation append 路径进入 pending turn，继续后续 assistant 恢复。
+- `RunContext` cancellation 已接入 non-stream LLM call、streaming event pull、approval wait 和
+  tool future：active LLM partial 通过 `CancelDisposition::DiscardTurn` 关闭并发出
+  `Done(Cancelled)`；open tool call 通过 `CancelDisposition::ResumeTurn` 合成 cancelled results，
+  保留 coherent pending turn，调用方可用 `AgentInput::Resume` 和新的 runtime context 继续同一 turn。
+- 更新 `README.md`、crate docs 与 `docs/agent-layer.md`，把 Agent 当前能力说明扩展到
+  approval policy/responder、approval event 挂起和 cancellation closure；未发现需要更新
+  `PLAN.md` 的阶段级计划变化。
+- 聚焦测试覆盖 approval approve、deny、timeout、approval cancel、stream 挂起不结束、非法重入
+  feed、active streaming partial cancel、open tool future cancel 后 resume feed、父 context
+  cancellation 向 child context/tool future 传播，以及 approval data shape round-trip。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test agent:: --all-targets`；`perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
+  `cargo test --doc`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
 ### M3-R [TODO] Milestone 3 Review
 

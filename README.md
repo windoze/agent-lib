@@ -50,7 +50,11 @@ boundary 以 `Role::User` 注入同一 pending turn，或在纯文本/final boun
 `reconfigure` 已作为 turn-boundary 配置入口接入 Agent loop，skill 启停、tool set replace/patch、
 system prompt overlay、model 与 loop policy 变更会排队到当前 Turn 完成后原子应用，下一次
 Client request 才会看到新的 system/tool/model/policy，当前 Turn 的 tool registry snapshot
-保持恒定；
+保持恒定；tool approval 已作为 runtime policy/responder 边界接入，`AwaitingApproval`
+事件会挂起当前 feed stream 而不结束，approve 后执行 tool，deny/timeout/cancel 会回灌标准
+`ToolStatus::Denied` 或 `ToolStatus::Cancelled` result；`RunContext` cancellation 已接入
+LLM stream 与 tool future，active partial 会通过 discard 关闭，open tool call 会通过
+`CancelDisposition::ResumeTurn` 合成 cancelled results，并可用新的 runtime context 继续 feed；
 `AgentSpec` 用于记录 worktree、初始 system prompt、tool 声明、model 请求设置和 loop
 policy，不包含 live conversation、client、tool registry 或 runtime handle；`AgentState`
 通过 `Conversation::snapshot`/`Conversation::restore` 持久化唯一 conversation，并把
@@ -91,7 +95,10 @@ Agent 的前一段 feed stream 消费完或 drop 前不能再次 feed。
   与 tool-use LLM 往返，并支持 `interject` 软转向：pivot queue 按 FIFO 在合法 step boundary
   应用，tool-result 后注入同一 pending turn，无法插入当前 turn 的 pivot 保留到下一 turn；
   `reconfigure` queue 只在 turn boundary 应用 skill/tool/system/model/policy 变更，失败时不部分
-  应用 queued config；
+  应用 queued config；`ToolApprovalPolicy` 是 live runtime handle，不进入 serde，审批请求以
+  data-only `ApprovalRequest` 事件暴露，调用方通过 `ApprovalResponse`/`AgentLoop::respond_approval`
+  回应；cancel 使用 `RunContext` token 贯穿 LLM stream 与 tool future，并复用 Conversation
+  cancel disposition 闭合 pending；
   调用方需在 `AgentInput::UserMessage` 中同时注入初始 user 与 assistant message id，或在
   `AgentInput::QueuedPivotTurn` 中为队首 pivot 的下一 turn 提供 turn/assistant/step id。
 - `conversation`：外部注入的强类型 id、独立 system 配置、不可原地修改的消息 envelope、
@@ -123,8 +130,8 @@ Conversation Core 已覆盖 pending/cancel、branch、projection/compaction、sn
 feed-to-`AgentEvent` stream 的公开契约与 reentrancy guard；基础 `DefaultAgentLoop` 已支持
 非流式/流式 LLM step、tool-use 执行编排、tool result 回灌、Conversation pending commit
 集成、`interject` pivot queue 在 step boundary 的软转向应用，以及 `reconfigure` queue 在
-turn boundary 的原子配置应用；
-approval policy、自动预算调度与多 agent 编排仍是后续计划范围，尚未作为已实现能力暴露。
+turn boundary 的原子配置应用、tool approval 挂起/响应和 run cancellation 闭合；
+自动预算调度与多 agent 编排仍是后续计划范围，尚未作为已实现能力暴露。
 完整设计和当前阶段计划分别见
 [`DESIGN.md`](DESIGN.md)、
 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。

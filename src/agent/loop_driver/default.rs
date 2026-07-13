@@ -9,22 +9,24 @@
 use super::{AgentEventStream, AgentFeedGuard, AgentLoop, BoxAgentEventStream};
 use crate::{
     agent::{
-        AgentError, AgentEvent, AgentInput, AgentOutcome, AgentState, DeclaredOnlyToolRegistry,
-        DeclaredOnlyToolRegistryResolver, LoopCursor, NoToolExecutionIds, PivotMessage,
-        ReconfigRequest, RunContext, StaticToolRegistryResolver, StepBoundary, StepId,
-        ToolCallFinished, ToolCallStarted, ToolExecutionIds, ToolFailurePolicy, ToolRegistry,
-        ToolRegistryResolver, ToolRuntimeError, TraceNodeId,
+        AgentError, AgentEvent, AgentInput, AgentOutcome, AgentState, ApprovalDecision,
+        ApprovalError, ApprovalRequest, ApprovalRequirement, ApprovalResponse,
+        DeclaredOnlyToolRegistry, DeclaredOnlyToolRegistryResolver, LoopCursor, NoApprovalPolicy,
+        NoToolExecutionIds, PivotMessage, ReconfigRequest, RunContext, StaticToolRegistryResolver,
+        StepBoundary, StepId, ToolApprovalPolicy, ToolCallFinished, ToolCallStarted,
+        ToolExecutionIds, ToolFailurePolicy, ToolRegistry, ToolRegistryResolver, ToolRuntimeError,
+        TraceNodeId,
         state::{CancelRecoveryReason, PivotSource, QueuedPivot, ReconfigApplication},
     },
     client::{ChatRequest, ClientError, LlmClient, Response},
     conversation::{
-        AssistantFinish, CancelDisposition, MessageId, MessageMeta, ToolCallId, ToolCallMapping,
-        TurnId, TurnMeta,
+        AssistantFinish, CancelDisposition, CancelledToolResult, MessageId, MessageMeta,
+        ToolCallId, ToolCallMapping, TurnId, TurnMeta,
     },
     model::{
         content::ContentBlock,
         message::Message,
-        tool::{ToolCall, ToolResponse},
+        tool::{ToolCall, ToolResponse, ToolStatus},
     },
     stream::StreamEvent,
 };
@@ -32,16 +34,22 @@ use async_trait::async_trait;
 use futures::{StreamExt, future::join_all, stream};
 use serde_json::{Map, Value};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fmt,
     sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
 };
+use tokio::{sync::oneshot, time::sleep};
 
 type SharedAgentState = Arc<Mutex<AgentState>>;
 type SharedToolRegistry = Arc<dyn ToolRegistry>;
 type SharedToolRegistrySlot = Arc<Mutex<SharedToolRegistry>>;
 type SharedToolRegistryResolver = Arc<dyn ToolRegistryResolver>;
 type SharedToolExecutionIds = Arc<dyn ToolExecutionIds>;
+type SharedApprovalPolicy = Arc<dyn ToolApprovalPolicy>;
+type SharedApprovalWaiters = Arc<Mutex<ApprovalWaiters>>;
+
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// LLM transport mode used by [`DefaultAgentLoop`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,10 +152,23 @@ impl DefaultAgentLoop {
                 tool_registry: Arc::new(Mutex::new(tool_registry)),
                 tool_registry_resolver,
                 tool_ids,
+                approval_policy: Arc::new(NoApprovalPolicy),
+                approval_waiters: Arc::new(Mutex::new(ApprovalWaiters::default())),
             },
             mode,
             guard: AgentFeedGuard::new(),
         }
+    }
+
+    /// Returns a loop driver that pauses tool execution according to `policy`.
+    ///
+    /// The approval policy is a live runtime object. Pending responder handles
+    /// remain in the loop runtime and are addressed with
+    /// [`ApprovalResponse`] through [`AgentLoop::respond_approval`].
+    #[must_use]
+    pub fn with_approval_policy(mut self, policy: SharedApprovalPolicy) -> Self {
+        self.runtime.approval_policy = policy;
+        self
     }
 
     /// Returns the configured LLM transport mode.
@@ -196,15 +217,11 @@ impl DefaultAgentLoop {
         let prepared = self
             .runtime
             .prepare_user_turn(input, self.mode.request_stream_flag())?;
-        let events = match self.runtime.run_non_streaming_segment(prepared).await {
-            Ok(events) => events,
-            Err(error) => {
-                self.runtime.abort_pending_and_idle()?;
-                return Err(error);
-            }
-        };
-
-        Ok(stream::iter(events.into_iter().map(Ok)).boxed())
+        Ok(stream::unfold(
+            NonStreamingSegment::new(self.runtime.clone(), prepared),
+            NonStreamingSegment::next_event,
+        )
+        .boxed())
     }
 
     async fn feed_streaming(&self, input: AgentInput) -> Result<BoxAgentEventStream, AgentError> {
@@ -250,6 +267,10 @@ impl AgentLoop for DefaultAgentLoop {
     fn reconfigure(&self, request: ReconfigRequest) -> Result<(), AgentError> {
         self.runtime.queue_reconfig(request)
     }
+
+    fn respond_approval(&self, response: ApprovalResponse) -> Result<(), AgentError> {
+        self.runtime.submit_approval_response(response)
+    }
 }
 
 impl fmt::Debug for DefaultAgentLoop {
@@ -270,6 +291,8 @@ struct LoopRuntime {
     tool_registry: SharedToolRegistrySlot,
     tool_registry_resolver: SharedToolRegistryResolver,
     tool_ids: SharedToolExecutionIds,
+    approval_policy: SharedApprovalPolicy,
+    approval_waiters: SharedApprovalWaiters,
 }
 
 impl LoopRuntime {
@@ -348,6 +371,44 @@ impl LoopRuntime {
             .map_err(|_| AgentError::Other("tool registry mutex poisoned".to_owned()))
     }
 
+    fn submit_approval_response(&self, response: ApprovalResponse) -> Result<(), AgentError> {
+        let mut waiters = self
+            .approval_waiters
+            .lock()
+            .map_err(|_| AgentError::Other("approval waiter mutex poisoned".to_owned()))?;
+        waiters.respond(response)
+    }
+
+    fn register_approval_waiter(
+        &self,
+        request: &ApprovalRequest,
+    ) -> Result<oneshot::Receiver<ApprovalResponse>, AgentError> {
+        let (sender, receiver) = oneshot::channel();
+        let mut waiters = self
+            .approval_waiters
+            .lock()
+            .map_err(|_| AgentError::Other("approval waiter mutex poisoned".to_owned()))?;
+        waiters.insert(request.step_id(), request.call_id(), sender)?;
+        Ok(receiver)
+    }
+
+    fn clear_approval_waiter(
+        &self,
+        step_id: StepId,
+        call_id: ToolCallId,
+    ) -> Result<(), AgentError> {
+        let mut waiters = self
+            .approval_waiters
+            .lock()
+            .map_err(|_| AgentError::Other("approval waiter mutex poisoned".to_owned()))?;
+        waiters.remove(step_id, call_id);
+        Ok(())
+    }
+
+    fn approval_requirement(&self, call_id: ToolCallId, call: &ToolCall) -> ApprovalRequirement {
+        self.approval_policy.approval_requirement(call_id, call)
+    }
+
     fn prepare_user_turn(
         &self,
         input: AgentInput,
@@ -384,10 +445,17 @@ impl LoopRuntime {
                     queued_pivot: true,
                 }
             }
-            AgentInput::Resume(_) => {
-                return Err(AgentError::Other(
-                    "resume feed input is not supported by the default LLM driver".to_owned(),
-                ));
+            AgentInput::Resume(input) => {
+                {
+                    let state = lock_agent_state(&self.state)?;
+                    if state.conversation().pending_context().is_none() {
+                        return Err(AgentError::Other(
+                            "resume feed input requires a pending conversation context".to_owned(),
+                        ));
+                    }
+                }
+                let assistant_message_id = self.tool_ids.next_assistant_message_id()?;
+                return self.prepare_assistant_call(input.step_id(), assistant_message_id, stream);
             }
         };
 
@@ -453,30 +521,12 @@ impl LoopRuntime {
         })
     }
 
-    async fn run_non_streaming_segment(
-        &self,
-        mut prepared: PreparedAssistantCall,
-    ) -> Result<Vec<AgentEvent>, AgentError> {
-        let mut events = Vec::new();
-        let mut assistant_steps_started = 1_u32;
-
+    async fn chat_with_cancel(&self, request: ChatRequest) -> Result<Response, AgentError> {
+        let mut call = Box::pin(self.client.chat(request));
         loop {
-            let response = self
-                .client
-                .chat(prepared.request.clone())
-                .await
-                .map_err(AgentError::Client)?;
-            match self.finish_complete_response(response, &prepared)? {
-                AssistantStepOutcome::Final(final_events) => {
-                    events.extend(final_events);
-                    return Ok(events);
-                }
-                AssistantStepOutcome::ToolCalls(invocations) => {
-                    events.extend(self.run_tool_batch(&prepared, invocations).await?);
-                    self.ensure_can_start_next_step(assistant_steps_started)?;
-                    assistant_steps_started += 1;
-                    prepared = self.prepare_next_assistant_call(false)?;
-                }
+            tokio::select! {
+                response = &mut call => return response.map_err(AgentError::Client),
+                () = sleep(CANCEL_POLL_INTERVAL) => self.context.check_cancelled()?,
             }
         }
     }
@@ -490,6 +540,20 @@ impl LoopRuntime {
             .chat_stream(prepared.request.clone())
             .await
             .map_err(AgentError::Client)
+    }
+
+    async fn next_stream_event(
+        &self,
+        source: &mut futures::stream::BoxStream<'static, Result<StreamEvent, ClientError>>,
+    ) -> Result<Option<StreamEvent>, AgentError> {
+        loop {
+            tokio::select! {
+                event = source.next() => {
+                    return event.transpose().map_err(AgentError::Client);
+                }
+                () = sleep(CANCEL_POLL_INTERVAL) => self.context.check_cancelled()?,
+            }
+        }
     }
 
     fn start_streaming_assistant(&self) -> Result<(), AgentError> {
@@ -587,52 +651,6 @@ impl LoopRuntime {
         }
     }
 
-    async fn run_tool_batch(
-        &self,
-        prepared: &PreparedAssistantCall,
-        invocations: Vec<ToolInvocation>,
-    ) -> Result<Vec<AgentEvent>, AgentError> {
-        if invocations.is_empty() {
-            return Err(AgentError::Tool(ToolRuntimeError::InvalidRegistry {
-                message: "assistant requested no tool calls after tool-use finish".to_owned(),
-            }));
-        }
-
-        let max_parallel = self.max_parallel_tools()? as usize;
-        let mut events = Vec::new();
-        let mut results = Vec::with_capacity(invocations.len());
-
-        for chunk in invocations.chunks(max_parallel.max(1)) {
-            let mut prepared_tools = Vec::with_capacity(chunk.len());
-            for invocation in chunk {
-                let prepared_tool = self.prepare_tool_execution(prepared, invocation.clone())?;
-                events.push(prepared_tool.started_event.clone());
-                prepared_tools.push(prepared_tool);
-            }
-
-            let executed = if prepared_tools.len() == 1 {
-                vec![self.execute_prepared_tool(prepared_tools.remove(0)).await]
-            } else {
-                join_all(
-                    prepared_tools
-                        .into_iter()
-                        .map(|tool| self.execute_prepared_tool(tool)),
-                )
-                .await
-            };
-
-            for record in executed {
-                let record = record?;
-                events.push(record.finished_event);
-                results.push((record.result_message_id, record.response));
-            }
-        }
-
-        self.append_tool_results(results)?;
-        events.push(self.apply_pivots_at_pending_step_boundary(prepared)?);
-        Ok(events)
-    }
-
     fn prepare_tool_execution(
         &self,
         prepared: &PreparedAssistantCall,
@@ -658,20 +676,25 @@ impl LoopRuntime {
         &self,
         prepared: PreparedToolExecution,
     ) -> Result<ToolExecutionRecord, AgentError> {
-        self.context.check_cancelled()?;
         let invocation = prepared.invocation;
         let tool_registry = self.active_tool_registry()?;
-        let response = match tool_registry
-            .execute(invocation.call_id, invocation.call.clone())
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => match self.tool_failure_policy()? {
-                ToolFailurePolicy::ReturnErrorToModel => {
-                    error.to_tool_response(invocation.call.id.clone())
-                }
-                ToolFailurePolicy::StopRun => return Err(AgentError::Tool(error)),
-            },
+        let mut execution =
+            Box::pin(tool_registry.execute(invocation.call_id, invocation.call.clone()));
+        let response = loop {
+            tokio::select! {
+                result = &mut execution => {
+                    break match result {
+                        Ok(response) => response,
+                        Err(error) => match self.tool_failure_policy()? {
+                            ToolFailurePolicy::ReturnErrorToModel => {
+                                error.to_tool_response(invocation.call.id.clone())
+                            }
+                            ToolFailurePolicy::StopRun => return Err(AgentError::Tool(error)),
+                        },
+                    };
+                },
+                () = sleep(CANCEL_POLL_INTERVAL) => self.context.check_cancelled()?,
+            }
         };
 
         let finished_event = AgentEvent::ToolCallFinished(ToolCallFinished::new(
@@ -688,16 +711,25 @@ impl LoopRuntime {
         })
     }
 
-    fn append_tool_results(
+    fn append_tool_result(
         &self,
-        results: Vec<(MessageId, ToolResponse)>,
+        message_id: MessageId,
+        response: ToolResponse,
     ) -> Result<(), AgentError> {
         let mut state = lock_agent_state(&self.state)?;
-        for (message_id, response) in results {
-            state
-                .conversation_mut()
-                .append_tool_response(message_id, response)?;
-        }
+        state
+            .conversation_mut()
+            .append_tool_response(message_id, response)?;
+        Ok(())
+    }
+
+    fn restore_awaiting_tool_cursor(
+        &self,
+        step_id: StepId,
+        call_ids: Vec<ToolCallId>,
+    ) -> Result<(), AgentError> {
+        let mut state = lock_agent_state(&self.state)?;
+        state.transition_cursor(LoopCursor::awaiting_tool(step_id, call_ids)?)?;
         Ok(())
     }
 
@@ -789,6 +821,464 @@ impl LoopRuntime {
         let mut state = lock_agent_state(&self.state)?;
         abort_pending_and_idle(&mut state)
     }
+
+    fn cancel_pending_discard_and_done(
+        &self,
+        step_id: StepId,
+        reason: CancelRecoveryReason,
+    ) -> Result<(), AgentError> {
+        let mut state = lock_agent_state(&self.state)?;
+        if state.conversation().pending().is_some() {
+            state
+                .conversation_mut()
+                .cancel_pending(CancelDisposition::DiscardTurn)?;
+        }
+        state.transition_cursor(LoopCursor::cancel_recovery(Some(step_id), reason))?;
+        state.transition_cursor(LoopCursor::Idle)?;
+        Ok(())
+    }
+
+    fn cancel_pending_resume_and_done(
+        &self,
+        step_id: StepId,
+        cancelled_results: Vec<CancelledToolResult>,
+    ) -> Result<(), AgentError> {
+        let mut state = lock_agent_state(&self.state)?;
+        state
+            .conversation_mut()
+            .cancel_pending(CancelDisposition::ResumeTurn { cancelled_results })?;
+        state.transition_cursor(LoopCursor::cancel_recovery(
+            Some(step_id),
+            CancelRecoveryReason::Cancelled,
+        ))?;
+        state.transition_cursor(LoopCursor::Idle)?;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ApprovalWaiters {
+    pending: BTreeMap<(StepId, ToolCallId), oneshot::Sender<ApprovalResponse>>,
+}
+
+impl ApprovalWaiters {
+    fn insert(
+        &mut self,
+        step_id: StepId,
+        call_id: ToolCallId,
+        sender: oneshot::Sender<ApprovalResponse>,
+    ) -> Result<(), AgentError> {
+        if self.pending.insert((step_id, call_id), sender).is_some() {
+            return Err(ApprovalError::DuplicatePending { call_id }.into());
+        }
+        Ok(())
+    }
+
+    fn respond(&mut self, response: ApprovalResponse) -> Result<(), AgentError> {
+        let step_id = response.step_id();
+        let call_id = response.call_id();
+        let sender = self
+            .pending
+            .remove(&(step_id, call_id))
+            .ok_or(ApprovalError::NoPending { step_id, call_id })?;
+        sender
+            .send(response)
+            .map_err(|_| ApprovalError::ResponderClosed { call_id }.into())
+    }
+
+    fn remove(&mut self, step_id: StepId, call_id: ToolCallId) {
+        self.pending.remove(&(step_id, call_id));
+    }
+}
+
+struct ToolBatchSegment {
+    runtime: LoopRuntime,
+    prepared: PreparedAssistantCall,
+    pending: VecDeque<ToolInvocation>,
+    queued: VecDeque<AgentEvent>,
+    waiting: Option<PendingApproval>,
+    boundary_emitted: bool,
+}
+
+impl ToolBatchSegment {
+    fn new(
+        runtime: LoopRuntime,
+        prepared: PreparedAssistantCall,
+        invocations: Vec<ToolInvocation>,
+    ) -> Result<Self, AgentError> {
+        if invocations.is_empty() {
+            return Err(AgentError::Tool(ToolRuntimeError::InvalidRegistry {
+                message: "assistant requested no tool calls after tool-use finish".to_owned(),
+            }));
+        }
+
+        Ok(Self {
+            runtime,
+            prepared,
+            pending: VecDeque::from(invocations),
+            queued: VecDeque::new(),
+            waiting: None,
+            boundary_emitted: false,
+        })
+    }
+
+    async fn next_event(&mut self) -> Result<ToolBatchPoll, AgentError> {
+        loop {
+            if let Some(event) = self.queued.pop_front() {
+                return Ok(ToolBatchPoll::Event(event));
+            }
+
+            if self.boundary_emitted {
+                return Ok(ToolBatchPoll::Complete);
+            }
+
+            if self.waiting.is_some() {
+                match self.resolve_pending_approval().await? {
+                    ToolBatchPoll::Event(event) => return Ok(ToolBatchPoll::Event(event)),
+                    ToolBatchPoll::Cancelled => return Ok(ToolBatchPoll::Cancelled),
+                    ToolBatchPoll::Complete => continue,
+                }
+            }
+
+            if self.pending.is_empty() {
+                let boundary = self
+                    .runtime
+                    .apply_pivots_at_pending_step_boundary(&self.prepared)?;
+                self.queued.push_back(boundary);
+                self.boundary_emitted = true;
+                continue;
+            }
+
+            if let Some(poll) = self.process_next_ready_tools().await? {
+                return Ok(poll);
+            }
+        }
+    }
+
+    async fn process_next_ready_tools(&mut self) -> Result<Option<ToolBatchPoll>, AgentError> {
+        let first = self
+            .pending
+            .front()
+            .expect("pending is checked before processing");
+        if let ApprovalRequirement::RequireApproval { reason } = self
+            .runtime
+            .approval_requirement(first.call_id, &first.call)
+        {
+            let invocation = self.pending.pop_front().expect("pending tool exists");
+            let prepared_tool = self
+                .runtime
+                .prepare_tool_execution(&self.prepared, invocation)?;
+            let request = ApprovalRequest::with_reason(
+                prepared_tool.step_id,
+                prepared_tool.invocation.call_id,
+                prepared_tool.invocation.call.clone(),
+                reason,
+                prepared_tool.trace_node_id.clone(),
+            );
+            let receiver = self.runtime.register_approval_waiter(&request)?;
+            {
+                let mut state = lock_agent_state(&self.runtime.state)?;
+                state.transition_cursor(LoopCursor::awaiting_approval(
+                    prepared_tool.step_id,
+                    prepared_tool.invocation.call_id,
+                ))?;
+            }
+            self.waiting = Some(PendingApproval {
+                prepared_tool,
+                receiver,
+            });
+            self.queued.push_back(AgentEvent::AwaitingApproval(request));
+            return Ok(None);
+        }
+
+        let max_parallel = self.runtime.max_parallel_tools()? as usize;
+        let mut prepared_tools = Vec::new();
+        while prepared_tools.len() < max_parallel.max(1) {
+            let Some(next) = self.pending.front() else {
+                break;
+            };
+            if matches!(
+                self.runtime.approval_requirement(next.call_id, &next.call),
+                ApprovalRequirement::RequireApproval { .. }
+            ) {
+                break;
+            }
+            let invocation = self.pending.pop_front().expect("pending tool exists");
+            let prepared_tool = self
+                .runtime
+                .prepare_tool_execution(&self.prepared, invocation)?;
+            self.queued.push_back(prepared_tool.started_event.clone());
+            prepared_tools.push(prepared_tool);
+        }
+
+        if prepared_tools.is_empty() {
+            return Ok(None);
+        }
+
+        let cancelled_results = self.cancelled_results_for(
+            prepared_tools
+                .iter()
+                .map(|tool| &tool.invocation)
+                .chain(self.pending.iter()),
+        );
+        let executed = if prepared_tools.len() == 1 {
+            vec![
+                self.runtime
+                    .execute_prepared_tool(prepared_tools.remove(0))
+                    .await,
+            ]
+        } else {
+            join_all(
+                prepared_tools
+                    .into_iter()
+                    .map(|tool| self.runtime.execute_prepared_tool(tool)),
+            )
+            .await
+        };
+
+        for record in &executed {
+            if let Err(error) = record {
+                if error.kind() == crate::agent::AgentErrorKind::Cancelled {
+                    self.runtime
+                        .cancel_pending_resume_and_done(self.prepared.step_id, cancelled_results)?;
+                    return Ok(Some(ToolBatchPoll::Cancelled));
+                }
+                return Err(error.clone());
+            }
+        }
+
+        for record in executed {
+            let record = record.expect("errors were handled before appending tool results");
+            self.runtime
+                .append_tool_result(record.result_message_id, record.response.clone())?;
+            self.queued.push_back(record.finished_event);
+        }
+
+        Ok(None)
+    }
+
+    async fn resolve_pending_approval(&mut self) -> Result<ToolBatchPoll, AgentError> {
+        let mut pending = self
+            .waiting
+            .take()
+            .expect("waiting approval is checked before resolving");
+        let response = match wait_for_approval(
+            &self.runtime,
+            pending.prepared_tool.step_id,
+            pending.prepared_tool.invocation.call_id,
+            &mut pending.receiver,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) if error.kind() == crate::agent::AgentErrorKind::Cancelled => {
+                let cancelled_results = self.cancelled_results_for(
+                    std::iter::once(&pending.prepared_tool.invocation).chain(self.pending.iter()),
+                );
+                self.runtime
+                    .cancel_pending_resume_and_done(self.prepared.step_id, cancelled_results)?;
+                return Ok(ToolBatchPoll::Cancelled);
+            }
+            Err(error) => return Err(error),
+        };
+
+        self.runtime.restore_awaiting_tool_cursor(
+            pending.prepared_tool.step_id,
+            vec![pending.prepared_tool.invocation.call_id],
+        )?;
+
+        match response.decision() {
+            ApprovalDecision::Approve => {
+                let cancelled_results = self.cancelled_results_for(
+                    std::iter::once(&pending.prepared_tool.invocation).chain(self.pending.iter()),
+                );
+                self.queued
+                    .push_back(pending.prepared_tool.started_event.clone());
+                match self
+                    .runtime
+                    .execute_prepared_tool(pending.prepared_tool)
+                    .await
+                {
+                    Ok(record) => {
+                        self.runtime.append_tool_result(
+                            record.result_message_id,
+                            record.response.clone(),
+                        )?;
+                        self.queued.push_back(record.finished_event);
+                        Ok(ToolBatchPoll::Complete)
+                    }
+                    Err(error) if error.kind() == crate::agent::AgentErrorKind::Cancelled => {
+                        self.runtime.cancel_pending_resume_and_done(
+                            self.prepared.step_id,
+                            cancelled_results,
+                        )?;
+                        Ok(ToolBatchPoll::Cancelled)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            ApprovalDecision::Deny | ApprovalDecision::Timeout | ApprovalDecision::Cancel => {
+                let response = approval_response_for_decision(
+                    &pending.prepared_tool.invocation.call,
+                    response.decision(),
+                    response.message(),
+                );
+                let result_message_id = pending.prepared_tool.invocation.result_message_id;
+                self.runtime
+                    .append_tool_result(result_message_id, response.clone())?;
+                Ok(ToolBatchPoll::Event(AgentEvent::ToolCallFinished(
+                    ToolCallFinished::new(
+                        pending.prepared_tool.step_id,
+                        pending.prepared_tool.invocation.call_id,
+                        response,
+                        pending.prepared_tool.trace_node_id,
+                    ),
+                )))
+            }
+        }
+    }
+
+    fn cancelled_results_for<'a>(
+        &self,
+        invocations: impl Iterator<Item = &'a ToolInvocation>,
+    ) -> Vec<CancelledToolResult> {
+        invocations
+            .map(|invocation| {
+                CancelledToolResult::new(
+                    invocation.call.id.clone(),
+                    invocation.call_id,
+                    invocation.result_message_id,
+                )
+            })
+            .collect()
+    }
+}
+
+enum ToolBatchPoll {
+    Event(AgentEvent),
+    Complete,
+    Cancelled,
+}
+
+struct PendingApproval {
+    prepared_tool: PreparedToolExecution,
+    receiver: oneshot::Receiver<ApprovalResponse>,
+}
+
+struct NonStreamingSegment {
+    runtime: LoopRuntime,
+    current: PreparedAssistantCall,
+    queued: VecDeque<Result<AgentEvent, AgentError>>,
+    done: bool,
+    assistant_steps_started: u32,
+    tool_batch: Option<ToolBatchSegment>,
+}
+
+impl NonStreamingSegment {
+    fn new(runtime: LoopRuntime, current: PreparedAssistantCall) -> Self {
+        Self {
+            runtime,
+            current,
+            queued: VecDeque::new(),
+            done: false,
+            assistant_steps_started: 1,
+            tool_batch: None,
+        }
+    }
+
+    async fn next_event(mut self) -> Option<(Result<AgentEvent, AgentError>, NonStreamingSegment)> {
+        loop {
+            if let Some(event) = self.queued.pop_front() {
+                return Some((event, self));
+            }
+            if self.done {
+                return None;
+            }
+
+            if let Some(batch) = self.tool_batch.as_mut() {
+                match batch.next_event().await {
+                    Ok(ToolBatchPoll::Event(event)) => return Some((Ok(event), self)),
+                    Ok(ToolBatchPoll::Complete) => {
+                        self.tool_batch = None;
+                        if let Err(error) = self
+                            .runtime
+                            .ensure_can_start_next_step(self.assistant_steps_started)
+                        {
+                            return self.fail(error);
+                        }
+                        self.assistant_steps_started += 1;
+                        self.current = match self.runtime.prepare_next_assistant_call(false) {
+                            Ok(next) => next,
+                            Err(error) => return self.fail(error),
+                        };
+                    }
+                    Ok(ToolBatchPoll::Cancelled) => return self.cancelled(),
+                    Err(error) => return self.fail(error),
+                }
+                continue;
+            }
+
+            let response = match self
+                .runtime
+                .chat_with_cancel(self.current.request.clone())
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    return if error.kind() == crate::agent::AgentErrorKind::Cancelled {
+                        self.cancel_active_llm()
+                    } else {
+                        self.fail(error)
+                    };
+                }
+            };
+
+            match self
+                .runtime
+                .finish_complete_response(response, &self.current)
+            {
+                Ok(AssistantStepOutcome::Final(events)) => {
+                    self.queued.extend(events.into_iter().map(Ok));
+                    self.done = true;
+                }
+                Ok(AssistantStepOutcome::ToolCalls(invocations)) => {
+                    self.tool_batch = match ToolBatchSegment::new(
+                        self.runtime.clone(),
+                        self.current.clone(),
+                        invocations,
+                    ) {
+                        Ok(batch) => Some(batch),
+                        Err(error) => return self.fail(error),
+                    };
+                }
+                Err(error) => return self.fail(error),
+            }
+        }
+    }
+
+    fn cancel_active_llm(self) -> Option<(Result<AgentEvent, AgentError>, Self)> {
+        match self.runtime.cancel_pending_discard_and_done(
+            self.current.step_id,
+            CancelRecoveryReason::LlmInterrupted,
+        ) {
+            Ok(()) => self.cancelled(),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn cancelled(mut self) -> Option<(Result<AgentEvent, AgentError>, Self)> {
+        self.done = true;
+        Some((Ok(AgentEvent::Done(AgentOutcome::Cancelled)), self))
+    }
+
+    fn fail(mut self, error: AgentError) -> Option<(Result<AgentEvent, AgentError>, Self)> {
+        self.done = true;
+        let error = match self.runtime.abort_pending_and_idle() {
+            Ok(()) => error,
+            Err(cleanup_error) => cleanup_error,
+        };
+        Some((Err(error), self))
+    }
 }
 
 struct StreamingSegment {
@@ -798,6 +1288,7 @@ struct StreamingSegment {
     queued: VecDeque<Result<AgentEvent, AgentError>>,
     done: bool,
     assistant_steps_started: u32,
+    tool_batch: Option<ToolBatchSegment>,
 }
 
 impl StreamingSegment {
@@ -813,6 +1304,7 @@ impl StreamingSegment {
             queued: VecDeque::new(),
             done: false,
             assistant_steps_started: 1,
+            tool_batch: None,
         }
     }
 
@@ -825,28 +1317,11 @@ impl StreamingSegment {
                 return None;
             }
 
-            match self.source.next().await {
-                Some(Ok(event)) => {
-                    if let Err(error) = self.runtime.push_stream_event(event.clone()) {
-                        return self.fail(error);
-                    }
-                    return Some((Ok(AgentEvent::Llm(event)), self));
-                }
-                Some(Err(error)) => return self.fail(AgentError::Client(error)),
-                None => match self.runtime.finish_current_assistant(&self.current) {
-                    Ok(AssistantStepOutcome::Final(events)) => {
-                        self.queued.extend(events.into_iter().map(Ok));
-                        self.done = true;
-                    }
-                    Ok(AssistantStepOutcome::ToolCalls(invocations)) => {
-                        match self
-                            .runtime
-                            .run_tool_batch(&self.current, invocations)
-                            .await
-                        {
-                            Ok(events) => self.queued.extend(events.into_iter().map(Ok)),
-                            Err(error) => return self.fail(error),
-                        }
+            if let Some(batch) = self.tool_batch.as_mut() {
+                match batch.next_event().await {
+                    Ok(ToolBatchPoll::Event(event)) => return Some((Ok(event), self)),
+                    Ok(ToolBatchPoll::Complete) => {
+                        self.tool_batch = None;
                         if let Err(error) = self
                             .runtime
                             .ensure_can_start_next_step(self.assistant_steps_started)
@@ -868,10 +1343,57 @@ impl StreamingSegment {
                         self.current = next;
                         self.source = source;
                     }
+                    Ok(ToolBatchPoll::Cancelled) => return self.cancelled(),
+                    Err(error) => return self.fail(error),
+                }
+                continue;
+            }
+
+            match self.runtime.next_stream_event(&mut self.source).await {
+                Ok(Some(event)) => {
+                    if let Err(error) = self.runtime.push_stream_event(event.clone()) {
+                        return self.fail(error);
+                    }
+                    return Some((Ok(AgentEvent::Llm(event)), self));
+                }
+                Ok(None) => match self.runtime.finish_current_assistant(&self.current) {
+                    Ok(AssistantStepOutcome::Final(events)) => {
+                        self.queued.extend(events.into_iter().map(Ok));
+                        self.done = true;
+                    }
+                    Ok(AssistantStepOutcome::ToolCalls(invocations)) => {
+                        self.tool_batch = match ToolBatchSegment::new(
+                            self.runtime.clone(),
+                            self.current.clone(),
+                            invocations,
+                        ) {
+                            Ok(batch) => Some(batch),
+                            Err(error) => return self.fail(error),
+                        };
+                    }
                     Err(error) => return self.fail(error),
                 },
+                Err(error) if error.kind() == crate::agent::AgentErrorKind::Cancelled => {
+                    return self.cancel_active_llm();
+                }
+                Err(error) => return self.fail(error),
             }
         }
+    }
+
+    fn cancel_active_llm(self) -> Option<(Result<AgentEvent, AgentError>, Self)> {
+        match self.runtime.cancel_pending_discard_and_done(
+            self.current.step_id,
+            CancelRecoveryReason::LlmInterrupted,
+        ) {
+            Ok(()) => self.cancelled(),
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn cancelled(mut self) -> Option<(Result<AgentEvent, AgentError>, Self)> {
+        self.done = true;
+        Some((Ok(AgentEvent::Done(AgentOutcome::Cancelled)), self))
     }
 
     fn fail(mut self, error: AgentError) -> Option<(Result<AgentEvent, AgentError>, Self)> {
@@ -930,6 +1452,59 @@ struct ToolExecutionRecord {
     result_message_id: MessageId,
     response: ToolResponse,
     finished_event: AgentEvent,
+}
+
+async fn wait_for_approval(
+    runtime: &LoopRuntime,
+    step_id: StepId,
+    call_id: ToolCallId,
+    receiver: &mut oneshot::Receiver<ApprovalResponse>,
+) -> Result<ApprovalResponse, AgentError> {
+    loop {
+        tokio::select! {
+            response = &mut *receiver => {
+                return response.map_err(|_| ApprovalError::ResponderClosed { call_id }.into());
+            }
+            () = sleep(CANCEL_POLL_INTERVAL) => {
+                if runtime.context.is_cancelled() {
+                    runtime.clear_approval_waiter(step_id, call_id)?;
+                    return Err(AgentError::RunContext(crate::agent::RunContextError::Cancelled));
+                }
+            }
+        }
+    }
+}
+
+fn approval_response_for_decision(
+    call: &ToolCall,
+    decision: ApprovalDecision,
+    message: Option<&str>,
+) -> ToolResponse {
+    let (status, default_text) = match decision {
+        ApprovalDecision::Approve => unreachable!("approve executes the tool"),
+        ApprovalDecision::Deny => (
+            ToolStatus::Denied,
+            "Tool execution was denied before it started.",
+        ),
+        ApprovalDecision::Timeout => (
+            ToolStatus::Denied,
+            "Tool execution approval timed out before the tool started.",
+        ),
+        ApprovalDecision::Cancel => (
+            ToolStatus::Cancelled,
+            "Tool execution was cancelled before it started.",
+        ),
+    };
+
+    ToolResponse {
+        tool_call_id: call.id.clone(),
+        content: vec![ContentBlock::Text {
+            text: message.unwrap_or(default_text).to_owned(),
+            extra: Map::new(),
+        }],
+        status,
+        extra: Map::new(),
+    }
 }
 
 fn build_chat_request(

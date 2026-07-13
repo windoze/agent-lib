@@ -7,8 +7,8 @@
 
 use crate::{
     agent::{
-        AgentStateError, BudgetError, RunContextError, StepId, TraceNodeId, state::QueuedPivot,
-        tool::ToolRuntimeError,
+        AgentStateError, ApprovalError, BudgetError, RunContextError, StepId, TraceNodeId,
+        state::QueuedPivot, tool::ToolRuntimeError,
     },
     client::ClientError,
     conversation::{Boundary, ConversationError, MessageId, ToolCallId, TurnId},
@@ -337,7 +337,7 @@ pub struct ToolCallStarted {
 impl ToolCallStarted {
     /// Creates a tool-start event payload.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         step_id: StepId,
         call_id: ToolCallId,
         call: ToolCall,
@@ -390,7 +390,7 @@ pub struct ToolCallFinished {
 impl ToolCallFinished {
     /// Creates a tool-finish event payload.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         step_id: StepId,
         call_id: ToolCallId,
         response: ToolResponse,
@@ -437,22 +437,37 @@ pub struct ApprovalRequest {
     call_id: ToolCallId,
     call: ToolCall,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     trace_node_id: Option<TraceNodeId>,
 }
 
 impl ApprovalRequest {
     /// Creates an approval-wait payload.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         step_id: StepId,
         call_id: ToolCallId,
         call: ToolCall,
+        trace_node_id: Option<TraceNodeId>,
+    ) -> Self {
+        Self::with_reason(step_id, call_id, call, None, trace_node_id)
+    }
+
+    /// Creates an approval-wait payload with stable reason text.
+    #[must_use]
+    pub fn with_reason(
+        step_id: StepId,
+        call_id: ToolCallId,
+        call: ToolCall,
+        reason: Option<String>,
         trace_node_id: Option<TraceNodeId>,
     ) -> Self {
         Self {
             step_id,
             call_id,
             call,
+            reason: reason.and_then(non_empty),
             trace_node_id,
         }
     }
@@ -473,6 +488,12 @@ impl ApprovalRequest {
     #[must_use]
     pub const fn call(&self) -> &ToolCall {
         &self.call
+    }
+
+    /// Returns stable approval reason text, if one was supplied.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 
     /// Returns the trace node associated with this approval wait, if any.
@@ -638,6 +659,8 @@ pub enum AgentErrorKind {
     AgentState,
     /// Tool registry, tool execution, or tool identity injection failed.
     Tool,
+    /// Tool approval policy or responder handling failed.
+    Approval,
     /// The failure did not fit a more specific category.
     Other,
 }
@@ -709,6 +732,9 @@ pub enum AgentError {
     /// Tool runtime operation failed.
     #[error("tool runtime operation failed: {0}")]
     Tool(#[from] ToolRuntimeError),
+    /// Approval runtime operation failed.
+    #[error("approval operation failed: {0}")]
+    Approval(#[from] ApprovalError),
     /// A loop implementation returned an uncategorized failure.
     #[error("agent runtime error: {0}")]
     Other(String),
@@ -730,6 +756,7 @@ impl AgentError {
             Self::RunContext(RunContextError::Trace(_)) => AgentErrorKind::Trace,
             Self::State(_) => AgentErrorKind::AgentState,
             Self::Tool(_) => AgentErrorKind::Tool,
+            Self::Approval(_) => AgentErrorKind::Approval,
             Self::Other(_) => AgentErrorKind::Other,
         }
     }

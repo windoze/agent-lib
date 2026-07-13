@@ -22,10 +22,11 @@
 //!   stream contract. [`agent::DefaultAgentLoop`] is the current runtime driver:
 //!   it sends non-streaming or streaming Client requests, folds responses through
 //!   Conversation pending, executes provider-neutral tool calls through a live
-//!   [`agent::ToolRegistry`], applies queued [`agent::PivotMessage`] values at
-//!   checked step boundaries, applies queued [`agent::ReconfigRequest`] values
-//!   only at turn boundaries, and commits only after a tool-free final assistant
-//!   response.
+//!   [`agent::ToolRegistry`], pauses tool execution through a live
+//!   [`agent::ToolApprovalPolicy`] and [`agent::ApprovalResponse`] boundary,
+//!   applies queued [`agent::PivotMessage`] values at checked step boundaries,
+//!   applies queued [`agent::ReconfigRequest`] values only at turn boundaries,
+//!   and commits only after a tool-free final assistant response.
 //! - [`conversation`] adds externally supplied strong identities,
 //!   Conversation-level configuration, immutable message envelopes with
 //!   optional envelope-local metadata, the
@@ -75,17 +76,19 @@
 //!   Turn/message facts; row reassembly returns a snapshot that still must pass
 //!   normal restore validation.
 //!
-//! Approval policy and multi-agent orchestration are still separate future
-//! runtime layers. The [`agent`] module currently exposes serde-friendly static
-//! configuration and identity data, [`agent::AgentState`] persistence through
-//! Conversation snapshots, [`agent::RunContext`] handles for cancellation,
-//! budget, and trace propagation, the object-safe [`agent::AgentLoop`] event
-//! stream contract with [`agent::AgentFeedGuard`] backpressure support, minimal
-//! live [`agent::ToolRegistry`]/[`agent::ToolExecutor`] boundaries, a
+//! Automatic budget scheduling and multi-agent orchestration are still separate
+//! future runtime layers. The [`agent`] module currently exposes serde-friendly
+//! static configuration and identity data, [`agent::AgentState`] persistence
+//! through Conversation snapshots, [`agent::RunContext`] handles for
+//! cancellation, budget, and trace propagation, the object-safe
+//! [`agent::AgentLoop`] event stream contract with [`agent::AgentFeedGuard`]
+//! backpressure support, minimal live [`agent::ToolRegistry`]/
+//! [`agent::ToolExecutor`] boundaries, [`agent::ToolApprovalPolicy`] and
+//! [`agent::ApprovalResponse`] approval boundaries, a
 //! [`agent::ToolRegistryResolver`] for turn-boundary tool-set replacement, and
-//! the [`agent::DefaultAgentLoop`] driver with `interject` soft-turning plus
-//! `reconfigure` turn-boundary config application, without making live handles
-//! part of persisted state.
+//! the [`agent::DefaultAgentLoop`] driver with `interject` soft-turning,
+//! `reconfigure` turn-boundary config application, approval waits, and
+//! cancellation closure, without making live handles part of persisted state.
 //!
 //! # Conversation Core example
 //!

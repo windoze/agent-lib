@@ -1,9 +1,10 @@
 use super::{DefaultAgentLoop, LlmStepMode};
 use crate::{
     agent::{
-        AgentErrorKind, AgentEvent, AgentInput, AgentLoop, AgentSpec, BudgetLimits, LoopCursorKind,
-        LoopPolicy, ModelRef, PivotSource, QueuedPivot, ReconfigRequest, RunContext, RunId,
-        StaticToolRegistryResolver, StepId, ToolExecutionIds, ToolFailurePolicy, ToolRegistry,
+        AgentError, AgentErrorKind, AgentEvent, AgentInput, AgentLoop, AgentSpec,
+        ApprovalRequirement, ApprovalResponse, BudgetLimits, LoopCursorKind, LoopPolicy, ModelRef,
+        PivotSource, QueuedPivot, ReconfigRequest, RunContext, RunId, StaticToolRegistryResolver,
+        StepId, ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy, ToolRegistry,
         ToolRegistryResolver, ToolRuntimeError, ToolSetId, ToolSetRef, TraceNodeId, WorktreeRef,
     },
     client::{Capability, ChatRequest, ClientError, LlmClient, Response},
@@ -28,6 +29,10 @@ use std::{
     num::NonZeroU32,
     sync::{Arc, Mutex},
 };
+use tokio::{
+    sync::{Notify, oneshot},
+    time::{Duration, sleep},
+};
 
 type FakeStreamEvents = Vec<Result<StreamEvent, ClientError>>;
 type FakeStreamResult = Result<FakeStreamEvents, ClientError>;
@@ -38,6 +43,54 @@ struct FakeClient {
     chat_results: Mutex<VecDeque<Result<Response, ClientError>>>,
     stream_results: Mutex<VecDeque<FakeStreamResult>>,
     requests: Mutex<Vec<ChatRequest>>,
+}
+
+#[derive(Debug)]
+struct DelayedStreamClient {
+    capability: Capability,
+    events: Vec<Result<StreamEvent, ClientError>>,
+    delay: Duration,
+    requests: Mutex<Vec<ChatRequest>>,
+}
+
+impl DelayedStreamClient {
+    fn new(events: Vec<Result<StreamEvent, ClientError>>, delay: Duration) -> Self {
+        Self {
+            capability: Capability::default(),
+            events,
+            delay,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmClient for DelayedStreamClient {
+    fn capability(&self) -> &Capability {
+        &self.capability
+    }
+
+    async fn chat(&self, _request: ChatRequest) -> Result<Response, ClientError> {
+        Err(ClientError::Other(
+            "delayed stream client only supports streaming".to_owned(),
+        ))
+    }
+
+    async fn chat_stream(
+        &self,
+        request: ChatRequest,
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError>
+    {
+        self.requests.lock().expect("requests mutex").push(request);
+        let delay = self.delay;
+        let events = VecDeque::from(self.events.clone());
+        Ok(stream::unfold(events, move |mut events| async move {
+            let event = events.pop_front()?;
+            sleep(delay).await;
+            Some((event, events))
+        })
+        .boxed())
+    }
 }
 
 impl FakeClient {
@@ -77,6 +130,83 @@ struct FakeToolRegistry {
     declarations: Vec<Tool>,
     results: Mutex<VecDeque<Result<ToolResponse, ToolRuntimeError>>>,
     calls: Mutex<Vec<(ToolCallId, ToolCall)>>,
+}
+
+#[derive(Debug)]
+struct BlockingToolRegistry {
+    declarations: Vec<Tool>,
+    started: Arc<Notify>,
+    response: Mutex<Option<oneshot::Receiver<ToolResponse>>>,
+    calls: Mutex<Vec<(ToolCallId, ToolCall)>>,
+}
+
+impl BlockingToolRegistry {
+    fn new(response: oneshot::Receiver<ToolResponse>) -> Self {
+        Self {
+            declarations: vec![weather_tool()],
+            started: Arc::new(Notify::new()),
+            response: Mutex::new(Some(response)),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn started(&self) -> Arc<Notify> {
+        Arc::clone(&self.started)
+    }
+
+    fn calls(&self) -> Vec<(ToolCallId, ToolCall)> {
+        self.calls.lock().expect("tool calls mutex").clone()
+    }
+}
+
+#[async_trait]
+impl ToolRegistry for BlockingToolRegistry {
+    fn declarations(&self) -> Vec<Tool> {
+        self.declarations.clone()
+    }
+
+    async fn execute(
+        &self,
+        call_id: ToolCallId,
+        call: ToolCall,
+    ) -> Result<ToolResponse, ToolRuntimeError> {
+        self.calls
+            .lock()
+            .expect("tool calls mutex")
+            .push((call_id, call));
+        let receiver = self
+            .response
+            .lock()
+            .expect("response mutex")
+            .take()
+            .expect("blocking tool response receiver");
+        self.started.notify_waiters();
+        receiver
+            .await
+            .map_err(|_| ToolRuntimeError::ExecutionFailed {
+                tool_name: "get_weather".to_owned(),
+                message: "response channel closed".to_owned(),
+            })
+    }
+}
+
+#[derive(Debug)]
+struct RequireApprovalPolicy {
+    reason: Option<String>,
+}
+
+impl RequireApprovalPolicy {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+impl ToolApprovalPolicy for RequireApprovalPolicy {
+    fn approval_requirement(&self, _call_id: ToolCallId, _call: &ToolCall) -> ApprovalRequirement {
+        ApprovalRequirement::required(self.reason.clone())
+    }
 }
 
 impl FakeToolRegistry {
@@ -248,6 +378,12 @@ fn tool_set_id_seed(seed: u64) -> ToolSetId {
 
 fn run_id() -> RunId {
     "018f0d9c-7b6a-7c12-8f31-123456789003"
+        .parse()
+        .expect("run id")
+}
+
+fn run_id_seed(seed: u64) -> RunId {
+    format!("018f0d9c-7b6a-7c12-8f31-{seed:012x}")
         .parse()
         .expect("run id")
 }
@@ -549,6 +685,12 @@ async fn collect_events(
     Ok(collected)
 }
 
+async fn collect_error(events: crate::agent::AgentEventStream) -> AgentError {
+    collect_events(events)
+        .await
+        .expect_err("stream should yield a classified error")
+}
+
 fn assert_text(message: &Message, expected: &str) {
     assert_eq!(message.content.len(), 1);
     let ContentBlock::Text { text, .. } = &message.content[0] else {
@@ -648,6 +790,28 @@ fn streaming_tool_loop(
         tool_registry,
         tool_ids,
     )
+}
+
+fn approval_tool_loop(
+    client: Arc<FakeClient>,
+    registry: Arc<dyn ToolRegistry>,
+    ids: Arc<FakeToolIds>,
+    spec: AgentSpec,
+    policy: Arc<dyn ToolApprovalPolicy>,
+    mode: LlmStepMode,
+    context: RunContext,
+) -> DefaultAgentLoop {
+    let llm: Arc<dyn LlmClient> = client;
+    let tool_ids: Arc<dyn ToolExecutionIds> = ids;
+    DefaultAgentLoop::with_tool_registry(
+        llm,
+        state_with_spec(spec),
+        context,
+        mode,
+        registry,
+        tool_ids,
+    )
+    .with_approval_policy(policy)
 }
 
 #[tokio::test]
@@ -1199,10 +1363,11 @@ async fn client_error_discards_pending_without_committing() {
     let llm: Arc<dyn LlmClient> = client;
     let mut loop_impl = DefaultAgentLoop::new(llm, state(), context(), LlmStepMode::NonStreaming);
 
-    let error = loop_impl
+    let stream = loop_impl
         .feed(input())
         .await
-        .expect_err("client error should fail feed");
+        .expect("feed starts before client response is pulled");
+    let error = collect_error(stream).await;
 
     assert!(matches!(
         error,
@@ -1230,10 +1395,11 @@ async fn invalid_assistant_response_discards_pending_without_committing() {
     let llm: Arc<dyn LlmClient> = client;
     let mut loop_impl = DefaultAgentLoop::new(llm, state(), context(), LlmStepMode::NonStreaming);
 
-    let error = loop_impl
+    let stream = loop_impl
         .feed(input())
         .await
-        .expect_err("invalid assistant response should fail feed");
+        .expect("feed starts before assistant response is folded");
+    let error = collect_error(stream).await;
 
     assert_eq!(error.kind(), crate::agent::AgentErrorKind::Conversation);
     loop_impl
@@ -1333,6 +1499,396 @@ async fn non_streaming_single_tool_executes_result_and_commits_final_assistant()
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0, tool_call_id_seed(100));
     assert_eq!(calls[0].1.name, "get_weather");
+}
+
+#[tokio::test]
+async fn approval_approve_pauses_stream_then_executes_tool_and_commits() {
+    let client = Arc::new(FakeClient::with_chats(vec![
+        Ok(tool_use_response(
+            vec![("call-weather", "get_weather", json!({ "city": "Shanghai" }))],
+            usage(5, 2),
+        )),
+        Ok(assistant_response("approved result used", usage(7, 4))),
+    ]));
+    let registry = Arc::new(FakeToolRegistry::new(vec![Ok(tool_response(
+        "call-weather",
+        "Sunny",
+        ToolStatus::Ok,
+    ))]));
+    let ids = Arc::new(FakeToolIds::new(
+        vec![tool_call_id_seed(700)],
+        vec![message_id_seed(701)],
+        vec![message_id_seed(702)],
+        vec![step_id_seed(703)],
+    ));
+    let mut loop_impl = approval_tool_loop(
+        client,
+        registry.clone(),
+        ids,
+        spec_with_tools(1, ToolFailurePolicy::ReturnErrorToModel),
+        Arc::new(RequireApprovalPolicy::new("human approval required")),
+        LlmStepMode::NonStreaming,
+        context(),
+    );
+
+    let mut stream = loop_impl.feed(input()).await.expect("feed starts");
+    let first = stream
+        .next()
+        .await
+        .expect("approval event")
+        .expect("approval event succeeds");
+    let AgentEvent::AwaitingApproval(request) = first else {
+        panic!("first event waits for approval");
+    };
+    assert_eq!(request.step_id(), step_id());
+    assert_eq!(request.call_id(), tool_call_id_seed(700));
+    assert_eq!(request.call().id, "call-weather");
+    assert_eq!(request.reason(), Some("human approval required"));
+    assert!(loop_impl.feed_in_progress());
+    assert!(registry.calls().is_empty());
+    loop_impl
+        .inspect_state(|state| {
+            assert_eq!(state.loop_cursor().kind(), LoopCursorKind::AwaitingApproval);
+            assert!(state.conversation().pending().is_some());
+        })
+        .expect("inspect state");
+
+    let reentrant = loop_impl
+        .feed(input_seed(710, "blocked"))
+        .await
+        .expect_err("approval keeps feed stream active");
+    assert_eq!(reentrant.kind(), AgentErrorKind::FeedInProgress);
+
+    loop_impl
+        .respond_approval(ApprovalResponse::approve(
+            request.step_id(),
+            request.call_id(),
+        ))
+        .expect("approval response accepted");
+
+    let mut events = vec![AgentEvent::AwaitingApproval(request)];
+    while let Some(event) = stream.next().await {
+        events.push(event.expect("stream event succeeds"));
+    }
+
+    assert!(matches!(events[1], AgentEvent::ToolCallStarted(_)));
+    let AgentEvent::ToolCallFinished(finished) = &events[2] else {
+        panic!("approved tool finishes");
+    };
+    assert_eq!(finished.response().status, ToolStatus::Ok);
+    assert!(matches!(events[3], AgentEvent::StepBoundary(_)));
+    assert!(matches!(events[4], AgentEvent::StepBoundary(_)));
+    assert_eq!(
+        events[5],
+        AgentEvent::Done(crate::agent::AgentOutcome::Completed)
+    );
+
+    loop_impl
+        .inspect_state(|state| {
+            assert_eq!(state.loop_cursor().kind(), LoopCursorKind::Idle);
+            assert!(state.conversation().pending().is_none());
+            let turn = &state.conversation().turns()[0];
+            assert_tool_result(turn.messages()[2].payload(), "call-weather", ToolStatus::Ok);
+            assert_text(turn.messages()[3].payload(), "approved result used");
+        })
+        .expect("inspect state");
+    assert_eq!(registry.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn approval_deny_timeout_and_cancel_return_standard_tool_results() {
+    let client = Arc::new(FakeClient::with_chats(vec![
+        Ok(tool_use_response(
+            vec![
+                ("call-deny", "get_weather", json!({ "city": "Private" })),
+                ("call-timeout", "get_weather", json!({ "city": "Slow" })),
+                ("call-cancel", "get_weather", json!({ "city": "Cancelled" })),
+            ],
+            usage(8, 3),
+        )),
+        Ok(assistant_response(
+            "handled approval decisions",
+            usage(9, 5),
+        )),
+    ]));
+    let registry = Arc::new(FakeToolRegistry::new(Vec::new()));
+    let ids = Arc::new(FakeToolIds::new(
+        vec![
+            tool_call_id_seed(720),
+            tool_call_id_seed(721),
+            tool_call_id_seed(722),
+        ],
+        vec![
+            message_id_seed(723),
+            message_id_seed(724),
+            message_id_seed(725),
+        ],
+        vec![message_id_seed(726)],
+        vec![step_id_seed(727)],
+    ));
+    let mut loop_impl = approval_tool_loop(
+        client,
+        registry.clone(),
+        ids,
+        spec_with_tools(3, ToolFailurePolicy::ReturnErrorToModel),
+        Arc::new(RequireApprovalPolicy::new("approval required")),
+        LlmStepMode::NonStreaming,
+        context(),
+    );
+
+    let mut stream = loop_impl.feed(input()).await.expect("feed starts");
+    let mut finished_statuses = Vec::new();
+    for (expected_call_id, response) in [
+        (
+            tool_call_id_seed(720),
+            ApprovalResponse::deny(
+                step_id(),
+                tool_call_id_seed(720),
+                Some("denied by policy".to_owned()),
+            ),
+        ),
+        (
+            tool_call_id_seed(721),
+            ApprovalResponse::timeout(
+                step_id(),
+                tool_call_id_seed(721),
+                Some("approval timed out".to_owned()),
+            ),
+        ),
+        (
+            tool_call_id_seed(722),
+            ApprovalResponse::cancel(
+                step_id(),
+                tool_call_id_seed(722),
+                Some("cancelled by approver".to_owned()),
+            ),
+        ),
+    ] {
+        let event = stream
+            .next()
+            .await
+            .expect("approval event")
+            .expect("approval event succeeds");
+        let AgentEvent::AwaitingApproval(request) = event else {
+            panic!("tool waits for approval");
+        };
+        assert_eq!(request.call_id(), expected_call_id);
+        loop_impl
+            .respond_approval(response)
+            .expect("approval response accepted");
+
+        let event = stream
+            .next()
+            .await
+            .expect("tool result event")
+            .expect("tool result succeeds");
+        let AgentEvent::ToolCallFinished(finished) = event else {
+            panic!("denied approval produces a tool-finished result");
+        };
+        finished_statuses.push(finished.response().status);
+    }
+
+    let rest = collect_events(stream)
+        .await
+        .expect("loop recovers after denials");
+    assert!(matches!(rest[0], AgentEvent::StepBoundary(_)));
+    assert!(matches!(rest[1], AgentEvent::StepBoundary(_)));
+    assert_eq!(
+        rest[2],
+        AgentEvent::Done(crate::agent::AgentOutcome::Completed)
+    );
+    assert_eq!(
+        finished_statuses,
+        vec![
+            ToolStatus::Denied,
+            ToolStatus::Denied,
+            ToolStatus::Cancelled
+        ]
+    );
+    assert!(registry.calls().is_empty());
+
+    loop_impl
+        .inspect_state(|state| {
+            let turn = &state.conversation().turns()[0];
+            assert_tool_result(
+                turn.messages()[2].payload(),
+                "call-deny",
+                ToolStatus::Denied,
+            );
+            assert_tool_result(
+                turn.messages()[3].payload(),
+                "call-timeout",
+                ToolStatus::Denied,
+            );
+            assert_tool_result(
+                turn.messages()[4].payload(),
+                "call-cancel",
+                ToolStatus::Cancelled,
+            );
+            assert_text(turn.messages()[5].payload(), "handled approval decisions");
+        })
+        .expect("inspect state");
+}
+
+#[tokio::test]
+async fn cancellation_discards_active_streaming_partial_and_closes_feed() {
+    let run_context = context();
+    let client = Arc::new(DelayedStreamClient::new(
+        text_stream_events("slow"),
+        Duration::from_millis(50),
+    ));
+    let llm: Arc<dyn LlmClient> = client;
+    let mut loop_impl =
+        DefaultAgentLoop::new(llm, state(), run_context.clone(), LlmStepMode::Streaming);
+
+    let mut stream = loop_impl.feed(input()).await.expect("feed starts");
+    let first = stream
+        .next()
+        .await
+        .expect("first stream event")
+        .expect("first event succeeds");
+    assert!(matches!(
+        first,
+        AgentEvent::Llm(StreamEvent::MessageStart { .. })
+    ));
+
+    run_context.cancellation().cancel();
+    let cancelled = stream
+        .next()
+        .await
+        .expect("cancel event")
+        .expect("cancel closes feed cleanly");
+    assert_eq!(
+        cancelled,
+        AgentEvent::Done(crate::agent::AgentOutcome::Cancelled)
+    );
+    assert!(stream.next().await.is_none());
+
+    loop_impl
+        .inspect_state(|state| {
+            assert_eq!(state.loop_cursor().kind(), LoopCursorKind::Idle);
+            assert!(state.conversation().pending().is_none());
+            assert!(state.conversation().turns().is_empty());
+            assert_eq!(state.conversation().version(), 0);
+        })
+        .expect("inspect state");
+}
+
+#[tokio::test]
+async fn parent_cancel_interrupts_open_tool_call_and_resume_feed_continues_turn() {
+    let client = Arc::new(FakeClient::with_chats(vec![
+        Ok(tool_use_response(
+            vec![("call-weather", "get_weather", json!({ "city": "Shanghai" }))],
+            usage(5, 2),
+        )),
+        Ok(assistant_response(
+            "continued after cancelled tool",
+            usage(7, 4),
+        )),
+    ]));
+    let (_sender, receiver) = oneshot::channel();
+    let registry = Arc::new(BlockingToolRegistry::new(receiver));
+    let started = registry.started();
+    let ids = Arc::new(FakeToolIds::new(
+        vec![tool_call_id_seed(740)],
+        vec![message_id_seed(741)],
+        vec![message_id_seed(742)],
+        Vec::new(),
+    ));
+    let parent_context = context();
+    let child_context = parent_context
+        .derive_child(run_id_seed(7_400), TraceNodeId::new("child-tool-run"))
+        .expect("child context derives from parent");
+    let llm: Arc<dyn LlmClient> = client.clone();
+    let tool_registry: Arc<dyn ToolRegistry> = registry.clone();
+    let tool_ids: Arc<dyn ToolExecutionIds> = ids.clone();
+    let mut loop_impl = DefaultAgentLoop::with_tool_registry(
+        llm,
+        state_with_spec(spec_with_tools(1, ToolFailurePolicy::ReturnErrorToModel)),
+        child_context,
+        LlmStepMode::NonStreaming,
+        tool_registry,
+        tool_ids,
+    );
+
+    let mut stream = loop_impl.feed(input()).await.expect("feed starts");
+    let mut next = Box::pin(stream.next());
+    tokio::select! {
+        () = started.notified() => {}
+        event = &mut next => panic!("tool future should not complete before cancellation: {event:?}"),
+    }
+    assert_eq!(registry.calls().len(), 1);
+
+    parent_context.cancellation().cancel();
+    let cancelled = (&mut next)
+        .await
+        .expect("cancel event")
+        .expect("tool cancel closes feed cleanly");
+    assert_eq!(
+        cancelled,
+        AgentEvent::Done(crate::agent::AgentOutcome::Cancelled)
+    );
+    drop(next);
+    assert!(stream.next().await.is_none());
+
+    loop_impl
+        .inspect_state(|state| {
+            assert_eq!(state.loop_cursor().kind(), LoopCursorKind::Idle);
+            let pending = state
+                .conversation()
+                .pending()
+                .expect("pending turn resumes");
+            assert_eq!(pending.messages().len(), 3);
+            assert_tool_result(
+                pending.messages()[2].payload(),
+                "call-weather",
+                ToolStatus::Cancelled,
+            );
+            assert!(state.conversation().turns().is_empty());
+        })
+        .expect("inspect state");
+
+    let resumed_state = loop_impl.into_state().expect("state can be recovered");
+    let llm: Arc<dyn LlmClient> = client;
+    let tool_registry: Arc<dyn ToolRegistry> = registry;
+    let tool_ids: Arc<dyn ToolExecutionIds> = ids;
+    let mut resumed_loop = DefaultAgentLoop::with_tool_registry(
+        llm,
+        resumed_state,
+        context(),
+        LlmStepMode::NonStreaming,
+        tool_registry,
+        tool_ids,
+    );
+    let events = collect_events(
+        resumed_loop
+            .feed(AgentInput::resume(step_id_seed(743)))
+            .await
+            .expect("resume feed starts"),
+    )
+    .await
+    .expect("resume feed succeeds");
+    assert!(matches!(events[0], AgentEvent::StepBoundary(_)));
+    assert_eq!(
+        events[1],
+        AgentEvent::Done(crate::agent::AgentOutcome::Completed)
+    );
+
+    resumed_loop
+        .inspect_state(|state| {
+            assert!(state.conversation().pending().is_none());
+            let turn = &state.conversation().turns()[0];
+            assert_tool_result(
+                turn.messages()[2].payload(),
+                "call-weather",
+                ToolStatus::Cancelled,
+            );
+            assert_text(
+                turn.messages()[3].payload(),
+                "continued after cancelled tool",
+            );
+        })
+        .expect("inspect resumed state");
 }
 
 #[tokio::test]
@@ -1652,10 +2208,11 @@ async fn duplicate_framework_tool_call_id_is_rejected_without_commit() {
         spec_with_tools(2, ToolFailurePolicy::ReturnErrorToModel),
     );
 
-    let error = loop_impl
+    let stream = loop_impl
         .feed(input())
         .await
-        .expect_err("duplicate framework call id should reject feed");
+        .expect("feed starts before tool mappings are registered");
+    let error = collect_error(stream).await;
 
     assert_eq!(error.kind(), AgentErrorKind::Conversation);
     loop_impl
@@ -1692,10 +2249,11 @@ async fn tool_response_for_unknown_provider_call_is_rejected_without_commit() {
         spec_with_tools(1, ToolFailurePolicy::ReturnErrorToModel),
     );
 
-    let error = loop_impl
+    let stream = loop_impl
         .feed(input())
         .await
-        .expect_err("unknown provider call result should reject feed");
+        .expect("feed starts before tool result is appended");
+    let error = collect_error(stream).await;
 
     assert_eq!(error.kind(), AgentErrorKind::Conversation);
     loop_impl

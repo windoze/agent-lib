@@ -1,43 +1,46 @@
 # 执行计划
 
-本文件记录本次调用的可公开推理摘要与执行步骤。不会记录隐藏链路思考；后续如计划变化或关键步骤完成，会继续更新这里。
+本文件记录本次调用的可审计执行计划、关键进度和计划变更。内容聚焦任务依据、操作步骤、验证方式和结果记录，不包含私有推理链。
 
-## 当前目标
+## 初始计划
 
-按 `TODO.md` 的权威顺序识别并完成第一个标题未带 `[DONE]` 的任务，完成后更新记录、验证、提交，然后停止。
+1. 先读取 `TODO.md`，按标题是否带 `[DONE]` 判断第一个未完成任务；同时查看最新提交信息，仅在其明确提到与该任务直接相关的未完成事项时纳入当前任务或新增前置任务。
+2. 阅读当前任务在 `TODO.md` 中的完整要求、依赖、验收标准和完成记录；必要时查阅 `PLAN.md` 以理解阶段边界，但不把 `PLAN.md` 作为日常任务日志。
+3. 检查工作区状态，识别已有未提交改动；不回滚用户改动，只在当前任务需要时与之协同。
+4. 针对第一个未完成任务阅读相关源码、测试和文档，确定最小但完整的实现范围。
+5. 实现任务；如发现阻塞当前任务的规格不匹配、缺陷或未排期失败测试，则优先修复，或在 `TODO.md` 中新增最小前置任务并停止。
+6. 按要求先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，最后在需要时运行 `cargo test --all --all-targets`（完整测试超时不超过 30 分钟）。若本次仅文档变更且上次完整测试仍可复用，则在完成记录中说明跳过原因。
+7. 更新 `TODO.md`：只有任务完整实现并验证后，才在任务标题前加 `[DONE]` 并填写完成记录。仅当阶段计划发生真实变化时才更新 `PLAN.md`。
+8. 提交本次变更，提交信息包含任务编号和清晰说明。
+9. 完成第一个未完成任务后停止，不继续处理后续任务。
 
-## 步骤
+## 进度记录
 
-1. 读取 `TODO.md`，只识别第一个未完成任务；同时查看最新提交信息，判断是否有与该任务直接相关的未完事项。
-2. 读取该任务涉及的计划、代码、测试和文档上下文，避免做无关历史问题扫描。
-3. 如任务可直接完成，按仓库现有设计实现；如存在阻塞当前任务的明确前置问题，则在 `TODO.md` 插入最小前置任务并停止。
-4. 依据任务要求补充或调整测试。
-5. 先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，最后运行必要测试；若代码有变更且任务要求完整验证，则运行 `cargo test --all --all-targets`。
-6. 将当前任务标题标记为 `[DONE]`，更新 completion record；仅在阶段计划真实变化时更新 `PLAN.md`。
-7. 检查工作区变更并提交本次任务相关全部变更。
+- 已完成：读取 `TODO.md` 标题列表，确认首个未完成任务是 `M3-4 Approval 挂起、responder 与 cancel 贯穿闭合`。
+- 已检查：最新提交为 `[M3-3] Implement turn-boundary reconfig queue`，与当前任务的直接前置任务一致；未发现需要在当前任务前额外插入的最新提交遗留事项。
+- 已注意：工作区已有未提交项 `docs/agent-effect-model.md`，当前先视为既有用户/外部改动；后续只在确认其与 M3-4 直接相关或必须纳入任务完成记录时处理，不回滚。
 
-## 状态
+## 当前任务计划：M3-4
 
-- 已创建初始计划。
-- 已读取 `TODO.md` 标题索引，首个未完成任务为 `M3-3 Turn-boundary reconfig：skill/tool/system 变更排队`。
-- 最新提交为 `[M3-2] Implement pivot queue interject soft turning`，与当前 M3-3 顺序相邻但未发现需先处理的额外 unfinished issue。
-- 当前工作区存在本次新增/更新的 `memory/claude_plan.md`，另有未跟踪 `docs/agent-effect-model.md`，后续会先判定其是否与 M3-3 直接相关，避免误覆盖用户改动。
+1. 阅读 `docs/agent-layer.md` 中 tool approval/cancel 相关规范，以及 `src/agent` 中 loop、event、state、context、tool 的现有边界。
+2. 识别现有 `AwaitingApproval` 事件、`ApprovalRequest`、`LoopCursor::AwaitingApproval`、`RunContext` cancellation、Conversation cancel API 的可复用点。
+3. 已完成：新增 `approval` 模块，定义 approval policy、requirement、response/decision 和分类 error；事件 payload 继续保持 data-only，live responder 通过 `AgentLoop::respond_approval` 提交。
+4. 已完成：approval 决策已接入默认 loop；approve 后执行 tool，deny/timeout/cancel 生成 provider-neutral `ToolStatus::Denied`/`Cancelled` result 并继续模型恢复。
+5. 已完成：`RunContext` cancellation token 已接入 LLM stream 与 tool future；active partial 走 discard closure，open tool call 走 `CancelDisposition::ResumeTurn` 合成 cancelled results，并可用新的 runtime context 继续 feed。
+6. 已完成：awaiting approval 使用 data-only `LoopCursor::AwaitingApproval`，live responder 留在 runtime waiter map，不进入 serde。
+7. 已完成：新增聚焦测试覆盖 approve、deny、timeout、approval cancel、stream 挂起不结束、active partial cancel、open tool cancel 后 resume feed，以及父 cancel 传播到 child context/tool future。
+8. 已完成：最终验证链通过，`TODO.md` 已将 `M3-4` 标记为 `[DONE]` 并补充完成记录；下一步提交本次 M3-4 相关改动。
 
-## M3-3 实施计划
+## 计划调整
 
-1. 扩展 `agent::state::queue`：把现有 `QueuedReconfig` 演进为公开的 `ReconfigRequest` 数据形状，并加入 `ReconfigQueue` wrapper；覆盖 skill activate/deactivate、active skill replace、tool set replace/patch、system overlay、model ref 和 loop policy 更新。
-2. 在 `AgentState` 增加已生效的 system overlay、current tool set、current model、current loop policy，以及受检的 `apply_queued_reconfigs` 原子应用入口；预校验通过后一次性 drain queue，失败时不修改队列或已生效状态。
-3. 在 runtime tool 边界增加可替换 registry wrapper，使 `DefaultAgentLoop` 可在 turn boundary 把新的 `ToolSetRef` 声明同步到 runtime registry；当前 turn 的工具执行仍使用该 turn 开始时的 snapshot。
-4. 修改 `DefaultAgentLoop`：`build_chat_request` 读取 state 中当前 model/policy/system/tool 声明；最终 assistant commit 后、发出 final `StepBoundary` 前应用 queued reconfigs，并把结果写入 boundary metadata。
-5. 补充聚焦测试：reconfig 在 pending turn 中延迟到最终 commit 后生效、下一 turn request 改变；tool-use turn 内 registry snapshot 恒定；pivot 与 reconfig 同时排队互不干扰；重复 skill、未知 tool set、system overlay 版本冲突失败保持原子性。
-6. 验证顺序：`cargo fmt --all` → `cargo clippy --all-targets -- -D warnings` → 聚焦 reconfig/default loop 测试 → `cargo test --all --all-targets` → `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` → `git diff --check`。
+- 为了满足“AwaitingApproval 挂起 stream、不结束 feed”，非流式 driver 也需要在 `feed()` 返回后由事件流推进实际 LLM/tool 工作；否则 `feed()` 会在等待 approval 前无法把 responder 暴露给调用方。接下来会把非流式路径改成懒执行 event stream，并调整相关错误测试从 `feed()` 错误改为 stream item 错误。
 
-## M3-3 当前进展
+## 验证记录
 
-- 已扩展 reconfig data shape：`ReconfigRequest`、`ReconfigQueue`、`ToolSetPatch`，并保留 `QueuedReconfig` 兼容别名。
-- 已在 `AgentState` 增加当前 system overlay、tool set、model 和 loop policy，并实现 queued reconfig 的预览/原子应用。
-- 已在 tool runtime 边界增加 `ToolRegistryResolver`、declared-only resolver 和静态 catalog resolver。
-- 已让 `DefaultAgentLoop` 支持 `reconfigure` 入队，在 idle turn boundary 和 final assistant commit boundary 应用 reconfig，并在 final `StepBoundary` 写入 metadata。
-- 已补充 state/default loop 聚焦测试，并更新 README、crate docs、`docs/agent-layer.md` 与 `TODO.md` 完成记录。
-- 验证已通过：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test agent::state --all-targets`、`cargo test agent::loop_driver::default --all-targets`、`perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`、`cargo test --doc`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`git diff --check`。完整测试后只改了 Markdown 和 Rust doc comment，并已重跑 `cargo fmt --all`、rustdoc 和 `git diff --check`。
-- 下一步是提交本任务变更并停止，不进入 M3-4。
+- 通过：`cargo fmt --all`
+- 通过：`cargo clippy --all-targets -- -D warnings`
+- 通过：`cargo test agent:: --all-targets`
+- 通过：`perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`
+- 通过：`cargo test --doc`
+- 通过：`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
+- 通过：`git diff --check`

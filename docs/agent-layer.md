@@ -89,6 +89,8 @@ trait AgentLoop {
     async fn feed(&mut self, input: Input) -> ResultAsyncStream<AgentEvent>;
     /// 软转向:不打断当前 LLM 调用,在下一个 step 边界并入 pending(见 §4)。
     fn interject(&self, msg: PivotMessage) -> Result<()>;
+    /// 回应当前挂起的 tool approval;live responder 留在 runtime,事件只带 data。
+    fn respond_approval(&self, response: ApprovalResponse) -> Result<()>;
     // cancel 走 RunContext 里的 CancellationToken,不单列。
 }
 ```
@@ -100,7 +102,7 @@ AgentEvent =
   | Llm(StreamEvent)                              // 透传 text/thinking delta
   | StepBoundary(Boundary)                        // 边界:trace/预算/compaction/pivot 生效点
   | ToolCallStarted { call } / ToolCallFinished { result }
-  | AwaitingApproval { call, respond: Responder } // 就地挂起等外部回灌(不结束 stream)
+  | AwaitingApproval { call, reason? }            // 就地挂起等外部回灌(不结束 stream)
   | Done(Outcome)                                 // 这一段为何结束
 ```
 
@@ -140,7 +142,7 @@ struct RunContext {
 
 | 干预 | 触发方向 | 时机 | 下层机制 |
 |---|---|---|---|
-| **审批**(human-in-loop) | loop 主动停 | 立即挂起 | `AwaitingApproval` + Responder,stream 挂起不结束 |
+| **审批**(human-in-loop) | loop 主动停 | 立即挂起 | `AwaitingApproval` + `respond_approval`,stream 挂起不结束 |
 | **pivot**(用户改向) | 外部主动插 | 下一个 step 边界 | 向 pending **注入**(见 §4) |
 | **cancel** | 外部主动停 | 立即(硬) | `CancellationToken` + 下层 cancel 闭合裂缝 |
 

@@ -5,9 +5,10 @@
 //! Conversation and data-only loop cursor boundary. [`AgentLoop`] defines the
 //! guarded feed-to-event-stream contract; [`DefaultAgentLoop`] provides the
 //! current LLM/tool runtime path, pivot queue soft-turning, and turn-boundary
-//! reconfiguration queue. Approval responders and orchestration remain future
-//! layers. Live handles stay out of serde data shapes.
+//! reconfiguration queue, and approval responder boundary. Orchestration remains
+//! a future layer. Live handles stay out of serde data shapes.
 
+pub mod approval;
 pub mod context;
 pub mod event;
 pub mod id;
@@ -16,6 +17,10 @@ pub mod spec;
 pub mod state;
 pub mod tool;
 
+pub use approval::{
+    ApprovalDecision, ApprovalError, ApprovalRequirement, ApprovalResponse, NoApprovalPolicy,
+    ToolApprovalPolicy,
+};
 pub use context::{
     BudgetCharge, BudgetDimension, BudgetError, BudgetHandle, BudgetLimits, BudgetSnapshot,
     BudgetUsage, CancellationToken, RunContext, RunContextError, TraceError, TraceHandle,
