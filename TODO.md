@@ -677,7 +677,7 @@ cancel 通过 `RunContext` 的 cancellation token 立即打断 LLM/tool/sub-agen
   `cargo test agent:: --all-targets`；`perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；
   `cargo test --doc`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；`git diff --check`。
 
-### M3-R [TODO] Milestone 3 Review
+### [DONE] M3-R Milestone 3 Review
 
 **前置依赖**：M3-1 至 M3-4 全部完成。
 
@@ -698,6 +698,43 @@ cancel 通过 `RunContext` 的 cancellation token 立即打断 LLM/tool/sub-agen
 - 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
   `cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check`。
+
+**完成记录（2026-07-13）**：
+
+- 对照 `docs/agent-layer.md` §1.3、§3、§4 与 §8 完成 M3 review：`interject` 仅接受
+  `PivotMessage`/`QueuedPivot` 的 `Role::User` payload，默认 loop 在 tool-result step
+  boundary 通过 `Conversation::inject_user_message` 注入同一 pending turn；纯文本/final
+  boundary 只记录 `deferred` metadata 并保留队列，后续必须由
+  `AgentInput::QueuedPivotTurn` 按 FIFO 启动下一 turn，普通 `UserMessage` 会被
+  `QueuedPivotPending` 拒绝。
+- 审查 Conversation 注入入口：`resolve_pending_step_boundary` 仍执行 owner、structural
+  version、range、fork ceiling 与 anchor 校验，并要求 token 指向当前 head；`PendingTurn`
+  只在所有 tool results 闭合后的 `AwaitingAssistant` phase 接受 user 注入，active partial、
+  open call、非法 role、重复 message id、stale/foreign/redo-suffix boundary 都在 mutation
+  前分类拒绝；closed-turn validator 只放宽为 `tool_result+ -> user+ -> assistant`，未暴露
+  raw history 或 unchecked pending mutation。
+- 审查 reconfig 路径：`ReconfigRequest`/`ReconfigQueue` 是 data-only turn-boundary 意图，
+  queue 入队会预览整队冲突，默认 loop 在新 turn 前或 final assistant commit 后应用；tool set
+  变更先经 `ToolRegistryResolver` 解析并比对声明，失败不替换 runtime registry；当前 turn 的
+  tool execution 与 assistant continuation 继续使用启动 turn 时的 registry snapshot。
+- 审查 approval/cancel 路径：`ToolApprovalPolicy` 与 approval waiter map 只存在于 runtime，
+  `AgentEvent::AwaitingApproval`/`ApprovalRequest` 和 `ApprovalResponse` 保持 data-only；
+  approve 后执行 tool，deny/timeout/cancel 回灌标准 `ToolStatus::Denied` 或
+  `ToolStatus::Cancelled` result；`RunContext` cancellation 会中断 LLM stream 与 tool future，
+  active partial 通过 `CancelDisposition::DiscardTurn` 闭合，open tool call 通过
+  `CancelDisposition::ResumeTurn` 合成 cancelled results，并允许后续 `AgentInput::Resume`
+  使用新的 runtime context 继续 feed。
+- 核对 M4 可调用边界：vertical API 应只依赖已公开的 `AgentLoop::feed`、`interject`、
+  `reconfigure`、`respond_approval`、`AgentState` 只读 getter/受检 queue API、
+  `ToolRegistry`/`ToolRegistryResolver` runtime traits 和 Conversation 公开受检 API；不得直接
+  操作 `DefaultAgentLoop` 内部 mutex、approval waiters、tool registry slot、raw history 或
+  `PendingTurn` 私有状态。
+- 未发现需要在 M3-R 前插入的新前置任务，也未发现需要更新 `PLAN.md` 的阶段级计划变化。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test agent:: --all-targets`；`cargo test conversation::pending::turn --all-targets`；
+  `cargo test conversation::validation --all-targets`；
+  `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`；`cargo test --doc`；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
 ---
 

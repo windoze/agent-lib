@@ -1,46 +1,44 @@
 # 执行计划
 
-本文件记录本次调用的可审计执行计划、关键进度和计划变更。内容聚焦任务依据、操作步骤、验证方式和结果记录，不包含私有推理链。
+## 当前约束
 
-## 初始计划
+- 输出和进度记录使用中文。
+- `TODO.md` 是任务顺序和完成条件的唯一权威来源。
+- 本轮只完成第一个标题未带 `[DONE]` 的任务，完成后提交 Git 并停止。
+- 如遇阻塞，不绕过规格；在 `TODO.md` 插入最小必要前置任务并提交后停止。
+- 格式化、clippy、完整测试按要求顺序执行；若只改文档且无代码变化，可复用上一轮绿色结果并记录原因。
 
-1. 先读取 `TODO.md`，按标题是否带 `[DONE]` 判断第一个未完成任务；同时查看最新提交信息，仅在其明确提到与该任务直接相关的未完成事项时纳入当前任务或新增前置任务。
-2. 阅读当前任务在 `TODO.md` 中的完整要求、依赖、验收标准和完成记录；必要时查阅 `PLAN.md` 以理解阶段边界，但不把 `PLAN.md` 作为日常任务日志。
-3. 检查工作区状态，识别已有未提交改动；不回滚用户改动，只在当前任务需要时与之协同。
-4. 针对第一个未完成任务阅读相关源码、测试和文档，确定最小但完整的实现范围。
-5. 实现任务；如发现阻塞当前任务的规格不匹配、缺陷或未排期失败测试，则优先修复，或在 `TODO.md` 中新增最小前置任务并停止。
-6. 按要求先运行 `cargo fmt --all`，再运行 `cargo clippy --all-targets -- -D warnings`，最后在需要时运行 `cargo test --all --all-targets`（完整测试超时不超过 30 分钟）。若本次仅文档变更且上次完整测试仍可复用，则在完成记录中说明跳过原因。
-7. 更新 `TODO.md`：只有任务完整实现并验证后，才在任务标题前加 `[DONE]` 并填写完成记录。仅当阶段计划发生真实变化时才更新 `PLAN.md`。
-8. 提交本次变更，提交信息包含任务编号和清晰说明。
-9. 完成第一个未完成任务后停止，不继续处理后续任务。
+## 步骤计划
 
-## 进度记录
+1. 读取 `TODO.md`，确定第一个未完成任务及其验收要求。
+2. 检查当前 Git 状态和最近提交，只关注与当前任务直接相关的未完成事项或阻塞。
+3. 阅读当前任务涉及的设计文档、源码和测试，确认既有模式与边界。
+4. 以最小、完整、符合现有架构的方式实现当前任务；若发现必须先修复的具体前置问题，更新 `TODO.md` 并停止。
+5. 添加或调整聚焦测试，覆盖当前任务要求和相关失败路径。
+6. 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`，并修复所有未被明确排期的失败。
+7. 将当前任务标题标记为 `[DONE]`，更新其完成记录；仅在阶段级计划变化时修改 `PLAN.md`。
+8. 查看 Git diff，确认没有误改或泄漏；提交本轮全部相关变更。
 
-- 已完成：读取 `TODO.md` 标题列表，确认首个未完成任务是 `M3-4 Approval 挂起、responder 与 cancel 贯穿闭合`。
-- 已检查：最新提交为 `[M3-3] Implement turn-boundary reconfig queue`，与当前任务的直接前置任务一致；未发现需要在当前任务前额外插入的最新提交遗留事项。
-- 已注意：工作区已有未提交项 `docs/agent-effect-model.md`，当前先视为既有用户/外部改动；后续只在确认其与 M3-4 直接相关或必须纳入任务完成记录时处理，不回滚。
+## 进度
 
-## 当前任务计划：M3-4
+- 已创建本执行计划。
+- 已读取 `TODO.md`，本轮第一个未完成任务为 `M3-R Milestone 3 Review`。
+- 本轮目标是完成 M3 的人工审查与验证，更新 `TODO.md` 完成记录并提交；不开始 M4。
+- 已检查工作树：除本计划文件外存在未跟踪 `docs/agent-effect-model.md`，内容为未采纳设计草稿；本轮不纳入 M3-R 修改。
+- 已人工读取 M3 关键实现与文档，初步确认 pivot/reconfig/approval/cancel 路径均通过受检边界接入。
+- 已运行 `cargo fmt --all`，通过。
+- 已运行 `cargo clippy --all-targets -- -D warnings`，通过。
+- 已运行 M3 聚焦测试：`cargo test agent:: --all-targets`、`cargo test conversation::pending::turn --all-targets`、`cargo test conversation::validation --all-targets`，均通过。
+- 已运行 `perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`，通过。
+- 已运行 `cargo test --doc` 与 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`，均通过。
+- 已将 `TODO.md` 中 `M3-R Milestone 3 Review` 标记为 `[DONE]` 并补充完成记录；未更新 `PLAN.md`，因为无阶段级计划变化。
+- 已运行 `git diff --check`，通过。
 
-1. 阅读 `docs/agent-layer.md` 中 tool approval/cancel 相关规范，以及 `src/agent` 中 loop、event、state、context、tool 的现有边界。
-2. 识别现有 `AwaitingApproval` 事件、`ApprovalRequest`、`LoopCursor::AwaitingApproval`、`RunContext` cancellation、Conversation cancel API 的可复用点。
-3. 已完成：新增 `approval` 模块，定义 approval policy、requirement、response/decision 和分类 error；事件 payload 继续保持 data-only，live responder 通过 `AgentLoop::respond_approval` 提交。
-4. 已完成：approval 决策已接入默认 loop；approve 后执行 tool，deny/timeout/cancel 生成 provider-neutral `ToolStatus::Denied`/`Cancelled` result 并继续模型恢复。
-5. 已完成：`RunContext` cancellation token 已接入 LLM stream 与 tool future；active partial 走 discard closure，open tool call 走 `CancelDisposition::ResumeTurn` 合成 cancelled results，并可用新的 runtime context 继续 feed。
-6. 已完成：awaiting approval 使用 data-only `LoopCursor::AwaitingApproval`，live responder 留在 runtime waiter map，不进入 serde。
-7. 已完成：新增聚焦测试覆盖 approve、deny、timeout、approval cancel、stream 挂起不结束、active partial cancel、open tool cancel 后 resume feed，以及父 cancel 传播到 child context/tool future。
-8. 已完成：最终验证链通过，`TODO.md` 已将 `M3-4` 标记为 `[DONE]` 并补充完成记录；下一步提交本次 M3-4 相关改动。
+## 当前任务执行清单
 
-## 计划调整
-
-- 为了满足“AwaitingApproval 挂起 stream、不结束 feed”，非流式 driver 也需要在 `feed()` 返回后由事件流推进实际 LLM/tool 工作；否则 `feed()` 会在等待 approval 前无法把 responder 暴露给调用方。接下来会把非流式路径改成懒执行 event stream，并调整相关错误测试从 `feed()` 错误改为 stream item 错误。
-
-## 验证记录
-
-- 通过：`cargo fmt --all`
-- 通过：`cargo clippy --all-targets -- -D warnings`
-- 通过：`cargo test agent:: --all-targets`
-- 通过：`perl -e 'alarm 1800; exec @ARGV' cargo test --all --all-targets`
-- 通过：`cargo test --doc`
-- 通过：`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
-- 通过：`git diff --check`
+1. 检查 Git 状态和最近提交，确认是否存在与 M3-R 直接相关的未提交/未完成事项。
+2. 阅读 M3 相关实现和文档：pivot 注入、reconfig、approval、cancel、Conversation 注入入口、runtime state 边界。
+3. 对照 `TODO.md` 的 M3-R 要求进行人工映射，确认无 unchecked pending/raw history 入口，无 turn 内 reconfig 生效，无不可恢复 approval/cancel 漏洞。
+4. 运行 M3 聚焦测试与全量验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、M3/agent/conversation 聚焦测试、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`git diff --check`。
+5. 若发现未排期失败或阻塞，修复或在 `TODO.md` 插入最小前置任务并停止。
+6. 若审查和验证通过，将 `M3-R` 标题标记为 `[DONE]`，补充完成记录，提交变更后停止。
