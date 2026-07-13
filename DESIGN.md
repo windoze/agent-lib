@@ -148,8 +148,15 @@ turn 的产物先攒在 **pending/staging 区**,到达完整 `Boundary` 时才 c
 
 方向性设计(未细化实现)。这一层大概率**不止一层**,并依赖若干垂直/横切功能。
 
+> 本层的细化草稿见 [`docs/agent-layer.md`](docs/agent-layer.md)(Agent 三层拆分 + RunContext、pivot/reconfig 两级边界、API-first、plan/blackboard、简单 agent + fork)。以下为基线要点。
+
 #### Layer A —— 单 agent 执行(Agent Runtime / Loop)
-一个 agent = LLM client + conversation + tool registry + 一个 loop 策略。核心是 agent loop:
+一个 agent = LLM client + conversation + tool registry + 一个 loop 策略。**结构刻意做薄,拆成三样、别糊成一个大 struct**(细节见 agent-layer.md §1):
+- **AgentSpec**(静态 identity/config,serde):worktree、初始 system prompt、初始 tool set、model。
+- **AgentState**(运行时状态):**唯一一个活动 conversation**、激活的 skill、当前 tool registry、loop 游标。
+- **AgentLoop**(推进引擎,不 serde)+ **RunContext**(budget / cancellation / trace,贯穿三层往下传)。
+
+核心是 agent loop:
 ```
 call LLM → response → 有 tool_use? → 执行 tools → tool_result 回灌 conversation → 再 call
                     → 无 tool_use / stop → 结束这一段
@@ -180,11 +187,19 @@ AgentEvent =
 
 **三种外部干预的分工**(扩展 `feed→stream` 的双向性):
 - **审批(human-in-loop)**:loop 主动停 → `AwaitingApproval` + responder,**stream 挂起而不结束**,回灌后继续。
-- **pivot(用户中途改向)**:外部主动插 → `interject`,**不立即打断当前 LLM 调用**,在下一个 `StepBoundary` 并入 conversation 生效(软转向,不违反 tool 配对)。
+- **pivot(用户中途改向)**:外部主动插 → `interject`,**不立即打断当前 LLM 调用**,在下一个 `StepBoundary` 并入 conversation 生效(软转向,不违反 tool 配对)。**pivot 限定为"消息"**(一律 `user` role,来源记 `meta`),**不含 reconfig**。
 - **cancel**:外部主动停 → `CancellationToken`(硬,立即;闭合裂缝见 Cancel 一致性)。
+
+**pivot 与 reconfig 落在两级不同边界(最大的简化)**:pivot(注入 user 消息)可落在 **step 边界**(turn 内 tool_result 之后);**reconfig**(skill 启停 / tool set / system prompt 变更)**只在 turn 边界生效**。后者保证 **turn 内工具集恒定**,"turn 中途换工具集、pending 里挂着引用旧工具集的调用"这类问题因此**根本不存在**。turn 进行中到达的 reconfig 排队到当前 turn 结束后应用(详见 agent-layer.md §4)。
 
 #### Layer B —— 多 agent 编排(Orchestration)
 **不发明大而全的编排引擎**,只提供最小原语:"把 agent 当可 await 的任务 spawn / 传消息 / 收结果",让编排用普通 Rust(tokio task / channel / join)写。多 agent 拓扑发散(委派 sub-agent、pipeline、group/swarm),过早抽象必选错。**先把 Layer A 做扎实,B 只给原语。**
+
+**设计原则:agent 结构保持简单,复杂度上移到 orchestration。** agent 严格持有**一个活动 conversation**(不引入会话池/挂起会话);多路径 / A-B / 分叉靠 **fork 出新 Conversation → 新 Agent 承载**(fork 在下层 O(1) 共享前缀)。简单的 agent 才能被灵活编排,而编排才是**最经常变**的地方。
+
+**垂直功能 API-first,tool 只是 adapter**:agent 调度 / plan / blackboard / skill 等先是一等 Rust API(宿主程序可直接编排、可测试),`ToolRegistry` 里的 tool 只是这些 API 的薄封装,不是唯一入口。两个协调设施(详见 agent-layer.md §6):
+- **plan**:一等数据结构,"办公室里的计划板"——只存 task 内容 + 状态,可检查 / 认领(CAS)/ 更新,**无 executor**,推进由 agent loop / 宿主负责。
+- **blackboard**:"agent 聊天群"——append-only 消息流,post / check,**无强制机制、best-effort 投递**(辅助/参考渠道,关键协调走 plan 的认领)。
 
 #### 垂直/横切功能(穿透 A/B)
 | 功能 | 关注点 |
@@ -210,7 +225,7 @@ AgentEvent =
 7. **Conversation 事务性推进**:committed log 永远满足不变量;turn 产物先入 pending,仅在 `Boundary` commit;cancel 只影响 pending(见 Cancel 一致性)。
 8. **Cancel 闭合裂缝**:默认给未应答 tool_use 补 `cancelled` 合成 tool_result;partial message 丢弃或闭合。**"cancel 后 conversation 仍可 feed" 是硬性验收标准。**
 9. **`feed` 的 stream 能"挂起而不结束"**:审批点要求 stream 停在中途等回灌;tool 执行编排要支持"某 tool call 获批前不启动"。
-10. **`interject` 要求 conversation 支持"在边界注入 message"**:注入后仍满足 role 序列合法与 tool 配对。conversation 要预留此写入口。
+10. **`interject` 要求 conversation 支持"在 step 边界注入 message"**:pivot 注入的一律是 `user` 消息(现状 `begin_turn` 一个 turn 只绑一条 user 消息,需新开"边界追加 user 消息"的写入口),注入后仍满足 role 序列合法(tool_result 后接 user)与 tool 配对。**reconfig 不走此入口**——它改 config/projection,只在 turn 边界生效。
 
 ## 2. 垂直组件
 

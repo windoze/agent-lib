@@ -1410,3 +1410,82 @@ registry/multi-agent 非目标边界。
   `cargo test --all --all-targets`、`cargo test --doc`、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`git diff --check`；所有 case 少于 1 分钟，
   完整 suite 少于 30 分钟。
+
+---
+
+## Milestone 7 — 交接：归档 Conversation 计划并起草 Agent 层计划
+
+### M7-1 [TODO] 归档 Conversation 计划并为 Agent 层编写新的 PLAN.md / TODO.md
+
+**前置依赖**：Conversation Core 全部里程碑（M1-R 至 M6-R）已 `[DONE]`。本任务是纯文档/计划
+交接，不写实现代码，也不改动 `src/` 下任何 Rust 文件。
+
+**上下文**：Conversation 层实现收尾后，项目重心转入 `DESIGN.md` §1.3 的 Agent 层。该层的
+规范性设计已落在 [`docs/agent-layer.md`](docs/agent-layer.md)（Agent 三层拆分
+`AgentSpec`/`AgentState`/`AgentLoop` + `RunContext`、pivot/reconfig 两级边界、垂直功能
+API-first、plan「计划板」/ blackboard「聊天群」、简单 agent + fork 编排原则）。当前根目录的
+`PLAN.md`、`TODO.md` 只服务已完成的 Conversation Core，须整体归档，再为 Agent 层新建同名
+计划文件。归档惯例参照现有
+[`docs/archive/2026-07-13-client-layer/`](docs/archive/2026-07-13-client-layer/)（该目录内
+存放上一阶段的 `PLAN.md` 与 `TODO.md`）。
+
+**做什么**：
+
+- **归档现有计划**：
+  - 新建目录 `docs/archive/2026-07-13-conversation/`。
+  - 用 `git mv` 把根目录当前的 `PLAN.md` 与 `TODO.md`（即本 Conversation Core 计划与任务清单）
+    移动到该目录下，保留文件名不变、保留 git 历史。
+  - 检查并修正因移动而失效的相对链接：被归档文件内指向 `docs/…`、`DESIGN.md`、`src/…` 的相对
+    路径需相应加一层 `../../`（例如 `docs/conversation-core.md` → `../../docs/conversation-core.md`，
+    `DESIGN.md` → `../../DESIGN.md`）；被移动文件之间的互相引用（`PLAN.md`↔`TODO.md`）保持同目录相对名。
+  - 全仓库检索其他文件对根 `PLAN.md`/`TODO.md` 的引用（`rg -n 'PLAN\.md|TODO\.md' --glob '!target/*'`），
+    对仍应指向「已归档 Conversation 计划」的历史性引用更新为新归档路径；对应指向「当前根计划」的
+    入口留给下一步新建的文件承接。
+
+- **为 Agent 层新建 `PLAN.md`**（放回仓库根目录，覆盖整份 Agent 层实现规划）：
+  - 格式与语气对齐被归档的 Conversation `PLAN.md`：包含「范围与非目标」「规范优先级与已定关键决策」
+    「里程碑总览（表格）」「建议目录与公共 API 边界」「测试策略与完成门」「每阶段结束的 Review」等小节。
+  - 规范性输入指向 `docs/agent-layer.md` 与 `DESIGN.md` §1.3；显式声明复用 Conversation 层已落地
+    的 `Boundary`（step / turn 两级）、committed log + pending + projection、cancel 闭合等地基，不重造。
+  - 把 `docs/agent-layer.md` §8「新增需求」逐条落进「已定关键决策」：conversation 需新开
+    「step 边界注入 user 消息」入口、loop 可暂停/恢复（`LoopCursor` + conversation 一起序列化）、
+    `RunContext` 贯穿三层。
+  - 里程碑划分需体现依赖顺序，建议自底向上：先 `AgentSpec`/`AgentState`/`RunContext` 数据骨架与
+    `AgentLoop` 步进模型（feed→`AgentEvent` stream），再 pivot（step 边界注入 user 消息）、
+    reconfig（turn 边界 skill/tool/prompt 变更）、审批与 cancel 贯穿，随后垂直功能（skill/mcp、
+    plan、blackboard、agent 调度原语），最后跨功能验收 + 文档 + 总 Review。以文件锚定的实际设计为准，
+    不臆造 `docs/agent-layer.md` 未包含的机制。
+
+- **为 Agent 层新建 `TODO.md`**（放回仓库根目录），任务须满足以下全部要求：
+  - **按实现顺序编号**：`Mx-y` 形式，`M1-1` 表示 milestone 1 的第一个任务，`M1-2`、`M2-1` 依此类推，
+    顺序即真实依赖顺序。
+  - **标题带 `[TODO]` 标记**：每个任务标题形如 `### M1-1 [TODO] 简述`，与被归档 TODO.md 一致，供
+    coding agent 识别未完成任务（完成后改为 `[DONE]`）。
+  - **每个任务自带足够上下文**：沿用 `前置依赖 / 上下文 / 做什么 / 验证` 四段结构；「上下文」引用
+    `docs/agent-layer.md` 的具体小节与 `src/conversation/` 中将被复用/扩展的具体类型（如
+    `Conversation::begin_turn`、`PendingTurn`、`Boundary`），让实现者无需反复搜索代码库。
+  - **每个任务定义完整验证条件**：至少包含针对性单测/集成测试描述，以及命令序列
+    `cargo fmt --all` → `cargo clippy --all-targets -- -D warnings` → 聚焦测试 →
+    `cargo test --all --all-targets` → `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` →
+    `git diff --check`；单测 < 1 分钟、全量 < 30 分钟的时限约束照旧。
+  - **每个里程碑末尾加一个独立 review 任务**：编号 `Mx-R`、标题带 `[TODO]`，职责是核对本阶段设计
+    约束、公共 API 封装、错误边界、测试与 rustdoc 的正确性与完整性，并确认下一阶段前置条件真实满足；
+    review 任务不得替代实现任务。
+  - 顶部保留与被归档 TODO.md 一致的「通用约束」说明段与指向新 `PLAN.md`、`docs/agent-layer.md` 的引用。
+
+- 完成后把本任务标题的 `[TODO]` 改为 `[DONE]` 并补写完成记录（列出归档路径、新文件里程碑数量与
+  任务数量）。
+
+**验证**：
+
+- `git status` 显示：`docs/archive/2026-07-13-conversation/PLAN.md`、
+  `docs/archive/2026-07-13-conversation/TODO.md` 为移动而来（`git log --follow` 保留历史），
+  根目录 `PLAN.md`、`TODO.md` 为新建的 Agent 层版本。
+- `rg -n 'PLAN\.md|TODO\.md' --glob '!target/*'` 审查：无指向根 `PLAN.md`/`TODO.md` 的失效引用；
+  被归档文件内的相对链接经手工点击/`ls` 核对均有效。
+- 新根 `PLAN.md` 覆盖 `docs/agent-layer.md` 的全部主要决策，里程碑总览表存在且标注依赖顺序；
+  新根 `TODO.md` 每个任务标题含 `[TODO]`、编号连续、含四段结构与完整验证命令，且每个里程碑均以
+  独立 `Mx-R` review 任务收尾。
+- Markdown 无断链、无残留 `Conversation Core` 专属措辞误入 Agent 层文件；`git diff --check` 通过。
+- 本任务仅改动 Markdown 与目录结构，不触碰 `src/`、`Cargo.toml`、`tests/`；`cargo fmt --all` 与
+  `cargo test --all --all-targets` 相对归档前无新增改动或失败。
