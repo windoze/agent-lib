@@ -305,6 +305,38 @@ fn llm_client_error_moves_cursor_to_error_and_discards_pending() {
 }
 
 #[test]
+fn llm_invalid_assistant_response_moves_cursor_to_error_and_discards_pending() {
+    let mut machine = machine(LlmStepMode::NonStreaming);
+    let id = park_on_need_llm(&mut machine);
+
+    // A non-assistant role fails the pending fold: the turn is discarded without
+    // committing and the machine parks on the error cursor.
+    let invalid = Response {
+        message: user_message("not an assistant"),
+        usage: Usage::default(),
+        stop_reason: StopReason::normalize("end_turn"),
+        extra: Map::new(),
+    };
+    let outcome = machine.step(StepInput::resume(RequirementResolution::new(
+        id,
+        RequirementResult::Llm(Ok(invalid)),
+    )));
+
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert!(outcome.notifications.is_empty());
+
+    let LoopCursor::Error(error) = machine.cursor() else {
+        panic!("an invalid assistant response must park on the error cursor");
+    };
+    assert!(error.message().contains("conversation operation failed"));
+
+    let conversation = machine.state().conversation();
+    assert!(conversation.pending().is_none());
+    assert!(conversation.turns().is_empty());
+}
+
+#[test]
 fn resume_with_mismatched_requirement_id_fails() {
     let mut machine = machine(LlmStepMode::NonStreaming);
     let _id = park_on_need_llm(&mut machine);

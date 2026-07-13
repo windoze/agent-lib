@@ -18,11 +18,10 @@
 //! - [`InteractionResponse::Approval`] embeds an [`ApprovalResponse`] verbatim,
 //!   and converts losslessly to/from it (see [`From`]/[`TryFrom`]).
 //!
-//! In a later milestone (M3), [`ToolApprovalPolicy`](crate::agent::ToolApprovalPolicy)
-//! becomes one *backend* of an interaction handler rather than a policy the loop
-//! calls directly, and the loop's `respond_approval` method is removed in favor
-//! of a generic [`RequirementResult::Interaction`] return path. This task does
-//! **not** change `DefaultAgentLoop`'s current approval usage.
+//! [`ToolApprovalPolicy`](crate::agent::ToolApprovalPolicy) is now one *backend*
+//! of an interaction handler rather than a policy a loop calls directly, and
+//! approvals are answered through the generic
+//! [`RequirementResult::Interaction`] return path.
 //!
 //! [`Requirement::NeedInteraction`]: crate::agent::RequirementKind::NeedInteraction
 //! [`RequirementResult::Interaction`]: crate::agent::RequirementResult::Interaction

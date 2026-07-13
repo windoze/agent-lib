@@ -4,10 +4,9 @@
 //! concrete "single-layer" scope a host uses to run a turn against a live
 //! [`LlmClient`], [`ToolRegistry`], and interaction backend, plus the
 //! [`drive_turn`] convenience that drains a machine to the end of one turn with
-//! no outer layer (migration doc §10, stage 2). It is the effect-model
-//! counterpart of [`DefaultAgentLoop`](crate::agent::DefaultAgentLoop): the same
-//! client / registry / approval wiring, reached through the sans-io
-//! [`AgentMachine`] + [`drain`] path rather than a self-driving loop.
+//! no outer layer (migration doc §10, stage 2). It is the canonical driver for
+//! the [`AgentMachine`] + [`drain`] path: client / registry / approval wiring
+//! reached through sans-io requirements rather than a self-driving loop.
 //!
 //! # The three handlers
 //!

@@ -1,8 +1,8 @@
 //! Turn-boundary reconfiguration tests for
 //! [`DefaultAgentMachine`](super::super::DefaultAgentMachine).
 //!
-//! These migrate the legacy `DefaultAgentLoop` reconfig integration tests
-//! (`src/agent/loop_driver/default/tests.rs`) onto the sans-io machine. A
+//! These cover the turn-boundary reconfig behavior on the sans-io machine
+//! (the reconfig integration coverage that predates the machine). A
 //! reconfiguration queued mid-turn is deferred to the turn boundary; when it
 //! changes the active tool set the machine parks on a
 //! [`RequirementKind::NeedReconfigRegistry`] effect and only commits once a

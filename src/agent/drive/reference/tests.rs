@@ -1,17 +1,15 @@
-//! Equivalence tests: the reference driver replays the legacy loop's turns.
+//! Behavioral tests: the reference driver drains a machine through a full turn.
 //!
 //! Each test drives a [`DefaultAgentMachine`] through [`drive_turn`] over a
 //! single [`ReferenceScope`] and asserts the committed
 //! [`Conversation`](crate::conversation::Conversation) and the drained
-//! [`Notification`] sequence match the corresponding
-//! [`DefaultAgentLoop`](crate::agent::DefaultAgentLoop) integration test in
-//! `src/agent/loop_driver/default/tests.rs`. The `DefaultAgentLoop` and its
-//! tests are left untouched (migration doc §10, stage 2); these are additional
-//! equivalence evidence for the sans-io path.
+//! [`Notification`] sequence. These are the canonical turn-level coverage for
+//! the sans-io path (migration doc §10, stage 2); the `*_matches_default_loop`
+//! names preserve the behavior the removed self-driving loop used to guarantee.
 //!
-//! The fakes and builders below are the migratable subset of the legacy loop's
-//! test fixtures (fake client, tool registry, host id sources, approval policy),
-//! reused here so the two paths run against identical scripts.
+//! The fakes and builders below (fake client, tool registry, host id sources,
+//! approval policy) script identical inputs so the folded turns are exercised
+//! end to end.
 
 use super::{ApprovalInteractionHandler, ReferenceScope, drive_turn};
 use crate::{
@@ -281,8 +279,8 @@ impl ToolExecutionIds for FakeToolIds {
 
 /// Attended interaction backend scripting a decision per tool-call id.
 ///
-/// Models a human resolving each approval differently (the reference-driver
-/// counterpart of the legacy loop's per-call `respond_approval`).
+/// Models a human resolving each approval differently, answered through the
+/// [`Interaction`] requirement return path.
 #[derive(Debug)]
 struct ScriptedApprovalInteraction {
     decisions: BTreeMap<ToolCallId, (ApprovalDecision, Option<String>)>,

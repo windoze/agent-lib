@@ -18,16 +18,18 @@
 //! - [`agent`] defines data-only Agent identity/static configuration, the
 //!   single-Conversation [`agent::AgentState`] and [`agent::LoopCursor`]
 //!   recovery boundary, run-level cancellation, budget, and trace context
-//!   handles, plus the guarded [`agent::AgentLoop`] feed-to-[`agent::AgentEvent`]
-//!   stream contract. [`agent::DefaultAgentLoop`] is the current runtime driver:
-//!   it sends non-streaming or streaming Client requests, folds responses through
-//!   Conversation pending, executes provider-neutral tool calls through a live
-//!   [`agent::ToolRegistry`], pauses tool execution through a live
-//!   [`agent::ToolApprovalPolicy`] and [`agent::ApprovalResponse`] boundary,
-//!   applies caller-supplied [`agent::PivotMessage`] injections at the checked
-//!   post-tool step boundary through the sans-io machine,
+//!   handles, plus the sans-io [`agent::AgentMachine`] `step` contract that
+//!   reifies each effect as an addressable [`agent::Requirement`] and folds
+//!   resumed [`agent::RequirementResult`] values back into Conversation.
+//!   [`agent::DefaultAgentMachine`] is the current LLM/tool state machine:
+//!   it requests non-streaming or streaming Client generations, folds responses
+//!   through Conversation pending, requests provider-neutral tool executions,
+//!   pauses tool execution through a live [`agent::ToolApprovalPolicy`] and the
+//!   [`agent::Interaction`] return path, applies caller-supplied
+//!   [`agent::PivotMessage`] injections at the checked post-tool step boundary,
 //!   applies queued [`agent::ReconfigRequest`] values only at turn boundaries,
-//!   and commits only after a tool-free final assistant response.
+//!   and commits only after a tool-free final assistant response. The
+//!   [`agent::drive`] reference driver fulfils those requirements out of band.
 //! - [`conversation`] adds externally supplied strong identities,
 //!   Conversation-level configuration, immutable message envelopes with
 //!   optional envelope-local metadata, the
@@ -81,14 +83,14 @@
 //! future runtime layers. The [`agent`] module currently exposes serde-friendly
 //! static configuration and identity data, [`agent::AgentState`] persistence
 //! through Conversation snapshots, [`agent::RunContext`] handles for
-//! cancellation, budget, and trace propagation, the object-safe
-//! [`agent::AgentLoop`] event stream contract with [`agent::AgentFeedGuard`]
-//! backpressure support, minimal live [`agent::ToolRegistry`]/
+//! cancellation, budget, and trace propagation, the sans-io
+//! [`agent::AgentMachine`] `step` contract that reifies effects as addressable
+//! [`agent::Requirement`] values, minimal live [`agent::ToolRegistry`]/
 //! [`agent::ToolExecutor`] boundaries, [`agent::ToolApprovalPolicy`] and
-//! [`agent::ApprovalResponse`] approval boundaries, a
+//! [`agent::Interaction`] approval boundaries, a
 //! [`agent::ToolRegistryResolver`] for turn-boundary tool-set replacement, and
-//! the [`agent::DefaultAgentLoop`] driver with
-//! `reconfigure` turn-boundary config application, approval waits, and
+//! the [`agent::DefaultAgentMachine`] state machine with
+//! `reconfigure` turn-boundary config application, approval requirements, and
 //! cancellation closure, without making live handles part of persisted state.
 //!
 //! # Conversation Core example

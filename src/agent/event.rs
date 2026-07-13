@@ -36,7 +36,7 @@ use thiserror::Error;
 /// request.
 pub type PivotMessage = QueuedPivot;
 
-/// Input accepted by one Agent `feed` segment.
+/// External input accepted by one Agent machine step.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentInput {
@@ -220,11 +220,10 @@ pub enum AgentEvent {
 ///   with an empty requirement set and the loop cursor reaching `Done`/`Error`
 ///   (§3.1/§5).
 ///
-/// During Stage 0 this type coexists with [`AgentEvent`]; use the
-/// `From<Notification> for AgentEvent` bridge to feed a notification onto the
-/// legacy stream still consumed by `DefaultAgentLoop`. Because the excluded
-/// variants are not notifications, there is deliberately no reverse
-/// `From<AgentEvent> for Notification`.
+/// This type coexists with [`AgentEvent`]; use the
+/// `From<Notification> for AgentEvent` bridge to render a notification as a
+/// legacy stream event. Because the excluded variants are not notifications,
+/// there is deliberately no reverse `From<AgentEvent> for Notification`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Notification {
@@ -640,8 +639,6 @@ impl ExternalRecoveryOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentErrorKind {
-    /// A feed call was attempted while a prior feed stream was still active.
-    FeedInProgress,
     /// Input failed Agent-level validation before reaching Conversation.
     InvalidInput,
     /// A Client operation failed.
@@ -706,9 +703,6 @@ impl From<&AgentError> for AgentFailure {
 /// Classified Agent loop failure.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum AgentError {
-    /// A feed stream is already active for this Agent.
-    #[error("another Agent feed stream is still active")]
-    FeedInProgress,
     /// User-turn input carried a role other than `Role::User`.
     #[error("agent user input must use Role::User, found {0:?}")]
     InvalidInputRole(Role),
@@ -742,7 +736,7 @@ pub enum AgentError {
         /// Path of the machine that emitted the requirement.
         origin: AgentPath,
     },
-    /// A loop implementation returned an uncategorized failure.
+    /// A machine or driver returned an uncategorized failure.
     #[error("agent runtime error: {0}")]
     Other(String),
 }
@@ -752,7 +746,6 @@ impl AgentError {
     #[must_use]
     pub const fn kind(&self) -> AgentErrorKind {
         match self {
-            Self::FeedInProgress => AgentErrorKind::FeedInProgress,
             Self::InvalidInputRole(_) => AgentErrorKind::InvalidInput,
             Self::Client(_) => AgentErrorKind::Client,
             Self::Conversation(_) => AgentErrorKind::Conversation,

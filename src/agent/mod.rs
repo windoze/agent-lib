@@ -1,12 +1,14 @@
-//! Agent-layer data models, runtime state, run context, and loop contracts.
+//! Agent-layer data models, runtime state, run context, and effect contracts.
 //!
 //! This module contains the static, serde-friendly Agent data and the first
 //! runtime boundary, [`RunContext`]. [`AgentState`] adds the single active
-//! Conversation and data-only loop cursor boundary. [`AgentLoop`] defines the
-//! guarded feed-to-event-stream contract; [`DefaultAgentLoop`] provides the
-//! current LLM/tool runtime path, pivot queue soft-turning, and turn-boundary
-//! reconfiguration queue, and approval responder boundary. Orchestration remains
-//! a future layer. Live handles stay out of serde data shapes.
+//! Conversation and data-only loop cursor boundary. [`AgentMachine`] defines the
+//! sans-io `step` contract; [`DefaultAgentMachine`] provides the current LLM/tool
+//! state machine that reifies each effect as a [`Requirement`] and folds resumed
+//! results back into the single active Conversation, including pivot injection
+//! and turn-boundary reconfiguration. The [`drive`] reference driver fulfils
+//! those requirements. Orchestration remains a future layer. Live handles stay
+//! out of serde data shapes.
 
 pub mod approval;
 pub mod context;
@@ -14,7 +16,6 @@ pub mod drive;
 pub mod event;
 pub mod id;
 pub mod interaction;
-pub mod loop_driver;
 pub mod machine;
 mod request;
 pub mod requirement;
@@ -46,15 +47,11 @@ pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};
 pub use interaction::{
     Interaction, InteractionError, InteractionKind, InteractionKindTag, InteractionResponse,
 };
-pub use loop_driver::{
-    AgentEventStream, AgentFeedGuard, AgentFeedPermit, AgentLoop, BoxAgentEventStream,
-    BoxAgentLoop, DefaultAgentLoop, LlmStepMode,
-};
 pub use machine::{AgentMachine, DefaultAgentMachine, StepInput, StepOutcome};
 pub use requirement::{
-    AgentPath, AgentSlot, AgentSpecRef, NoRequirementIds, Requirement, RequirementError,
-    RequirementId, RequirementIds, RequirementKind, RequirementKindTag, RequirementResolution,
-    RequirementResult, SubagentOutput,
+    AgentPath, AgentSlot, AgentSpecRef, LlmStepMode, NoRequirementIds, Requirement,
+    RequirementError, RequirementId, RequirementIds, RequirementKind, RequirementKindTag,
+    RequirementResolution, RequirementResult, SubagentOutput,
 };
 pub use spec::{AgentSpec, LoopPolicy, ModelRef, ToolFailurePolicy, ToolSetRef, WorktreeRef};
 pub use state::{

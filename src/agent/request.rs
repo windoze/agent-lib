@@ -1,8 +1,8 @@
 //! Shared Client request construction from Agent state.
 //!
-//! [`build_chat_request`] renders the provider-neutral [`ChatRequest`] both the
-//! legacy [`DefaultAgentLoop`](crate::agent::DefaultAgentLoop) and the sans-io
-//! [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine) send to the model.
+//! [`build_chat_request`] renders the provider-neutral [`ChatRequest`] the
+//! sans-io [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine) sends to
+//! the model.
 //! It reads only data-only [`AgentState`] facts (the head-clipped committed
 //! view, the frozen pending context, the current model, and the system prompt
 //! overlay) plus a caller-supplied list of tool declarations. The tool

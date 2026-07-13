@@ -10,11 +10,12 @@
 //! another process, and rebuild the pending-requirement registry straight from
 //! the cursor.
 //!
-//! The requirement binding is modeled as `Option` during the migration window:
-//! the sans-io machine always stamps it, while the legacy `DefaultAgentLoop`
-//! (which awaits IO directly and never reifies requirements) leaves it empty.
-//! Live handles ([`AgentRuntimeHandles`](super::AgentRuntimeHandles)) stay out
-//! of this serde shape entirely.
+//! The requirement binding is modeled as `Option` so the same cursor shape can
+//! serve both requirement-bearing waits — which the sans-io machine always
+//! stamps with the outstanding [`RequirementId`] — and any restored cursor whose
+//! binding is not yet re-registered. Live handles
+//! ([`AgentRuntimeHandles`](super::AgentRuntimeHandles)) stay out of this serde
+//! shape entirely.
 
 use crate::{
     agent::{AgentPath, RequirementId, StepId},

@@ -117,9 +117,9 @@ pub trait ToolExecutionIds: Send + Sync + fmt::Debug {
 
 /// Registry that can advertise declarations but has no executable tools.
 ///
-/// The default loop constructor uses this to preserve the static `AgentSpec`
+/// The default machine constructor uses this to preserve the static `AgentSpec`
 /// request shape. Hosts that expect tool execution should pass a real registry
-/// through [`crate::agent::DefaultAgentLoop::with_tool_registry`].
+/// through the driver's [`ToolHandler`](crate::agent::ToolHandler).
 #[derive(Clone, Debug, Default)]
 pub struct DeclaredOnlyToolRegistry {
     declarations: Vec<Tool>,

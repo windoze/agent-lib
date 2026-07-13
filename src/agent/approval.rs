@@ -1,8 +1,9 @@
 //! Tool approval runtime boundaries.
 //!
 //! Approval state is split deliberately: requests and responses are data-only
-//! values, while the policy and pending responder are live runtime handles owned
-//! by an [`crate::agent::AgentLoop`] implementation.
+//! values, while the policy is a live runtime handle owned by a machine, and
+//! approvals are answered through the [`Interaction`](crate::agent::Interaction)
+//! requirement return path.
 
 use crate::{
     agent::StepId,
@@ -27,7 +28,7 @@ use thiserror::Error;
 pub enum ApprovalRequirement {
     /// Execute the tool without pausing for external approval.
     AutoApprove,
-    /// Pause the feed stream and emit an approval request before execution.
+    /// Pause tool execution and emit an approval request before execution.
     RequireApproval {
         /// Stable reason shown to the external approver.
         reason: Option<String>,
@@ -191,9 +192,9 @@ fn non_empty(value: String) -> Option<String> {
 
 /// Synthesizes a model-visible tool result for a non-approving decision.
 ///
-/// Shared by the legacy [`DefaultAgentLoop`](crate::agent::DefaultAgentLoop) and
-/// the sans-io [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine): a
-/// denied, timed-out, or cancelled approval never executes the tool, so the loop
+/// Used by the sans-io
+/// [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine): a denied,
+/// timed-out, or cancelled approval never executes the tool, so the machine
 /// appends this synthetic [`ToolResponse`] in place of a real one. The
 /// [`Approve`](ApprovalDecision::Approve) decision is unreachable because an
 /// approved call executes the tool instead.

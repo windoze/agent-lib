@@ -1,13 +1,12 @@
 //! Concrete sans-io Agent machine for the LLM and tool steps.
 //!
-//! [`DefaultAgentMachine`] is the effect-model counterpart of the legacy
-//! [`DefaultAgentLoop`](crate::agent::DefaultAgentLoop): instead of awaiting the
-//! client, tools, or approvals internally, it *requests* each effect by handing
-//! back a [`Requirement`] and parking on the matching [`LoopCursor`]. A driver
-//! fulfils the requirement and feeds the result back through
-//! [`StepInput::Resume`], at which point the machine folds it into the single
-//! active Conversation using the same checked pending boundary the legacy loop
-//! uses (`start_assistant_response` → `finish_assistant` →
+//! [`DefaultAgentMachine`] is the effect-model Agent runtime: instead of
+//! awaiting the client, tools, or approvals internally, it *requests* each
+//! effect by handing back a [`Requirement`] and parking on the matching
+//! [`LoopCursor`]. A driver fulfils the requirement and feeds the result back
+//! through [`StepInput::Resume`], at which point the machine folds it into the
+//! single active Conversation using the checked pending boundary
+//! (`start_assistant_response` → `finish_assistant` →
 //! `register_tool_calls` / `append_tool_response` → `commit_pending`).
 //!
 //! Two milestones build this up:

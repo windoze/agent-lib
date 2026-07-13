@@ -29,7 +29,7 @@
 
 use crate::{
     agent::{
-        AgentError, AgentId, LlmStepMode, ToolSetRef,
+        AgentError, AgentId, ToolSetRef,
         interaction::{Interaction, InteractionError, InteractionResponse},
         tool::ToolRuntimeError,
     },
@@ -42,6 +42,30 @@ use serde_json::Value;
 use std::{fmt, str::FromStr};
 use thiserror::Error;
 use uuid::Uuid;
+
+/// LLM transport mode carried by a [`RequirementKind::NeedLlm`] requirement.
+///
+/// The mode selects which client transport a driver uses to fulfil the
+/// generation ([`chat`](crate::client::LlmClient::chat) for
+/// [`NonStreaming`](Self::NonStreaming),
+/// [`chat_stream`](crate::client::LlmClient::chat_stream) for
+/// [`Streaming`](Self::Streaming)) and rides along in the requirement so a
+/// serialized outstanding request records the transport it was rendered for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmStepMode {
+    /// Fold a complete response into Conversation in one shot.
+    NonStreaming,
+    /// Stream each [`StreamEvent`](crate::stream::StreamEvent) as it arrives.
+    Streaming,
+}
+
+impl LlmStepMode {
+    /// Returns whether the rendered [`ChatRequest`] should set its stream flag.
+    pub(crate) const fn request_stream_flag(self) -> bool {
+        matches!(self, Self::Streaming)
+    }
+}
 
 /// Opaque identity for one reified requirement, used for return-path routing.
 ///

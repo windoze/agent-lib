@@ -1164,7 +1164,7 @@ ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --che
   `cargo test --all --all-targets`(438 lib 测试全过,新增 5 个)、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、
   `git diff --check` 均通过。legacy loop 与其 reconfig 实现/测试保留不动(留待 M4-3 删除)。
 
-### [TODO] M4-3 删除 `respond_approval`、pivot queue 残留与 `AgentFeedGuard`
+### [DONE] M4-3 删除 `respond_approval`、pivot queue 残留与 `AgentFeedGuard`
 
 **前置依赖**:M4-2、M4-2a。
 
@@ -1187,6 +1187,40 @@ ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(clean);`git diff --che
 - 聚焦测试:审批完全走 interaction 回程、无 `respond_approval` 调用点;背压由 `&mut self`
   保证(重入在类型层不可能或 debug_assert 触发)。
 - 运行 `cargo test --all --all-targets` 确认无悬挂引用;其余全套命令。
+
+**完成记录**:
+
+- **决策 E = 彻底删除 `DefaultAgentLoop` 及整个 `loop_driver` 模块**(不重构为"薄 driver")。
+  理由:sans-io `AgentMachine`(machine/default)+ 参考 driver(drive.rs / drive/reference.rs)
+  已完整取代 loop 的自驱运行时,自 M3-3 起参考 driver 已按 `reference_*_matches_default_loop`
+  等价复跑 loop 集成测试;删除 `respond_approval` + `ApprovalWaiters` 后 loop 审批路径已无法闭合,
+  把 loop 重构成"薄 driver"只会重复 `drive_turn`/`ReferenceScope`;且 `DefaultAgentLoop`/`AgentLoop`
+  未被任何集成测试(tests/)或 example 依赖。故删除是无 workaround 的收尾。
+- **决策 F = 删除 `AgentFeedGuard`/`AgentFeedPermit`**(随 loop 一并删除):机器 `&mut self` +
+  单活 turn 已提供背压,不再需要 feed guard 防重入。
+- **删除**:整个 `src/agent/loop_driver.rs`(trait `AgentLoop`、`BoxAgentLoop`、
+  `BoxAgentEventStream`、`AgentEventStream`、`AgentFeedGuard`、`AgentFeedPermit`、
+  `respond_approval` 默认方法)、`src/agent/loop_driver/default.rs`(`DefaultAgentLoop`、
+  `LoopRuntime`、`ApprovalWaiters`、`NonStreamingSegment`、`StreamingSegment`)、
+  `src/agent/loop_driver/default/tests.rs`(约 18 个 loop 单测);并移除随之无意义的
+  `AgentError::FeedInProgress` / `AgentErrorKind::FeedInProgress`。
+- **迁移**:`LlmStepMode`(+`request_stream_flag`)迁到 `src/agent/requirement.rs`(它是
+  `NeedLlm` 的载荷类型),`agent/mod.rs` 改从 requirement 重导出。
+- **等价覆盖**:loop 集成测试的绝大多数场景已被 machine/reference 测试覆盖(text、streaming
+  transport、single/parallel tool、tool 错误自愈、approval approve/deny/cancel、cancel 丢弃在途、
+  client 错误丢弃 pending、reconfig text/tool/conflict/idle)。缺口补 3 个 machine 单测:
+  `llm_invalid_assistant_response_moves_cursor_to_error_and_discards_pending`
+  (`tests/mod.rs`)、`duplicate_framework_tool_call_id_moves_cursor_to_error_and_discards_pending`
+  与 `unknown_provider_call_result_moves_cursor_to_error_and_discards_pending`(`tests/tools.rs`,
+  含 `ScriptedToolIds::with_tool_call_ids` 构造 duplicate id)。streaming delta 转发按迁移文档
+  §12-D 仍延后,机器 `streaming_mode_requests_stream_transport` 覆盖传输选择。
+- **文档**:更新 `lib.rs`/`agent/mod.rs` 模块级 doc(改述为 machine + `Requirement` + 参考
+  driver)、`README.md` Agent 层段落,以及 event.rs / approval.rs / interaction.rs / request.rs /
+  tool.rs / state/cursor.rs / machine/default/mod.rs / drive/reference*.rs 里指向已删符号的
+  rustdoc 链接与措辞。`PLAN.md`/`DESIGN.md` 为阶段/历史设计文档,未改。
+- **验证**:`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、
+  `cargo test --all --all-targets`(lib 423 测试全过:removed ~18 loop 测试、新增 3 machine 测试)、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`git diff --check` 均通过。每测试 <1min。
 
 ### [TODO] M4-R Milestone 4 Review
 

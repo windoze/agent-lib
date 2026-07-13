@@ -107,6 +107,14 @@ impl ScriptedToolIds {
             step_cursor: AtomicUsize::new(0),
         }
     }
+
+    /// Overrides the framework tool-call id pool (e.g. to force a duplicate).
+    fn with_tool_call_ids(tool_call_ids: Vec<ToolCallId>) -> Self {
+        Self {
+            tool_call_ids,
+            ..Self::new()
+        }
+    }
 }
 
 impl ToolExecutionIds for ScriptedToolIds {
@@ -501,6 +509,72 @@ fn tool_error_stops_run_under_stop_policy() {
     };
     assert!(error.message().contains("get_weather"));
     assert!(machine.state().conversation().pending().is_none());
+}
+
+#[test]
+fn duplicate_framework_tool_call_id_moves_cursor_to_error_and_discards_pending() {
+    // The host id source hands the same framework tool-call id to two distinct
+    // calls; registering the mappings must be rejected wholesale.
+    let ids = ScriptedToolIds::with_tool_call_ids(vec![tool_call_id(0), tool_call_id(0)]);
+    let mut machine = DefaultAgentMachine::new(
+        state(),
+        LlmStepMode::NonStreaming,
+        Arc::new(ScriptedRequirementIds::new()),
+    )
+    .with_tool_execution_ids(Arc::new(ids))
+    .with_approval_policy(Arc::new(NoApprovalPolicy));
+
+    let llm_id = park_on_need_llm(&mut machine);
+    let outcome = resume_llm(
+        &mut machine,
+        llm_id,
+        tool_use_response_with(vec![
+            tool_use_block("call-a", "first_tool"),
+            tool_use_block("call-b", "second_tool"),
+        ]),
+    );
+
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    let LoopCursor::Error(error) = machine.cursor() else {
+        panic!("a duplicate framework tool-call id must park on the error cursor");
+    };
+    assert!(error.message().contains("conversation operation failed"));
+
+    let conversation = machine.state().conversation();
+    assert!(conversation.pending().is_none());
+    assert!(conversation.turns().is_empty());
+}
+
+#[test]
+fn unknown_provider_call_result_moves_cursor_to_error_and_discards_pending() {
+    let mut machine = tool_machine(Arc::new(NoApprovalPolicy));
+    let llm_id = park_on_need_llm(&mut machine);
+
+    let outcome = resume_llm(
+        &mut machine,
+        llm_id,
+        single_tool_response("call-a", "get_weather"),
+    );
+    let (tool_req, _, _) = need_tool(&outcome, 0);
+
+    // The tool result references a provider call id the turn never registered, so
+    // appending it fails and the pending turn is discarded without committing.
+    let outcome = machine.step(StepInput::resume(RequirementResolution::new(
+        tool_req,
+        RequirementResult::Tool(Ok(tool_ok("unknown-call", "wrong result"))),
+    )));
+
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    let LoopCursor::Error(error) = machine.cursor() else {
+        panic!("an unknown provider call id must park on the error cursor");
+    };
+    assert!(error.message().contains("conversation operation failed"));
+
+    let conversation = machine.state().conversation();
+    assert!(conversation.pending().is_none());
+    assert!(conversation.turns().is_empty());
 }
 
 #[test]
