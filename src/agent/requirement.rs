@@ -28,7 +28,11 @@
 //! later milestone.
 
 use crate::{
-    agent::{AgentError, AgentId, LlmStepMode, tool::ToolRuntimeError},
+    agent::{
+        AgentError, AgentId, LlmStepMode,
+        interaction::{Interaction, InteractionError, InteractionResponse},
+        tool::ToolRuntimeError,
+    },
     client::{ChatRequest, ClientError, Response},
     conversation::ToolCallId,
     model::tool::{ToolCall, ToolResponse},
@@ -251,28 +255,6 @@ impl AgentPath {
     }
 }
 
-/// Stage-0 placeholder for an interaction request.
-///
-/// Task M1-3 replaces this with the real `Interaction` type (which generalizes
-/// approval into approval / open question / choice). It is defined now only so
-/// [`RequirementKind::NeedInteraction`] has a serde-able payload and the variant
-/// can be exercised before the generalization lands.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Interaction {
-    /// Opaque prompt text carried until the real interaction model lands.
-    pub prompt: String,
-}
-
-/// Stage-0 placeholder for an interaction response.
-///
-/// Task M1-3 replaces this with the real `InteractionResponse`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InteractionResponse {
-    /// A free-form answer supplied for the placeholder interaction.
-    Answer(String),
-}
-
 /// Stage-0 placeholder reference to a subagent specification.
 ///
 /// Stage 4 (task M5) refines this into the real subagent spec addressing.
@@ -397,20 +379,31 @@ impl RequirementKind {
     /// Checks that `result` is type-aligned with this requirement kind.
     ///
     /// A `NeedLlm` requirement only accepts an
-    /// [`RequirementResult::Llm`] result, and so on for each family.
+    /// [`RequirementResult::Llm`] result, and so on for each family. For a
+    /// `NeedInteraction` requirement, the carried [`InteractionResponse`] is
+    /// additionally validated against the [`Interaction`] request (choice range,
+    /// approval step/call match, response family).
     ///
     /// # Errors
     ///
     /// Returns [`RequirementError::ResultKindMismatch`] when the result family
-    /// does not match this requirement's family.
+    /// does not match this requirement's family, or
+    /// [`RequirementError::Interaction`] when an interaction response fails its
+    /// request-specific check.
     pub fn accepts(&self, result: &RequirementResult) -> Result<(), RequirementError> {
         let expected = self.tag();
         let actual = result.tag();
-        if expected == actual {
-            Ok(())
-        } else {
-            Err(RequirementError::ResultKindMismatch { expected, actual })
+        if expected != actual {
+            return Err(RequirementError::ResultKindMismatch { expected, actual });
         }
+        if let (Self::NeedInteraction { request }, RequirementResult::Interaction(response)) =
+            (self, result)
+        {
+            request
+                .accepts_response(response)
+                .map_err(RequirementError::Interaction)?;
+        }
+        Ok(())
     }
 }
 
@@ -494,6 +487,9 @@ pub enum RequirementError {
         /// Requirement family whose id could not be supplied.
         kind: RequirementKindTag,
     },
+    /// An interaction result failed its request-specific check.
+    #[error("interaction result rejected: {0}")]
+    Interaction(#[from] InteractionError),
 }
 
 #[cfg(test)]
@@ -531,6 +527,12 @@ mod tests {
         "018f0d9c-7b6a-7c12-8f31-1234567890d1"
             .parse()
             .expect("agent id")
+    }
+
+    fn step_id() -> crate::agent::StepId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890e9"
+            .parse()
+            .expect("step id")
     }
 
     fn chat_request() -> ChatRequest {
@@ -576,9 +578,7 @@ mod tests {
     }
 
     fn interaction() -> Interaction {
-        Interaction {
-            prompt: "proceed?".to_owned(),
-        }
+        Interaction::question(step_id(), "proceed?".to_owned())
     }
 
     fn kind_of(tag: RequirementKindTag) -> RequirementKind {
@@ -789,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_interaction_types_round_trip() {
+    fn interaction_types_round_trip() {
         assert_json_round_trip(&interaction());
         assert_json_round_trip(&InteractionResponse::Answer("ok".to_owned()));
         assert_json_round_trip(&AgentSpecRef(agent_id()));

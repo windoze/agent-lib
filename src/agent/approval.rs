@@ -10,7 +10,12 @@ use std::fmt;
 use thiserror::Error;
 
 /// Runtime policy result for one tool call.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Derives `serde` (pure, non-behavioral) so it can ride inside a persistable
+/// [`InteractionKind::Approval`](crate::agent::InteractionKind::Approval)
+/// request without redefining the type.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalRequirement {
     /// Execute the tool without pausing for external approval.
     AutoApprove,
