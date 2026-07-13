@@ -1,8 +1,8 @@
 //! Raw-retention, active-lineage, and hidden-identity tests.
 
 use super::{
-    ToolCallIndex, assert_index_matches_rebuild, begin, call_id, commit_text_turn, conversation,
-    freeze, message_id, register_batch, response, text, tool_response, tool_use, turn_id, user,
+    assert_index_matches_rebuild, begin, call_id, commit_text_turn, conversation, freeze,
+    message_id, register_batch, response, text, tool_response, tool_use, turn_id, user,
 };
 use crate::{
     conversation::{
@@ -41,9 +41,12 @@ fn replacement_lineage_hides_old_suffix_but_retains_raw_and_all_identities() {
             .is_some()
     );
 
-    conversation.history.set_active_len_for_test(1);
-    conversation.tool_call_index =
-        ToolCallIndex::rebuild(conversation.turns(), conversation.pending());
+    let first_turn = conversation
+        .boundary_after(turn_id(10))
+        .expect("first turn has a checked boundary");
+    conversation
+        .revert_to(first_turn)
+        .expect("checked head movement rebuilds the index");
     assert_eq!(conversation.turns().len(), 1);
     assert!(conversation.raw_turn(turn_id(11)).is_some());
     assert!(

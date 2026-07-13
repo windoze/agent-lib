@@ -63,6 +63,11 @@ impl History {
         self.lineage_len
     }
 
+    /// Returns the number of turns at or before the logical head.
+    pub(crate) const fn active_len(&self) -> usize {
+        self.active_len
+    }
+
     /// Returns the effective tip node, or `None` at the zero-turn boundary.
     fn tip_node(&self) -> Option<&Arc<HistoryNode>> {
         self.active_len
@@ -157,14 +162,13 @@ impl History {
             .map(crate::conversation::ToolPairing::call_id)
     }
 
-    /// Moves the effective tip in tests that exercise the M3-1 storage layer.
+    /// Moves the effective tip after a Conversation-level boundary check.
     ///
-    /// Public checked head movement is introduced by the later revert task;
-    /// this hook exists only to prove now that a replacement suffix leaves raw
-    /// nodes intact and excluded from the effective lineage.
-    #[cfg(test)]
-    pub(crate) fn set_active_len_for_test(&mut self, active_len: usize) {
-        assert!(active_len <= self.lineage_len);
+    /// Keeping this primitive crate-private prevents storage callers from
+    /// bypassing owner/version/anchor validation. Moving the head never edits
+    /// the immutable lineage or append-only raw scope.
+    pub(crate) fn move_head_to(&mut self, active_len: usize) {
+        debug_assert!(active_len <= self.lineage_len);
         self.active_len = active_len;
     }
 }

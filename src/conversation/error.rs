@@ -672,4 +672,11 @@ pub enum ConversationError {
         /// Exhausted current version.
         current_version: u64,
     },
+
+    /// Head and version cannot be advanced together because the version is exhausted.
+    #[error("head cannot move atomically from exhausted structural version {current_version}")]
+    NonAtomicHeadMove {
+        /// Exhausted current version.
+        current_version: u64,
+    },
 }

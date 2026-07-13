@@ -8,6 +8,10 @@
 use super::{BoundaryError, Conversation, ConversationId, TurnId};
 use serde::{Deserialize, Serialize};
 
+mod head;
+
+pub use head::RevertOutcome;
+
 /// A Conversation-issued token naming one complete-Turn cut.
 ///
 /// `turn_count == 0` and `after_turn == None` identify the zero-turn boundary.
@@ -94,15 +98,9 @@ impl Conversation {
     /// parent's suffix above the child's ceiling.
     #[must_use]
     pub fn valid_boundaries(&self) -> Vec<Boundary> {
-        let lineage = self.history.lineage_turns();
-        let mut boundaries = Vec::with_capacity(lineage.len() + 1);
-        boundaries.push(self.issue_boundary(0, None));
-        boundaries.extend(lineage.iter().enumerate().map(|(index, turn)| {
-            let turn_count =
-                u64::try_from(index + 1).expect("an in-memory lineage length cannot exceed u64");
-            self.issue_boundary(turn_count, Some(turn.id()))
-        }));
-        boundaries
+        (0..=self.history.lineage_len())
+            .map(|position| self.issue_boundary_at(position))
+            .collect()
     }
 
     /// Returns the current-lineage boundary immediately after `turn_id`.
@@ -222,6 +220,18 @@ impl Conversation {
     /// Issues a token from already-owned lineage facts.
     fn issue_boundary(&self, turn_count: u64, after_turn: Option<TurnId>) -> Boundary {
         Boundary::issued(self.id, turn_count, after_turn, self.version)
+    }
+
+    /// Issues a token for one already-checked current-lineage position.
+    fn issue_boundary_at(&self, position: usize) -> Boundary {
+        debug_assert!(position <= self.history.lineage_len());
+        let turn_count =
+            u64::try_from(position).expect("an in-memory lineage length cannot exceed u64");
+        let after_turn = position
+            .checked_sub(1)
+            .and_then(|index| self.history.lineage_turns().get(index))
+            .map(super::Turn::id);
+        self.issue_boundary(turn_count, after_turn)
     }
 
     /// Converts the addressable lineage ceiling to the token's stable width.

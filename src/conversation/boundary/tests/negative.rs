@@ -97,7 +97,12 @@ fn boundary_after_distinguishes_unknown_and_detached_raw_turns() {
 
     commit_text_turn(&mut conversation, 121);
     commit_text_turn(&mut conversation, 122);
-    conversation.history.set_active_len_for_test(1);
+    let first_turn = conversation
+        .boundary_after(turn_id(121))
+        .expect("first turn has a checked boundary");
+    conversation
+        .revert_to(first_turn)
+        .expect("checked head movement succeeds");
     commit_text_turn(&mut conversation, 123);
     let branched_before = snapshot(&conversation);
 

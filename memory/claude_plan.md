@@ -1,68 +1,53 @@
-# 当前调用执行计划
+# 当前执行计划
 
-> 本文件记录可审计的执行计划、关键判断依据、进度与验证结果；不记录模型的私有逐字推理。
+## 目标与边界
 
-## 目标与约束
+- 本次调用只处理 `TODO.md` 中按顺序出现的第一个标题未带 `[DONE]` 的任务；完成并提交后立即停止。
+- `TODO.md` 是任务顺序、需求、依赖、验证标准和完成记录的唯一权威来源；只有阶段级计划确实变化时才更新 `PLAN.md`。
+- 不做开放式历史缺陷巡检。只检查最新提交是否明确提到与当前任务直接相关的未完成问题，以及实现/验证当前任务所必需的代码路径。
+- 若发现阻塞当前任务的真实前置缺陷，优先完整修复；若本次无法正确落地，则以最少数量在 `TODO.md` 中插入前置任务、明确依赖，提交任务编排变更后停止。
+- 不通过缩小表示范围、特例、shim 或调整测试形状绕过规范问题。
 
-- 以 `TODO.md` 为唯一任务顺序与验收来源，只处理标题中第一个未带 `[DONE]` 的任务。
-- 在选择该任务后，仅检查与该任务直接相关的最新提交、实现、测试和文档；不进行开放式历史缺陷扫描。
-- 若发现直接阻塞当前任务的既有缺陷或未建模前置条件，按要求在 `TODO.md` 中插入最少的前置任务、保持当前任务未完成、提交任务表调整后停止。
-- 若无阻塞，则完整实现、测试、更新完成记录、提交；不继续下一个任务。
-- 尊重现有未提交改动，先辨认其归属，不覆盖或丢弃用户改动；若这是上次中断留下的同一任务工作，最终提交需包含所有未提交文件。
+## 分步执行
 
-## 分步计划
+1. 读取 `TODO.md`，仅根据任务标题是否有 `[DONE]` 识别第一个未完成任务，完整摘录其需求、依赖、验收命令和完成记录要求。
+2. 检查工作树状态与最近一次提交说明：
+   - 保留所有既有用户改动，不回退、不覆盖无关内容；
+   - 判断是否属于上次中断后遗留的同一任务；若是，本次完成时将全部未提交文件纳入同一个任务提交；
+   - 只把最新提交明确指出且直接影响当前任务的未完成问题纳入范围。
+3. 阅读当前任务直接涉及的设计、实现和测试文件，建立需求到代码/测试的对应关系；不进行无关的广泛排查。
+4. 若任务规模本身较大，仍按既有任务单元完整实施；只有出现无法绕开的、未跟踪的具体前置条件时才调整 `TODO.md` 任务序列。
+5. 采用多个小而聚焦的补丁实施：每个关键修改后重读相关片段，补齐同一根因影响的整类情况，并增加或更新针对性测试与必要文档。
+6. 先运行最小范围测试以快速验证行为。任何失败都按测试失败政策处理：修复，或确认已有明确后续任务；不得把未安排的失败当作噪声。
+7. 代码稳定后依次执行最终验证：
+   - `cargo fmt --all`
+   - `cargo clippy --all-targets -- -D warnings`
+   - `cargo test --all --all-targets`（最长 30 分钟）
+   - 若任务要求或改动影响公开文档，再执行 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
+   若本次只有文档变化且可复用最近一次绿色全量结果，则按规则跳过全量测试并在完成记录中说明。
+8. 验证通过后更新 `TODO.md`：给当前任务标题加 `[DONE]`，写清实现、测试命令及结果、关键取舍和提交信息占位。仅当阶段依赖/完成标准变化时更新 `PLAN.md`。
+9. 再检查 diff、任务边界、格式和工作树，确保没有秘密、生成物、无关修改或遗漏文件；若 `PROMPT.md` 意外变化，按用户要求一并纳入提交且不擅自回退。
+10. 使用清晰且包含任务编号的消息创建 Git 提交。提交后核对 `git status` 与提交摘要，并把最终提交哈希补入 `TODO.md` 的完成记录；如果补哈希会产生新的未提交变更，则采用不会制造自指未提交状态的记录方式（例如记录提交命令/消息，最终答复提供实际哈希）。
+11. 向用户报告当前任务、主要实现、验证结果和提交哈希，然后停止，不开始下一个任务。
 
-1. 读取 `TODO.md`，从上到下识别首个标题未带 `[DONE]` 的任务，完整摘取其需求、依赖、验收命令和完成记录格式。
-2. 查看工作树状态和最新提交摘要；只判断未提交内容及最新提交是否与当前任务直接相关，并据此确认是全新执行、恢复执行，还是存在必须先处理的前置问题。
-3. 阅读 `PLAN.md` 中与该任务所属阶段直接相关的部分，以及任务点名的代码、测试和文档；建立需求到实现与测试的对应关系。
-4. 在不缩窄规范、不引入临时兼容层的前提下，按小而聚焦的补丁实现任务；每完成关键实现或计划发生变化，立即更新本文件。
-5. 增补或调整覆盖正常路径、边界条件、错误分类、原子性/不变量（若任务涉及）的测试；先运行聚焦测试以快速定位问题。
-6. 按规定顺序验证：`cargo fmt --all`，然后 `cargo clippy --all-targets -- -D warnings`，最后在不超过 30 分钟的超时约束下运行 `cargo test --all --all-targets`；再执行任务要求的其他验证（例如文档构建）。任何未被后续任务明确安排的失败都必须在本次修复或转化为排在当前任务前的最小前置任务。
-7. 验证通过后，在 `TODO.md` 的任务标题前添加 `[DONE]`，填写准确的实现与验证记录。仅当阶段级顺序、依赖、假设或完成标准确实变化时才更新 `PLAN.md`。
-8. 复查差异、任务范围、格式与工作树，确认没有秘密、构建产物或无关改动；用包含任务编号的清晰信息创建一次 Git 提交。若属于恢复执行，按要求将当前所有未提交文件纳入同一提交。
-9. 记录最终提交哈希与完成状态，然后停止，不读取或执行下一个任务。
+## 进度日志
 
-## 当前进度
+- 已建立本计划。
+- 已读取 `TODO.md` 并确认首个未完成任务为 **M3-3：逻辑 `head`、revert/redo 与 revert 后分支**；前置 M3-2 已标记完成。
+- 本次必须实现：受检 `revert_to(Boundary)`、old/new head outcome、结构 version 推进、有效工具索引随 head 重建、同 active lineage redo、revert 后提交形成新 parent suffix、detached raw suffix 保留且不泄漏，以及 raw/current-lineage 只读查询。
+- 指定验证重点：多次 revert/redo、zero、revert 后分叉提交、再次 revert、tool index clipping、旧 boundary stale、新 boundary 可用、raw id/payload 不变、detached branch 隔离和两条 parent path 可重建。
+- 已检查工作树：存在 `boundary/head.rs`、`boundary/tests/revert/` 及 history/error/docs 等同一 M3-3 范围的未提交改动，判定为上次意外中断后的恢复现场；完成时必须把当前全部未提交文件原子纳入本任务提交。
+- 最新提交 `0f41f647` 是 `[M3-2] Implement checked boundary tokens`，没有在提交说明中明确提出与 M3-3 相关的额外未完成前置问题。
+- 已审阅现有 diff、规范 §7--§9、commit/identity/index 路径：实现以 logical `active_len` 裁剪有效视图，保留 addressable lineage redo suffix 和 append-only raw branch；真实移动在写状态前完成 Boundary 校验、version 溢出检查与 index 重建，revert 后 commit 以当前 `tip_id` 作为新 parent，raw identity 检查覆盖 detached branch。
+- 验证已通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；`cargo test conversation::boundary -- --nocapture`（19 passed）；`timeout 1800 cargo test --all --all-targets`（239 个库测试与 3 个离线集成测试 passed，7 ignored，examples passed）。
+- 后续验证也已通过：`cargo test --doc`（1 个正向与 10 个 compile-fail passed）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`、`git diff --check`。
+- 已将 `TODO.md` 的 M3-3 标题更新为 `[DONE]`，并记录实现、错误原子性、分支/raw/index 行为与完整验证结果；阶段顺序和完成标准未变化，未修改 `PLAN.md`。
+- 最终暂存审计包含 17 个文件：head/revert 实现、7 个聚焦回归及 fixture 调整、history/error/API 接线、README/crate docs、TODO 和本进度文件；均属于 M3-3 恢复现场，没有构建产物、凭据、`PLAN.md` 或 `PROMPT.md` 变化，`git diff --cached --check` 通过。
+- 下一步重新暂存本条进度更新，创建一个 `[M3-3]` 提交，核对提交后工作树并停止。
 
-- [x] 在任何检查、构建或代码命令前创建本计划文件。
-- [x] 识别首个未完成任务：`M3-2 受检 Boundary、version 与 stale/ABA 防护`。
-- [x] 确认工作树与直接相关上下文：当前为 `M3-2` 中断恢复，已有同任务未提交改动。
-- [x] 完成实现与聚焦测试。
-- [x] 完成格式化、严格 lint、完整测试及任务专属验证。
-- [x] 更新 `TODO.md` 完成记录并标记 `M3-2 [DONE]`。
-- [x] 完成最终差异审计；本文件将随全部 `M3-2` 恢复现场纳入任务提交，然后停止。
+## 风险与处理原则
 
-## 计划变更与关键结果
-
-- `TODO.md` 中从上到下首个未带 `[DONE]` 的标题位于第 599 行：`M3-2 [TODO]`。
-- 当前任务要求新增私有字段的 `Boundary` token、合法边界枚举与按 Turn 查询、统一 owner /
-  structural version / anchor / range / pending 校验，以及稳定分类的 stale、ABA、跨会话、未知
-  Turn、fork ceiling 和伪造 serde token 负例。
-- `M3-3` 才负责真正的 head/revert/redo 操作，因此本次只建立边界模型与统一校验基础；测试所需
-  的 future suffix / fork ceiling 应在当前 history 内部能力上验证，不能提前公开或实现下一
-  任务的完整状态转换。
-- 最新提交 `72506520dfbc5998b06087cb61533ea79921afea` 是已完成的 `M3-1`，提交说明没有
-  M3-2 直接相关的未完成问题。
-- 工作树已有 `README.md`、`docs/conversation-core.md`、Conversation error/history/module、
-  crate root 及新 `boundary` 模块的未提交修改，形状与 M3-2 完全一致；`TODO.md` 尚未修改。
-  因此按“恢复同一任务”处理：逐项审计、修正、验证，并在最终提交中包含当前全部未提交文件。
-- 已对照 `PLAN.md` 与 `docs/conversation-core.md` §9 审计现有实现：`Boundary` 私有字段绑定
-  owner、`turn_count`、稳定 `after_turn` anchor 与 version；公开签发 API 覆盖 zero、每个
-  addressable Turn、revert 后 redo suffix；统一 resolver 按 owner/version/pending/range/
-  fork ceiling/anchor 校验，serde 仅恢复声明。
-- `History` 将 active head、addressable lineage ceiling 与共享 backing allocation 分离，既能让
-  root 的 future suffix 继续可寻址，也能让测试中的 fork child 精确拒绝 ceiling 以上位置；
-  真正的公开 head/revert/fork 转换仍留在 M3-3/M3-4，没有扩大本任务范围。
-- 现有正负测试已经覆盖任务列出的 empty/multi/zero/head/future redo、cross-owner、stale/ABA、
-  pending、unknown/detached、fork ceiling、伪造 range/anchor 与 serde round-trip，并对所有拒绝
-  路径快照比较 state 不变。现在按规定进入 format → clippy → 聚焦 → 全量 → rustdoc 验证链。
-- 正式验证全部通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；Boundary
-  聚焦测试 12 passed；1800 秒硬上限内全量测试为 232 个库测试与 3 个离线集成测试 passed、
-  7 ignored、0 failed，全部 example targets passed；doctest 为 1 个正向与 10 个
-  compile-fail passed；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`；首次
-  `git diff --check`。
-- 已在 `TODO.md` 把标题更新为 `M3-2 [DONE]` 并填写实现、错误边界、测试矩阵与验证记录；
-  `PLAN.md` 的阶段顺序、依赖、假设和完成标准没有变化，按规则未修改。完成记录和本进度文件
-  是验证后的纯 Markdown 变更，无需重复运行编译测试；最终仍会重跑 diff check 并审计暂存内容。
-- 最终暂存审计包含 13 个文件，均属于 Boundary 实现、测试、相关 history/error 接线、规范/
-  README、TODO 与恢复进度；没有无关文件或构建产物，`git diff --cached --check` 通过。
+- 若工作树已有改动与当前任务重叠，先辨认归属并在原基础上安全推进；无法避免覆盖风险时停止并说明。
+- 若任何单测超过一分钟或疑似卡死，立即终止并调查，不等待其自然超时。
+- 若完整测试发现未在后续任务明确安排的失败，不得把当前任务标为 `[DONE]`，必须先修复或安排最小前置/后续任务。
+- 最终只提交当前任务所需内容；若这是一次同任务恢复，则遵循要求提交当前全部未提交文件。

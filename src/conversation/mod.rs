@@ -10,7 +10,10 @@
 //! cancelled tool results, or validates a caller-supplied final response before
 //! committing. Complete-Turn cuts use Conversation-issued [`Boundary`] tokens
 //! whose owner, structural version, lineage position/anchor, fork ceiling, and
-//! pending consistency state are checked before consumption.
+//! pending consistency state are checked before consumption. The logical head
+//! can move backward or forward without deleting raw Turns; committing from a
+//! reverted head creates a new parent-pointer suffix while the old branch stays
+//! available to read-only raw-history queries.
 
 pub mod boundary;
 pub mod config;
@@ -22,7 +25,7 @@ pub mod pending;
 pub mod turn;
 mod validation;
 
-pub use boundary::Boundary;
+pub use boundary::{Boundary, RevertOutcome};
 pub use config::ConversationConfig;
 pub use error::{
     BoundaryError, CancelError, CommitError, ContentBlockKind, ConversationError,
@@ -107,6 +110,26 @@ impl Conversation {
         self.history.turns()
     }
 
+    /// Returns every Turn on the current addressable lineage in order.
+    ///
+    /// This includes a redo suffix beyond the logical [`head`](Self::head), if
+    /// the Conversation has been reverted. Use [`turns`](Self::turns) for the
+    /// currently effective prefix and raw queries for detached branches.
+    #[must_use]
+    pub fn lineage_turns(&self) -> &[Turn] {
+        self.history.lineage_turns()
+    }
+
+    /// Returns all retained raw Turns in deterministic insertion order.
+    ///
+    /// The returned vector contains shared read-only references. It can include
+    /// detached suffixes and therefore must not be treated as the effective
+    /// Conversation view; [`turns`](Self::turns) remains head-clipped.
+    #[must_use]
+    pub fn raw_turns(&self) -> Vec<&Turn> {
+        self.history.raw_turns()
+    }
+
     /// Finds an immutable retained raw turn, including a detached suffix.
     ///
     /// This is a debug/persistence lookup only. Returning a shared reference
@@ -130,8 +153,8 @@ impl Conversation {
 
     /// Returns the monotonic version advanced by each structural history change.
     ///
-    /// Successful commits currently advance it. Later checked head movement
-    /// and fork/restore transitions use the same structural-version domain so
+    /// Successful commits and real logical-head moves advance it. Future
+    /// fork/restore transitions use the same structural-version domain so
     /// previously issued [`Boundary`] tokens cannot survive an ABA change.
     #[must_use]
     pub const fn version(&self) -> u64 {

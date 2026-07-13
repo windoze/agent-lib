@@ -30,6 +30,8 @@
 //!   Conversation-owned [`conversation::Boundary`] tokens name only complete
 //!   Turn cuts; their position and stable anchor are revalidated against owner,
 //!   structural version, lineage/fork range, and pending state before use.
+//!   [`conversation::Conversation::revert_to`] moves a logical head backward or
+//!   forward, rebuilds derived lookup state, and retains every raw branch.
 //!
 //! Agent loops, tool registries, approval policy, and multi-agent orchestration
 //! are deliberately outside this crate. Those layers should persist and replay

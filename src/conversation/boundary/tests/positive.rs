@@ -74,7 +74,12 @@ fn reverted_head_still_issues_fresh_boundaries_for_same_lineage_redo_suffix() {
         commit_text_turn(&mut conversation, seed);
     }
 
-    conversation.history.set_active_len_for_test(1);
+    let first_turn = conversation
+        .boundary_after(turn_id(20))
+        .expect("first turn has a checked boundary");
+    conversation
+        .revert_to(first_turn)
+        .expect("checked head movement succeeds");
 
     assert_eq!(conversation.turns().len(), 1, "active head moved back");
     let boundaries = conversation.valid_boundaries();
