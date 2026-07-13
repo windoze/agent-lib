@@ -16,6 +16,7 @@ use crate::{
         StepBoundary, StepId, ToolApprovalPolicy, ToolCallFinished, ToolCallStarted,
         ToolExecutionIds, ToolFailurePolicy, ToolRegistry, ToolRegistryResolver, ToolRuntimeError,
         TraceNodeId,
+        approval::approval_response_for_decision,
         state::{CancelRecoveryReason, PivotSource, QueuedPivot, ReconfigApplication},
     },
     client::{ChatRequest, ClientError, LlmClient, Response},
@@ -26,7 +27,7 @@ use crate::{
     model::{
         content::ContentBlock,
         message::Message,
-        tool::{ToolCall, ToolResponse, ToolStatus},
+        tool::{ToolCall, ToolResponse},
     },
     stream::StreamEvent,
 };
@@ -1486,38 +1487,6 @@ async fn wait_for_approval(
                 }
             }
         }
-    }
-}
-
-fn approval_response_for_decision(
-    call: &ToolCall,
-    decision: ApprovalDecision,
-    message: Option<&str>,
-) -> ToolResponse {
-    let (status, default_text) = match decision {
-        ApprovalDecision::Approve => unreachable!("approve executes the tool"),
-        ApprovalDecision::Deny => (
-            ToolStatus::Denied,
-            "Tool execution was denied before it started.",
-        ),
-        ApprovalDecision::Timeout => (
-            ToolStatus::Denied,
-            "Tool execution approval timed out before the tool started.",
-        ),
-        ApprovalDecision::Cancel => (
-            ToolStatus::Cancelled,
-            "Tool execution was cancelled before it started.",
-        ),
-    };
-
-    ToolResponse {
-        tool_call_id: call.id.clone(),
-        content: vec![ContentBlock::Text {
-            text: message.unwrap_or(default_text).to_owned(),
-            extra: Map::new(),
-        }],
-        status,
-        extra: Map::new(),
     }
 }
 

@@ -4,8 +4,16 @@
 //! values, while the policy and pending responder are live runtime handles owned
 //! by an [`crate::agent::AgentLoop`] implementation.
 
-use crate::{agent::StepId, conversation::ToolCallId, model::tool::ToolCall};
+use crate::{
+    agent::StepId,
+    conversation::ToolCallId,
+    model::{
+        content::ContentBlock,
+        tool::{ToolCall, ToolResponse, ToolStatus},
+    },
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Map;
 use std::fmt;
 use thiserror::Error;
 
@@ -179,6 +187,46 @@ pub enum ApprovalError {
 
 fn non_empty(value: String) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
+}
+
+/// Synthesizes a model-visible tool result for a non-approving decision.
+///
+/// Shared by the legacy [`DefaultAgentLoop`](crate::agent::DefaultAgentLoop) and
+/// the sans-io [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine): a
+/// denied, timed-out, or cancelled approval never executes the tool, so the loop
+/// appends this synthetic [`ToolResponse`] in place of a real one. The
+/// [`Approve`](ApprovalDecision::Approve) decision is unreachable because an
+/// approved call executes the tool instead.
+pub(crate) fn approval_response_for_decision(
+    call: &ToolCall,
+    decision: ApprovalDecision,
+    message: Option<&str>,
+) -> ToolResponse {
+    let (status, default_text) = match decision {
+        ApprovalDecision::Approve => unreachable!("approve executes the tool"),
+        ApprovalDecision::Deny => (
+            ToolStatus::Denied,
+            "Tool execution was denied before it started.",
+        ),
+        ApprovalDecision::Timeout => (
+            ToolStatus::Denied,
+            "Tool execution approval timed out before the tool started.",
+        ),
+        ApprovalDecision::Cancel => (
+            ToolStatus::Cancelled,
+            "Tool execution was cancelled before it started.",
+        ),
+    };
+
+    ToolResponse {
+        tool_call_id: call.id.clone(),
+        content: vec![ContentBlock::Text {
+            text: message.unwrap_or(default_text).to_owned(),
+            extra: Map::new(),
+        }],
+        status,
+        extra: Map::new(),
+    }
 }
 
 #[cfg(test)]
