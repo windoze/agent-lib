@@ -40,9 +40,34 @@ pub type PivotMessage = QueuedPivot;
 pub enum AgentInput {
     /// Start a new user-authored turn.
     UserMessage(AgentUserInput),
+    /// A `Role::User` pivot injected directly between two steps.
+    ///
+    /// This is the effect-model replacement for the pivot queue: a driver soft-
+    /// turns the machine by feeding a pivot at a step boundary instead of
+    /// queueing it (see the migration doc §2.2). Queueing policy — when to
+    /// inject — moves to the driver / session.
+    Pivot(PivotMessage),
     /// Start the next turn from the oldest queued pivot message.
+    ///
+    /// Deprecated: the effect model injects a pivot directly via
+    /// [`AgentInput::Pivot`]. This queue-driven variant is retained only so the
+    /// legacy [`DefaultAgentLoop`](crate::agent::DefaultAgentLoop) keeps
+    /// compiling during Stage 0–2; it is removed in M4.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use AgentInput::Pivot; the pivot queue is removed in M4"
+    )]
     QueuedPivotTurn(QueuedPivotTurnInput),
     /// Resume from a data-only loop cursor after external recovery.
+    ///
+    /// Deprecated: resume semantics move onto
+    /// [`StepInput::Resume`](crate::agent::StepInput::Resume), which feeds a
+    /// specific requirement's result back rather than resuming an opaque cursor.
+    /// Retained for the legacy loop during Stage 0–2; removed in M4.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use StepInput::Resume; opaque cursor resume is removed in M4"
+    )]
     Resume(ResumeInput),
 }
 
@@ -69,8 +94,21 @@ impl AgentInput {
         )?))
     }
 
-    /// Creates input for starting a turn from the oldest queued pivot.
+    /// Creates input for injecting a `Role::User` pivot between two steps.
     #[must_use]
+    pub const fn pivot(pivot: PivotMessage) -> Self {
+        Self::Pivot(pivot)
+    }
+
+    /// Creates input for starting a turn from the oldest queued pivot.
+    ///
+    /// Deprecated: see [`AgentInput::QueuedPivotTurn`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use AgentInput::Pivot; the pivot queue is removed in M4"
+    )]
+    #[must_use]
+    #[allow(deprecated)]
     pub const fn queued_pivot_turn(
         turn_id: TurnId,
         assistant_message_id: MessageId,
@@ -84,7 +122,14 @@ impl AgentInput {
     }
 
     /// Creates input for resuming a feed segment after external recovery.
+    ///
+    /// Deprecated: see [`AgentInput::Resume`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use StepInput::Resume; opaque cursor resume is removed in M4"
+    )]
     #[must_use]
+    #[allow(deprecated)]
     pub const fn resume(step_id: StepId) -> Self {
         Self::Resume(ResumeInput::new(step_id))
     }
@@ -943,6 +988,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn agent_input_rejects_non_user_turn_payloads() {
         let error = AgentInput::user_message(
             turn_id(),
@@ -1169,6 +1215,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn agent_input_round_trips_for_checked_user_and_resume_shapes() {
         assert_json_round_trip(
             AgentInput::user_message(

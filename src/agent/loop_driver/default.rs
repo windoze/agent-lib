@@ -415,6 +415,7 @@ impl LoopRuntime {
         input: AgentInput,
         stream: bool,
     ) -> Result<PreparedAssistantCall, AgentError> {
+        #[allow(deprecated)]
         let initial = match input {
             AgentInput::UserMessage(user) => {
                 let state = lock_agent_state(&self.state)?;
@@ -457,6 +458,13 @@ impl LoopRuntime {
                 }
                 let assistant_message_id = self.tool_ids.next_assistant_message_id()?;
                 return self.prepare_assistant_call(input.step_id(), assistant_message_id, stream);
+            }
+            AgentInput::Pivot(_) => {
+                return Err(AgentError::Other(
+                    "the legacy default loop does not support direct pivot injection; \
+                     queue the pivot and feed AgentInput::QueuedPivotTurn instead"
+                        .to_owned(),
+                ));
             }
         };
 

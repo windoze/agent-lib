@@ -213,6 +213,7 @@ mod tests {
             .expect("step id")
     }
 
+    #[allow(deprecated)]
     fn input() -> AgentInput {
         AgentInput::resume(step_id())
     }

@@ -608,6 +608,7 @@ fn input_seed(seed: u64, text: &str) -> AgentInput {
 }
 
 fn queued_pivot_turn_input(seed: u64) -> AgentInput {
+    #[allow(deprecated)]
     AgentInput::queued_pivot_turn(
         turn_id_seed(seed),
         message_id_seed(seed + 1),
@@ -1775,6 +1776,7 @@ async fn cancellation_discards_active_streaming_partial_and_closes_feed() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn parent_cancel_interrupts_open_tool_call_and_resume_feed_continues_turn() {
     let client = Arc::new(FakeClient::with_chats(vec![
         Ok(tool_use_response(

@@ -1,39 +1,59 @@
-# 执行计划 — M1-R Milestone 1 Review
+# 执行计划 — M2-1 `AgentMachine`、`StepInput`、`StepOutcome` 与 `AgentInput` 调整
 
 ## 当前任务
 
-第一个未完成任务：**M1-R Milestone 1 Review**（前置 M1-1..M1-3 均已 [DONE]）。
-这是评审任务，不拆分。核对类型骨架完整性、serde 边界、与迁移文档 §3/§4/§12 形状一致，
-且未改动任何现有行为；运行全套验证命令并把结论写入完成记录。
+第一个未完成任务：**M2-1**（前置 M1-R 已 [DONE]）。迁移文档 §2。
+只定义类型与 trait，不实现具体 `step` 逻辑（留 M2-3/M2-4）。
 
-## 评审清单（逐项核对）
+## 做什么
 
-1. [done] §12 决策 A（RequirementIds 供给）在类型层已体现：`RequirementIds` trait + `NoRequirementIds`。
-2. [done] §12 决策 B/C（暂不排序/一次吐一批）已留位：`Requirement` 携带 `id + origin` 可寻址，
-   批量语义留 M2 的 `StepOutcome`；类型层未强加 priority/顺序字段（符合 C 暂不排序）。
-3. [done] `RequirementKind` 四变体 + `RequirementResult` 四变体 + `accepts` 4×4 类型对齐矩阵齐全。
-4. [done] `Notification` 只含四个纯通知变体（无 approval/done）；`From<Notification> for AgentEvent` 一一映射。
-5. [done] `Interaction` 正确泛化 approval（Approval/Question/Choice），旧 approval 类型保留并 re-export。
-6. [done] serde 边界 rustdoc 清晰：persistable 描述 vs runtime 结果（requirement.rs 模块级文档）。
-7. [ ] 运行验证命令确认 `DefaultAgentLoop` 与现有 loop 测试全绿。
+1. 新建 `src/agent/machine.rs`，从 `agent/mod.rs` 导出并 re-export：
+   - `trait AgentMachine { fn step(&mut self, input: StepInput) -> StepOutcome;
+     fn cursor(&self) -> &LoopCursor; }`（非 async_trait，对象安全）。
+   - `enum StepInput { External(AgentInput), Resume(RequirementResolution), Abandon(RequirementId) }`
+     （含构造器）。因 `Resume` 携带运行期 `RequirementResolution`（非 serde），整体不派生 serde；
+     仅 Clone+Debug。
+   - `struct StepOutcome { notifications: Vec<Notification>, requirements: Vec<Requirement>,
+     quiescent: bool }`（决策 B）。全字段可 serde → 派生 Serialize/Deserialize + Clone/Debug/PartialEq；
+     加 `new` 构造器与便捷 `quiescent()`/`is_quiescent()`。
+2. 调整 `AgentInput`（event.rs）：
+   - 新增 `Pivot(PivotMessage)` 变体 + `pivot(..)` 构造器。
+   - **并存策略**：`DefaultAgentLoop` 仍使用 `QueuedPivotTurn`/`Resume`，删除会破坏它，
+     故保留旧变体并加 `#[deprecated]`（note：M4 清理），在内部消费点加 `#[allow(deprecated)]`
+     以过 `-D warnings`。完成记录写明该选择。
+   - `default.rs` 的 `AgentInput` match 需补 `Pivot` 臂：legacy loop 不支持直插 pivot（走队列），
+     返回 `AgentError::Other` 明确报错（现有测试不构造 `Pivot`，行为不变）。
+3. mod.rs：`pub mod machine;` + `pub use machine::{AgentMachine, StepInput, StepOutcome};`
+
+## 需要加 `#[allow(deprecated)]` 的内部消费点
+
+- event.rs: `AgentInput::queued_pivot_turn`、`AgentInput::resume` 构造器；event.rs 测试。
+- default.rs: match 的 `QueuedPivotTurn`/`Resume` 臂。
+- default/tests.rs、loop_driver.rs: `AgentInput::resume(..)`。
+
+## 测试（machine.rs #[cfg(test)]）
+
+- fake machine 实现 `AgentMachine`，可作为 `Box<dyn AgentMachine>`（对象安全）。
+- `StepOutcome` serde round-trip（含 notifications + requirements）。
+- 调整后 `AgentInput`（含 `Pivot`）serde round-trip。
+- `StepInput` 构造器 + Clone/Debug 断言（Resume 非 serde，故不测 serde）。
 
 ## 验证命令
 
 - `cargo fmt --all`
 - `cargo clippy --all-targets -- -D warnings`
+- 聚焦：agent::machine 测试
 - `cargo test --all --all-targets`（≤30min）
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
 - `git diff --check`
 
 ## 进度
 
-- 已阅读 requirement.rs / interaction.rs / event.rs(Notification) / mod.rs / PLAN.md / 迁移文档 §12。
-- 代码审查通过，无返工项；待验证命令确认后写入完成记录、标 [DONE]、提交、停止。
-
-## 结果（M1-R 完成）
-
-- 评审结论：**通过，无返工项**。逐项核对（§12 A/B/C、四变体+accepts 矩阵、Notification 仅通知、
-  Interaction 泛化 approval+旧类型可用、serde 边界 rustdoc、DefaultAgentLoop 未受影响）全部满足。
-- 验证复跑：fmt clean / clippy(-D warnings) clean / test（lib 375 passed，0 failed，网络 ignored）/
-  rustdoc(-D warnings) 通过 / diff check 干净。
-- TODO.md M1-R → [DONE] 并写入完成记录。提交并停止；下一轮从 M2-1 开始。
+- [x] 新建 machine.rs
+- [x] 调整 AgentInput + 并存 deprecated
+- [x] default.rs 补 Pivot 臂 + allow(deprecated)
+- [x] mod.rs 导出
+- [x] 测试（machine 5 passed）
+- [x] 全套验证：fmt/clippy/聚焦/全量(lib 380)/rustdoc/diff 全通过
+- [x] TODO.md 标 [DONE] + 完成记录
+- [ ] 提交并停止
