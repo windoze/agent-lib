@@ -683,6 +683,44 @@ async fn recorded_tool_round_trip_replays_offline() {
 - cassette 文件必须通过 redactor,并在 review 中可读。
 - cassette mismatch 应报告 request fingerprint 与 entry index。
 
+#### 现状(M6-4 已落地)
+
+已落地三个命名 replay 套件(均在 `crates/agent-testkit/tests/`,cassette JSON 在
+`crates/agent-testkit/tests/cassettes/`;M3-4 的 `cassette_replay.rs` 作为首个离线 replay 的基础设施验证保留):
+
+| 套件文件 | cassette | 回放的流程 |
+|---|---|---|
+| `agent_replay_text.rs` | `agent_text_turn.json` | user -> LLM text -> commit(无 tool/interaction) |
+| `agent_replay_tool.rs` | `agent_tool_error_roundtrip.json` | user -> LLM tool_use -> **tool error 结果** -> LLM 恢复文本(区别于 `cassette_replay.rs` 的 happy-path) |
+| `agent_replay_approval.rs` | `agent_tool_approval_roundtrip.json` | user -> LLM tool_use -> **approval(approve)** -> tool -> LLM final text |
+
+每个套件含两个测试:`offline_replay_*`(读 committed cassette 离线回放,断言 final conversation、
+handler call log、final cursor)与 `regenerate_*`(录制/更新 cassette 的 source of truth,默认 skip)。
+
+#### 如何 record / update cassette
+
+cassette 的写盘受环境变量护栏,默认关闭,所以普通 CI 运行只做离线回放,永不改动 committed 文件:
+
+- `AGENT_TESTKIT_RECORD_CASSETTES=1` 启用 `CassetteRecorder::record`(录制新文件)。
+- `AGENT_TESTKIT_UPDATE_CASSETTES=1` 启用 `CassetteRecorder::update`(覆盖既有文件)。
+- 二者都不设置时,`regenerate_*` 测试提前返回(`RecorderReport::Skipped`),replay 测试仅读磁盘上的 cassette。
+
+更新某个套件的 cassette(例如 spec 或脚本改动后重新捕获 fingerprint):
+
+```bash
+# 覆盖既有 cassette(update 模式)
+AGENT_TESTKIT_UPDATE_CASSETTES=1 \
+  cargo test -p agent-testkit --test agent_replay_tool regenerate
+
+# 之后离线回放确认锁步(不设任何环境变量)
+cargo test -p agent-testkit --test agent_replay_tool
+```
+
+`regenerate_*` 测试用 recorder 包裹脚本化 handler 驱动真实 `DefaultAgentMachine`,因此录制的正是机器
+实际发出的请求——这保证 entry fingerprint 与回放时机器复现的请求锁步。cassette 由 recorder 以
+`to_json_string_pretty` 写出(无行尾空白、无末尾换行),满足 `git diff --check`,并经 redactor
+把 volatile id 归一为占位符后再计算 fingerprint。
+
 ### 8.4 Future DSL/TS Suites
 
 这些套件等 Rust scenario model 稳定后再做。目标是用更轻量的脚本表达复杂真实世界场景。

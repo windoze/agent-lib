@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "test_name": "agent_text_turn",
+    "description": "user -> LLM text -> commit; no tools, network, or credentials"
+  },
+  "entries": [
+    {
+      "family": "llm",
+      "index": 0,
+      "request": {
+        "model": "gpt-5.5",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "hello?"
+              }
+            ]
+          }
+        ],
+        "tools": [],
+        "system": "Test conversation system.",
+        "max_tokens": 512,
+        "temperature": 0.1,
+        "stream": false,
+        "provider_extras": null
+      },
+      "mode": "non_streaming",
+      "fingerprint": "{\"max_tokens\":512,\"messages\":[{\"content\":[{\"text\":\"hello?\",\"type\":\"text\"}],\"role\":\"user\"}],\"model\":\"gpt-5.5\",\"provider_extras\":null,\"stream\":false,\"system\":\"Test conversation system.\",\"temperature\":0.10000000149011612,\"tools\":[]}",
+      "result": {
+        "ok": {
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Hello from the recorded model."
+              }
+            ]
+          },
+          "usage": {
+            "input": 4,
+            "output": 3,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "stop_reason": {
+            "value": "end_turn",
+            "raw": "end_turn"
+          }
+        }
+      }
+    }
+  ]
+}

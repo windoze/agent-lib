@@ -1271,7 +1271,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - **保留的最小本地件(有意,非可 mock 的 effect fake)**:`agent_tool_basic` 的 `spec_with_step_limit`(仅为触发 step-limit 路径而把 fixture 固定的 `max_steps=8` 改为可传参,其余与 `agent_spec_with_tools` 逐字一致);`agent_interaction_basic` 的 `RequireApprovalPolicy`(approval 策略是 spec 级决策,testkit 有意不导出 require-approval policy,与 M6-1/M6-2 一致)。
 - **验证**:`cargo fmt --all` 干净;`cargo clippy --all-targets -- -D warnings`(workspace)无告警;5 个套件各自过滤运行 `cargo test --test agent_step_basic`(5)/`--test agent_tool_basic`(5)/`--test agent_interaction_basic`(5)/`--test agent_driver_basic`(4)/`--test agent_trace_budget_basic`(3)全绿;`cargo test --all --all-targets` 全绿(0 失败;新增 22 用例并入其余套件);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。未发现需插入前置修复的 spec 偏差或新增未调度失败测试。
 
-### [TODO] M6-4 新增 recorded replay suites
+### [DONE] M6-4 新增 recorded replay suites
 
 **前置依赖**:M6-3。
 
@@ -1290,6 +1290,54 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 在无 credentials 环境运行 replay suites 成功。
 - `git diff --check` 确认 cassette JSON 无尾随空白。
 - 全套验证命令全部通过。
+
+**完成记录(2026-07-14)**:
+
+- **交付**:新增 3 个命名 recorded replay 套件(均在 `crates/agent-testkit/tests/`,cassette JSON 在
+  `crates/agent-testkit/tests/cassettes/`,与 M3-4 同一 seam;全部 `use agent_testkit::prelude::*;`,离线、
+  无网络/credentials/真实 provider/真实 tool 后端/真实人工)。每个套件含两个测试:`offline_replay_*`
+  (读 committed cassette 离线回放,断言 final conversation、handler call log、final cursor)与 `regenerate_*`
+  (cassette 的 source of truth——用 `CassetteRecorder::update` 包裹脚本化 handler 驱动真实
+  `DefaultAgentMachine`,只在 `AGENT_TESTKIT_UPDATE_CASSETTES=1` 时写盘,默认 `RecorderReport::Skipped`
+  no-op,永不改动 committed 文件)。这与 M3-4 的 source-of-truth 模式一致:录制机器实际发出的请求,
+  保证 entry fingerprint 与回放时机器复现的请求锁步。
+  - `tests/agent_replay_text.rs` + `cassettes/agent_text_turn.json`:`user -> LLM text -> commit`(`agent_spec`
+    无 tools;1 个 llm entry)。断言 cursor `Done`、llm log count 1 all_completed、conversation
+    committed_turns 1 / 2 msg / 末 assistant 文本。
+  - `tests/agent_replay_tool.rs` + `cassettes/agent_tool_error_roundtrip.json`:`user -> LLM tool_use ->
+    tool error 结果 -> LLM 恢复文本`(3 entries)。**有意选 tool-error 路径**以区别于 M3-4
+    `cassette_replay.rs` 的 happy-path(committed conversation 携带 `ToolStatus::Error` 而非 `Ok`,回放复现
+    错误 hand-off)。断言 cursor `Done`、llm 2 / tool 1 all_completed、conversation 1 turn / 4 msg /
+    `tool_result_status` Error / 末文本 / tool-use name。
+  - `tests/agent_replay_approval.rs` + `cassettes/agent_tool_approval_roundtrip.json`:`user -> LLM tool_use ->
+    approval(approve) -> tool -> LLM final text`(4 entries:llm/interaction/tool/llm)。machine 带最小本地
+    `RequireApprovalPolicy`(approval 策略是 spec 级决策,testkit 有意不导出,与 M6-1/M6-3 一致),
+    其余全部由 cassette 驱动(`CassetteLlmHandler`/`CassetteToolHandler`/`CassetteInteractionHandler`)。
+    断言 cursor `Done`、llm 2 / tool 1 all_completed、interaction log len 1、conversation
+    `tool_result_status` Ok / 末文本。录制的 approval `result` 携带确定性 SeqIds 生成的 step_id/call_id,
+    回放时同序 SeqIds 复现同一组 id,通过 driver 的 return-path family/aim 校验。
+- **Coverage map(新增测试 → `docs/TESTABILITY.md` §8.3 矩阵行)**:
+  - `agent_replay_text` → §8.3 `agent_replay_text` 行(`CassetteLlmHandler`;recorded user -> LLM text -> commit)。
+  - `agent_replay_tool` → §8.3 `agent_replay_tool` 行(cassette-backed llm/tool;recorded LLM tool_use +
+    real-ish tool result + final text——此处 real-ish result 为 model-visible Error)。
+  - `agent_replay_approval` → §8.3 `agent_replay_approval` 行(cassette-backed interaction;tool approval
+    request + approve + final response)。
+  - `agent_replay_reconfig` / `agent_replay_regression` 仍为 §8.3 规划中未落地行(本任务只承诺 text/tool +
+    approval 或 regression 之一;已交付 approval)。
+- **避免重复既有测试**:保留 M3-4 `crates/agent-testkit/tests/cassette_replay.rs`(首个离线 replay 的基础设施
+  验证,及其历史校验命令 `cargo test -p agent-testkit --test cassette_replay` 仍可跑),未重命名/删除;
+  `agent_replay_tool` 有意走 tool-error 路径,不复制其 weather happy-path。
+- **文档**:`docs/TESTABILITY.md` §8.3 增补「现状(M6-4 已落地)」表与「如何 record / update cassette」小节,
+  记录三套件路径/cassette、两个环境变量(`AGENT_TESTKIT_RECORD_CASSETTES` / `AGENT_TESTKIT_UPDATE_CASSETTES`)、
+  update 命令、默认离线 skip 行为,以及 cassette 经 `to_json_string_pretty`(无行尾空白/末尾换行)+ redactor
+  归一 volatile id 的护栏。
+- **验证**:`cargo fmt --all` 干净;`cargo clippy --all-targets -- -D warnings`(workspace)无告警;
+  3 套件离线运行(不设任何环境变量)`cargo test -p agent-testkit --test agent_replay_text`(2)/
+  `--test agent_replay_tool`(2)/`--test agent_replay_approval`(2)全绿(`regenerate_*` 默认 Skipped no-op、
+  `offline_replay_*` 绿);cassette 由 `AGENT_TESTKIT_UPDATE_CASSETTES=1 ... regenerate` 生成后离线回放确认
+  锁步;`git diff --check` 干净(3 个新 cassette JSON 无尾随空白);`cargo test --all --all-targets` 全绿
+  (0 failed,新增 6 用例并入其余套件);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
+  未发现需插入前置修复的 spec 偏差或新增未调度失败测试。
 
 ### [TODO] M6-R Milestone 6 Review
 
