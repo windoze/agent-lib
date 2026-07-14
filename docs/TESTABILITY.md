@@ -703,15 +703,28 @@ async fn recorded_tool_round_trip_replays_offline() {
 - 断言应同时覆盖 final conversation、handler call log、trace/budget 中至少一个可观察面。
 - 复杂场景失败时,错误信息应能指出脚本 step 与 effect family。
 
-#### 现状(未落地,deferred 至 M7 之后)
+#### 现状(未落地为独立 scenario 套件;复杂组合已由 `tests/agent_complex_*.rs` 直接覆盖)
 
 M6 的范围是“迁移 e2e/reference fake、补基础 coverage、离线 cassette replay”,不含 §8.2 的独立
-scripted scenario 套件,故本节 6 行均尚未作为命名套件落地。当前这些复杂组合已有等价覆盖:多轮
-tool loop 与 auto+guarded 混合见 `tests/reference_driver.rs`;child headless interaction pop 到 parent、
-tool batch out-of-order/peak concurrency、subagent depth/budget/cancel 见 `tests/agent_effect_e2e.rs`
-与 `crates/agent-testkit/src/subagent.rs` 单测;多 queued reconfig / registry swap 见
-`src/agent/machine/default/tests/reconfig.rs`。独立 scenario 套件依赖 M7 的 data-only scenario model
-稳定后再抽,以免过早把复杂脚本固化成不可维护的 Rust 测试代码。
+scripted scenario 套件,故本节 6 行均尚未作为**命名 scenario 套件**落地。独立 scenario 套件依赖 M7 的
+data-only scenario model 稳定后再抽,以免过早把复杂脚本固化成不可维护的 Rust 测试代码。
+
+不过,本节意在覆盖的“多轮 + 多 handler + 多 scope 组合正确性”现已由一组**专门的复杂 mock 套件**直接固化
+(设计见 [`complex-tests.md`](complex-tests.md),落地状态见其 §11),它们仍站在 agent effect 边界、离线确定性、
+可单独过滤运行:
+
+| 套件文件 | 直接覆盖的复杂组合 |
+|---|---|
+| `tests/agent_complex_support.rs` | mock plan/blackboard vertical feature 与断言 helper 的支持层不变量。 |
+| `tests/agent_complex_flow.rs` | 多轮 tool loop + approve/deny + plan 依赖/claim 冲突 + pivot 注入。 |
+| `tests/agent_complex_subagent.rs` | subagent 创建/执行、headless child interaction pop 到 parent、pivot 后重渲染 brief。 |
+| `tests/agent_complex_cancel.rs` | cancel never-resume、approval cancel 与 context cancel 的区分。 |
+
+早期这些组合的等价覆盖仍在:多轮 tool loop 与 auto+guarded 混合见 `tests/reference_driver.rs`;child headless
+interaction pop 到 parent、tool batch out-of-order/peak concurrency、subagent depth/budget/cancel 见
+`tests/agent_effect_e2e.rs` 与 `crates/agent-testkit/src/subagent.rs` 单测;多 queued reconfig / registry swap 见
+`src/agent/machine/default/tests/reconfig.rs`。§8.2 表格中的命名 `agent_scenario_*` 套件本身仍待 M7 之后按
+data-only scenario model 抽取,与上述复杂 mock 套件不冲突。
 
 ### 8.3 Recorded Replay Suites
 

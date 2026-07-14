@@ -917,7 +917,7 @@ pivot 前旧目标 spawn child 或执行危险 tool。
   `cargo test --all --all-targets` 全绿(所有测试二进制 0 failed);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
-### [TODO] M4-4 更新文档、运行说明与测试矩阵
+### [DONE] M4-4 更新文档、运行说明与测试矩阵
 
 **前置依赖**:M4-3。
 
@@ -939,6 +939,34 @@ pivot 前旧目标 spawn child 或执行危险 tool。
 
 - `git diff --check`。
 - 如果只改文档,无需运行 Rust 构建;若同时改测试代码,执行全套验证门。
+
+**完成记录**:
+
+- 勘查确认:全部 P0/P1 场景均已落地,**无一 deferred**,且实际测试名与 `docs/complex-tests.md` 各场景
+  「建议测试名」逐一一致。映射:
+  - P0-1 `complex_turn_combines_plan_blackboard_approval_deny_and_pivot` →
+    `tests/agent_complex_flow.rs`;
+  - P0-2 `complex_subagent_updates_shared_plan_and_pops_approval_to_parent` →
+    `tests/agent_complex_subagent.rs`;
+  - P0-3 `complex_cancel_abandons_child_and_preserves_committed_state` →
+    `tests/agent_complex_cancel.rs`;
+  - P1-1 `complex_plan_claim_conflict_or_dependency_block_recovers_through_blackboard` →
+    `tests/agent_complex_flow.rs`;
+  - P1-2 `complex_approval_cancel_does_not_cancel_context_unless_driver_cancels` →
+    `tests/agent_complex_cancel.rs`;
+  - P1-3 `complex_pivot_then_subagent_uses_rerendered_brief` →
+    `tests/agent_complex_subagent.rs`;
+  - 支持层单测在 `tests/agent_complex_support.rs`(6 个),支持模块在 `tests/complex_support/`。
+- `docs/complex-tests.md` 新增 §11「落地状态」:含支持层文件结构表、支持层单测表、场景→测试文件→测试名
+  →状态映射表(全部标「已落地」)、mock store 仍是测试支持层而非生产 plan API 的说明、以及各套件单独
+  运行命令示例。明确无 P1 deferred。
+- `docs/TESTABILITY.md` §8.2「现状」改写:标题从「未落地,deferred 至 M7 之后」改为指出本节意图覆盖的
+  复杂组合现已由专门的 `tests/agent_complex_*.rs` 复杂 mock 套件直接固化(附套件→覆盖组合表),并说明
+  命名 `agent_scenario_*` scenario 套件本身仍待 M7 之后按 data-only scenario model 抽取,二者不冲突。
+- `README.md`「构建与测试」新增复杂 mock 套件单独运行示例(README 原已有测试运行示例,符合可选修改条件),
+  并链接 `docs/complex-tests.md`。
+- 本任务仅改文档(`docs/*.md`、`README.md`、`TODO.md`、`memory/claude_plan.md`),未触及任何 Rust
+  编译产物,故按验证门规则复用上次全量绿结果,未重跑 Rust 构建/测试。已运行 `git diff --check`(干净)。
 
 ### [TODO] M4-R Milestone 4 总 Review
 

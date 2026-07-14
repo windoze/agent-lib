@@ -374,6 +374,16 @@ cargo test --test integration_openai_resp -- --ignored --nocapture
 cargo test --test integration_normalization -- --ignored --nocapture
 ```
 
+复杂 mock 测试套件（多轮、approval、subagent、plan/blackboard、cancel、pivot 的组合边界）默认离线、
+可单独过滤运行，设计与落地状态见 [`docs/complex-tests.md`](docs/complex-tests.md)：
+
+```bash
+cargo test --test agent_complex_support    # mock plan/blackboard 支持层与断言 helper
+cargo test --test agent_complex_flow       # 多轮 + approve/deny + plan 依赖 + pivot
+cargo test --test agent_complex_subagent   # subagent pop、pivot 后重渲染 brief
+cargo test --test agent_complex_cancel     # cancel never-resume、approval vs context cancel
+```
+
 ## 参考文档
 
 - [`DESIGN.md`](DESIGN.md) —— 完整设计。

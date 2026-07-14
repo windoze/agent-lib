@@ -376,3 +376,75 @@ struct BoardMessage {
 - 如果一个测试组合过多机制,失败定位会变差。控制方式是 P0 拆成 3 个主场景,每个有明确主断言。
 - plan/blackboard API 未落地,测试 mock 的形状可能需要随真实 API 调整。控制方式是把 mock store 做得薄,只断言设计层不变量:plan CAS/状态/依赖、claim-first、blackboard append-only。
 - `StepHarness` 与 `DrainHarness` 混用可能造成样板增加。控制方式是只有 pivot/cancel 时机需要手动 step,其余使用 drain。
+
+## 11. 落地状态(实现现状)
+
+> 截至 M4-4:本设计的全部 P0 与 P1 场景均已作为离线复杂 mock 测试落地,**没有任何 P1 被 deferred**。
+> 测试名与前文各场景「建议测试名」一致,便于对照。
+
+### 11.1 支持层与文件结构
+
+复杂测试的共享支持层落在 `tests/complex_support/`,由每个复杂 integration test 通过
+`#[path = "complex_support/mod.rs"] mod complex_support;` 引入:
+
+| 文件 | 内容 |
+|---|---|
+| `tests/complex_support/mod.rs` | 声明子模块并 re-export 常用符号。 |
+| `tests/complex_support/plan_blackboard.rs` | `MockPlanBlackboardStore` 及 plan/blackboard 数据模型与操作(§8 草案的实现)。 |
+| `tests/complex_support/tools.rs` | tool 名常量、`tool_declarations()`、`ComplexToolHandler`、审批 policy、`SPAWN_REVIEWER`。 |
+| `tests/complex_support/assertions.rs` | role 序列 / pivot / store-ops / handler-log 断言 helper。 |
+
+支持层自身的单元测试在 `tests/agent_complex_support.rs`:
+
+| 测试名 | 覆盖 |
+|---|---|
+| `plan_dependencies_reject_unknown_self_and_cycles` | `add_task` 拒绝未知依赖、自依赖、环。 |
+| `claim_rejects_unfinished_dependencies_atomically` | dependency-blocked claim 原子失败,不改状态。 |
+| `claim_first_available_skips_blocked_and_claimed_items` | claim-first 跳过 completed/已认领/依赖未完成项。 |
+| `blackboard_is_append_only_and_offsets_are_monotonic` | blackboard append-only、offset 单调。 |
+| `assertions_report_store_ops_on_failure` | 断言 helper 失败时打印 store ops 日志。 |
+| `role_sequence_and_pivot_helpers_find_expected_messages` | role 序列 / pivot 断言 helper 行为。 |
+
+### 11.2 场景 → 测试映射
+
+| 场景 | 建议测试名(=实际测试名) | 测试文件 | 状态 |
+|---|---|---|---|
+| P0-1 多轮 + plan/blackboard + approve/deny + pivot | `complex_turn_combines_plan_blackboard_approval_deny_and_pivot` | `tests/agent_complex_flow.rs` | 已落地 |
+| P0-2 subagent + parent approval pop + shared store | `complex_subagent_updates_shared_plan_and_pops_approval_to_parent` | `tests/agent_complex_subagent.rs` | 已落地 |
+| P0-3 cancel during subagent/tool wait + never-resume | `complex_cancel_abandons_child_and_preserves_committed_state` | `tests/agent_complex_cancel.rs` | 已落地 |
+| P1-1 claim 冲突/依赖阻塞 + blackboard 恢复 | `complex_plan_claim_conflict_or_dependency_block_recovers_through_blackboard` | `tests/agent_complex_flow.rs` | 已落地 |
+| P1-2 approval cancel 与 context cancel 的区别 | `complex_approval_cancel_does_not_cancel_context_unless_driver_cancels` | `tests/agent_complex_cancel.rs` | 已落地 |
+| P1-3 pivot 后 subagent 使用重渲染 brief | `complex_pivot_then_subagent_uses_rerendered_brief` | `tests/agent_complex_subagent.rs` | 已落地 |
+
+`tests/agent_complex_flow.rs` 另含两个 M2 负向回归用例
+(`claim_dependency_block_returns_tool_error_and_does_not_mutate_task`、
+`denied_dangerous_write_does_not_execute_tool`),它们钉住 dependency-blocked tool error 与
+approval deny 不执行 dangerous tool 的不变量,同属主 flow 文件。
+
+### 11.3 mock store 仍是测试支持层
+
+`MockPlanBlackboardStore` 及其 tool adapter 仅是**测试支持层的 mock vertical feature**,不是生产
+plan/blackboard API。代码里目前只有 `PlanId` / `BlackboardId` identity;正式 plan/blackboard API 落地后,
+本文 §4/§5 的同一批场景应迁移到真实 store/API,mock store 随之退役。因此 mock 有意做薄,只断言设计层
+不变量(plan CAS/状态/依赖、claim-first、blackboard append-only),不承担生产语义。
+
+### 11.4 如何单独运行
+
+每个复杂套件都可离线、单独过滤运行(默认无网络、无 credentials、无真实 sleep):
+
+```bash
+# 支持层单测
+cargo test --test agent_complex_support
+
+# P0-1 / P1-1 主 flow(含 M2 负向回归)
+cargo test --test agent_complex_flow
+
+# P0-2 / P1-3 subagent
+cargo test --test agent_complex_subagent
+
+# P0-3 / P1-2 cancel
+cargo test --test agent_complex_cancel
+
+# 单个场景(示例)
+cargo test --test agent_complex_flow complex_turn_combines_plan_blackboard_approval_deny_and_pivot
+```
