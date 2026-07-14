@@ -92,8 +92,12 @@ M1 Review 必须记录最终选择与理由。
 
 **已定案(M1-R,2026-07-14)**:采用首选 crate 形态。root `Cargo.toml` 以
 `[workspace] members = [".", "crates/agent-testkit"], resolver = "3"` 纳管 `crates/agent-testkit`,
-其单向依赖 `agent-lib = { path = "../.." }`,`agent-lib` 未反向 dev-dep testkit,root package 构建/测试正常,
-无依赖周期,未使用 `tests/support/agent_testkit` 过渡方案。
+其单向依赖 `agent-lib = { path = "../.." }`,root package 构建正常,未使用 `tests/support/agent_testkit` 过渡方案。
+**M6-1 更新(2026-07-14)**:root `agent-lib` 迁移集成测试改用 testkit,遂新增
+`[dev-dependencies] agent-testkit = { path = "crates/agent-testkit" }`,落实上文 “agent-lib tests --dev-dep-->
+agent-testkit(若 Cargo 拓扑可接受)” 首选边。这构成一条**经 dev-dependency 的依赖环**
+(`agent-lib --dev--> agent-testkit --normal--> agent-lib`),Cargo 允许——dev-dep 不参与库正常构建,
+库构建单元与测试构建单元分离,故构建图无实际环,`cargo metadata` 解析与全套 `cargo test` 均正常。
 
 ## 测试套件策略
 

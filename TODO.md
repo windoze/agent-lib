@@ -1128,7 +1128,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 ## Milestone 6 — 测试套件迁移与扩展
 
-### [TODO] M6-1 迁移 `tests/agent_effect_e2e.rs` 到 testkit
+### [DONE] M6-1 迁移 `tests/agent_effect_e2e.rs` 到 testkit
 
 **前置依赖**:M5-R。
 
@@ -1147,6 +1147,28 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 聚焦运行 `cargo test --test agent_effect_e2e`。
 - 断言测试行数或本地 fake 类型数量显著下降,完成记录中写明删除了哪些重复类型。
 - 全套验证命令全部通过。
+
+**完成记录(2026-07-14)**:
+
+- **Cargo 拓扑**:root `agent-lib` 新增 `[dev-dependencies] agent-testkit = { path = "crates/agent-testkit" }`。这与 `agent-testkit -> agent-lib`(普通依赖)构成一条**经 dev-dependency 的依赖环**,Cargo 允许(dev-dep 不参与库正常构建),`cargo metadata` 解析通过、无实际构建环。这落实了 PLAN.md 里 M1 预留的 “agent-lib tests --dev-dep--> agent-testkit(若 Cargo 拓扑可接受)” 首选方案,未走 `tests/support/agent_testkit` 过渡;相应更新 PLAN.md M1-R 定案备注。
+- **文件重写**:`tests/agent_effect_e2e.rs` 由 1032 行降到 435 行(约 −58%),`use agent_testkit::prelude::*;` 一行拉起全部 kit 能力。四个 `#[tokio::test]` 语义逐一保持。
+- **删除的本地重复类型/ helper(共 11 个)**,全部由 testkit 等价物取代:
+  - `SeqIds`(本地 UUID 计数器 + `RequirementIds`/`ToolExecutionIds` impl + 7 个 mint_* 方法)→ `agent_testkit::SeqIds`。
+  - `FakeClient`(fake `LlmClient`,VecDeque 脚本 + request 计数)→ `ScriptedLlmHandler`(`LlmStep::tool_use/.with_usage` + `response`),request 计数改读 `log().len()`。
+  - `FakeToolRegistry`(fake `ToolRegistry` + call 计数)→ `ScriptedToolRegistry::from_steps`,经 reference `ToolRegistryHandler`;call 计数改读 registry `log().len()`。
+  - `CountingApproveInteraction` → `ScriptedInteractionHandler::approve_all()`,served 计数改读 `log().len()`。
+  - `CountingToolHandler`(parent 自有 tool)→ `ScriptedToolHandler::from_steps`,tool 计数改读 `log().len()`。
+  - `ConcurrentToolHandler`(手写 in-flight/peak 原子计数 + `yield_now`)→ `DelayingToolHandler::with_delay(inner, Delay::yields(2))`,peak 改读 `peak_concurrency()`(协作式 yield、无真实时钟)。
+  - `ChildSpawner`(`SubagentSpawner` + `BuildChild` closure 别名)→ `ScriptedSubagentSpawner::builder(..).child(..).summary(..)` + `SpawnedChildBuilder`。
+  - `ParentScope`/`ChildScope`/`EmptyScope`/`ObservingScope`(4 个手写 `HandlerScope`)→ `parent_scope_with_subagent`/`headless_child_scope`/`attended_child_scope`/`TestScope::{builder,empty}`。
+  - `ParentBatchMachine`(手写批量机)→ `ScriptMachine::builder().requirements([NeedTool, NeedSubagent]).done_after_all_resumed()`。
+  - 本地 payload/builder helpers(`nz`/`agent_id`/`tool_set_id`/`conversation_id`/`weather_tool`/`text_block`/`user_message`/`usage`/`assistant_response`/`tool_use_response`/`tool_response`/`child_spec`/`child_state`/`build_child_machine`/`root_context`)→ fixtures(`agent_spec_with_tools`/`agent_state`/`default_machine`/`root_context`/`tool_call`/`usage`/`user_input`/`weather_tool`)+ `LlmStep`/`ToolStep`。
+- **保留的最小本地件(有意,非 fake)**:
+  - `ChargingLlmHandler`:薄 wrapper 包 `Arc<dyn LlmHandler>`(内为 `ScriptedLlmHandler`),从响应 usage 向 `ctx.charge_tokens` 记账。token 记账是 **host 责任**——testkit `ScriptedLlmHandler` 与 reference `LlmClientHandler` 均不碰 budget——故保留此件以维持测试 1 的 budget 聚合语义(child 18 token 落到 parent 共享 ledger)。
+  - `RequireApprovalPolicy`:approval 策略是 spec 级决策而非可 mock 的 effect 边界,testkit 不导出 require-approval policy,故保留最小本地件强制 child `NeedTool` 走 `NeedInteraction`。
+  - `assert_text`:单处 1-block 文本断言小工具。
+- **四语义验证**(`cargo test --test agent_effect_e2e` 4/4):`attended_parent_serves_headless_child_via_pop`(parent tool log==1、popped approval log==1、child registry log==1、child llm log==2、`child_charged==18` 且 `ctx.budget().used().tokens()==18`);`same_child_spec_attended_resolves_in_place`(就地 served==1、registry==1、committed 会话 4 消息 user/assistant/tool/answer,末条文本 "sunny, per get_weather");`batch_requirements_are_fulfilled_concurrently`(registry==2、`peak_concurrency()==2`,串行会停在 1 并干净失败而非死锁);`parent_cancel_propagates_and_abandons_child`(结果 `Subagent(Ok)`、registry==0、llm==0、charged==0、budget==0)。
+- **验证**:`cargo fmt --all --check` 干净;`cargo clippy --all-targets -- -D warnings`(workspace)无告警;`cargo test --test agent_effect_e2e` 4/4;`cargo test --all --all-targets` 全绿(agent-lib lib 434、e2e 4、其余集成套件 3+3+2 全过;agent-testkit lib 122 + cassette 2 + smoke 2;网络集成 1+3 按设计 ignored;0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过;`git diff --check` 干净。未发现需插入前置修复的 spec 偏差或新增未调度失败测试。
 
 ### [TODO] M6-2 迁移 reference driver 测试中的重复 fake
 
