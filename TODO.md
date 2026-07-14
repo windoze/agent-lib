@@ -500,7 +500,7 @@ dangerous tool approve、post-tool pivot、第二个 dangerous tool deny、final
 - 本次 review 未改动任何被测/生产代码,仅更新 `TODO.md`(标记 `[DONE]` + 本记录)与 `memory/claude_plan.md`;
   Milestone 2 至此签收,后续进入 Milestone 3。
 
-### [TODO] M3-1 实现 subagent + parent approval pop + shared plan/blackboard 场景
+### [DONE] M3-1 实现 subagent + parent approval pop + shared plan/blackboard 场景
 
 **前置依赖**:M2-R。
 
@@ -541,6 +541,43 @@ plan/blackboard。现有 `agent-testkit` 已有 `ScriptedSubagentSpawner`、`hea
 - `cargo test --all --all-targets`。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - `git diff --check`。
+
+**完成记录**:
+
+- 新建 `tests/agent_complex_subagent.rs`,单测
+  `complex_subagent_updates_shared_plan_and_pops_approval_to_parent`,复用 `agent-testkit` 的
+  `ScriptedSubagentSpawner` / `DrivingSubagentHandler` / `headless_child_scope` /
+  `parent_scope_with_subagent` 与 M1 支持层的 `MockPlanBlackboardStore` / `complex_agent_machine` /
+  `complex_tool_handler`。parent 用 `ScriptMachine` emit 单个 `NeedSubagent`(最少样板且完整驱动
+  `DrivingSubagentHandler`);child 是真实 `DefaultAgentMachine`,scope headless(仅 llm+tool,无
+  interaction),故其 dangerous-write 审批必须 pop 到 parent。
+- **共享 plan**:parent 直接向同一 `Arc<MockPlanBlackboardStore>` 预置 `design→review→implement`
+  依赖链并把 `design` 置 `Completed`(seeding 后 version=5,已断言)。child 首步
+  `plan_claim_first_available(worker, ev=5)` 跳过已完成的 `design` 与依赖未满足的 `implement`,原子
+  认领 `review`(v6);末步 `plan_update(review, Completed, ev=6)`(v7)。断言:`review` owner=worker
+  且 `Completed`;`implement` 仍 `Todo`、无 owner(仅一次 first-available claim,未误领);`design`
+  `Completed`;`review`/`implement` 的 `depends_on` 关系不变。
+- **parent approval pop**:child 第二步 `dangerous_write` 经 `RequireDangerousWriteApprovalPolicy`
+  触发 `NeedInteraction`,headless child 无法就地应答,pop 一层到 parent 的 attended
+  `ScriptedInteractionHandler::approve_all()`。断言 `parent_interaction_log.len()==1` 且
+  `assert_tool_executions(DANGEROUS_WRITE, 1)`——唯有批准该工具才执行(deny 会是零次)。
+- **共享 blackboard**:parent 先以 sender `parent` append 一条,child 以 sender `child` append
+  `review started`/`review done`,dangerous-write 以 sender `dangerous_write` append。
+  `assert_board_messages` 固定 4 条按序且长度精确(顺带排除重复 side effect),再逐条断言 sender 可区分
+  parent/child/工具。
+- **budget 传播**:child 的 LLM 用 `ChargingLlm` 包装把 usage 计入 run context;因 child context 由
+  parent 派生,四步用量 `(5+3)+(4+2)+(6+3)+(3+2)=28` 聚合到 parent 共享 ledger,断言
+  `ctx.budget().snapshot().used().tokens()==28`。
+- **subagent 生命周期 + trace**:`spawner.ids_calls()/spawn_calls()/summarize_calls()` 均为 1;
+  `parent_log.resume_tags()==[Subagent]` 证明 parent 被 subagent 输出 resume;`assert_trace` 断言
+  `subagent_count==1`、parent `NeedSubagent` 节点 `resolved_at_scope==0` 且 `Resumed`,child interaction
+  节点 `resolved_at_scope==1`(pop 一层到 parent)且 `Resumed`——因 child context 与 parent 共享 trace
+  记录(`Arc<Mutex<Vec<TraceRecord>>>`),故在 parent ctx 快照即可观察。
+- **验证结果(全部通过)**:`cargo fmt --all -- --check` 干净;`cargo clippy --all-targets -- -D warnings`
+  无告警(修正一处 `redundant_guards`);`cargo test --test agent_complex_subagent`(1 passed);
+  `cargo test --all --all-targets` 全绿(lib 423 + testkit 131 + 各集成 crate 全通过,仅
+  credential-gated 集成测试 ignored,无 failed);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --workspace` 无告警;`git diff --check` 干净。
 
 ### [TODO] M3-2 实现 cancel during subagent/tool wait 场景
 

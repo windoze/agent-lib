@@ -1,31 +1,42 @@
-# 当前任务：M2-R Milestone 2 Review
+# 当前任务：M3-1 subagent + parent approval pop + shared plan/blackboard 场景
 
 ## 定位
-- `TODO.md` 第一个未完成任务 = **M2-R**（首个 `[TODO]`，行 445）。前置依赖：M2-1..M2-2（均 `[DONE]`）。
-- HEAD=e5098cc（[M2-2]），工作树干净。属于 Milestone 2。
-- 这是 review 任务（`*R`），**不拆分**。产出为 review 结论 + 验证，写入完成记录。
+- `TODO.md` 第一个未完成任务 = **M3-1**（行 503，首个 `[TODO]`）。前置 M2-R 已 `[DONE]`。
+- HEAD=6396734（[M2-R]），工作树干净。属于 Milestone 3。
+- 非 review 任务，**不拆分**。产出：新建 `tests/agent_complex_subagent.rs`。
 
-## 目标（TODO.md M2-R 做什么）
-核对 `tests/agent_complex_flow.rs`（576 行）主场景与两个负向用例：
-1. 主场景经过 >=4 次 LLM 往返 + 2 次 interaction。
-2. pivot 落在合法 post-tool boundary，且被后续 LLM request 看到。
-3. deny 后 dangerous tool 未执行，turn 继续到 final。
-4. plan dependency blocked 是 model-visible tool error，不是 panic。
-5. 测试可读性：如过长抽 helper，但不新建 DSL。
+## 设计（复用现有基础设施）
+参考 `tests/agent_effect_e2e.rs::attended_parent_serves_headless_child_via_pop`，
+child 换成跑 plan/blackboard 工具的真实 `DefaultAgentMachine`（`complex_agent_machine`）。
 
-## 静态核对结论（读代码已确认）
-- LLM 往返：llm_open -> plan_llm -> (pre_pivot_llm 被 pivot 重渲染为 pivot_llm，同 id) -> final_llm。4 次 resume LLM。OK >=4
-- interaction：approval_one(Approve) + approval_two(Deny)。=2，顺序 approve->deny（recorded_decisions 断言）。
-- pivot：danger_one 结果后、下一 NeedLlm 前调 harness.pivot；assert_eq!(pre_pivot_llm,pivot_llm) 证明重渲染同 id；final_request 断言含 PIVOT_TEXT 的 Role::User 消息。
-- deny 不执行：assert_tool_executions(DANGEROUS_WRITE,1)（仅批准那次）；turn 到 Done。
-- dependency blocked：M2-2 claim_dependency_block_... 断言 ToolStatus::Error+文本含 design+task 不变；主场景也断言 store.claim 返回 DependencyBlocked。非 panic。
-- 可读性：helper 已抽（fulfill_tool/fulfill_interaction/resume_tool_batch/message_text/...），无 DSL。
+- shared `Arc<MockPlanBlackboardStore>`，直接预置 plan：
+  - create → design(v1) → review depends[design](v2) → implement depends[review](v3)
+  - claim(design,seed,3)→v4；update(design,seed,Completed,4)→v5。V_seed=5。
+- child = `complex_agent_machine`，headless scope：llm(charging scripted)+tool(complex_tool_handler(store))，无 interaction → 审批 pop 到 parent。
+- child LLM 脚本（4 步）：
+  1. tool_use: plan_claim_first_available(worker,ev=5)+blackboard_post(child,"review started") → claim review, v6
+  2. tool_use: dangerous_write("apply review fix") → 审批 pop→approve→执行, post board
+  3. tool_use: plan_update(review,worker,Completed,ev=6)+blackboard_post(child,"review done") → v7
+  4. final text
+- parent = ScriptMachine emit 1×NeedSubagent；scope = parent_scope_with_subagent(handler).attended(approve_all)。
+- 驱动前 parent 直接 store.post("parent","delegating…") 展示共享 board + sender 区分。
+- charging LLM wrapper（照抄 e2e）把 child usage 计入 shared ledger。总 tokens=8+6+9+5=28。
+
+## 断言
+- spawn_calls==1, summarize_calls==1, ids_calls==1。
+- parent_interaction_log.len()==1（child 审批 pop 到 parent, 决定 Approve）。
+- review: owner=worker, status=Completed；implement: 无 owner + Todo（未被 claim）。
+- design Completed；depends_on 不变。
+- board 4 条按序 [parent, review started(child), apply review fix(dangerous_write), review done(child)]，sender 可区分。
+- dangerous_write 执行恰好 1 次。
+- child token 计入 parent ctx.budget()==28。
+- trace: subagent_count==1；child interaction requirement resolved_at_scope==1+Resumed；parent NeedSubagent resumed（parent_log.resume_tags()==[Subagent]）。
 
 ## 验证顺序
-fmt --check -> clippy --all-targets -D warnings -> cargo test --test agent_complex_flow -> full suite -> RUSTDOCFLAGS=-D warnings cargo doc --no-deps --workspace -> git diff --check。
+fmt --check → clippy --all-targets -D warnings → cargo test --test agent_complex_subagent → full suite → RUSTDOCFLAGS=-D warnings cargo doc → git diff --check。
 
 ## 完成
-TODO.md M2-R [TODO]->[DONE] + 写 review 结论/验证记录；提交 [M2-R]；停止。
+TODO.md M3-1 [TODO]→[DONE] + 写完成记录；提交 [M3-1]；停止。
 
 ## 进度
-- [完成] 静态核对 + 全套验证均通过（fmt/clippy/agent_complex_flow 3 tests/full all-targets 全绿 lib423+testkit131/doc -D warnings/diff --check）。TODO.md M2-R 标 [DONE] 并写 review 结论。待提交 [M2-R]。
+- [完成] tests/agent_complex_subagent.rs 写好，全部验证门通过（fmt/clippy/focused/full all-targets/doc -D warnings/diff --check）。TODO.md M3-1 标 [DONE] 并写完成记录。待提交 [M3-1]。
