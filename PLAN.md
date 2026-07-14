@@ -90,6 +90,11 @@ agent-testkit/tests/ 同时依赖 agent-testkit 和 agent-lib
 如果 root package + workspace 共存带来不必要复杂度,允许先以 `tests/support/agent_testkit` 过渡,但
 M1 Review 必须记录最终选择与理由。
 
+**已定案(M1-R,2026-07-14)**:采用首选 crate 形态。root `Cargo.toml` 以
+`[workspace] members = [".", "crates/agent-testkit"], resolver = "3"` 纳管 `crates/agent-testkit`,
+其单向依赖 `agent-lib = { path = "../.." }`,`agent-lib` 未反向 dev-dep testkit,root package 构建/测试正常,
+无依赖周期,未使用 `tests/support/agent_testkit` 过渡方案。
+
 ## 测试套件策略
 
 **Core Rust suites** 快速、细粒度、默认离线:

@@ -104,10 +104,18 @@ crates/agent-testkit/
     harness.rs
     assertions.rs
     concurrency.rs
+    subagent.rs
     prelude.rs
 ```
 
 `agent-lib` 不依赖 `agent-testkit`;测试目标通过 dev-dependency 使用它。
+
+> **实际落地(M1,2026-07-14)**:采用上面的 crate 形态,`crates/agent-testkit` 作为工作区成员
+> (root `Cargo.toml` `[workspace] members=[".","crates/agent-testkit"], resolver="3"`)。testkit 单向
+> 依赖 `agent-lib = { path="../.." }`,`agent-lib` 未反向 dev-dep testkit,因此无依赖周期;当前 testkit
+> 的集成测试放在自身 `tests/`(如 `smoke.rs`),`agent-lib` 现有测试改用 testkit 属 M6 迁移范围。
+> 上面“先建立 `crates/agent-testkit` 或 `tests/support/agent_testkit`”的过渡门已定案为 crate 形态,
+> 无需过渡支持模块。
 
 ### 4.1 是否需要拆出 trait crate
 

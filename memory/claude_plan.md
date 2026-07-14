@@ -1,47 +1,46 @@
-# 执行计划 — M1-3 provider-neutral fixtures
+# 执行计划 — M1-R Milestone 1 Review
 
 ## 选中的任务
-`TODO.md` 第一个未完成任务 = **M1-3**(M1-1、M1-2 已 `[DONE]`)。HEAD=a767125,工作树 clean。
-非 Review 任务,不拆分;仅改动 testkit(fixtures.rs + prelude.rs),无 agent-lib 语义变更。
+`TODO.md` 第一个未完成任务 = **M1-R**(M1-1/M1-2/M1-3 均已 `[DONE]`)。HEAD=c4d0d38,工作树 clean。
+这是 Review 任务,**不拆分**。核对 M1 拓扑/id source/fixtures 是否形成稳定基础且未引入 provider wire mock 或运行时语义变化。
 
-## 目标(TODO.md M1-3)
-在 `crates/agent-testkit/src/fixtures.rs` 用 agent-lib 公开构造器实现 provider-neutral fixtures:
-- message/content:`text_block`、`user_message`、`user_input(&SeqIds, text)`。
-- LLM response:`assistant_text(text, usage)`、`assistant_tool_use(calls, usage)`、`usage(input, output)`。
-- tool:`tool_call(provider_id, name, input)`、`tool_response(provider_call_id, text, status)`、
-  `tool_ok`、`tool_error_response`。
-- declaration:`weather_tool()`、`calendar_tool()`。
-- agent:`agent_spec`、`agent_spec_with_tools`、`agent_state`、`default_machine`、`root_context(&SeqIds)`。
-- 只用公开构造器,禁 private API / unchecked mutation。
-- prelude re-export 常用 fixtures。
+## Review 核对项(TODO.md M1-R)
+1. Cargo 拓扑:确认采用 `crates/agent-testkit`(工作区成员)还是过渡支持模块,并记录理由。
+2. testkit 只依赖 `agent-lib` 公开 API。
+3. `SeqIds` 覆盖 `RequirementIds`、`ToolExecutionIds` 与常用 Agent/Conversation id。
+4. fixtures 只产生 provider-neutral 类型。
+5. 更新 PLAN.md / docs/TESTABILITY.md 中与实际拓扑不一致的描述。
 
-## 设计(公开构造器签名)
-- `text_block(text) -> ContentBlock::Text`;`user_message(text) -> Message{User,[text]}`。
-- `user_input(&SeqIds, text) -> AgentInput`:turn/message/assistant_message/step id 全取自 SeqIds。
-- `usage(in,out) -> Usage`;`assistant_text -> Response(end_turn)`;`assistant_tool_use(Vec<ToolCall>) -> Response(tool_use)`。
-- `tool_call(id,name,input) -> ToolCall`;`tool_response(id,text,status) -> ToolResponse`;
-  `tool_ok`=Ok、`tool_error_response`=Error。
-- `weather_tool()/calendar_tool() -> Tool`。
-- `agent_spec(&SeqIds)`=空 toolset;`agent_spec_with_tools(&SeqIds, Vec<Tool>)`;
-  `agent_state(&SeqIds, AgentSpec) -> AgentState`(conversation id 取自 SeqIds);
-  `default_machine(&SeqIds, AgentState) -> DefaultAgentMachine`(RequirementIds+ToolExecutionIds 均用 ids.clone(),NonStreaming);
-  `root_context(&SeqIds) -> RunContext::new_root(run_id, unbounded, trace_node("root"))`。
+## 核对结论(代码巡检)
+- 拓扑:root `Cargo.toml` = `[workspace] members=[".","crates/agent-testkit"] resolver="3"`;
+  testkit 单向 `agent-lib = { path="../.." }`,agent-lib 无反向 dev-dep → 无依赖周期。采用首选 crate 形态,
+  非过渡模块。→ 与 PLAN.md 建议目录一致。
+- 只依赖公开 API:testkit `use agent_lib::{agent::*, client::*, conversation::*, model::*}` 全部公开路径;
+  Cargo.toml 无 mockall/proptest/insta,仅复用基础依赖。Rust 跨 crate 只能访问 `pub`,天然保证。
+- `SeqIds`:`impl RequirementIds`(next_requirement_id)+`impl ToolExecutionIds`
+  (tool_call_id/tool_result_message_id/next_assistant_message_id/next_step_id);inherent helper 覆盖
+  run/agent/tool_set/conversation/turn/message/tool_call/step/trace_node/requirement id。clone 共享 counter、
+  fork 新子树、named 重贴 label、exhausted/with_budget 失败模式、requirement_log 保序可查。
+- fixtures:全部经公开构造器产出 provider-neutral 类型(Message/Response/ToolCall/ToolResponse/Tool/
+  AgentSpec/AgentState/RunContext/DefaultAgentMachine),无 Anthropic/OpenAI wire JSON,无 private API。
+
+## 文档一致性动作
+- PLAN.md 过渡门(`允许先以 tests/support/agent_testkit 过渡`)已定案 → 追加“已定案:crate 形态”一句。
+- docs/TESTABILITY.md §5.0(实现路径)候选项 → 补一句“实际已落地 crates/agent-testkit 工作区成员”。
 
 ## 步骤
-1. [x] 写 fixtures.rs(带项文档,满足 #![warn(missing_docs)])。
-2. [ ] prelude re-export 常用 fixtures。
-3. [ ] 单测:user_input 产出合法 UserMessage(role=User);assistant text/tool_use 被 DefaultAgentMachine fold
-       的最小 smoke(text→提交 turn;tool_use→NeedTool);tool 声明经 ToolSetRef round-trip 稳定。
-4. [ ] fmt → clippy -Dwarnings → test -p agent-testkit → test --all --all-targets → doc -Dwarnings → diff --check。
-5. [ ] TODO.md 标 M1-3 [DONE] + 完成记录。
+1. [x] 巡检 Cargo.toml / lib.rs / prelude.rs / ids.rs / fixtures.rs。
+2. [x] 巡检 PLAN.md / docs/TESTABILITY.md。
+3. [ ] 最小文档更新(PLAN.md + TESTABILITY.md 各一处 resolved 注记)。
+4. [ ] 验证:fmt --check → clippy -Dwarnings → test -p agent-testkit → doc -Dwarnings → diff --check。
+       全量 `cargo test --all` 自 M1-3(c4d0d38,全绿)以来无代码变更,本任务仅改文档 → 复用上次绿结果。
+5. [ ] TODO.md 标 M1-R [DONE] + 完成记录(写 review 结论)。
 6. [ ] 提交,停止。
 
 ## 进度/发现
-- (进行中)
-
-## 完成(M1-3)
-- fixtures.rs 落地全部 message/response/tool/declaration/agent helpers(公开构造器);prelude re-export。
-- 6 个单测:user_input role=User;assistant_text→提交 turn;assistant_tool_use→NeedTool;
-  tool 状态;ToolSetRef round-trip;root_context depth0/unbounded。
-- 全套验证绿(fmt/clippy -Dwarnings/test -p 14+2/test --all 全 ok/doc -Dwarnings/diff --check)。
-- 已标 TODO.md M1-3 [DONE] + 完成记录;PLAN.md 无需改。
+- [x] 文档更新完成:PLAN.md 过渡门定案注记;TESTABILITY.md §4 补 crate 形态 resolved 注记 + subagent.rs。
+- [x] 验证全绿:fmt --check;clippy -Dwarnings(root + testkit);test -p agent-testkit(14+2);
+      cargo test --all --all-targets(agent-lib 434 + testkit 14+2,0 failed,7 network-gated ignored);
+      doc -Dwarnings(root + testkit);diff --check 干净。
+- [x] TODO.md M1-R 标 [DONE] + 完成记录(review 结论、拓扑决策、无偏离)。
+- [ ] 提交并停止。

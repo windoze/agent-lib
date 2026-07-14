@@ -180,7 +180,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - **备注**:`PLAN.md` 无需改动(阶段拓扑/依赖未变);仅 testkit 新增数据构造器,无 `agent-lib` 运行时语义变化,
   未引入 provider wire mock。
 
-### [TODO] M1-R Milestone 1 Review
+### [DONE] M1-R Milestone 1 Review
 
 **前置依赖**:M1-1..M1-3。
 
@@ -198,6 +198,40 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 - 全套验证命令全部通过。
 - Review 结论和任何偏离计划的原因写入完成记录。
+
+**完成记录**(2026-07-14):
+
+- **拓扑结论**:采用首选 crate 形态,非过渡支持模块。root `Cargo.toml` =
+  `[workspace] { members = [".", "crates/agent-testkit"], resolver = "3" }`;`crates/agent-testkit/Cargo.toml`
+  单向依赖 `agent-lib = { path = "../.." }`(`publish = false`),`agent-lib` 未反向 dev-dep testkit,
+  故无 Cargo 依赖周期,root package 构建/测试正常,无需 `tests/support/agent_testkit`。当前 testkit 的
+  集成测试落在自身 `tests/smoke.rs`;`agent-lib` 现有测试改用 testkit 属 M6 迁移范围,符合计划。
+- **只依赖公开 API**:testkit 全部 `use agent_lib::{ agent::*, client::*, conversation::*, model::* }`
+  均为公开路径(`RequirementIds`/`ToolExecutionIds`/`AgentMachine`/`DefaultAgentMachine`/`Message`/`Response`/
+  `ToolCall`/`ToolResponse`/`AgentSpec`/`AgentState`/`RunContext` 等);`Cargo.toml` 只复用
+  `async-trait`/`futures`/`serde`/`serde_json`/`tokio`/`uuid`,未引入 mockall/proptest/insta。跨 crate
+  只能访问 `pub` 项,天然不触及 `agent-lib` 内部不变量,未见 unchecked mutation / private 绕过。
+- **`SeqIds` 覆盖度**:`impl RequirementIds`(`next_requirement_id`)与 `impl ToolExecutionIds`
+  (`tool_call_id`/`tool_result_message_id`/`next_assistant_message_id`/`next_step_id`)齐全;inherent
+  helper 覆盖 `requirement_id`/`run_id`/`agent_id`/`tool_set_id`/`conversation_id`/`turn_id`/`message_id`/
+  `tool_call_id`/`step_id`/`trace_node`。clone 共享 counter、`fork` 新子树 + 嵌套 label、`named` 重贴 label、
+  `exhausted`/`with_budget` 失败模式、`requirement_log`/`requirement_ids(tag)` 保序可查——单一共享单调
+  `AtomicU64` 保证全局唯一。
+- **fixtures provider-neutral**:所有 helper 经 `agent-lib` 公开构造器产出 provider-neutral 类型
+  (`ContentBlock`/`Message`/`Response`/`Usage`/`ToolCall`/`ToolResponse`/`Tool`/`AgentSpec`/`AgentState`/
+  `RunContext`/`DefaultAgentMachine`),无 Anthropic/OpenAI wire JSON,无 private API。`assistant_tool_use`
+  仅把 `ToolCall` 映射为 `ContentBlock::ToolUse`,不触碰传输层。
+- **文档并轨**:`PLAN.md` 过渡门(`tests/support/agent_testkit`)与 `docs/TESTABILITY.md` §4 候选拓扑各补一处
+  “已定案:crate 形态(工作区成员,无反向 dev-dep,无依赖周期)”注记;`docs/TESTABILITY.md` §4 推荐模块树
+  补齐遗漏的 `subagent.rs`,与实际 `lib.rs` 预声明一致。`PLAN.md` 阶段拓扑/依赖/完成门未变,故不改结构。
+- **验证结果**(全绿):`cargo fmt --all -- --check`;`cargo clippy --all-targets -- -D warnings` 与
+  `-p agent-testkit --all-targets`(两 crate 均干净);`cargo test -p agent-testkit`(lib 14 + smoke 2 passed);
+  `cargo test --all --all-targets`(agent-lib 434 unit + e2e/capability/conversation 等集成套件全绿,testkit
+  14 + 2,0 failed;7 个 network-gated 集成用例照旧 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
+  与 `-p agent-testkit` 均干净;`git diff --check` 干净。
+- **偏离计划**:无。M1 三项产出(拓扑、`SeqIds`、fixtures)已形成稳定基础,未引入 provider wire mock 或
+  `agent-lib` 运行时语义变化。本次仅改文档(TODO/PLAN/TESTABILITY),编译产物自 M1-3 起未变,但作为里程碑
+  Review 仍完整重跑全套验证以确认现态全绿。
 
 ---
 
