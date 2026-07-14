@@ -124,7 +124,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
   0 failed;3+1 个 network-gated 用例照旧 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
   与 `-p agent-testkit` 均干净(修掉两处 redundant-explicit-links);`git diff --check` 干净。
 
-### [TODO] M1-3 实现 provider-neutral fixtures
+### [DONE] M1-3 实现 provider-neutral fixtures
 
 **前置依赖**:M1-2。
 
@@ -150,6 +150,35 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:assistant text/tool_use response 可被 `DefaultAgentMachine` fold 的最小 smoke。
 - 单测:tool declaration 与 `ToolSetRef` round-trip 保持稳定。
 - 跑全套验证命令。
+
+**完成记录**(2026-07-14):
+
+- **fixtures 落地**:`crates/agent-testkit/src/fixtures.rs` 全部经 `agent-lib` 公开构造器实现,无 private
+  API / unchecked mutation。message/content:`text_block`、`user_message`、`user_input(&SeqIds, text)`
+  (turn/user-message/assistant-message/step id 全取自 `SeqIds`,经 `AgentInput::user_message` 校验 role)。
+  LLM response:`usage(input, output)`、`assistant_text(text, usage)`(stop=`end_turn`)、
+  `assistant_tool_use(Vec<ToolCall>, usage)`(stop=`tool_use`,每个 `ToolCall` 映射为一个
+  `ContentBlock::ToolUse`)。tool:`tool_call(provider_id, name, input)`、
+  `tool_response(provider_call_id, text, status)`、`tool_ok`(`ToolStatus::Ok`)、
+  `tool_error_response`(`ToolStatus::Error`)。declaration:`weather_tool()`(`get_weather`/`city`)、
+  `calendar_tool()`(`get_calendar`/`date`)。agent:`agent_spec(&SeqIds)`(空 toolset)、
+  `agent_spec_with_tools(&SeqIds, Vec<Tool>)`、`agent_state(&SeqIds, AgentSpec)`(conversation id 取自
+  `SeqIds`)、`default_machine(&SeqIds, AgentState)`(`RequirementIds` 与 `ToolExecutionIds` 均由
+  `ids.clone()` 提供、NonStreaming)、`root_context(&SeqIds)`(`RunContext::new_root` + `BudgetLimits::unbounded()`
+  + `trace_node("root")`)。
+- **prelude**:re-export 上述常用 fixtures(与 `SeqIds`/`RequirementAllocation` 并列)。
+- **测试**(`fixtures.rs` 内 6 个单测):`user_input` 产出 role=User 的 `AgentInput::UserMessage`;
+  `assistant_text` 经 `default_machine` fold(External→NeedLlm,Resume(Llm(Ok))→提交 turn、cursor=Done);
+  `assistant_tool_use` fold 出 `RequirementKind::NeedTool`(证明 tool 执行 id 源接线正确);tool_ok/error 状态正确;
+  `weather_tool()`+`calendar_tool()` 经 `ToolSetRef` serde round-trip 与 `AgentSpec::initial_tools` 稳定;
+  `root_context` depth=0、budget unbounded。
+- **验证结果**(全绿):`cargo fmt --all`(--check 干净);`cargo clippy --all-targets -- -D warnings`
+  (两 crate 干净);`cargo test -p agent-testkit`(lib 14 + smoke 2 passed);`cargo test --all --all-targets`
+  (14 个测试二进制全部 `test result: ok`,0 failed);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
+  与 `-p agent-testkit` 均干净(module doc 用 in-scope intra-doc link 规避 redundant-explicit-links);
+  `git diff --check` 干净。
+- **备注**:`PLAN.md` 无需改动(阶段拓扑/依赖未变);仅 testkit 新增数据构造器,无 `agent-lib` 运行时语义变化,
+  未引入 provider wire mock。
 
 ### [TODO] M1-R Milestone 1 Review
 
