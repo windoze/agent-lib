@@ -1,462 +1,43 @@
 # agent-lib
 
-`agent-lib` 是一个面向 LLM API 的 Rust Client 与 Conversation Core 基础库。它用
-provider-neutral 的数据模型承载消息、内容块、工具调用和 token usage，同时保留
-provider 原始值与尚未建模的字段，避免上层 Conversation / Agent 逻辑依赖特定厂商的
-wire 格式。
+`agent-lib` 是一个面向 LLM API 的 Rust 基础库。它用 provider-neutral 的数据模型承载消息、
+内容块、工具调用和 token usage，并在此之上提供三层可组合的能力：
 
-当前实现包含完整态数据模型、可折叠的归一化流式事件、dyn-safe Client 抽象、
-Anthropic Messages 与 OpenAI Responses 的非流式/流式适配器、真实 endpoint 的跨
-provider 归一化验收，以及 Conversation Core 的强类型 identity、独立 system 配置、
-immutable message envelope、只读 closed Turn、I1--I4 validator、原子 commit 数据边界，
-不暴露 partial 的 stream/non-stream `PendingMessage` 冻结边界，以及可容纳任意多轮工具往返、
-显式记录 open call、可在闭合 tool-result step boundary 受检注入带来源 metadata 的
-`Role::User` 消息并只在最终 assistant 后提交的 `PendingTurn` 事务；pending cancel 可选择
-整体丢弃、合成 `Cancelled` tool results 后继续，或补入完整最终 assistant 后原子提交；
-committed Turn 已进入保留全部 raw 分支节点的结构共享 history，当前 lineage 与隐藏旧 suffix
-彼此分离，并由可从 closed turns + pending 重建的 `ToolCallIndex` 提供只读定位加速；
-`Boundary` 以 owner、Turn 位置/锚点和 structural version 共同防止跨会话、越界、stale 与
-同位置 ABA 误用，反序列化 token 仍须交回所属 Conversation 校验；逻辑 head 可受检地
-revert/redo，移动只裁剪当前有效视图和派生 index scope，不删除 raw Turn；从回退位置再次
-提交会生成新的 parent suffix，旧分支仍可只读调试；`fork_at` 可从合法 boundary 创建带
-`ForkOrigin` 的 child Conversation，O(1) 共享 immutable prefix，父子随后独立推进；
-`Projection`/`Span`/`Artifact` 已作为 raw history 上的非破坏性 overlay 数据模型接入，
-`CheckedTurnRange` 会把 Boundary 解析为可按 Turn anchor 重验证的稳定覆盖范围，默认
-projection 为当前 head 以内的 all-raw spans；`effective_view` 会输出 Client-ready 的
-system prompt 与投影后完整消息，并在 head 落入 compacted cover 时回退 raw 前缀以防摘要
-泄漏未来 Turn，pending 中已冻结的完整消息只能通过单独 `pending_context` 显式取得；
-`CompactionPlan`/`CompactionStep` 可序列化记录纯数据压缩意图，`apply_compaction` 会在
-当前完整 Turn 边界上原子替换 projection，支持 raw tail tiering 与旧 summary + raw tail 的
-consolidate，同时保留 raw history 和已替换 artifact provenance；dyn-safe
-`CompactionStrategy`、只读 `CompactionStrategyResolver` 与同步 `CompactionTrigger` 只作为
-运行时扩展点存在，缺失或错误的 `StrategyRef` 会分类失败，不会 fallback 到其他算法；
-`ConversationSnapshot` 已作为 committed boundary 上的 versioned data-only 一致点接入，
-保存 id/config、retained raw Turn facts、lineage/head、fork origin/ceiling、structural
-version 与 projection/artifact provenance，同时拒绝 pending 并排除 Accumulator、派生 index、
-Arc/lock、client/registry handle 和 strategy/trigger object；`ConversationRows` 可把同一
-snapshot 分解为 DB-neutral parent-tree rows，使用稳定 PK/FK、parent Turn pointer 与显式
-sequence 表达 conversation/turn/message/pairing/projection/artifact facts，重组后仍必须走
-`Conversation::restore` 校验，fork child 的导出只新增 child metadata/association 和本地 suffix
-facts，不复制共享祖先 message/turn payload；Agent 层已开始暴露 data-only 的强类型
-identity、静态 `AgentSpec` 配置模型、持有唯一活动 `Conversation` 的 `AgentState`、
-data-only `LoopCursor`、run 级 `RunContext` 取消、预算和 trace handle 边界，以及
-`AgentInput`/`Notification` 数据形状，以及 sans-io `AgentMachine` 的
-`step` 契约——把每个 effect reify 成可寻址的 `Requirement`，driver 兑现后经
-`StepInput::Resume` 把 `RequirementResult` 折回同一活动 `Conversation`；
-`DefaultAgentMachine` 已实现文本与 tool turn 的完整状态机：请求非流式/流式（由
-`LlmStepMode` 选择传输模式）Client 生成、折叠 response 进 Conversation pending、请求
-provider-neutral tool-use 执行并回灌 result，并在无 tool-use 的 final assistant 后提交 Turn、
-发出 `StepBoundary`；pivot 走 `AgentInput::Pivot`：由 driver / Session 在合法的 tool-result
-step boundary 直接把 `Role::User` 消息注入同一 pending turn（`step(External(AgentInput::Pivot))`），
-沿用现有 role sequence 校验并在同一 step 下重新渲染 LLM 请求推进本 turn，库内不再保留 pivot queue；
-`reconfigure` 作为 turn-boundary 配置入口，skill 启停、tool set replace/patch、system prompt
-overlay、model 与 loop policy 变更会排队到当前 Turn 完成后原子应用，tool set 变化会 reify 成
-`NeedReconfigRegistry` effect 由 driver 换入 live registry，当前 Turn 的 tool registry snapshot
-保持恒定；tool approval 统一走 `NeedInteraction` + `RequirementResult::Interaction` 通用回程
-（不再有 loop 级 `respond_approval`），deny/timeout/cancel 会回灌标准 `ToolStatus::Denied`
-或 `ToolStatus::Cancelled` result；cancel 走 `StepInput::Abandon` 的 never-resume 关闭，经
-`Conversation::cancel_pending` 丢弃在途 turn 并回到可再喂的 `Idle`；`agent::drive` 参考 driver
-（`drain` / `drive_turn` / `ReferenceScope`）把这些 requirement 兑现到 live
-`LlmClient`/`ToolRegistry`/interaction 后端：一个 `HandlerScope` 按 requirement 家族提供
-handler，本层不挂 handler 的 requirement 经 `Pop` 逐级向上路由到外层 scope（顶层无人处理则
-`UnhandledRequirement`）；`NestedMachine` 与 `SubagentHandler` 把同一 pull/pop 机制扩展成按
-`AgentPath` 寻址的父子 agent 树，headless 子 scope 的 `NeedInteraction` 会 pop 到 attended 父
-scope 兑现，depth 上限、budget 继承与 cancel 传播由 subagent handler 强制；`AgentSpec` 用于记录
-worktree、初始 system prompt、
-tool 声明、model 请求设置和 loop policy，不包含 live conversation、client、tool registry 或
-runtime handle；`AgentState` 通过 `Conversation::snapshot`/`Conversation::restore` 持久化唯一
-conversation，并把 client、tool registry、MCP session、approval policy 和 task handle 留在单独
-runtime holder；`RunContext` 本身也不作为 serde data shape 持久化；机器以 `&mut self` 单活 turn
-提供背压，无需额外的 feed guard。
-已完成的 Client 层实施记录见
-[`docs/archive/2026-07-13-client-layer/TODO.md`](docs/archive/2026-07-13-client-layer/TODO.md)；
-已完成的 Conversation Core 计划和任务记录见
-[`docs/archive/2026-07-13-conversation/`](docs/archive/2026-07-13-conversation/)；
-已完成的 Agent Effect Model 迁移记录见
-[`docs/archive/2026-07-14-agent-effect-migration/`](docs/archive/2026-07-14-agent-effect-migration/)。
-当前根 [`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md) 是 **Testability 阶段**:为 agent effect 层建立
-dev-only 测试基础设施 `agent-testkit`(见 [`docs/TESTABILITY.md`](docs/TESTABILITY.md) 与
-[`crates/agent-testkit`](crates/agent-testkit))。
+- **Client 层** —— 把 Anthropic Messages 与 OpenAI Responses 的 wire 格式统一成同一套请求 /
+  响应 / 流式事件，上层代码只依赖 dyn-safe 的 `LlmClient`，不感知具体厂商。
+- **Conversation 层** —— 以强类型 identity、不可变消息 envelope 和唯一的 pending 事务，
+  把一次会话建模成可校验、可分支、可投影 / 压缩、可快照恢复的历史。
+- **Agent 层** —— 在 Conversation 之上提供 sans-io 的状态机（`AgentMachine`），把每个副作用
+  reify 成可寻址的 `Requirement`，由 driver 兑现后折回同一个 Conversation。
 
-## 设计边界
+保留 provider 原始值与尚未建模的字段，是贯穿三层的一个设计原则：上层逻辑永远不需要绑定
+特定厂商的 wire 细节。
 
-- `model::message`：不带 Conversation `MessageId` 的 `Message` 与 `Role`。
-- `model::content`：text、image、tool use/result、thinking 等完整态内容块。
-- `model::tool`：工具 JSON Schema、工具调用与包含非正常状态的工具响应。
-- `model::usage`：input/output/cache read/cache write/reasoning 分列的 token 统计。
-- `model::normalized`：归一化枚举值，同时保留 provider 原始字符串。
-- `model::extras`：绑定 `ProviderId`、仅在最终请求序列化阶段合并的方言字段。
-- `stream`：用稳定 block id 关联增量事件，并通过统一 accumulator 折叠为完整响应。
-- `client`：dyn-safe `LlmClient`、分类错误、结构化 capability、endpoint 与请求配置。
-- `agent`：外部注入的强类型 Agent/Run/Step/ToolSet/Skill/Plan/Blackboard id，以及字段私有、
-  可 serde 的静态 `AgentSpec`、`WorktreeRef`、`ToolSetRef`、`ModelRef` 和 `LoopPolicy`；
-  `AgentState` 持有唯一活动 `Conversation`、active skills、queued reconfig 数据和
-  受检 `LoopCursor`，serde 时只写入 Conversation snapshot，恢复时必须重新通过
-  `Conversation::restore`；client、tool registry、MCP session、approval responder 和 task
-  handle 位于单独 runtime holder，不进入 state JSON；run 级 `RunContext` 用字段私有的
-  live handle 贯穿取消、预算和 trace，子 context 必须从父 context 派生并共享预算上限、
-  取消传播和 trace parent；只有 `BudgetSnapshot`/`TraceRecord` 等 record DTO 可 serde，
-  live handle 不进入持久化形状；`Notification::Llm` 透明承载 Client `StreamEvent`，
-  `StepBoundary` 携带 Conversation `Boundary`、`StepId` 和 trace metadata（旧 `AgentEvent`
-  单一混装流与 `AgentOutcome` 结束事件已删除，turn 结束改由 quiescent `StepOutcome` 表达，
-  审批变成 `NeedInteraction` requirement）；
-  `AgentMachine` 定义 sans-io `step` 契约，把 effect reify 成可寻址 `Requirement` 而不持久化
-  live handle；`ToolExecutor`/
-  `ToolRegistry` 是最小 runtime trait，`ToolExecutionIds` 由调用方注入 tool-call、tool-result、
-  后续 assistant message 与 step identity；`ToolRegistryResolver` 把 turn-boundary
-  `ToolSetRef` 变更解析回 live registry；`DefaultAgentMachine` 作为当前状态机支持 text-only
-  与 tool-use LLM 往返；pivot 改由 `AgentInput::Pivot` 在合法 step boundary（tool-result 之后）
-  直接把 `Role::User` 消息注入同一 pending turn，"何时插 pivot"归 driver / Session，库内不再排队；
-  `reconfigure` queue 只在 turn boundary 应用 skill/tool/system/model/policy 变更，失败时不部分
-  应用 queued config；`ToolApprovalPolicy` 是 live runtime handle，不进入 serde，审批统一走
-  `NeedInteraction` requirement 与 `RequirementResult::Interaction` 回程（不再有 loop 级
-  `respond_approval`）；cancel 使用 `StepInput::Abandon` never-resume 关闭，并复用 Conversation
-  cancel disposition 闭合 pending；`agent::drive` 参考 driver（`drain`/`drive_turn`/`ReferenceScope`）
-  把 requirement 兑现到 live Client/registry/interaction 后端；
-  调用方需在 `AgentInput::UserMessage` 中同时注入初始 user 与 assistant message id，或在
-  `AgentInput::Pivot` 中提供 pivot 的 message id 与 `Role::User` payload。
-- `conversation`：外部注入的强类型 id、独立 system 配置、不可原地修改的消息 envelope、
-  共享只读 message 的 closed `Turn`、分类 commit 错误、唯一 I1--I4 校验门，以及复用 Client
-  `Accumulator` 的单消息 pending/freeze 状态机、唯一 `PendingTurn` 事务状态机、闭合
-  tool-result 后的 step-boundary user 注入入口和原子 cancel disposition；raw history 采用
-  parent-pointer/`Arc` 节点结构共享，派生 `ToolCallIndex`
-  可按框架或 provider call id 查询当前 lineage 与 pending，而不参与事实校验；字段私有的
-  `Boundary` 只由 Conversation 签发，并统一校验 owner/version/anchor/range/pending；
-  `head`、`revert_to` 和 `RevertOutcome` 提供无损 revert/redo，`turns`、`lineage_turns` 与
-  `raw_turns` 分别公开有效前缀、可 redo lineage 和 retained raw 分支的只读视图；`fork_at`
-  记录 `ForkOrigin`，共享 fork 点祖先，并让 child 拥有自己的 boundary owner、version 与
-  raw/debug 可见范围；`Projection`、`Span`、`Artifact` 与 `CheckedTurnRange` 提供受检
-  projection 覆盖范围、artifact provenance 和 token accounting；`effective_view` 渲染
-  committed projection，`pending_context` 单独暴露已冻结 pending payload；
-  `CompactionPlan`/`CompactionStep`/`apply_compaction` 提供 data-only、version/head 受检且
-  失败不改旧 projection 的原子 compaction overlay 更新，raw history 不因 overlay、视图生成
-  或 compaction apply 而改写；`CompactionStrategy`/`CompactionTrigger` 只在运行时观察只读
-  spans、effective context、Conversation 和 usage，并把结果落回 data-only plan/artifact；
-  `ConversationSnapshot` 只在无 pending 的 committed 一致点导出 versioned data-only facts，
-  不把 pending、Accumulator、派生 index 或 runtime handles 写入持久化形状；
-  `ConversationRows` 提供不绑定数据库驱动的 row DTO 与受检 snapshot 重组，immutable
-  Turn/message rows 只 INSERT 不 UPDATE，annotation/评分应另表引用 `MessageId`，不能更新
-  `MessageRecord.payload`。
+## 模块概览
 
-Conversation Core 已覆盖 pending/cancel、branch、projection/compaction、snapshot/rows restore
-与跨 adapter effective-view 兼容验收；Agent 层当前完成静态 identity/spec 数据模型、
-`AgentState`/`LoopCursor` 可恢复状态边界、`RunContext` 横切上下文边界，以及 sans-io
-`AgentMachine` 的 `step` 契约与可寻址 `Requirement` 回程；`DefaultAgentMachine` 已支持
-非流式/流式 LLM step、tool-use 执行编排、tool result 回灌、Conversation pending commit
-集成、`AgentInput::Pivot` 在合法 step boundary 的 user 消息注入，以及 `reconfigure` queue 在
-turn boundary 的原子配置应用、`NeedInteraction` 审批回程和 `Abandon` cancel 闭合；`agent::drive`
-参考 driver 把这些 requirement 兑现到 live Client/registry/interaction 后端；
-自动预算调度与多 agent 编排仍是后续计划范围，尚未作为已实现能力暴露。
-Agent 层的 sans-io + effect-handler 模型详见
-[`docs/agent-layer.md`](docs/agent-layer.md)、
-[`docs/agent-effect-model.md`](docs/agent-effect-model.md) 与
-[`docs/agent-effect-migration.md`](docs/agent-effect-migration.md)。
-完整设计和当前阶段计划分别见
-[`DESIGN.md`](DESIGN.md)、
-[`PLAN.md`](PLAN.md) 与 [`TODO.md`](TODO.md)。当前根 `PLAN.md` / `TODO.md` 属 **Testability 阶段**
-(`agent-testkit` dev-only 测试基础设施),规范性设计输入见 [`docs/TESTABILITY.md`](docs/TESTABILITY.md)。
+| 模块 | 作用 |
+| --- | --- |
+| `model` | 完整态的消息、多模态内容块、工具 schema、token usage、归一化枚举，以及保留未建模字段的逃生舱。 |
+| `stream` | 稳定 block id、归一化 delta，以及把增量事件折叠回完整 `Response` 的统一 `Accumulator`。 |
+| `client` | `EndpointConfig`、认证、结构化 capability、分类错误，以及 dyn-safe 的 `LlmClient` trait。 |
+| `adapter` | Anthropic Messages 与 OpenAI Responses 的 HTTP / SSE 适配器。 |
+| `conversation` | 强类型 identity、`Conversation`、`PendingTurn` 事务、`Boundary`、fork、projection / compaction、snapshot / restore。 |
+| `agent` | data-only 的 Agent 配置与状态、sans-io `AgentMachine`、`Requirement` 副作用模型和参考 driver。 |
 
-下面把调用方提供的稳定 UUID 与完整 Client message 组合成冻结 envelope。system prompt
-单独保存在配置中，不会被包装成 `Role::System` 历史消息：
+## 安装
 
-```rust
-use agent_lib::{
-    conversation::{ConversationConfig, ConversationMessage, MessageId},
-    model::message::{Message, Role},
-};
-
-let message_id: MessageId = "018f0d9c-7b6a-7c12-8f31-1234567890ad"
-    .parse()
-    .expect("valid externally supplied id");
-let message = ConversationMessage::new(
-    message_id,
-    Message {
-        role: Role::User,
-        content: Vec::new(),
-    },
-);
-let config = ConversationConfig::new(Some("回答简洁。".to_owned()));
-
-assert_eq!(message.id(), message_id);
-assert_eq!(message.payload().role, Role::User);
-assert_eq!(config.system(), Some("回答简洁。"));
-```
-
-Closed `Turn` 只暴露有序 message、完整 tool pairing、parent 和 metadata 的共享只读视图；
-克隆不会复制或重新分配 message identity。它没有 public raw constructor，也不能从 serde
-输入 unchecked 反序列化：内存 draft 与 serde DTO 都必须通过同一个 I1--I4 validator，
-成功后才能一次性推进 Conversation history/version。失败会返回分类化
-`ConversationError`/`CommitError`，原 Conversation 全结构不变。
-
-公开 API 可以创建空 Conversation、只读检查 closed history，并通过唯一 pending 事务推进
-history；它不会暴露裸 message/turn push：
-
-```rust
-use agent_lib::conversation::{Conversation, ConversationConfig, ConversationId};
-
-let conversation_id: ConversationId = "018f0d9c-7b6a-7c12-8f31-1234567890ab"
-    .parse()
-    .expect("valid externally supplied id");
-let conversation = Conversation::new(
-    conversation_id,
-    ConversationConfig::new(Some("回答简洁。".to_owned())),
-);
-
-assert_eq!(conversation.id(), conversation_id);
-assert_eq!(conversation.config().system(), Some("回答简洁。"));
-assert!(conversation.turns().is_empty());
-assert!(conversation.pending().is_none());
-assert_eq!(conversation.version(), 0);
-```
-
-Turn 切割使用 Conversation 签发的 `Boundary`，而不是裸 `usize`。空会话只含 zero boundary；
-每次结构变化后都应重新获取 token。`Boundary` 可以序列化传递，但 serde 只恢复字段声明，
-消费前仍需由当前 Conversation 检查 owner、version、Turn 锚点、lineage 范围和 pending
-一致点：
-
-```rust
-use agent_lib::conversation::{Boundary, Conversation};
-
-fn round_trip_zero_boundary(
-    conversation: &Conversation,
-) -> Result<Boundary, Box<dyn std::error::Error>> {
-    let zero = conversation
-        .valid_boundaries()
-        .into_iter()
-        .next()
-        .expect("every conversation has a zero boundary");
-    assert_eq!(zero.turn_count(), 0);
-    assert_eq!(zero.after_turn(), None);
-
-    let encoded = serde_json::to_string(&zero)?;
-    let restored: Boundary = serde_json::from_str(&encoded)?;
-    conversation.validate_boundary(&restored)?;
-    Ok(restored)
-}
-```
-
-`revert_to` 可向前或向后移动逻辑 head。真实移动会推进 structural version，因此调用前的
-token 随即 stale；返回值中的 old/new head 已按新 version 重新签发，old head 可直接作为
-redo token。所有 raw Turn 和 immutable message 保持不变：
-
-```rust
-use agent_lib::conversation::{Boundary, Conversation, ConversationError, RevertOutcome};
-
-fn move_head(
-    conversation: &mut Conversation,
-    target: Boundary,
-) -> Result<RevertOutcome, ConversationError> {
-    let outcome = conversation.revert_to(target)?;
-    assert_eq!(conversation.head(), outcome.new_head());
-    Ok(outcome)
-}
-```
-
-回退后，`turns()` 只含 head 以内的当前有效 Turn，`lineage_turns()` 还包含同一路径上可 redo
-的 suffix，`raw_turns()`/`raw_turn(id)` 还会保留改道后 detached 的旧 suffix；这些接口都只
-返回 immutable 视图，不构成第二条提交路径。
-
-`fork_at` 使用父 Conversation 签发且当前仍有效的 `Boundary` 创建 child Conversation。
-child 复用 fork 点之前的 immutable Turn/message storage，但重新签发自己的 boundary；
-父 boundary 不能直接给 child 使用，父分支在 fork 点之后的 suffix 也不会进入 child 的
-`turns()`、`raw_turns()` 或派生 index：
-
-```rust
-use agent_lib::conversation::{Boundary, Conversation, ConversationError, ConversationId};
-
-fn fork_conversation(
-    parent: &Conversation,
-    fork_point: Boundary,
-    child_id: ConversationId,
-) -> Result<Conversation, ConversationError> {
-    let child = parent.fork_at(fork_point, child_id)?;
-    let origin = child.origin().expect("fork child records provenance");
-
-    assert_eq!(origin.parent(), parent.id());
-    assert_eq!(child.head().conversation_id(), child_id);
-    Ok(child)
-}
-```
-
-`begin_turn` 只把完整 user payload 放入 pending，不提前修改 raw history。assistant 可以从
-完整 `Response` 开始，也可以逐个接收 `StreamEvent`；冻结后若扫描到 `ToolUse`，调用方必须
-为每个 provider call id 提供唯一 `ToolCallId`，逐一追加完整 result，并在所有 open call
-闭合后继续下一条 assistant。只有无 tool-use 的最终 assistant 才能进入 `commit_pending`：
-
-```rust
-use agent_lib::{
-    client::Response,
-    conversation::{
-        AssistantFinish, Conversation, ConversationError, MessageId, TurnId, TurnMeta,
-    },
-    model::message::{Message, Role},
-};
-
-fn commit_text_response(
-    conversation: &mut Conversation,
-    turn_id: TurnId,
-    user_message_id: MessageId,
-    assistant_message_id: MessageId,
-    response: Response,
-) -> Result<TurnId, ConversationError> {
-    conversation.begin_turn(
-        turn_id,
-        user_message_id,
-        Message {
-            role: Role::User,
-            content: Vec::new(),
-        },
-    )?;
-    conversation.start_assistant_response(response)?;
-    let outcome = conversation.finish_assistant(assistant_message_id)?;
-    assert_eq!(outcome, AssistantFinish::ReadyToCommit);
-    conversation.commit_pending(TurnMeta::default())
-}
-```
-
-带工具的响应会返回 `AssistantFinish::RequiresToolCallMappings`；随后使用
-`register_tool_calls`、`append_tool_response`（或 `append_tool_result`）闭合本轮 calls。
-pending 只公开 frozen messages、phase、usage、response metadata 与只读 tool-call 视图；
-活跃 accumulator 和 partial JSON 始终不可见。
-
-`cancel_pending` 只处理尚未提交的事务。`DiscardTurn` 整体丢弃 pending；`ResumeTurn` 丢弃
-活跃 partial，并要求调用方为每个已冻结 open call 提供 provider id、稳定 `ToolCallId` 与
-result `MessageId`。库会生成带明确中断文本和 `ToolStatus::Cancelled` 的完整结果，然后回到
-`AwaitingAssistant`。尚未执行 `register_tool_calls` 的冻结 call 也能在同一个原子操作中建立
-mapping；已 mapping 的 call 则必须使用原 id：
-
-```rust
-use agent_lib::conversation::{
-    CancelDisposition, CancelOutcome, CancelledToolResult, Conversation, ConversationError,
-    MessageId, ToolCallId,
-};
-
-fn cancel_open_call_and_resume(
-    conversation: &mut Conversation,
-    provider_call_id: &str,
-    call_id: ToolCallId,
-    result_message_id: MessageId,
-) -> Result<CancelOutcome, ConversationError> {
-    conversation.cancel_pending(CancelDisposition::ResumeTurn {
-        cancelled_results: vec![CancelledToolResult::new(
-            provider_call_id,
-            call_id,
-            result_message_id,
-        )],
-    })
-}
-```
-
-若当前只有 active partial 而没有冻结 open call，`cancelled_results` 传空数组即可。
-`CancelDisposition::commit_turn(...)` 会在同样闭合 calls 后追加调用方提供的完整、无 tool-use
-最终 `Response`，再复用唯一 I1--I4 validator 原子提交。任一 identity、状态、freeze 或
-validator 错误都保留原 pending 与 committed history，成功 discard/commit 后可立即开始新 Turn。
-
-单条 assistant response 在进入 PendingTurn 前先通过 `PendingMessage` 冻结。流式调用逐个
-`push(StreamEvent)`；非流式调用从完整 `Response` 创建同一状态机。两条路径都只在
-`finish` 成功时绑定调用方提供的 id，并把 usage、stop reason 与 provider metadata 和
-immutable message 一起返回；partial JSON、缺失 stop 或 error event 不会产生 message：
-
-```rust
-use agent_lib::{
-    client::Response,
-    conversation::{ConversationError, FrozenMessage, MessageId, PendingMessage},
-};
-
-fn freeze_response(
-    response: Response,
-    message_id: MessageId,
-) -> Result<FrozenMessage, ConversationError> {
-    let mut pending = PendingMessage::from_response(response);
-    pending.finish(message_id)
-}
-```
-
-validator 接受的 canonical Turn 必须从一条 user message 开始，允许完整闭合的
-assistant tool-use → 一条或多条 tool-result → 可选 user 注入 → assistant 往返，并以不含
-tool-use 的 assistant message 结束；system message、partial marker、重复 identity、孤儿/悬空/重复
-provider call 以及跨 Turn pairing 都会被拒绝。调用方可依赖如下 closed 只读边界：
-
-```rust
-use agent_lib::conversation::Turn;
-
-fn inspect_turn(turn: &Turn) {
-    for message in turn.messages() {
-        println!("message={} role={:?}", message.id(), message.payload().role);
-    }
-    for pairing in turn.pairings() {
-        // closed pairing 的 result message 在类型上始终存在，不是 Option。
-        println!("call={} result={}", pairing.call_id(), pairing.result_msg());
-    }
-}
-```
-
-## Conversation Core 离线用法
-
-`examples/conversation_core.rs` 从公开 API 驱动一段完整离线会话，不访问真实 endpoint，也不创建
-Agent loop 或 tool registry。示例显式注入 deterministic `ConversationId`/`TurnId`/`MessageId`/
-`ToolCallId`/`ArtifactId`，并用 normalized `Response` 与 `ToolResponse` 模拟 Client 已完成的输出：
-
-```bash
-cargo run --example conversation_core
-```
-
-该示例依次断言：
-
-- user → assistant tool-use → tool-result → final assistant → `commit_pending` 会形成一个满足
-  I1--I4 的 closed Turn。
-- open tool call 被 `CancelDisposition::ResumeTurn` 合成 `ToolStatus::Cancelled` result 后，仍可继续
-  feed final assistant 并提交；partial 或 dangling call 不进入 committed `effective_view`。
-- `Boundary` 只能由当前 Conversation 签发和消费；`fork_at` 创建 child 时共享 fork 点之前的
-  immutable prefix，父子后续 commit 互相隔离。
-- `CompactionPlan` 只替换 projection overlay；raw Turn/message id 与 payload 保留，`effective_view`
-  渲染 summary artifact 加 head 以内 raw tail。
-- `Conversation::snapshot` 只在无 pending 的 committed 一致点成功；JSON restore 后的
-  `effective_view` 与 raw fact 数量保持一致。
-
-## 环境与构建
-
-需要支持 Rust 2024 edition 的稳定版工具链。克隆仓库后执行：
-
-```bash
-cargo build
-cargo test --all --all-targets
-cargo doc --no-deps --open
-```
-
-若作为同一工作区中的 path dependency 使用：
+需要支持 Rust 2024 edition 的稳定版工具链。在同一工作区中作为 path dependency 使用：
 
 ```toml
 [dependencies]
 agent-lib = { path = "../agent-lib" }
 ```
 
-## Endpoint 与认证配置
+## 快速开始：Client 层
 
-`EndpointConfig` 只描述传输端点；adapter 负责附加协议路径（Anthropic 的
-`/v1/messages`、OpenAI Responses 的 `/responses`）并做 wire 转换。认证可用 Bearer、
-任意自定义 header 或 `None`，因此 wire protocol 与部署环境的认证方式不会耦合。
-`EndpointConfig` 可序列化但包含凭据，不应写入日志或未经批准的持久化存储。
-
-仓库中的三个 Client endpoint 示例通过 `AGENT_LIB_PROVIDER` 选择 adapter，并采用已经过真实 Foundry
-endpoint 验证的默认值：
-
-| 变量 | Anthropic | OpenAI Responses |
-| --- | --- | --- |
-| provider 选择 | `AGENT_LIB_PROVIDER=anthropic` | `AGENT_LIB_PROVIDER=openai` |
-| base URL | `ANTHROPIC_BASE_URL`（必填） | `OPENAI_BASE_URL`（必填） |
-| 凭据 | `ANTHROPIC_AUTH_TOKEN`（Bearer，必填） | `OPENAI_API_KEY`（`api-key` header，必填） |
-| model/deployment | `ANTHROPIC_MODEL`（默认 `databricks-claude-haiku-4-5`） | `OPENAI_MODEL`（默认 `gpt-5.5`） |
-| API version | `ANTHROPIC_VERSION`（默认 `2023-06-01` header） | `OPENAI_API_VERSION`（默认 `2025-04-01-preview` query） |
-
-其他部署若使用 `x-api-key`、标准 OpenAI Bearer 或不同 query/header，应直接构造相应的
-`AuthScheme` 和 `EndpointConfig`；无需修改 adapter。环境变量的值不会被示例打印。
-
-## Client 层用法
-
-下面通过 dyn-safe `LlmClient` 发起一次完整响应请求。调用 `chat` 时 `stream` 必须为
-`false`；调用 `chat_stream` 时必须为 `true`，流式事件可交给统一的 `Accumulator`
-折叠为同一个 `Response` 类型。
+通过 dyn-safe 的 `LlmClient` 发起一次完整（非流式）响应请求。调用 `chat` 时 `stream`
+必须为 `false`；`chat_stream` 时必须为 `true`，流式事件可交给统一的 `Accumulator` 折叠成
+同一个 `Response` 类型。
 
 ```rust
 use agent_lib::{
@@ -476,10 +57,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         base_url: env::var("ANTHROPIC_BASE_URL")?,
         auth: AuthScheme::Bearer(env::var("ANTHROPIC_AUTH_TOKEN")?),
         query_params: Vec::new(),
-        extra_headers: vec![(
-            "anthropic-version".to_owned(),
-            "2023-06-01".to_owned(),
-        )],
+        extra_headers: vec![("anthropic-version".to_owned(), "2023-06-01".to_owned())],
     };
     let client: Box<dyn LlmClient> = Box::new(AnthropicAdapter::new(endpoint));
     let request = ChatRequest {
@@ -506,85 +84,206 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
-## 可运行示例
+`EndpointConfig` 只描述传输端点，adapter 负责附加协议路径（Anthropic 的 `/v1/messages`、
+OpenAI Responses 的 `/responses`）并做 wire 转换。认证可用 Bearer、任意自定义 header 或
+`None`。注意它包含凭据，不应写入日志或未经批准的持久化存储。
 
-`conversation_core` 是完全离线的 Conversation 示例，无需任何环境变量：
+## 快速开始：Conversation 层
 
-```bash
-cargo run --example conversation_core
+`Conversation` 用调用方提供的稳定 UUID 与完整 Client message 组成冻结 envelope，
+system prompt 单独保存在配置里，不会被包装成 `Role::System` 历史消息。
+
+```rust
+use agent_lib::conversation::{Conversation, ConversationConfig, ConversationId};
+
+let conversation_id: ConversationId = "018f0d9c-7b6a-7c12-8f31-1234567890ab"
+    .parse()
+    .expect("valid externally supplied id");
+let conversation = Conversation::new(
+    conversation_id,
+    ConversationConfig::new(Some("回答简洁。".to_owned())),
+);
+
+assert_eq!(conversation.id(), conversation_id);
+assert_eq!(conversation.config().system(), Some("回答简洁。"));
+assert!(conversation.turns().is_empty());
+assert!(conversation.pending().is_none());
 ```
 
-设置上表对应的环境变量后，三个 Client endpoint 示例可原样切换 Anthropic 或 OpenAI Responses：
+历史只能通过唯一的 pending 事务推进，公开 API 不暴露裸 message/turn push。一次典型的
+文本往返是：`begin_turn` 放入完整 user payload → `start_assistant_response` 冻结 assistant →
+`finish_assistant` → `commit_pending`。
 
-```bash
-export AGENT_LIB_PROVIDER=anthropic # 或 openai
-cargo run --example non_streaming
-cargo run --example streaming_typewriter
-cargo run --example tool_round_trip
+```rust
+use agent_lib::{
+    client::Response,
+    conversation::{
+        AssistantFinish, Conversation, ConversationError, MessageId, TurnId, TurnMeta,
+    },
+    model::message::{Message, Role},
+};
+
+fn commit_text_response(
+    conversation: &mut Conversation,
+    turn_id: TurnId,
+    user_message_id: MessageId,
+    assistant_message_id: MessageId,
+    response: Response,
+) -> Result<TurnId, ConversationError> {
+    conversation.begin_turn(
+        turn_id,
+        user_message_id,
+        Message { role: Role::User, content: Vec::new() },
+    )?;
+    conversation.start_assistant_response(response)?;
+    let outcome = conversation.finish_assistant(assistant_message_id)?;
+    assert_eq!(outcome, AssistantFinish::ReadyToCommit);
+    conversation.commit_pending(TurnMeta::default())
+}
 ```
 
-- `non_streaming`：通过 `Box<dyn LlmClient>` 获取完整的 normalized `Response`。
-- `streaming_typewriter`：收到 `Delta::Text` 即刷新 stdout，同时把同一事件逐个送入公共
-  `Accumulator`，最后校验可折叠的完整响应。
-- `tool_round_trip`：声明 `get_weather` JSON Schema，读取模型产生的统一 `ToolUse`，模拟
-  本地执行，再用同一个 call id 回灌 `ToolResult` 并取得最终文本。
-- `conversation_core`：用 normalized 本地 fixture 演示 Conversation identity、pending/commit/cancel、
-  Boundary/fork、projection/effective view 和 snapshot/restore，不访问网络。
+带工具的响应会返回 `AssistantFinish::RequiresToolCallMappings`，需用 `register_tool_calls`
+与 `append_tool_response` 闭合本轮 call 后再继续；只有不含 tool-use 的最终 assistant 才能
+`commit_pending`。所有提交都会通过同一套 I1–I4 canonical 校验，失败时原 Conversation
+结构不变。
 
-每个示例为单次 HTTP 操作配置 45 秒 timeout；缺少变量或 provider 值非法时会给出不含
-secret 的明确错误。离线 `conversation_core` 示例不读取 endpoint 环境变量。
+### 主要能力
+
+- **Boundary**：Turn 切割使用 Conversation 签发的 `Boundary` 而非裸 `usize`。可序列化传递，
+  但消费前必须由当前 Conversation 校验 owner / version / 锚点 / 范围 / pending 一致点。
+- **revert / redo**：`revert_to` 无损移动逻辑 head，raw Turn 与 immutable message 保持不变，
+  旧 head 可作为 redo token。
+- **fork**：`fork_at` 从合法 boundary 创建 child Conversation，O(1) 共享 fork 点之前的
+  immutable prefix，父子随后独立推进。
+- **projection / compaction**：`CompactionPlan` 只替换 projection overlay，raw history 不被改写；
+  `effective_view` 渲染 Client-ready 的 system prompt 与投影后消息。
+- **snapshot / restore**：`Conversation::snapshot` 只在无 pending 的 committed 一致点导出
+  data-only facts，`Conversation::restore` 重新校验后恢复。
+
+完整设计见 [`docs/conversation-core.md`](docs/conversation-core.md)。
+
+## Agent 层
+
+Agent 层在 Conversation 之上提供 data-only 的强类型 identity、静态 `AgentSpec` 配置和
+可恢复的 `AgentState`，核心是 sans-io 的 `AgentMachine`：
+
+- `step` 契约把每个副作用（LLM 请求、工具执行、审批、reconfigure 等）reify 成可寻址的
+  `Requirement`；driver 兑现后经 `StepInput::Resume` 把 `RequirementResult` 折回同一个活动
+  `Conversation`。
+- `DefaultAgentMachine` 实现了文本与 tool turn 的完整状态机：请求非流式 / 流式 Client 生成、
+  折叠进 pending、执行 provider-neutral 工具并回灌 result，在无 tool-use 的 final assistant
+  后提交 Turn。
+- `agent::drive` 是参考 driver，把这些 requirement 兑现到 live 的 `LlmClient` /
+  `ToolRegistry` / interaction 后端；`NestedMachine` 与 `SubagentHandler` 把同一 pull/pop
+  机制扩展到父子 agent 树。
+
+设计详见 [`docs/agent-layer.md`](docs/agent-layer.md) 与
+[`docs/agent-effect-model.md`](docs/agent-effect-model.md)。
+
+### 用一组 scoped effect 构造一个 agent
+
+这是本库最不直观的部分,值得单独说明。`AgentMachine` 本身**不做任何 IO**——它不会去调
+LLM、不会执行工具、不会弹审批框。`step` 每次只把"我现在需要什么"表达成一个可寻址的
+`Requirement`(如 `NeedLlm`、`NeedTool`、`NeedInteraction`、`NeedReconfigRegistry`),然后
+**停下来**等外部兑现。真正干活的是 driver:它按 requirement 家族找到对应 handler,`await`
+真实后端,把结果包成 `RequirementResult` 经 `StepInput::Resume` 折回机器,如此往复直到本轮
+结束。
+
+"scoped effect"指的就是:一组 handler 打包成一个 `HandlerScope`(每个副作用家族一个),
+一层 scope 就是一个 drain layer。scope 只处理它声明能处理的家族,**处理不了的 requirement
+会 pop 到外层 scope**;顶层还没人处理就报 `UnhandledRequirement`。这带来两个直接好处:
+
+- **run mode 变成 scope 的接线方式**。`ReferenceScope` 的 interaction handler 是可选的:挂上
+  就是 *attended*(审批在本层解决),不挂就是 *headless*(审批 pop 到外层)。
+- **父子 agent 只是 scope 的嵌套**。`SubagentHandler` 兑现 `NeedSubagent` 时会开一层新的
+  drain 驱动子机器;子机器自己 scope 处理不了的 requirement(比如 headless 子 agent 的审批)
+  会 pop 回发起 `NeedSubagent` 的那层去解决。
+
+下面用官方参考实现 `ReferenceScope`(把 `LlmClient` + `ToolRegistry` + 审批后端接成一层
+total scope)把一整轮 turn 跑完。`client`、`registry` 是你实现的 `LlmClient` /
+`ToolRegistry`;`ids` 是你实现的 `RequirementIds` + `ToolExecutionIds` 身份源:
+
+```rust
+use agent_lib::agent::{
+    AgentInput, AgentSpec, AgentState, ApprovalInteractionHandler, BudgetLimits,
+    DefaultAgentMachine, LlmStepMode, LoopPolicy, ModelRef, ReferenceScope, RunContext,
+    ToolFailurePolicy, ToolSetRef, WorktreeRef, drive_turn,
+};
+use agent_lib::conversation::{Conversation, ConversationConfig};
+use agent_lib::model::message::{Message, Role};
+use std::num::NonZeroU32;
+use std::sync::Arc;
+
+async fn run_one_turn(
+    client: Arc<dyn agent_lib::client::LlmClient>,
+    registry: Arc<dyn agent_lib::agent::ToolRegistry>,
+    ids: Arc<MyIds>, // 实现 RequirementIds + ToolExecutionIds
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 1. 静态配置:worktree、system prompt、初始 tool set、model、loop policy。
+    let spec = AgentSpec::new(
+        ids.agent_id(),
+        WorktreeRef::new("/repo/my-agent"),
+        Some("You are a helpful agent.".to_owned()),
+        ToolSetRef::new(ids.tool_set_id(), registry.declarations()),
+        ModelRef::new("gpt-5.5", NonZeroU32::new(512).unwrap(), Some(0.1), None),
+        LoopPolicy::new(
+            NonZeroU32::new(8).unwrap(),
+            NonZeroU32::new(4).unwrap(),
+            ToolFailurePolicy::ReturnErrorToModel,
+        ),
+    );
+
+    // 2. 状态:持有唯一活动 Conversation 的 AgentState。
+    let state = AgentState::new(
+        spec,
+        Conversation::new(ids.conversation_id(), ConversationConfig::new(None)),
+    );
+
+    // 3. sans-io 机器:只 reify effect,不做 IO。
+    let mut machine = DefaultAgentMachine::new(state, LlmStepMode::NonStreaming, ids.clone())
+        .with_tool_execution_ids(ids.clone());
+
+    // 4. 一层 scope:把 LLM / 工具 / 审批后端接成 handler 集合。
+    //    挂上 interaction handler => attended;去掉 .with_interaction 即 headless。
+    let scope = ReferenceScope::new(client, registry)
+        .with_interaction(ApprovalInteractionHandler::approve());
+
+    // 5. 横切上下文:取消、预算、trace。
+    let ctx = RunContext::new_root(ids.run_id(), BudgetLimits::unbounded(), ids.trace_root());
+
+    // 6. driver 把机器 reify 的每个 requirement 兑现到 scope,直到本轮结束。
+    let input = AgentInput::user_message(
+        ids.turn_id(),
+        ids.message_id(),
+        Message { role: Role::User, content: Vec::new() },
+        ids.message_id(),
+        ids.step_id(),
+    )?;
+    let done = drive_turn(&mut machine, input, &scope, &ctx).await?;
+
+    println!("turn ended at {:?}", done.cursor());
+    Ok(())
+}
+```
+
+要点回顾:机器负责*决定*要做什么(纯状态),scope 负责*怎么做*(真实 IO),两者通过
+`Requirement` / `RequirementResult` 解耦。想换 provider、换审批策略、加子 agent,都只是换
+scope 里的 handler 或多套一层 scope,机器代码一行不动。参考 driver 的完整语义(pop 路由、
+嵌套、cancel)见 [`docs/agent-effect-model.md`](docs/agent-effect-model.md)。
+
+一个接真实 provider、端到端跑通"对话 + 需审批的工具"的完整可运行示例见
+[`examples/agent_chat.rs`](examples/agent_chat.rs)(下方[可运行示例](#可运行示例)有运行方式):
+它自己实现了 `RequirementIds`/`ToolExecutionIds` 身份源、一个 mock 的 `get_weather` 工具、
+一个要求审批的 `ToolApprovalPolicy`,以及一个从 stdin 读取放行/拒绝的 `InteractionHandler`,
+最后把它们组合成一层自定义 `HandlerScope` 用 `drain` 驱动。
 
 ## 数据模型与逃生舱
 
-下面的例子构造一条包含文本和工具调用的 assistant 消息，并展示如何读取归一化
-usage。内容块的 `extra` 会保留尚未建模的 provider 字段。
+内容块的 `extra` 会保留尚未建模的 provider 字段，`ProviderExtras` 则让 provider 专属请求
+参数绑定目标 provider、只在匹配时合并。
 
 ```rust
-use agent_lib::model::{
-    content::ContentBlock,
-    message::{Message, Role},
-    usage::Usage,
-};
-use serde_json::{Map, json};
-
-let message = Message {
-    role: Role::Assistant,
-    content: vec![
-        ContentBlock::Text {
-            text: "我来查询天气。".to_owned(),
-            extra: Map::new(),
-        },
-        ContentBlock::ToolUse {
-            id: "call_weather_1".to_owned(),
-            name: "get_weather".to_owned(),
-            input: json!({ "city": "Shanghai" }),
-            extra: Map::new(),
-        },
-    ],
-};
-
-let encoded = serde_json::to_string(&message).expect("serialize message");
-let decoded: Message = serde_json::from_str(&encoded).expect("deserialize message");
-assert_eq!(decoded, message);
-
-let usage: Usage = serde_json::from_value(json!({
-    "input_tokens": 20,
-    "output_tokens": 8,
-    "cache_read_input_tokens": 5
-}))
-.expect("deserialize usage");
-assert_eq!(usage.input, 20);
-assert_eq!(usage.output, 8);
-assert_eq!(usage.cache_read, 5);
-```
-
-Provider 专属请求参数必须绑定目标 provider。只有目标匹配时才会合并，并且调用方
-需要检查可观测的合并结果：
-
-```rust
-use agent_lib::model::extras::{
-    ProviderExtras, ProviderExtrasMergeOutcome, ProviderId,
-};
+use agent_lib::model::extras::{ProviderExtras, ProviderExtrasMergeOutcome, ProviderId};
 use serde_json::{Map, json};
 
 let extras = ProviderExtras {
@@ -600,9 +299,65 @@ assert_eq!(outcome, ProviderExtrasMergeOutcome::Merged);
 assert_eq!(body["top_k"], json!(20));
 ```
 
-## 开发验证
+## 可运行示例
 
-提交前依次运行格式化、严格 lint、完整测试和文档构建：
+`conversation_core` 完全离线，无需任何环境变量：
+
+```bash
+cargo run --example conversation_core
+```
+
+设置下表环境变量后，三个 Client endpoint 示例可原样切换 Anthropic 或 OpenAI Responses：
+
+```bash
+export AGENT_LIB_PROVIDER=anthropic # 或 openai
+cargo run --example non_streaming
+cargo run --example streaming_typewriter
+cargo run --example tool_round_trip
+```
+
+Agent 端到端示例(交互式对话 + 需审批的 mock 工具)用同一组环境变量：
+
+```bash
+cargo run --example agent_chat
+```
+
+- `non_streaming`：通过 `Box<dyn LlmClient>` 获取完整的 normalized `Response`。
+- `streaming_typewriter`：收到 `Delta::Text` 即刷新 stdout，同时把事件送入公共 `Accumulator`
+  校验可折叠的完整响应。
+- `tool_round_trip`：声明 `get_weather` schema，读取模型的统一 `ToolUse`，模拟本地执行后
+  用同一 call id 回灌 `ToolResult`。
+- `conversation_core`：用本地 fixture 演示 identity、pending/commit/cancel、Boundary/fork、
+  projection/effective view 和 snapshot/restore。
+- `agent_chat`：接真实 provider 的 `AgentMachine` + 自定义 scoped-effect driver 端到端演示——
+  行输入的多轮对话、mock 的 `get_weather` 工具、逐次审批(stdin 放行/拒绝的 `InteractionHandler`),
+  输入 `/quit` 退出并打印整段会话的 token 统计。
+
+每个 endpoint 示例为单次 HTTP 操作配置 45 秒 timeout，缺少变量或 provider 非法时会给出
+不含 secret 的明确错误。
+
+### Endpoint 环境变量
+
+| 变量 | Anthropic | OpenAI Responses |
+| --- | --- | --- |
+| provider 选择 | `AGENT_LIB_PROVIDER=anthropic` | `AGENT_LIB_PROVIDER=openai` |
+| base URL | `ANTHROPIC_BASE_URL`（必填） | `OPENAI_BASE_URL`（必填） |
+| 凭据 | `ANTHROPIC_AUTH_TOKEN`（Bearer） | `OPENAI_API_KEY`（`api-key` header） |
+| model | `ANTHROPIC_MODEL`（默认 `databricks-claude-haiku-4-5`） | `OPENAI_MODEL`（默认 `gpt-5.5`） |
+| API version | `ANTHROPIC_VERSION`（默认 `2023-06-01` header） | `OPENAI_API_VERSION`（默认 `2025-04-01-preview` query） |
+
+其他部署若使用 `x-api-key` 或标准 OpenAI 认证，直接构造相应的 `AuthScheme` 与
+`EndpointConfig` 即可，无需修改 adapter。
+
+## 构建与测试
+
+```bash
+cargo build
+cargo test --all --all-targets
+cargo doc --no-deps --open
+```
+
+提交前建议依次运行：
 
 ```bash
 cargo fmt --all
@@ -611,8 +366,7 @@ cargo test --all --all-targets
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-真实 endpoint 测试默认标记为 `#[ignore]`，只在显式选择时发起网络请求。配置好上述
-凭据后可分别运行：
+真实 endpoint 测试默认标记为 `#[ignore]`，配置好上述凭据后可显式运行：
 
 ```bash
 cargo test --test integration_anthropic -- --ignored --nocapture
@@ -620,6 +374,10 @@ cargo test --test integration_openai_resp -- --ignored --nocapture
 cargo test --test integration_normalization -- --ignored --nocapture
 ```
 
-完整能力差异与已实测范围见 [`docs/capability-matrix.md`](docs/capability-matrix.md)，
-Client endpoint 约定与测试策略见已归档的
-[`Client 层 PLAN.md`](docs/archive/2026-07-13-client-layer/PLAN.md)。
+## 参考文档
+
+- [`DESIGN.md`](DESIGN.md) —— 完整设计。
+- [`docs/conversation-core.md`](docs/conversation-core.md) —— Conversation 层设计。
+- [`docs/agent-layer.md`](docs/agent-layer.md)、[`docs/agent-effect-model.md`](docs/agent-effect-model.md)
+  —— Agent 层 sans-io + effect-handler 模型。
+- [`docs/capability-matrix.md`](docs/capability-matrix.md) —— provider 能力差异与实测范围。

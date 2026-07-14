@@ -336,6 +336,10 @@ impl LoopCursor {
                     StreamingStep | CancelRecovery | Done | Error
                 )
                 | (CancelRecovery, Idle | Done | Error)
+                // A completed or errored segment is a terminal rest state. The
+                // machine is reused across turns, so a fresh user turn resets it
+                // back to the feedable `Idle` before opening the next turn.
+                | (Done | Error, Idle)
         )
     }
 }

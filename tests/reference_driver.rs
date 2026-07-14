@@ -220,6 +220,57 @@ async fn reference_text_only_matches_default_loop() {
     assert!(registry.log().is_empty());
 }
 
+/// A committed turn settles the cursor at `Done`, yet the same machine must
+/// accept a follow-up user turn. Regression coverage for the multi-turn reuse
+/// gap: feeding a second `UserMessage` into a machine whose cursor was left at
+/// `Done` used to be rejected (no `Done -> Idle` transition), so the driver
+/// returned the stale conversation without issuing a new LLM call. Both turns
+/// must now commit distinct assistant replies and both must hit the client.
+#[tokio::test]
+async fn reference_consecutive_turns_reuse_the_same_machine() {
+    let ids = SeqIds::new();
+    let client = Arc::new(ScriptedLlmClient::from_steps([
+        LlmStep::text("first reply").with_usage(usage(3, 5)),
+        LlmStep::text("second reply").with_usage(usage(7, 11)),
+    ]));
+    let registry = idle_registry();
+    let mut machine = default_machine(
+        &ids,
+        agent_state(&ids, agent_spec_with_tools(&ids, vec![weather_tool()])),
+    );
+    let scope = ReferenceScope::new(client.clone(), registry.clone());
+
+    let ctx = root_context(&ids);
+    let done = drive_turn(&mut machine, user_input(&ids, "hello"), &scope, &ctx)
+        .await
+        .expect("first turn commits");
+    assert!(matches!(done.cursor(), LoopCursor::Done(_)));
+    assert_eq!(machine.state().loop_cursor().kind(), LoopCursorKind::Done);
+
+    // Second turn on the *same* machine, whose cursor is currently `Done`.
+    let ctx2 = root_context(&ids);
+    let done2 = drive_turn(&mut machine, user_input(&ids, "again"), &scope, &ctx2)
+        .await
+        .expect("second turn commits on the reused machine");
+    assert!(matches!(done2.cursor(), LoopCursor::Done(_)));
+
+    let conversation = machine.state().conversation();
+    assert!(conversation.pending().is_none());
+    assert_eq!(conversation.turns().len(), 2);
+    assert_text(
+        conversation.turns()[0].messages()[1].payload(),
+        "first reply",
+    );
+    assert_text(
+        conversation.turns()[1].messages()[1].payload(),
+        "second reply",
+    );
+
+    // The second turn genuinely called the client instead of replaying the
+    // first response.
+    assert_eq!(client.request_count(), 2);
+}
+
 #[tokio::test]
 async fn reference_single_tool_matches_default_loop() {
     let ids = SeqIds::new();

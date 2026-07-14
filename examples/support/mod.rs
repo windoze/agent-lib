@@ -1,4 +1,8 @@
 //! Shared runtime configuration and provider-neutral builders for the examples.
+//!
+//! Each example uses a different subset of these helpers, so unused-function
+//! warnings here are expected for any single example binary.
+#![allow(dead_code)]
 
 use agent_lib::{
     adapter::{anthropic::AnthropicAdapter, openai_resp::OpenAiRespAdapter},

@@ -297,6 +297,19 @@ impl DefaultAgentMachine {
 
     /// Opens a fresh user turn and blocks on one `NeedLlm` requirement.
     fn begin_user_turn(&mut self, user: AgentUserInput) -> StepOutcome {
+        // A completed or errored turn settles the cursor at a terminal rest state
+        // (`Done` / `Error`). The same machine is reused across turns, so a new
+        // user message supersedes that finished turn: reset the cursor to the
+        // feedable `Idle` before opening the next one. (A fresh machine already
+        // starts at `Idle`, so this is a no-op for the first turn.)
+        if matches!(
+            self.state.loop_cursor(),
+            LoopCursor::Done(_) | LoopCursor::Error(_)
+        ) && let Err(error) = self.state.transition_cursor(LoopCursor::Idle)
+        {
+            return self.fail(format!("cursor transition failed: {error}"));
+        }
+
         // A never-resume abandon of a tool batch leaves a *coherent* pending turn
         // (its dangling tool_use closed by synthesized `Cancelled` results) with
         // the cursor settled at `Idle`. A new user turn supersedes that
