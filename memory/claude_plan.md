@@ -1,43 +1,31 @@
-# 当前任务：M2-2 补充主 flow 的负向断言与防回归用例
+# 当前任务：M2-R Milestone 2 Review
 
 ## 定位
-- `TODO.md` 第一个未完成任务 = **M2-2**（首个 `[TODO]`，行 394）。前置依赖：M2-1（`[DONE]`）。
-- HEAD=503bfd2（[M2-1]），工作树干净。属于 Milestone 2。
-- 非 review、单一执行单元，**不拆分**。
+- `TODO.md` 第一个未完成任务 = **M2-R**（首个 `[TODO]`，行 445）。前置依赖：M2-1..M2-2（均 `[DONE]`）。
+- HEAD=e5098cc（[M2-2]），工作树干净。属于 Milestone 2。
+- 这是 review 任务（`*R`），**不拆分**。产出为 review 结论 + 验证，写入完成记录。
 
-## 目标（TODO.md M2-2）
-在 `tests/agent_complex_flow.rs` 增加两个聚焦测试，把 plan dependency 与 approval deny 的错误面固定住：
-1. `claim_dependency_block_returns_tool_error_and_does_not_mutate_task`
-   - 直接通过 `ComplexToolHandler.fulfill` 调 `plan_claim` claim `implement`（design 未 completed）。
-   - 断言返回 `ToolStatus::Error`，错误文本 model-visible 且提及被阻塞依赖 design。
-   - 断言 owner/status/version 不变（implement 仍 Todo、无 owner、version 不变）。
-2. `denied_dangerous_write_does_not_execute_tool`
-   - 用 `DrainHarness` + 脚本 LLM(dangerous_write→text) + `ComplexToolHandler` + deny 交互。
-   - 断言 dangerous execution log == 0，interaction 决策 1 次，turn Done，tool_result 为 Denied。
-- 失败信息必须包含 store ops(assert_* helper) 或 handler log(assert_tool_executions)。
+## 目标（TODO.md M2-R 做什么）
+核对 `tests/agent_complex_flow.rs`（576 行）主场景与两个负向用例：
+1. 主场景经过 >=4 次 LLM 往返 + 2 次 interaction。
+2. pivot 落在合法 post-tool boundary，且被后续 LLM request 看到。
+3. deny 后 dangerous tool 未执行，turn 继续到 final。
+4. plan dependency blocked 是 model-visible tool error，不是 panic。
+5. 测试可读性：如过长抽 helper，但不新建 DSL。
 
-## 关键 API（已核对）
-- 直接执行工具：`handler.fulfill(ids.tool_call_id(), &tool_call(...), &ctx).await` → `RequirementResult::Tool(Ok(ToolResponse))`。
-- 建 plan：`store.create_plan()`→v0；`store.add_task("design", Vec::<String>::new())`→v1；
-  `store.add_task("implement", ["design"])`→v2。`store.version()`==2。
-- `store.claim` 校验顺序 version→owner→status→deps，dep 未完成 → `DependencyBlocked`，不改状态。
-- DrainHarness：`complex_scope(Arc<llm>, Arc<handler> as Arc<dyn ToolHandler>, Some(Arc<interaction>))`；
-  `DrainHarness::with_ids(machine,&scope,None,&ctx,ids).run_user(..).await`。
-- 断言：`assert_conversation(conv).committed_turns(1).pending_none().tool_result_status("c-danger",Denied).last_assistant_text(..)`；
-  `assert_tool_executions(&handler,DANGEROUS_WRITE,0)`；`assert_interaction_decisions(&log,1)`；`assert_done(turn_done)`。
-
-## 新增 import
-handlers::ScriptedLlmHandler；harness::DrainHarness；assertions::{assert_conversation,assert_done}；
-script::LlmStep；tools::{complex_scope, PLAN_CLAIM}；model::tool::ToolResponse。
+## 静态核对结论（读代码已确认）
+- LLM 往返：llm_open -> plan_llm -> (pre_pivot_llm 被 pivot 重渲染为 pivot_llm，同 id) -> final_llm。4 次 resume LLM。OK >=4
+- interaction：approval_one(Approve) + approval_two(Deny)。=2，顺序 approve->deny（recorded_decisions 断言）。
+- pivot：danger_one 结果后、下一 NeedLlm 前调 harness.pivot；assert_eq!(pre_pivot_llm,pivot_llm) 证明重渲染同 id；final_request 断言含 PIVOT_TEXT 的 Role::User 消息。
+- deny 不执行：assert_tool_executions(DANGEROUS_WRITE,1)（仅批准那次）；turn 到 Done。
+- dependency blocked：M2-2 claim_dependency_block_... 断言 ToolStatus::Error+文本含 design+task 不变；主场景也断言 store.claim 返回 DependencyBlocked。非 panic。
+- 可读性：helper 已抽（fulfill_tool/fulfill_interaction/resume_tool_batch/message_text/...），无 DSL。
 
 ## 验证顺序
-fmt --check → clippy --all-targets -D warnings → 两个指定测试 → cargo test --all --all-targets(<=30min)
-→ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace → git diff --check。
+fmt --check -> clippy --all-targets -D warnings -> cargo test --test agent_complex_flow -> full suite -> RUSTDOCFLAGS=-D warnings cargo doc --no-deps --workspace -> git diff --check。
 
 ## 完成
-TODO.md M2-2 [TODO]->[DONE] + 完成记录；提交 [M2-2]；停止。
+TODO.md M2-R [TODO]->[DONE] + 写 review 结论/验证记录；提交 [M2-R]；停止。
 
 ## 进度
-- [完成] 两个防回归测试写完并通过。fmt/clippy/两个指定测试/整文件 3 tests/全量 all-targets 全绿
-  (lib 423 + testkit 131 + 集成 crate,credential-gated ignored)/doc(-D warnings)/diff --check 均通过。
-  TODO.md M2-2 标 [DONE] 并写完成记录。待提交 [M2-2]。
+- [完成] 静态核对 + 全套验证均通过（fmt/clippy/agent_complex_flow 3 tests/full all-targets 全绿 lib423+testkit131/doc -D warnings/diff --check）。TODO.md M2-R 标 [DONE] 并写 review 结论。待提交 [M2-R]。

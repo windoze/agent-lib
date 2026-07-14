@@ -442,7 +442,7 @@ dangerous tool approve、post-tool pivot、第二个 dangerous tool deny、final
   testkit 131 + 各集成 crate 全通过,仅 credential-gated 集成测试 ignored);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
-### [TODO] M2-R Milestone 2 Review
+### [DONE] M2-R Milestone 2 Review
 
 **前置依赖**:M2-1..M2-2。
 
@@ -468,9 +468,37 @@ dangerous tool approve、post-tool pivot、第二个 dangerous tool deny、final
 - `git diff --check`。
 - Review 结论写入本任务完成记录。
 
----
+**完成记录**:
 
-## Milestone 3 — Subagent、Scope Pop 与 Cancel
+- Review 结论:主复杂 flow 稳定覆盖 M2 目标,失败信息足够定位,无需返工。逐项核对如下。
+- **≥4 次 LLM 往返 + 2 次 interaction**:`complex_turn_combines_plan_blackboard_approval_deny_and_pivot`
+  依次 resume 四个 `NeedLlm`——`llm_open`(开轮)→`plan_llm`(建 plan 后)→`pivot_llm`(pivot 重渲染)
+  →`final_llm`(收尾),且 pivot 前的 `pre_pivot_llm` 被重渲染为同 id 的 `pivot_llm`(第 5 个渲染点),
+  满足“至少 4 次往返”。interaction 恰两次:`approval_one`(Approve)、`approval_two`(Deny),
+  `recorded_decisions` 断言顺序为 `Approve`→`Deny`,`assert_interaction_decisions(log,2)` 固定计数。
+- **pivot 落在合法 post-tool boundary 且被后续 LLM request 看到**:pivot 在首个 dangerous 结果
+  (`after_danger_one`)之后、下一次 LLM resume 之前注入;`assert_eq!(pre_pivot_llm, pivot_llm)`
+  证明 pivot 是对未决 `NeedLlm` 的原地重渲染(复用同 id,而非新增待决步);`final_request` 断言其
+  `messages` 含带 `PIVOT_TEXT` 的 `Role::User` 消息,证明后续模型 request 确实看到 pivot。
+- **deny 后 dangerous tool 未执行且 turn 继续到 final**:第二次 approval 取 `Deny` 后 machine 不发
+  `NeedTool`,直接 drain 到 `final_llm`,末轮文本把 cursor 推到 `LoopCursorKind::Done`;
+  `assert_tool_executions(DANGEROUS_WRITE, 1)` 证明仅被批准的那次执行(handler 日志仅一条),
+  `final_request` 含 `ToolStatus::Denied` 的 `ToolResult`。M2-2 的 `denied_dangerous_write_does_not_execute_tool`
+  以 `DrainHarness` 独立复核:deny 一次、执行零次、共享 store 未被触碰、turn `Done`。
+- **plan dependency blocked 是 model-visible tool error 而非 panic**:主场景断言
+  `store.claim("implement", …)` 返回 `StoreError::DependencyBlocked{unfinished:[design]}`;M2-2 的
+  `claim_dependency_block_returns_tool_error_and_does_not_mutate_task` 直接经 `ComplexToolHandler.fulfill`
+  证明 `plan_claim` 返回 `ToolStatus::Error`(文本含被阻塞依赖 `design`),且 `implement` 仍 `Todo`、
+  无 owner、plan version 不变——错误经工具结果面暴露给模型,不是 handler panic 或静默降级。
+- **测试可读性**:`tests/agent_complex_flow.rs` 共 576 行,主场景已抽 `fulfill_tool`/`fulfill_interaction`/
+  `resume_tool_batch`/`message_text`/`llm_request_messages`/`recorded_decisions` 等聚焦 helper,断言经
+  M1 支持层的 `assert_*`/`role_sequence` 承载;无新增 DSL、无冗余样板,阶段边界注释清晰,无需重构。
+- **验证结果(全部通过)**:`cargo fmt --all -- --check` 干净;`cargo clippy --all-targets -- -D warnings`
+  无告警;`cargo test --test agent_complex_flow`(3 passed);`cargo test --all --all-targets` 全绿
+  (lib 423 + testkit 131 + 各集成 crate 全通过,仅 credential-gated 集成测试 ignored,无 failed);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
+- 本次 review 未改动任何被测/生产代码,仅更新 `TODO.md`(标记 `[DONE]` + 本记录)与 `memory/claude_plan.md`;
+  Milestone 2 至此签收,后续进入 Milestone 3。
 
 ### [TODO] M3-1 实现 subagent + parent approval pop + shared plan/blackboard 场景
 
