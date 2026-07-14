@@ -363,7 +363,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
   interaction 采用反应式决策(而非直接包 `Script<InteractionStep>`)是因 interaction family 无 `Err`
   且响应须寻址活 request,已在模块与任务文档说明。
 
-### [TODO] M2-3 实现 `TestScope` builder
+### [DONE] M2-3 实现 `TestScope` builder
 
 **前置依赖**:M2-2。
 
@@ -384,6 +384,41 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:只挂 tool 时只有 `tool()` 返回 `Some`。
 - 单测:headless top scope 遇到 `NeedInteraction` 仍返回 `UnhandledRequirement`。
 - 跑全套验证命令。
+
+**完成记录**(2026-07-14):
+
+- **`TestScope` + `TestScopeBuilder`**:`crates/agent-testkit/src/scope.rs` 实现二者。`TestScope` 持五个
+  family 槽 `Option<Arc<dyn LlmHandler/ToolHandler/InteractionHandler/SubagentHandler/ReconfigHandler>>`
+  加一个 `inner: Option<Arc<dyn HandlerScope>>`。`impl HandlerScope for TestScope` 每个 accessor 先看本层
+  override(`Some(arc.as_ref())`),否则委派 `inner`(`inner.and_then(|s| s.llm())` 等),否则 `None`。
+  未显式挂且无 inner 时返回 `None`——scope **默认不 total**,顶层缺 handler 仍暴露
+  `UnhandledRequirement`。
+- **builder 五 family setter**:`.llm(..)`/`.tool(..)`/`.interaction(..)`/`.subagent(..)`/`.reconfig(..)`
+  各取 `Arc<dyn XHandler>`(调用点由具体 `Arc<H>` 自动 unsize 强转,调用方可持另一个具体 `Arc` clone
+  在 drain 后读 `log()`)。`.build()` 出 `TestScope`;`TestScope::builder()`/`TestScope::empty()` 便捷入口。
+- **headless / attended**:未调用 `.interaction(..)` 时 `interaction()` 恒 `None`(headless,不兜底、不
+  auto-approve);`.attended(handler)` 是 `.interaction(handler)` 的语义别名,**必须显式调用**才让该层
+  attended。
+- **wrapping**:`.wrapping(Arc<dyn HandlerScope>)` 设 inner,把本层未 override 的 family 委派给内层
+  (可包 `ReferenceScope` 或另一个 `TestScope`);per-family override 始终优先于被包 scope。
+  「把已有 handler trait object 放入 scope」即各 setter 取 `Arc<dyn XHandler>` 的直接用法。
+- **prelude**:追加 `TestScope`/`TestScopeBuilder` 导出。
+- **测试**(`scope.rs` 内 4 个单测):`empty_scope_serves_no_family`(五 accessor 全 `None`);
+  `tool_only_scope_serves_only_the_tool_family`(仅 `tool()` 为 `Some`,其余 `None`);
+  `wrapping_delegates_unoverridden_families_to_the_inner_scope`(外层只 override llm,`tool()` 经内层解析);
+  `headless_top_scope_surfaces_unhandled_interaction`(inline `RequireApprovalPolicy` +
+  `agent_spec_with_tools([weather_tool])` + `ScriptedLlmHandler` 出 `tool_use`;TestScope 挂 llm+tool 不挂
+  interaction;`drain(.., None, ..)` 返回 `AgentError::UnhandledRequirement { kind: Interaction }`,
+  scripted tool 的 call log 长度 0,证明未 auto-approve 也未跳过)。
+- **验证结果**(全绿):`cargo fmt --all -- --check`;`cargo clippy --all-targets -- -D warnings`
+  与 `-p agent-testkit`(两 crate 均干净);`cargo test -p agent-testkit`(lib 42 含 4 个新 scope 用例
+  + smoke 2);`cargo test --all --all-targets`(agent-lib 434 unit + 集成套件全绿,testkit 42 + 2,
+  0 failed,7 个 network-gated ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 与
+  `-p agent-testkit`(修掉一处对已导入 `HandlerScope` 的 redundant explicit link 后干净);
+  `git diff --check` 干净。
+- **偏离计划**:无。scope 层为纯新增模块,未改 `agent-lib` 运行时语义,未引入 provider wire mock。
+  wrapping 测试用内层 `TestScope`(而非 `ReferenceScope`)演示委派,因 `ReferenceScope` 需 `LlmClient`
+  fake 而 testkit 刻意不 mock `LlmClient`;两者走同一 `Arc<dyn HandlerScope>` 委派路径。
 
 ### [TODO] M2-4 实现 `ScriptMachine` machine double
 
