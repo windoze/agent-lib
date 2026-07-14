@@ -1339,7 +1339,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
   (0 failed,新增 6 用例并入其余套件);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
   未发现需插入前置修复的 spec 偏差或新增未调度失败测试。
 
-### [TODO] M6-R Milestone 6 Review
+### [DONE] M6-R Milestone 6 Review
 
 **前置依赖**:M6-1..M6-4。
 
@@ -1356,6 +1356,25 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 - 全套验证命令全部通过。
 - Review 结论写入完成记录。
+
+**完成记录(2026-07-14)**:
+
+- **性质**:纯 review 任务,未改动任何 Rust 代码;唯一产出改动是 `docs/TESTABILITY.md` 现状描述(§8.1/§8.2/§8.3)。M6-1..M6-4 全部 `[DONE]`(HEAD `c890ad7 [M6-4]`),依赖满足。
+- **全套验证(全绿)**:`cargo fmt --all --check` 干净;`cargo clippy --all-targets -- -D warnings`(workspace)无告警;`cargo test --all --all-targets` **601 passed / 0 failed / 7 ignored**(ignored 全为网络集成:`integration_anthropic` 3 + `integration_normalization` 1 + `integration_openai_resp` 3,按设计跳过);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。文档改动为 `*.md`,不影响编译产物,故沿用同一轮全套绿结果。
+- **迁移前后对比(样板确实下降,而非只加一层抽象)**:
+  - `tests/agent_effect_e2e.rs`:迁移前 1032 行(`git show 32267d1~1`)→ 现 441 行(约 −57%)。
+  - `tests/reference_driver.rs`:迁移前 `src/agent/drive/reference/tests.rs` 1362 行(`git show da09b2e~1`)→ 现 826 行(约 −39%),且 `src/agent/drive/reference/tests.rs` 已删除、不再 tracked。
+  - 两个迁移文件中**已无任何本地 fake struct**(grep `FakeClient|FakeToolRegistry|FakeToolIds|ChildSpawner|ParentScope|ChildScope|ConcurrentToolHandler|CountingApproveInteraction|ComposedScope|CancelScope` → NONE);完成记录列出的共计 ~22 个重复类型/helper 全部由 testkit 等价物取代(M6-1 删 11、M6-2 删 11)。保留的最小本地件均为**有意的非-effect-mock 件**(`ChargingLlmHandler` token 记账、`RequireApprovalPolicy` spec 级策略、`ScriptedLlmClient` reference adapter、单 block 断言小工具),理由在各任务记录中已说明。
+- **覆盖矩阵核对**(现存套件 ↔ `docs/TESTABILITY.md`):
+  - **Core Rust(§8.1)**:规划 8 行,M6-3 调度并交付 5 行——`agent_step_basic`(5)/`agent_tool_basic`(5)/`agent_interaction_basic`(5)/`agent_driver_basic`(4)/`agent_trace_budget_basic`(3),各可单独 `--test` 过滤。未落地 3 行(`agent_pivot_basic`/`agent_reconfig_basic`/`agent_cancel_basic`):§7 明确“不要求一次性全部迁移”,且行为已由 `agent-lib` 低层单测覆盖(pivot→`machine/default/tests/tools.rs`;reconfig→`machine/default/tests/reconfig.rs`+`state.rs`;cancel/never-resume→`context/*`+`machine/default/tests/`)。判定为 deferred 集成镜像,**非缺失覆盖,非 spec 偏差,无需插入前置任务**。
+  - **Scripted Scenario(§8.2)**:6 行均未作为独立命名套件落地——不在 M6 范围内(M6=迁移+基础 coverage+cassette replay)。复杂组合当前已有等价覆盖(多轮 tool loop/auto+guarded→`reference_driver.rs`;pop/peak/subagent→`agent_effect_e2e.rs`+testkit `subagent` 单测;多 reconfig→`machine/default/tests/reconfig.rs`)。独立 scenario 套件依赖 M7 data-only scenario model,合理 deferred。
+  - **Recorded Replay(§8.3)**:规划 5 行,交付 3(`agent_replay_text`/`agent_replay_tool`(tool-error)/`agent_replay_approval`)+ M3-4 `cassette_replay` 基础设施;`agent_replay_reconfig`/`agent_replay_regression` deferred。
+- **replay 离线可跑核对**:`cargo test --all --all-targets` 全程**未设任何环境变量**,4 个 cassette 套件(`agent_replay_text`/`_tool`/`_approval`/`cassette_replay`)各 2 用例全绿——`offline_replay_*` 只读 committed cassette,`regenerate_*` 默认 `RecorderReport::Skipped` no-op、不写盘。record/update 受 `AGENT_TESTKIT_RECORD_CASSETTES` / `AGENT_TESTKIT_UPDATE_CASSETTES` 显式护栏。确认 CI 离线可跑、cassette 不被普通运行改动。cassette JSON 经 `to_json_string_pretty`(无行尾空白/末尾换行)+ redactor 归一 volatile id,`git diff --check` 干净。
+- **文档更新**:`docs/TESTABILITY.md` 新增/补齐三处现状块——§8.1「现状(M6-3 已落地)」(5 交付 + 3 deferred 及其低层单测出处)、§8.2「现状(未落地,deferred 至 M7 之后)」(scenario 套件推迟理由与等价覆盖出处)、§8.3 补一句 reconfig/regression deferred 说明。与既有 §8.3「现状(M6-4 已落地)」表并轨,使文档现状与实际套件一致。
+- **PLAN.md 判定**:M6 未改变 phase 级计划、依赖或完成判据(M1→…→M7 顺序不变,M6 产出与总览一致),故**未改 PLAN.md**——仅记录于 TODO.md 完成记录,符合“PLAN.md 只在 phase 计划变化时更新”。
+- **PLAN §每阶段 Review 逐项核对**:① 只 mock agent effect 边界(`LlmHandler`/`ToolHandler`/`InteractionHandler`/`SubagentHandler`),无 provider wire format——见 PLAN 非目标与 M1-R;② testkit 只依赖公开 API(`agent-testkit -> agent-lib` 普通依赖 + root dev-dep,单元测试引 kit 会触发 `multiple different versions of crate agent_lib`,故迁移件落在集成层,未绕过不变量);③ 负例覆盖保留——`UnhandledRequirement`(`agent_driver_basic`/reference headless)、misaligned result(`agent_driver_basic`)、cancel never-resume(`agent_trace_budget_basic`/e2e)均在;④ cassette 可审阅、可脱敏、CI 离线;⑤ 新 helper 降样板未掩盖行为(line 数下降 + 负例仍暴露);⑥ 文档/计划/代码经本次更新后一致。
+- **结论**:Milestone 6 达标。testkit 实测降低了测试样板(两迁移文件合计 2394→1267 行,−47%,22 重复 fake 归零)并按调度扩展了基础/回放覆盖;所有 replay 默认离线可跑;未发现需插入前置修复的 spec 偏差、workaround 或新增未调度失败测试。§8.1 剩 3 套 + §8.2 scenario 套件为文档已声明的 deferred 项(行为已被低层单测/e2e 覆盖),不阻塞里程碑,后续随 M7 scenario DSL 择机补齐。
+- **无关未追踪文件**:`docs/external-agent.md`(External Agent 设计草案)与 M6/Testability 计划无关、TODO/PLAN 未引用,**不纳入本次提交**。
 
 ---
 

@@ -645,6 +645,24 @@ async fn recorded_tool_round_trip_replays_offline() {
 - 优先替换现有重复 fixture,但保留已有低层状态机单测中直接表达更清楚的部分。
 - 每个 suite 应能单独过滤运行,方便定位回归。
 
+#### 现状(M6-3 已落地)
+
+已落地 5 个 Core Rust 套件(均在 root `tests/`,`use agent_testkit::prelude::*;`,离线,可单独过滤):
+
+| 套件文件 | 用例数 | 覆盖 |
+|---|---|---|
+| `agent_step_basic.rs` | 5 | `StepHarness` 驱动同步 step 协议:user -> NeedLlm、resume text、wrong id、wrong result kind、abandon |
+| `agent_tool_basic.rs` | 5 | `DrainHarness` 跑完整 tool phase:single/parallel tool、tool error、step limit、provider call mismatch |
+| `agent_interaction_basic.rs` | 5 | `ScriptedInteractionHandler` + 最小 approval policy:approve/deny/timeout/cancel、wrong call rejection |
+| `agent_driver_basic.rs` | 4 | `ScriptMachine` + `TestScope`/`ScopePop` 测 drain 路由:local handler、pop、top unhandled、misaligned result |
+| `agent_trace_budget_basic.rs` | 3 | `assert_trace`/`assert_budget`:resolved_at_scope、never-resumed、shared budget ledger |
+
+尚未单独落地 testkit 套件的 3 行(`agent_pivot_basic`、`agent_reconfig_basic`、`agent_cancel_basic`):§7
+明确“不要求一次性全部迁移”,且这些行为已由 `agent-lib` 内的低层单测充分覆盖——pivot 见
+`src/agent/machine/default/tests/tools.rs`,reconfig 见 `src/agent/machine/default/tests/reconfig.rs` 与
+`src/agent/state.rs`,cancel/never-resume 见 `src/agent/context/*` 与 `src/agent/machine/default/tests/`。
+故它们是 deferred 的集成层镜像,而非缺失覆盖;待 scenario DSL(M7)稳定后可择机补齐。
+
 ### 8.2 Scripted Scenario Suites
 
 这些套件仍在 Rust 中运行,但用脚本化步骤表达复杂流程。目标是覆盖多轮、多 handler、多 scope 的组合正确性。
@@ -663,6 +681,16 @@ async fn recorded_tool_round_trip_replays_offline() {
 - 测试主体应读起来像 scenario,不应堆满 fixture 细节。
 - 断言应同时覆盖 final conversation、handler call log、trace/budget 中至少一个可观察面。
 - 复杂场景失败时,错误信息应能指出脚本 step 与 effect family。
+
+#### 现状(未落地,deferred 至 M7 之后)
+
+M6 的范围是“迁移 e2e/reference fake、补基础 coverage、离线 cassette replay”,不含 §8.2 的独立
+scripted scenario 套件,故本节 6 行均尚未作为命名套件落地。当前这些复杂组合已有等价覆盖:多轮
+tool loop 与 auto+guarded 混合见 `tests/reference_driver.rs`;child headless interaction pop 到 parent、
+tool batch out-of-order/peak concurrency、subagent depth/budget/cancel 见 `tests/agent_effect_e2e.rs`
+与 `crates/agent-testkit/src/subagent.rs` 单测;多 queued reconfig / registry swap 见
+`src/agent/machine/default/tests/reconfig.rs`。独立 scenario 套件依赖 M7 的 data-only scenario model
+稳定后再抽,以免过早把复杂脚本固化成不可维护的 Rust 测试代码。
 
 ### 8.3 Recorded Replay Suites
 
@@ -696,6 +724,9 @@ async fn recorded_tool_round_trip_replays_offline() {
 
 每个套件含两个测试:`offline_replay_*`(读 committed cassette 离线回放,断言 final conversation、
 handler call log、final cursor)与 `regenerate_*`(录制/更新 cassette 的 source of truth,默认 skip)。
+
+矩阵中的 `agent_replay_reconfig` 与 `agent_replay_regression` 尚未落地:M6-4 只承诺 text/tool + approval
+或 regression 之一(已交付 approval),这两行随 reconfig/回归场景的真实 cassette 需求出现时再补。
 
 #### 如何 record / update cassette
 
