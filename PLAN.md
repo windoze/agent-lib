@@ -1,134 +1,172 @@
-# 实施计划：Agent Effect Model 迁移
+# 实施计划：Agent Testability 与 `agent-testkit`
 
-> 本计划以 [`docs/agent-effect-model.md`](docs/agent-effect-model.md)(为什么)与
-> [`docs/agent-effect-migration.md`](docs/agent-effect-migration.md)(接口形状与迁移路径)
-> 为规范性设计输入。它把现有 push / 自驱的 `AgentLoop::feed → AgentEvent stream` 契约
-> 翻转为 sans-io + effect-handler 的 `step → (notifications, requirements)` pull 契约。
+> 本计划以 [`docs/TESTABILITY.md`](docs/TESTABILITY.md) 为规范性设计输入。它接续已完成的
+> Agent Effect Model 迁移,把现有散落在各测试文件中的 fake、fixture、script machine、scope
+> wrapper 与断言逻辑收敛成一套 dev-only 测试基础设施。
 >
-> 被本计划取代的旧 Agent Layer 计划(M1–M3 已落地)归档在
-> [`docs/archive/2026-07-13-agent-layer/`](docs/archive/2026-07-13-agent-layer/);
-> 已完成的 Conversation Core 归档在
-> [`docs/archive/2026-07-13-conversation/`](docs/archive/2026-07-13-conversation/)。
-> 逐任务要求与完成记录见 [`TODO.md`](TODO.md)。
+> 已完成的 Agent Effect Model 迁移计划和任务记录已归档到
+> [`docs/archive/2026-07-14-agent-effect-migration/`](docs/archive/2026-07-14-agent-effect-migration/)。
+> 已完成的 Client、Conversation、旧 Agent Layer 记录分别在 `docs/archive/2026-07-13-*` 下。
+> 逐任务要求见 [`TODO.md`](TODO.md)。
 
 ## 范围与非目标
 
-**范围**:把已落地的单 Agent 运行时(`AgentSpec`/`RunContext`/`AgentState`/`LoopCursor`/
-`DefaultAgentLoop`/pivot/reconfig/approval/cancel)重构为 sans-io 计算模型:纯 `step`
-状态机(不做 IO、只吐 requirement)、库外 async driver、requirement/notification 二分、
-handler scope + drain + pop 路由、cancel = never-resume 接 `Conversation::cancel_pending`、
-`LoopCursor` 升格为整台机器的可序列化状态,并落地 agent hierarchy 与 subagent handler。
-复用已完成的 Client `LlmClient`/`ChatRequest`/`Response`/`StreamEvent` 与 Conversation 的
-committed log、pending、`Boundary`、`cancel_pending`、`fork_at`、snapshot/restore 能力。
+**范围**:为 agent effect 层建立可复用测试基础设施,包括 deterministic id source、provider-neutral
+fixtures、scripted handlers、cassette 录制/重放、scope builder、script machine、step/drain harness、
+断言 helper、并发/取消测试工具,并据此组织一组基础 Rust suites、脚本化 scenario suites 与
+recorded replay suites。
 
-**非目标**:不引入 continuation 复制 / multishot(多路径一律 `Conversation::fork_at` → 新
-Agent 承载);不发明通用 DAG/workflow/scheduler;不重新实现 Conversation 的 I1–I4、tool
-pairing、`Boundary` 校验或 restore 门;不引入 provider 特判;不支持一个 Agent 同时持有多个
-活动 Conversation。driver 编排(join/select/串行)归调用者,库只提供机制与不变量。
+**非目标**:不 mock HTTP provider;不替代 adapter/client/stream 协议层测试;不在首版做 Node/NAPI;
+不把所有底层单测改写到 testkit;不拆出 trait crate;不改变 `agent-lib` 运行时 API 语义;不引入
+真实时间 sleep、真实网络或 credentials 作为默认测试条件。
 
-## 规范优先级与已采纳的关键决策
+## 规范优先级与关键决策
 
-`docs/agent-effect-migration.md` 是本阶段权威接口输入。`agent-layer.md` §1.3/§3/§4 已在
-M6-1 按 pull 契约改写并与迁移文档并轨,不再冲突;若历史文本仍有出入,以迁移文档的 pull
-契约为准。迁移文档 §12 的开放决策,本计划**采纳其默认建议**:
-
-1. **sans-io `step` 是核心**:`step(&mut self, StepInput) -> StepOutcome`,纯、同步、无 IO、
-   无 async;`&mut self` 即天然背压。所有 await 在 driver 兑现 requirement 时发生。
-2. **AgentEvent 一分为二**:`Notification`(通知,drain 可跳过)与 `Requirement`(请求,
-   drain 不能跳过,带 `id + origin` 可寻址回程)。turn 结束由 `StepOutcome.quiescent + cursor
-   到达 Done/Error` 表达,不再是流里的 `Done` 事件。
-3. **step 推进到静止并一次吐一批 requirement**(决策 B):直接支撑 hierarchy 聚合与父子并发。
-4. **RequirementId 由 host 供给 trait 分配**(决策 A):新增 `RequirementIds`,与既有
-   `ToolExecutionIds` 一致,保持"库不自己造 id"的既定风格。
-5. **NeedInteraction 泛化 approval**:现有 `ApprovalRequirement/Response/Policy` 成为
-   interaction 的一个子类型 + interaction handler 后端。"运行模式"= 顶层 interaction handler
-   挂真人 UI(attended)还是 policy(unattended)。删除 loop 上的 `respond_approval`。
-6. **cancel = never-resume handler**:`step(StepInput::Abandon(id))` 不回灌结果,迁 cursor 到
-   `CancelRecovery`,触发被弃子树 `Conversation::cancel_pending` 闭合,收尾后仍可 feed。
-   `CancellationToken` 保留为向下的"该停了"信号,不再是 cancel 实现主体。
-7. **pivot = 多喂 input**:`AgentInput::Pivot`,删除 pivot queue / `QueuedPivotTurn` /
-   `interject` 的排队语义;何时插入由 driver / Session 决定。
-8. **LoopCursor 升格**:现有变体已与 requirement 一一对应,补 `RequirementId`(及 `AgentPath`)
-   后即"精确记住卡在哪个 requirement 上";整台机器(含子机器)可序列化,live handle 全移出。
-9. **RunContext 由 drain scope 隐式派生**:cancel↓/budget↕/trace↓ 沿 hierarchy 派生,
-   interaction 走 pop↑;深度上限、预算继承、cancel 传播全部在 subagent handler 强制。
-10. **pop 路由库强制**:本层无 handler 则 pop 给外层(查找从发出者外层起,跳过自身防即时环);
-    顶层仍无 handler 即分类报错 `UnhandledRequirement`,绝不静默跳过或挂起。
-11. **每阶段必须 Review**:每个里程碑末尾有独立 `Mx-R`,审阅接口形状、serde 边界、pop 路由
-    不变量、测试与 rustdoc;Review 不替代实现任务。
+1. **测试分层固定**:协议层测 HTTP/SSE/provider JSON;agent 层测 `Requirement` emit、handler
+   wiring、resume/abandon、conversation/trace/budget 终态;应用层/未来 TS 测复杂编排场景。
+2. **effect 边界 mock**:`agent-testkit` 直接实现 `LlmHandler`、`ToolHandler`、`InteractionHandler`、
+   `SubagentHandler`、`ReconfigHandler` 等公开 trait,不模拟 provider wire format。
+3. **短期不拆 trait crate**:`agent-testkit` 直接依赖 `agent-lib`。若未来要拆,应拆为承载 DTO、错误和
+   trait 的 `agent-core`/`agent-api`,而不是只抽一个薄 traits crate。
+4. **首版优先 Rust**:基础行为与简单组合用 Rust + testkit 覆盖;复杂/真实场景先用 scripted/cassette;
+   JS/TS/NAPI 等 Rust scenario model 稳定后再接。
+5. **cassette 是 provider-neutral fixture**:录制 `ChatRequest`/`Response`、`ToolCall`/`ToolResponse`、
+   `Interaction`/`InteractionResponse` 等 effect req/resp,不录制 headers、auth、base URL 或 provider raw body。
+6. **cassette 默认安全**:record/update 必须显式 opt-in;writer 必须经过 redactor;replay 在 CI 离线可跑。
+7. **testkit 不掩盖不变量**:`TestScope` 不默认兜底所有 handler;顶层缺 handler 仍应暴露
+   `UnhandledRequirement`;handler 常规错误必须留在同 family 的 `Err` 中。
+8. **完成门一致**:每个任务按 format → clippy → 聚焦测试 → 全量测试 → rustdoc → diff check 验证。
 
 ## 里程碑总览
 
-| 里程碑 | 迁移文档阶段 | 目标 | 主要产出 |
-|---|---|---|---|
-| **M1 类型骨架** | 阶段 0 | 新增 requirement/notification/interaction 类型,不改行为 | `Requirement`/`RequirementKind`/`RequirementId`/`AgentPath`/`RequirementResult`/`Notification`/`Interaction*` |
-| **M2 sans-io step** | 阶段 1 | 把 `DefaultAgentLoop` 推进逻辑抽成纯 `AgentMachine::step` | `AgentMachine`/`StepInput`/`StepOutcome`、`AgentInput` 调整、`LoopCursor` 升格 |
-| **M3 driver + drain(单层)** | 阶段 2 | 库侧 handler scope + drain + pop;参考 driver 复跑现有集成测试 | `HandlerScope`/四个 handler trait/`drain`/`UnhandledRequirement`、参考 driver |
-| **M4 cancel / pivot 收编** | 阶段 3 | cancel→never-resume、pivot→多喂 input,删旧机制 | `Abandon` + `cancel_pending` glue、`AgentInput::Pivot`、删 `respond_approval`/pivot queue/guard |
-| **M5 hierarchy / subagent** | 阶段 4 | 嵌套状态机 + `NeedSubagent` handler + 作用域强制 | 嵌套机器 state、`SubagentHandler`、深度/预算/cancel 强制、trace resolved-by-scope |
-| **M6 文档并轨与端到端验收** | 阶段 5 | 更新主文档,attended+headless 端到端验收与示例 | `agent-layer.md`/`README` 更新、多 agent 示例、Agent 层总 Review |
+| 里程碑 | 目标 | 主要产出 |
+|---|---|---|
+| **M1 Testkit 骨架与基础数据** | 建立 dev-only crate / 支持模块、id source 与 fixtures | `agent-testkit` skeleton、`SeqIds`、fixtures、prelude |
+| **M2 Scripted handlers 与 scope** | 把现有 fake 收敛成可脚本化 handlers 和 scope builder | script model、call log、scripted handlers、`TestScope`、`ScriptMachine` |
+| **M3 Cassette 录制/重放** | 记录真实 effect req/resp,并在 CI 离线重放 | cassette schema、redactor、fingerprint、replay handlers、record/update wrapper |
+| **M4 Harness 与断言库** | 降低 step/drain 测试样板,统一状态断言 | `StepHarness`、`DrainHarness`、conversation/notification/trace/budget assertions |
+| **M5 并发、取消与 subagent 工具** | 稳定表达乱序、并发峰值、取消时机和子 agent scope | delay/barrier/peak、cancel-on-call、panic-on-call、scripted subagent spawner |
+| **M6 测试套件迁移与扩展** | 用 testkit 组织基础 Rust suites、scenario suites、recorded replay suites | 迁移 e2e/reference fake、补基础 coverage、离线 cassette replay 测试 |
+| **M7 Scenario DSL 与文档并轨** | 为未来 TS/NAPI 保留数据化 scenario 入口,完成文档和示例 | scenario model 草案、runner spike、README/docs 更新、总 Review |
 
-依赖顺序固定:M1 → M2 → M3 → M4 → M5 → M6。后续里程碑只依赖前序已暴露的受检 API,不得
-公开裸机器状态、unchecked serde 或绕过 pop 路由的兑现入口。
+依赖顺序固定:M1 → M2 → M3 → M4 → M5 → M6 → M7。每个里程碑末尾必须有独立 Review 任务。
 
-## 受影响的目录与公共 API 边界
+## 建议目录与依赖形状
+
+首选 crate 形态:
 
 ```text
-src/agent/
-  requirement.rs   # 新增:Requirement、RequirementKind、RequirementId、AgentPath、
-                   #        RequirementResult、RequirementResolution、RequirementIds 供给 trait
-  interaction.rs   # 由 approval.rs 演进:Interaction/InteractionKind/InteractionResponse;
-                   #        旧 Approval* 类型保留并 re-export
-  event.rs         # AgentEvent 拆出 Notification;调整 AgentInput(UserMessage/Pivot)
-  machine.rs       # 新增:AgentMachine trait、StepInput、StepOutcome
-  loop_driver.rs   # 弱化/删除 AgentFeedGuard;AgentLoop → driver 侧
-  loop_driver/default.rs  # 拆分:纯推进逻辑 → step;client/tool/approval/sleep → driver + handler
-  state/cursor.rs  # LoopCursor 各变体补 RequirementId / AgentPath,升格为机器状态
-  state.rs         # AgentState 移出 live handle;为 hierarchy 预留子机器包含结构
-  drive.rs         # 新增:HandlerScope、LlmHandler/ToolHandler/InteractionHandler/SubagentHandler、
-                   #        drain 参考实现、Pop 路由、UnhandledRequirement 错误
-  context.rs       # RunContext 保留;派生点从机器内部挪到 subagent handler
-  context/trace.rs # 新增 TraceNodeKind::Requirement { resolved_at_scope, disposition }
+crates/agent-testkit/
+  Cargo.toml
+  src/
+    lib.rs
+    ids.rs
+    fixtures.rs
+    script.rs
+    handlers.rs
+    cassette.rs
+    scope.rs
+    machine.rs
+    harness.rs
+    assertions.rs
+    concurrency.rs
+    subagent.rs
+    prelude.rs
+  tests/
+    smoke.rs
 ```
 
-公共 API 只暴露受检操作与只读查询:构造机器、`step` 推进、消费 `Notification`、把
-`Requirement` 交给 driver 兑现、`Resume`/`Abandon` 回灌、drain/scope 组合、snapshot/restore
-data-only 机器状态。内部不得公开裸 mutable 机器容器、unchecked cursor、可跳过 pop 的兑现
-入口或 bypass `cancel_pending` 的丢弃入口。
+推荐依赖:
 
-## 测试策略与完成门
+```text
+agent-lib                 # 当前核心库:公开 trait + 默认机器 + reference driver
+agent-testkit --dep--> agent-lib
 
-- **类型/serde 单测**:全部新增 requirement/notification/interaction/cursor 类型 round-trip;
-  `RequirementResult` 与 `RequirementKind` 的类型对齐(NeedLlm 只接 Llm result)分类报错。
-- **step 状态机测试(纯、无 async)**:喂 requirement 结果序列 → 断言 `notifications`/
-  `requirements`/`cursor`/`quiescent`;覆盖 text-only、single/parallel tool、tool failure
-  self-heal、approval(NeedInteraction)、max steps、budget exhausted、abandon 后 cursor 状态。
-- **drain / pop 测试**:本层兑现不冒泡;本层无 handler 则 pop;顶层无 handler 报
-  `UnhandledRequirement`;pop 从外层起(handler 自 perform 同类不回到自身)。
-- **迁移回归**:M3 用参考 driver 复跑现有 `DefaultAgentLoop` 的 50 个集成测试
-  (`src/agent/loop_driver/default/tests.rs`)语义,text/tool/approval turn 全绿。
-- **cancel/pivot 测试**:"cancel 后仍可 feed" 迁到 never-resume 路径并通过;pivot 软转向。
-- **hierarchy 测试**:attended 父 + headless 子(子 `NeedInteraction` pop 到父真人后端)端到端;
-  父子并发兑现按完成顺序回灌;深度上限/预算继承/cancel 传播由 subagent handler 强制。
-- **命令顺序**:每个任务先 `cargo fmt --all`,再 `cargo clippy --all-targets -- -D warnings`,
-  随后聚焦测试与 `cargo test --all --all-targets`,最后
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 与 `git diff --check`。全量测试最长 30
-  分钟,单个测试必须少于 1 分钟。
+agent-lib tests --dev-dep--> agent-testkit   # 若 Cargo 拓扑可接受
+或:
+agent-testkit/tests/ 同时依赖 agent-testkit 和 agent-lib
+```
 
-## Serde / 恢复边界
+如果 root package + workspace 共存带来不必要复杂度,允许先以 `tests/support/agent_testkit` 过渡,但
+M1 Review 必须记录最终选择与理由。
 
-可持久化事实:`AgentSpec`、机器状态(含 `LoopCursor` + 各 cursor 里的 `RequirementId` /
-`AgentPath`)、唯一活动 Conversation snapshot、active skills、budget 剩余额度、trace record。
-跨进程恢复时,driver 用 cursor 里的 `RequirementId` 重建未决 requirement 登记表。
+## 测试套件策略
 
-不得持久化:live `LlmClient`/`ToolRegistry`/handler、tokio task、channel、
-`CancellationToken` 内部状态、interaction 后端、active stream。恢复后的 Conversation 必须
-通过既有 `Conversation::restore` 校验。
+**Core Rust suites** 快速、细粒度、默认离线:
 
-## 每阶段结束的 Review
+| 套件 | 目标 |
+|---|---|
+| `agent_step_basic` | user -> NeedLlm、resume text、wrong id/kind、abandon |
+| `agent_tool_basic` | single/parallel tool、tool error、step limit、provider call mismatch |
+| `agent_interaction_basic` | approve/deny/timeout/cancel、wrong call/step rejection |
+| `agent_pivot_basic` | post-tool pivot 成功与非法边界拒绝 |
+| `agent_reconfig_basic` | idle/during-turn reconfig、registry effect、atomic reject |
+| `agent_driver_basic` | local handler、pop、top unhandled、misaligned result |
+| `agent_cancel_basic` | never-resume, cancel 后新 turn 可继续 |
+| `agent_trace_budget_basic` | resolved_at_scope、disposition、budget 共享 |
 
-每个里程碑末尾必须有独立 `Mx-R`,核对是否遵守迁移文档:sans-io `step` 不 await、
-requirement/notification 二分、`id + origin` 可寻址、pop 路由与顶层 total、cancel=never-resume
-接 `cancel_pending`、多路径走 `fork_at` 不做 multishot、RunContext 由 scope 派生、serde/runtime
-分离、公共 API 封装、错误分类、rustdoc。M6-R 额外回溯本计划与 `TODO.md` 全文,确认没有
-重新实现或弱化 Conversation Core 已落地的不变量。
+**Scripted scenario suites** 覆盖复杂组合:
+
+- 多轮 tool loop。
+- auto tool + guarded tool 混合。
+- child headless interaction pop 到 parent。
+- tool batch out-of-order 与 cancel timing。
+- 多 queued reconfig 与 registry swap。
+- subagent depth/budget/cancel 组合。
+
+**Recorded replay suites** 复用真实 req/resp:
+
+- recorded text turn。
+- recorded tool-use round trip。
+- recorded approval flow。
+- recorded reconfig / registry swap。
+- 历史 bug 的真实 flow 固化。
+
+**Future DSL/TS suites** 等 scenario model 稳定后再接,先支持 JSON runner,再考虑 NAPI。
+
+## Cassette 边界
+
+录制内容:
+
+- schema version、crate version、test name、说明。
+- effect family、调用序号、normalized request、request fingerprint。
+- normalized result、review summary。
+- 可选 final cursor、notifications summary、conversation summary、trace requirement disposition。
+
+不录制:
+
+- HTTP headers、auth token、endpoint、provider raw response body。
+- live client/registry/callback/runtime handle。
+- 未脱敏敏感输入。
+- wall-clock timing,除非显式作为测试输入。
+
+默认匹配策略:
+
+- family + 顺序 + request fingerprint。
+- 忽略 volatile ids,包括 `RequirementId`、`TraceNodeId` 和测试运行分配的 host ids。
+- `ChatRequest` fingerprint 包含 model/system/messages/tools/max_tokens/temperature/provider extras 的脱敏 canonical 形状。
+
+## 验证与完成门
+
+每项任务至少执行:
+
+- `cargo fmt --all`
+- `cargo clippy --all-targets -- -D warnings`
+- 相关聚焦测试
+- `cargo test --all --all-targets`
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
+- `git diff --check`
+
+若任务只改文档,至少执行 `git diff --check`,并说明未运行 Rust 构建的理由。新增测试不得依赖网络、
+credentials 或真实 sleep。record/update cassette 必须默认 skipped 或显式 opt-in。
+
+## 每阶段 Review
+
+每个 `Mx-R` 必须核对:
+
+- 是否仍只 mock agent effect 边界,没有把 provider wire format 混入 testkit。
+- testkit 是否只依赖公开 API,没有绕过 `agent-lib` 不变量。
+- 是否保留 `UnhandledRequirement`、misaligned result、cancel never-resume 等负例覆盖。
+- cassette 是否可审阅、可脱敏、CI 离线可跑。
+- 新 helper 是否减少样板而不是掩盖行为。
+- 文档、README、计划与实际代码是否一致。
