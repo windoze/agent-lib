@@ -294,7 +294,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
   redundant explicit intra-doc link 后干净);`git diff --check` 干净。
 - **偏离计划**:无。script 层为纯新增模块,未改 `agent-lib` 运行时语义,未引入 provider wire mock。
 
-### [TODO] M2-2 实现 scripted effect handlers
+### [DONE] M2-2 实现 scripted effect handlers
 
 **前置依赖**:M2-1。
 
@@ -317,6 +317,51 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:LLM/tool/interaction/reconfig 错误路径都保留在正确 family。
 - 单测:misaligned wrapper 能触发 `drain` 的 misaligned result 错误。
 - 跑全套验证命令。
+
+**完成记录**(2026-07-14):
+
+- **四个 scripted handler**:`crates/agent-testkit/src/handlers.rs` 实现 `ScriptedLlmHandler`(`LlmHandler`)、
+  `ScriptedToolHandler`(`ToolHandler`)、`ScriptedInteractionHandler`(`InteractionHandler`)、
+  `ScriptedReconfigHandler`(`ReconfigHandler`)。前三/四个 script-backed handler 各持
+  `Arc<Script<Step>>` + `Arc<CallLog<Req, RequirementResult>>`(别名 `LlmCallLog`/`ToolCallLog`/
+  `InteractionCallLog`/`ReconfigCallLog`),`new(Arc<Script>)` 与 `from_steps(iter)` 两种构造,
+  `script()`/`log()` accessor 供 drain 后读取。每次 `fulfill` 都 `log.begin(req)` → 产结果 →
+  `log.complete(ticket, result)`,记录 dispatch 与 completion 双序号。
+- **family-aligned 错误**:`into_result()` 恒对齐 family;script 耗尽(`StrictMode::Error`)按 family 折叠为
+  族内 `Err`——LLM→`Llm(Err(ClientError::Other))`,Tool→`Tool(Err(ToolRuntimeError::ExecutionFailed{tool_name}))`,
+  Reconfig→`Reconfig(Err(ToolRuntimeError::InvalidRegistry))`;`StrictMode::Panic` 时 `Script::next_step`
+  自身 panic(opt-in),handler 不折叠。绝不用 wrong family 表达失败。
+- **interaction 反应式**:`InteractionResponse` 无 `Err` family 且 approval 响应必须寻址活 request 的
+  `step_id`/`call_id`,故 `ScriptedInteractionHandler` 采用反应式 `InteractionDecision`
+  (`Approve`/`ApproveWith`/`Deny`/`Answer`/`Choice`/`Response`)而非重放预建响应队列。helper:
+  `approve_all()`、`deny_all(message)`(固定 disposition),`sequence(decisions)`(按 dispatch 顺序消费,
+  耗尽时 `StrictMode::Error` 回落到可配 `with_exhausted_decision`(默认 `Deny(None)`),`StrictMode::Panic`
+  + `with_label` 显式 panic)。`approval_response` 从 request 构造寻址正确的 `ApprovalResponse`,
+  Question/Choice 给出 trivial in-family 响应。
+- **ScriptedToolRegistry**:`ToolRegistry`(+`Debug`)变体,`declarations()` 返回声明的 `Tool` 集,
+  `execute()` 走 `Script<ToolStep>`(与 `ScriptedToolHandler` 共用 `tool_step_result` 折叠逻辑),
+  供经 reference `ToolRegistryHandler`/turn-boundary reconfig 的测试使用。
+- **MisalignedHandler**:持一个 wrong-family `RequirementResult`,同时实现四个 handler trait,`fulfill`
+  恒返回该 result,用于触发 `drain` 的 `RequirementKind::accepts` 校验失败。
+- **prelude**:追加 `ScriptedLlmHandler`/`ScriptedToolHandler`/`ScriptedInteractionHandler`/
+  `ScriptedReconfigHandler`/`ScriptedToolRegistry`/`MisalignedHandler`/`InteractionDecision` 及四个
+  CallLog 别名导出。
+- **测试**(`handlers.rs` 内 12 个单测):四 family 的结果均被对应 `RequirementKind::accepts` 接受
+  (interaction 用真实 approval request,验证 step/call 寻址);LLM/tool/reconfig 的 scripted 错误与
+  耗尽折叠都停留在正确 family;`interaction_deny_stays_in_the_interaction_family`;
+  interaction sequence 顺序消费 + 耗尽回落;interaction panic 模式仅 opt-in 才 panic(`catch_unwind` +
+  `futures::executor::block_on`);ScriptedToolRegistry declare/execute/耗尽;
+  用内联 `LlmScope` + `drain` 做 scripted-LLM 文本回合冒烟(抵达 `Done`,log 记 1 条);
+  `misaligned_handler_trips_the_drain_family_check` 断言 `drain` 返回含 "misaligned" 的 `AgentError::Other`。
+- **验证结果**(全绿):`cargo fmt --all -- --check`;`cargo clippy --all-targets -- -D warnings`
+  与 `-p agent-testkit`(两 crate 均干净);`cargo test -p agent-testkit`(lib 38 含 12 个新 handler 用例
+  + smoke 2);`cargo test --all --all-targets`(agent-lib 434 unit + 集成套件全绿,testkit 38 + 2,
+  0 failed,7 个 network-gated ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 与
+  `-p agent-testkit`(修掉一处 redundant explicit link 与一处把 `Deny(None)` 误判为 intra-doc link 后干净);
+  `git diff --check` 干净。
+- **偏离计划**:无。handlers 层为纯新增模块,未改 `agent-lib` 运行时语义,未引入 provider wire mock;
+  interaction 采用反应式决策(而非直接包 `Script<InteractionStep>`)是因 interaction family 无 `Err`
+  且响应须寻址活 request,已在模块与任务文档说明。
 
 ### [TODO] M2-3 实现 `TestScope` builder
 

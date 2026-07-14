@@ -11,6 +11,11 @@ pub use crate::fixtures::{
     calendar_tool, default_machine, root_context, text_block, tool_call, tool_error_response,
     tool_ok, tool_response, usage, user_input, user_message, weather_tool,
 };
+pub use crate::handlers::{
+    InteractionCallLog, InteractionDecision, LlmCallLog, MisalignedHandler, ReconfigCallLog,
+    ScriptedInteractionHandler, ScriptedLlmHandler, ScriptedReconfigHandler, ScriptedToolHandler,
+    ScriptedToolRegistry, ToolCallLog,
+};
 pub use crate::ids::{RequirementAllocation, SeqIds};
 pub use crate::script::{
     CallLog, CallRecord, CallTicket, InteractionStep, LlmStep, ReconfigStep, Script, ScriptError,
