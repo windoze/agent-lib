@@ -579,7 +579,7 @@ plan/blackboard。现有 `agent-testkit` 已有 `ScriptedSubagentSpawner`、`hea
   credential-gated 集成测试 ignored,无 failed);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
   --workspace` 无告警;`git diff --check` 干净。
 
-### [TODO] M3-2 实现 cancel during subagent/tool wait 场景
+### [DONE] M3-2 实现 cancel during subagent/tool wait 场景
 
 **前置依赖**:M3-1。
 
@@ -611,6 +611,48 @@ plan/blackboard。现有 `agent-testkit` 已有 `ScriptedSubagentSpawner`、`hea
 - `cargo test --all --all-targets`。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - `git diff --check`。
+
+**完成记录**:
+
+- 新建 `tests/agent_complex_cancel.rs`,单测
+  `complex_cancel_abandons_child_and_preserves_committed_state`,复用 `agent-testkit` 的
+  `ScriptedSubagentSpawner` / `DrivingSubagentHandler` / `SpawnedChildBuilder` /
+  `headless_child_scope` / `ScopePop` 与 M1 支持层的 `MockPlanBlackboardStore` /
+  `complex_tool_handler` / `complex_agent_machine` / `complex_scope`。测试分两段跑在同一个
+  `Arc<MockPlanBlackboardStore>` 上。
+- **机制核对**:`src/agent/drive.rs::drain` 在每轮循环顶部、`fulfill_batch` 之前检查
+  `ctx.is_cancelled()`;命中则把首个 pending requirement 记为 `NeverResumed`@`resolved_at_scope==0`、
+  向 machine 喂 `StepInput::Abandon`、随后 break 并返回 `Ok(TurnDone)`。
+  `DrivingSubagentHandler::fulfill` 先过 depth guard,再 `child_ids`→`derive_child`(继承 parent 的
+  budget 与 cancellation、共享 trace `Arc`)→`spawn`→`drain(child, child_ctx)`→`summarize`。因此
+  “先 cancel parent ctx 再驱动 subagent handler”会让 child_ctx 一开始就是 cancelled,child drain 在第一个
+  fulfill 前就 abandon 掉 child 的 outstanding requirement——`resume_count==0` 且 handler 从不执行。
+  这与参考单测 `src/agent/drive/subagent/tests.rs::parent_cancel_propagates_and_abandons_child` 同构。
+  已确认 `CancelOnCall` 无法达成该形状(它在 fulfill 内部 cancel,requirement 仍会被 Resume),故采用参考写法。
+- **Phase A(cancel abandons child)**:seed `create(v0)`→`add_task(review,[])(v1)`→
+  `claim(review,"worker",1)(v2, InProgress)`、`post("worker","review started")`,断言 seeded version==2。
+  child 是 `ScriptMachine`,emit 单个 `NeedTool`——`plan_update(review, worker, completed, ev=2)`
+  (若执行会把 `review` 置 `Completed`,正是不该发生的 side effect);`.idle_on_abandon()`。child scope
+  headless,tool = 共享 store 的 `ComplexToolHandler`。`ctx.cancellation().cancel()` 后
+  `handler.fulfill(&spec_ref,&brief,None,&mut outer,&ctx)`→`Subagent(Ok(_))`(cancel 是有序收尾而非错误)。
+  断言:`ids_calls/spawn_calls/summarize_calls==1`;`child_log.abandon_count()==1` 且 `resume_count()==0`;
+  `assert_tool_executions(child_tool,PLAN_UPDATE,0)` 且 `calls().is_empty()`;`review` 仍 `InProgress`、
+  owner=`worker`;`assert_board_messages(&store,["review started"])`(无重复、无 completed side effect);
+  `assert_trace(&ctx).subagent_count(1)`、child `NeedTool` 节点 `resolved_at_scope(0).never_resumed()`。
+- **Phase B(cancel 后仍可用)**:fresh `cleanup_ctx`,parent = `complex_agent_machine`
+  (真实 `DefaultAgentMachine`),scripted LLM ① tool_use `blackboard_post("parent","review cancelled")`
+  + `plan_update(review, worker, cancelled, ev=2)`(`InProgress`→`Cancelled` 合法转换,沿用 worker 的
+  claim)② text;`drain(...)`→`LoopCursorKind::Done`。断言 `review`==`Cancelled`;
+  `assert_board_messages(&store,["review started","review cancelled"])`(无重复 started);
+  `assert_conversation(cleanup.state().conversation()).committed_turns(1).pending_none()`——证明 cancel
+  只作用于其所在 run,store 与 machine 之后仍可提交新 turn。
+- **确定性**:cancel 时机由显式 `ctx.cancellation().cancel()` 固定在驱动 subagent 之前,不用真实 sleep、
+  网络或时钟,离线稳定;单测 <1s。
+- **验证结果(全部通过)**:`cargo fmt --all -- --check` 干净;`cargo clippy --all-targets -- -D warnings`
+  无告警;`cargo test --test agent_complex_cancel complex_cancel_abandons_child_and_preserves_committed_state`
+  (1 passed);`cargo test --all --all-targets` 全绿(lib 423 + testkit 131 + 各集成 crate 全通过,仅
+  credential-gated 集成测试 ignored,无 failed);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  无告警;`git diff --check` 干净。
 
 ### [TODO] M3-R Milestone 3 Review
 

@@ -1,42 +1,52 @@
-# 当前任务：M3-1 subagent + parent approval pop + shared plan/blackboard 场景
+# 当前任务：M3-2 cancel during subagent/tool wait 场景
 
 ## 定位
-- `TODO.md` 第一个未完成任务 = **M3-1**（行 503，首个 `[TODO]`）。前置 M2-R 已 `[DONE]`。
-- HEAD=6396734（[M2-R]），工作树干净。属于 Milestone 3。
-- 非 review 任务，**不拆分**。产出：新建 `tests/agent_complex_subagent.rs`。
+- `TODO.md` 第一个未完成任务 = **M3-2**（行 582，首个 `[TODO]`）。前置 M3-1 已 `[DONE]`。
+- HEAD=18ff0e1（[M3-1]），工作树干净。Milestone 3，非 review 任务，**不拆分**。
+- 产出：新建 `tests/agent_complex_cancel.rs`，单测
+  `complex_cancel_abandons_child_and_preserves_committed_state`。
 
-## 设计（复用现有基础设施）
-参考 `tests/agent_effect_e2e.rs::attended_parent_serves_headless_child_via_pop`，
-child 换成跑 plan/blackboard 工具的真实 `DefaultAgentMachine`（`complex_agent_machine`）。
+## 关键机制（已核对源码）
+- `drain` 在每次循环顶部、fulfill 前检查 `ctx.is_cancelled()`：命中则把首个 pending
+  requirement 记为 `NeverResumed`@scope0、喂 `Abandon` 给 machine，然后 break（返回 Ok）。
+  → 要让 child `resume_count==0 & abandon_count==1`，必须在 child drain 首个 fulfill 前
+  child_ctx 已 cancelled。
+- `DrivingSubagentHandler::fulfill`：depth guard → child_ids → `derive_child`（继承
+  parent 的 budget + cancel，共享 trace Arc）→ spawn → `drain(child, child_ctx)` → summarize。
+  parent ctx 先 cancel，则 child_ctx 继承 cancel，child 首个 req 立即被 abandon，child
+  handler 从不执行。参照 `src/agent/drive/subagent/tests.rs::parent_cancel_propagates_and_abandons_child`。
+- `ScopePop`/`Pop`/`SubagentHandler` 均 `pub`（src/agent/mod.rs 导出），集成测试可直接驱动 handler。
+- 不能用 `CancelOnCall` 打到 child：它在 fulfill 内 cancel，requirement 仍被 Resume（resume_count>=1）。
+  故采用 “先 cancel parent ctx 再驱动 subagent handler” 的参考写法。
 
-- shared `Arc<MockPlanBlackboardStore>`，直接预置 plan：
-  - create → design(v1) → review depends[design](v2) → implement depends[review](v3)
-  - claim(design,seed,3)→v4；update(design,seed,Completed,4)→v5。V_seed=5。
-- child = `complex_agent_machine`，headless scope：llm(charging scripted)+tool(complex_tool_handler(store))，无 interaction → 审批 pop 到 parent。
-- child LLM 脚本（4 步）：
-  1. tool_use: plan_claim_first_available(worker,ev=5)+blackboard_post(child,"review started") → claim review, v6
-  2. tool_use: dangerous_write("apply review fix") → 审批 pop→approve→执行, post board
-  3. tool_use: plan_update(review,worker,Completed,ev=6)+blackboard_post(child,"review done") → v7
-  4. final text
-- parent = ScriptMachine emit 1×NeedSubagent；scope = parent_scope_with_subagent(handler).attended(approve_all)。
-- 驱动前 parent 直接 store.post("parent","delegating…") 展示共享 board + sender 区分。
-- charging LLM wrapper（照抄 e2e）把 child usage 计入 shared ledger。总 tokens=8+6+9+5=28。
+## 设计（复用 testkit + M1 支持层）
+shared `Arc<MockPlanBlackboardStore>`：
+- Phase A（cancel abandons child）：
+  - seed：create(v0) → add_task(review,[])(v1) → claim(review,"worker",1)(v2, InProgress)。
+    post("worker","review started")（代表 worker 取消前已提交的进度）。ver=2。
+  - child = `ScriptMachine` emit 1×`NeedTool`：`plan_update(review, worker, completed, ev=2)`
+    （若执行会把 review 置 Completed —— 正是不该发生的 side effect）。`.idle_on_abandon()`。
+  - child scope = `headless_child_scope().tool(complex_tool_handler(store)).build()`。
+  - spawner = `ScriptedSubagentSpawner::builder(ids.clone()).child(child).summary("review cancelled before completion").build()`；`handler = spawner.into_handler(4)`。
+  - outer = `ScopePop::new(&TestScope::builder().build(), None)`。
+  - `ctx.cancellation().cancel()`，再 `handler.fulfill(&spec_ref, &brief, None, &mut outer, &ctx).await` → `Subagent(Ok(_))`。
+- Phase B（cancel 后仍可用）：fresh `ctx2`，parent = `complex_agent_machine`（DefaultAgentMachine），
+  scripted LLM：① tool_use blackboard_post("parent","review cancelled")+plan_update(review,worker,cancelled,ev=2) ② text。
+  `drain(&mut cleanup, user_input, &complex_scope(llm,tool,None), None, &ctx2)` → Done。
 
 ## 断言
-- spawn_calls==1, summarize_calls==1, ids_calls==1。
-- parent_interaction_log.len()==1（child 审批 pop 到 parent, 决定 Approve）。
-- review: owner=worker, status=Completed；implement: 无 owner + Todo（未被 claim）。
-- design Completed；depends_on 不变。
-- board 4 条按序 [parent, review started(child), apply review fix(dangerous_write), review done(child)]，sender 可区分。
-- dangerous_write 执行恰好 1 次。
-- child token 计入 parent ctx.budget()==28。
-- trace: subagent_count==1；child interaction requirement resolved_at_scope==1+Resumed；parent NeedSubagent resumed（parent_log.resume_tags()==[Subagent]）。
+- ids_calls/spawn_calls/summarize_calls == 1（生命周期在 cancel 下仍干净收尾）。
+- child log: `abandon_count()==1`、`resume_count()==0`。
+- child tool 从不执行：`assert_tool_executions(child_tool, PLAN_UPDATE, 0)` 且 `calls().is_empty()`。
+- Phase A 后 review 仍 `InProgress`、owner=worker；board==["review started"]（无重复/无 completed side effect）。
+- trace：`subagent_count(1)`；child NeedTool req `resolved_at_scope(0).never_resumed()`。
+- Phase B 后：review==`Cancelled`；board==["review started","review cancelled"]（无重复 started）；
+  `assert_conversation(cleanup.state().conversation()).committed_turns(1).pending_none()`；done cursor==Done。
 
 ## 验证顺序
-fmt --check → clippy --all-targets -D warnings → cargo test --test agent_complex_subagent → full suite → RUSTDOCFLAGS=-D warnings cargo doc → git diff --check。
+`cargo fmt --all -- --check` → `cargo clippy --all-targets -- -D warnings` →
+`cargo test --test agent_complex_cancel complex_cancel_abandons_child_and_preserves_committed_state` →
+`cargo test --all --all-targets`（<30min）→ `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` → `git diff --check`。
 
 ## 完成
-TODO.md M3-1 [TODO]→[DONE] + 写完成记录；提交 [M3-1]；停止。
-
-## 进度
-- [完成] tests/agent_complex_subagent.rs 写好，全部验证门通过（fmt/clippy/focused/full all-targets/doc -D warnings/diff --check）。TODO.md M3-1 标 [DONE] 并写完成记录。待提交 [M3-1]。
+TODO.md M3-2 `[TODO]`→`[DONE]` + 写完成记录；提交 `[M3-2] ...`；停止。
