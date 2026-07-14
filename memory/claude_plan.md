@@ -1,49 +1,57 @@
-# 当前任务：M7-R Milestone 7 与 Testability 总 Review
+# 当前任务：M1-1 建立复杂测试支持模块与 MockPlanBlackboardStore
 
 ## 定位
-- `TODO.md` 第一个未完成任务 = **M7-R**（line 1490，标题 `[TODO]`）。M1..M6 与 M7-1/M7-2 全部 `[DONE]`。
-- HEAD=a19fb15 [M7-2]。前置依赖 M7-1..M7-2 已完成，无阻塞。
-- 工作树干净，唯一未跟踪文件 `docs/external-agent.md`（无关 External Agent 草案，TODO/PLAN 未引用，不纳入提交）。
-- 这是 Review 任务：不做代码功能改动，除非 review 发现 spec 偏差/失败测试需修复或新增前置任务。不得拆分 review 任务。
+- `TODO.md` 第一个未完成任务 = **M1-1**（首个 `[TODO]`）。前置依赖：无。
+- 新一轮计划：复杂 Mock 测试与 Plan 依赖语义（PLAN.md / docs/complex-tests.md / docs/agent-layer.md §6.2）。
+- HEAD=a1a94ee，工作树干净。上一轮 M1..M7 已归档。
 
-## 任务要求（TODO.md M7-R）
-做什么：
-- 回溯 `PLAN.md`、`TODO.md`、`docs/TESTABILITY.md`。
-- 确认 testkit 没有引入 provider wire mock。
-- 确认基础 Rust suites 与 recorded replay suites 默认离线可跑。
-- 确认 cassette 脱敏与 update 护栏有效。
-- 确认 scenario DSL 是否足以作为未来 TS/NAPI 输入；若不足，列出缺口。
-- 总结是否仍无需拆 trait crate；若 Cargo 拓扑证明需拆，提出单独后续计划。
+## 目标（TODO.md M1-1）
+新建：
+- `tests/complex_support/mod.rs`（声明 `pub mod plan_blackboard;`）
+- `tests/complex_support/plan_blackboard.rs`（内存 store + 类型 + 错误）
+- `tests/agent_complex_support.rs`（`#[path="complex_support/mod.rs"] mod complex_support;` + 4 个测试）
 
-验证：
-- 全套验证命令全部通过。
-- 总 Review 结论与后续项写入完成记录。
+数据模型：
+- `MockPlanBlackboardStore { plan: Mutex<PlanState>, board: Mutex<Vec<BoardMessage>>, ops: Mutex<Vec<StoreOp>> }`
+- `PlanState { id: PlanId, version: u64, task_order: Vec<String>, tasks: BTreeMap<String, TaskState> }`
+- `TaskState { status: TaskStatus, owner: Option<String>, depends_on: Vec<String> }`
+- `TaskStatus`: Todo/InProgress/Completed/Blocked/Cancelled
+- `BoardMessage { offset: u64, sender: String, text: String }`
+- `StoreOp { kind, outcome: Result<String,String> }`，成功/失败都记录
 
-## Review 核查清单（逐条取证）
-1. [ ] 无 provider wire mock：grep testkit 源码无 reqwest/hyper/http/sse/base_url/headers/auth 传输层 mock。
-2. [ ] 离线可跑：core suites 与 recorded replay 默认不触网；replay 默认 skipped/opt-in。
-3. [ ] cassette 护栏：record/update 需显式 env opt-in；writer 经 redactor；verify 不写盘。
-4. [ ] 负例覆盖仍在：UnhandledRequirement / misaligned / cancel never-resume。
-5. [ ] scenario DSL 对 TS/NAPI 充分性评估 + 缺口清单。
-6. [ ] trait crate：cargo metadata 拓扑分析，是否仍无需拆。
-7. [ ] 文档/README/PLAN/TODO 与代码一致。
+plan 操作：
+- `create_plan` → 初始化 version=0 空 plan，记录 op
+- `add_task(id, depends_on)` → 校验依赖已知/非自依赖/无环；成功追加 task_order，version+1
+- `claim(task, owner, expected_version)` → CAS 版本 + owner + status + 依赖已完成；依赖未完成返回 DependencyBlocked 且不改状态（原子）
+- `claim_first_available(owner, expected_version)` → 按 task_order 跳过 completed/已认领/依赖未完成，认领首个可用；无则 NoAvailableItem
+- `update_status(task, owner, status, expected_version)` → owner/version/合法转换校验，成功 version+1
+
+blackboard 操作：
+- `post(sender, text) -> offset`（append-only，offset 从 0 单调递增）
+- `read_from(offset) -> Vec<BoardMessage>`（offset 及之后）
+
+错误：`StoreError` enum（UnknownTask/SelfDependency/DependencyCycle/DuplicateTask/VersionConflict/NotOwner/DependencyBlocked/AlreadyClaimed/NoAvailableItem/InvalidTransition），`Display` 产出 model-visible 文本，供 M1-2 tool adapter 使用。
+`ops_summary()` 提供日志摘要，便于失败定位（M1-3 断言复用）。
+
+环检测：deps 必须引用已存在 task（DAG by construction），add_task 内部仍跑 `detect_cycle`（防御 + 共享）。`detect_cycle` 设为 pub，测试用手工构造的 A→B→A 图断言其能识别环。
+
+## 4 个必需测试（tests/agent_complex_support.rs）
+1. `plan_dependencies_reject_unknown_self_and_cycles`
+2. `claim_rejects_unfinished_dependencies_atomically`
+3. `claim_first_available_skips_blocked_and_claimed_items`
+4. `blackboard_is_append_only_and_offsets_are_monotonic`
 
 ## 验证顺序
-- `cargo fmt --check`
+- `cargo fmt --all -- --check`
+- `cargo test --test agent_complex_support <各测试名>`
 - `cargo clippy --all-targets -- -D warnings`
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
-- `cargo test --all --all-targets`（<=30min timeout）
+- `cargo test --all --all-targets`（<=30min）
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
 - `git diff --check`
 
-## 进度
-- [进行中] 撰写本计划、执行 review 取证
+## 完成后
+- TODO.md M1-1 标题 `[TODO]`→`[DONE]`，补完成记录。
+- 提交：`[M1-1] ...`。停止。
 
-## 结果（M7-R 完成）
-- Review 六项全部核实通过：无 provider wire mock / 默认离线 / cassette 脱敏+update 护栏 / 负例保留 /
-  scenario DSL 为 TS-NAPI seam（列缺口）/ 仍无需拆 trait crate。
-- 发现并修复唯一验证门失败：prelude.rs:6 rustdoc redundant_explicit_links（M7-2 因 doc fingerprint 缓存漏检）。
-  改裸链接 [`TestScope`]。顺带更新 TESTABILITY.md 状态横幅为「M1–M7 全部完成」。
-- 验证全绿：fmt --check / clippy -D warnings / RUSTDOCFLAGS=-D warnings doc（强制重跑 testkit）/
-  cargo test --all --all-targets（24 suite,609 passed,0 failed,0 ignored 实跑）/ git diff --check。
-- TODO.md 30/30 [DONE]。M7-R 标 [DONE] + 完成记录已写。
-- 收尾：commit [M7-R]，创建 endtag（所有任务完成）。
+## 进度
+- [完成] store + 4 测试 + 完成记录, 全部验证通过, 待提交
