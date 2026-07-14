@@ -1380,7 +1380,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 ## Milestone 7 — Scenario DSL 草案与文档并轨
 
-### [TODO] M7-1 设计 data-only scenario model 草案
+### [DONE] M7-1 设计 data-only scenario model 草案
 
 **前置依赖**:M6-R。
 
@@ -1399,6 +1399,46 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:scenario JSON round-trip。
 - 单测:最小 text/tool/approval scenario 可运行。
 - 全套验证命令全部通过。
+
+**完成记录(2026-07-14)**:
+
+- **交付**:新增 `crates/agent-testkit/src/scenario.rs`(在 `lib.rs` 注册 `pub mod scenario`,并从
+  `prelude` 导出全部公共类型),提供 data-only scenario model 草案与 runner spike。这是有意最小化的 spike,
+  不是稳定 DSL(呼应 `docs/TESTABILITY.md` §9.4「不要过早稳定 DSL」),只覆盖 text / tool / approval 三类最小 turn。
+- **数据模型**(全部 serde derive,复用 `agent-lib` 稳定 serde 枚举 `Tool`/`Role`/`ToolStatus`/`LoopCursorKind`
+  而非另建平行 label 词表,保持 provider-neutral):
+  - `Scenario { name, description?, tools: Vec<Tool>, approval: ApprovalPolicySpec, input: ScenarioInput,
+    effects: ScenarioEffectScript, expect: ScenarioExpectation }`。
+  - `ScenarioInput`(内部 tag=`kind`,今仅 `User { text }`,枚举形以便后续扩展 pivot/external)。
+  - `ApprovalPolicySpec`:`AutoAllow`(默认)/ `RequireApproval`(approval 策略是 spec 级决策,不作为可复用
+    API 导出,仅 runner 内部私有 `ScenarioApprovalPolicy` 按数据物化)。
+  - `ScenarioEffectScript { llm, tool, interaction }`,按 dispatch 序被消费,空列表 = 该 family 不接线(未接线
+    family 的 requirement 会 pop 成 `UnhandledRequirement` 而非被静默服务)。子项:`ScenarioLlmStep`
+    (`Text{text,usage}` / `ToolUse{calls,usage}`;`ScenarioUsage{input,output}`;`ScenarioToolCall{id,name,input}`)、
+    `ScenarioToolStep`(`Ok` / `Error` 按 `call_id`)、`ScenarioInteractionStep`
+    (`Approve`/`ApproveWith`/`Deny`/`Answer`/`Choice`)。
+  - `ScenarioExpectation`:全 `Option`/空集合,golden 只校验被设置的字段。
+- **Runner spike**:`pub async fn run_scenario(&Scenario) -> Result<ScenarioSummary, ScenarioError>`——经 crate
+  fixtures 构建真实 `DefaultAgentMachine`(tools + 可选 approval policy),仅把 effects 脚本填充的 family 接入
+  `TestScope`,`drain` 一个 turn,回读 committed conversation 与 handler call log 得出 `ScenarioSummary`。
+  `ScenarioSummary` 本身是 serde 数据(可 golden),`ScenarioSummary::check(&ScenarioExpectation)` 返回 mismatch
+  串列表(空 = 全部匹配)。`ScenarioError::Drain(AgentError)` 保留分类错误、实现 `Display`/`Error`(source)。
+- **进入 summary 的断言(data-only、跨序列化稳定)** 与 **仍留 Rust 的断言** 在模块 doc 中明确区分:summary
+  含 committed turn 数、每 turn message role 序列、last assistant text、llm/tool/interaction 调用计数、按 provider
+  call id 的 tool result `ToolStatus`、final `LoopCursorKind`;需要 live handler/trace/timing 的断言留在 Rust——
+  trace 树/`BudgetAssertions` 快照、notification 细节、乱序/并发/peak-in-flight、`ContentBlock` 内部与 provider
+  extras、misaligned-family 注入、cancel timing 与 panic-on-call、requirement-id 级 `StepHarness` step-by-step。
+- **单测**(`scenario::tests`,8 个):`scenario_round_trips_through_json`(text/tool/approval 三类 JSON round-trip)、
+  `summary_round_trips_and_check_is_empty_on_match`、三个 `*_scenario_runs_*`(最小 text/tool/approval 可运行且
+  summary 匹配 expectation,含 approval 走 require-approval → 授权后跑守卫工具)、`scenario_loaded_from_json_runs_the_same_way`
+  (JSON 解析→运行的 data-only 全链路)、`check_reports_mismatches_against_a_wrong_expectation`、
+  `interaction_steps_map_onto_every_decision`。均在 <1s 内完成。
+- **验证**:`cargo fmt` + `cargo fmt --check` 干净;`cargo clippy --all-targets -- -D warnings`(workspace)无告警;
+  `cargo test -p agent-testkit --lib scenario` 8/8 绿;`cargo test --all --all-targets` 全绿(0 failed,testkit lib
+  由 123→131 用例,新增 8);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p agent-testkit` 通过(修正一处
+  redundant explicit link 与一处指向私有项的 intra-doc link)。未发现需插入前置修复的 spec 偏差或新增未调度失败测试。
+- **备注**:未追踪文件 `docs/external-agent.md` 与本任务无关(TODO/PLAN 未引用),不纳入本次提交。PLAN.md 无
+  phase 级变更,未改动。
 
 ### [TODO] M7-2 文档、README 与开发指南更新
 

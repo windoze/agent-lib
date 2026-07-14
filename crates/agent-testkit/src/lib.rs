@@ -40,6 +40,7 @@
 //! - [`assertions`]: conversation/notification/trace/budget assertions.
 //! - [`concurrency`]: delay/barrier/peak and cancel/panic tools.
 //! - [`subagent`]: scripted subagent spawner and parent/child scope helpers.
+//! - [`scenario`]: the data-only scenario model draft and runner spike.
 //! - [`prelude`]: convenience re-exports for test authors.
 
 #![warn(missing_docs)]
@@ -52,6 +53,7 @@ pub mod handlers;
 pub mod harness;
 pub mod ids;
 pub mod machine;
+pub mod scenario;
 pub mod scope;
 pub mod script;
 pub mod subagent;

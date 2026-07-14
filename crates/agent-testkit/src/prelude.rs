@@ -42,6 +42,12 @@ pub use crate::harness::{
 };
 pub use crate::ids::{RequirementAllocation, SeqIds};
 pub use crate::machine::{ScriptMachine, ScriptMachineBuilder, ScriptMachineLog};
+pub use crate::scenario::{
+    ApprovalPolicySpec, Scenario, ScenarioEffectScript, ScenarioError, ScenarioExpectation,
+    ScenarioInput, ScenarioInteractionStep, ScenarioLlmStep, ScenarioSummary, ScenarioToolCall,
+    ScenarioToolStep, ScenarioUsage, ToolResultExpectation, ToolResultObservation,
+    TurnRolesExpectation, run_scenario,
+};
 pub use crate::scope::{TestScope, TestScopeBuilder};
 pub use crate::script::{
     CallLog, CallRecord, CallTicket, InteractionStep, LlmStep, ReconfigStep, Script, ScriptError,
