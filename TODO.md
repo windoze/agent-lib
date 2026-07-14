@@ -312,7 +312,7 @@ Milestone 1 支持层审阅通过,五项检查点全部确认,无需返工。
 
 ## Milestone 2 — 主复杂 Flow：多轮、Plan/Blackboard、Approval、Pivot
 
-### [TODO] M2-1 实现 `agent_complex_flow` 主场景
+### [DONE] M2-1 实现 `agent_complex_flow` 主场景
 
 **前置依赖**:M1-R。
 
@@ -354,6 +354,42 @@ dangerous tool approve、post-tool pivot、第二个 dangerous tool deny、final
 - `cargo test --all --all-targets`。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - `git diff --check`。
+
+**完成记录**:
+
+- 新建 `tests/agent_complex_flow.rs`,`#[path = "complex_support/mod.rs"] mod complex_support;`
+  复用 M1 支持层。单测 `complex_turn_combines_plan_blackboard_approval_deny_and_pivot`
+  为 `#[tokio::test]`(complex tool/interaction handler 的 `fulfill` 为 async,需在 await 边界
+  产出 `RequirementResult` 再喂给 `StepHarness::resume`)。
+- 用 `StepHarness::with_ids` 手动逐步推进整轮,pivot 精确落在合法 post-tool → NeedLlm 边界:
+  1. `user("实现功能 A")` → NeedLlm;
+  2. 第 1 次 LLM 返回 `plan_create` + `plan_add_task(design)` + `plan_add_task(implement,[design])`,
+     三个 auto-approve 工具作为一个 NeedTool 批;`resume_tool_batch` 按发射(模型)顺序经
+     `ComplexToolHandler` 逐个 fulfill+resume,最后一次推进到下一 NeedLlm;
+  3. 第 2 次 LLM 返回 `blackboard_post`(auto)+ `dangerous_write#1`(gated):先 fulfill 自动 post,
+     再对 `dangerous_write#1` 的 NeedInteraction 调 `ScriptedInteractionHandler::sequence([Approve,
+     Deny(..)])` 取 Approve,批准后 machine 发 `dangerous_write#1` 的 NeedTool 并执行(落一条 board);
+  4. 在第一次 dangerous 结果后、下一次 LLM resume 前 `harness.pivot("先不要改文件,只给方案")`,
+     断言重渲染的 NeedLlm 复用同一 id;
+  5. 重渲染 LLM 返回 `blackboard_post`(pivot 后策略)+ `dangerous_write#2`:自动 post 落 board,
+     第二次 approval 取 Deny → machine 合成 `Denied` 工具结果、不发 NeedTool、drain 到 final NeedLlm
+     (先捕获其 `ChatRequest` 再 resume);
+  6. 最终 LLM 文本收尾,cursor 到 `Done`。
+- 断言(全部通过):committed turns==1 且 pending none;`assert_pivot_after_tool_result` 定位 pivot 落在
+  首个 tool result 之后;`implement.depends_on==[design]`、`design` 仍为 `Todo`,且
+  `store.claim("implement",…,version)` 返回 `DependencyBlocked{unfinished:[design]}`;
+  `assert_board_messages` 断言 board 恰为 `["start processing feature A","apply the risky change
+  to file A","changed strategy after pivot"]`(单调、无重复副作用);
+  `assert_tool_executions(DANGEROUS_WRITE,1)`(仅批准的那次执行);
+  `assert_interaction_decisions(log,2)` 且 records 顺序为 `Approve`→`Deny`;
+  最后一次 LLM `ChatRequest.messages` 同时包含 pivot 文本的 `Role::User` 消息与
+  `ToolStatus::Denied` 的 `ToolResult`。
+- 验证结果(全部通过):`cargo fmt --all -- --check`;
+  `cargo test --test agent_complex_flow complex_turn_combines_plan_blackboard_approval_deny_and_pivot`
+  (1 passed);`cargo clippy --all-targets -- -D warnings` 无告警;
+  `cargo test --all --all-targets` 全绿(lib 423 + testkit 131 + 各集成 crate 全通过,仅
+  credential-gated 集成测试 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  无告警;`git diff --check` 干净。
 
 ### [TODO] M2-2 补充主 flow 的负向断言与防回归用例
 
