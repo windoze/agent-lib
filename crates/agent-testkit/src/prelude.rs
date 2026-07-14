@@ -47,7 +47,12 @@ pub use crate::script::{
     CallLog, CallRecord, CallTicket, InteractionStep, LlmStep, ReconfigStep, Script, ScriptError,
     ScriptStep, StrictMode, ToolStep,
 };
+pub use crate::subagent::{
+    ScriptedSubagentSpawner, ScriptedSubagentSpawnerBuilder, SpawnedChildBuilder,
+    attended_child_scope, headless_child_scope, parent_scope_with_subagent,
+};
 pub use agent_lib::agent::{
-    AgentMachine, DefaultAgentMachine, LlmStepMode, Requirement, RequirementKind, StepInput,
-    StepOutcome,
+    AgentMachine, AgentSpecRef, DefaultAgentMachine, DrivingSubagentHandler, Interaction,
+    LlmStepMode, Requirement, RequirementKind, SpawnedChild, StepInput, StepOutcome,
+    SubagentOutput, SubagentSpawner, TurnDone,
 };

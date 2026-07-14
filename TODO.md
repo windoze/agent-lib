@@ -1055,7 +1055,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
   - `PanicOnCall` 未触发路径:纯文本 turn 不产出 NeedTool,panicking tool handler 不被调用、`cursor==Done`;触发路径:LLM 返回 tool_use 且不取消 → 驱动派发 tool batch → `#[should_panic(expected = "weather tool must not run")]`。
 - 验证:`cargo fmt --all` 已格式化;`cargo clippy -p agent-testkit --all-targets -- -D warnings` 与 `cargo clippy --all-targets -- -D warnings` 均无告警;`cargo test -p agent-testkit --lib concurrency` 15/15;`cargo test --all --all-targets` 全绿(agent-lib lib 434 + 集成套件全过,agent-testkit lib 117 + cassette 2 + smoke 2,0 失败;3+1+3 网络集成测试按设计 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。
 
-### [TODO] M5-3 实现 scripted subagent spawner 与 parent/child scope helpers
+### [DONE] M5-3 实现 scripted subagent spawner 与 parent/child scope helpers
 
 **前置依赖**:M5-2。
 
@@ -1076,6 +1076,22 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:parent cancel 传播到 child abandon。
 - 单测:child token charge 进入 parent budget。
 - 跑全套验证命令。
+
+**完成记录(2026-07-14)**:
+
+- 在 `crates/agent-testkit/src/subagent.rs` 落地 M5-3 全部工具(此前是拓扑占位 stub;`lib.rs` 模块拓扑早已声明 `subagent` 为“scripted subagent spawner 与 parent/child scope helpers”,故就地实现):
+  - `ScriptedSubagentSpawner`(impl `SubagentSpawner`):从 `SeqIds` 树 deterministic 铸造 child ids(`child_ids = (ids.run_id(), ids.trace_node(label))`),按需交出 `SpawnedChild`,返回脚本化/固定 summary。内部 `ChildSource` 二态:`Once(Mutex<Option<SpawnedChild>>)`(单 subagent 常态——测试先在外部建 child machine、clone 其 `log()` 以在驱动后观测,再把整个 `SpawnedChild` 交入;第二次 `spawn` 会 panic 提示改用 factory)与 `Factory(Box<dyn Fn()->SpawnedChild+Send+Sync>)`(多 child 或“证明 spawn 不发生”时用 panicking factory)。三个 `AtomicUsize` 计数 `ids_calls/spawn_calls/summarize_calls`,让测试断言 `DrivingSubagentHandler` 到底走到哪一步(例如 depth guard 触发时二者皆 0)。`summarize` 从 `summaries` 队列弹出,耗尽后回落到 `default_summary`。
+  - `ScriptedSubagentSpawnerBuilder`:`new(ids)`/`trace_label()`/`child()`/`child_factory()`/`summary()`/`summaries()`/`build()`;`build()` 缺 child source 时 panic。`ScriptedSubagentSpawner::into_handler(self: Arc<Self>, max_depth)` 一步包成 `DrivingSubagentHandler`,`Arc<Self>` coerce 为 `Arc<dyn SubagentSpawner>`,测试可保留自己的 Arc clone 以读回计数。
+  - `SpawnedChildBuilder`:`machine()`/`boxed_machine()`/`scope()`/`boxed_scope()`/`opening()`/`build() -> SpawnedChild`,把 child machine、child 自己的 drain scope、开场 `AgentInput` 三件套组合成 `SpawnedChild`;三者缺一 `build()` panic。
+  - parent/child scope helpers(均返回 `TestScopeBuilder` 以便链式补 family):`headless_child_scope()`(无 interaction,child `NeedInteraction` pop 到 outer/parent)、`attended_child_scope(interaction)`(child 就地应答)、`parent_scope_with_subagent(handler)`(parent 服务 `NeedSubagent`,可再 `.attended()/.tool()/.llm()`)。取代 reference `subagent/tests.rs` 与 `agent_effect_e2e.rs` 里手写的 `MockSpawner`/`ChildSpawner`/`MockScope`/`ChildScope`/`ParentScope`。
+- `prelude.rs` 追加 `ScriptedSubagentSpawner`、`ScriptedSubagentSpawnerBuilder`、`SpawnedChildBuilder`、`attended_child_scope`、`headless_child_scope`、`parent_scope_with_subagent`,并补齐 subagent 相关 agent-lib 再导出(`AgentSpecRef`、`DrivingSubagentHandler`、`Interaction`、`SpawnedChild`、`SubagentOutput`、`SubagentSpawner`、`TurnDone`),供 M6 迁移直接引用。
+- 单测(`subagent/tests.rs` 新增 5 个,均用上述 helper 驱动真实 `DrivingSubagentHandler`,复刻 reference 四大层级保证 + attended 覆盖):
+  - `attended_parent_serves_headless_child_interaction_via_pop`:headless child `NeedInteraction` pop 到 attended parent 的 `ScriptedInteractionHandler`(log.len==1);child resume tag==`Interaction`、parent resume tag==`Subagent`;spawner 计数 1/1/1。
+  - `depth_guard_refuses_at_limit_without_spawning`:`max_depth==1` + depth-1 ctx,`fulfill` 直调得 `SubagentDepthExceeded { limit:1, depth:1 }`;panicking child_factory 未触发;`ids_calls/spawn_calls/summarize_calls` 全 0。
+  - `parent_cancel_propagates_and_abandons_child`:ctx 预先 cancel;child scope 的 llm 用 `PanicOnCall`(被调即 panic)证明 abandon 路径从不派发 llm;结果 `Subagent(Ok)`,child `abandon_count==1`、`resume_count==0`。
+  - `child_token_charge_counts_against_parent_budget`:本地 `ChargingLlmHandler` charge 42 token;驱动后 parent ctx `budget().snapshot().used().tokens()==42`、child resume tag==`Llm`,证明 child ctx 是 derive(共享 ledger)而非新建。
+  - `attended_child_resolves_its_interaction_in_place`:覆盖 `attended_child_scope`;child 就地应答(log.len==1),parent interaction 用 `PanicOnCall` 断言绝不被 pop 触发。
+- 验证:`cargo fmt --all` 已格式化;`cargo clippy -p agent-testkit --all-targets -- -D warnings` 与 `cargo clippy --all-targets --workspace -- -D warnings` 均无告警;`cargo test -p agent-testkit --lib subagent` 5/5;`cargo test --all --all-targets` 全绿(agent-lib lib 434、e2e 4、其余集成套件全过;agent-testkit lib 122[含新 5] + cassette 2 + smoke 2;网络集成 3+1+3 按设计 ignored;0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过(修掉一处 redundant explicit link);`git diff --check` 干净。
 
 ### [TODO] M5-R Milestone 5 Review
 
