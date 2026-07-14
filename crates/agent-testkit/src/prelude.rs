@@ -3,7 +3,7 @@
 //! Test modules can `use agent_testkit::prelude::*;` to pull in the most common
 //! `agent-lib` agent-effect types alongside the kit's own helpers: deterministic
 //! ids, provider-neutral fixtures, scripted and cassette-backed handlers, the
-//! [`TestScope`](crate::scope::TestScope) builder, the step/drain harnesses, the
+//! [`TestScope`] builder, the step/drain harnesses, the
 //! assertion entry points, the concurrency/cancellation tools, and the
 //! [`scenario`](crate::scenario) runner — so downstream tests can name the
 //! effect boundary without a deep import path.

@@ -1487,7 +1487,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - **备注**:未追踪文件 `docs/external-agent.md` 与本任务无关(TODO/PLAN 未引用),不纳入本次提交。PLAN.md 无
   phase 级变更,未改动。
 
-### [TODO] M7-R Milestone 7 与 Testability 总 Review
+### [DONE] M7-R Milestone 7 与 Testability 总 Review
 
 **前置依赖**:M7-1..M7-2。
 
@@ -1506,3 +1506,53 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 - 全套验证命令全部通过。
 - 总 Review 结论与后续项写入完成记录。
+
+**完成记录(2026-07-14)**:
+
+- **回溯 `PLAN.md` / `TODO.md` / `docs/TESTABILITY.md`**:三者与实际代码一致。里程碑 M1–M7 全部 `[DONE]`,
+  依赖链 M1→…→M7 未被打破;`agent-testkit` 目录形态与 PLAN「建议目录」一致(ids/fixtures/script/handlers/
+  cassette/scope/machine/harness/assertions/concurrency/subagent/scenario/prelude 全部落地)。本次把
+  `docs/TESTABILITY.md` 顶部状态横幅由「实施中(M7 收尾)」更新为「已落地(M1–M7 全部完成,含总 Review M7-R)」
+  以保持文档-代码一致。
+- **确认 testkit 无 provider wire mock**:`crates/agent-testkit/Cargo.toml` 依赖仅 `agent-lib` +
+  async-trait/futures/serde/serde_json/tokio/uuid,**无 reqwest/hyper/eventsource/http 传输 crate**;源码全量搜索无
+  `reqwest`/`hyper::`/`EventSource`/`TcpListener`/`SocketAddr`/`text/event-stream`/`base_url`/`Authorization` 等传输符号。
+  testkit 通过直接实现公开 handler traits 兑现 `Requirement`,边界符合 PLAN §2。
+- **确认默认离线**:core Rust suites(`agent_step/tool/interaction/driver/trace_budget_basic`、`agent_effect_e2e`、
+  `reference_driver`)默认离线;recorded replay suites(`agent_replay_text/tool/approval`、`cassette_replay`)从
+  committed **synthetic** cassette 重放,`regenerate_*` 在未设 `AGENT_TESTKIT_UPDATE_CASSETTES=1` 时返回
+  `RecorderReport::Skipped` no-op、绝不改写 committed fixture;唯一触网的 `integration_anthropic` /
+  `integration_openai_resp` 全部 `#[ignore]` + env 门控,默认 `cargo test` 不运行(0 ignored 实跑)。
+- **确认 cassette 脱敏与 update 护栏**:record/update 需显式 env opt-in(`RECORD_ENV_VAR=AGENT_TESTKIT_RECORD_CASSETTES`、
+  `UPDATE_ENV_VAR=AGENT_TESTKIT_UPDATE_CASSETTES`);所有记录路径经 `Redactor`(`DefaultRedactor` 空 allowlist,
+  默认擦除全部 provider extras、保留 modeled text/tool input),verify 或未 opt-in 时不写盘、返回 `Skipped`。
+- **确认负例覆盖保留**:`UnhandledRequirement` / misaligned result / cancel never-resume / wrong-id/kind / abandon
+  覆盖分布在 `agent_effect_e2e`、`agent_step_basic`、`agent_interaction_basic`、`agent_driver_basic`、
+  `agent_trace_budget_basic`、`reference_driver`。
+- **scenario DSL 对未来 TS/NAPI 的充分性**:data-only serde `Scenario` model 已足以作为未来 JSON runner / TS-NAPI 的
+  **输入 seam**(JSON round-trip,覆盖 text/tool/approval 三类最小 turn),`run_scenario` 产出可 golden 的
+  `ScenarioSummary`。但它仍是**最小 spike,非稳定 DSL**。缺口(follow-up,不阻塞本阶段,供未来 DSL/TS 计划):
+  (a) `ScenarioInput` 仅 `User`,无 pivot/external/multi-turn;(b) 无 reconfig/subagent 脚本族;(c) summary 只含
+  data-only 断言,trace/budget/notification/timing/concurrency 断言仍留 Rust;(d) 尚无 NAPI binding 与 JSON runner CLI;
+  (e) approval policy 仅 runner 内部物化。
+- **是否需拆 trait crate**:`cargo metadata` 拓扑显示 workspace 仅两 crate——`agent-lib`(核心:公开 trait + 默认机器 +
+  reference driver)与 `agent-testkit`(dev-only,`publish=false`,仅依赖 `agent-lib`)。经 dev-dependency 的依赖环
+  (`agent-lib --dev--> agent-testkit --normal--> agent-lib`)工作正常,`cargo build`/`clippy --all-targets`/
+  `test --all --all-targets` 全绿。**结论:仍无需拆 trait crate**。若未来确需拆,按 PLAN §3 拆为承载 DTO/错误/trait 的
+  `agent-core` / `agent-api`,而非薄 traits crate;届时另立后续计划。
+- **Review 中发现并修复的真实问题(唯一验证门失败)**:`crates/agent-testkit/src/prelude.rs:6` 存在
+  `rustdoc::redundant_explicit_links` —— `[`TestScope`](crate::scope::TestScope)` 的显式链接目标冗余,在
+  `RUSTDOCFLAGS="-D warnings"` 下报错。M7-2 的 `cargo doc --no-deps` 因 cargo doc fingerprint 缓存未真正重跑
+  `agent-testkit`(工作区形式复用了旧 doc 制品)而漏检此错。已改为裸链接 `[`TestScope`]`(prelude 已
+  `pub use crate::scope::{TestScope, ...}`,intra-doc 可解析),强制重跑 testkit rustdoc 通过。此为正确修复而非
+  workaround。未发现其它未调度失败测试或 spec 偏差,无需新增前置任务。
+- **验证**:`cargo fmt --all --check` 干净;`cargo clippy --all-targets -- -D warnings`(workspace)无告警;
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(强制重跑 `agent-testkit` 后)通过;`cargo test --all --all-targets`
+  全绿——24 个 suite、609 passed、0 failed、0 ignored 实跑,每例 <1s;`git diff --check` 干净。
+- **后续项(不阻塞本阶段完成)**:Future DSL/TS 补 pivot/reconfig/subagent/multi-turn scenario 族、JSON runner CLI 与
+  NAPI binding,再考虑稳定 DSL;若引入独立 core crate 按 `agent-core`/`agent-api` 形态拆分。
+- **Testability 阶段总结论**:M1–M7 全部落地并通过总 Review。testkit 只 mock agent effect 边界、未混入 provider wire
+  format;仅依赖 `agent-lib` 公开 API、未绕过不变量;负例覆盖完整;cassette 可审阅、可脱敏、CI 离线可跑;新 helper
+  降低样板而非掩盖行为;文档/README/PLAN/TODO 与代码一致。
+- **备注**:未追踪文件 `docs/external-agent.md` 与本任务无关(TODO/PLAN 未引用),不纳入本次提交。PLAN.md 无 phase 级
+  变更(里程碑、依赖、完成标准均未变),未改动。

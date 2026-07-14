@@ -1,6 +1,6 @@
 # Testability 计划 —— Agent Effect 测试增强
 
-> 状态:实施中(M1–M6 已落地,M7 文档/scenario 收尾)。本文记录 `agent-lib` 在 agent effect 模型落地后的
+> 状态:已落地(M1–M7 全部完成,含总 Review M7-R)。本文记录 `agent-lib` 在 agent effect 模型落地后的
 > 测试增强计划与当前实现状态。原本设想的 dev-only `agent-testkit` 已作为工作区成员落地
 > (`crates/agent-testkit`),下文各模块规划已对应到实际源码;§5 顶部给出「落地状态」映射,§9 迁移计划标注
 > 各 phase 的落地里程碑。目标不是重写已有测试,而是把现有散落的 fake、fixture、handler 组合与断言能力

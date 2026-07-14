@@ -1,51 +1,49 @@
-# 当前任务：M7-2 文档、README 与开发指南更新
+# 当前任务：M7-R Milestone 7 与 Testability 总 Review
 
 ## 定位
-- `TODO.md` 第一个未完成任务 = **M7-2**（line 1443，标题 `[TODO]`）。M1..M6 与 M7-1 全部 `[DONE]`。
-- HEAD=df2ac70 [M7-1]。前置依赖 M7-1 已完成，无阻塞。
-- 未追踪文件 `docs/external-agent.md` = 无关 External Agent 草案，TODO/PLAN 未引用，不纳入本次提交。
+- `TODO.md` 第一个未完成任务 = **M7-R**（line 1490，标题 `[TODO]`）。M1..M6 与 M7-1/M7-2 全部 `[DONE]`。
+- HEAD=a19fb15 [M7-2]。前置依赖 M7-1..M7-2 已完成，无阻塞。
+- 工作树干净，唯一未跟踪文件 `docs/external-agent.md`（无关 External Agent 草案，TODO/PLAN 未引用，不纳入提交）。
+- 这是 Review 任务：不做代码功能改动，除非 review 发现 spec 偏差/失败测试需修复或新增前置任务。不得拆分 review 任务。
 
-## 任务要求（TODO.md M7-2）
+## 任务要求（TODO.md M7-R）
 做什么：
-- 更新 `docs/TESTABILITY.md`，把已落地模块从规划改为当前状态。
-- 更新 `README.md` 当前计划链接，说明当前根 `PLAN.md`/`TODO.md` 是 Testability 阶段。
-- 给 `crates/agent-testkit` 添加 crate-level rustdoc，包含 quickstart 示例。
-- 记录 cassette record/update 环境变量。
-- 记录“不 mock HTTP provider”的边界。
+- 回溯 `PLAN.md`、`TODO.md`、`docs/TESTABILITY.md`。
+- 确认 testkit 没有引入 provider wire mock。
+- 确认基础 Rust suites 与 recorded replay suites 默认离线可跑。
+- 确认 cassette 脱敏与 update 护栏有效。
+- 确认 scenario DSL 是否足以作为未来 TS/NAPI 输入；若不足，列出缺口。
+- 总结是否仍无需拆 trait crate；若 Cargo 拓扑证明需拆，提出单独后续计划。
 
 验证：
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过。
-- README archive/current plan 链接有效。
 - 全套验证命令全部通过。
+- 总 Review 结论与后续项写入完成记录。
 
-## 关键事实
-- cassette 环境变量：`AGENT_TESTKIT_RECORD_CASSETTES=1`（record）、`AGENT_TESTKIT_UPDATE_CASSETTES=1`（update）；
-  常量 `RECORD_ENV_VAR`/`UPDATE_ENV_VAR`。Verify 模式不写盘。§8.3 已详述。
-- agent-testkit 模块已全部落地：ids/fixtures/script/handlers/cassette/scope/machine/harness/assertions/
-  concurrency/subagent/scenario/prelude（源在 crates/agent-testkit/src）。
-- README 现有链接全部有效；archive 目录含 agent-layer/client-layer/conversation/agent-effect-migration。
-- lib.rs 已有 crate-level doc（Boundaries + Module map），缺 Quickstart 示例与 cassette env 说明。
-- crate 内仅 assertions/mod.rs 有一个 `no_run` doctest；agent-lib 是普通依赖，doctest 可 `use agent_lib::...`。
-
-## 编辑计划
-1. `crates/agent-testkit/src/lib.rs`：新增 `# Quickstart`（`no_run` doctest，基于 drain+ScriptedLlmHandler，
-   编译通过）；新增 `# Recording cassettes` 说明 record/update env 护栏；强化“不 mock provider wire”边界。
-2. `docs/TESTABILITY.md`：line 3 状态横幅改为“部分落地/M7 进行中”；§5 顶部加“落地状态”映射表；
-   §9 迁移计划标注各 phase 已落地；§13/§8.4 注明 scenario model 草案（M7-1）已落地。
-3. `README.md`：line 75 与 150-152 更新为“当前根 PLAN.md/TODO.md 属 Testability 阶段”，
-   补 docs/TESTABILITY.md 与 agent-effect-migration archive 链接。
+## Review 核查清单（逐条取证）
+1. [ ] 无 provider wire mock：grep testkit 源码无 reqwest/hyper/http/sse/base_url/headers/auth 传输层 mock。
+2. [ ] 离线可跑：core suites 与 recorded replay 默认不触网；replay 默认 skipped/opt-in。
+3. [ ] cassette 护栏：record/update 需显式 env opt-in；writer 经 redactor；verify 不写盘。
+4. [ ] 负例覆盖仍在：UnhandledRequirement / misaligned / cancel never-resume。
+5. [ ] scenario DSL 对 TS/NAPI 充分性评估 + 缺口清单。
+6. [ ] trait crate：cargo metadata 拓扑分析，是否仍无需拆。
+7. [ ] 文档/README/PLAN/TODO 与代码一致。
 
 ## 验证顺序
-- `cargo fmt` + `cargo fmt --check`
+- `cargo fmt --check`
 - `cargo clippy --all-targets -- -D warnings`
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p agent-testkit`
-- `cargo test -p agent-testkit --doc`（doctest 编译）
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
 - `cargo test --all --all-targets`（<=30min timeout）
-- README 链接有效性脚本
 - `git diff --check`
 
 ## 进度
-- [完成] 编辑三处文件
-- [完成] 验证全绿（fmt/clippy/doc/doctest/链接/diff-check）
-- [完成] TODO.md M7-2 [DONE] + 完成记录
-- [进行中] commit [M7-2] 停止
+- [进行中] 撰写本计划、执行 review 取证
+
+## 结果（M7-R 完成）
+- Review 六项全部核实通过：无 provider wire mock / 默认离线 / cassette 脱敏+update 护栏 / 负例保留 /
+  scenario DSL 为 TS-NAPI seam（列缺口）/ 仍无需拆 trait crate。
+- 发现并修复唯一验证门失败：prelude.rs:6 rustdoc redundant_explicit_links（M7-2 因 doc fingerprint 缓存漏检）。
+  改裸链接 [`TestScope`]。顺带更新 TESTABILITY.md 状态横幅为「M1–M7 全部完成」。
+- 验证全绿：fmt --check / clippy -D warnings / RUSTDOCFLAGS=-D warnings doc（强制重跑 testkit）/
+  cargo test --all --all-targets（24 suite,609 passed,0 failed,0 ignored 实跑）/ git diff --check。
+- TODO.md 30/30 [DONE]。M7-R 标 [DONE] + 完成记录已写。
+- 收尾：commit [M7-R]，创建 endtag（所有任务完成）。
