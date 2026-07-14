@@ -1093,7 +1093,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
   - `attended_child_resolves_its_interaction_in_place`:覆盖 `attended_child_scope`;child 就地应答(log.len==1),parent interaction 用 `PanicOnCall` 断言绝不被 pop 触发。
 - 验证:`cargo fmt --all` 已格式化;`cargo clippy -p agent-testkit --all-targets -- -D warnings` 与 `cargo clippy --all-targets --workspace -- -D warnings` 均无告警;`cargo test -p agent-testkit --lib subagent` 5/5;`cargo test --all --all-targets` 全绿(agent-lib lib 434、e2e 4、其余集成套件全过;agent-testkit lib 122[含新 5] + cassette 2 + smoke 2;网络集成 3+1+3 按设计 ignored;0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过(修掉一处 redundant explicit link);`git diff --check` 干净。
 
-### [TODO] M5-R Milestone 5 Review
+### [DONE] M5-R Milestone 5 Review
 
 **前置依赖**:M5-1..M5-3。
 
@@ -1110,6 +1110,19 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 - 全套验证命令全部通过。
 - Review 结论写入完成记录。
+
+**完成记录(2026-07-14)**:
+
+- **核对 1 — 无真实 sleep**(通过):`crates/agent-testkit/src/concurrency.rs` 模块头明确声明并发观测“without leaning on a real clock”。三件并发原语均协作式、不触时钟:`Delay`/`YieldTicks` 每 tick `cx.waker().wake_by_ref()` 后返回 `Poll::Pending`(注释“the real clock is never consulted”),`n` 次后 `Ready`;`Barrier`/`BarrierWait` 用 waker 集合在到达 threshold 时一起放行;`PeakInFlight` 纯 `Mutex` 计数 + completion log;`DelayingToolHandler` 只注入上述 `Delay`。全 crate `grep -rn "sleep|Instant::now|SystemTime|thread::sleep|tokio::time" src/` 仅命中 `concurrency.rs` 的文档字样与 `cassette/record.rs:37,615` 的 `SystemTime`——后者只为 M3 cassette 文件名生成 unix 纳秒时间戳,不在 M5 并发/取消路径上,out of scope。M5-1 单测(`Delay::yields(3)` 恰 4 次 poll = 3 pending + 1 ready、ordered delays 稳定 `completion_order()==[1,0]`)直接证明乱序完成由 tick 数而非墙钟决定。**确认无真实 sleep。**
+- **核对 2 — cancel helpers 不吞 never-resume 语义**(通过):`CancelOnCall::cancel_if_due` 命中触发调用时**只**调 `ctx.cancellation().cancel()` 置取消令牌并向 `CancelLog` 记 `CancelEvent { call_index, timing }`,随后照常 `self.inner.fulfill(..).await` 透传 inner 的**真实 family 结果**(四个 family impl 均 `next_index → cancel_if_due(Before) → inner.fulfill → cancel_if_due(After) → result`),从不伪造 resolution、resume 或替换成别的 family——因此“取消后本层剩余 requirement 永不 resume、被 abandon”的语义完全留给 driver 依据取消令牌落实,wrapper 不掩盖。`PanicOnCall` 仅在被调用时 `panic!`,用于反证某 family 在取消路径上根本未被派发。子测试 `parent_cancel_propagates_and_abandons_child`(subagent.rs)以 `child_log.abandon_count()==1` / `resume_count()==0` + child scope 的 `PanicOnCall` llm 从不运行,证明取消确实走 abandon(never-resume)而非被 helper 悄悄 resolve;M5-2 集成 drain 测试亦以 `PanicOnCall` tool 未 panic 证明被取消 batch 从不派发工具。**确认 never-resume 未被吞。**
+- **核对 3 — subagent helpers 不绕过 `DrivingSubagentHandler` 的深度/预算/cancel 强制**(通过):testkit `ScriptedSubagentSpawner` 仅实现 `SubagentSpawner` 的**policy** 三钩子(`child_ids`/`spawn`/`summarize`),经 `into_handler(max_depth)` = `DrivingSubagentHandler::new(self, max_depth)` 包进 `agent-lib` 的**真实** handler;`parent_scope_with_subagent(handler)` 把该真实 handler 原样塞入 `TestScope` 的 subagent 槽。深度/预算/cancel 守卫全部只存在于 `src/agent/drive/subagent.rs::DrivingSubagentHandler::fulfill`:`ctx.depth() >= max_depth` 时**在 spawn 之前**早退 `AgentError::SubagentDepthExceeded { limit, depth }`;child 经 `RunContext::derive_child` 派生,共享 parent 的 budget ledger 与 cancel 链。testkit 无任何旁路复制这些守卫。三条子测试驱动**真实** handler 验证守卫确实生效:`depth_guard_refuses_at_limit_without_spawning`(得 `SubagentDepthExceeded { limit:1, depth:1 }` 且 spawner `ids_calls/spawn_calls/summarize_calls` 全 0、panicking child_factory 未触发)、`child_token_charge_counts_against_parent_budget`(child charge 42 token 落到 `ctx.budget().snapshot().used().tokens()==42`,证明共享 ledger 而非新建)、`parent_cancel_propagates_and_abandons_child`(预取消 ctx → child abandon)。**确认未绕过强制。**
+- **M6 目标测试套件文件清单**(供 M6 迁移/新增,依赖链 M5→M6 不变):
+  - M6-1 迁移 `tests/agent_effect_e2e.rs`(以 M5 subagent/cancel helper + M2/M3 scripted 层替换本地 `ChildSpawner`/child scope/`SeqIds`/payload helper,保四语义)。
+  - M6-2 迁移 `src/agent/drive/reference/tests.rs`(以 testkit 脚本替换重复 fake client/registry/id/approval,保 reference driver 全覆盖;保留必要的 `LlmClient`/`ToolRegistry`/`FakeClient` reference 适配器)。
+  - M6-3 新增 Core Rust suites:`agent_step_basic`、`agent_tool_basic`、`agent_interaction_basic`、`agent_driver_basic`、`agent_trace_budget_basic`(各可单独 filter,离线快速)。
+  - M6-4 新增 recorded replay suites:`agent_replay_text`、`agent_replay_tool`,以及(工具足够时)`agent_replay_approval` 或 `agent_replay_regression`(默认离线,断言 final conversation + call log + final cursor)。
+- **验证**:`cargo fmt --all --check` 干净;`cargo clippy --all-targets -- -D warnings`(workspace,含 agent-lib + agent-testkit,已覆盖 testkit)无告警;`cargo test -p agent-testkit --lib` 全绿(122 passed,含 concurrency 15 + subagent 5,0 failed)。自 M5-3(HEAD=`34f6c07`,全套 `cargo test --all --all-targets` 已绿:agent-lib lib 434 + e2e 4 + 其余集成套件全过,agent-testkit lib 122 + cassette 2 + smoke 2,0 失败,网络集成按设计 ignored)以来**无任何编译代码/清单改动**,本 Review 仅改 `TODO.md`/`memory/claude_plan.md`(仅文档),按“仅文档变更可复用上次绿结果”规则复用该全套绿结果;`git diff --check` 干净。
+- **Review 结论**:Milestone 5 通过。并发工具确定性、零真实时钟;cancel/panic wrapper 只置取消令牌与观测、不伪造 resolution,never-resume 语义仍由 driver 落实;subagent helper 只供 policy、经真实 `DrivingSubagentHandler` 强制深度/预算/cancel。三项不变量均成立且有负例覆盖,未发现需插入前置修复的 spec 偏差或新增未调度失败测试。放行 Milestone 6。
 
 ---
 
