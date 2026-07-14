@@ -1,3 +1,27 @@
 /target
 .envrc
 /probes
+
+# Rust
+**/*.rs.bk
+*.pdb
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment / secrets
+.env
+.env.local
+
+# Logs & temp
+*.log
+tmp/
