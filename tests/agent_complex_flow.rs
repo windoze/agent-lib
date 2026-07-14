@@ -20,6 +20,11 @@
 //! surfaces as a model-visible [`ToolStatus::Error`] without mutating the task,
 //! and a denied dangerous write never reaches the tool at the effect boundary.
 //!
+//! Milestone 4 (M4-1) adds the P1 recovery face: a lost optimistic claim race
+//! (version conflict) and a dependency-blocked claim both come back as
+//! model-visible [`ToolStatus::Error`] results, and the model recovers through
+//! the shared blackboard by falling back to a first-available claim.
+//!
 //! Run in isolation with `cargo test --test agent_complex_flow`.
 
 #[path = "complex_support/mod.rs"]
@@ -46,13 +51,14 @@ use agent_testkit::script::LlmStep;
 
 use complex_support::assertions::{
     assert_board_messages, assert_interaction_decisions, assert_no_task_owner,
-    assert_pivot_after_tool_result, assert_task_depends_on, assert_task_status,
+    assert_pivot_after_tool_result, assert_task_depends_on, assert_task_owner, assert_task_status,
     assert_tool_executions, role_sequence,
 };
 use complex_support::plan_blackboard::{MockPlanBlackboardStore, StoreError, TaskStatus};
 use complex_support::tools::{
-    BLACKBOARD_POST, ComplexToolHandler, DANGEROUS_WRITE, PLAN_ADD_TASK, PLAN_CLAIM, PLAN_CREATE,
-    complex_agent_machine, complex_scope, complex_tool_handler,
+    BLACKBOARD_POST, ComplexToolHandler, DANGEROUS_WRITE, PLAN_ADD_TASK, PLAN_CLAIM,
+    PLAN_CLAIM_FIRST_AVAILABLE, PLAN_CREATE, complex_agent_machine, complex_scope,
+    complex_tool_handler,
 };
 
 /// Fixed plan id so store construction stays deterministic and offline.
@@ -573,4 +579,189 @@ async fn denied_dangerous_write_does_not_execute_tool() {
         .pending_none()
         .tool_result_status("c-danger", ToolStatus::Denied)
         .last_assistant_text("done, delivered the plan");
+}
+
+// ----- M4-1: claim conflict / dependency-block recovery --------------------
+
+/// A racing claim conflict and a dependency-blocked claim both surface to the
+/// model as tool errors, and the model recovers through the blackboard by
+/// claiming a different available task.
+///
+/// `docs/complex-tests.md` §5.1 P1-1: when a second worker loses an optimistic
+/// claim race, or targets a task whose dependencies are unfinished, neither
+/// failure may panic, silently succeed, or corrupt the plan. Both must come back
+/// as a model-visible [`ToolStatus::Error`], and the model must be able to keep
+/// going — here by posting the failure to the shared blackboard and falling back
+/// to [`PLAN_CLAIM_FIRST_AVAILABLE`], which atomically skips the still-owned and
+/// still-blocked tasks and claims the only remaining one.
+///
+/// The turn is driven end to end through a [`DrainHarness`] so the model actually
+/// *sees* each tool error before scripting its next step. The plan is seeded
+/// directly (not through the model) so the scripted `expected_version` arguments
+/// pin known versions, which is what makes the version-conflict race
+/// deterministic offline: worker-2 claims `task-a` with the stale version it read
+/// before worker-1's successful claim bumped it.
+#[tokio::test]
+async fn complex_plan_claim_conflict_or_dependency_block_recovers_through_blackboard() {
+    let ids = SeqIds::new();
+    let ctx = root_context(&ids);
+
+    // Seed a plan with three tasks at known versions:
+    //   task-a: claimable now,
+    //   task-b: blocked until `task-a` completes,
+    //   task-c: independently claimable.
+    // create (v0), +task-a (v1), +task-b (v2), +task-c (v3).
+    let store = Arc::new(MockPlanBlackboardStore::new(plan_id()));
+    store.create_plan();
+    store
+        .add_task("task-a", Vec::<&str>::new())
+        .expect("add task-a");
+    store.add_task("task-b", ["task-a"]).expect("add task-b");
+    store
+        .add_task("task-c", Vec::<&str>::new())
+        .expect("add task-c");
+    let seeded_version = store.version();
+    assert_eq!(
+        seeded_version, 3,
+        "seeding leaves the plan at a known version"
+    );
+
+    let handler = complex_tool_handler(Arc::clone(&store));
+
+    // The model script: worker-1 claims `task-a`; worker-2 then loses the claim
+    // race on the same task (stale version), recovers by trying the blocked
+    // `task-b`, and finally falls back to a first-available claim of `task-c`.
+    let llm = ScriptedLlmHandler::from_steps([
+        // 1. worker-1 claims `task-a` at the seeded version -> success -> v4.
+        LlmStep::tool_use(vec![tool_call(
+            "c-claim-a",
+            PLAN_CLAIM,
+            serde_json::json!({
+                "task": "task-a",
+                "owner": "worker-1",
+                "expected_version": 3
+            }),
+        )]),
+        // 2. worker-2 posts and re-claims `task-a` with its *stale* version 3;
+        //    the plan is now at v4, so this is a version conflict, not a silent
+        //    overwrite. The post is the only board write in this step.
+        LlmStep::tool_use(vec![
+            tool_call(
+                "c-post-conflict",
+                BLACKBOARD_POST,
+                serde_json::json!({
+                    "sender": "worker-2",
+                    "text": "claim conflict on task-a, backing off"
+                }),
+            ),
+            tool_call(
+                "c-claim-a-dup",
+                PLAN_CLAIM,
+                serde_json::json!({
+                    "task": "task-a",
+                    "owner": "worker-2",
+                    "expected_version": 3
+                }),
+            ),
+        ]),
+        // 3. worker-2 recovers by targeting `task-b`, whose dependency `task-a`
+        //    is still in progress -> dependency-blocked. Version is now current
+        //    (4), so this fails on the dependency check, not the version check.
+        LlmStep::tool_use(vec![
+            tool_call(
+                "c-post-block",
+                BLACKBOARD_POST,
+                serde_json::json!({
+                    "sender": "worker-2",
+                    "text": "dependency blocked on task-b, deferring"
+                }),
+            ),
+            tool_call(
+                "c-claim-b",
+                PLAN_CLAIM,
+                serde_json::json!({
+                    "task": "task-b",
+                    "owner": "worker-2",
+                    "expected_version": 4
+                }),
+            ),
+        ]),
+        // 4. worker-2 falls back to a first-available claim: `task-a` is owned,
+        //    `task-b` is dependency-blocked, so it atomically claims `task-c` -> v5.
+        LlmStep::tool_use(vec![tool_call(
+            "c-claim-first",
+            PLAN_CLAIM_FIRST_AVAILABLE,
+            serde_json::json!({ "owner": "worker-2", "expected_version": 4 }),
+        )]),
+        // 5. The model closes the turn once it has recovered.
+        LlmStep::text("recovered by claiming task-c after conflict and dependency block"),
+    ]);
+
+    // No dangerous tool runs here, so the scope needs no interaction backend.
+    let scope = complex_scope(
+        Arc::new(llm),
+        Arc::clone(&handler) as Arc<dyn ToolHandler>,
+        None,
+    );
+
+    let machine = complex_agent_machine(&ids);
+    let mut harness = DrainHarness::with_ids(machine, &scope, None, &ctx, ids);
+    let observed = harness
+        .run_user("认领并推进计划任务")
+        .await
+        .expect("the claim-recovery turn drains to completion");
+    assert_done(observed.turn_done());
+
+    // ----- single owner per task -------------------------------------------
+
+    // `task-a` has exactly one owner: worker-1's claim won the race, worker-2's
+    // conflicting re-claim never took it.
+    assert_task_status(&store, "task-a", TaskStatus::InProgress);
+    assert_task_owner(&store, "task-a", "worker-1");
+
+    // The recovery claimed the only other available task for worker-2.
+    assert_task_status(&store, "task-c", TaskStatus::InProgress);
+    assert_task_owner(&store, "task-c", "worker-2");
+
+    // ----- the blocked task was never modified -----------------------------
+
+    // The dependency-blocked claim left `task-b` untouched: still Todo, unowned,
+    // with its dependency edge intact.
+    assert_task_status(&store, "task-b", TaskStatus::Todo);
+    assert_no_task_owner(&store, "task-b");
+    assert_task_depends_on(&store, "task-b", &["task-a"]);
+
+    // ----- the conflict/block messages survive on the blackboard -----------
+
+    // Both recovery notes are retained, in order, with no duplicated side effect.
+    assert_board_messages(
+        &store,
+        &["claim conflict on task-a", "dependency blocked on task-b"],
+    );
+
+    // ----- exactly two successful mutations --------------------------------
+
+    // Only worker-1's `task-a` claim and worker-2's `task-c` first-available
+    // claim bumped the version (v3 -> v4 -> v5); the conflict and the block did
+    // not, proving the plan state was not corrupted by the failed attempts.
+    assert_eq!(
+        store.version(),
+        5,
+        "only the two successful claims bump the version\nstore operations:\n{}",
+        store.ops_summary()
+    );
+
+    // ----- the failures were model-visible tool errors ---------------------
+
+    // The successful claims are `Ok`, the conflict and the dependency block are
+    // model-visible `Error` tool results the model could recover from.
+    let machine = harness.into_machine();
+    assert_conversation(machine.state().conversation())
+        .committed_turns(1)
+        .pending_none()
+        .tool_result_status("c-claim-a", ToolStatus::Ok)
+        .tool_result_status("c-claim-a-dup", ToolStatus::Error)
+        .tool_result_status("c-claim-b", ToolStatus::Error)
+        .tool_result_status("c-claim-first", ToolStatus::Ok)
+        .last_assistant_text("recovered by claiming task-c after conflict and dependency block");
 }

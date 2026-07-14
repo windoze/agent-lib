@@ -732,7 +732,7 @@ plan/blackboard。现有 `agent-testkit` 已有 `ScriptedSubagentSpawner`、`hea
 
 ## Milestone 4 — P1 回归补强与文档并轨
 
-### [TODO] M4-1 实现 plan claim conflict / dependency-blocked recovery 场景
+### [DONE] M4-1 实现 plan claim conflict / dependency-blocked recovery 场景
 
 **前置依赖**:M3-R。
 
@@ -761,6 +761,35 @@ model-visible tool result 返回给 LLM,而不是 panic 或破坏 plan 状态。
 - `cargo test --all --all-targets`。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - `git diff --check`。
+
+**完成记录**:
+
+- **落地**:在 `tests/agent_complex_flow.rs` 新增 `#[tokio::test]`
+  `complex_plan_claim_conflict_or_dependency_block_recovers_through_blackboard`(对应
+  `docs/complex-tests.md` §5.1 P1-1),用单个 `DrainHarness` turn + `ScriptedLlmHandler` 五步脚本把
+  version-conflict 与 dependency-blocked 两条恢复路径合并覆盖。补充 import:assertions `assert_task_owner`、
+  tools `PLAN_CLAIM_FIRST_AVAILABLE`;并更新文件模块级 doc 说明 M4-1 新增面。未改动任何生产/被测代码或
+  支持层(`tests/complex_support/`),纯新增测试。
+- **场景构造(离线确定性)**:直接 seed 计划到已知版本 —— create(v0)、+`task-a`(v1)、
+  +`task-b`(依赖 `task-a`,v2)、+`task-c`(v3)。脚本:①`worker-1` claim `task-a` exp_ver=3 → 成功 → v4;
+  ②`worker-2` post "claim conflict on task-a" + 用**陈旧** exp_ver=3 重认领 `task-a` → `VersionConflict`
+  (expected 3, actual 4),不 mutate;③`worker-2` post "dependency blocked on task-b" + claim `task-b`
+  exp_ver=4 → `DependencyBlocked`(`task-a` 仍 InProgress),不 mutate;④`worker-2`
+  `plan_claim_first_available` exp_ver=4 → 跳过已占用 `task-a` 与依赖未满足 `task-b`,原子认领 `task-c` → v5;
+  ⑤final text 收尾。每步至多一次 board 写入,claim 版本检查对 intra-batch 顺序不敏感,故完全确定。
+- **断言**:同一 `task-a` 只有单一 owner=`worker-1`(InProgress),恢复认领 `task-c` owner=`worker-2`;
+  blocked `task-b` 未被修改(仍 Todo、无 owner、`depends_on=[task-a]`);blackboard append-only 保留
+  conflict/block 两条消息(`assert_board_messages` 精确长度=2,兼作无重复 side effect 守卫);
+  两次失败都是 model-visible `ToolStatus::Error`(`c-claim-a-dup`、`c-claim-b`),两次成功为 `Ok`
+  (`c-claim-a`、`c-claim-first`),经 `assert_conversation(...).tool_result_status(...)` 读机器 committed
+  conversation;`store.version()==5` 证明只有两次成功 claim bump 版本,冲突/阻塞未污染 plan 状态;
+  committed 1 turn、pending none、last assistant text 一致。无 panic、无 wrong-family error、无 provider
+  wire mock、无真实 sleep/网络(<1s)。
+- **验证结果(全部通过)**:`cargo fmt --all -- --check` 干净;
+  `cargo test --test agent_complex_flow complex_plan_claim_conflict_or_dependency_block_recovers_through_blackboard`
+  (1 passed);`cargo test --test agent_complex_flow`(4 passed);`cargo clippy --all-targets -- -D warnings`
+  无告警;`cargo test --all --all-targets` 全绿(所有测试二进制 0 failed);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
 ### [TODO] M4-2 实现 approval cancel vs context cancel 区分场景
 
