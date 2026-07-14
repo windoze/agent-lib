@@ -1,56 +1,35 @@
-# 当前任务：M1-3 实现复杂测试断言 helper
+# 当前任务：M1-R Milestone 1 Review
 
 ## 定位
-- `TODO.md` 第一个未完成任务 = **M1-3**（首个 `[TODO]`，行 179）。前置依赖：M1-2（已 `[DONE]`，commit e4256c0）。
-- HEAD=e4256c0，工作树干净。属于 Milestone 1「Support 与 Mock Vertical Features」。
+- `TODO.md` 第一个未完成任务 = **M1-R**（首个 `[TODO]`，行 250）。前置依赖：M1-1..M1-3（均 `[DONE]`）。
+- HEAD=c9d325f（[M1-3]），工作树干净。属于 Milestone 1「Support 与 Mock Vertical Features」。
+- Review 任务，**不拆分**。产出=核对 + 验证命令全绿 + 结论写入完成记录。
 
-## 目标（TODO.md M1-3）
-新建 `tests/complex_support/assertions.rs`，提供只读断言 helper，失败信息按 docs/complex-tests.md §6
-携带 role sequence / tool result status / store ops / handler log。helper 只读观察对象，不改
-machine/store/context。在 `mod.rs` re-export 常用类型/helper。
+## Review 检查项（TODO.md M1-R）
+1. MockPlanBlackboardStore 的 dependency / claim / claim-first / blackboard append-only 语义。
+2. tool adapter 只站在 ToolHandler/ToolRegistry effect 边界。
+3. approval policy 只 guard dangerous_write，不影响 safe tools。
+4. helper 失败信息含 store ops / role sequence / handler log。
+5. 支持层仍留在 tests/complex_support/，未提前移到 agent-testkit。
 
-### plan/blackboard 断言（失败打印 store.ops_summary）
-- assert_task_status(store, id, status)
-- assert_task_owner(store, id, owner)
-- assert_task_depends_on(store, id, expected: &[&str])
-- assert_no_task_owner(store, id)
-- assert_board_messages(store, expected_substrings_in_order: &[&str])（长度相等 + 逐条 contains）
-
-### conversation helper（复用 agent_testkit::assert_conversation，不重写）
-- role_sequence(conversation, turn_index) -> Vec<Role>（越界 panic 带 summary）
-- assert_pivot_after_tool_result(conversation, pivot_text)：扫描全体消息顺序，找到某个 Tool 结果后
-  出现的、文本含 pivot_text 的 User 消息；失败打印 role 序列。
-
-### handler log helper
-- assert_tool_executions(handler: &ComplexToolHandler, tool_name, count)（execution_count，失败打印调用日志）
-- assert_interaction_decisions(log: &InteractionCallLog, expected)（completed_len）
-
-### mod.rs
-- pub mod assertions;
-- re-export：plan_blackboard 常用类型、tools 常量与类型、assertions helper。
-  若触发 unused_imports，加 #[allow(unused_imports)]。
-
-## 新增单测（tests/agent_complex_support.rs）
-1. assertions_report_store_ops_on_failure（必需）：建 store 建 plan+board，先跑通过路径，
-   再 catch_unwind 一个错误期望，断言 panic 文本含 store ops 摘要。
-2. role_sequence_and_pivot_helpers_find_expected_messages（必需）：StepHarness 驱动
-   complex_agent_machine 走 user->tool_use(safe_read)->tool result->mid-turn pivot->final text。
-   断言 role_sequence(0)=[User,Assistant,Tool,User,Assistant]，assert_pivot_after_tool_result 命中。
-3. handler_and_store_assertions_hold_after_approved_dangerous_write（补充）：DrainHarness 端到端
-   dangerous_write->approval(Approve)->执行->final text。断言 assert_tool_executions、
-   assert_interaction_decisions、assert_board_messages。
+## 代码核对结论（已读源码）
+- plan_blackboard.rs：dependency（UnknownTask/SelfDependency/DependencyCycle）、claim（版本 CAS + owner + 可转移 + 依赖完成，失败不改状态）、claim_first_available（stable order，仅 Todo+无 owner+依赖满足）、blackboard append-only（offset=len 单调，无删/改路径）。✓
+- tools.rs：ComplexToolHandler 通过 ToolHandler::fulfill 的 NeedTool 边界派发；store/arg 错误折成 ToolStatus::Error，未知工具 -> ToolRuntimeError::UnknownTool；无 provider wire mock。✓
+- RequireDangerousWriteApprovalPolicy 只对 DANGEROUS_WRITE required，其余 AutoApprove。✓
+- assertions.rs：plan/board 断言失败打印 ops_summary；role_sequence/pivot 打印会话摘要；tool/interaction 断言打印调用日志。✓
+- 位置：全部在 tests/complex_support/，未移入 crate。✓
+- 单测覆盖（agent_complex_support.rs）：dependency/claim/claim-first/append-only/tool errors/approval-gating/call-log/assertions helpers 均有测试。✓
 
 ## 验证顺序
 - cargo fmt --all -- --check
-- cargo test --test agent_complex_support <两个必需测试名>
 - cargo clippy --all-targets -- -D warnings
+- cargo test --test agent_complex_support
 - cargo test --all --all-targets（<=30min）
 - RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - git diff --check
 
 ## 完成后
-- TODO.md M1-3 标题 [TODO]->[DONE]，补完成记录。提交 [M1-3] ...。停止。
+- TODO.md M1-R 标题 [TODO]->[DONE]，补 Review 结论完成记录。提交 [M1-R] ...。停止。
 
 ## 进度
-- [进行中] 调研完成（store/handler/conversation/harness API）。开始写 assertions.rs。
-- [完成] assertions.rs + mod.rs re-export + 三个单测全部落地。fmt/clippy/doc/全量测试(423+131 等，0 fail，4 ignored=credential-gated)与 git diff --check 全部通过。TODO.md M1-3 标记 [DONE] 并补完成记录。待提交 [M1-3]。
+- [完成] 代码核对 + 全部验证命令通过(fmt/clippy/agent_complex_support 10 passed/全量 620 passed 0 failed 7 credential-gated ignored/doc/diff --check)。TODO.md M1-R 标记 [DONE] 并写入 Review 结论。待提交 [M1-R]。

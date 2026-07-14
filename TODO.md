@@ -247,7 +247,7 @@ result status、store ops、outstanding ids / child log。helper 只应读观察
   `cargo test --all --all-targets` 全绿(仅 4 个 credential-gated 集成测试 ignored);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
-### [TODO] M1-R Milestone 1 Review
+### [DONE] M1-R Milestone 1 Review
 
 **前置依赖**:M1-1..M1-3。
 
@@ -272,6 +272,41 @@ result status、store ops、outstanding ids / child log。helper 只应读观察
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - `git diff --check`。
 - Review 结论写入本任务完成记录。
+
+**完成记录**:
+
+Milestone 1 支持层审阅通过,五项检查点全部确认,无需返工。
+
+- **Store 语义(`plan_blackboard.rs`)**:
+  - dependency:`add_task` 拒绝 `DuplicateTask` / `SelfDependency` / `UnknownTask`(依赖必须指向已知任务),
+    并跑 `detect_cycle` 做防御性无环检查;`depends_on` 存 typed 边集。
+  - claim:先做 `version` CAS(`VersionConflict`),再原子校验 owner(`AlreadyClaimed`,同 owner 幂等)、
+    状态可转移(`can_transition_to`)、依赖全部 `Completed`(`DependencyBlocked` 携带 `unfinished`);任一校验
+    失败都不改 owner/status/version——dependency-blocked claim 确实是 no-op。
+  - claim-first:`claim_first_available` 按 `task_order` 稳定序扫描,只认 `Todo` + 无 owner + 依赖满足的第一个
+    任务,否则 `NoAvailableItem`;跳过 completed/claimed/blocked 项。
+  - blackboard:`post` 以 `offset = board.len()` 单调递增追加,只有 `post` / `read_from` / `board_snapshot`,
+    无删除或改写路径,append-only 成立。
+  - 每个操作(成功/失败)都进 `StoreOp` 日志,`ops_summary()` 渲染成带编号的转录。
+- **Tool adapter 边界(`tools.rs`)**:`ComplexToolHandler` 仅经 `ToolHandler::fulfill` 的
+  `RequirementKind::NeedTool` 边界派发到 store;store/参数错误折成 model-visible `ToolStatus::Error`(不 panic),
+  未知工具返回 `ToolRuntimeError::UnknownTool`。没有 mock 任何 provider wire(HTTP/SSE/raw JSON),`ToolRegistry`
+  后端也未被伪造。已执行调用才进 call log(approval 未通过者不留痕),`execution_count` 因此等于真实执行次数。
+- **Approval policy**:`RequireDangerousWriteApprovalPolicy` 只对 `dangerous_write` 返回 `RequireApproval`,
+  其余工具 `AutoApprove`;safe tools 不受影响。`dangerous_write_requires_approval_and_safe_tools_do_not`
+  测试固定住该边界。
+- **Helper 失败信息(`assertions.rs`)**:plan/board 断言失败嵌入 `store.ops_summary()`;`role_sequence` /
+  `assert_pivot_after_tool_result` 失败打印会话 role 序列摘要;`assert_tool_executions` 打印每工具调用日志,
+  `assert_interaction_decisions` 打印 begun/completed 计数。§6 要求的定位上下文齐备。
+- **位置**:支持层仍完整位于 `tests/complex_support/`(`mod.rs` + `plan_blackboard.rs` + `tools.rs` +
+  `assertions.rs`),未提前迁入 `agent-testkit`;`#![allow(dead_code, unused_imports)]` 传播使 staged-for-later
+  的 re-export 不在未使用的复杂测试 crate 里告警。
+- **验证结果(全绿)**:`cargo fmt --all -- --check` 无 diff;`cargo clippy --all-targets -- -D warnings` 无告警;
+  `cargo test --test agent_complex_support` 10 passed;`cargo test --all --all-targets` 620 passed / 0 failed /
+  7 ignored(全部为 `#[ignore = "requires ..."]` 的 credential/network-gated 集成测试,符合离线约束,非被屏蔽的失败);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
+- **结论**:Milestone 1 交付物满足 P0/P1 场景的表达需求,未把测试 mock 做成生产 API 或 provider wire mock;
+  可进入 Milestone 2。
 
 ---
 
