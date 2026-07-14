@@ -990,7 +990,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 ## Milestone 5 — 并发、取消与 subagent 测试工具
 
-### [TODO] M5-1 实现并发 delay/barrier/peak 工具
+### [DONE] M5-1 实现并发 delay/barrier/peak 工具
 
 **前置依赖**:M4-R。
 
@@ -1009,6 +1009,17 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:通过 delay 稳定得到 out-of-order completion。
 - 单测:不依赖真实时间。
 - 跑全套验证命令。
+
+**完成记录(2026-07-14)**:
+
+- 将 `crates/agent-testkit/src/concurrency.rs` 从 5 行 stub 升级为确定性并发观测模块,全部基于协作式调度、不触碰真实时钟:
+  - `Delay { ticks }`:`ready()`(0 tick)/`yields(n)`/`ticks()`;`IntoFuture` → `YieldTicks` 手动 future,每 tick `cx.waker().wake_by_ref()` 后返回 `Poll::Pending`,`n` 次后 `Poll::Ready`。给并发调用不同 tick 数即得确定的完成先后,无 `tokio::time::sleep`。
+  - `Barrier`(cooperative barrier)+ `BarrierWait` future:`new(threshold)`(`0` 即已释放)、`wait()`、`threshold()`/`arrived()`/`is_released()`;第 `threshold` 个到达者置 `released` 并唤醒全部已登记 waker,一起放行,从而把峰值并发钉在 `threshold`。`BarrierWait` 用 `counted` 标志保证每个 future 只计一次到达。
+  - `PeakInFlight` 计数器 + completion log:`Mutex<{in_flight, peak, begun, completions}>`;`enter()` → RAII `InFlightGuard`(抬升 in_flight/peak,携带 begin index),`complete()` 按完成序把 begin index 记入 `completions`;`Drop` 兜底:未 `complete` 就被 drop(取消路径)仅释放 in_flight 槽、不记完成。访问器 `peak()`/`in_flight()`/`begun()`/`completed()`/`completion_order()`。
+  - `DelayingToolHandler<H: ToolHandler>` wrapper:`new`/`with_delay(delay)`/`with_delays(iter)`(dispatch 序消费、drain 后回落 `ready`)+ 链式 `with_barrier(threshold)`;`fulfill` 为 `enter → 可选 barrier.wait → delay → inner.fulfill → guard.complete`。因 scripted inner fulfill 同步完成、无 await,注入的 delay 才是让并发调用真正重叠的 await 窗口。访问器 `gauge()`/`barrier()`/`inner()`/`peak_concurrency()`/`completion_order()`。
+- `prelude.rs` 追加 `Barrier`、`BarrierWait`、`Delay`、`DelayingToolHandler`、`InFlightGuard`、`PeakInFlight`、`YieldTicks` 再导出。
+- 单测(concurrency.rs `#[cfg(test)]`,7 个;并发用例用 `FuturesUnordered` 复刻 driver 执行器):`Delay::yields(3)` 恰好 4 次 poll(3 pending + 1 ready)证明无真实时间;`ready` 首 poll 完成;barrier 两 waiter 一起放行且 `arrived==2`;`PeakInFlight` 两重叠 bracket 峰值=2 且乱序 complete → `completion_order()==[1,0]`;dropped guard 只释放槽不记完成;两并发 tool call 经 barrier 峰值 in-flight=2(begun/completed 均 2);ordered delays `[yields(3), yields(0)]` 稳定得到 `completion_order()==[1,0]`(第二个 dispatch 先完成)且峰值=2。
+- 验证:`cargo fmt --all` 已格式化;`cargo clippy --all-targets -- -D warnings`(root)与 `cargo clippy -p agent-testkit --all-targets -- -D warnings` 均无告警;`cargo test -p agent-testkit --lib concurrency` 7/7;`cargo test --all --all-targets` 全绿(agent-lib 434、agent-testkit lib 111 + 集成 cassette 2 + smoke 2,0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。
 
 ### [TODO] M5-2 实现 cancel-on-call 与 panic-on-call wrappers
 

@@ -22,6 +22,9 @@ pub use crate::cassette::{
     RecordingToolHandler, Redactor, ReplayMismatch, ReplayMismatchKind, ToolEntry, ToolOutcome,
     UPDATE_ENV_VAR, request_fingerprint,
 };
+pub use crate::concurrency::{
+    Barrier, BarrierWait, Delay, DelayingToolHandler, InFlightGuard, PeakInFlight, YieldTicks,
+};
 pub use crate::fixtures::{
     agent_spec, agent_spec_with_tools, agent_state, assistant_text, assistant_tool_use,
     calendar_tool, default_machine, root_context, text_block, tool_call, tool_error_response,
