@@ -6,6 +6,12 @@
 //! and step contract so downstream tests can name the effect boundary without a
 //! deep import path, plus the deterministic id source.
 
+pub use crate::assertions::{
+    BudgetAssertions, CallAssertions, ConversationAssertions, NotificationAssertions,
+    RequirementAssertions, RequirementTraceView, RequirementView, TraceAssertions, TraceNodeView,
+    TurnDoneAssertions, assert_budget, assert_budget_snapshot, assert_calls, assert_conversation,
+    assert_done, assert_notifications, assert_requirements, assert_trace, assert_trace_records,
+};
 pub use crate::cassette::{
     CASSETTE_SCHEMA_VERSION, Cassette, CassetteEntry, CassetteError, CassetteInteractionHandler,
     CassetteLlmHandler, CassetteMetadata, CassetteObservations, CassettePlayer,

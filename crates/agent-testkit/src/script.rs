@@ -493,6 +493,14 @@ pub struct CallTicket(usize);
 /// order ([`CallRecord::completion_index`]) so a test can assert on both even
 /// when concurrent calls finish out of order. It uses interior mutability so a
 /// handler records behind a shared reference while a test reads it.
+///
+/// The log also tracks *peak concurrency*: the maximum number of calls that
+/// were in flight (begun but not yet completed) at once. Because every
+/// [`begin`](Self::begin) and [`complete`](Self::complete) crosses the same
+/// mutex, the log is the single serialization point where an in-flight gauge can
+/// be maintained without a separate observer. A delay/barrier handler wrapper
+/// (milestone M5) drives high concurrency; the peak it produces is read back
+/// here through [`peak_concurrency`](Self::peak_concurrency).
 #[derive(Debug)]
 pub struct CallLog<Req, Res> {
     state: Mutex<CallLogState<Req, Res>>,
@@ -502,6 +510,8 @@ pub struct CallLog<Req, Res> {
 struct CallLogState<Req, Res> {
     records: Vec<CallRecord<Req, Res>>,
     completed: usize,
+    in_flight: usize,
+    peak_in_flight: usize,
 }
 
 impl<Req, Res> Default for CallLog<Req, Res> {
@@ -518,6 +528,8 @@ impl<Req, Res> CallLog<Req, Res> {
             state: Mutex::new(CallLogState {
                 records: Vec::new(),
                 completed: 0,
+                in_flight: 0,
+                peak_in_flight: 0,
             }),
         }
     }
@@ -532,6 +544,10 @@ impl<Req, Res> CallLog<Req, Res> {
             result: None,
             completion_index: None,
         });
+        state.in_flight += 1;
+        if state.in_flight > state.peak_in_flight {
+            state.peak_in_flight = state.in_flight;
+        }
         CallTicket(call_index)
     }
 
@@ -545,6 +561,7 @@ impl<Req, Res> CallLog<Req, Res> {
         let completion_index = if first_completion {
             let index = state.completed;
             state.completed += 1;
+            state.in_flight = state.in_flight.saturating_sub(1);
             Some(index)
         } else {
             state.records[ticket.0].completion_index
@@ -577,6 +594,19 @@ impl<Req, Res> CallLog<Req, Res> {
     #[must_use]
     pub fn completed_len(&self) -> usize {
         self.lock().completed
+    }
+
+    /// Returns the peak number of calls in flight (begun but not completed) at
+    /// any single moment over this log's lifetime.
+    ///
+    /// A log that only ever ran calls one at a time (or through
+    /// [`record`](Self::record), which begins and completes atomically) reports
+    /// `1` once any call has run, and `0` before the first call. Concurrent
+    /// begins raise the peak until their matching completions bring the
+    /// in-flight count back down.
+    #[must_use]
+    pub fn peak_concurrency(&self) -> usize {
+        self.lock().peak_in_flight
     }
 
     /// Runs `visitor` against the recorded calls in dispatch order.
@@ -725,6 +755,37 @@ mod tests {
             assert_eq!(records[0].completion_index, Some(0));
             assert_eq!(records[1].completion_index, Some(1));
         });
+    }
+
+    #[test]
+    fn call_log_tracks_peak_concurrency() {
+        let log: CallLog<u8, u8> = CallLog::new();
+        assert_eq!(log.peak_concurrency(), 0, "no call has begun yet");
+
+        // Two overlapping calls raise the peak to 2; a third begins only after
+        // both complete, so the in-flight count never exceeds 2.
+        let a = log.begin(1);
+        let b = log.begin(2);
+        assert_eq!(log.peak_concurrency(), 2);
+        log.complete(b, 20);
+        log.complete(a, 10);
+
+        let c = log.begin(3);
+        assert_eq!(log.peak_concurrency(), 2, "the peak is a high-water mark");
+        log.complete(c, 30);
+        assert_eq!(log.peak_concurrency(), 2);
+    }
+
+    #[test]
+    fn call_log_sequential_calls_peak_at_one() {
+        let log: CallLog<u8, u8> = CallLog::new();
+        log.record(1, 10);
+        log.record(2, 20);
+        assert_eq!(
+            log.peak_concurrency(),
+            1,
+            "atomic begin/complete never overlaps"
+        );
     }
 
     #[test]

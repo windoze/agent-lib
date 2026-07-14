@@ -20,9 +20,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_lib::agent::{LoopCursorKind, drain};
+use agent_lib::agent::drain;
 use agent_lib::model::content::ContentBlock;
 use agent_lib::model::message::Role;
+use agent_lib::model::tool::ToolStatus;
 use agent_testkit::prelude::*;
 
 /// City the scripted model looks up.
@@ -155,40 +156,40 @@ async fn offline_replay_runs_a_full_weather_turn() {
     .await
     .expect("the offline turn drains to completion");
 
-    // Final cursor: the turn closed cleanly on `Done`.
-    assert_eq!(done.cursor().kind(), LoopCursorKind::Done);
+    // Final cursor: `assert_done` bakes in the clean `Done`-cursor check.
+    assert_done(&done);
 
     // Handler call logs: two LLM generations and one tool call, all completed,
     // and no interaction/reconfig/subagent traffic (those handlers do not exist).
-    assert_eq!(
-        llm_log.len(),
-        2,
-        "one tool-use generation + one final generation"
-    );
-    assert_eq!(llm_log.completed_len(), 2);
-    assert_eq!(tool_log.len(), 1, "the single get_weather call");
-    assert_eq!(tool_log.completed_len(), 1);
+    assert_calls(&llm_log).count(2).all_completed();
+    assert_calls(&tool_log).count(1).all_completed();
 
     // Committed conversation: one closed turn of user, assistant tool-use, tool
-    // result, and the assistant's final answer.
-    let conversation = machine.state().conversation();
-    assert!(conversation.pending().is_none(), "the turn committed");
-    assert_eq!(conversation.turns().len(), 1);
-    let messages = conversation.turns()[0].messages();
-    assert_eq!(messages.len(), 4);
-    assert_eq!(messages[0].payload().role, Role::User);
+    // result, and the assistant's final answer, with the single tool call paired
+    // and its result recorded as `Ok`.
+    assert_conversation(machine.state().conversation())
+        .pending_none()
+        .committed_turns(1)
+        .open_call_count(0)
+        .pairing_count(0, 1)
+        .message_role(0, 0, Role::User)
+        .message_role(0, 1, Role::Assistant)
+        .message_role(0, 2, Role::Tool)
+        .message_role(0, 3, Role::Assistant)
+        .tool_result_status(CALL_ID, ToolStatus::Ok)
+        .last_assistant_text(FINAL_ANSWER);
 
-    assert_eq!(messages[1].payload().role, Role::Assistant);
+    // The assertion module intentionally stays out of block-level detail, so the
+    // last low-level facts — the exact message count and the tool-use *name* — are
+    // still checked directly against the committed conversation.
+    let messages = machine.state().conversation().turns()[0].messages();
+    assert_eq!(
+        messages.len(),
+        4,
+        "user, tool-use, tool result, final answer"
+    );
     let ContentBlock::ToolUse { name, .. } = &messages[1].payload().content[0] else {
         panic!("the second message must be the assistant's tool-use request");
     };
     assert_eq!(name, "get_weather");
-
-    assert_eq!(messages[2].payload().role, Role::Tool);
-
-    assert_eq!(messages[3].payload().role, Role::Assistant);
-    let ContentBlock::Text { text, .. } = &messages[3].payload().content[0] else {
-        panic!("the final message must be the assistant's text answer");
-    };
-    assert_eq!(text, FINAL_ANSWER);
 }

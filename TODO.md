@@ -920,7 +920,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测(harness.rs `#[cfg(test)] mod drain_tests`,3 个 `#[tokio::test]`):local tool scripted turn(LLM tool_use → tool ok → LLM text)drain 到 `Done`,watched llm/tool 摘要为 2/2 与 1/1,且 conversation 已提交无 pending;guarded 工具调用在 headless top scope 下原样返回 `AgentError::UnhandledRequirement { kind: Interaction }`(非字符串化)且 tool 未运行;cancel 先于 drain 时首个 requirement 被 abandon,tool handler 与其摘要均为 0。
 - 验证:`cargo fmt --all --check` 通过;`cargo clippy --all-targets -- -D warnings`(root + `-p agent-testkit`)无告警;`cargo test -p agent-testkit --lib drain_tests` 3/3;`cargo test --all --all-targets` 全绿(agent-lib 434、agent-testkit 85 + 集成 cassette 2 + smoke 2,0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(root + `-p agent-testkit`)通过;`git diff --check` 干净。
 
-### [TODO] M4-3 实现 assertions 模块
+### [DONE] M4-3 实现 assertions 模块
 
 **前置依赖**:M4-2。
 
@@ -941,6 +941,23 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:至少一个 failure message 快照式断言,确保上下文足够。
 - 用 assertions 改写一个已有 testkit smoke 测试,证明可读性提升。
 - 跑全套验证命令。
+
+**完成记录(2026-07-14)**:
+
+- 将 `assertions.rs` 从 5 行 stub 升级为目录模块 `crates/agent-testkit/src/assertions/`,`mod.rs` 汇总文档与 `pub use` 再导出,按断言家族拆成 7 个只读子模块(全部只借用 machine/context,不修改状态):
+  - `conversation.rs`:`assert_conversation(&Conversation)` → `ConversationAssertions`,覆盖 `committed_turns`、`pending_present`/`pending_none`、`open_call_count`、`message_role`、`message_text`/`message_text_contains`、`last_assistant_text`/`last_assistant_text_contains`、`tool_result_status`、`pairing_count`。
+  - `requirements.rs`:`assert_requirements(&[Requirement])` → `RequirementAssertions` + `RequirementView`,覆盖 `count`/`empty`/`single`、按家族 `single_of`/`single_llm`/`single_tool`/`single_interaction`/`single_subagent`/`single_reconfig`,以及 view 上的 `id`/`tag`/`origin_root`/`origin`/`llm_mode`/`tool_call`/`tool_name`/`request_summary`。
+  - `notifications.rs`:`assert_notifications(&[Notification])`,覆盖各家族计数、`tool_started`/`tool_finished`、`started_then_finished` 配对、`step_boundary` 计数与 `boundary_metadata` 快照。
+  - `trace.rs`:`assert_trace(&RunContext)`/`assert_trace_records`,`TraceAssertions` + `RequirementTraceView`/`TraceNodeView`,覆盖 node/requirement/subagent 计数、`resolved_at_scope`、`disposition`、`resumed`/`never_resumed`、`parent_is`/`kind_is`。
+  - `budget.rs`:`assert_budget(&RunContext)`/`assert_budget_snapshot`,覆盖 `steps`/`tokens`/`cost_micros`。
+  - `calls.rs`:`assert_calls(&CallLog)`(泛型于 Req/Res),覆盖 `count`/`request_count`/`completed`/`all_completed`/`completion_order`/`peak_concurrency`。
+  - `done.rs`:`assert_done(&TurnDone)`(内建 `Done` cursor 断言),覆盖 `cursor_kind`/`errored`/`notification_count`/`notifications`。
+- 前置增强:`script.rs` 的 `CallLog` 在同一把锁下新增 `in_flight`/`peak_in_flight` 计量与 `peak_concurrency()` 访问器(`begin` 自增并抬升峰值,首次 `complete` 用 `saturating_sub(1)` 递减),为 `assert_calls().peak_concurrency(..)` 提供真实并发峰值;顺序/原子 `record()` 峰值为 1,首次调用前为 0。新增 2 个单测。
+- fluent 风格:断言方法均以 panic 表达失败(非 `#[must_use]`),链式终结调用不再触发 `unused_must_use`;失败信息统一走 `panic!("{}", msg)`/`assert!` 以便 `catch_unwind` 下 `downcast_ref::<String>()`。
+- `prelude.rs` 追加全部 assertion 入口函数与 view 类型再导出。
+- 可读性改写:`tests/cassette_replay.rs::offline_replay_runs_a_full_weather_turn` 用 `assert_done`/`assert_calls`/`assert_conversation` 取代手写 `llm_log.len()`/`completed_len()`、`conversation.turns()[0].messages()` 与逐条 role/content 断言,保留同等覆盖(仅保留 message 数与 tool-use name 两处 assertion 模块刻意不覆盖的 block 级细节的直接检查)。
+- 单测:每类 assertion happy path + 至少一条 failure-message 快照式断言(`catch_unwind` 校验 panic payload 携带足够上下文),assertions 子模块共 17 个单测;`assert_calls` 覆盖 peak concurrency。
+- 验证:`cargo fmt --all` 已格式化;`cargo clippy --all-targets -- -D warnings`(root + `-p agent-testkit`)无告警;`cargo test -p agent-testkit` 全绿(lib 104 + cassette 2 + smoke 2 + doctest 1);`cargo test --all --all-targets` 全绿(agent-lib 434、agent-testkit lib 104 + 集成 cassette 2 + smoke 2,0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。
 
 ### [TODO] M4-R Milestone 4 Review
 
