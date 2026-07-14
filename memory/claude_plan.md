@@ -1,35 +1,49 @@
-# 执行计划 — M3-1 定义 cassette schema、redactor 与 fingerprint
+# 执行计划 — M3-2 实现 cassette replay handlers
 
 ## 选中的任务
-`TODO.md` 第一个未完成任务 = **M3-1 定义 cassette schema、redactor 与 fingerprint**(line 559)。
-M1-* / M2-* 全 `[DONE]` 且已提交(HEAD=`cd1fdc1` = M2-R),工作树 clean。前置依赖 M2-R 已满足。
+`TODO.md` 第一个未完成任务 = **M3-2 实现 cassette replay handlers**(line 615)。
+前置 M3-1 已 `[DONE]`(HEAD=`220a8ad`),工作树 clean。
 
-## 任务要求(TODO.md M3-1)
-在 `crates/agent-testkit/src/cassette.rs`(当前仅 skeleton stub)实现:
-1. `Cassette`:schema version、metadata、entries、optional observations。
-2. entry 类型:`LlmEntry`/`ToolEntry`/`InteractionEntry`/`ReconfigEntry`(统一 tagged enum `CassetteEntry`)。
-3. request fingerprint:canonical JSON(排序 key)作为 v1 fingerprint 字符串。
-4. fingerprint 默认忽略 volatile ids:RequirementId、TraceNodeId、测试分配 id、tool_call id/step_id 等。
-5. `Redactor` trait + `DefaultRedactor`:默认保留 message 文本,redacts provider extras 未知字段。
-6. schema version 常量;未知版本 deserialize 分类失败。
-
-只做 M3-1;不实现 replay handlers(M3-2)。
+## 任务要求(TODO.md M3-2)
+- `CassetteLlmHandler: LlmHandler`
+- `CassetteToolHandler: ToolHandler`
+- `CassetteInteractionHandler: InteractionHandler`
+- `CassetteReconfigHandler: ReconfigHandler`
+- 每个 handler 按 **family + 顺序 + request fingerprint** 匹配 entry。
+- mismatch 错误含 cassette path/label、entry index、family、expected fp、actual fp、请求摘要。
+- 与 scripted handler 共享 call log 风格(复用 `LlmCallLog`/`ToolCallLog`/… 与 `CallLog`)。
+- replay 不调用真实 handler(replay handler 本身即终端,无 delegate)。
 
 ## 关键设计决策
-- payload 均可序列化;`ToolRuntimeError` 不可序列化 → testkit 内定义镜像 `CassetteToolError` + 双向 From,
-  不改 agent-lib(与 `ClientError` 可序列化先例一致)。
-- outcome:LlmOutcome/ToolOutcome/InteractionResponse/ReconfigOutcome。
-- `CassetteEntry` internally-tagged(tag="family"),M3-1 不含 Subagent(AgentError 属 M5)。
-- fingerprint:to_value → 递归 canonicalize(排序 key + volatile-id key 字符串值→`<volatile-id>`)→ compact JSON。
-  `input`/`input_schema` 子树 opaque:排序但不 strip id。
-- `Cassette::from_json_str` 先读 schema_version 分类(missing/unsupported/ok)再 full parse。
-- `DefaultRedactor` scrub `provider_extras.fields` 与 `response.extra` 非 allowlist 值→`<redacted>`;message 文本不动。
+- 模块化:`cassette.rs` → `cassette/mod.rs`(schema 保持不变) + 新增 `cassette/replay.rs`;mod.rs `mod replay; pub use replay::*;`。honors M3-1 doc "replay 扩展 crate::cassette"。
+- `CassettePlayer`:持 `Arc<Cassette>` + label,`.llm_handler()/.tool_handler()/.interaction_handler()/.reconfig_handler()` 各造独立 handler。
+- 每 handler 持:该 family 的 `Vec<*Entry>`(构造时按 family 过滤克隆)+ `label: Arc<str>` + `cursor: Mutex<usize>` + `Arc<CallLog>`。
+- 匹配:算 `request_fingerprint(request)`;取 cursor 处 entry;None→exhausted;fp 不等→mismatch;相等→advance+返回记录 result。
+- mismatch 折叠(遵循现有 "family-aligned failure" 哲学):
+  - LLM → `Llm(Err(ClientError::Other(msg)))`
+  - Tool → `Tool(Err(ToolRuntimeError::ExecutionFailed{tool_name, message}))`
+  - Reconfig → `Reconfig(Err(ToolRuntimeError::InvalidRegistry{message}))`
+  - Interaction → 无 Err 家族 → **panic**(loud,与 ScriptedInteractionHandler panic 一致)。
+- `ReplayMismatch`(pub)+ `ReplayMismatchKind`(Fingerprint/Exhausted);Display 含全部字段;accessors 便于测试。
+- outcome→RequirementResult:replay.rs 内私有 helper(不改 M3-1 schema)。
+- prelude 追加导出 handler + player + mismatch 类型。
 
-## 验证:fmt → clippy(-D warnings)→ test -p agent-testkit → test --all --all-targets → doc → diff check。
+## 验证
+fmt → clippy(-D warnings)→ test -p agent-testkit(replay + 全 crate)→ test --all --all-targets → doc(-D warnings)→ git diff --check。
 
 ## 步骤
-1. [x] 读 TODO/PLAN/memory + agent-lib 相关类型。
-2. [x] 实现 cassette.rs + prelude 导出。
-3. [x] fmt → clippy(clean)→ 聚焦(11 passed)→ 全量(绿)→ doc(clean)→ diff check(clean)。
-4. [x] TODO.md 标 M3-1 [DONE] + 完成记录。
-5. [ ] 提交并停止(进行中)。
+1. [x] 读 TODO/PLAN/memory + 相关类型。
+2. [ ] git mv cassette.rs → cassette/mod.rs;加 replay 模块声明与导出。
+3. [ ] 实现 replay.rs(handlers + player + mismatch + 单测)。
+4. [ ] prelude 导出。
+5. [ ] fmt → clippy → 聚焦测试 → 全量 → doc → diff check。
+6. [ ] TODO.md 标 M3-2 [DONE] + 完成记录。
+7. [ ] 提交并停止。
+
+## 完成状态(2026-07-14)
+- [x] git mv cassette.rs → cassette/mod.rs;replay 模块声明与 pub use 导出。
+- [x] 实现 replay.rs(4 handler + CassettePlayer + ReplayMismatch/Kind + 10 单测)。
+- [x] prelude 导出。
+- [x] fmt(clean)→ clippy -D warnings(clean)→ replay 测试(10 passed)→ 全量(agent-lib 434 + testkit 68 + smoke 2,0 failed)→ doc -D warnings(clean)→ diff check(clean)。
+- [x] TODO.md 标 M3-2 [DONE] + 完成记录。
+- [ ] 提交并停止(进行中)。

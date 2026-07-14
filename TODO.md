@@ -612,7 +612,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - **边界确认**:cassette 仅记 provider-neutral effect req/resp,未含 header/auth/endpoint/provider raw body;
   replay handlers 与 record/verify/update wrapper 分别属 M3-2 / M3-3,本任务未实现。
 
-### [TODO] M3-2 实现 cassette replay handlers
+### [DONE] M3-2 实现 cassette replay handlers
 
 **前置依赖**:M3-1。
 
@@ -634,6 +634,40 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:request mismatch 报错信息包含 entry index 与 fingerprint。
 - 单测:replay 不调用任何真实 handler。
 - 跑全套验证命令。
+
+**完成记录**(2026-07-14):
+
+- **模块化**:`cassette.rs` → `cassette/mod.rs`(schema/fingerprint/redactor 原样保留) + 新增
+  `cassette/replay.rs`(replay handlers);`mod.rs` 加 `mod replay; pub use replay::{...}`,公共路径仍是
+  `crate::cassette::CassetteLlmHandler` 等,兑现 M3-1 doc "replay 扩展 crate::cassette"。`prelude` 追加导出。
+- **四个 replay handler**:`CassetteLlmHandler`/`CassetteToolHandler`/`CassetteInteractionHandler`/
+  `CassetteReconfigHandler`,分别实现 `LlmHandler`/`ToolHandler`/`InteractionHandler`/`ReconfigHandler`。每个持
+  该 family 的 `Vec<*Entry>`(构造时按 family 过滤克隆)+ `label: Arc<str>` + `Mutex<usize>` cursor + 复用
+  `crate::handlers` 的 `LlmCallLog`/`ToolCallLog`/`InteractionCallLog`/`ReconfigCallLog`(与 scripted handler 同
+  一 call log 风格,begin/complete)。
+- **匹配**:泛型 `ReplayCursor<E>`,算 `request_fingerprint(request)`(忽略 volatile ids),取 cursor 处 entry;
+  仅在 fingerprint 相等时 advance,divergent 请求每次都报同一 expected entry。replay 本身是终端 handler,无
+  delegate,故"不调用真实 handler"天然成立。
+- **`CassettePlayer`**:持 `Arc<Cassette>` + label,`.llm_handler()/.tool_handler()/.interaction_handler()/`
+  `.reconfig_handler()` 各造独立 handler,便于整轮 replay(M3-4)。
+- **mismatch 清晰错误**:`ReplayMismatch`(pub,含 `kind`/`label`/`family`/`entry_index`/`family_position`/
+  `expected_fingerprint`/`actual_fingerprint`/`request_summary`,accessors + `Display`)+ `ReplayMismatchKind`
+  (`Fingerprint`/`Exhausted`)。遵循 kit 的 family-alignment:LLM →
+  `Llm(Err(ClientError::Other(msg)))`,Tool → `Tool(Err(ExecutionFailed{tool_name,message}))`,Reconfig →
+  `Reconfig(Err(InvalidRegistry{message}))`;Interaction 家族 `InteractionResponse` 无 Err 变体,无法 in-band
+  折叠 → **panic**(与 `ScriptedInteractionHandler` 的 panic 语义一致)。`Err` 变体经 `Box` 满足
+  `clippy::result_large_err`。
+- **单测(10 个,全绿,`crates/agent-testkit/src/cassette/replay.rs`)**:按序返回记录结果(user→tool_use→tool→
+  final text 整轮)、volatile-id 差异仍匹配、LLM fingerprint mismatch 折叠且报错含 label/entry #0/expected+actual
+  fingerprint、LLM 耗尽报错清晰、Tool mismatch 折叠 `ExecutionFailed` 含 index+fingerprint、Tool 记录的
+  runtime error 原样重放、Reconfig Ok 重放 + mismatch 折叠 `InvalidRegistry`、Interaction 记录响应重放、
+  Interaction mismatch `#[should_panic]`、player/mismatch accessors 暴露。
+- **验证**:`cargo fmt --all --check`(clean);`cargo clippy -p agent-testkit --all-targets -- -D warnings`
+  (clean);`cargo test -p agent-testkit replay`(10 passed);`cargo test --all --all-targets`(全绿:agent-lib
+  434 + agent-testkit 68 + smoke 2,0 failed);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p agent-testkit`
+  (clean,`#![warn(missing_docs)]` 满足);`git diff --check`(clean)。
+- **边界确认**:record/verify/update wrapper(M3-3)与首个离线 recorded replay 测试(M3-4)本任务未实现;replay
+  handler 仅消费 provider-neutral cassette entry,无 header/auth/endpoint/provider raw body。
 
 ### [TODO] M3-3 实现 record / verify / update wrapper
 

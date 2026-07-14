@@ -9,10 +9,10 @@
 //! exchanges with its handlers — never HTTP headers, auth, endpoints, or a
 //! provider's raw wire body.
 //!
-//! This module (milestone M3-1) defines the on-disk **schema**, the request
-//! **fingerprint**, and the **redactor**. The replay handlers that consume a
-//! cassette land in milestone M3-2 ([`crate::cassette`] is extended there), and
-//! the record/verify/update wrappers land in M3-3.
+//! This module defines the on-disk **schema**, the request **fingerprint**, and
+//! the **redactor** (milestone M3-1), plus the offline **replay handlers**
+//! (milestone M3-2; see the [Replay](#replay) section). The record/verify/update
+//! wrappers land in M3-3.
 //!
 //! # Schema shape
 //!
@@ -25,6 +25,22 @@
 //! - Loading through [`Cassette::from_json_str`] classifies an unknown
 //!   [`schema version`](CASSETTE_SCHEMA_VERSION) as a
 //!   [`CassetteError::UnsupportedSchemaVersion`] instead of a vague parse error.
+//!
+//! # Replay
+//!
+//! The replay handlers ([`CassetteLlmHandler`], [`CassetteToolHandler`],
+//! [`CassetteInteractionHandler`], [`CassetteReconfigHandler`], built cohesively
+//! through a [`CassettePlayer`]) turn a recorded [`Cassette`] back into the four
+//! effect handler traits. Each returns recorded results in family + dispatch
+//! order, matching every request by its [`request fingerprint`](request_fingerprint)
+//! and surfacing a clear [`ReplayMismatch`] when a live request diverges.
+
+mod replay;
+
+pub use replay::{
+    CassetteInteractionHandler, CassetteLlmHandler, CassettePlayer, CassetteReconfigHandler,
+    CassetteToolHandler, ReplayMismatch, ReplayMismatchKind,
+};
 
 use std::collections::BTreeSet;
 use std::fmt;
