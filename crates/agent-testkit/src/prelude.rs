@@ -17,6 +17,7 @@ pub use crate::handlers::{
     ScriptedToolRegistry, ToolCallLog,
 };
 pub use crate::ids::{RequirementAllocation, SeqIds};
+pub use crate::machine::{ScriptMachine, ScriptMachineBuilder, ScriptMachineLog};
 pub use crate::scope::{TestScope, TestScopeBuilder};
 pub use crate::script::{
     CallLog, CallRecord, CallTicket, InteractionStep, LlmStep, ReconfigStep, Script, ScriptError,

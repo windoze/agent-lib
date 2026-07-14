@@ -420,7 +420,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
   wrapping 测试用内层 `TestScope`(而非 `ReferenceScope`)演示委派,因 `ReferenceScope` 需 `LlmClient`
   fake 而 testkit 刻意不 mock `LlmClient`;两者走同一 `Arc<dyn HandlerScope>` 委派路径。
 
-### [TODO] M2-4 实现 `ScriptMachine` machine double
+### [DONE] M2-4 实现 `ScriptMachine` machine double
 
 **前置依赖**:M2-3。
 
@@ -442,6 +442,40 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:abandon 行为可配置。
 - 用 `drain` + `TestScope` 做一个 local tool fulfillment smoke。
 - 跑全套验证命令。
+
+**完成记录**(2026-07-14):
+
+- **`ScriptMachine` + `ScriptMachineBuilder`**:`crates/agent-testkit/src/machine.rs` 实现二者,替代
+  `drive.rs`/`subagent/tests.rs`/`agent_effect_e2e.rs` 里的三个 ad hoc batch machine。`impl AgentMachine`:
+  - `StepInput::External` → 把 `outstanding` 重置为 batch 的 id 集合,cursor 设为非 terminal 的 `waiting_cursor`
+    (默认 `LoopCursor::streaming_step`,固定 step id `DEFAULT_WAITING_STEP_ID`),emit 整个 batch(quiescent)。
+  - `StepInput::Resume` → 先向共享 log 记录 `(id, result.tag())`;若 id 命中 `outstanding` 则移除,`outstanding`
+    空且 `done_after_all_resumed` 时 cursor→`Done(Completed)`;若 id 不在 batch,cursor→`Error`(诊断信息含
+    label 与未知 id),不动 `outstanding`——stray result 不被吞掉。
+  - `StepInput::Abandon` → `abandon_count` +1;若配了 `abandon_cursor` 则 cursor 设为该值,否则保持不变。
+- **共享观察 log**:`ScriptMachineLog`(`Arc` 共享,`Mutex<Vec<..>>` + `AtomicUsize` interior mutability)记录
+  `resume_order()`/`resume_tags()`/`resume_count()`/`abandon_count()`。测试在把 machine 交给 driver(或作为
+  nested child machine)前 clone 一份 log,drive 结束后仍可读——满足 docs §5.7「支持嵌套测试中的 child machine」。
+  `ScriptMachine` 亦提供 `log()`/`outstanding()`/`resume_order()`/`resume_tags()`/`abandon_count()`/`label()`。
+- **builder 五 knob**:`requirements(iter)`(extend)/`requirement(one)`;`done_after_all_resumed()`(opt-in,
+  未调用则永不 terminal,供手动 `step` 驱动);`idle_on_abandon()`(= `abandon_cursor(Idle)` 的语义别名)与更
+  通用的 `abandon_cursor(LoopCursor)`(覆盖 ParentBatchMachine 的 abandon→Done 行为);`initial_cursor(LoopCursor)`
+  (设 waiting cursor,默认 streaming_step);`label(into String)`。`ScriptMachine::builder()` 入口。
+- **prelude**:追加导出 `ScriptMachine`/`ScriptMachineBuilder`/`ScriptMachineLog`。
+- **测试**(`machine.rs` 内 5 个单测):`emits_the_batch_and_completes_on_out_of_order_resume`(NeedTool+
+  NeedInteraction 混合 batch,先 resume interaction 再 tool,验 batch 全 emit、resume_order/tags 按 resume 序、
+  最终 `Done`);`unknown_resume_id_moves_to_an_error_cursor`(stray id → `Error` cursor,原 requirement 仍
+  outstanding);`abandon_behaviour_is_configurable`(idle_on_abandon→`Idle`;无配置→cursor 不变;
+  `abandon_cursor(Done)`→`Done`;各 abandon_count=1);`drain_fulfils_a_local_tool_batch_through_a_test_scope`
+  (`drain` + `TestScope` 挂 `ScriptedToolHandler` 本地 fulfill NeedTool,跑到 `Done`,tool_log len 1,machine log
+  resume 记录正确);`log_starts_empty`。
+- **验证结果**(全绿):`cargo fmt --all -- --check`;`cargo clippy --all-targets -- -D warnings` 与
+  `-p agent-testkit --all-targets`(两 crate 均干净);`cargo test -p agent-testkit`(lib 47 含 5 个新 machine 用例
+  + smoke 2);`cargo test --all --all-targets`(agent-lib 434 unit + 集成套件全绿,testkit 47 + 2,0 failed,
+  7 个 network-gated ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净;
+  `git diff --check` 干净。
+- **偏离计划**:无。machine 层为纯新增模块,未改 `agent-lib` 运行时语义,未引入 provider wire mock。既有三个
+  ad hoc batch machine 的实际删除/迁移由后续 M2-R 标记、M6-* 执行,本任务只交付统一 double。
 
 ### [TODO] M2-R Milestone 2 Review
 
