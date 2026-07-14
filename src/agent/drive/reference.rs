@@ -354,6 +354,3 @@ where
 {
     drain(machine, input, scope, None, ctx).await
 }
-
-#[cfg(test)]
-mod tests;

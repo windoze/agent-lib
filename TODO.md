@@ -1170,7 +1170,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - **四语义验证**(`cargo test --test agent_effect_e2e` 4/4):`attended_parent_serves_headless_child_via_pop`(parent tool log==1、popped approval log==1、child registry log==1、child llm log==2、`child_charged==18` 且 `ctx.budget().used().tokens()==18`);`same_child_spec_attended_resolves_in_place`(就地 served==1、registry==1、committed 会话 4 消息 user/assistant/tool/answer,末条文本 "sunny, per get_weather");`batch_requirements_are_fulfilled_concurrently`(registry==2、`peak_concurrency()==2`,串行会停在 1 并干净失败而非死锁);`parent_cancel_propagates_and_abandons_child`(结果 `Subagent(Ok)`、registry==0、llm==0、charged==0、budget==0)。
 - **验证**:`cargo fmt --all --check` 干净;`cargo clippy --all-targets -- -D warnings`(workspace)无告警;`cargo test --test agent_effect_e2e` 4/4;`cargo test --all --all-targets` 全绿(agent-lib lib 434、e2e 4、其余集成套件 3+3+2 全过;agent-testkit lib 122 + cassette 2 + smoke 2;网络集成 1+3 按设计 ignored;0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过;`git diff --check` 干净。未发现需插入前置修复的 spec 偏差或新增未调度失败测试。
 
-### [TODO] M6-2 迁移 reference driver 测试中的重复 fake
+### [DONE] M6-2 迁移 reference driver 测试中的重复 fake
 
 **前置依赖**:M6-1。
 
@@ -1185,9 +1185,32 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 **验证**:
 
-- 聚焦运行 `cargo test --lib agent::drive::reference::tests`。
+- 聚焦运行 `cargo test --test reference_driver`。
 - 全套验证命令全部通过。
 - 完成记录列出保留的 reference-specific fake 与理由。
+
+**完成记录(2026-07-14)**:
+
+- **必须迁到集成测试层(非改法,而是唯一可行处)**:实测在 `agent-lib` **自身单元测试**里引用 testkit 会编译失败——`error: multiple different versions of crate agent_lib`。原因是 `agent-testkit -> agent-lib`(普通依赖)+ root `agent-lib` 的 `[dev-dependencies] agent-testkit`(M6-1 建立)构成经 dev-dep 的依赖环:单元测试的 `cfg(test)` 构建与 testkit 所链接的普通 `agent-lib` 构建是**两个不同的 crate 实例**,类型不可统一。集成测试(`tests/`)只链接一份普通 `agent-lib`,kit 类型即可无缝对接(与 M6-1 同一 seam)。因此本任务将这批用例整体搬到 `tests/reference_driver.rs`,并把验证命令由 `cargo test --lib agent::drive::reference::tests` 改为 `cargo test --test reference_driver`。同时删除 `src/agent/drive/reference/tests.rs` 与 `src/agent/drive/reference.rs` 尾部的 `#[cfg(test)] mod tests;`。
+- **文件迁移**:`src/agent/drive/reference/tests.rs`(1362 行,含 11 个 test + 全套本地 fake)→ `tests/reference_driver.rs`(826 行,约 −39%),`use agent_testkit::prelude::*;` 一行拉起全部 kit 能力。11 个 `#[tokio::test]` 函数名与语义逐一保持。
+- **testkit 增强(供 deny 路径复用,非本测试私有 hack)**:`InteractionDecision` 新增 `Timeout(Option<String>)` / `Cancel(Option<String>)` 两个变体及 `respond()` 分支(映射到 `ApprovalDecision::Timeout` / `ApprovalDecision::Cancel`),并加单元测试 `interaction_timeout_and_cancel_stay_in_the_interaction_family`。这样 kit 的 `ScriptedInteractionHandler` 就能覆盖 approve/deny 之外的两种否决 disposition。
+- **删除的本地重复 fake / helper**,均由 testkit 等价物取代:
+  - `ScriptedRequirementIds`(本地 seed 化 `RequirementIds`)+ `FakeToolIds`(本地 seed 化 `ToolExecutionIds`)→ `agent_testkit::SeqIds`(经 `default_machine` fixture 同时作为两类 id 源)。原先对确切 seed id 的断言(`tool_call_id_seed(100)` 等)改为**结构断言**(pairing 的 `result_msg()` 指向已提交的 tool result 消息、`registry.log().len()`、notification 序列、status 序列),覆盖等价。
+  - `FakeClient`(fake `LlmClient`,VecDeque 脚本 + request 计数)→ 保留最小本地 `ScriptedLlmClient`(见下),但脚本用 kit `Script<LlmStep>`、request 计数改读 kit `LlmCallLog`。
+  - `FakeToolRegistry`(fake `ToolRegistry` + pop_front 脚本 + call 计数)→ `ScriptedToolRegistry::from_steps`,call 计数改读 `log().len()` / `log().requests()[i].name`(kit 与旧 fake 同为 FIFO 派发)。
+  - `ScriptedApprovalInteraction` + `ComposedScope`(手写按序 disposition 的 interaction + 组合 scope)→ `ScriptedInteractionHandler::sequence([Deny, Timeout, Cancel])` + `TestScope::builder().wrapping(ReferenceScope).attended(..)`(reference 的 llm/tool 家族经 `wrapping` 委派,interaction 家族被脚本覆盖)。
+  - `CancellingLlmHandler`(手写"返回 tool_use 前取消 ctx"的 handler)→ `CancelOnCall::before(ScriptedLlmHandler::from_steps([..]))`。
+  - `PanicToolHandler`(被调用即 panic 的 tool handler)→ `PanicOnCall::new()`。
+  - `CancelScope`(手写 `HandlerScope`)→ `TestScope::builder().llm(..).tool(..).build()`。
+  - 本地 payload/id helpers(`fake_tool`/`read_calendar_tool`/`weather_call`/`assistant_*`/各 seed id 常量等)→ fixtures(`agent_spec_with_tools`/`agent_state`/`default_machine`/`root_context`/`user_input`/`tool_call`/`usage`/`weather_tool`/`calendar_tool`)+ `LlmStep`/`ToolStep`。
+- **保留的最小 reference-specific 本地件(有意,非可 mock 的 effect fake)**:
+  - `ScriptedLlmClient`:`ReferenceScope::new(client, registry)` 要求一个真实 `LlmClient`,而 kit **有意不 mock LlmClient**(它脚本化的是 `LlmHandler` seam)。此薄 adapter 让 reference 的 `LlmClientHandler` 包裹路径仍受测,同时其脚本(`Script<LlmStep>`)与 call log(`LlmCallLog`)全部来自 testkit——符合任务"保留最小 adapter,但底层脚本和 call log 来自 testkit"的要求。`chat_stream` 返回空流(这些 turn 走非流式路径)。
+  - `RequireApprovalPolicy`:approval 策略是 spec 级决策而非可 mock 的 effect 边界,testkit 不导出 require-approval policy,故保留最小本地件(与 M6-1 一致),仅 approve/deny/headless 三个 test 装配它。
+  - `ApprovalInteractionHandler::approve()`:这是 **reference driver 自带的 attended 后端(public 组件,非 fake)**,approve test 直接行使真实组件。
+  - `assert_text` / `assert_tool_result`:单 block payload 断言小工具。
+- **fixture 值差异适配**:kit `calendar_tool()` 名为 `get_calendar`/参数 `date`(旧本地为 `read_calendar`/`day`),reconfig-swap test 相应改用 `get_calendar` 调用并断言 `new_log.requests()[0].name == "get_calendar"`;`agent_state` fixture 的会话 system 为 `"Test conversation system."`,故 reconfig 的 overlay 断言为 `Some("Test conversation system.\n\nUse calendar context.")`。
+- **11 语义验证**(`cargo test --test reference_driver` 11/11):text-only(1 turn/2 消息/usage/单 StepBoundary turn_count==1、registry 未触);single tool(4 消息、pairing 指向 tool result、`ToolCallStarted/Finished/tool boundary(turn_count 0)/final boundary(turn_count 1)`、registry log 名 `get_weather`);parallel(两 start 先于两 finish、两 pairing 各指一条 tool result、registry==2);tool failure self-heal(finished 状态 `[Denied, Error]`、末条恢复文本);approval approve(经真实 `ApprovalInteractionHandler::approve()` 走完、tool Ok);headless(同一装配去掉 interaction 后端 → `AgentError::UnhandledRequirement{kind: Interaction}`、guarded tool 未运行);approval deny(并发批 disposition 按序 Deny/Timeout/Cancel → 状态 `[Denied, Denied, Cancelled]`、末条恢复文本,依赖 `FuturesUnordered` push-order 决定性,与既有 parallel/tool-failure test 同一保证,实测通过);cancel-during-wait(cursor Idle、pending 已合成 cancelled result 收口、history 空、tool 从未运行);new-turn-after-cancel(丢弃被中断 pending、新 turn 干净完成);idle queued reconfig(开场请求即带新 tool set + overlay、start-of-turn 应用无 `reconfigs` boundary metadata、state 已应用);reconfig swap end-to-end(经 `StaticToolRegistryResolver` 换入的 registry 执行调用 `new_log==1`、旧 registry `old_log` 空、开场请求已带新 tool set)。
+- **验证**:`cargo fmt --all --check` 干净;`cargo clippy --all-targets -- -D warnings`(workspace)无告警;`cargo test --test reference_driver` 11/11;`cargo test --all --all-targets` 全绿(agent-lib lib 423、reference_driver 11、其余集成套件全过;agent-testkit lib 123 + cassette 2 + smoke 2;网络集成按设计 ignored;0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。未发现需插入前置修复的 spec 偏差或新增未调度失败测试。
 
 ### [TODO] M6-3 新增 Core Rust suites
 

@@ -250,6 +250,16 @@ pub enum InteractionDecision {
     ApproveWith(String),
     /// Deny an approval interaction, with an optional message.
     Deny(Option<String>),
+    /// Resolve an approval interaction as a timeout, with an optional message.
+    ///
+    /// The machine folds a [`ApprovalDecision::Timeout`] into a denied tool
+    /// status, exactly as a real attended backend that never answered in time.
+    Timeout(Option<String>),
+    /// Cancel an approval interaction, with an optional message.
+    ///
+    /// The machine folds a [`ApprovalDecision::Cancel`] into a cancelled tool
+    /// status, modelling an approver that aborted the request.
+    Cancel(Option<String>),
     /// Answer a question interaction with free-form text.
     Answer(String),
     /// Select a zero-based option for a choice interaction.
@@ -271,6 +281,12 @@ impl InteractionDecision {
             }
             Self::Deny(message) => {
                 approval_response(request, ApprovalDecision::Deny, message.clone())
+            }
+            Self::Timeout(message) => {
+                approval_response(request, ApprovalDecision::Timeout, message.clone())
+            }
+            Self::Cancel(message) => {
+                approval_response(request, ApprovalDecision::Cancel, message.clone())
             }
             Self::Answer(text) => InteractionResponse::answer(text.clone()),
             Self::Choice(index) => InteractionResponse::Choice(*index),
@@ -782,6 +798,44 @@ mod tests {
         };
         assert_eq!(approval.decision(), ApprovalDecision::Deny);
         assert_eq!(approval.message(), Some("policy"));
+    }
+
+    #[tokio::test]
+    async fn interaction_timeout_and_cancel_stay_in_the_interaction_family() {
+        let ids = SeqIds::new();
+        let ctx = root_context(&ids);
+        let approval = |ids: &SeqIds| {
+            Interaction::approval(
+                ids.step_id(),
+                ids.tool_call_id(),
+                ApprovalRequirement::required(None),
+            )
+        };
+        let decision = |result: &RequirementResult| -> (ApprovalDecision, Option<String>) {
+            let RequirementResult::Interaction(InteractionResponse::Approval(approval)) = result
+            else {
+                panic!("an approval decision must answer with an approval response");
+            };
+            (approval.decision(), approval.message().map(str::to_owned))
+        };
+
+        // Both dispositions address the live request and keep the family.
+        let handler = ScriptedInteractionHandler::sequence([
+            InteractionDecision::Timeout(Some("timed out".to_owned())),
+            InteractionDecision::Cancel(Some("aborted".to_owned())),
+        ]);
+
+        let timed_out = handler.fulfill(&approval(&ids), &ctx).await;
+        assert_eq!(
+            decision(&timed_out),
+            (ApprovalDecision::Timeout, Some("timed out".to_owned()))
+        );
+
+        let cancelled = handler.fulfill(&approval(&ids), &ctx).await;
+        assert_eq!(
+            decision(&cancelled),
+            (ApprovalDecision::Cancel, Some("aborted".to_owned()))
+        );
     }
 
     #[tokio::test]
