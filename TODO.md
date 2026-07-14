@@ -477,7 +477,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - **偏离计划**:无。machine 层为纯新增模块,未改 `agent-lib` 运行时语义,未引入 provider wire mock。既有三个
   ad hoc batch machine 的实际删除/迁移由后续 M2-R 标记、M6-* 执行,本任务只交付统一 double。
 
-### [TODO] M2-R Milestone 2 Review
+### [DONE] M2-R Milestone 2 Review
 
 **前置依赖**:M2-1..M2-4。
 
@@ -494,6 +494,63 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 - 全套验证命令全部通过。
 - Review 结论写入完成记录。
+
+**完成记录**(2026-07-14):
+
+- **核对 1 — handler result family 正确**(通过):`crates/agent-testkit/src/handlers.rs` 四个 scripted
+  handler 的 `fulfill` 都经各自 `ScriptStep::into_result()` 只产出对应 family 的 `RequirementResult`
+  (`Llm`/`Tool`/`Interaction`/`Reconfig`);script 耗尽(`StrictMode::Error`)按 family **折叠为族内
+  `Err`**——LLM→`Llm(Err(ClientError::Other))`、Tool→`Tool(Err(ToolRuntimeError::ExecutionFailed))`、
+  Reconfig→`Reconfig(Err(ToolRuntimeError::InvalidRegistry))`,绝不用 wrong family 表达失败。interaction
+  family 无 `Err`,`ScriptedInteractionHandler` 反应式产 in-family 响应并寻址活 request 的 `step_id`/`call_id`。
+  `MisalignedHandler` 专门返回 wrong-family 结果以触发 `drain` 的 `RequirementKind::accepts` 校验失败。相应单测
+  (`*_stay_in_the_*_family`、`misaligned_handler_trips_the_drain_family_check` 等)全绿。**未发现掩盖 effect
+  handler 不变量的情况。**
+- **核对 2 — `TestScope` 默认不 total**(通过):`scope.rs` 每个 accessor 顺序为「本层 override → wrapping
+  inner → `None`」;未挂 handler 且无 inner 即返回 `None`,故顶层缺 handler 的 family 会一路 pop 成
+  `UnhandledRequirement`,不会被静默兜底。特别地未调 `.interaction(..)` 的 scope 为 headless。
+  `headless_top_scope_surfaces_unhandled_interaction` 断言顶层 `NeedInteraction` 返回
+  `AgentError::UnhandledRequirement { kind: Interaction }` 且 scripted tool 未被 auto-approve/跳过。**确认默认
+  不 total。**
+- **核对 3 — `ScriptMachine` 覆盖 driver/pop/subagent 语义**(通过):`machine.rs` 的 `step`:External 吐固定
+  requirement batch 并停在**非 terminal** waiting cursor(`LoopCursor::streaming_step`,drain 可识别);Resume
+  记录 order/tag、移除 outstanding、全清且 `done_after_all_resumed` 时→`Done(Completed)`;unknown resume id→
+  诊断 `Error` cursor(不吞 stray);Abandon 计 `abandon_count` 且可配 `abandon_cursor`(含 `idle_on_abandon`)。
+  requirements 为任意 `Vec<Requirement>`,可含 `NeedTool`/`NeedInteraction`/`NeedSubagent`,故能覆盖
+  `agent_effect_e2e.rs` 的 `ParentBatchMachine`(batch=NeedTool+NeedSubagent、resume→Done、abandon→Done,
+  用 `abandon_cursor(Done)`+`done_after_all_resumed` 复现)与 driver/pop/subagent 机制,符合 docs/TESTABILITY.md
+  §5.7 验收(替代三处 ad hoc batch machine、明确表达 out-of-order resume)。共享 `Arc<ScriptMachineLog>` 支持
+  machine 移入 driver / 作 nested child 后仍读回观察。**确认语义足够。**
+- **优先迁移目标(可删除 fake 清单)**——实际删除/迁移在 M6-1(`agent_effect_e2e.rs`)、M6-2(reference driver
+  测试)执行,此处仅标记:
+  - `tests/agent_effect_e2e.rs`(M2 层可替换):`SeqIds`→testkit `SeqIds`;`EmptyScope`→`TestScope::empty()`;
+    `ParentScope`→`TestScope::builder().tool/.interaction/.subagent`;`ParentBatchMachine`→`ScriptMachine`
+    (M2-4 headline 目标);`CountingApproveInteraction`→`ScriptedInteractionHandler::approve_all()`+CallLog 计数;
+    `CountingToolHandler`→`ScriptedToolHandler`(固定 `ToolStep::ok`)+`ToolCallLog` 计数;
+    `FakeToolRegistry`→`ScriptedToolRegistry`;`ChildScope`/`ObservingScope`→`TestScope::builder()`(可 `wrapping`);
+    payload 助手(`weather_tool`/`text_block`/`user_message`/`usage`/`assistant_response`→`assistant_text`/
+    `tool_use_response`→`assistant_tool_use`/`tool_response`/`agent_id`/`tool_set_id`/`conversation_id`)→ testkit
+    fixtures + `SeqIds` accessor。
+  - `src/agent/drive/reference/tests.rs`(M2 层可替换):`ScriptedRequirementIds`+`FakeToolIds`→testkit `SeqIds`
+    (`RequirementIds`+`ToolExecutionIds`);`FakeToolRegistry`→`ScriptedToolRegistry`(经 reference
+    `ToolRegistryHandler`);`ScriptedApprovalInteraction`→`ScriptedInteractionHandler`(反应式 approve/deny 决策);
+    `ComposedScope`→`TestScope::builder().interaction(..).wrapping(Arc<ReferenceScope>)`;fixture 助手
+    (`weather_tool`/`calendar_tool`/`usage`/`assistant_response`/`tool_use_response`/`tool_response`/`user_message`/
+    `spec`)→ testkit fixtures。
+  - **明确延后(非 M2 层,后续里程碑提供)**:`FakeClient`(`LlmClient`——testkit 刻意不 mock 协议层 client;
+    reference/tests.rs 的 `FakeClient` 为 `ReferenceScope` 适配器测试所必需,保留);`ConcurrentToolHandler`
+    (peak 并发工具 → M5-1);`ChildSpawner`(`SubagentSpawner` → M5-3);`CancellingLlmHandler`/`PanicToolHandler`/
+    `CancelScope`(cancel/panic wrappers → M5-2);`RequireApprovalPolicy`(`ToolApprovalPolicy`,两文件重复,当前
+    testkit 无对应型,可作后续 fixture 候选);`ChargingLlmHandler`(token 计费 LLM handler,迁移与否取决于计费边界,
+    M6 判定)。
+- **验证结果**:`cargo fmt --all -- --check` 干净;`cargo clippy --all-targets -- -D warnings` 干净(root +
+  testkit);`cargo test -p agent-testkit` 全绿(lib 47 + smoke 2,0 failed)——覆盖三项核对对应的单测。全套
+  `cargo test --all --all-targets` 自 M2-4(HEAD=`0875598`)绿后**无任何代码/清单改动**,本 Review 任务仅改
+  `TODO.md`/`memory/claude_plan.md` 文档,按「仅文档变更可复用上次绿结果」规则跳过重跑(上次结果:agent-lib 434
+  unit + 集成套件全绿,testkit 47 + 2,0 failed,7 个 network-gated ignored)。
+- **Review 结论**:Milestone 2 交付的 scripted 层(script model/handlers/scope/machine)可替代现有重复 fake,
+  且三项关键不变量(family 对齐、scope 默认不 total、machine 覆盖 driver/pop/subagent)均成立、未被掩盖。可进入
+  Milestone 3。未发现需插入前置修复任务的 spec 偏差或失败测试。
 
 ---
 
