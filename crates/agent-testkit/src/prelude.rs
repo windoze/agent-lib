@@ -26,6 +26,7 @@ pub use crate::handlers::{
     ScriptedInteractionHandler, ScriptedLlmHandler, ScriptedReconfigHandler, ScriptedToolHandler,
     ScriptedToolRegistry, ToolCallLog,
 };
+pub use crate::harness::{StepHarness, StepHarnessError, StepObservation};
 pub use crate::ids::{RequirementAllocation, SeqIds};
 pub use crate::machine::{ScriptMachine, ScriptMachineBuilder, ScriptMachineLog};
 pub use crate::scope::{TestScope, TestScopeBuilder};

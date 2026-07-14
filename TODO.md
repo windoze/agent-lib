@@ -854,7 +854,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 ## Milestone 4 — Step/Drain harness 与断言库
 
-### [TODO] M4-1 实现 `StepHarness`
+### [DONE] M4-1 实现 `StepHarness`
 
 **前置依赖**:M3-R。
 
@@ -874,6 +874,17 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:wrong id resume 失败信息包含 cursor/outstanding id。
 - 单测:`StepHarness` 本身不使用 async。
 - 跑全套验证命令。
+
+**完成记录(2026-07-14)**:
+
+- 在 `crates/agent-testkit/src/harness.rs` 实现同步 `StepHarness<M: AgentMachine>`:
+  - 步进 API:`external(input)`、`user(text)`、`pivot(text)`(`PivotSource::Human`)、`resume(id, result)`、`abandon(id)`;`user`/`pivot` 从注入的 `SeqIds` 取 turn/message/step id(`new` 自建、`with_ids` 复用机器同源 id 树)。
+  - `resume`/`abandon` 提供 fallible 双胞胎 `try_resume`/`try_abandon`;非 `try_` 版本对错误 `panic!("{error}")`。校验在 harness 层前置:id 必须 outstanding,且 `Requirement::accepts_resolution` 家族对齐,校验失败**不步进**机器。
+  - `StepObservation` 暴露 `label`/`notifications`/`requirements`/`is_quiescent`/`cursor`(`LoopCursor` 快照),以及提取器 `single`/`single_llm`/`single_tool`/`single_interaction`/`requirements_by_tag`。
+  - `StepHarnessError` 的 `Display` 始终包含当前 cursor、outstanding ids、最近一步 label;提供 `message`/`cursor`/`outstanding`/`last_label` 访问器并实现 `std::error::Error`。harness 自行跟踪 outstanding 集合(pivot 以同一 requirement id 复发时刷新而非重复)。
+- `prelude.rs` 追加 `StepHarness`、`StepHarnessError`、`StepObservation` 再导出。
+- 单测(harness.rs `#[cfg(test)]`,7 个,全为普通 `#[test]` 证明无 async):text-only turn step-by-step 到 `Done`;tool-use 折叠出中间 `NeedTool` 被暴露;wrong-id resume 报文含 cursor(`StreamingStep`)+ outstanding 真 id + stray id + label 且机器未步进;wrong-family resume 前置拒绝;abandon stray 拒绝 + 真 id 清除;`single_tool` 缺家族诊断含期望/实际家族。
+- 验证:`cargo fmt --all --check` 通过;`cargo clippy --all-targets -- -D warnings` 无告警;`cargo test -p agent-testkit harness` 7/7;`cargo test --all --all-targets` 全绿(agent-lib 434、agent-testkit 82 + 集成 4,0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(root + `-p agent-testkit`)通过;`git diff --check` 干净。
 
 ### [TODO] M4-2 实现 `DrainHarness`
 
