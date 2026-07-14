@@ -669,7 +669,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - **边界确认**:record/verify/update wrapper(M3-3)与首个离线 recorded replay 测试(M3-4)本任务未实现;replay
   handler 仅消费 provider-neutral cassette entry,无 header/auth/endpoint/provider raw body。
 
-### [TODO] M3-3 实现 record / verify / update wrapper
+### [DONE] M3-3 实现 record / verify / update wrapper
 
 **前置依赖**:M3-2。
 
@@ -690,7 +690,47 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:verify 模式 detect result drift。
 - 跑全套验证命令。
 
+**完成记录**(2026-07-14):
+
+- **模块化**:新增 `cassette/record.rs`(record/verify/update wrapper),`cassette/mod.rs` 加 `mod record; pub use
+  record::{...}` 并更新顶部 doc(新增 `# Record` 段,标注 M3-3 已落地)。公共路径为 `crate::cassette::CassetteRecorder`
+  等;`prelude` 追加导出。schema/fingerprint/redactor(M3-1)与 replay(M3-2)原样保留。
+- **`CassetteRecorder` builder**:`record(path)` / `verify(path)` / `update(path)` 三个构造器 → `RecorderMode`
+  枚举(`Record`/`Verify`/`Update`,`env_var()`/`writes()` 辅助)。builder 方法 `with_redactor<R: Redactor>` /
+  `with_metadata` / `with_enabled_override`(显式测试钩子,绕过 env gate)。accessors `path()`/`mode()`/`is_enabled()`/
+  `skip_reason()`。
+- **env 护栏**:`RECORD_ENV_VAR = "AGENT_TESTKIT_RECORD_CASSETTES"`、`UPDATE_ENV_VAR =
+  "AGENT_TESTKIT_UPDATE_CASSETTES"`;写模式仅当 override 为真或对应 env 值 `"1"` 时 `is_enabled()`;Verify 永远启用
+  (从不写盘)。`finish()` 对未启用的写模式返回 `Ok(RecorderReport::Skipped)` 且不写任何文件(防御:即便未经
+  `is_enabled()` gate 也不会误写)。
+- **四个 recording wrapper**:`RecordingLlmHandler`/`RecordingToolHandler`/`RecordingInteractionHandler`/
+  `RecordingReconfigHandler`,分别实现对应 handler trait:先调真实 inner handler,再对该 family 结果经 `Redactor`
+  归一化(request 与 Ok 结果都脱敏)→ 按共享 `RecorderState`(`Mutex<Vec<CassetteEntry>>`)的全局 dispatch 序号
+  `push`(index=当前 len,锁内原子选号+追加)→ 原样返回 inner 结果。指纹在**脱敏后**的 request 上计算(与
+  `docs/TESTABILITY.md` §5.4 "provider_extras 的脱敏后 canonical 形状" 一致)。
+- **finish 语义**:`finish() -> Result<RecorderReport, RecorderError>`。写模式(启用)→ 构建 `Cassette`(metadata +
+  累积 entries),pretty JSON,`write_atomic`(同目录 `.name.tmp.pid.nanos.n` → write → rename,失败清理临时文件;
+  必要时 `create_dir_all`)→ `Wrote{path, entry_count}`。Verify → 读盘 `Cassette::from_json_str`,与 live 累积 entries
+  逐位比对,无漂移 → `Verified{entry_count}`,否则 `Err(Drift(Vec<EntryDrift>))`。`EntryDrift{position, family,
+  detail}` 分类 family / request-fingerprint / result / 计数(missing/unexpected)漂移;`RecorderError{Drift, Load,
+  Serialize, Io}` 实现 `Display`/`Error`(size 远低于 clippy `result_large_err` 阈值,无需 Box)。
+- **单测(6 个,全绿,`crates/agent-testkit/src/cassette/record.rs`)**:`update_is_disabled_without_env_var`(默认
+  未启用 + skip_reason 含 env 名)、`update_without_env_var_writes_no_file`(finish → Skipped 且文件不存在)、
+  `record_writes_stable_redacted_json`(un-allowlist 的 provider_extras/response.extra 值 → `<redacted>`,allowlist
+  的 `keep` 保留,parse→re-serialize pretty 与文件字节一致 = 稳定 JSON)、`verify_detects_result_drift`(同指纹不同
+  结果 → 一条 position #0 的 result drift)、`verify_passes_when_results_match`(→ Verified{1})、
+  `update_overwrites_existing_cassette`(覆盖而非追加)、`records_all_families_in_dispatch_order`(共享累积器把
+  llm/tool/interaction/reconfig 混合轮次记为全局序 0..3)。用自删除 `TempPath` guard,唯一名避免并行冲突;测试**不**
+  修改进程级 env(用 override 走写路径,依赖 env 缺省走禁用路径),避免 flaky。
+- **验证**:`cargo fmt --all`;`cargo clippy -p agent-testkit --all-targets -- -D warnings`(clean,修正一处
+  `collapsible_if` → let-chain);`cargo test -p agent-testkit record`(12 filtered-in,全绿);`cargo test --all
+  --all-targets`(全绿:agent-lib 434 + agent-testkit 75 + smoke 2 + 其余,0 failed);`RUSTDOCFLAGS="-D warnings"
+  cargo doc --no-deps -p agent-testkit`(clean,`#![warn(missing_docs)]` 满足);`git diff --check`(clean)。
+- **边界确认**:recorder 仅捕获 provider-neutral effect req/resp(无 header/auth/endpoint/provider raw body);写盘仅
+  在显式 env/override opt-in 时发生且原子;首个离线 recorded replay 测试(M3-4)本任务未实现。
+
 ### [TODO] M3-4 增加首个离线 recorded replay 测试
+
 
 **前置依赖**:M3-3。
 

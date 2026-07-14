@@ -10,9 +10,10 @@
 //! provider's raw wire body.
 //!
 //! This module defines the on-disk **schema**, the request **fingerprint**, and
-//! the **redactor** (milestone M3-1), plus the offline **replay handlers**
-//! (milestone M3-2; see the [Replay](#replay) section). The record/verify/update
-//! wrappers land in M3-3.
+//! the **redactor** (milestone M3-1), the offline **replay handlers**
+//! (milestone M3-2; see the [Replay](#replay) section), and the
+//! **record/verify/update wrappers** (milestone M3-3; see the [Record](#record)
+//! section).
 //!
 //! # Schema shape
 //!
@@ -34,9 +35,23 @@
 //! effect handler traits. Each returns recorded results in family + dispatch
 //! order, matching every request by its [`request fingerprint`](request_fingerprint)
 //! and surfacing a clear [`ReplayMismatch`] when a live request diverges.
+//!
+//! # Record
+//!
+//! The [`CassetteRecorder`] wraps the four *real* effect handlers to capture a
+//! cassette. It records fresh traffic, verifies live traffic against an existing
+//! cassette, or updates one — with the two writing modes gated behind explicit
+//! [environment opt-ins](RecorderMode::env_var) so a normal CI run never
+//! overwrites a committed fixture, and with writes persisted atomically.
 
+mod record;
 mod replay;
 
+pub use record::{
+    CassetteRecorder, EntryDrift, RECORD_ENV_VAR, RecorderError, RecorderMode, RecorderReport,
+    RecordingInteractionHandler, RecordingLlmHandler, RecordingReconfigHandler,
+    RecordingToolHandler, UPDATE_ENV_VAR,
+};
 pub use replay::{
     CassetteInteractionHandler, CassetteLlmHandler, CassettePlayer, CassetteReconfigHandler,
     CassetteToolHandler, ReplayMismatch, ReplayMismatchKind,

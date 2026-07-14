@@ -9,9 +9,12 @@
 pub use crate::cassette::{
     CASSETTE_SCHEMA_VERSION, Cassette, CassetteEntry, CassetteError, CassetteInteractionHandler,
     CassetteLlmHandler, CassetteMetadata, CassetteObservations, CassettePlayer,
-    CassetteReconfigHandler, CassetteToolError, CassetteToolHandler, DefaultRedactor,
-    InteractionEntry, LlmEntry, LlmOutcome, ReconfigEntry, ReconfigOutcome, Redactor,
-    ReplayMismatch, ReplayMismatchKind, ToolEntry, ToolOutcome, request_fingerprint,
+    CassetteReconfigHandler, CassetteRecorder, CassetteToolError, CassetteToolHandler,
+    DefaultRedactor, EntryDrift, InteractionEntry, LlmEntry, LlmOutcome, RECORD_ENV_VAR,
+    ReconfigEntry, ReconfigOutcome, RecorderError, RecorderMode, RecorderReport,
+    RecordingInteractionHandler, RecordingLlmHandler, RecordingReconfigHandler,
+    RecordingToolHandler, Redactor, ReplayMismatch, ReplayMismatchKind, ToolEntry, ToolOutcome,
+    UPDATE_ENV_VAR, request_fingerprint,
 };
 pub use crate::fixtures::{
     agent_spec, agent_spec_with_tools, agent_state, assistant_text, assistant_tool_use,
