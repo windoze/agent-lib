@@ -21,16 +21,31 @@
 //!   record overlap in a [`PeakInFlight`], so a scripted tool turn can be driven
 //!   into a known concurrency shape.
 //!
-//! Cancel-on-call and panic-on-call wrappers (milestone M5-2) and the scripted
-//! subagent spawner (M5-3) build on these primitives.
+//! The cancellation side of the milestone lives here too:
+//!
+//! - [`CancelOnCall`] wraps any effect handler to cancel the [`RunContext`]
+//!   either before or after a chosen call, replacing the hand-written
+//!   "cancel as I answer" handlers that agent-layer tests used to repeat. It
+//!   records each cancellation in a [`CancelLog`] so a test can assert *when* the
+//!   cancel fired.
+//! - [`PanicOnCall`] is a handler that panics if any of its families is invoked,
+//!   proving a code path abandons work before it reaches that family (for
+//!   example, that a cancelled tool batch never dispatches a tool).
+//!
+//! The scripted subagent spawner (M5-3) builds on these primitives.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use agent_lib::agent::{RequirementResult, RunContext, ToolHandler};
+use agent_lib::agent::{
+    Interaction, InteractionHandler, LlmHandler, LlmStepMode, ReconfigHandler, RequirementResult,
+    RunContext, ToolHandler, ToolSetRef,
+};
+use agent_lib::client::ChatRequest;
 use agent_lib::conversation::ToolCallId;
 use agent_lib::model::tool::ToolCall;
 use async_trait::async_trait;
@@ -483,18 +498,370 @@ impl<H: ToolHandler> ToolHandler for DelayingToolHandler<H> {
     }
 }
 
+// ----- CancelOnCall -----
+
+/// When a [`CancelOnCall`] cancels the run context relative to the inner call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelTiming {
+    /// Cancel *before* delegating to the inner handler, so the inner handler
+    /// already observes a cancelled context (and can short-circuit on it).
+    Before,
+    /// Cancel *after* the inner handler returns, so the inner handler runs to
+    /// completion and the cancellation is only visible to whatever the driver
+    /// does next. This models a "stop" that arrives as an effect resolves — the
+    /// shape the reference cancel tests exercise, where an LLM answer both
+    /// produces a tool-use response and cancels the run.
+    After,
+}
+
+/// One cancellation fired by a [`CancelOnCall`] wrapper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CancelEvent {
+    /// Zero-based dispatch index of the call that triggered the cancellation.
+    pub call_index: usize,
+    /// Whether the cancel fired before or after the inner call.
+    pub timing: CancelTiming,
+}
+
+/// An observable log of the cancellations a [`CancelOnCall`] fired.
+///
+/// The log lets a test assert not just *that* a run was cancelled but *when*:
+/// which dispatch reached the trigger call, and whether the cancel landed before
+/// or after that call's inner work.
+#[derive(Debug, Default)]
+pub struct CancelLog {
+    events: Mutex<Vec<CancelEvent>>,
+}
+
+impl CancelLog {
+    /// Builds an empty cancel log.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn record(&self, event: CancelEvent) {
+        self.lock().push(event);
+    }
+
+    /// Returns every recorded cancellation in the order it fired.
+    #[must_use]
+    pub fn events(&self) -> Vec<CancelEvent> {
+        self.lock().clone()
+    }
+
+    /// Returns how many cancellations have fired.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Returns whether no cancellation has fired yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// Returns whether at least one cancellation has fired.
+    #[must_use]
+    pub fn cancelled(&self) -> bool {
+        !self.is_empty()
+    }
+
+    /// Returns the dispatch index of the call that first fired a cancel, if any.
+    #[must_use]
+    pub fn cancelled_at(&self) -> Option<usize> {
+        self.lock().first().map(|event| event.call_index)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<CancelEvent>> {
+        self.events.lock().expect("cancel log mutex poisoned")
+    }
+}
+
+/// Wraps an effect handler to cancel the [`RunContext`] on a chosen call.
+///
+/// The wrapper counts the calls that pass through it (across whichever family it
+/// serves) and, on the configured trigger call, cancels the run context either
+/// [`Before`](CancelTiming::Before) or [`After`](CancelTiming::After) delegating
+/// to the inner handler. Every cancellation is recorded in a shared
+/// [`CancelLog`], readable through [`log`](Self::log).
+///
+/// `CancelOnCall<H>` implements whichever of [`LlmHandler`], [`ToolHandler`],
+/// [`InteractionHandler`], and [`ReconfigHandler`] the inner `H` implements, so a
+/// test wires it into a [`TestScope`](crate::scope::TestScope) exactly where the
+/// real handler would go. It replaces the per-test "cancel as I answer" handlers
+/// the agent-layer suites used to hand-roll.
+pub struct CancelOnCall<H> {
+    inner: H,
+    timing: CancelTiming,
+    trigger_call: usize,
+    calls: Arc<Mutex<usize>>,
+    log: Arc<CancelLog>,
+}
+
+impl<H> CancelOnCall<H> {
+    fn with_timing(inner: H, timing: CancelTiming) -> Self {
+        Self {
+            inner,
+            timing,
+            trigger_call: 1,
+            calls: Arc::new(Mutex::new(0)),
+            log: Arc::new(CancelLog::new()),
+        }
+    }
+
+    /// Wraps `inner`, cancelling the context *before* the trigger call reaches it.
+    #[must_use]
+    pub fn before(inner: H) -> Self {
+        Self::with_timing(inner, CancelTiming::Before)
+    }
+
+    /// Wraps `inner`, cancelling the context *after* the trigger call returns.
+    #[must_use]
+    pub fn after(inner: H) -> Self {
+        Self::with_timing(inner, CancelTiming::After)
+    }
+
+    /// Fires the cancel on the `nth` (1-based) call instead of the first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `nth` is `0`; call numbering is 1-based.
+    #[must_use]
+    pub fn on_call(mut self, nth: usize) -> Self {
+        assert!(nth >= 1, "cancel trigger call is 1-based; nth must be >= 1");
+        self.trigger_call = nth;
+        self
+    }
+
+    /// Returns the wrapped handler.
+    #[must_use]
+    pub fn inner(&self) -> &H {
+        &self.inner
+    }
+
+    /// Returns when the cancel fires relative to the inner call.
+    #[must_use]
+    pub fn timing(&self) -> CancelTiming {
+        self.timing
+    }
+
+    /// Returns the 1-based call number that triggers the cancel.
+    #[must_use]
+    pub fn trigger_call(&self) -> usize {
+        self.trigger_call
+    }
+
+    /// Returns the shared log of cancellations this wrapper has fired.
+    #[must_use]
+    pub fn log(&self) -> &Arc<CancelLog> {
+        &self.log
+    }
+
+    /// Returns whether this wrapper has fired its cancel yet.
+    #[must_use]
+    pub fn cancelled(&self) -> bool {
+        self.log.cancelled()
+    }
+
+    /// Returns how many calls have been dispatched through this wrapper.
+    #[must_use]
+    pub fn dispatched(&self) -> usize {
+        *self
+            .calls
+            .lock()
+            .expect("cancel-on-call counter mutex poisoned")
+    }
+
+    /// Reserves the next zero-based dispatch index for a call passing through.
+    fn next_index(&self) -> usize {
+        let mut calls = self
+            .calls
+            .lock()
+            .expect("cancel-on-call counter mutex poisoned");
+        let index = *calls;
+        *calls += 1;
+        index
+    }
+
+    /// Cancels `ctx` and records it when `index` is the trigger call and `phase`
+    /// matches the configured timing.
+    fn cancel_if_due(&self, index: usize, phase: CancelTiming, ctx: &RunContext) {
+        if phase == self.timing && index + 1 == self.trigger_call {
+            ctx.cancellation().cancel();
+            self.log.record(CancelEvent {
+                call_index: index,
+                timing: phase,
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl<H: LlmHandler> LlmHandler for CancelOnCall<H> {
+    async fn fulfill(
+        &self,
+        request: &ChatRequest,
+        mode: LlmStepMode,
+        ctx: &RunContext,
+    ) -> RequirementResult {
+        let index = self.next_index();
+        self.cancel_if_due(index, CancelTiming::Before, ctx);
+        let result = self.inner.fulfill(request, mode, ctx).await;
+        self.cancel_if_due(index, CancelTiming::After, ctx);
+        result
+    }
+}
+
+#[async_trait]
+impl<H: ToolHandler> ToolHandler for CancelOnCall<H> {
+    async fn fulfill(
+        &self,
+        call_id: ToolCallId,
+        call: &ToolCall,
+        ctx: &RunContext,
+    ) -> RequirementResult {
+        let index = self.next_index();
+        self.cancel_if_due(index, CancelTiming::Before, ctx);
+        let result = self.inner.fulfill(call_id, call, ctx).await;
+        self.cancel_if_due(index, CancelTiming::After, ctx);
+        result
+    }
+}
+
+#[async_trait]
+impl<H: InteractionHandler> InteractionHandler for CancelOnCall<H> {
+    async fn fulfill(&self, request: &Interaction, ctx: &RunContext) -> RequirementResult {
+        let index = self.next_index();
+        self.cancel_if_due(index, CancelTiming::Before, ctx);
+        let result = self.inner.fulfill(request, ctx).await;
+        self.cancel_if_due(index, CancelTiming::After, ctx);
+        result
+    }
+}
+
+#[async_trait]
+impl<H: ReconfigHandler> ReconfigHandler for CancelOnCall<H> {
+    async fn fulfill(&self, tool_set: &ToolSetRef, ctx: &RunContext) -> RequirementResult {
+        let index = self.next_index();
+        self.cancel_if_due(index, CancelTiming::Before, ctx);
+        let result = self.inner.fulfill(tool_set, ctx).await;
+        self.cancel_if_due(index, CancelTiming::After, ctx);
+        result
+    }
+}
+
+// ----- PanicOnCall -----
+
+/// A handler that panics if any of its families is ever invoked.
+///
+/// Wire a `PanicOnCall` into the family a code path must *not* reach — a tool
+/// handler for a turn that should be abandoned before any tool runs, an
+/// interaction handler for a headless turn that should never ask — and the test
+/// fails loudly the moment that family is served. It replaces the one-off
+/// "`panic!("must never run")`" handlers agent-layer tests used to repeat, and
+/// implements [`LlmHandler`], [`ToolHandler`], [`InteractionHandler`], and
+/// [`ReconfigHandler`] so it drops into any of those slots.
+#[derive(Clone, Debug)]
+pub struct PanicOnCall {
+    message: Cow<'static, str>,
+}
+
+impl PanicOnCall {
+    /// Builds a panic handler with a default message.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            message: Cow::Borrowed(
+                "PanicOnCall handler was invoked, but this path must not trigger it",
+            ),
+        }
+    }
+
+    /// Builds a panic handler whose panic carries `message`.
+    #[must_use]
+    pub fn with_message(message: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    /// Returns the message this handler panics with.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    fn boom(&self) -> ! {
+        panic!("{}", self.message);
+    }
+}
+
+impl Default for PanicOnCall {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl LlmHandler for PanicOnCall {
+    async fn fulfill(
+        &self,
+        _request: &ChatRequest,
+        _mode: LlmStepMode,
+        _ctx: &RunContext,
+    ) -> RequirementResult {
+        self.boom()
+    }
+}
+
+#[async_trait]
+impl ToolHandler for PanicOnCall {
+    async fn fulfill(
+        &self,
+        _call_id: ToolCallId,
+        _call: &ToolCall,
+        _ctx: &RunContext,
+    ) -> RequirementResult {
+        self.boom()
+    }
+}
+
+#[async_trait]
+impl InteractionHandler for PanicOnCall {
+    async fn fulfill(&self, _request: &Interaction, _ctx: &RunContext) -> RequirementResult {
+        self.boom()
+    }
+}
+
+#[async_trait]
+impl ReconfigHandler for PanicOnCall {
+    async fn fulfill(&self, _tool_set: &ToolSetRef, _ctx: &RunContext) -> RequirementResult {
+        self.boom()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Barrier, Delay, DelayingToolHandler, PeakInFlight};
-    use crate::fixtures::{root_context, tool_call};
-    use crate::handlers::ScriptedToolHandler;
+    use super::{
+        Barrier, CancelOnCall, CancelTiming, Delay, DelayingToolHandler, PanicOnCall, PeakInFlight,
+    };
+    use crate::fixtures::{
+        agent_spec, agent_spec_with_tools, agent_state, default_machine, root_context, tool_call,
+        user_input, weather_tool,
+    };
+    use crate::handlers::{ScriptedLlmHandler, ScriptedToolHandler};
     use crate::ids::SeqIds;
-    use crate::script::ToolStep;
-    use agent_lib::agent::{RunContext, ToolHandler};
+    use crate::scope::TestScope;
+    use crate::script::{LlmStep, ToolStep};
+    use agent_lib::agent::{LoopCursor, RequirementResult, RunContext, ToolHandler, drain};
     use agent_lib::conversation::ToolCallId;
     use agent_lib::model::tool::ToolCall;
+    use async_trait::async_trait;
     use futures::stream::{FuturesUnordered, StreamExt};
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
     /// A `Delay` yields exactly `ticks` times before completing, consulting no
     /// clock.
@@ -623,5 +990,225 @@ mod tests {
         // Begin index 1 (the second dispatch) completed before begin index 0.
         assert_eq!(handler.completion_order(), vec![1, 0]);
         assert_eq!(handler.peak_concurrency(), 2);
+    }
+
+    // ----- CancelOnCall / PanicOnCall (M5-2) -----
+
+    /// A tool handler that records whether the context was already cancelled when
+    /// it ran, then delegates to a scripted inner handler.
+    struct ObserveCancel {
+        observed: Arc<Mutex<Option<bool>>>,
+        inner: ScriptedToolHandler,
+    }
+
+    #[async_trait]
+    impl ToolHandler for ObserveCancel {
+        async fn fulfill(
+            &self,
+            call_id: ToolCallId,
+            call: &ToolCall,
+            ctx: &RunContext,
+        ) -> RequirementResult {
+            *self.observed.lock().expect("observe mutex poisoned") = Some(ctx.is_cancelled());
+            self.inner.fulfill(call_id, call, ctx).await
+        }
+    }
+
+    fn observe(
+        steps: impl IntoIterator<Item = ToolStep>,
+    ) -> (ObserveCancel, Arc<Mutex<Option<bool>>>) {
+        let observed = Arc::new(Mutex::new(None));
+        let handler = ObserveCancel {
+            observed: Arc::clone(&observed),
+            inner: ScriptedToolHandler::from_steps(steps),
+        };
+        (handler, observed)
+    }
+
+    /// `before` cancels the context ahead of the inner call, so the inner handler
+    /// already observes the cancellation.
+    #[tokio::test]
+    async fn cancel_on_call_before_lets_inner_observe_cancellation() {
+        let ids = SeqIds::new();
+        let ctx = root_context(&ids);
+        let (inner, observed) = observe([ToolStep::ok("call-a", "sunny")]);
+        let handler = CancelOnCall::before(inner);
+
+        let (id, call) = (
+            ids.tool_call_id(),
+            tool_call("call-a", "get_weather", json!({})),
+        );
+        let _ = handler.fulfill(id, &call, &ctx).await;
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(true),
+            "inner saw a cancelled ctx"
+        );
+        assert!(ctx.is_cancelled());
+        assert!(handler.cancelled());
+        assert_eq!(handler.log().cancelled_at(), Some(0));
+        assert_eq!(handler.log().events()[0].timing, CancelTiming::Before);
+    }
+
+    /// `after` runs the inner call to completion first, then cancels; the inner
+    /// handler therefore observes an uncancelled context.
+    #[tokio::test]
+    async fn cancel_on_call_after_runs_inner_before_cancelling() {
+        let ids = SeqIds::new();
+        let ctx = root_context(&ids);
+        let (inner, observed) = observe([ToolStep::ok("call-a", "sunny")]);
+        let handler = CancelOnCall::after(inner);
+
+        let (id, call) = (
+            ids.tool_call_id(),
+            tool_call("call-a", "get_weather", json!({})),
+        );
+        let _ = handler.fulfill(id, &call, &ctx).await;
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some(false),
+            "inner ran before the cancel landed"
+        );
+        assert!(
+            ctx.is_cancelled(),
+            "the cancel landed once the inner returned"
+        );
+        assert_eq!(handler.log().cancelled_at(), Some(0));
+        assert_eq!(handler.log().events()[0].timing, CancelTiming::After);
+    }
+
+    /// `on_call(n)` fires the cancel only on the nth (1-based) dispatch.
+    #[tokio::test]
+    async fn cancel_on_call_fires_on_the_nth_call() {
+        let ids = SeqIds::new();
+        let ctx = root_context(&ids);
+        let inner = ScriptedToolHandler::from_steps([
+            ToolStep::ok("call-a", "a"),
+            ToolStep::ok("call-b", "b"),
+            ToolStep::ok("call-c", "c"),
+        ]);
+        let handler = CancelOnCall::before(inner).on_call(2);
+
+        let (id_a, call_a) = (
+            ids.tool_call_id(),
+            tool_call("call-a", "get_weather", json!({})),
+        );
+        let _ = handler.fulfill(id_a, &call_a, &ctx).await;
+        assert!(!ctx.is_cancelled(), "the first call is below the trigger");
+        assert!(!handler.cancelled());
+
+        let (id_b, call_b) = (
+            ids.tool_call_id(),
+            tool_call("call-b", "get_weather", json!({})),
+        );
+        let _ = handler.fulfill(id_b, &call_b, &ctx).await;
+        assert!(ctx.is_cancelled(), "the second call trips the trigger");
+
+        let (id_c, call_c) = (
+            ids.tool_call_id(),
+            tool_call("call-c", "get_weather", json!({})),
+        );
+        let _ = handler.fulfill(id_c, &call_c, &ctx).await;
+
+        assert_eq!(handler.dispatched(), 3);
+        assert_eq!(handler.log().len(), 1, "the cancel fires exactly once");
+        assert_eq!(handler.log().cancelled_at(), Some(1));
+    }
+
+    /// The headline requirement: an LLM answer that returns a tool-use response
+    /// and cancels the run must abandon the tool batch before any tool runs, so a
+    /// `PanicOnCall` tool handler is never invoked.
+    #[tokio::test]
+    async fn cancel_after_llm_tool_use_abandons_the_tool_batch() {
+        let ids = SeqIds::new();
+        let ctx = root_context(&ids);
+        let spec = agent_spec_with_tools(&ids, vec![weather_tool()]);
+        let mut machine = default_machine(&ids, agent_state(&ids, spec));
+
+        let llm = CancelOnCall::after(ScriptedLlmHandler::from_steps([LlmStep::tool_use(vec![
+            tool_call("call-weather", "get_weather", json!({ "city": "SH" })),
+        ])]));
+        let cancel_log = Arc::clone(llm.log());
+        let scope = TestScope::builder()
+            .llm(Arc::new(llm))
+            .tool(Arc::new(PanicOnCall::with_message(
+                "cancelled tool batch must not dispatch a tool",
+            )))
+            .build();
+
+        let done = drain(
+            &mut machine,
+            user_input(&ids, "weather?"),
+            &scope,
+            None,
+            &ctx,
+        )
+        .await
+        .expect("a cancelled turn drains to a rest state");
+
+        // The tool handler panics if it runs, so reaching this point proves the
+        // batch was abandoned. Corroborate with the cursor and the cancel log.
+        assert!(matches!(done.cursor(), LoopCursor::Idle));
+        assert!(cancel_log.cancelled());
+        assert_eq!(cancel_log.cancelled_at(), Some(0));
+    }
+
+    /// A `PanicOnCall` wired to a family the turn never serves stays silent.
+    #[tokio::test]
+    async fn panic_on_call_stays_silent_when_its_family_is_never_served() {
+        let ids = SeqIds::new();
+        let ctx = root_context(&ids);
+        let spec = agent_spec(&ids);
+        let mut machine = default_machine(&ids, agent_state(&ids, spec));
+
+        // A plain text turn never emits a NeedTool, so the panicking tool handler
+        // is never reached.
+        let scope = TestScope::builder()
+            .llm(Arc::new(ScriptedLlmHandler::from_steps([LlmStep::text(
+                "hi",
+            )])))
+            .tool(Arc::new(PanicOnCall::new()))
+            .build();
+
+        let done = drain(&mut machine, user_input(&ids, "hi"), &scope, None, &ctx)
+            .await
+            .expect("a text turn completes without touching the tool family");
+        assert!(matches!(done.cursor(), LoopCursor::Done(_)));
+    }
+
+    /// A `PanicOnCall` panics the moment its family is served.
+    #[tokio::test]
+    #[should_panic(expected = "weather tool must not run")]
+    async fn panic_on_call_panics_when_its_family_is_served() {
+        let ids = SeqIds::new();
+        let ctx = root_context(&ids);
+        let spec = agent_spec_with_tools(&ids, vec![weather_tool()]);
+        let mut machine = default_machine(&ids, agent_state(&ids, spec));
+
+        // The LLM returns a tool-use without cancelling, so the driver dispatches
+        // the tool batch straight into the panicking handler.
+        let scope = TestScope::builder()
+            .llm(Arc::new(ScriptedLlmHandler::from_steps([
+                LlmStep::tool_use(vec![tool_call(
+                    "call-weather",
+                    "get_weather",
+                    json!({ "city": "SH" }),
+                )]),
+            ])))
+            .tool(Arc::new(PanicOnCall::with_message(
+                "weather tool must not run",
+            )))
+            .build();
+
+        let _ = drain(
+            &mut machine,
+            user_input(&ids, "weather?"),
+            &scope,
+            None,
+            &ctx,
+        )
+        .await;
     }
 }

@@ -1021,7 +1021,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测(concurrency.rs `#[cfg(test)]`,7 个;并发用例用 `FuturesUnordered` 复刻 driver 执行器):`Delay::yields(3)` 恰好 4 次 poll(3 pending + 1 ready)证明无真实时间;`ready` 首 poll 完成;barrier 两 waiter 一起放行且 `arrived==2`;`PeakInFlight` 两重叠 bracket 峰值=2 且乱序 complete → `completion_order()==[1,0]`;dropped guard 只释放槽不记完成;两并发 tool call 经 barrier 峰值 in-flight=2(begun/completed 均 2);ordered delays `[yields(3), yields(0)]` 稳定得到 `completion_order()==[1,0]`(第二个 dispatch 先完成)且峰值=2。
 - 验证:`cargo fmt --all` 已格式化;`cargo clippy --all-targets -- -D warnings`(root)与 `cargo clippy -p agent-testkit --all-targets -- -D warnings` 均无告警;`cargo test -p agent-testkit --lib concurrency` 7/7;`cargo test --all --all-targets` 全绿(agent-lib 434、agent-testkit lib 111 + 集成 cassette 2 + smoke 2,0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。
 
-### [TODO] M5-2 实现 cancel-on-call 与 panic-on-call wrappers
+### [DONE] M5-2 实现 cancel-on-call 与 panic-on-call wrappers
 
 **前置依赖**:M5-1。
 
@@ -1039,6 +1039,21 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:LLM 返回 tool_use 后 cancel,tool handler 未触发。
 - 单测:PanicOnCall 在不应触发路径不 panic,在触发路径 panic。
 - 跑全套验证命令。
+
+**完成记录(2026-07-14)**:
+
+- 在 `crates/agent-testkit/src/concurrency.rs` 追加取消/panic 工具(lib.rs 模块拓扑早已声明 `concurrency` 含 cancel/panic 工具,故就地实现而非新建模块;更新模块头文档描述这两组新 wrapper):
+  - `CancelTiming { Before, After }`:cancel 相对 inner 调用的时机。`Before` 让 inner 观察到已取消的 ctx;`After` 先跑完 inner 再取消——复刻 reference cancel 测试里“LLM 应答既产出 tool_use 又取消本 run”的形状。
+  - `CancelEvent { call_index, timing }` + `CancelLog`(`Mutex<Vec<CancelEvent>>`):记录每次 cancel 的 dispatch 序与时机;`new()/events()/len()/is_empty()/cancelled()/cancelled_at()`。这是“与 call log 集成、记录 cancel 发生时机”的落点。
+  - `CancelOnCall<H>`:字段 `inner/timing/trigger_call(1-based)/calls(Arc<Mutex<usize>>)/log(Arc<CancelLog>)`。构造 `before(inner)`/`after(inner)`;`on_call(nth)` 设置第 N 次触发(`nth==0` panic);访问器 `inner()/timing()/trigger_call()/log()/cancelled()/dispatched()`。内部 `next_index()` 领取 dispatch 序,`cancel_if_due(index, phase, ctx)` 在命中触发调用且时机匹配时 `ctx.cancellation().cancel()` 并记 log。为 `LlmHandler/ToolHandler/InteractionHandler/ReconfigHandler` 四个 family 各实现:`fulfill = next_index → cancel_if_due(Before) → inner.fulfill → cancel_if_due(After)`,inner 实现哪个 family 就自动获得对应 wrapper impl,可直接塞进 `TestScope` 对应槽位。取代各测试手写的“边应答边 cancel”handler。
+  - `PanicOnCall`:可带自定义 message(`new()`/`with_message()`/`message()`),对 `LlmHandler/ToolHandler/InteractionHandler/ReconfigHandler` 四 family 均在被调用时 `panic!`,用于证明某代码路径在触达该 family 前已放弃工作。取代各测试手写的 `panic!("must never run")` handler。
+- `prelude.rs` 追加 `CancelEvent`、`CancelLog`、`CancelOnCall`、`CancelTiming`、`PanicOnCall` 再导出。
+- 单测(concurrency.rs `#[cfg(test)]` 新增 6 个,并发/延迟旧测 9 个不变):
+  - `before` 让 inner 观察到 ctx 已取消(`observed==Some(true)`)、log 记 `cancelled_at()==Some(0)` 且 timing `Before`;`after` 让 inner 观察到未取消(`Some(false)`)、返回后 `ctx.is_cancelled()`、log timing `After`。
+  - `on_call(2)`:仅第 2 次 dispatch 触发,`dispatched()==3`、`log().len()==1`、`cancelled_at()==Some(1)`。
+  - 集成 drain(headline 验证):`CancelOnCall::after(scripted LLM 返回 tool_use)` 作 llm + `PanicOnCall` 作 tool,`drain` 后 tool handler 未触发(未 panic 即证明,batch 被取消放弃)、`cursor==Idle`、cancel log 非空。
+  - `PanicOnCall` 未触发路径:纯文本 turn 不产出 NeedTool,panicking tool handler 不被调用、`cursor==Done`;触发路径:LLM 返回 tool_use 且不取消 → 驱动派发 tool batch → `#[should_panic(expected = "weather tool must not run")]`。
+- 验证:`cargo fmt --all` 已格式化;`cargo clippy -p agent-testkit --all-targets -- -D warnings` 与 `cargo clippy --all-targets -- -D warnings` 均无告警;`cargo test -p agent-testkit --lib concurrency` 15/15;`cargo test --all --all-targets` 全绿(agent-lib lib 434 + 集成套件全过,agent-testkit lib 117 + cassette 2 + smoke 2,0 失败;3+1+3 网络集成测试按设计 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。
 
 ### [TODO] M5-3 实现 scripted subagent spawner 与 parent/child scope helpers
 

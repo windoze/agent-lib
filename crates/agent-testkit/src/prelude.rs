@@ -23,7 +23,8 @@ pub use crate::cassette::{
     UPDATE_ENV_VAR, request_fingerprint,
 };
 pub use crate::concurrency::{
-    Barrier, BarrierWait, Delay, DelayingToolHandler, InFlightGuard, PeakInFlight, YieldTicks,
+    Barrier, BarrierWait, CancelEvent, CancelLog, CancelOnCall, CancelTiming, Delay,
+    DelayingToolHandler, InFlightGuard, PanicOnCall, PeakInFlight, YieldTicks,
 };
 pub use crate::fixtures::{
     agent_spec, agent_spec_with_tools, agent_state, assistant_text, assistant_tool_use,
