@@ -654,7 +654,7 @@ plan/blackboard。现有 `agent-testkit` 已有 `ScriptedSubagentSpawner`、`hea
   credential-gated 集成测试 ignored,无 failed);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
   无告警;`git diff --check` 干净。
 
-### [TODO] M3-R Milestone 3 Review
+### [DONE] M3-R Milestone 3 Review
 
 **前置依赖**:M3-1..M3-2。
 
@@ -680,6 +680,53 @@ plan/blackboard。现有 `agent-testkit` 已有 `ScriptedSubagentSpawner`、`hea
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - `git diff --check`。
 - Review 结论写入本任务完成记录。
+
+**完成记录**:
+
+- **性质**:纯 review 任务,未改动任何被测/生产代码或测试代码;仅更新 `TODO.md`(标 `[DONE]` + 本记录)与
+  `memory/claude_plan.md`。逐条核对 M3-1(`tests/agent_complex_subagent.rs`)、M3-2
+  (`tests/agent_complex_cancel.rs`)及共享支持层(`tests/complex_support/`)。
+- **核对 1 — child headless interaction pop 到 parent**:确认。child scope 用
+  `headless_child_scope()`(仅 llm+tool,无 interaction backend),其 `dangerous_write` 经
+  `RequireDangerousWriteApprovalPolicy` 触发 `NeedInteraction`,只能 pop 一层到 parent 的
+  `ScriptedInteractionHandler::approve_all()`。断言真实检查:`parent_interaction_log.len()==1`、
+  `assert_tool_executions(DANGEROUS_WRITE, 1)`(唯有批准才执行,deny 会是 0 次)、trace 上该 interaction
+  requirement `resolved_at_scope(1).resumed()`(恰好跨一层)。
+- **核对 2 — `plan_claim_first_available` 跳过 dependency-blocked item**:确认。store 实现
+  (`plan_blackboard.rs::claim_first_available`)按稳定 `task_order` 扫描,谓词为
+  `status==Todo && owner.is_none() && dependencies_satisfied(depends_on)`,故跳过已 `Completed` 的
+  `design` 与依赖未满足的 `implement`,原子认领 `review`。测试断言 `review` owner=worker 且最终
+  `Completed`;`implement` 仍 `Todo` 且 `assert_no_task_owner`(仅一次 first-available claim,未误领);
+  依赖边 `review→[design]`、`implement→[review]` 不变。
+- **核对 3 — shared store side effect 只发生一次,无 retry/resume 重复写**:确认。
+  `assert_board_messages` 强制 `board.len()==expected.len()`(见 `assertions.rs:103`),任何重复/补跑
+  的 blackboard 写入都会使断言失败;subagent 场景固定 4 条按序、逐条断言 sender 可区分
+  parent/child/工具;plan 状态用精确 `assert_task_status`。
+- **核对 4 — cancel path 是 abandon/never-resume,不是 wrong-family error 或 panic**:确认。cancel
+  场景先 `ctx.cancellation().cancel()` 再驱动 subagent handler,child_ctx 继承 cancel,drain 在首个
+  fulfill 前 abandon child 的 outstanding requirement。断言:handler 返回
+  `RequirementResult::Subagent(Ok(_))`(有序收尾而非错误)、`child_log.abandon_count()==1` 且
+  `resume_count()==0`、`assert_tool_executions(PLAN_UPDATE, 0)` 且 `calls().is_empty()`(工具从不执行)、
+  `review` 仍 `InProgress`、trace 上该 tool requirement `resolved_at_scope(0).never_resumed()`。无 panic、
+  无 wrong-family error。
+- **核对 5 — cancel 后继续新 turn 的断言真实检查 committed conversation**:确认。Phase B 用 fresh
+  `cleanup_ctx` + 真实 `DefaultAgentMachine` 跑一整轮(`InProgress`→`Cancelled` 合法转换),
+  `assert_conversation(cleanup.state().conversation()).committed_turns(1).pending_none()` 直接读机器
+  的 conversation state,证明 committed 1 轮且无 pending;board 增至 `["review started","review cancelled"]`
+  无重复 started。
+- **核对 6 — 仅 mock agent effect 边界,无 provider wire mock**:确认。两测均用
+  `ScriptedLlmHandler` / `ScriptMachine` / `DefaultAgentMachine` / `ScriptedInteractionHandler` /
+  `ScriptedSubagentSpawner` 等 effect 边界替身,无任何 Anthropic/OpenAI HTTP、SSE 或 raw JSON wire mock;
+  无真实 sleep/网络/时钟,离线确定性(每测 <1s)。
+- **核对 7 — 无过早抽象成 DSL**:确认。新增 helper 仅 `ChargingLlm`(证明 child usage 计入 parent
+  ledger)与两个 trace/id 小工具,均为可读性服务,未引入 scenario DSL。
+- **验证结果(全部通过)**:`cargo fmt --all -- --check` 干净;`git diff --check` 干净;
+  `cargo clippy --all-targets -- -D warnings` 无告警;`cargo test --test agent_complex_subagent`(1 passed);
+  `cargo test --test agent_complex_cancel`(1 passed);`cargo test --all --all-targets` 全绿(29 个测试
+  二进制 `test result: ok`,0 failed,仅 credential-gated 集成测试 ignored);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警。
+- **结论**:Milestone 3 的 subagent 动态作用域、共享 plan/blackboard side effect、budget 传播、
+  cancel never-resume 与 cancel 后继续新 turn 均被复杂测试真实覆盖且断言到位,签核通过。可进入 Milestone 4。
 
 ---
 
