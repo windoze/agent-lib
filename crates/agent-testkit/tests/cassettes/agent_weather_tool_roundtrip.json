@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "test_name": "agent_weather_tool_roundtrip",
+    "description": "user -> LLM tool_use -> get_weather result -> LLM final text; no network or credentials"
+  },
+  "entries": [
+    {
+      "family": "llm",
+      "index": 0,
+      "request": {
+        "model": "gpt-5.5",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "weather?"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "Look up weather for a city.",
+            "input_schema": {
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "type": "object"
+            }
+          }
+        ],
+        "system": "Test conversation system.",
+        "max_tokens": 512,
+        "temperature": 0.1,
+        "stream": false,
+        "provider_extras": null
+      },
+      "mode": "non_streaming",
+      "fingerprint": "{\"max_tokens\":512,\"messages\":[{\"content\":[{\"text\":\"weather?\",\"type\":\"text\"}],\"role\":\"user\"}],\"model\":\"gpt-5.5\",\"provider_extras\":null,\"stream\":false,\"system\":\"Test conversation system.\",\"temperature\":0.10000000149011612,\"tools\":[{\"description\":\"Look up weather for a city.\",\"input_schema\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"name\":\"get_weather\"}]}",
+      "result": {
+        "ok": {
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call-weather",
+                "name": "get_weather",
+                "input": {
+                  "city": "Shanghai"
+                }
+              }
+            ]
+          },
+          "usage": {
+            "input": 5,
+            "output": 2,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "stop_reason": {
+            "value": "tool_use",
+            "raw": "tool_use"
+          }
+        }
+      }
+    },
+    {
+      "family": "tool",
+      "index": 1,
+      "request": {
+        "id": "call-weather",
+        "name": "get_weather",
+        "input": {
+          "city": "Shanghai"
+        }
+      },
+      "fingerprint": "{\"id\":\"<volatile-id>\",\"input\":{\"city\":\"Shanghai\"},\"name\":\"get_weather\"}",
+      "result": {
+        "ok": {
+          "tool_call_id": "call-weather",
+          "content": [
+            {
+              "type": "text",
+              "text": "Sunny, 20C in Shanghai."
+            }
+          ],
+          "status": "ok"
+        }
+      }
+    },
+    {
+      "family": "llm",
+      "index": 2,
+      "request": {
+        "model": "gpt-5.5",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "weather?"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call-weather",
+                "name": "get_weather",
+                "input": {
+                  "city": "Shanghai"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call-weather",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Sunny, 20C in Shanghai."
+                  }
+                ],
+                "status": "ok"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "Look up weather for a city.",
+            "input_schema": {
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "type": "object"
+            }
+          }
+        ],
+        "system": "Test conversation system.",
+        "max_tokens": 512,
+        "temperature": 0.1,
+        "stream": false,
+        "provider_extras": null
+      },
+      "mode": "non_streaming",
+      "fingerprint": "{\"max_tokens\":512,\"messages\":[{\"content\":[{\"text\":\"weather?\",\"type\":\"text\"}],\"role\":\"user\"},{\"content\":[{\"id\":\"<volatile-id>\",\"input\":{\"city\":\"Shanghai\"},\"name\":\"get_weather\",\"type\":\"tool_use\"}],\"role\":\"assistant\"},{\"content\":[{\"content\":[{\"text\":\"Sunny, 20C in Shanghai.\",\"type\":\"text\"}],\"status\":\"ok\",\"tool_use_id\":\"<volatile-id>\",\"type\":\"tool_result\"}],\"role\":\"tool\"}],\"model\":\"gpt-5.5\",\"provider_extras\":null,\"stream\":false,\"system\":\"Test conversation system.\",\"temperature\":0.10000000149011612,\"tools\":[{\"description\":\"Look up weather for a city.\",\"input_schema\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"name\":\"get_weather\"}]}",
+      "result": {
+        "ok": {
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "It is sunny in Shanghai."
+              }
+            ]
+          },
+          "usage": {
+            "input": 6,
+            "output": 4,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0
+          },
+          "stop_reason": {
+            "value": "end_turn",
+            "raw": "end_turn"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,43 +1,34 @@
-# 执行计划 — M3-3 实现 record / verify / update wrapper
+# 当前任务:M3-4 增加首个离线 recorded replay 测试
 
-## 选中的任务
-`TODO.md` 第一个未完成任务 = **M3-3 实现 record / verify / update wrapper**(TODO.md line 672)。
-前置 M3-1 / M3-2 已 `[DONE]`(HEAD=`9557f3b`),工作树 clean。
-
-## 任务要求(TODO.md M3-3)
-- `CassetteRecorder` builder,支持 `record(path)` / `verify(path)` / `update(path)`。
-- wrappers:wrap llm/tool/interaction/reconfig handler,调用真实 handler 后记录或比较 entry。
-- update 必须检查显式环境变量 `AGENT_TESTKIT_UPDATE_CASSETTES=1`。
-- record 也显式 opt-in `AGENT_TESTKIT_RECORD_CASSETTES=1`,否则返回 skipped/ignored 风格结果。
-- 写 cassette 用临时文件 + atomic rename,避免半写文件。
-- 验证:update 未启用不写文件;record 经 redactor 写稳定 JSON;verify 检测 result drift;跑全套验证命令。
+## 目标(来自 TODO.md M3-4)
+- 新增 `crates/agent-testkit/tests/cassettes/agent_weather_tool_roundtrip.json`(testkit crate 下等价路径)。
+- cassette 覆盖 user -> LLM tool_use -> tool result -> LLM final text。
+- 新增 replay 测试:`DefaultAgentMachine` + `CassetteLlmHandler` + `CassetteToolHandler` 跑完整 turn。
+- 断言 committed conversation、handler call log、final cursor。
+- 无需网络、credentials、真实 tool backend。
 
 ## 关键设计
-- 新文件 `cassette/record.rs`(保持 mod.rs 聚焦);mod.rs 加 `mod record; pub use record::{...}`。
-- `RecorderMode { Record, Verify, Update }`;常量 `RECORD_ENV_VAR` / `UPDATE_ENV_VAR`。
-- `CassetteRecorder { path, mode, metadata, redactor: Arc<dyn Redactor>, enabled_override, state: Arc<RecorderState> }`。
-  - `RecorderState { entries: Mutex<Vec<CassetteEntry>> }`,record(|index| entry) 原子按全局 dispatch 顺序追加。
-  - builder:with_redactor / with_metadata / with_enabled_override(测试钩子,绕过 env gate)。
-  - is_enabled():Verify 恒 true;Record/Update = override 或 env=="1"。
-  - wrap_llm/tool/interaction/reconfig(&self, impl Handler) → Recording* 包装器,克隆 state+redactor。
-- Recording* 包装器:先调真实 handler,再对该 family 结果 redact→归一化→按全局 index push,原样返回结果。
-  - 指纹在 redact 后的 request 上计算(与 doc §5.4 "脱敏后 canonical 形状" 一致)。
-- finish() -> Result<RecorderReport, RecorderError>:
-  - Record/Update:未启用 → Ok(Skipped) 不写;启用 → build cassette,pretty JSON,临时文件+rename。
-  - Verify:读盘 cassette,与 live 累积 entries 逐位比对 → Verified 或 Err(Drift(Vec<EntryDrift>))。
-- EntryDrift { position, family, detail },分类 family/request-fingerprint/result/count 漂移。
-- RecorderError { Drift, Load, Serialize, Io };RecorderReport { Wrote, Verified, Skipped }。
-- 原子写:同目录 .name.tmp.pid.nanos.n → write → rename,失败清理;必要时 create_dir_all。
-- prelude 追加导出。
-
-## 验证
-fmt → clippy(-D warnings)→ test -p agent-testkit record(+ 全 crate)→ test --all --all-targets → doc(-D warnings)→ git diff --check。
+- 新集成测试文件 `crates/agent-testkit/tests/cassette_replay.rs`。
+- fixture 生成不靠手写:用 M3-3 `CassetteRecorder::update(path)` 包 `ScriptedLlmHandler`/`ScriptedToolHandler`
+  跑一遍真实 `DefaultAgentMachine`,record 到磁盘。录制的 LLM 请求指纹必然与 replay 时机器产出的请求一致。
+  - 该 regenerate 测试受 `AGENT_TESTKIT_UPDATE_CASSETTES=1` 门禁,CI 默认 Skipped 不写盘。
+- replay 测试运行时读取(std::fs::read_to_string,非 include_str!,避免 fixture 未生成时编译失败)→
+  Cassette::from_json_str → CassettePlayer → llm_handler()/tool_handler()(持 Arc 以便读 call log)→
+  TestScope(仅 llm+tool)→ drain 完整 turn。
+- 场景:weather_tool;LLM step1 = tool_use get_weather(Shanghai) usage(5,2);tool = ok "Sunny...";
+  LLM step2 = text 最终答复 usage(6,4)。无 approval policy → 无 interaction。
+- 断言:cursor.kind()==Done;conversation pending None、1 turn、4 消息(User/Assistant/Tool/Assistant text);
+  最终文本;llm.log().len()==2 & completed==2;tool.log().len()==1;budget used==17 tokens。
 
 ## 步骤
-1. [x] 读 TODO/PLAN/memory + 相关类型。
-2. [x] 写 cassette/record.rs(recorder + 4 wrapper + report/error/drift + atomic write + 单测)。
-3. [x] mod.rs 声明并导出 record 模块;更新 mod.rs 顶部 doc。
-4. [x] prelude 导出新类型。
-5. [x] fmt → clippy(clean)→ record 测试(全绿)→ 全量(agent-lib 434 + testkit 75 + smoke 2,0 failed)→ doc(clean)→ diff check(clean)。
-6. [x] TODO.md 标 M3-3 [DONE] + 完成记录。
-7. [ ] 提交并停止(进行中)。
+1. [x] 读 TODO/PLAN/源码,确认 recorder/replay/scope/fixtures API。
+2. [x] 写 tests/cassette_replay.rs(regenerate[update-gated] + replay + 共享 scenario 构造)。
+3. [x] 建 tests/cassettes/ 目录;用 update 门禁跑 regenerate 生成 JSON fixture。
+4. [x] 人工检查 JSON 可读、无 auth/endpoint/raw body。
+5. [x] 聚焦跑 replay 测试确认绿。
+6. [x] fmt → clippy(-D warnings)→ 全量 test --all --all-targets → doc(-D warnings)→ git diff --check。
+7. [x] TODO.md 标 M3-4 [DONE] + 完成记录。
+8. [x] 提交并停止。
+
+## 备注
+- docs/external-agent.md 为无关的未跟踪文件,HEAD 已是干净 M3-3 提交,非失败恢复场景,故本任务不纳入提交。

@@ -729,7 +729,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - **边界确认**:recorder 仅捕获 provider-neutral effect req/resp(无 header/auth/endpoint/provider raw body);写盘仅
   在显式 env/override opt-in 时发生且原子;首个离线 recorded replay 测试(M3-4)本任务未实现。
 
-### [TODO] M3-4 增加首个离线 recorded replay 测试
+### [DONE] M3-4 增加首个离线 recorded replay 测试
 
 
 **前置依赖**:M3-3。
@@ -749,6 +749,39 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 聚焦运行 recorded replay 测试。
 - 全套验证命令全部通过。
 - 人工检查 cassette JSON 可读,无 auth/endpoint/raw provider body。
+
+**完成记录**(2026-07-14):
+
+- **产出**:新增集成测试 `crates/agent-testkit/tests/cassette_replay.rs`(testkit crate 下等价路径,而非仓库根
+  `tests/`,契合 dev-only testkit 拓扑)+ 首个 recorded fixture
+  `crates/agent-testkit/tests/cassettes/agent_weather_tool_roundtrip.json`(pretty JSON,`schema_version=1`,3 entry:
+  llm#0 → tool#1 → llm#2)。
+- **replay 测试 `offline_replay_runs_a_full_weather_turn`**:运行时 `std::fs::read_to_string` 读 fixture(非
+  `include_str!`,以便 fixture 未生成时仍可编译并跑 regenerate)→ `Cassette::from_json_str` →
+  `CassettePlayer::new` → `llm_handler()`/`tool_handler()`(各持 `Arc` 便于读 `log()`)→ `TestScope`(**仅** llm+tool,
+  headless,任何 stray interaction 会以 `UnhandledRequirement` 暴露而非静默 auto-approve)→ `default_machine`(真实
+  `DefaultAgentMachine`,NonStreaming,无 approval policy)→ `drain` 跑完整 turn。断言三项:**final cursor**
+  `done.cursor().kind() == LoopCursorKind::Done`;**handler call log** llm 2 次(且 completed 2)、tool 1 次(且
+  completed 1);**committed conversation** `pending().is_none()`、1 turn、4 消息(User / Assistant `ToolUse{get_weather}`
+  / Tool / Assistant `Text` 最终答复),且第 4 条文本 == 预期终答。整条链无 `LlmClient`、无 provider HTTP、无真实 tool
+  backend、无 credentials。
+- **fixture 生成不靠手写**:同文件的 `regenerate_weather_cassette` 用 M3-3 `CassetteRecorder::update(path)` 包
+  `ScriptedLlmHandler`/`ScriptedToolHandler`,跑一遍**同一个真实机器**并 record 到磁盘——这样录制的 LLM 请求正是机器
+  实际发出的请求,entry 指纹与 replay 时机器重放的请求天然一致(volatile id 被 fingerprint strip,record/replay 两次
+  run 无需 id 相同)。该测试受 `AGENT_TESTKIT_UPDATE_CASSETTES=1` 门禁:默认 CI run `skip_reason()` 命中即早退(断言其
+  含 env 名),**永不覆盖已提交 fixture**;opt-in 时写盘并断言 `RecorderReport::Wrote{entry_count: 3}`。本任务即以
+  `AGENT_TESTKIT_UPDATE_CASSETTES=1` 跑一次该测试生成committed fixture。
+- **人工检查 JSON**:provider-neutral,仅含 effect-boundary `ChatRequest`/`Response`、`ToolCall`/`ToolResponse`;**无**
+  header/auth/endpoint/provider raw wire body;`provider_extras: null`;每 entry 带自算 `fingerprint`(tool 请求与第二个
+  LLM 请求中的 `id`/`tool_use_id` 已被替换为 `<volatile-id>`)。
+- **边界修正**:初版误加 budget 断言(`ctx.budget().used()==17`);实测为 0,因 budget charge 是 **handler 职责**(参考
+  `ChargingLlmHandler` 显式 `ctx.charge_tokens`),cassette replay handler 与 scripted handler 均不 charge。已删除该错误
+  断言与相应注释;录制 usage 仅作为真实形状 payload 保留(JSON 中可见)。
+- **验证**:`cargo fmt --all`(+ `--check` clean);`cargo clippy --all-targets -- -D warnings`(workspace clean);
+  聚焦 `cargo test -p agent-testkit --test cassette_replay`(2 passed:regenerate no-op skipped + offline replay 绿);
+  `cargo test --all --all-targets`(全绿:agent-lib 434 + agent-testkit 75 + cassette_replay 2 + smoke 2 + 其余,0
+  failed);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p agent-testkit`(clean);`git diff --check`(clean)。
+
 
 ### [TODO] M3-R Milestone 3 Review
 
