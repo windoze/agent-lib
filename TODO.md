@@ -556,7 +556,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 ## Milestone 3 — Cassette 录制与离线重放
 
-### [TODO] M3-1 定义 cassette schema、redactor 与 fingerprint
+### [DONE] M3-1 定义 cassette schema、redactor 与 fingerprint
 
 **前置依赖**:M2-R。
 
@@ -578,6 +578,39 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:redactor 会处理 provider extras 未知字段。
 - 单测:未知 schema version 失败。
 - 跑全套验证命令。
+
+**完成记录**(2026-07-14):
+
+- **产出**:`crates/agent-testkit/src/cassette.rs`(全量实现,替换原 skeleton stub)+ `prelude.rs` 追加导出。
+- **schema**:`Cassette { schema_version, metadata: CassetteMetadata, entries: Vec<CassetteEntry>, observations:
+  Option<CassetteObservations> }`;常量 `CASSETTE_SCHEMA_VERSION = 1`。`CassetteEntry` 为 internally-tagged
+  (`tag = "family"`, snake_case)enum,含 `Llm(LlmEntry)`/`Tool(ToolEntry)`/`Interaction(InteractionEntry)`/
+  `Reconfig(ReconfigEntry)`。每个 entry 记 `index`(dispatch 序号)、normalized request、`fingerprint`、
+  normalized result(`LlmOutcome`/`ToolOutcome`/`InteractionResponse`/`ReconfigOutcome`)、可选 `summary`。
+  entry 构造器自动算 fingerprint。M3-1 **不含** Subagent 家族(其结果 `AgentError` 属 M5)。
+- **可序列化结果镜像**:`ToolRuntimeError` 不可序列化 → testkit 内新增 `CassetteToolError`(5 变体镜像,
+  `tag = "kind"`)+ 双向 `From` + `Display`(委托 `ToolRuntimeError`);**未改动 agent-lib**,与 `ClientError`
+  本已可序列化的先例一致。`LlmOutcome`/`ToolOutcome`/`ReconfigOutcome` 用 serde 默认(external)tag 避免包裹
+  枚举时的 internal-tag 限制。
+- **fingerprint**:`request_fingerprint<T: Serialize>` → `to_value` → 递归 canonicalize(对象 key 排序 + volatile-id
+  key 的字符串值替换为 `<volatile-id>`)→ compact JSON 字符串(v1 直接用 canonical 串)。volatile key 集合含
+  `id/tool_call_id/tool_use_id/call_id/step_id/message_id/requirement_id/trace_node_id`;`input`/`input_schema`
+  子树视为 opaque(仍排序 key,但不 strip id),保护 tool 输入内语义化的 `id`。
+- **redactor**:`Redactor` trait(每 family 一个默认 no-op 方法)+ `DefaultRedactor`(带 allowlist):scrub
+  `ChatRequest.provider_extras.fields` 与 `Response.extra` 中非 allowlist key 的值为 `<redacted>`,保留 key 形状与
+  message 文本。
+- **schema 加载护栏**:`Cassette::from_json_str` 先读并校验 `schema_version` 再 full parse,未知/缺失分别分类为
+  `CassetteError::UnsupportedSchemaVersion` / `MissingSchemaVersion`;另有 `to_json_string[_pretty]`。
+- **单测(11 个,全绿)**:JSON round-trip 稳定(compact + pretty);同 logical request 不同 volatile id →
+  fingerprint 一致,改 tool input / input 内 `id` → fingerprint 变化;key 乱序 fingerprint 稳定;volatile id 被替换为
+  占位符;`DefaultRedactor` scrub provider extras / response extra 且保留 allowlist 与 message 文本;未知/缺失
+  schema version 分类;family tag + index 暴露;`CassetteToolError` ↔ `ToolRuntimeError` round-trip。
+- **验证**:`cargo fmt --all`;`cargo clippy --all-targets -- -D warnings`(clean);`cargo test -p agent-testkit
+  cassette`(11 passed);`cargo test --all --all-targets`(全绿,含 agent-testkit 58 + smoke 2);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p agent-testkit`(clean,`#![warn(missing_docs)]` 满足);
+  `git diff --check`(clean)。
+- **边界确认**:cassette 仅记 provider-neutral effect req/resp,未含 header/auth/endpoint/provider raw body;
+  replay handlers 与 record/verify/update wrapper 分别属 M3-2 / M3-3,本任务未实现。
 
 ### [TODO] M3-2 实现 cassette replay handlers
 

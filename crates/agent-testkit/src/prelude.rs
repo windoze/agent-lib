@@ -6,6 +6,12 @@
 //! and step contract so downstream tests can name the effect boundary without a
 //! deep import path, plus the deterministic id source.
 
+pub use crate::cassette::{
+    CASSETTE_SCHEMA_VERSION, Cassette, CassetteEntry, CassetteError, CassetteMetadata,
+    CassetteObservations, CassetteToolError, DefaultRedactor, InteractionEntry, LlmEntry,
+    LlmOutcome, ReconfigEntry, ReconfigOutcome, Redactor, ToolEntry, ToolOutcome,
+    request_fingerprint,
+};
 pub use crate::fixtures::{
     agent_spec, agent_spec_with_tools, agent_state, assistant_text, assistant_tool_use,
     calendar_tool, default_machine, root_context, text_block, tool_call, tool_error_response,
