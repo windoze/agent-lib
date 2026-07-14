@@ -31,14 +31,17 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use std::sync::Arc;
+
 use agent_lib::agent::{
-    AgentInput, AgentMachine, LoopCursor, LoopCursorKind, Notification, PivotSource, QueuedPivot,
-    Requirement, RequirementId, RequirementKindTag, RequirementResolution, RequirementResult,
-    StepInput, StepOutcome,
+    AgentError, AgentInput, AgentMachine, HandlerScope, LoopCursor, LoopCursorKind, Notification,
+    PivotSource, Pop, QueuedPivot, Requirement, RequirementId, RequirementKindTag,
+    RequirementResolution, RequirementResult, RunContext, StepInput, StepOutcome, TurnDone, drain,
 };
 
 use crate::fixtures::{user_input, user_message};
 use crate::ids::SeqIds;
+use crate::script::CallLog;
 
 /// A synchronous driver that advances an [`AgentMachine`] one step at a time and
 /// keeps every intermediate observation inspectable.
@@ -503,6 +506,286 @@ fn external_label(input: &AgentInput) -> String {
     }
 }
 
+/// An asynchronous harness that drives an [`AgentMachine`] all the way to the end
+/// of one turn through the reference driver [`drain`], keeping the raw
+/// [`TurnDone`], the drained notifications, the final [`LoopCursor`], and an
+/// optional summary of watched handler call logs inspectable.
+///
+/// Where [`StepHarness`] stops at every blocking point so a test can assert on
+/// each intermediate requirement batch, `DrainHarness` runs the whole turn and
+/// reports what the driver settled on. It deliberately does *not* flatten or
+/// reclassify failures: [`drain`] returns a classified [`AgentError`], and this
+/// harness forwards it verbatim (never stringified) so a test can match on
+/// [`AgentErrorKind`](agent_lib::agent::AgentErrorKind) — an
+/// [`UnhandledRequirement`](agent_lib::agent::AgentError::UnhandledRequirement),
+/// a trace failure, or a budget failure — exactly as the production driver would
+/// surface it.
+///
+/// Build one with [`DrainHarness::new`] (which mints a fresh [`SeqIds`] for the
+/// [`run_user`](Self::run_user) convenience) or [`DrainHarness::with_ids`] to
+/// share an existing id tree with the fixtures that built the machine. Attach
+/// scripted handler call logs with [`watching`](Self::watching) to have each
+/// [`DrainObservation`] carry a per-handler call-count summary.
+pub struct DrainHarness<'drive, M: AgentMachine> {
+    machine: M,
+    scope: &'drive dyn HandlerScope,
+    parent: Option<&'drive mut (dyn Pop + 'drive)>,
+    ctx: &'drive RunContext,
+    ids: SeqIds,
+    logs: Vec<WatchedLog>,
+}
+
+impl<'drive, M: AgentMachine> DrainHarness<'drive, M> {
+    /// Wraps `machine` to be drained through `scope` (with an optional outer
+    /// `parent` layer) under `ctx`, minting a fresh [`SeqIds`] for the
+    /// [`run_user`](Self::run_user) convenience.
+    #[must_use]
+    pub fn new(
+        machine: M,
+        scope: &'drive dyn HandlerScope,
+        parent: Option<&'drive mut (dyn Pop + 'drive)>,
+        ctx: &'drive RunContext,
+    ) -> Self {
+        Self::with_ids(machine, scope, parent, ctx, SeqIds::new())
+    }
+
+    /// Wraps `machine` like [`new`](Self::new), drawing the
+    /// [`run_user`](Self::run_user) turn/message/step ids from `ids`.
+    ///
+    /// Pass the same [`SeqIds`] the machine was built from so every fabricated
+    /// input id stays globally unique within the test tree.
+    #[must_use]
+    pub fn with_ids(
+        machine: M,
+        scope: &'drive dyn HandlerScope,
+        parent: Option<&'drive mut (dyn Pop + 'drive)>,
+        ctx: &'drive RunContext,
+        ids: SeqIds,
+    ) -> Self {
+        Self {
+            machine,
+            scope,
+            parent,
+            ctx,
+            ids,
+            logs: Vec::new(),
+        }
+    }
+
+    /// Registers a scripted handler's call log under `name` so every
+    /// [`DrainObservation`] this harness produces carries its begun/completed
+    /// call counts.
+    ///
+    /// A concrete `Arc<CallLog<Req, Res>>` (for example the `Arc` returned by a
+    /// scripted handler's `log()`) coerces to the trait-object `Arc` at the call
+    /// site. Watching nothing leaves [`DrainObservation::handler_logs`] `None`.
+    #[must_use]
+    pub fn watching(mut self, name: impl Into<String>, log: Arc<dyn HandlerCallCounts>) -> Self {
+        self.logs.push(WatchedLog {
+            name: name.into(),
+            log,
+        });
+        self
+    }
+
+    /// Returns a shared reference to the wrapped machine.
+    pub const fn machine(&self) -> &M {
+        &self.machine
+    }
+
+    /// Returns a mutable reference to the wrapped machine.
+    ///
+    /// Prefer the run moves; this is an escape hatch for machine-specific
+    /// configuration that must happen after wrapping.
+    pub const fn machine_mut(&mut self) -> &mut M {
+        &mut self.machine
+    }
+
+    /// Returns the id source backing the [`run_user`](Self::run_user)
+    /// convenience.
+    #[must_use]
+    pub const fn ids(&self) -> &SeqIds {
+        &self.ids
+    }
+
+    /// Consumes the harness and returns the wrapped machine, letting a test
+    /// inspect the committed conversation after the turn drained.
+    #[must_use]
+    pub fn into_machine(self) -> M {
+        self.machine
+    }
+
+    /// Drains the machine from a fresh external `input` to the end of one turn.
+    ///
+    /// # Errors
+    ///
+    /// Forwards the classified [`AgentError`] [`drain`] returns verbatim — an
+    /// unhandled requirement, a trace failure, a budget failure, or a family
+    /// mismatch — without collapsing it into a generic string.
+    pub async fn run(&mut self, input: AgentInput) -> Result<DrainObservation, AgentError> {
+        let turn = drain(
+            &mut self.machine,
+            input,
+            self.scope,
+            self.parent.as_deref_mut(),
+            self.ctx,
+        )
+        .await?;
+        Ok(self.observe(turn))
+    }
+
+    /// Opens and drains a fresh user turn carrying `text`, minting the input ids
+    /// from the harness's [`SeqIds`].
+    ///
+    /// This still routes through [`AgentInput::user_message`] and the shared
+    /// [`SeqIds`]; it is purely a readability shorthand over [`run`](Self::run).
+    ///
+    /// # Errors
+    ///
+    /// Forwards the classified [`AgentError`] from [`run`](Self::run).
+    pub async fn run_user(&mut self, text: &str) -> Result<DrainObservation, AgentError> {
+        let input = user_input(&self.ids, text);
+        self.run(input).await
+    }
+
+    /// Snapshots the watched handler logs and packages them with `turn`.
+    fn observe(&self, turn: TurnDone) -> DrainObservation {
+        let handler_logs = if self.logs.is_empty() {
+            None
+        } else {
+            Some(
+                self.logs
+                    .iter()
+                    .map(|watched| HandlerLogSummary {
+                        name: watched.name.clone(),
+                        begun: watched.log.begun(),
+                        completed: watched.log.completed(),
+                    })
+                    .collect(),
+            )
+        };
+        DrainObservation { turn, handler_logs }
+    }
+}
+
+impl<M: AgentMachine + fmt::Debug> fmt::Debug for DrainHarness<'_, M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DrainHarness")
+            .field("machine", &self.machine)
+            .field("cursor", &self.machine.cursor().kind())
+            .field("has_parent", &self.parent.is_some())
+            .field(
+                "watched_logs",
+                &self.logs.iter().map(|w| &w.name).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+/// A scripted handler's call log registered with a [`DrainHarness`] under a name.
+struct WatchedLog {
+    name: String,
+    log: Arc<dyn HandlerCallCounts>,
+}
+
+/// An object-safe count view over a scripted handler's
+/// [`CallLog`].
+///
+/// Implemented for every [`CallLog<Req, Res>`](crate::script::CallLog), so a test
+/// can hand a [`DrainHarness`] any family's log (llm, tool, interaction,
+/// reconfig) through one uniform trait object and read its call counts back off
+/// the [`DrainObservation`].
+pub trait HandlerCallCounts: Send + Sync {
+    /// Returns how many calls have begun against the handler.
+    fn begun(&self) -> usize;
+
+    /// Returns how many calls have completed against the handler.
+    fn completed(&self) -> usize;
+}
+
+impl<Req: Send, Res: Send> HandlerCallCounts for CallLog<Req, Res> {
+    fn begun(&self) -> usize {
+        self.len()
+    }
+
+    fn completed(&self) -> usize {
+        self.completed_len()
+    }
+}
+
+/// The product of one [`DrainHarness`] run: the raw [`TurnDone`] the driver
+/// returned, plus an optional summary of the watched handler call logs.
+///
+/// The notifications and final cursor are forwarded straight off the underlying
+/// [`TurnDone`] so a test reads exactly what [`drain`] produced; nothing here
+/// rewrites or hides driver output.
+#[derive(Clone, Debug)]
+pub struct DrainObservation {
+    turn: TurnDone,
+    handler_logs: Option<Vec<HandlerLogSummary>>,
+}
+
+impl DrainObservation {
+    /// Returns the raw [`TurnDone`] the driver produced.
+    #[must_use]
+    pub const fn turn_done(&self) -> &TurnDone {
+        &self.turn
+    }
+
+    /// Consumes the observation and returns the underlying [`TurnDone`].
+    #[must_use]
+    pub fn into_turn_done(self) -> TurnDone {
+        self.turn
+    }
+
+    /// Returns the notifications produced over the whole drain, in order.
+    #[must_use]
+    pub fn notifications(&self) -> &[Notification] {
+        self.turn.notifications()
+    }
+
+    /// Returns the terminal cursor the machine came to rest on.
+    #[must_use]
+    pub const fn final_cursor(&self) -> &LoopCursor {
+        self.turn.cursor()
+    }
+
+    /// Returns the per-handler call-count summary for the logs registered with
+    /// [`DrainHarness::watching`], or `None` when no log was watched.
+    #[must_use]
+    pub fn handler_logs(&self) -> Option<&[HandlerLogSummary]> {
+        self.handler_logs.as_deref()
+    }
+}
+
+/// The begun/completed call counts of one watched handler log after a drain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandlerLogSummary {
+    name: String,
+    begun: usize,
+    completed: usize,
+}
+
+impl HandlerLogSummary {
+    /// Returns the name the log was registered under.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns how many calls began against the handler over the drain.
+    #[must_use]
+    pub const fn begun(&self) -> usize {
+        self.begun
+    }
+
+    /// Returns how many calls completed against the handler over the drain.
+    #[must_use]
+    pub const fn completed(&self) -> usize {
+        self.completed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::StepHarness;
@@ -677,5 +960,190 @@ mod tests {
             RequirementResult::Llm(Ok(assistant_text("ok", usage(1, 1)))),
         );
         assert!(done.is_quiescent());
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::DrainHarness;
+    use crate::fixtures::{
+        agent_spec_with_tools, agent_state, default_machine, root_context, tool_call, weather_tool,
+    };
+    use crate::handlers::{ScriptedLlmHandler, ScriptedToolHandler};
+    use crate::ids::SeqIds;
+    use crate::scope::TestScope;
+    use crate::script::{LlmStep, ToolStep};
+    use agent_lib::agent::{
+        AgentError, AgentErrorKind, ApprovalRequirement, LoopCursorKind, RequirementKindTag,
+        ToolApprovalPolicy,
+    };
+    use agent_lib::conversation::ToolCallId;
+    use agent_lib::model::tool::ToolCall;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// Approval policy that guards every tool call, forcing a `NeedInteraction`.
+    #[derive(Debug)]
+    struct RequireApprovalPolicy;
+
+    impl ToolApprovalPolicy for RequireApprovalPolicy {
+        fn approval_requirement(
+            &self,
+            _call_id: ToolCallId,
+            _call: &ToolCall,
+        ) -> ApprovalRequirement {
+            ApprovalRequirement::required(Some("human approval required".to_owned()))
+        }
+    }
+
+    /// A scripted local tool turn drains all the way to `Done`, and the watched
+    /// handler logs report the full round-trip (two LLM generations, one tool).
+    #[tokio::test]
+    async fn local_tool_turn_drains_to_done() {
+        let ids = SeqIds::new();
+        let ctx = root_context(&ids);
+        let spec = agent_spec_with_tools(&ids, vec![weather_tool()]);
+        let machine = default_machine(&ids, agent_state(&ids, spec));
+
+        let llm = ScriptedLlmHandler::from_steps([
+            LlmStep::tool_use(vec![tool_call(
+                "call-weather",
+                "get_weather",
+                json!({ "city": "SH" }),
+            )]),
+            LlmStep::text("sunny in SH"),
+        ]);
+        let tool = ScriptedToolHandler::from_steps([ToolStep::ok("call-weather", "sunny")]);
+        let llm_log = Arc::clone(llm.log());
+        let tool_log = Arc::clone(tool.log());
+        let scope = TestScope::builder()
+            .llm(Arc::new(llm))
+            .tool(Arc::new(tool))
+            .build();
+
+        let mut harness = DrainHarness::with_ids(machine, &scope, None, &ctx, ids)
+            .watching("llm", llm_log.clone())
+            .watching("tool", tool_log.clone());
+
+        let observed = harness
+            .run_user("weather?")
+            .await
+            .expect("the scripted local tool turn drains to completion");
+
+        // Final cursor: the turn closed cleanly on `Done`.
+        assert_eq!(observed.final_cursor().kind(), LoopCursorKind::Done);
+
+        // Watched handler logs summarise the full round-trip.
+        let logs = observed
+            .handler_logs()
+            .expect("watched logs are summarised");
+        let tool_summary = logs
+            .iter()
+            .find(|summary| summary.name() == "tool")
+            .expect("tool summary present");
+        assert_eq!(tool_summary.begun(), 1);
+        assert_eq!(tool_summary.completed(), 1);
+        let llm_summary = logs
+            .iter()
+            .find(|summary| summary.name() == "llm")
+            .expect("llm summary present");
+        assert_eq!(
+            llm_summary.begun(),
+            2,
+            "one tool-use + one final generation"
+        );
+        assert_eq!(llm_summary.completed(), 2);
+
+        // The turn committed: no pending turn remains on the conversation.
+        let machine = harness.into_machine();
+        assert!(
+            machine.state().conversation().pending().is_none(),
+            "the drained turn committed"
+        );
+    }
+
+    /// A guarded tool call makes the machine emit a `NeedInteraction`; a headless
+    /// top scope cannot fulfil it, so the drain returns the *raw* classified
+    /// `AgentError::UnhandledRequirement` — never a stringified summary.
+    #[tokio::test]
+    async fn top_unhandled_interaction_returns_raw_agent_error() {
+        let ids = SeqIds::new();
+        let ctx = root_context(&ids);
+        let spec = agent_spec_with_tools(&ids, vec![weather_tool()]);
+        let machine = default_machine(&ids, agent_state(&ids, spec))
+            .with_approval_policy(Arc::new(RequireApprovalPolicy));
+
+        let llm = ScriptedLlmHandler::from_steps([LlmStep::tool_use(vec![tool_call(
+            "call-weather",
+            "get_weather",
+            json!({ "city": "SH" }),
+        )])]);
+        let tool = ScriptedToolHandler::from_steps([ToolStep::ok("call-weather", "sunny")]);
+        let tool_log = Arc::clone(tool.log());
+        // Headless top scope: llm + tool, no interaction handler.
+        let scope = TestScope::builder()
+            .llm(Arc::new(llm))
+            .tool(Arc::new(tool))
+            .build();
+
+        let mut harness = DrainHarness::with_ids(machine, &scope, None, &ctx, ids);
+
+        let error = harness
+            .run_user("hi")
+            .await
+            .expect_err("a headless top scope cannot fulfil the approval");
+
+        // The classified error is forwarded verbatim, not collapsed into a string.
+        assert_eq!(error.kind(), AgentErrorKind::UnhandledRequirement);
+        match error {
+            AgentError::UnhandledRequirement { kind, .. } => {
+                assert_eq!(kind, RequirementKindTag::Interaction);
+            }
+            other => panic!("expected UnhandledRequirement, got {other:?}"),
+        }
+        // The approval was neither auto-granted nor skipped: the tool never ran.
+        assert_eq!(tool_log.len(), 0);
+    }
+
+    /// A cancelled context abandons the turn's first requirement instead of
+    /// fulfilling it, so the tool handler is never reached.
+    #[tokio::test]
+    async fn cancelled_context_never_runs_the_tool_handler() {
+        let ids = SeqIds::new();
+        let ctx = root_context(&ids);
+        let spec = agent_spec_with_tools(&ids, vec![weather_tool()]);
+        let machine = default_machine(&ids, agent_state(&ids, spec));
+
+        let llm = ScriptedLlmHandler::from_steps([
+            LlmStep::tool_use(vec![tool_call(
+                "call-weather",
+                "get_weather",
+                json!({ "city": "SH" }),
+            )]),
+            LlmStep::text("done"),
+        ]);
+        let tool = ScriptedToolHandler::from_steps([ToolStep::ok("call-weather", "sunny")]);
+        let tool_log = Arc::clone(tool.log());
+        let scope = TestScope::builder()
+            .llm(Arc::new(llm))
+            .tool(Arc::new(tool))
+            .build();
+
+        let mut harness = DrainHarness::with_ids(machine, &scope, None, &ctx, ids)
+            .watching("tool", tool_log.clone());
+
+        // Cancel before draining: the first requirement is abandoned, not served.
+        ctx.cancellation().cancel();
+
+        let observed = harness
+            .run_user("weather?")
+            .await
+            .expect("a cancelled drain still closes the turn");
+
+        // The tool handler was never reached, on the handler log and the summary.
+        assert_eq!(tool_log.len(), 0, "the cancelled turn never ran the tool");
+        let logs = observed.handler_logs().expect("the tool log was watched");
+        assert_eq!(logs[0].name(), "tool");
+        assert_eq!(logs[0].begun(), 0);
     }
 }

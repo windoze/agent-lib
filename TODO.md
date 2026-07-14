@@ -886,7 +886,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测(harness.rs `#[cfg(test)]`,7 个,全为普通 `#[test]` 证明无 async):text-only turn step-by-step 到 `Done`;tool-use 折叠出中间 `NeedTool` 被暴露;wrong-id resume 报文含 cursor(`StreamingStep`)+ outstanding 真 id + stray id + label 且机器未步进;wrong-family resume 前置拒绝;abandon stray 拒绝 + 真 id 清除;`single_tool` 缺家族诊断含期望/实际家族。
 - 验证:`cargo fmt --all --check` 通过;`cargo clippy --all-targets -- -D warnings` 无告警;`cargo test -p agent-testkit harness` 7/7;`cargo test --all --all-targets` 全绿(agent-lib 434、agent-testkit 82 + 集成 4,0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(root + `-p agent-testkit`)通过;`git diff --check` 干净。
 
-### [TODO] M4-2 实现 `DrainHarness`
+### [DONE] M4-2 实现 `DrainHarness`
 
 **前置依赖**:M4-1。
 
@@ -906,6 +906,19 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:top unhandled interaction 原样返回 `AgentErrorKind::UnhandledRequirement`。
 - 单测:cancelled context 路径不触发 tool handler。
 - 跑全套验证命令。
+
+**完成记录(2026-07-14)**:
+
+- 在 `crates/agent-testkit/src/harness.rs` 实现异步 `DrainHarness<'drive, M: AgentMachine>`,包装 `agent_lib::agent::drain`:
+  - 拥有 machine(与 `StepHarness` 一致),借用 `scope: &dyn HandlerScope`、`parent: Option<&mut dyn Pop>`、`ctx: &RunContext`,并持有注入的 `SeqIds`(供 `run_user`)。`new` 自建 `SeqIds`、`with_ids` 复用机器同源 id 树。
+  - 步进 API:`run(input)`(async,一次性 drain 到本轮结束)与 `run_user(text)` convenience(内部 `user_input(&ids, text)` → `AgentInput::user_message` → `run`)。
+  - 错误路径:`run`/`run_user` 直接透传 `drain` 返回的 classified `AgentError`(unhandled requirement / trace failure / budget failure / family mismatch),**不**折叠为泛化字符串。
+  - accessors:`machine`/`machine_mut`/`into_machine`(可在 drain 后检视已提交 conversation)/`ids`;`Debug` 概述 machine、cursor、是否有 parent、watched log 名称。
+- `DrainObservation`:持 `TurnDone` + `Option<Vec<HandlerLogSummary>>`;暴露 `turn_done`/`into_turn_done`/`notifications`(转发)/`final_cursor`(转发)/`handler_logs`。
+- 可选 handler logs summary:新增 object-safe `HandlerCallCounts: Send + Sync`(`begun`/`completed`),对 `CallLog<Req: Send, Res: Send>` 委托 `len()`/`completed_len()`;`DrainHarness::watching(name, Arc<dyn HandlerCallCounts>)` 注册任意家族(llm/tool/interaction/reconfig)的 `Arc<CallLog<..>>`(调用点 unsize 强转),drain 后按 name 汇总为 `HandlerLogSummary { name, begun, completed }`;未注册则 `handler_logs()` 返回 `None`。
+- `prelude.rs` 追加 `DrainHarness`、`DrainObservation`、`HandlerCallCounts`、`HandlerLogSummary` 再导出。
+- 单测(harness.rs `#[cfg(test)] mod drain_tests`,3 个 `#[tokio::test]`):local tool scripted turn(LLM tool_use → tool ok → LLM text)drain 到 `Done`,watched llm/tool 摘要为 2/2 与 1/1,且 conversation 已提交无 pending;guarded 工具调用在 headless top scope 下原样返回 `AgentError::UnhandledRequirement { kind: Interaction }`(非字符串化)且 tool 未运行;cancel 先于 drain 时首个 requirement 被 abandon,tool handler 与其摘要均为 0。
+- 验证:`cargo fmt --all --check` 通过;`cargo clippy --all-targets -- -D warnings`(root + `-p agent-testkit`)无告警;`cargo test -p agent-testkit --lib drain_tests` 3/3;`cargo test --all --all-targets` 全绿(agent-lib 434、agent-testkit 85 + 集成 cassette 2 + smoke 2,0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(root + `-p agent-testkit`)通过;`git diff --check` 干净。
 
 ### [TODO] M4-3 实现 assertions 模块
 
