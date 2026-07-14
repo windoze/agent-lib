@@ -1212,7 +1212,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - **11 语义验证**(`cargo test --test reference_driver` 11/11):text-only(1 turn/2 消息/usage/单 StepBoundary turn_count==1、registry 未触);single tool(4 消息、pairing 指向 tool result、`ToolCallStarted/Finished/tool boundary(turn_count 0)/final boundary(turn_count 1)`、registry log 名 `get_weather`);parallel(两 start 先于两 finish、两 pairing 各指一条 tool result、registry==2);tool failure self-heal(finished 状态 `[Denied, Error]`、末条恢复文本);approval approve(经真实 `ApprovalInteractionHandler::approve()` 走完、tool Ok);headless(同一装配去掉 interaction 后端 → `AgentError::UnhandledRequirement{kind: Interaction}`、guarded tool 未运行);approval deny(并发批 disposition 按序 Deny/Timeout/Cancel → 状态 `[Denied, Denied, Cancelled]`、末条恢复文本,依赖 `FuturesUnordered` push-order 决定性,与既有 parallel/tool-failure test 同一保证,实测通过);cancel-during-wait(cursor Idle、pending 已合成 cancelled result 收口、history 空、tool 从未运行);new-turn-after-cancel(丢弃被中断 pending、新 turn 干净完成);idle queued reconfig(开场请求即带新 tool set + overlay、start-of-turn 应用无 `reconfigs` boundary metadata、state 已应用);reconfig swap end-to-end(经 `StaticToolRegistryResolver` 换入的 registry 执行调用 `new_log==1`、旧 registry `old_log` 空、开场请求已带新 tool set)。
 - **验证**:`cargo fmt --all --check` 干净;`cargo clippy --all-targets -- -D warnings`(workspace)无告警;`cargo test --test reference_driver` 11/11;`cargo test --all --all-targets` 全绿(agent-lib lib 423、reference_driver 11、其余集成套件全过;agent-testkit lib 123 + cassette 2 + smoke 2;网络集成按设计 ignored;0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。未发现需插入前置修复的 spec 偏差或新增未调度失败测试。
 
-### [TODO] M6-3 新增 Core Rust suites
+### [DONE] M6-3 新增 Core Rust suites
 
 **前置依赖**:M6-2。
 
@@ -1232,6 +1232,44 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 每个 suite 可被 cargo test filter 单独运行。
 - 全套验证命令全部通过。
 - 完成记录给出 coverage map:新增测试对应 `docs/TESTABILITY.md` 中哪一行矩阵。
+
+**完成记录(2026-07-14)**:
+
+- **交付**:新增 5 个可独立过滤运行的集成测试套件(均在 `tests/`,与 M6-1/M6-2 同一 seam——testkit 类型只能从 root `agent-lib` 的集成测试链接,单元测试会触发 `multiple different versions of crate agent_lib`)。全部 `use agent_testkit::prelude::*;` 拉起 kit 能力,离线、无网络/credentials/真实时间/真实 provider。共 22 个用例,每个尽量只证明一个不变量:
+  - `tests/agent_step_basic.rs`:5 个同步 `#[test]`,经 `StepHarness` 驱动 `DefaultAgentMachine` 的同步 step 协议。
+  - `tests/agent_tool_basic.rs`:5 个 `#[tokio::test]`,经 `DrainHarness` 跑完整 tool phase。
+  - `tests/agent_interaction_basic.rs`:5 个 `#[tokio::test]`,经 `DrainHarness` + 最小本地 `RequireApprovalPolicy` + `ScriptedInteractionHandler` 覆盖 approval 闸门。
+  - `tests/agent_driver_basic.rs`:4 个 `#[tokio::test]`,用 `ScriptMachine` 替身 + `TestScope`/`ScopePop` 直接测 `drain` 路由。
+  - `tests/agent_trace_budget_basic.rs`:3 个 `#[tokio::test]`,用 `ScriptMachine` + `assert_trace`/`assert_budget` 观察 trace/budget 账本。
+- **Coverage map(新增测试 → `docs/TESTABILITY.md` 矩阵行)**:
+  - `agent_step_basic` → §8.1 `agent_step_basic` 行(`StepHarness`, fixtures);场景归 §7 `text turn`:
+    - `user_message_opens_on_a_single_need_llm` → §8.1 “user -> NeedLlm” / §7 text turn(NeedLlm emit)。
+    - `resume_text_commits_the_turn` → §8.1 “resume text” / §7 text turn(text -> commit)。
+    - `wrong_id_resume_is_rejected_before_stepping` → §8.1 “wrong id”。
+    - `wrong_kind_resume_is_rejected_before_stepping` → §8.1 “wrong result kind”。
+    - `abandon_discards_the_turn_and_settles_idle` → §8.1 “abandon”。
+  - `agent_tool_basic` → §8.1 `agent_tool_basic` 行(`ScriptedToolHandler`;实际用 `DrainHarness` 跑完整 turn);场景归 §7 `tool turn` / `parallel tools`:
+    - `single_tool_round_trip_commits` → §8.1 “single tool” / §7 tool turn。
+    - `parallel_tool_batch_runs_both_calls` → §8.1 “parallel tool” / §7 parallel tools。**已有覆盖,未重复**:批次并发 peak 已由 `agent_effect_e2e::batch_requirements_are_fulfilled_concurrently` 端到端证明,故本用例只断言批次两 call 均执行(tool log==2、两 start/finish notification、pairing==2),不重复测量并发峰值。
+    - `tool_error_returns_to_model_and_commits` → §8.1 “tool error”。
+    - `step_limit_parks_on_error_before_second_model_step` → §8.1 “step limit”。
+    - `provider_call_mismatch_discards_the_pending_turn` → §8.1 “provider call mismatch”。
+  - `agent_interaction_basic` → §8.1 `agent_interaction_basic` 行(`ScriptedInteractionHandler`);场景归 §7 `approval`:
+    - `approve_runs_the_guarded_tool` / `deny_synthesizes_a_denied_result` / `timeout_folds_into_a_denied_result` / `cancel_marks_the_result_cancelled` → §8.1 “approve/deny/timeout/cancel” / §7 approval approve/deny/timeout/cancel(状态分别 Ok/Denied/Denied/Cancelled)。
+    - `wrong_call_approval_is_rejected` → §8.1 “wrong call/step rejection”。
+  - `agent_driver_basic` → §8.1 `agent_driver_basic` 行(`ScriptMachine`, `TestScope`);场景归 §7 `headless` / `pop routing`:
+    - `local_handler_resolves_in_place` → §8.1 “local handler”。
+    - `interaction_pops_to_the_parent_scope` → §8.1 “pop to parent” / §7 pop routing。
+    - `top_scope_without_handler_is_unhandled_requirement` → §8.1 “top unhandled” / §7 headless(`AgentError::UnhandledRequirement{kind: Interaction}`)。
+    - `misaligned_result_fails_the_turn` → §8.1 “misaligned result”。
+  - `agent_trace_budget_basic` → §8.1 `agent_trace_budget_basic` 行(`assert_trace`, `assert_budget`);场景归 §7 `trace` / `budget`:
+    - `resolved_at_scope_spans_local_and_popped_layers` → §8.1 “resolved_at_scope” / §7 trace(hop 0 本地 tool + hop 1 popped interaction,均 Resumed)。
+    - `cancel_records_never_resumed_without_calling_handler` → §8.1 “never-resumed” / §7 trace disposition(cancel 前置 → NeverResumed,handler 未调用)。
+    - `derived_child_shares_the_budget_ledger` → §8.1 “budget shared ledger” / §7 budget(child charge 见于 parent 快照、depth+1、parent trace 记 subagent 节点)。
+- **避免重复既有底层测试**:trace/budget 的 `resolved_at_scope` 与 `never-resumed` 语义在 `src/agent/drive.rs` 已有单元测试(`drain_records_resolved_at_scope_for_local_and_popped_requirements` / `drain_records_never_resumed_disposition_on_cancel`);本套件不复制其内部 `BatchMachine`,而是用 kit 公共 `ScriptMachine` + `TestScope` 在集成层复述同一不变量,作为面向公开 API 的回归护栏(与 §8.1 “优先替换重复 fixture,但保留底层单测中更清楚部分”的分层一致)。
+- **未改文档**:`docs/TESTABILITY.md` §8.1 已列这 5 个套件名与目标,实现逐一对齐,无需改动矩阵。
+- **保留的最小本地件(有意,非可 mock 的 effect fake)**:`agent_tool_basic` 的 `spec_with_step_limit`(仅为触发 step-limit 路径而把 fixture 固定的 `max_steps=8` 改为可传参,其余与 `agent_spec_with_tools` 逐字一致);`agent_interaction_basic` 的 `RequireApprovalPolicy`(approval 策略是 spec 级决策,testkit 有意不导出 require-approval policy,与 M6-1/M6-2 一致)。
+- **验证**:`cargo fmt --all` 干净;`cargo clippy --all-targets -- -D warnings`(workspace)无告警;5 个套件各自过滤运行 `cargo test --test agent_step_basic`(5)/`--test agent_tool_basic`(5)/`--test agent_interaction_basic`(5)/`--test agent_driver_basic`(4)/`--test agent_trace_budget_basic`(3)全绿;`cargo test --all --all-targets` 全绿(0 失败;新增 22 用例并入其余套件);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。未发现需插入前置修复的 spec 偏差或新增未调度失败测试。
 
 ### [TODO] M6-4 新增 recorded replay suites
 

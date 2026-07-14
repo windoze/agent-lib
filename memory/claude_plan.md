@@ -1,61 +1,70 @@
-# 当前任务：M6-2 迁移 reference driver 测试中的重复 fake
+# 当前任务：M6-3 新增 Core Rust suites
 
 ## 定位
-- `TODO.md` 第一个未完成任务 = **M6-2**（line 1173，标题 `[TODO]`）。M6-1 已 `[DONE]`（HEAD=32267d1）。
-- 无关未跟踪文件 `docs/external-agent.md`（external-agent 设计草案，非本任务产物，不纳入提交）。
+- `TODO.md` 第一个未完成任务 = **M6-3**（line 1215，标题 `[TODO]`）。M6-1/M6-2 已 `[DONE]`（HEAD=da09b2e）。
+- 前置依赖 M6-2 已完成。无阻塞。
 
-## 关键阻塞（已实证）
-`src/agent/drive/reference/tests.rs` 是 **单元测试模块**（`#[cfg(test)] mod tests;`）。
-探针实测：单元测试构建下 `agent-lib`（test-cfg 实例）与 `agent-testkit` 所链接的 `agent-lib`
-（plain 实例）是**两个不同 crate 实例**（"multiple different versions of crate agent_lib"），
-testkit 产出的类型（machine/spec/ctx/scope）无法喂给 `crate::` 的 `drive_turn` 等。dev-dep 依赖环
-对单元测试**不可用**，无解。→ 迁移必须把这些测试**迁到集成测试层**（`tests/`，单一 plain 实例，
-类型统一，与 M6-1 相同模式）。这是 testkit 的既定消费面，不是 workaround。
+## 目标
+在 root `agent-lib` 的集成测试层（`tests/`，dev-dep 已含 agent-testkit，与 M6-1/M6-2 同一 seam）
+新增 5 个 filter-可单跑的 Core Rust suites，用 testkit（StepHarness/DrainHarness + scripted handlers
++ ScriptMachine + TestScope + assertions），快、稳、离线。避免复制既有底层单测：这些是集成套件，
+断言聚焦 agent 可观察终态（conversation/notifications/trace/budget/cursor）。
 
-## 方案
-1. 新建 `tests/reference_driver.rs`（集成测试），`use agent_testkit::prelude::*;`，迁移全部 11 个测试。
-2. 替换映射：
-   - `FakeClient` → 本地最小 `ScriptedLlmClient`（`LlmClient` adapter，脚本+call log 来自 testkit
-     `Script<LlmStep>` + `LlmCallLog`）。`ReferenceScope` 需 `LlmClient`，testkit 无 `LlmClient`，故保留。
-   - `FakeToolRegistry` → `ScriptedToolRegistry`（testkit `ToolRegistry`），call 计数读 `log()`。
-   - `ScriptedRequirementIds` + `FakeToolIds` → `SeqIds`；payload helpers → fixtures + `LlmStep`/`ToolStep`/`tool_call`。
-   - `CancellingLlmHandler` → `CancelOnCall::before(ScriptedLlmHandler)`；`PanicToolHandler` → `PanicOnCall`；
-     `CancelScope` → `TestScope::builder().llm(..).tool(..)`。
-   - `ScriptedApprovalInteraction` + `ComposedScope`（deny）→ `TestScope::wrapping(ReferenceScope).attended(ScriptedInteractionHandler::sequence([Deny,Timeout,Cancel]))`。
-   - approve 测试保留 `ApprovalInteractionHandler::approve()`（reference 自有组件，非 fake）。
-   - 保留最小本地 `RequireApprovalPolicy`（spec 级策略，非 effect fake；同 e2e）。
-   - `assert_text` / `assert_tool_result` 小工具保留。
-   - 精确 seed id 断言 → 结构断言（pairings 链接 result_msg==messages[i].id()、registry log 名称/计数、
-     notification 序列、status 序列）。coverage 不减。
-3. testkit 增强（迁移暴露的 gap）：`InteractionDecision` 增 `Timeout(Option<String>)` / `Cancel(Option<String>)`
-   + testkit 单测。deny 测试需覆盖全部四种 `ApprovalDecision`。
-4. 删除 `src/agent/drive/reference/tests.rs` 与 `reference.rs` 的 `#[cfg(test)] mod tests;`。
-5. TODO.md：M6-2 标 `[DONE]`，修正验证命令（`--lib ...reference::tests` → `--test reference_driver`），
-   完成记录写明阻塞、迁移理由、保留件。
+## 五个套件（tests/*.rs，各自独立 test binary → cargo test --test <name> 单跑）
+1. tests/agent_step_basic.rs（StepHarness，同步 #[test]）
+   - NeedLlm emit：user() → 单 NeedLlm、StreamingStep、outstanding=[llm_id]。
+   - resume text：resume(assistant_text) → quiescent/Done、conversation 1turn/2msg/末 assistant 文本。
+   - wrong id：try_resume(stray) → Err 命名 cursor+outstanding；机器未步进；随后真 id 提交。
+   - wrong kind：try_resume(NeedLlm, Tool result) → Err "rejected"；未步进。
+   - abandon：abandon(llm_id) → outstanding 清空、cursor=Idle、无 committed turn/pending。
+2. tests/agent_tool_basic.rs（DrainHarness）
+   - single tool：llm[tool_use,text]+tool[ok] → Done、tool 1、4msg、末文本。
+   - parallel tool：llm[tool_use(2),text]+tool[ok,ok] → Done、tool 2、两 call started/finished。
+     （峰值并发已由 e2e batch_requirements_are_fulfilled_concurrently 覆盖，此处不复制。）
+   - tool error：llm[tool_use,text]+tool[error] → Done、tool_result_status Error、tool 1。
+   - step limit：max_steps=1 spec，llm[tool_use]+tool[ok] → Error cursor、tool 1、pending none。
+   - provider call mismatch：tool[ok("wrong-call")] → Error cursor、turns 空、pending none。
+3. tests/agent_interaction_basic.rs（DrainHarness + 本地 RequireApprovalPolicy）
+   - approve：approve_all → tool 跑、末文本、Done、tool_result Ok。
+   - deny：deny_all → tool 未跑、denied result、Done、status Denied。
+   - timeout：fixed(Timeout) → status Denied、Done、tool 未跑。
+   - cancel：fixed(Cancel) → status Cancelled、Done、tool 未跑。
+   - wrong call/step rejection：fixed(Response(错 step_id 的 approval)) → drain validate 拒绝
+     → AgentError::Other(misaligned)、tool 未跑。
+4. tests/agent_driver_basic.rs（ScriptMachine + TestScope + ScopePop + drain）
+   - local handler：ScriptMachine[NeedTool]+scope.tool → Done、resume_tags=[Tool]。
+   - pop to parent：inner headless[NeedInteraction]+outer.interaction via ScopePop → Done、outer 服务。
+   - top unhandled：headless top[NeedInteraction]、无 parent → AgentError::UnhandledRequirement{Interaction}。
+   - misaligned result：ScriptMachine[NeedTool]+scope.tool=MisalignedHandler(Llm) → AgentError::Other(misaligned)。
+5. tests/agent_trace_budget_basic.rs（drain + assert_trace/assert_budget + derive_child）
+   - resolved_at_scope：inner.tool(hop0)+outer.interaction(hop1) via ScopePop → 两节点 scope 0/1 Resumed。
+   - never-resumed：cancel 前置 → drain 记 NeverResumed、handler 未调用。
+   - budget shared ledger：derive_child→child.charge_tokens→parent snapshot 反映、depth+1、subagent_count 1。
+
+## 覆盖矩阵映射（完成记录用，docs/TESTABILITY.md §8.1 / §7）
+- agent_step_basic → §8.1 行 `agent_step_basic`（StepHarness, fixtures）。
+- agent_tool_basic → §8.1 行 `agent_tool_basic`（StepHarness/DrainHarness, ScriptedToolHandler）。
+- agent_interaction_basic → §8.1 行 `agent_interaction_basic`（ScriptedInteractionHandler）。
+- agent_driver_basic → §8.1 行 `agent_driver_basic`（ScriptMachine, TestScope）。
+- agent_trace_budget_basic → §8.1 行 `agent_trace_budget_basic`（assert_trace, assert_budget）。
+- §7 覆盖矩阵：text turn / tool turn / parallel tools / approval / headless / pop routing / cancel / trace / budget 行。
 
 ## 校验顺序
-fmt --check → clippy --all-targets -D warnings → cargo test --test reference_driver → testkit 聚焦 →
-全套 cargo test --all --all-targets（≤30min）→ rustdoc → git diff --check → commit（M6-2）。停止。
+cargo fmt --all --check → clippy --all-targets -D warnings → 5 个 --test 聚焦 →
+全套 cargo test --all --all-targets（≤30min）→ RUSTDOCFLAGS=-D warnings cargo doc → git diff --check
+→ TODO.md M6-3 标 [DONE]+完成记录（含 coverage map）→ commit（[M6-3]）。停止。
 
 ## 进度
-- [x] 读 reference tests + testkit 各模块 + 实证阻塞
-- [ ] 扩展 testkit InteractionDecision（Timeout/Cancel）+ 单测
-- [ ] 写 tests/reference_driver.rs
-- [ ] 删单元测试模块 + reference.rs mod 声明
-- [ ] fmt/clippy/聚焦/全套/rustdoc
-- [ ] TODO.md 标 [DONE] + 完成记录
-- [ ] 提交（M6-2）。停止。
+- [x] 读 harness/handlers/scope/machine/fixtures/script/assertions + drive.rs + default tests，确认全部 API 与行为
+- [x] 写 5 个 tests/*.rs（step 5 / tool 5 / interaction 5 / driver 4 / trace_budget 3 = 22 用例）
+- [x] fmt/clippy/聚焦(5×)/全套/rustdoc/diff 全绿
+- [x] TODO.md 标 [DONE] + 完成记录（coverage map）
+- [ ] commit（[M6-3]）。停止。
 
 ## 备注
-- deny 序列映射依赖 fulfill_batch 的 FuturesUnordered push-order；现有 parallel/tool_failure 测试已依赖同一
-  决定性，一致，运行验证。
-- 若迁移暴露真实 bug/失败测试，按策略插前置任务并停。
+- `docs/external-agent.md` 为未追踪的无关设计草案（非 M6-3 产出，TODO/PLAN 未引用），不纳入本次提交。
 
-## Progress — M6-2 COMPLETE (2026-07-14)
-
-- [x] Extended testkit `InteractionDecision` (Timeout/Cancel) + testkit unit test — passing.
-- [x] Wrote `tests/reference_driver.rs` (11 migrated tests, 826 lines) — all 11 pass.
-- [x] Deleted `src/agent/drive/reference/tests.rs` (git rm) + removed `#[cfg(test)] mod tests;`.
-- [x] Validation: fmt --check clean; clippy --all-targets -D warnings clean; `cargo test --test reference_driver` 11/11; full `cargo test --all --all-targets` 0 failed; rustdoc -D warnings ok; `git diff --check` clean.
-- [x] TODO.md M6-2 marked [DONE], validation cmd fixed to `--test reference_driver`, completion record written.
-- [x] Commit (excluding docs/external-agent.md). STOP after commit.
+## 备注
+- 不新增 testkit 能力即可完成（能力在 M1–M5 齐备）。若写用例暴露真实 bug/未调度失败测试，按策略插前置任务并停。
+- step limit/provider mismatch：drain 视 Error 为 terminal → 返回 Ok(TurnDone, Error cursor)。
+- wrong-call interaction：drain 先 validate(accepts) → AgentError::Other，不到机器 Error cursor。
