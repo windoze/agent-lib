@@ -1,9 +1,16 @@
-//! Unit coverage for the complex-test support layer (milestone 1, M1-1).
+//! Unit coverage for the complex-test support layer (milestone 1).
 //!
-//! These tests pin the invariants of the mock plan/blackboard vertical feature
-//! before the higher-level complex flow/subagent/cancel suites depend on it:
-//! dependency-graph validation, atomic dependency-blocked claims,
-//! `claim_first_available` skip rules, and append-only blackboard offsets.
+//! These tests pin the invariants of the support layer before the higher-level
+//! complex flow/subagent/cancel suites depend on it:
+//!
+//! - M1-1: the mock plan/blackboard vertical feature — dependency-graph
+//!   validation, atomic dependency-blocked claims, `claim_first_available` skip
+//!   rules, and append-only blackboard offsets;
+//! - M1-2: the complex tool adapter — model-visible tool errors, the
+//!   dangerous-tool approval policy, and the per-tool call log;
+//! - M1-3: the read-only assertion helpers — store-op-annotated failures, the
+//!   role-sequence / pivot-position conversation queries, and the handler /
+//!   interaction log checks.
 //!
 //! Run in isolation with `cargo test --test agent_complex_support`.
 
@@ -14,23 +21,37 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use agent_lib::agent::{
-    ApprovalRequirement, RequirementResult, RunContext, ToolApprovalPolicy, ToolHandler,
-    ToolRuntimeError,
+    ApprovalRequirement, LoopCursorKind, RequirementResult, RunContext, ToolApprovalPolicy,
+    ToolHandler, ToolRuntimeError,
 };
 use agent_lib::model::content::ContentBlock;
+use agent_lib::model::message::Role;
 use agent_lib::model::tool::{ToolResponse, ToolStatus};
 
 use agent_lib::agent::PlanId;
 
-use agent_testkit::fixtures::{root_context, tool_call};
+use agent_testkit::fixtures::{
+    assistant_text, assistant_tool_use, root_context, tool_call, tool_ok, usage,
+};
+use agent_testkit::handlers::{
+    InteractionDecision, ScriptedInteractionHandler, ScriptedLlmHandler,
+};
+use agent_testkit::harness::{DrainHarness, StepHarness};
 use agent_testkit::ids::SeqIds;
+use agent_testkit::script::LlmStep;
 
+use complex_support::assertions::{
+    assert_board_messages, assert_interaction_decisions, assert_no_task_owner,
+    assert_pivot_after_tool_result, assert_task_depends_on, assert_task_owner, assert_task_status,
+    assert_tool_executions, role_sequence,
+};
 use complex_support::plan_blackboard::{
     MockPlanBlackboardStore, StoreError, TaskState, TaskStatus, detect_cycle,
 };
 use complex_support::tools::{
     BLACKBOARD_POST, ComplexToolHandler, DANGEROUS_WRITE, PLAN_ADD_TASK, PLAN_CLAIM, PLAN_CREATE,
-    RequireDangerousWriteApprovalPolicy, SAFE_READ,
+    RequireDangerousWriteApprovalPolicy, SAFE_READ, complex_agent_machine, complex_scope,
+    complex_tool_handler,
 };
 
 /// Fixed plan id so store construction stays deterministic and offline.
@@ -422,4 +443,186 @@ async fn dangerous_write_call_log_counts_executions() {
     );
     assert_eq!(board[0].text, "first");
     assert_eq!(board[1].text, "second");
+}
+
+// ----- M1-3: read-only assertion helpers -----------------------------------
+
+/// The store/blackboard assertion helpers pass on the expected state and, on
+/// mismatch, embed the store operation log so a failing complex test can localize
+/// the divergence.
+#[test]
+fn assertions_report_store_ops_on_failure() {
+    let store = store();
+    store
+        .add_task("design", Vec::<String>::new())
+        .expect("add design");
+    store.add_task("build", ["design"]).expect("add build");
+    store.claim("design", "alice", 2).expect("claim design");
+    store.post("planner", "kicked off the design task");
+
+    // The happy-path helpers agree with the store's actual state.
+    assert_task_status(&store, "design", TaskStatus::InProgress);
+    assert_task_owner(&store, "design", "alice");
+    assert_task_status(&store, "build", TaskStatus::Todo);
+    assert_no_task_owner(&store, "build");
+    assert_task_depends_on(&store, "build", &["design"]);
+    assert_no_task_owner(&store, "build");
+    assert_board_messages(&store, &["kicked off"]);
+
+    // A wrong owner expectation panics, and the panic carries the numbered store
+    // operation transcript so the mismatch is traceable.
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_task_owner(&store, "design", "bob");
+    }))
+    .expect_err("a wrong owner expectation must panic");
+    let message = panic
+        .downcast_ref::<String>()
+        .expect("panic payload is a String");
+    assert!(
+        message.contains("expected task \"design\" to be owned by \"bob\""),
+        "message names the expectation: {message}"
+    );
+    assert!(
+        message.contains("store operations:"),
+        "message includes the store op log header: {message}"
+    );
+    assert!(
+        message.contains("Claim") && message.contains("alice"),
+        "message includes the recorded claim op: {message}"
+    );
+
+    // A board-content mismatch likewise prints the op log.
+    let board_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_board_messages(&store, &["never posted this"]);
+    }))
+    .expect_err("a wrong board expectation must panic");
+    let board_message = board_panic
+        .downcast_ref::<String>()
+        .expect("panic payload is a String");
+    assert!(
+        board_message.contains("store operations:") && board_message.contains("Post"),
+        "board mismatch prints the op log: {board_message}"
+    );
+}
+
+/// A driven turn that folds a mid-turn pivot in after a tool result exercises
+/// both conversation helpers: `role_sequence` reports the committed roles and
+/// `assert_pivot_after_tool_result` locates the injected pivot.
+#[test]
+fn role_sequence_and_pivot_helpers_find_expected_messages() {
+    let ids = SeqIds::new();
+    let machine = complex_agent_machine(&ids);
+    let mut harness = StepHarness::with_ids(machine, ids);
+
+    // Open the turn and answer the opening NeedLlm with a safe (auto-approved)
+    // tool call.
+    let llm_open = harness
+        .user("start planning")
+        .single_llm()
+        .expect("a fresh user turn opens on NeedLlm")
+        .id;
+    let after_llm = harness.resume(
+        llm_open,
+        RequirementResult::Llm(Ok(assistant_tool_use(
+            vec![tool_call("c-read", SAFE_READ, serde_json::json!({}))],
+            usage(4, 2),
+        ))),
+    );
+
+    // `safe_read` auto-approves, so the machine parks on NeedTool; answer it.
+    let tool_id = after_llm
+        .single_tool()
+        .expect("a safe tool call auto-approves to NeedTool")
+        .id;
+    let after_tool = harness.resume(
+        tool_id,
+        RequirementResult::Tool(Ok(tool_ok("c-read", "the board is empty"))),
+    );
+
+    // The closed tool batch leaves the machine awaiting the next assistant: the
+    // exact boundary a pivot is legal at. Inject one; it re-renders the same
+    // NeedLlm under the same id.
+    let post_tool_llm = after_tool
+        .single_llm()
+        .expect("the post-tool step parks on NeedLlm")
+        .id;
+    let after_pivot = harness.pivot("changed strategy after pivot");
+    let pivot_llm = after_pivot
+        .single_llm()
+        .expect("the pivot re-renders the outstanding NeedLlm")
+        .id;
+    assert_eq!(
+        post_tool_llm, pivot_llm,
+        "a pivot re-renders the same LLM step under the same id"
+    );
+
+    // Close the turn with a final assistant answer.
+    let done = harness.resume(
+        pivot_llm,
+        RequirementResult::Llm(Ok(assistant_text(
+            "understood, taking the new direction",
+            usage(3, 2),
+        ))),
+    );
+    assert_eq!(done.cursor().kind(), LoopCursorKind::Done);
+
+    let machine = harness.into_machine();
+    let conversation = machine.state().conversation();
+
+    // The committed turn interleaves the pivot user message after the tool
+    // result: user -> assistant(tool_use) -> tool -> user(pivot) -> assistant.
+    assert_eq!(
+        role_sequence(conversation, 0),
+        vec![
+            Role::User,
+            Role::Assistant,
+            Role::Tool,
+            Role::User,
+            Role::Assistant,
+        ],
+    );
+    assert_pivot_after_tool_result(conversation, "changed strategy after pivot");
+}
+
+/// An approved dangerous-write turn, driven end to end through the complex
+/// machine/scope, is observable through the handler-log and store helpers: the
+/// tool executed once, exactly one interaction decision was rendered, and the
+/// single side effect landed on the blackboard.
+#[tokio::test]
+async fn handler_and_store_assertions_hold_after_approved_dangerous_write() {
+    let ids = SeqIds::new();
+    let ctx = root_context(&ids);
+    let machine = complex_agent_machine(&ids);
+
+    let store = Arc::new(MockPlanBlackboardStore::new(plan_id()));
+    let handler = complex_tool_handler(Arc::clone(&store));
+
+    // The model asks for the dangerous write, then answers once it has run.
+    let llm = ScriptedLlmHandler::from_steps([
+        LlmStep::tool_use(vec![tool_call(
+            "c-danger",
+            DANGEROUS_WRITE,
+            serde_json::json!({ "text": "apply the risky change" }),
+        )]),
+        LlmStep::text("done, the change is applied"),
+    ]);
+    let interaction = ScriptedInteractionHandler::fixed(InteractionDecision::Approve);
+    let interaction_log = Arc::clone(interaction.log());
+    let tool: Arc<dyn ToolHandler> = handler.clone();
+    let scope = complex_scope(Arc::new(llm), tool, Some(Arc::new(interaction)));
+
+    let mut drain = DrainHarness::with_ids(machine, &scope, None, &ctx, ids);
+    drain
+        .run_user("please apply the risky change")
+        .await
+        .expect("the approved dangerous-write turn drains");
+
+    // Handler log: the dangerous tool executed exactly once and the safe tools
+    // never ran.
+    assert_tool_executions(&handler, DANGEROUS_WRITE, 1);
+    assert_tool_executions(&handler, SAFE_READ, 0);
+    // Interaction log: the one approval prompt yielded exactly one decision.
+    assert_interaction_decisions(&interaction_log, 1);
+    // Store: the approved write left a single, non-duplicated side effect.
+    assert_board_messages(&store, &["apply the risky change"]);
 }

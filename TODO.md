@@ -176,7 +176,7 @@ plan/blackboard API 尚未落地。当前代码只有 `PlanId` / `BlackboardId` 
   无告警;`cargo test --all --all-targets` 全绿(仅 4 个 credential-gated 集成测试 ignored,无 failure);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
-### [TODO] M1-3 实现复杂测试断言 helper
+### [DONE] M1-3 实现复杂测试断言 helper
 
 **前置依赖**:M1-2。
 
@@ -213,6 +213,39 @@ result status、store ops、outstanding ids / child log。helper 只应读观察
 - `cargo test --all --all-targets`。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - `git diff --check`。
+
+**完成记录**:
+
+- 新建 `tests/complex_support/assertions.rs`(只读断言层)。plan/blackboard 断言
+  `assert_task_status` / `assert_task_owner` / `assert_no_task_owner` /
+  `assert_task_depends_on` / `assert_board_messages` 全部在失败时把 `store.ops_summary()`
+  编号操作日志嵌进 panic 文本;`assert_board_messages` 用「长度相等 + 逐条 `contains`」同时充当
+  no-duplicate-side-effect 守卫。
+- conversation 断言 `role_sequence(conversation, turn_index)`(越界 panic 带会话摘要)与
+  `assert_pivot_after_tool_result(conversation, pivot_text)`(按会话顺序扫描 committed+pending
+  消息,定位 tool result 之后含 pivot 文本的 `Role::User` 消息,失败打印 role 序列);沿用
+  `agent_testkit::assert_conversation` 的坐标级能力,只补 role-sequence / pivot 位置查询,不重写。
+- handler/interaction 断言 `assert_tool_executions(handler, tool, count)`(读
+  `ComplexToolHandler::execution_count`,失败打印每工具调用日志,`count=0` 即「dangerous tool 未执行」
+  检查)与 `assert_interaction_decisions(log, expected)`(读 `InteractionCallLog::completed_len`)。
+- `mod.rs` 增加 `pub mod assertions;` 并 re-export 支持层常用类型/helper(store、tools 常量与类型、
+  assertions helper);因各复杂测试 crate 只用子集,`#![allow(dead_code, unused_imports)]` 传播到子模块
+  避免误报。
+- 新增三个单测(`tests/agent_complex_support.rs`):
+  `assertions_report_store_ops_on_failure`(通过路径 + `catch_unwind` 验证 owner/board 失败文本含
+  `store operations:` 与记录的 Claim/Post op)、
+  `role_sequence_and_pivot_helpers_find_expected_messages`(用 `StepHarness` 驱动
+  `complex_agent_machine` 走 user→tool_use(safe_read)→tool result→真正的 mid-turn `pivot`→final text,
+  断言 role_sequence(0)=[User,Assistant,Tool,User,Assistant] 且 pivot 命中)、
+  `handler_and_store_assertions_hold_after_approved_dangerous_write`(`DrainHarness` 端到端跑
+  dangerous_write→approval(Approve)→执行→final text,断言 `assert_tool_executions`(DANGEROUS_WRITE=1,
+  SAFE_READ=0)、`assert_interaction_decisions`=1、`assert_board_messages` 单一副作用)。
+- 验证结果(全部通过):`cargo fmt --all -- --check`;两个指定测试
+  (`assertions_report_store_ops_on_failure`、
+  `role_sequence_and_pivot_helpers_find_expected_messages`)单独运行通过;
+  `cargo clippy --all-targets -- -D warnings` 无告警;
+  `cargo test --all --all-targets` 全绿(仅 4 个 credential-gated 集成测试 ignored);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
 ### [TODO] M1-R Milestone 1 Review
 
