@@ -12,6 +12,10 @@ pub use crate::fixtures::{
     tool_ok, tool_response, usage, user_input, user_message, weather_tool,
 };
 pub use crate::ids::{RequirementAllocation, SeqIds};
+pub use crate::script::{
+    CallLog, CallRecord, CallTicket, InteractionStep, LlmStep, ReconfigStep, Script, ScriptError,
+    ScriptStep, StrictMode, ToolStep,
+};
 pub use agent_lib::agent::{
     AgentMachine, DefaultAgentMachine, LlmStepMode, Requirement, RequirementKind, StepInput,
     StepOutcome,

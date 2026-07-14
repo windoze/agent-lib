@@ -1,46 +1,50 @@
-# 执行计划 — M1-R Milestone 1 Review
+# 执行计划 — M2-1 实现 script model、strict 模式与 call log
 
 ## 选中的任务
-`TODO.md` 第一个未完成任务 = **M1-R**(M1-1/M1-2/M1-3 均已 `[DONE]`)。HEAD=c4d0d38,工作树 clean。
-这是 Review 任务,**不拆分**。核对 M1 拓扑/id source/fixtures 是否形成稳定基础且未引入 provider wire mock 或运行时语义变化。
+`TODO.md` 第一个未完成任务 = **M2-1**(M1-1/M1-2/M1-3/M1-R 均 `[DONE]`)。
+HEAD=c403017,工作树 clean。非 Review 任务,**不拆分**(单一可验证单元:script model 层)。
 
-## Review 核对项(TODO.md M1-R)
-1. Cargo 拓扑:确认采用 `crates/agent-testkit`(工作区成员)还是过渡支持模块,并记录理由。
-2. testkit 只依赖 `agent-lib` 公开 API。
-3. `SeqIds` 覆盖 `RequirementIds`、`ToolExecutionIds` 与常用 Agent/Conversation id。
-4. fixtures 只产生 provider-neutral 类型。
-5. 更新 PLAN.md / docs/TESTABILITY.md 中与实际拓扑不一致的描述。
+## 任务要求(TODO.md M2-1)
+- `script.rs` 定义 `StrictMode`:脚本耗尽 panic 或返回分类错误;默认返回分类错误,panic opt-in。
+- 定义 `LlmStep`、`ToolStep`、`InteractionStep`、`ReconfigStep`。
+- 定义 `CallLog<TRequest, TResultSummary>`:调用序号、请求摘要、结果摘要、完成顺序。
+- 脚本按顺序匹配;tool/interaction 预留 key 匹配接口,首版仅顺序。
+- 错误信息含 family、调用序号、脚本长度、可选 cassette/scenario label。
+- 验证:顺序消费+call log;耗尽返回可断言错误;strict panic 仅 opt-in 时 panic;全套验证。
 
-## 核对结论(代码巡检)
-- 拓扑:root `Cargo.toml` = `[workspace] members=[".","crates/agent-testkit"] resolver="3"`;
-  testkit 单向 `agent-lib = { path="../.." }`,agent-lib 无反向 dev-dep → 无依赖周期。采用首选 crate 形态,
-  非过渡模块。→ 与 PLAN.md 建议目录一致。
-- 只依赖公开 API:testkit `use agent_lib::{agent::*, client::*, conversation::*, model::*}` 全部公开路径;
-  Cargo.toml 无 mockall/proptest/insta,仅复用基础依赖。Rust 跨 crate 只能访问 `pub`,天然保证。
-- `SeqIds`:`impl RequirementIds`(next_requirement_id)+`impl ToolExecutionIds`
-  (tool_call_id/tool_result_message_id/next_assistant_message_id/next_step_id);inherent helper 覆盖
-  run/agent/tool_set/conversation/turn/message/tool_call/step/trace_node/requirement id。clone 共享 counter、
-  fork 新子树、named 重贴 label、exhausted/with_budget 失败模式、requirement_log 保序可查。
-- fixtures:全部经公开构造器产出 provider-neutral 类型(Message/Response/ToolCall/ToolResponse/Tool/
-  AgentSpec/AgentState/RunContext/DefaultAgentMachine),无 Anthropic/OpenAI wire JSON,无 private API。
-
-## 文档一致性动作
-- PLAN.md 过渡门(`允许先以 tests/support/agent_testkit 过渡`)已定案 → 追加“已定案:crate 形态”一句。
-- docs/TESTABILITY.md §5.0(实现路径)候选项 → 补一句“实际已落地 crates/agent-testkit 工作区成员”。
+## 设计(对齐 docs/TESTABILITY.md §5.3 建议 API)
+- `StrictMode { Error(default), Panic }`。
+- `trait ScriptStep`: `const FAMILY: RequirementKindTag`;`into_result(self)->RequirementResult`;
+  `match_key(&self)->Option<&str>`(预留,默认 None)。
+- Step 类型(payload = 对应 family 的 RequirementResult 载荷):
+  - `LlmStep`(Result<Response,ClientError>):`text/tool_use/response/error`。
+  - `ToolStep`(Result<ToolResponse,ToolRuntimeError>):`ok/error/response/runtime_error`;key=provider call id。
+  - `InteractionStep`(InteractionResponse):`answer/choice/approval/response`;预留 key。
+  - `ReconfigStep`(Result<(),ToolRuntimeError>):`ok/error`。
+- `Script<S: ScriptStep>`:内部 `Mutex<VecDeque<S>>`+dispatched 计数;`new/with_strict_mode/with_label`;
+  `next_step(&self)->Result<S,ScriptError>`(顺序 pop,耗尽按 StrictMode)。
+- `ScriptError::Exhausted{family,call_index,script_len,label}`,手写 Display(含全部字段+可选 label)。
+- `CallLog<Req,Res>`:`Mutex<Vec<CallRecord>>`+completion 计数;`begin(req)->CallTicket`、
+  `complete(ticket,res)`、`record(req,res)`、`len/is_empty/completed_len/with_records/records/requests`。
+  `CallRecord{call_index,request,result:Option,completion_index:Option}`——分离 dispatch 与 completion 顺序,
+  为 M5 并发乱序完成预留。
+- prelude 追加 step/StrictMode/ScriptError/Script/CallLog 导出。
 
 ## 步骤
-1. [x] 巡检 Cargo.toml / lib.rs / prelude.rs / ids.rs / fixtures.rs。
-2. [x] 巡检 PLAN.md / docs/TESTABILITY.md。
-3. [ ] 最小文档更新(PLAN.md + TESTABILITY.md 各一处 resolved 注记)。
-4. [ ] 验证:fmt --check → clippy -Dwarnings → test -p agent-testkit → doc -Dwarnings → diff --check。
-       全量 `cargo test --all` 自 M1-3(c4d0d38,全绿)以来无代码变更,本任务仅改文档 → 复用上次绿结果。
-5. [ ] TODO.md 标 M1-R [DONE] + 完成记录(写 review 结论)。
-6. [ ] 提交,停止。
+1. [ ] 实现 crates/agent-testkit/src/script.rs(含单测)。
+2. [ ] 更新 prelude.rs 导出。
+3. [ ] 验证:fmt --check → clippy -Dwarnings(两 crate)→ test -p agent-testkit → 全量 test --all --all-targets
+       → doc -Dwarnings → diff --check。(本任务改代码 → 需跑全量)
+4. [ ] TODO.md 标 M2-1 [DONE] + 完成记录。
+5. [ ] 提交,停止。
 
 ## 进度/发现
-- [x] 文档更新完成:PLAN.md 过渡门定案注记;TESTABILITY.md §4 补 crate 形态 resolved 注记 + subagent.rs。
-- [x] 验证全绿:fmt --check;clippy -Dwarnings(root + testkit);test -p agent-testkit(14+2);
-      cargo test --all --all-targets(agent-lib 434 + testkit 14+2,0 failed,7 network-gated ignored);
-      doc -Dwarnings(root + testkit);diff --check 干净。
-- [x] TODO.md M1-R 标 [DONE] + 完成记录(review 结论、拓扑决策、无偏离)。
+- [x] 实现 script.rs:StrictMode、ScriptStep trait、LlmStep/ToolStep/InteractionStep/ReconfigStep、
+      Script<S>(顺序消费 + 预留 match_key)、ScriptError::Exhausted(手写 Display 含全字段+可选 label)、
+      CallLog<Req,Res>(begin/complete 分离 dispatch 与 completion 序号)。11 个新单测全过。
+- [x] prelude.rs 追加 script 层导出。
+- [x] 验证全绿:fmt --check;clippy -Dwarnings(root + testkit);test -p agent-testkit(25 lib + 2 smoke);
+      test --all --all-targets(agent-lib 434 + testkit 25+2,0 failed,7 network-gated ignored);
+      doc -Dwarnings(修两处 redundant explicit link 后 root + testkit 干净);diff --check 干净。
+- [x] TODO.md M2-1 标 [DONE] + 完成记录。
 - [ ] 提交并停止。

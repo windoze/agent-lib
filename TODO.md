@@ -237,7 +237,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 ## Milestone 2 — Scripted handlers、scope 与 machine doubles
 
-### [TODO] M2-1 实现 script model、strict 模式与 call log
+### [DONE] M2-1 实现 script model、strict 模式与 call log
 
 **前置依赖**:M1-R。
 
@@ -257,6 +257,42 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:脚本耗尽返回可断言的错误信息。
 - 单测:strict panic 模式只在显式 opt-in 时 panic。
 - 跑全套验证命令。
+
+**完成记录**(2026-07-14):
+
+- **StrictMode**:`enum StrictMode { Error(#[default]), Panic }`。`Script::next_step` 耗尽时,`Error` 返回
+  `Err(ScriptError::Exhausted)`,`Panic` 走 `panic!("{error}")`。默认 `Error`,`with_strict_mode(Panic)` 显式
+  opt-in——`error_mode_does_not_panic_on_exhaustion` 与 `panic_mode_panics_only_when_opted_in` 用
+  `catch_unwind` 分别断言两种模式行为。
+- **Step 类型**:`trait ScriptStep`(`const FAMILY: RequirementKindTag` + `into_result(self) -> RequirementResult`
+  + 预留 `match_key`)统一四个 family。`LlmStep`(`text`/`tool_use`/`response`/`error`/`with_usage`,载荷
+  `Result<Response, ClientError>`)、`ToolStep`(`ok`/`error`/`response`/`runtime_error`/`with_key`,载荷
+  `Result<ToolResponse, ToolRuntimeError>`,provider call id 兼作 key)、`InteractionStep`(`answer`/`choice`/
+  `approval`/`response`/`with_key`,载荷 `InteractionResponse`)、`ReconfigStep`(`ok`/`error`,载荷
+  `Result<(), ToolRuntimeError>`)。每个 `into_result` 只产出对应 family 的 `RequirementResult`,由
+  `steps_convert_to_their_result_family`、`tool_step_error_is_a_model_visible_error_response`、
+  `tool_step_runtime_error_stays_in_the_tool_family_err_path`、`llm_step_error_stays_in_the_llm_family_err_path`
+  验证错误路径不串 family。
+- **CallLog**:泛型 `CallLog<Req, Res>`(内部 `Mutex`),`begin(req) -> CallTicket` 记 dispatch 序号,
+  `complete(ticket, res)` 记 completion 序号(与 dispatch 分离,为 M5 并发乱序完成预留),`record` 为同步一体化;
+  `CallRecord { call_index, request, result: Option, completion_index: Option }`;查询 `len`/`is_empty`/
+  `completed_len`/`with_records`/`records`/`requests`。`call_log_records_request_result_and_orders` 用乱序
+  complete 断言 dispatch 与 completion 两套序号,`call_log_record_begins_and_completes_atomically` 断言一体化路径。
+- **顺序匹配 + 预留 key**:`Script<S: ScriptStep>`(内部 `Mutex<VecDeque<S>>` + dispatched 计数)首版仅按 dispatch
+  顺序 `pop_front`;`ScriptStep::match_key` 已在 `ToolStep`/`InteractionStep` 上返回 key,但 `Script` 暂不消费,
+  为后续按 key 匹配预留接口。`script_consumes_steps_in_dispatch_order` 验证顺序消费与 key 保留。
+- **错误信息**:`ScriptError::Exhausted { family, call_index, script_len, label }` 手写 `Display`,含 family、
+  0-based 调用序号、脚本长度、可选 label。`exhausted_script_returns_a_classified_error_by_default` 断言字段与
+  "llm"/"call #1"/"1 step" 子串;`exhaustion_error_includes_the_optional_label` 断言含 "weather-scenario" 与
+  "reconfig"。
+- **prelude**:`prelude.rs` 追加 `CallLog`/`CallRecord`/`CallTicket`/`InteractionStep`/`LlmStep`/`ReconfigStep`/
+  `Script`/`ScriptError`/`ScriptStep`/`StrictMode`/`ToolStep` 导出。
+- **验证结果**(全绿):`cargo fmt --all -- --check`;`cargo clippy --all-targets -- -D warnings` 与
+  `-p agent-testkit --all-targets`(两 crate 均干净);`cargo test -p agent-testkit`(lib 25 含 11 个新 script 用例
+  + smoke 2 passed);`cargo test --all --all-targets`(agent-lib 434 unit + 各集成套件全绿,testkit 25 + 2,
+  0 failed,7 个 network-gated ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(root + testkit,修掉两处
+  redundant explicit intra-doc link 后干净);`git diff --check` 干净。
+- **偏离计划**:无。script 层为纯新增模块,未改 `agent-lib` 运行时语义,未引入 provider wire mock。
 
 ### [TODO] M2-2 实现 scripted effect handlers
 
