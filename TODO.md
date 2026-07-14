@@ -968,7 +968,7 @@ pivot 前旧目标 spawn child 或执行危险 tool。
 - 本任务仅改文档(`docs/*.md`、`README.md`、`TODO.md`、`memory/claude_plan.md`),未触及任何 Rust
   编译产物,故按验证门规则复用上次全量绿结果,未重跑 Rust 构建/测试。已运行 `git diff --check`(干净)。
 
-### [TODO] M4-R Milestone 4 总 Review
+### [DONE] M4-R Milestone 4 总 Review
 
 **前置依赖**:M4-1..M4-4。
 
@@ -998,3 +998,37 @@ pivot 前旧目标 spawn child 或执行危险 tool。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - `git diff --check`。
 - Review 结论写入本任务完成记录。
+
+**完成记录**:
+
+- **P0 场景全部落地**:P0-1 `complex_turn_combines_plan_blackboard_approval_deny_and_pivot`
+  (`tests/agent_complex_flow.rs`)、P0-2 `complex_subagent_updates_shared_plan_and_pops_approval_to_parent`
+  (`tests/agent_complex_subagent.rs`)、P0-3 `complex_cancel_abandons_child_and_preserves_committed_state`
+  (`tests/agent_complex_cancel.rs`) 均存在且通过。
+- **P1 场景全部落地,无一 deferred**:P1-1 `complex_plan_claim_conflict_or_dependency_block_recovers_through_blackboard`
+  (`tests/agent_complex_flow.rs`)、P1-2 `complex_approval_cancel_does_not_cancel_context_unless_driver_cancels`
+  (`tests/agent_complex_cancel.rs`)、P1-3 `complex_pivot_then_subagent_uses_rerendered_brief`
+  (`tests/agent_complex_subagent.rs`)。测试名与 `docs/complex-tests.md` 各场景「建议测试名」逐一一致,
+  且与 §11 落地状态映射表一致。
+- **可单独运行**:四个套件均可 `cargo test --test <name>` 独立跑通;单测计数 support=10、flow=4
+  (含 M2 两个负向回归)、subagent=2、cancel=2。
+- **无真实 sleep/网络/credentials/provider wire mock**:对 `tests/agent_complex_*.rs` 与
+  `tests/complex_support/` 全量 grep `sleep|reqwest|TcpStream|std::net|api_key|credential|http[s]?://|from_secs|from_millis|SystemTime|Instant::now` 无命中(唯一命中是
+  `agent_complex_cancel.rs` 中「无真实时钟/sleep」的注释)。cancel 场景用确定性驱动而非竞态。需 credential 的
+  `integration_*` 套件全部 `#[ignore]`,不在复杂 mock 套件内。
+- **failure diagnostics 充分**:`tests/complex_support/assertions.rs` 的 panic 均内嵌上下文——
+  store op 日志(`ops_summary`)、blackboard 快照、tool 调用日志(`ComplexToolHandler::calls`/`execution_count`)、
+  interaction 决策计数、committed role sequence 与 `conversation_summary`(逐消息 role + content 摘要);
+  outstanding requirement 的 family 诊断在 subagent/step 套件通过 `NeedLlm`/`outstanding_ids` 暴露。
+- **helper 未扩张成通用 DSL**:支持层仅三个聚焦模块(`plan_blackboard`/`tools`/`assertions`)加 `mod.rs`
+  re-export,均为只读断言与 mock adapter,无 scenario DSL、无 Node/NAPI runner。`mod.rs` re-export 属于缩短
+  `use` 列表的便利,不构成新 DSL 层;三处以上复用的 assertion helper 已在 `docs/complex-tests.md` 记录为测试支持层,
+  未来正式 plan API 落地后再评估是否上提到 `agent-testkit`。
+- **验证门结果(全绿)**:`cargo fmt --all -- --check` OK;`cargo clippy --all-targets -- -D warnings` exit 0;
+  `cargo test --test agent_complex_support` 10 passed;`--test agent_complex_flow` 4 passed;
+  `--test agent_complex_subagent` 2 passed;`--test agent_complex_cancel` 2 passed;
+  `cargo test --all --all-targets` 全绿(agent-lib 423 unit + 各集成套件;agent-testkit 131 + replay/cassette/smoke;
+  credential-gated integration 套件 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` exit 0;
+  `git diff --check` 干净。
+- **结论**:Milestone 4 及整个复杂 mock 测试计划(M1→M4)按 `PLAN.md`/`docs/complex-tests.md` 完整落地,
+  无 flakiness、无过度抽象、无 workaround、无 deferred。M4-R 通过。
