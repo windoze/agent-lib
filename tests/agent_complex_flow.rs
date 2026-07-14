@@ -15,6 +15,11 @@
 //! interaction backend, so the mock plan/blackboard store and the handler/
 //! interaction logs record exactly what a real registry would.
 //!
+//! Alongside the combined happy-path turn, milestone 2 (M2-2) pins the two error
+//! faces that flow must never silently swallow: a dependency-blocked plan claim
+//! surfaces as a model-visible [`ToolStatus::Error`] without mutating the task,
+//! and a denied dangerous write never reaches the tool at the effect boundary.
+//!
 //! Run in isolation with `cargo test --test agent_complex_flow`.
 
 #[path = "complex_support/mod.rs"]
@@ -28,23 +33,26 @@ use agent_lib::agent::{
 };
 use agent_lib::model::content::ContentBlock;
 use agent_lib::model::message::{Message, Role};
-use agent_lib::model::tool::ToolStatus;
+use agent_lib::model::tool::{ToolResponse, ToolStatus};
 
+use agent_testkit::assertions::{assert_conversation, assert_done};
 use agent_testkit::fixtures::{assistant_text, assistant_tool_use, root_context, tool_call, usage};
 use agent_testkit::handlers::{
-    InteractionCallLog, InteractionDecision, ScriptedInteractionHandler,
+    InteractionCallLog, InteractionDecision, ScriptedInteractionHandler, ScriptedLlmHandler,
 };
-use agent_testkit::harness::{StepHarness, StepObservation};
+use agent_testkit::harness::{DrainHarness, StepHarness, StepObservation};
 use agent_testkit::ids::SeqIds;
+use agent_testkit::script::LlmStep;
 
 use complex_support::assertions::{
-    assert_board_messages, assert_interaction_decisions, assert_pivot_after_tool_result,
-    assert_task_depends_on, assert_task_status, assert_tool_executions, role_sequence,
+    assert_board_messages, assert_interaction_decisions, assert_no_task_owner,
+    assert_pivot_after_tool_result, assert_task_depends_on, assert_task_status,
+    assert_tool_executions, role_sequence,
 };
 use complex_support::plan_blackboard::{MockPlanBlackboardStore, StoreError, TaskStatus};
 use complex_support::tools::{
-    BLACKBOARD_POST, ComplexToolHandler, DANGEROUS_WRITE, PLAN_ADD_TASK, PLAN_CREATE,
-    complex_agent_machine, complex_tool_handler,
+    BLACKBOARD_POST, ComplexToolHandler, DANGEROUS_WRITE, PLAN_ADD_TASK, PLAN_CLAIM, PLAN_CREATE,
+    complex_agent_machine, complex_scope, complex_tool_handler,
 };
 
 /// Fixed plan id so store construction stays deterministic and offline.
@@ -416,4 +424,153 @@ async fn resume_tool_batch(
         last = Some(harness.resume(requirement.id, result));
     }
     last.expect("the batch had at least one requirement")
+}
+
+// ----- M2-2: negative / regression cases -----------------------------------
+
+/// Concatenates every [`ContentBlock::Text`] payload of a tool response.
+fn tool_response_text(response: &ToolResponse) -> String {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A dependency-blocked claim is a model-visible tool error, not a silent
+/// success or a panic, and it must leave the target task untouched.
+///
+/// This pins the plan-dependency error face directly at the
+/// [`ComplexToolHandler`] boundary: with `implement` depending on an unfinished
+/// `design`, claiming `implement` returns a [`ToolStatus::Error`] response whose
+/// text names the blocking dependency, and `implement` stays `Todo`, unowned,
+/// with the plan version unchanged. A future handler or store change that swallowed
+/// the dependency check (claiming the task anyway, or hiding the error) would trip
+/// one of these assertions.
+#[tokio::test]
+async fn claim_dependency_block_returns_tool_error_and_does_not_mutate_task() {
+    let ids = SeqIds::new();
+    let ctx = root_context(&ids);
+
+    // Build the dependency graph directly: `implement` depends on `design`, and
+    // `design` is never completed.
+    let store = Arc::new(MockPlanBlackboardStore::new(plan_id()));
+    store.create_plan();
+    store
+        .add_task("design", Vec::<String>::new())
+        .expect("`design` is a fresh task");
+    store
+        .add_task("implement", ["design"])
+        .expect("`implement` depends on the known task `design`");
+    let version_before = store.version();
+
+    let handler = complex_tool_handler(Arc::clone(&store));
+
+    // The model tries to claim `implement` while `design` is still `Todo`.
+    let call = tool_call(
+        "c-claim-implement",
+        PLAN_CLAIM,
+        serde_json::json!({
+            "task": "implement",
+            "owner": "worker",
+            "expected_version": version_before
+        }),
+    );
+    let response = match handler.fulfill(ids.tool_call_id(), &call, &ctx).await {
+        RequirementResult::Tool(Ok(response)) => response,
+        other => panic!(
+            "plan_claim must fulfil to a tool response, got {other:?}\nstore operations:\n{}",
+            store.ops_summary()
+        ),
+    };
+
+    // The dependency block surfaces as a model-visible tool error that names the
+    // unfinished dependency — it is not silently downgraded to success.
+    assert_eq!(
+        response.status,
+        ToolStatus::Error,
+        "a dependency-blocked claim must be a tool error, got {:?}\nstore operations:\n{}",
+        response.status,
+        store.ops_summary()
+    );
+    let error_text = tool_response_text(&response);
+    assert!(
+        error_text.contains("design"),
+        "the tool error must name the blocking dependency `design`, got {error_text:?}\nstore operations:\n{}",
+        store.ops_summary()
+    );
+
+    // The rejected claim left the task untouched: still `Todo`, unowned, and the
+    // plan version did not move.
+    assert_task_status(&store, "implement", TaskStatus::Todo);
+    assert_no_task_owner(&store, "implement");
+    assert_eq!(
+        store.version(),
+        version_before,
+        "a rejected claim must not bump the plan version\nstore operations:\n{}",
+        store.ops_summary()
+    );
+}
+
+/// A denied dangerous write never reaches the tool at the effect boundary.
+///
+/// The guarded round-trip is driven end to end through a [`DrainHarness`]: the
+/// model requests [`DANGEROUS_WRITE`], the approval is denied, the machine
+/// synthesizes a [`ToolStatus::Denied`] result, and the model's follow-up closes
+/// the turn. The regression guard is [`assert_tool_executions`] reporting zero
+/// dangerous executions — the [`ComplexToolHandler`] log stays empty, proving the
+/// denied write never ran and never touched the shared store.
+#[tokio::test]
+async fn denied_dangerous_write_does_not_execute_tool() {
+    let ids = SeqIds::new();
+    let ctx = root_context(&ids);
+
+    let store = Arc::new(MockPlanBlackboardStore::new(plan_id()));
+    let handler = complex_tool_handler(Arc::clone(&store));
+
+    let interaction =
+        ScriptedInteractionHandler::deny_all(Some("keep it to a plan for now".to_owned()));
+    let interaction_log = Arc::clone(interaction.log());
+
+    // The model asks for the gated write, then answers once the (synthesized)
+    // denied result returns.
+    let llm = ScriptedLlmHandler::from_steps([
+        LlmStep::tool_use(vec![tool_call(
+            "c-danger",
+            DANGEROUS_WRITE,
+            serde_json::json!({ "text": "apply the risky change to file A" }),
+        )]),
+        LlmStep::text("done, delivered the plan"),
+    ]);
+
+    let scope = complex_scope(
+        Arc::new(llm),
+        Arc::clone(&handler) as Arc<dyn ToolHandler>,
+        Some(Arc::new(interaction) as Arc<dyn InteractionHandler>),
+    );
+
+    let machine = complex_agent_machine(&ids);
+    let mut harness = DrainHarness::with_ids(machine, &scope, None, &ctx, ids);
+    let observed = harness
+        .run_user("实现功能 A")
+        .await
+        .expect("the denied dangerous-write turn drains to completion");
+
+    assert_done(observed.turn_done());
+    // Exactly one approval was rendered, and it denied the write.
+    assert_interaction_decisions(&interaction_log, 1);
+    // The dangerous tool never executed: its handler log is empty.
+    assert_tool_executions(&handler, DANGEROUS_WRITE, 0);
+    // The denied write left the shared store untouched.
+    assert_board_messages(&store, &[]);
+
+    let machine = harness.into_machine();
+    assert_conversation(machine.state().conversation())
+        .committed_turns(1)
+        .pending_none()
+        .tool_result_status("c-danger", ToolStatus::Denied)
+        .last_assistant_text("done, delivered the plan");
 }

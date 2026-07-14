@@ -1,56 +1,43 @@
-# 当前任务：M2-1 实现 `agent_complex_flow` 主场景
+# 当前任务：M2-2 补充主 flow 的负向断言与防回归用例
 
 ## 定位
-- `TODO.md` 第一个未完成任务 = **M2-1**（首个 `[TODO]`，行 315）。前置依赖：M1-R（`[DONE]`）。
-- HEAD=1d98249（[M1-R]），工作树干净。属于 Milestone 2「主复杂 flow」。
+- `TODO.md` 第一个未完成任务 = **M2-2**（首个 `[TODO]`，行 394）。前置依赖：M2-1（`[DONE]`）。
+- HEAD=503bfd2（[M2-1]），工作树干净。属于 Milestone 2。
 - 非 review、单一执行单元，**不拆分**。
 
-## 目标（docs/complex-tests.md §4.1 P0-1）
-同一 turn 内组合：plan dependency + blackboard post + dangerous approve + post-tool pivot
-+ 第二次 dangerous deny + final LLM。pivot 必须用 StepHarness 在合法 NeedLlm 边界手动插入。
+## 目标（TODO.md M2-2）
+在 `tests/agent_complex_flow.rs` 增加两个聚焦测试，把 plan dependency 与 approval deny 的错误面固定住：
+1. `claim_dependency_block_returns_tool_error_and_does_not_mutate_task`
+   - 直接通过 `ComplexToolHandler.fulfill` 调 `plan_claim` claim `implement`（design 未 completed）。
+   - 断言返回 `ToolStatus::Error`，错误文本 model-visible 且提及被阻塞依赖 design。
+   - 断言 owner/status/version 不变（implement 仍 Todo、无 owner、version 不变）。
+2. `denied_dangerous_write_does_not_execute_tool`
+   - 用 `DrainHarness` + 脚本 LLM(dangerous_write→text) + `ComplexToolHandler` + deny 交互。
+   - 断言 dangerous execution log == 0，interaction 决策 1 次，turn Done，tool_result 为 Denied。
+- 失败信息必须包含 store ops(assert_* helper) 或 handler log(assert_tool_executions)。
 
-## 机器行为（已核对 src/agent/machine/default/tools.rs）
-- LLM 返回 tool_use → 拆成 auto 批量(一次 NeedTool 批) + approval 队列(逐个 NeedInteraction)。
-- auto 批先跑；approve 后为该 call 发单个 NeedTool；deny → 合成 Denied 结果，不发 NeedTool。
+## 关键 API（已核对）
+- 直接执行工具：`handler.fulfill(ids.tool_call_id(), &tool_call(...), &ctx).await` → `RequirementResult::Tool(Ok(ToolResponse))`。
+- 建 plan：`store.create_plan()`→v0；`store.add_task("design", Vec::<String>::new())`→v1；
+  `store.add_task("implement", ["design"])`→v2。`store.version()`==2。
+- `store.claim` 校验顺序 version→owner→status→deps，dep 未完成 → `DependencyBlocked`，不改状态。
+- DrainHarness：`complex_scope(Arc<llm>, Arc<handler> as Arc<dyn ToolHandler>, Some(Arc<interaction>))`；
+  `DrainHarness::with_ids(machine,&scope,None,&ctx,ids).run_user(..).await`。
+- 断言：`assert_conversation(conv).committed_turns(1).pending_none().tool_result_status("c-danger",Denied).last_assistant_text(..)`；
+  `assert_tool_executions(&handler,DANGEROUS_WRITE,0)`；`assert_interaction_decisions(&log,1)`；`assert_done(turn_done)`。
 
-## 手动 stepping 序列（#[tokio::test]，handler.fulfill 是 async）
-1. user("实现功能 A") → NeedLlm L1
-2. resume L1 = tool_use[plan_create, plan_add_task(design), plan_add_task(implement,[design])]
-   → NeedTool 批(3) → 逐个 handler.fulfill+resume → NeedLlm L2
-3. resume L2 = tool_use[blackboard_post("start processing feature A"), dangerous_write#1]
-   → NeedTool[post] → resume → NeedInteraction(dangerous#1) → interaction.fulfill=Approve → resume
-   → NeedTool[dangerous#1] → resume(执行, board+1) → NeedLlm L3
-4. 在 dangerous#1 结果后、resume L3 前：harness.pivot("先不要改文件,只给方案") → 同 id 重渲染 L3
-5. resume L3 = tool_use[blackboard_post("changed strategy after pivot..."), dangerous_write#2]
-   → NeedTool[post] → resume → NeedInteraction(dangerous#2) → interaction=Deny → resume
-   → 合成 Denied,tool phase drained → NeedLlm L4（捕获其 ChatRequest）
-6. resume L4 = text("done") → Done
-
-## 交互后端
-ScriptedInteractionHandler::sequence([Approve, Deny(Some(...))])，逐次 fulfill；log 记录 2 次。
-
-## 断言
-- committed turns == 1，pending none。
-- assert_pivot_after_tool_result(pivot 文本) + role_sequence。
-- implement.depends_on == [design]；design=Todo；store.claim("implement",..,v=2)=DependencyBlocked。
-- board = ["start processing","apply the risky change"(dangerous#1),"changed strategy after pivot"]，offset 单调。
-- assert_tool_executions(DANGEROUS_WRITE,1)。
-- assert_interaction_decisions(log,2) + records 顺序 Approve/Deny。
-- L4 ChatRequest.messages 含 pivot 文本 User 消息 + Denied ToolResult。
-
-## 文件
-新建 tests/agent_complex_flow.rs（#[path=complex_support/mod.rs] mod）。测试名
-`complex_turn_combines_plan_blackboard_approval_deny_and_pivot`。
+## 新增 import
+handlers::ScriptedLlmHandler；harness::DrainHarness；assertions::{assert_conversation,assert_done}；
+script::LlmStep；tools::{complex_scope, PLAN_CLAIM}；model::tool::ToolResponse。
 
 ## 验证顺序
-fmt --check → clippy --all-targets -D warnings → 指定测试 → cargo test --all --all-targets(<=30min)
+fmt --check → clippy --all-targets -D warnings → 两个指定测试 → cargo test --all --all-targets(<=30min)
 → RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace → git diff --check。
 
 ## 完成
-TODO.md M2-1 [TODO]->[DONE] + 完成记录；提交 [M2-1]；停止。
+TODO.md M2-2 [TODO]->[DONE] + 完成记录；提交 [M2-2]；停止。
 
 ## 进度
-- [完成] 新建 tests/agent_complex_flow.rs;StepHarness 手动推进 + async handler fulfill;pivot 落
-  post-tool→NeedLlm 边界。全部验证通过(fmt/clippy/指定测试 1 passed/全量 all-targets 全绿:lib 423 +
-  testkit 131 + 集成 crate,credential-gated ignored/doc/diff --check)。TODO.md M2-1 标 [DONE] 并写完成
-  记录。待提交 [M2-1]。
+- [完成] 两个防回归测试写完并通过。fmt/clippy/两个指定测试/整文件 3 tests/全量 all-targets 全绿
+  (lib 423 + testkit 131 + 集成 crate,credential-gated ignored)/doc(-D warnings)/diff --check 均通过。
+  TODO.md M2-2 标 [DONE] 并写完成记录。待提交 [M2-2]。

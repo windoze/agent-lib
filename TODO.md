@@ -391,7 +391,7 @@ dangerous tool approve、post-tool pivot、第二个 dangerous tool deny、final
   credential-gated 集成测试 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
   无告警;`git diff --check` 干净。
 
-### [TODO] M2-2 补充主 flow 的负向断言与防回归用例
+### [DONE] M2-2 补充主 flow 的负向断言与防回归用例
 
 **前置依赖**:M2-1。
 
@@ -417,6 +417,30 @@ dangerous tool approve、post-tool pivot、第二个 dangerous tool deny、final
 - `cargo test --all --all-targets`。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - `git diff --check`。
+
+**完成记录**:
+
+- 在 `tests/agent_complex_flow.rs` 追加两个 `#[tokio::test]` 防回归用例,复用 M1 支持层,未新建 DSL;
+  模块顶层 doc 增补一句说明 M2-2 固定的两个错误面。
+- `claim_dependency_block_returns_tool_error_and_does_not_mutate_task`:走最少样板的**直接 handler** 路径。
+  先用 store helper 造依赖图(`create_plan`→v0、`add_task("design",[])`→v1、`add_task("implement",["design"])`
+  →v2),记录 `version_before`;再用 `handler.fulfill(ids.tool_call_id(), &tool_call(PLAN_CLAIM,{task:implement,
+  owner:worker,expected_version:2}), &ctx)` 触发 claim。断言:`RequirementResult::Tool(Ok(resp))` 且
+  `resp.status == ToolStatus::Error`;错误文本(取 `ContentBlock::Text`)含被阻塞依赖 `design`(证明是
+  model-visible 错误而非静默降级);`implement` 仍 `Todo`、无 owner(`assert_task_status`/`assert_no_task_owner`)、
+  `store.version()` 未变。所有 panic 分支打印 `store.ops_summary()`。
+- `denied_dangerous_write_does_not_execute_tool`:走最少样板的 **`DrainHarness`** 路径。脚本 LLM 先请求
+  `dangerous_write` 再收尾 `text`,`ScriptedInteractionHandler::deny_all` 拒批,`ComplexToolHandler` 作为
+  tool 后端,`complex_scope(llm, handler, Some(interaction))` 组装 attended scope,`complex_agent_machine`
+  仅 gate `dangerous_write`。断言:turn `Done`;`assert_interaction_decisions(log,1)`(一次 deny);
+  `assert_tool_executions(handler, DANGEROUS_WRITE, 0)`(handler 日志为空 → 被拒工具从未执行);
+  `assert_board_messages(store,&[])`(共享 store 未被触碰);`assert_conversation` 断言 committed=1、
+  pending none、`c-danger` tool_result 为 `ToolStatus::Denied`、末条 assistant 文本收尾。失败信息由
+  `assert_tool_executions` 打印 handler 逐工具调用日志承载。
+- 验证结果(全部通过):`cargo fmt --all -- --check`;两个指定测试各 1 passed;整文件 3 tests 全通过;
+  `cargo clippy --all-targets -- -D warnings` 无告警;`cargo test --all --all-targets` 全绿(lib 423 +
+  testkit 131 + 各集成 crate 全通过,仅 credential-gated 集成测试 ignored);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
 ### [TODO] M2-R Milestone 2 Review
 
