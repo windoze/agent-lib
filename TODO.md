@@ -1440,7 +1440,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - **备注**:未追踪文件 `docs/external-agent.md` 与本任务无关(TODO/PLAN 未引用),不纳入本次提交。PLAN.md 无
   phase 级变更,未改动。
 
-### [TODO] M7-2 文档、README 与开发指南更新
+### [DONE] M7-2 文档、README 与开发指南更新
 
 **前置依赖**:M7-1。
 
@@ -1459,6 +1459,33 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 通过。
 - README 中 archive/current plan 链接有效。
 - 全套验证命令全部通过。
+
+**完成记录(2026-07-14)**:
+
+- **`docs/TESTABILITY.md`(规划 → 当前状态)**:顶部状态横幅由「规划稿」改为「实施中(M1–M6 已落地,M7 收尾)」;
+  §5「模块规划」新增「落地状态(截至 M7-1)」映射表,把 `ids`/`fixtures`/`script`/`handlers`/`scope`/`machine`/
+  `cassette`/`harness`/`assertions`/`concurrency`/`subagent`/`scenario`/`prelude` 逐一对应到 `crates/agent-testkit/src`
+  实际源码与落地里程碑;§9「迁移计划」新增落地状态块,把 Phase 1–6 映射到 M1..M5 与 M7-1(并指出既有测试迁移见 M6);
+  §8.4、§13 各补一条「现状(M7-1 已落地)」说明 data-only `scenario` model 草案与 runner spike 已落地、但仍是最小
+  spike 而非稳定 DSL。各小节原「职责 / 建议 API / 验收」保留为设计依据。
+- **`README.md`(当前计划链接)**:两处「当前 Agent 层阶段计划」表述更新为「当前根 `PLAN.md` / `TODO.md` 属
+  **Testability 阶段**」,补 `docs/TESTABILITY.md` 与 `crates/agent-testkit` 链接;并新增已完成 Agent Effect Model
+  迁移的归档链接 `docs/archive/2026-07-14-agent-effect-migration/`。校验脚本确认 README 全部非 http 链接(含新增
+  archive / current-plan / TESTABILITY / crate 链接)均指向存在的路径。
+- **crate-level rustdoc(`crates/agent-testkit/src/lib.rs`)**:新增 `# Quickstart`(`no_run` doctest:`drain` 一个
+  脚本化 text turn 并断言 committed conversation,编译通过)、`# Recording cassettes`(记录 `AGENT_TESTKIT_RECORD_CASSETTES=1`
+  / `AGENT_TESTKIT_UPDATE_CASSETTES=1` 写盘护栏、`RecorderReport::Skipped` 默认离线语义,附 update→replay 命令示例);
+  强化 `# Boundaries` 里「**never mocks a provider HTTP/SSE transport**」的边界表述;把 Module map 与 `prelude` 文档里
+  「随里程碑逐步填充」的过时措辞改为「均已落地」。
+- **验证**:`cargo fmt` + `cargo fmt --check` 干净;`cargo clippy --all-targets -- -D warnings`(workspace)无告警;
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(整个 workspace)通过;`cargo test -p agent-testkit --doc` 2/2 绿
+  (含新增 crate-level quickstart doctest 的编译);README 链接有效性脚本全 OK;`git diff --check` 干净。
+- **全套测试复用说明**:本任务仅改动文档文件(`*.md`)与 Rust **文档注释**(`lib.rs`/`prelude.rs` 的 `//!`),唯一新增
+  的编译单元是 crate-level quickstart doctest,已由 `cargo test -p agent-testkit --doc` 单独验证通过;`--all-targets`
+  不含 doctest 且非注释代码零改动,`cargo clippy --all-targets` 已成功编译全部 target。据此复用 M7-1 的最近一次
+  `cargo test --all --all-targets` 全绿结果,未重复运行该昂贵套件(符合「仅文档变更可复用上次全绿结果」的门规)。
+- **备注**:未追踪文件 `docs/external-agent.md` 与本任务无关(TODO/PLAN 未引用),不纳入本次提交。PLAN.md 无
+  phase 级变更,未改动。
 
 ### [TODO] M7-R Milestone 7 与 Testability 总 Review
 

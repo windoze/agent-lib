@@ -1,8 +1,10 @@
 # Testability 计划 —— Agent Effect 测试增强
 
-> 状态:规划稿。本文记录 `agent-lib` 在 agent effect 模型落地后的测试增强计划。
-> 目标不是重写已有测试,而是把现有散落的 fake、fixture、handler 组合与断言能力收敛成一套
-> 可复用的测试基础设施,让高层 agent 场景能用脚本化 effect 回放表达,避免每个用例都手写一套
+> 状态:实施中(M1–M6 已落地,M7 文档/scenario 收尾)。本文记录 `agent-lib` 在 agent effect 模型落地后的
+> 测试增强计划与当前实现状态。原本设想的 dev-only `agent-testkit` 已作为工作区成员落地
+> (`crates/agent-testkit`),下文各模块规划已对应到实际源码;§5 顶部给出「落地状态」映射,§9 迁移计划标注
+> 各 phase 的落地里程碑。目标不是重写已有测试,而是把现有散落的 fake、fixture、handler 组合与断言能力
+> 收敛成一套可复用的测试基础设施,让高层 agent 场景能用脚本化 effect 回放表达,避免每个用例都手写一套
 > Rust mock。
 
 ## 0. 一句话
@@ -150,7 +152,26 @@ agent-testkit/tests/ 集成测试同时依赖 agent-testkit 和 agent-lib
 
 ## 5. 模块规划
 
-### 5.1 `ids`
+> **落地状态(截至 M7-1)**:下表所列模块均已在 `crates/agent-testkit/src` 落地,后续小节的
+> 「职责 / 建议 API / 验收」保留为设计依据,可与实际实现对照。
+
+| 模块 | 源码 | 落地里程碑 |
+|---|---|---|
+| `ids` | `src/ids.rs` | M1-2 |
+| `fixtures` | `src/fixtures.rs` | M1-3 |
+| `script` | `src/script.rs` | M2-1 |
+| `handlers` | `src/handlers.rs` | M2-2 |
+| `scope` | `src/scope.rs` | M2-3 |
+| `machine` | `src/machine.rs` | M2-4 |
+| `cassette` | `src/cassette/{mod,record,replay}.rs` | M3-1..M3-3 |
+| `harness` | `src/harness.rs` | M4-1..M4-2 |
+| `assertions` | `src/assertions/` | M4-3 |
+| `concurrency` | `src/concurrency.rs` | M5-1..M5-2 |
+| `subagent` | `src/subagent.rs` | M5-3 |
+| `scenario` | `src/scenario.rs` | M7-1(data-only 草案 + runner spike) |
+| `prelude` | `src/prelude.rs` | 随各模块增量导出 |
+
+
 
 提供 deterministic id source,消除测试里的 UUID 噪音。
 
@@ -768,7 +789,23 @@ cargo test -p agent-testkit --test agent_replay_tool
 - 至少有 3-5 个复杂 Rust scenario 能自然映射到 data-only scenario。
 - 已明确哪些断言属于 runner 输出 summary,哪些仍留在 Rust 内部。
 
+> **现状(M7-1 已落地)**:data-only scenario model 草案与 runner spike 已作为 `scenario` 模块落地
+> (`src/scenario.rs`):`Scenario` 支持 serde round-trip,`run_scenario` 把 text/tool/approval 三类最小场景
+> 跑成可 golden 的 `ScenarioSummary`,并明确了哪些断言进入 summary、哪些仍留在 Rust。这是有意最小化的 spike,
+> 不是稳定 DSL(见 §9.4),上表的 `scenario_json_*` / `scenario_ts_*` 命名套件仍待正式建立。
+
 ## 9. 迁移计划
+
+> **落地状态(截至 M7-1)**:下述 Phase 1–6 均已落地,对应里程碑如下;各 phase 保留为设计与验收依据。
+>
+> - Phase 1 提取基础 fake → M1(ids/fixtures)+ M2(scripted handlers/`TestScope`)。
+> - Phase 2 Recorded cassette → M3(schema/redactor/fingerprint、record/replay/update、首个离线 replay)。
+> - Phase 3 Step/Drain harness → M4(`StepHarness`/`DrainHarness`/assertions)。
+> - Phase 4 并发与取消工具 → M5-1..M5-2(delay/barrier/peak、cancel-on-call/panic-on-call)。
+> - Phase 5 Subagent 与 hierarchy → M5-3(`ScriptedSubagentSpawner`、parent/child scope helper)。
+> - Phase 6 场景 DSL 草案 → M7-1(data-only `scenario` model + runner spike)。
+>
+> 既有底层测试向 testkit 的迁移与基础/replay suites 的组织见 M6(M6-1..M6-4)。
 
 ### Phase 1: 提取基础 fake
 
@@ -969,3 +1006,7 @@ testkit 自身额外标准:
 - 若需要更低延迟或更强 IDE 体验,再把同一个 runner 包成 NAPI。
 
 这样可以避免直接把 Node async callback、NAPI 错误映射、tokio runtime 管理引入当前测试增强主线。
+
+> **现状(M7-1 已落地)**:Rust 侧的 data-only scenario model 草案(`scenario` 模块)已经就位,可作为未来
+> JSON runner / NAPI 的候选输入形状。它目前是最小 spike(仅 text/tool/approval),尚未稳定为对外 DSL;是否
+> 足以支撑 TS/NAPI 由 M7-R 总 Review 评估并列出缺口。
