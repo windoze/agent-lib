@@ -16,7 +16,7 @@ provider raw body 录入 cassette;不得依赖真实 sleep、网络或 credentia
 
 ## Milestone 1 — Testkit 骨架与基础数据
 
-### [TODO] M1-1 建立 `agent-testkit` 拓扑与最小 crate 骨架
+### [DONE] M1-1 建立 `agent-testkit` 拓扑与最小 crate 骨架
 
 **前置依赖**:无。
 
@@ -43,6 +43,30 @@ provider raw body 录入 cassette;不得依赖真实 sleep、网络或 credentia
 - `cargo test --all --all-targets`。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 - `git diff --check`。
+
+**完成记录**(2026-07-14):
+
+- **拓扑决策**:采用首选方案 `crates/agent-testkit`。root `Cargo.toml` 增加
+  `[workspace] { members = [".", "crates/agent-testkit"], resolver = "3" }`(edition 2024 → resolver 3)。
+  testkit 只单向依赖 `agent-lib = { path = "../.." }`,`agent-lib` 未反向 dev-dep testkit,
+  因此无 Cargo 依赖周期,root package 测试与构建正常,无需 `tests/support/agent_testkit` 过渡方案。
+- **crate 骨架**:新建 `crates/agent-testkit/Cargo.toml`(`publish = false`,复用
+  `async-trait`/`futures`/`serde`/`serde_json`/`tokio`/`uuid`,未引入 mockall/proptest/insta)、
+  `src/lib.rs`(crate 级文档 + `#![warn(missing_docs)]`)、`src/prelude.rs`。
+- **模块预声明**:`ids`、`fixtures`、`script`、`handlers`、`cassette`、`scope`、`machine`、
+  `harness`、`assertions`、`concurrency`、`subagent`、`prelude` 全部落地。除 `prelude` 外均为带模块
+  文档的 skeleton stub,标注各自将由哪个里程碑填充。`prelude` 先 re-export
+  `AgentMachine`/`DefaultAgentMachine`/`LlmStepMode`/`Requirement`/`RequirementKind`/`StepInput`/`StepOutcome`。
+- **smoke test**:`tests/smoke.rs` 通过泛型约束 `assert_agent_machine::<DefaultAgentMachine>()`
+  证明 `DefaultAgentMachine` 满足公开 `AgentMachine` trait,并经 `prelude` 与全限定路径引用
+  `agent_lib::agent::LlmStepMode`,验证 testkit 能引用公开类型。
+- **验证结果**(全绿):`cargo fmt --all`;`cargo clippy --all-targets -- -D warnings`(两 crate 均干净);
+  `cargo test -p agent-testkit`(2 passed);`cargo test --all --all-targets`(全部通过,0 failed);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`(agent-lib 与 `-p agent-testkit` 均干净);
+  `git diff --check` 干净。
+- **备注**:`cargo doc --no-deps` 默认只文档化 root package(workspace default member),故额外用
+  `-p agent-testkit` 单独验证 testkit rustdoc 无 warning。后续里程碑如需默认一并出 testkit 文档,可再评估
+  `default-members`,当前未做此改动以避免超出 M1-1 范围。
 
 ### [TODO] M1-2 实现 deterministic id source: `SeqIds`
 
