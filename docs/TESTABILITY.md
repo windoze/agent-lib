@@ -259,15 +259,14 @@ let interaction = ScriptedInteractions::approve_all();
 
 录制内容:
 
-- metadata: cassette schema version、crate version、test name、created_at、可选说明。
-- run inputs: root input 摘要、可选 scenario label。
-- per-effect entries:
-  - requirement family 与调用序号。
+- cassette 顶层带 `schema_version`;`metadata` 含 test name、可选 description(承载 scenario label)、可选 crate version。
+- per-effect entries(每个已兑现 requirement 一条):
+  - requirement family 与全局 dispatch 序号(`index`)。
   - normalized request payload: `ChatRequest`、`ToolCall`、`Interaction`、`ToolSetRef`。
-  - request fingerprint:对稳定字段做 canonical JSON hash。
+  - request fingerprint:volatile-id 归一化后的 canonical JSON 串(v1 直接以该串为指纹,后续可换 hash 而不改匹配语义)。
   - normalized result payload: `Response`、`ToolResponse`、`InteractionResponse`、reconfig ok/error。
-  - result summary:便于 review 的 text/tool/status/usage 摘要。
-- optional observations:drained notifications 摘要、final cursor、committed conversation 摘要、trace requirement disposition。
+  - 可选 result summary:便于 review 的 text/tool/status/usage 摘要。
+- optional observations:final cursor、drained notifications 摘要、committed conversation 摘要、trace requirement disposition。
 
 不录制内容:
 
@@ -286,28 +285,35 @@ let interaction = ScriptedInteractions::approve_all();
 匹配策略:
 
 - 默认按 family + 顺序 + request fingerprint 匹配。
-- 可选按自定义 key 匹配,例如 tool name + provider call id。
+- 可选按自定义 key 匹配(例如 tool name + provider call id)为后续扩展;当前实现只做 fingerprint 匹配。
 - 默认忽略 volatile id: `RequirementId`、`TraceNodeId`、测试运行产生的 host ids 不进入 request fingerprint。
 - 对 `ChatRequest` 默认包含 model、system、messages、tools、max_tokens、temperature、provider_extras 的脱敏后 canonical 形状。
 
 脱敏策略:
 
 - cassette writer 必须经过 redactor。
-- 默认 redactor 移除 auth/endpoint 类字段,虽然 agent effect 层正常不应出现这些字段。
+- `DefaultRedactor` 默认把 `ChatRequest.provider_extras` 与 `Response.extra` 中所有非白名单字段的**值**替换为 `<redacted>`(保留 key 形状),因此即便 agent effect 层意外带入 auth/endpoint 类字段也会被脱敏。
 - 对 `Message` 文本内容默认保留,因为它是 agent 行为测试的核心;涉及敏感数据的真实录制必须在测试侧提供自定义 redactor 或 synthetic prompt。
-- provider extras 默认保守处理:未知字段 redact,测试可白名单允许字段。
+- provider extras 默认保守处理:未知字段值被 redact,测试用 `DefaultRedactor::allow_field(..)` 白名单允许保留的字段。
 
 建议 API:
 
 ```rust
-let cassette = Cassette::load("tests/cassettes/weather_tool_roundtrip.json")?;
+// 加载:先读文件,再按当前 schema version 解析。
+let json = std::fs::read_to_string("tests/cassettes/weather_tool_roundtrip.json")?;
+let cassette = Cassette::from_json_str(&json)?;
 
-let llm = CassetteLlmHandler::replay(cassette.clone());
-let tools = CassetteToolHandler::replay(cassette.clone());
+// 重放:player 用同一份 cassette 为每个 family 各铸一个终端 handler。
+let player = CassettePlayer::new(cassette, "tests/cassettes/weather_tool_roundtrip.json");
+let llm = player.llm_handler();
+let tools = player.tool_handler();
 
+// 录制:recorder 包裹真实 handler;写盘受环境变量护栏(默认不写)。
 let recorder = CassetteRecorder::record("tests/cassettes/weather_tool_roundtrip.json")
-    .with_redactor(DefaultRedactor::new())
-    .wrap_llm(real_llm_handler);
+    .with_redactor(DefaultRedactor::new());
+let recording_llm = recorder.wrap_llm(real_llm_handler);
+// ... 用 recording_llm 驱动机器跑完一轮,然后:
+let report = recorder.finish()?;
 ```
 
 验收:
@@ -561,17 +567,21 @@ async fn tool_round_trip_is_scripted() {
 录制/重放写法:
 
 ```rust
+use std::sync::Arc;
+
 use agent_testkit::prelude::*;
 
 #[tokio::test]
 async fn recorded_tool_round_trip_replays_offline() {
     let ids = SeqIds::new();
-    let cassette = Cassette::load("tests/cassettes/weather_tool_roundtrip.json")
-        .expect("cassette loads");
+    let json = std::fs::read_to_string("tests/cassettes/weather_tool_roundtrip.json")
+        .expect("cassette present");
+    let cassette = Cassette::from_json_str(&json).expect("cassette parses");
+    let player = CassettePlayer::new(cassette, "tests/cassettes/weather_tool_roundtrip.json");
     let scope = TestScope::builder()
-        .llm(CassetteLlmHandler::replay(cassette.clone()))
-        .tool(CassetteToolHandler::replay(cassette.clone()))
-        .interaction(CassetteInteractionHandler::replay(cassette.clone()))
+        .llm(Arc::new(player.llm_handler()))
+        .tool(Arc::new(player.tool_handler()))
+        .interaction(Arc::new(player.interaction_handler()))
         .build();
     let ctx = root_context(&ids);
     let mut machine = default_machine(&ids, default_spec_with_tools([weather_tool()]));

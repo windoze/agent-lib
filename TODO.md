@@ -783,7 +783,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
   failed);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p agent-testkit`(clean);`git diff --check`(clean)。
 
 
-### [TODO] M3-R Milestone 3 Review
+### [DONE] M3-R Milestone 3 Review
 
 **前置依赖**:M3-1..M3-4。
 
@@ -801,6 +801,54 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 - 全套验证命令全部通过。
 - Review 结论写入完成记录。
+
+**完成记录**(2026-07-14):
+
+- **核对 1 — cassette schema provider-neutral**(通过):`crates/agent-testkit/src/cassette/mod.rs` 的
+  `Cassette { schema_version, metadata, entries, observations }` 只承载 effect 边界的 provider-neutral 类型——
+  request 侧 `ChatRequest`/`ToolCall`/`Interaction`/`ToolSetRef`,result 侧 `Response`/`ToolResponse`/
+  `InteractionResponse`/`ReconfigOutcome`(以及可序列化镜像 `CassetteToolError`)。**无** HTTP header、auth token、
+  base URL、provider raw wire body;`ToolRuntimeError` 的镜像在 testkit 内定义,未改 agent-lib。已提交 fixture
+  `tests/cassettes/agent_weather_tool_roundtrip.json` 实测 `provider_extras: null`、仅 effect payload,证实录制点在
+  handler effect 边界而非协议层。**确认 provider-neutral,未混入协议 fixture。**
+- **核对 2 — redactor 默认策略**(通过):`DefaultRedactor` 把 `ChatRequest.provider_extras.fields` 与
+  `Response.extra` 中所有**非白名单** key 的**值**替换为 `<redacted>`,**保留 key 形状**与 message 文本;allowlist
+  默认空(默认脱敏一切 extras 值),`allow_field(..)` 显式放行。指纹在**脱敏后**的 request 上计算(与 §5.4 一致)。
+  相应单测(`record_writes_stable_redacted_json`、mod 内 redactor round-trip)全绿。**确认默认保守、可显式放行。**
+- **核对 3 — record/update 环境变量护栏**(通过):`RECORD_ENV_VAR = "AGENT_TESTKIT_RECORD_CASSETTES"`、
+  `UPDATE_ENV_VAR = "AGENT_TESTKIT_UPDATE_CASSETTES"`;`Record`/`Update` 仅当显式 override 为真或对应 env 值
+  `"1"` 时 `is_enabled()`,`Verify` 从不写盘;`finish()` 对未启用的写模式返回 `RecorderReport::Skipped` 且**不写任何
+  文件**(双重防御)。写盘走临时文件 + atomic rename。集成测试 `regenerate_weather_cassette` 在默认(无 env)run 下命中
+  `skip_reason()`(断言含 env 名)并早退,**永不覆盖已提交 fixture**。**确认 CI 默认不会意外录制/覆盖。**
+- **核对 4 — replay 无 credentials 可跑**(通过):replay handler(`CassetteLlmHandler` 等)是**终端** handler,无
+  delegate、不触网、不调用真实 backend,仅按 family + 顺序 + fingerprint 返回记录结果。集成测试
+  `offline_replay_runs_a_full_weather_turn` 用真实 `DefaultAgentMachine` + `CassettePlayer` 铸的 llm/tool handler 跑完
+  整 user→tool_use→tool→final-text turn,无 `LlmClient`、无 HTTP、无真实 tool、无 credentials。本次聚焦跑
+  `cargo test -p agent-testkit --test cassette_replay`(2 passed:regenerate 默认 Skipped + 离线 replay 绿)与
+  `cargo test -p agent-testkit cassette`(28 + 1 passed)实证以上四项。**确认离线可跑。**
+- **文档并轨(`docs/TESTABILITY.md` §5.4/§6 cassette 描述,与实现对齐)**:
+  - 建议 API / 录制-重放示例:`Cassette::load(path)` → 实际 `std::fs::read_to_string(path)` + `Cassette::from_json_str(&json)`
+    (无 `load` 方法);`CassetteLlmHandler::replay(cassette)` 等 → 实际 `CassettePlayer::new(cassette, label)` 的
+    `.llm_handler()/.tool_handler()/.interaction_handler()`(或 `CassetteXHandler::from_cassette`);§5.4 recorder 示例把
+    `wrap_llm(..)` 结果误命名为 `recorder`(实为 `RecordingLlmHandler`),已拆成 recorder + wrapped handler + `finish()`。
+    §6 replay 示例补 `use std::sync::Arc;` 并把 handler 以 `Arc::new(..)` 传入 builder(匹配 `TestScopeBuilder::llm` 签名)。
+  - 录制内容:删除实现里不存在的 `created_at` 与独立 "run inputs" section;明确 metadata 仅 `test_name`/可选
+    `description`(承载 scenario label)/可选 `crate_version`,schema_version 在 cassette 顶层;observations 字段对齐
+    (final cursor / notifications / conversation / trace dispositions)。
+  - fingerprint:"canonical JSON hash" → "volatile-id 归一化后的 canonical JSON 串(v1 直接以该串为指纹,后续可换 hash)",
+    与 `request_fingerprint` 实现及其 doc comment 一致。
+  - 脱敏策略:"移除 auth/endpoint 类字段" → 准确表述为「脱敏所有非白名单 extras 字段的**值**、保留 key 形状」,并注明
+    `DefaultRedactor::allow_field(..)` 白名单入口。
+  - 匹配策略:标注"自定义 key 匹配"为后续扩展,当前实现只做 fingerprint 匹配。
+- **验证结果**:`cargo fmt --all --check` 干净;聚焦 `cargo test -p agent-testkit cassette`(28 + 1,0 failed)与
+  `cargo test -p agent-testkit --test cassette_replay`(2,0 failed)全绿,实证四项核对。全套
+  `cargo test --all --all-targets` 自 M3-4(HEAD=`1946a77`)绿后**无任何代码/清单改动**(本 Review 仅改
+  `docs/TESTABILITY.md` 与 `memory/claude_plan.md` 文档),按「仅文档变更可复用上次绿结果」规则跳过重跑(M3-4 上次
+  结果:agent-lib 434 + agent-testkit 75 + cassette_replay 2 + smoke 2 + 其余,0 failed)。
+- **Review 结论**:Milestone 3 交付的 cassette 层(schema/fingerprint/redactor、replay handler、record/verify/update
+  wrapper、首个离线 recorded replay 测试)可支撑真实 req/resp 离线复用;四项关键属性(schema provider-neutral、redactor
+  默认保守、record/update 受 env 护栏、replay 无 credentials 可跑)均成立,且未把协议层 fixture 混入 agent testkit。文档
+  已与实现并轨。未发现需插入前置修复任务的 spec 偏差或失败测试,可进入 Milestone 4。
 
 ---
 
