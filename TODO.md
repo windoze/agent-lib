@@ -959,7 +959,7 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:每类 assertion happy path + 至少一条 failure-message 快照式断言(`catch_unwind` 校验 panic payload 携带足够上下文),assertions 子模块共 17 个单测;`assert_calls` 覆盖 peak concurrency。
 - 验证:`cargo fmt --all` 已格式化;`cargo clippy --all-targets -- -D warnings`(root + `-p agent-testkit`)无告警;`cargo test -p agent-testkit` 全绿(lib 104 + cassette 2 + smoke 2 + doctest 1);`cargo test --all --all-targets` 全绿(agent-lib 434、agent-testkit lib 104 + 集成 cassette 2 + smoke 2,0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。
 
-### [TODO] M4-R Milestone 4 Review
+### [DONE] M4-R Milestone 4 Review
 
 **前置依赖**:M4-1..M4-3。
 
@@ -976,6 +976,15 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 
 - 全套验证命令全部通过。
 - Review 结论写入完成记录。
+
+**完成记录(2026-07-14)**:
+
+- **`StepHarness` 仍精确暴露中间 requirement**:每个步进 move 返回的 `StepObservation` 携带该步 `outcome.requirements` 原样 batch(`build_observation` 直接搬运,不折叠、不过滤),配合 `single`/`single_llm`/`single_tool`/`single_interaction`/`requirements_by_tag` 提取器按家族取出中间 requirement;harness 自身维护 `outstanding: BTreeMap<RequirementId, Requirement>`,`resume`/`abandon` 在**步进机器之前**做前置校验(id 必须 outstanding、`accepts_resolution` 家族对齐),失败时机器不步进且诊断含 cursor + outstanding ids + last label。tool-use 折叠出的中间 `NeedTool` 有单测证明可见。结论:harness 暴露而非隐藏中间态。
+- **`DrainHarness` 保留原始 `AgentError`**:`run`/`run_user` 对 `drain(..)` 结果用 `?` 直接透传,签名即 `Result<DrainObservation, AgentError>`,不 stringify、不 reclassify;`AgentErrorKind`(UnhandledRequirement / trace failure / budget failure / family mismatch)原样上浮。单测 `top_unhandled_interaction_returns_unhandled_requirement` 以 `AgentError::UnhandledRequirement { kind, .. }` 结构匹配验证(非字符串)。可选 `watching(..)` handler-log 摘要不改变错误路径。
+- **assertions 只读且诊断充分**:7 个断言家族入口(`assert_conversation`/`assert_requirements`/`assert_notifications`/`assert_trace`/`assert_budget`/`assert_calls`/`assert_done`)全部接收 `&`/`Copy` 快照(`&Conversation`、`&[Requirement]`、`&[Notification]`、`&RunContext`、`&BudgetSnapshot`、`&CallLog`、`&TurnDone`);全模块无 `&mut`/`RefCell`/`Cell`/`borrow_mut`(唯一 `&mut` 出现在各自 `#[cfg(test)]` 的 `drain(&mut machine, ..)` 构造轮次处,不在断言体内),因此断言不可能改变被检查的行为。失败信息统一 `panic!`/`assert!` 携带期望 vs 实际 + 周边 shape(turn/msg 下标、requirement 家族、notification 种类、trace 节点、call-log summary/suffix),payload 恒为 `String` 以便 `catch_unwind` 元测试断言;17 个子模块单测覆盖 happy path + 至少一条 failure-message 快照。
+- **下一阶段迁移目标清单已核对(仍准确,无需重构任务)**:M6-1 目标 `tests/agent_effect_e2e.rs` 存在(约 16 处本地 `Fake*`/`Seq*`/helper 命中,四个验收语义待保持);M6-2 目标 `src/agent/drive/reference/tests.rs` 存在(约 50 处 fake/struct 命中);二者均为 M6 迁移的真实重复源。M5(delay/barrier/peak、cancel/panic-on-call、scripted subagent spawner)为上述迁移与 Core suites 提供并发/取消/子 agent 能力。依赖链 M5→M6 保持不变,PLAN.md 阶段计划无需改动。
+- **验证**:`cargo fmt --all --check` 通过;`cargo clippy --all-targets -- -D warnings`(root)与 `cargo clippy -p agent-testkit --all-targets -- -D warnings` 均无告警;`cargo test --all --all-targets` 全绿(agent-lib + agent-testkit lib 104 + cassette_replay 2 + smoke 2,0 失败);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。未新增代码,验证仅确认 M4 落地状态为绿的里程碑门。
+- **结论**:Milestone 4 通过。harness/assertions 只 mock/观测 agent effect 边界,依赖公开 API,未绕过 `agent-lib` 不变量;`UnhandledRequirement`、misaligned/wrong-family、cancel never-resume 等负例覆盖保留;新 helper 降低样板而非掩盖行为。放行 M5。
 
 ---
 
