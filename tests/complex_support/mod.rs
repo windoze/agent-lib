@@ -6,8 +6,9 @@
 //! support layer here holds the pieces reused across those scenarios.
 //!
 //! Milestone 1 lands the mock plan/blackboard vertical feature in
-//! [`plan_blackboard`]; later milestones add tool adapters, approval policies,
-//! and assertion helpers alongside it.
+//! [`plan_blackboard`] and the complex tool adapter, tool declarations, and
+//! approval policy in [`tools`]; later milestones add assertion helpers
+//! alongside them.
 //!
 //! The support layer is grown one milestone at a time and is compiled fresh into
 //! each complex-test binary, so any given test crate only exercises a subset of
@@ -17,3 +18,4 @@
 #![allow(dead_code)]
 
 pub mod plan_blackboard;
+pub mod tools;

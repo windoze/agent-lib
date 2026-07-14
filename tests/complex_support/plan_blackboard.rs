@@ -61,6 +61,24 @@ impl TaskStatus {
         }
     }
 
+    /// Parses a lowercase wire label (as produced by [`label`](Self::label))
+    /// back into a [`TaskStatus`].
+    ///
+    /// The complex tool adapter uses this to turn a model-supplied `status`
+    /// string argument into a typed status; an unrecognized label returns
+    /// `None` so the adapter can surface a model-visible error.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<TaskStatus> {
+        match label {
+            "todo" => Some(TaskStatus::Todo),
+            "in_progress" => Some(TaskStatus::InProgress),
+            "completed" => Some(TaskStatus::Completed),
+            "blocked" => Some(TaskStatus::Blocked),
+            "cancelled" => Some(TaskStatus::Cancelled),
+            _ => None,
+        }
+    }
+
     /// Returns whether a status transition is a legal `update_status` move.
     ///
     /// Terminal states ([`Completed`](TaskStatus::Completed) /

@@ -11,11 +11,26 @@
 mod complex_support;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use agent_lib::agent::{
+    ApprovalRequirement, RequirementResult, RunContext, ToolApprovalPolicy, ToolHandler,
+    ToolRuntimeError,
+};
+use agent_lib::model::content::ContentBlock;
+use agent_lib::model::tool::{ToolResponse, ToolStatus};
 
 use agent_lib::agent::PlanId;
 
+use agent_testkit::fixtures::{root_context, tool_call};
+use agent_testkit::ids::SeqIds;
+
 use complex_support::plan_blackboard::{
     MockPlanBlackboardStore, StoreError, TaskState, TaskStatus, detect_cycle,
+};
+use complex_support::tools::{
+    BLACKBOARD_POST, ComplexToolHandler, DANGEROUS_WRITE, PLAN_ADD_TASK, PLAN_CLAIM, PLAN_CREATE,
+    RequireDangerousWriteApprovalPolicy, SAFE_READ,
 };
 
 /// Fixed plan id so store construction stays deterministic and offline.
@@ -195,4 +210,216 @@ fn blackboard_is_append_only_and_offsets_are_monotonic() {
     assert_eq!(board.len(), 4);
     assert_eq!(board[0].text, "start processing", "history is immutable");
     assert_eq!(board[3].offset, 3);
+}
+
+// ----- M1-2: complex tool adapter + approval policy ------------------------
+
+/// Fixed framework-side tool call id source for adapter tests.
+fn adapter_ids() -> SeqIds {
+    SeqIds::new()
+}
+
+/// Concatenates the text of every text block in a tool response.
+fn response_text(response: &ToolResponse) -> String {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Drives one tool call through the handler and unwraps its tool-family result.
+async fn call_tool(
+    handler: &ComplexToolHandler,
+    ids: &SeqIds,
+    ctx: &RunContext,
+    name: &str,
+    input: serde_json::Value,
+) -> Result<ToolResponse, ToolRuntimeError> {
+    let call = tool_call("provider-call", name, input);
+    match handler.fulfill(ids.tool_call_id(), &call, ctx).await {
+        RequirementResult::Tool(inner) => inner,
+        other => panic!("tool handler must return a Tool result, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn plan_tools_return_model_visible_errors() {
+    let ids = adapter_ids();
+    let ctx = root_context(&ids);
+    let handler = ComplexToolHandler::new(Arc::new(MockPlanBlackboardStore::new(plan_id())));
+
+    // Build a small plan through the tools themselves.
+    let created = call_tool(&handler, &ids, &ctx, PLAN_CREATE, serde_json::json!({}))
+        .await
+        .expect("plan_create is a known tool");
+    assert_eq!(created.status, ToolStatus::Ok);
+
+    let added = call_tool(
+        &handler,
+        &ids,
+        &ctx,
+        PLAN_ADD_TASK,
+        serde_json::json!({ "id": "design" }),
+    )
+    .await
+    .expect("plan_add_task is a known tool");
+    assert_eq!(added.status, ToolStatus::Ok);
+
+    call_tool(
+        &handler,
+        &ids,
+        &ctx,
+        PLAN_ADD_TASK,
+        serde_json::json!({ "id": "implement", "depends_on": ["design"] }),
+    )
+    .await
+    .expect("plan_add_task is a known tool");
+
+    // A store error (dependency-blocked claim) folds into a model-visible error
+    // tool result, not a panic and not a runtime error.
+    let blocked = call_tool(
+        &handler,
+        &ids,
+        &ctx,
+        PLAN_CLAIM,
+        serde_json::json!({ "task": "implement", "owner": "worker", "expected_version": 2 }),
+    )
+    .await
+    .expect("plan_claim is a known tool");
+    assert_eq!(blocked.status, ToolStatus::Error);
+    assert!(
+        response_text(&blocked).contains("blocked by unfinished dependencies"),
+        "claim error must surface the store message: {}",
+        response_text(&blocked),
+    );
+
+    // An unknown-dependency add is likewise a model-visible error.
+    let unknown_dep = call_tool(
+        &handler,
+        &ids,
+        &ctx,
+        PLAN_ADD_TASK,
+        serde_json::json!({ "id": "ship", "depends_on": ["ghost"] }),
+    )
+    .await
+    .expect("plan_add_task is a known tool");
+    assert_eq!(unknown_dep.status, ToolStatus::Error);
+    assert!(response_text(&unknown_dep).contains("unknown task `ghost`"));
+
+    // A missing required argument is a model-visible error, never a panic.
+    let bad_args = call_tool(
+        &handler,
+        &ids,
+        &ctx,
+        PLAN_CLAIM,
+        serde_json::json!({ "owner": "worker", "expected_version": 2 }),
+    )
+    .await
+    .expect("plan_claim is a known tool");
+    assert_eq!(bad_args.status, ToolStatus::Error);
+    assert!(response_text(&bad_args).contains("argument `task`"));
+
+    // An unknown tool is the one hard failure: a tool-family runtime error.
+    let unknown = call_tool(&handler, &ids, &ctx, "not_a_tool", serde_json::json!({})).await;
+    assert_eq!(
+        unknown,
+        Err(ToolRuntimeError::UnknownTool {
+            name: "not_a_tool".to_owned(),
+        }),
+    );
+}
+
+#[tokio::test]
+async fn dangerous_write_requires_approval_and_safe_tools_do_not() {
+    let ids = adapter_ids();
+    let policy = RequireDangerousWriteApprovalPolicy;
+
+    // The dangerous tool requires approval and carries a stable reason.
+    let dangerous = tool_call(
+        "c-danger",
+        DANGEROUS_WRITE,
+        serde_json::json!({ "text": "rm" }),
+    );
+    let requirement = policy.approval_requirement(ids.tool_call_id(), &dangerous);
+    let ApprovalRequirement::RequireApproval { reason } = &requirement else {
+        panic!("dangerous_write must require approval, got {requirement:?}");
+    };
+    assert_eq!(
+        reason.as_deref(),
+        Some("`dangerous_write` requires human approval")
+    );
+
+    // Every other tool auto-approves.
+    for name in [
+        SAFE_READ,
+        PLAN_CREATE,
+        PLAN_CLAIM,
+        BLACKBOARD_POST,
+        PLAN_ADD_TASK,
+    ] {
+        let call = tool_call("c-safe", name, serde_json::json!({}));
+        assert_eq!(
+            policy.approval_requirement(ids.tool_call_id(), &call),
+            ApprovalRequirement::AutoApprove,
+            "{name} must auto-approve",
+        );
+    }
+}
+
+#[tokio::test]
+async fn dangerous_write_call_log_counts_executions() {
+    let ids = adapter_ids();
+    let ctx = root_context(&ids);
+    let store = Arc::new(MockPlanBlackboardStore::new(plan_id()));
+    let handler = ComplexToolHandler::new(Arc::clone(&store));
+
+    // Two dangerous writes and one safe read all execute (approval is enforced
+    // by the machine, not the handler; a handler call means the tool ran).
+    for text in ["first", "second"] {
+        let response = call_tool(
+            &handler,
+            &ids,
+            &ctx,
+            DANGEROUS_WRITE,
+            serde_json::json!({ "text": text }),
+        )
+        .await
+        .expect("dangerous_write is a known tool");
+        assert_eq!(response.status, ToolStatus::Ok);
+    }
+    call_tool(&handler, &ids, &ctx, SAFE_READ, serde_json::json!({}))
+        .await
+        .expect("safe_read is a known tool");
+
+    // The call log counts executions per tool and preserves the inputs.
+    assert_eq!(handler.execution_count(DANGEROUS_WRITE), 2);
+    assert_eq!(handler.execution_count(SAFE_READ), 1);
+    let inputs: Vec<String> = handler
+        .calls_named(DANGEROUS_WRITE)
+        .iter()
+        .map(|call| {
+            call.input
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .expect("dangerous_write records its text input")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(inputs, vec!["first".to_owned(), "second".to_owned()]);
+
+    // Each approved dangerous write left a visible blackboard side effect.
+    let board = store.board_snapshot();
+    assert_eq!(board.len(), 2, "both dangerous writes posted to the board");
+    assert!(
+        board
+            .iter()
+            .all(|message| message.sender == DANGEROUS_WRITE)
+    );
+    assert_eq!(board[0].text, "first");
+    assert_eq!(board[1].text, "second");
 }

@@ -91,7 +91,7 @@ plan/blackboard API 尚未落地。当前代码只有 `PlanId` / `BlackboardId` 
   `cargo test --all --all-targets` 全绿(仅 credential-gated 集成测试 ignored);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
-### [TODO] M1-2 实现 complex tool adapter、tool declarations 与 approval policy helpers
+### [DONE] M1-2 实现 complex tool adapter、tool declarations 与 approval policy helpers
 
 **前置依赖**:M1-1。
 
@@ -133,6 +133,48 @@ plan/blackboard API 尚未落地。当前代码只有 `PlanId` / `BlackboardId` 
 - `cargo test --all --all-targets`。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - `git diff --check`。
+
+**完成记录**:
+
+- 新建 `tests/complex_support/tools.rs`,`mod.rs` 增加 `pub mod tools;`。工具站在
+  `RequirementKind::NeedTool` 边界(实现 `ToolHandler`),不 mock provider wire,不接真实
+  `ToolRegistry` 后端。
+- 工具名常量全部落地:`PLAN_CREATE`/`PLAN_ADD_TASK`/`PLAN_CLAIM`/`PLAN_CLAIM_FIRST_AVAILABLE`/
+  `PLAN_UPDATE`、`BLACKBOARD_POST`/`BLACKBOARD_READ`、`DANGEROUS_WRITE`/`SAFE_READ`(均为
+  `pub const &str`)。`tool_declarations() -> Vec<Tool>` 为每个工具给出 JSON input schema,供
+  `agent_spec_with_tools` 使用。
+- `ComplexToolHandler` 持 `Arc<MockPlanBlackboardStore>`,按 `ToolCall.name` 分发到 store 操作:
+  plan_create/add_task/claim/claim_first_available/update 与 blackboard post/read。成功返回
+  `Tool(Ok(ToolResponse{status:Ok}))`;store 错误或参数解析错误返回
+  `Tool(Ok(ToolResponse{status:Error}))`(model-visible,不 panic);unknown tool 返回
+  `Tool(Err(ToolRuntimeError::UnknownTool))`(固定选此风格,`plan_tools_return_model_visible_errors`
+  锁定)。`dangerous_write` 向 blackboard(sender=`dangerous_write`)追加消息,使"已批准写确实执行"
+  在 store 中可观察;`safe_read` 为 auto-allow 的普通读。
+- per-tool call log:`ToolInvocation { name, input, outcome }`,只在 handler 真正被调用(即审批通过后
+  执行)时入日志;提供 `calls()`/`calls_named()`/`execution_count()`,可断言 dangerous tool 执行次数与
+  input。
+- `RequireDangerousWriteApprovalPolicy` 实现 `ToolApprovalPolicy`:`dangerous_write` 返回
+  `ApprovalRequirement::required(reason)`,其余工具 `AutoApprove`。
+- scenario setup helper:`complex_agent_machine(ids)` 构造带全部 complex tools 声明 + 上述 approval
+  policy 的 `DefaultAgentMachine`;`complex_tool_handler(store)` 构造 `Arc<ComplexToolHandler>`;
+  `complex_scope(llm, tool, interaction)` 组装 `TestScope`(interaction 可选,`None` 保持 headless)。
+  说明:store 不进 machine——machine 只承载 tool 声明与 approval policy,store 走 tool handler / scope
+  边界,因此拆成 `complex_tool_handler(store)`,避免机器持有它导致 unused 参数;这是 helper 人体工学选择,
+  非 spec 偏离(machine 与 scope 仍分别覆盖 TODO 所列职责)。
+- 支持层辅助:`TaskStatus::from_label` 新增于 `plan_blackboard.rs`,供 adapter 解析 `plan_update` 的
+  `status` 字符串参数(未知 label 返回 `None` → model-visible error)。
+- `tests/agent_complex_support.rs` 补三个 `#[tokio::test]` adapter 单测,直接驱动
+  `handler.fulfill` / `policy.approval_requirement`:
+  `plan_tools_return_model_visible_errors`(依赖阻塞、未知依赖、缺参 → status Error 且携带 store/参数
+  文本;未知工具 → `UnknownTool`)、
+  `dangerous_write_requires_approval_and_safe_tools_do_not`(危险工具 RequireApproval 且 reason 稳定,
+  其余 AutoApprove)、
+  `dangerous_write_call_log_counts_executions`(两次危险写 + 一次 safe_read,断言执行计数、input 序列与
+  blackboard 副作用)。
+- 验证结果(全部通过):`cargo fmt --all -- --check`;三个指定测试与整个
+  `cargo test --test agent_complex_support`(7 passed)通过;`cargo clippy --all-targets -- -D warnings`
+  无告警;`cargo test --all --all-targets` 全绿(仅 4 个 credential-gated 集成测试 ignored,无 failure);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
 ### [TODO] M1-3 实现复杂测试断言 helper
 

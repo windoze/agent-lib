@@ -1,57 +1,60 @@
-# 当前任务：M1-1 建立复杂测试支持模块与 MockPlanBlackboardStore
+# 当前任务：M1-2 实现 complex tool adapter、tool declarations 与 approval policy helpers
 
 ## 定位
-- `TODO.md` 第一个未完成任务 = **M1-1**（首个 `[TODO]`）。前置依赖：无。
-- 新一轮计划：复杂 Mock 测试与 Plan 依赖语义（PLAN.md / docs/complex-tests.md / docs/agent-layer.md §6.2）。
-- HEAD=a1a94ee，工作树干净。上一轮 M1..M7 已归档。
+- `TODO.md` 第一个未完成任务 = **M1-2**（首个 `[TODO]`）。前置依赖：M1-1（已 `[DONE]`，commit 832e1f1）。
+- HEAD=832e1f1，工作树干净。本轮为复杂 Mock 测试与 Plan 依赖语义。
 
-## 目标（TODO.md M1-1）
-新建：
-- `tests/complex_support/mod.rs`（声明 `pub mod plan_blackboard;`）
-- `tests/complex_support/plan_blackboard.rs`（内存 store + 类型 + 错误）
-- `tests/agent_complex_support.rs`（`#[path="complex_support/mod.rs"] mod complex_support;` + 4 个测试）
+## 目标（TODO.md M1-2）
+在 `tests/complex_support/tools.rs` 建立复杂测试 tool 适配层，站在 `RequirementKind::NeedTool` 边界，
+不 mock provider wire，不使用真实 ToolRegistry 后端。
 
-数据模型：
-- `MockPlanBlackboardStore { plan: Mutex<PlanState>, board: Mutex<Vec<BoardMessage>>, ops: Mutex<Vec<StoreOp>> }`
-- `PlanState { id: PlanId, version: u64, task_order: Vec<String>, tasks: BTreeMap<String, TaskState> }`
-- `TaskState { status: TaskStatus, owner: Option<String>, depends_on: Vec<String> }`
-- `TaskStatus`: Todo/InProgress/Completed/Blocked/Cancelled
-- `BoardMessage { offset: u64, sender: String, text: String }`
-- `StoreOp { kind, outcome: Result<String,String> }`，成功/失败都记录
+### 工具名常量
+PLAN_CREATE / PLAN_ADD_TASK / PLAN_CLAIM / PLAN_CLAIM_FIRST_AVAILABLE / PLAN_UPDATE、
+BLACKBOARD_POST / BLACKBOARD_READ、DANGEROUS_WRITE / SAFE_READ。
 
-plan 操作：
-- `create_plan` → 初始化 version=0 空 plan，记录 op
-- `add_task(id, depends_on)` → 校验依赖已知/非自依赖/无环；成功追加 task_order，version+1
-- `claim(task, owner, expected_version)` → CAS 版本 + owner + status + 依赖已完成；依赖未完成返回 DependencyBlocked 且不改状态（原子）
-- `claim_first_available(owner, expected_version)` → 按 task_order 跳过 completed/已认领/依赖未完成，认领首个可用；无则 NoAvailableItem
-- `update_status(task, owner, status, expected_version)` → owner/version/合法转换校验，成功 version+1
+### tool_declarations() -> Vec<Tool>
+每个工具的 JSON input schema，供 agent_spec_with_tools 使用。
 
-blackboard 操作：
-- `post(sender, text) -> offset`（append-only，offset 从 0 单调递增）
-- `read_from(offset) -> Vec<BoardMessage>`（offset 及之后）
+### ComplexToolHandler（impl ToolHandler）
+- 持 Arc<MockPlanBlackboardStore>。
+- per-tool call log（name + input + outcome status），可断言 dangerous tool 执行次数与 input。
+- 按 ToolCall.name 分发到 store 操作。
+- 成功 -> Tool(Ok(ToolResponse{status:Ok}))。
+- store 错误 / 参数解析错误 -> Tool(Ok(ToolResponse{status:Error}))（model-visible，不 panic）。
+- unknown tool -> Tool(Err(ToolRuntimeError::UnknownTool))（固定选此风格，测试锁定）。
+- dangerous_write：post 到 blackboard（sender=dangerous_write）可观察副作用。
+- safe_read：read blackboard，auto-allow 普通 tool。
 
-错误：`StoreError` enum（UnknownTask/SelfDependency/DependencyCycle/DuplicateTask/VersionConflict/NotOwner/DependencyBlocked/AlreadyClaimed/NoAvailableItem/InvalidTransition），`Display` 产出 model-visible 文本，供 M1-2 tool adapter 使用。
-`ops_summary()` 提供日志摘要，便于失败定位（M1-3 断言复用）。
+### RequireDangerousWriteApprovalPolicy（impl ToolApprovalPolicy）
+- dangerous_write -> ApprovalRequirement::required。其他 -> AutoApprove。
 
-环检测：deps 必须引用已存在 task（DAG by construction），add_task 内部仍跑 `detect_cycle`（防御 + 共享）。`detect_cycle` 设为 pub，测试用手工构造的 A→B→A 图断言其能识别环。
+### scenario setup helpers
+- complex_agent_machine(ids) -> 带全部 complex tools 声明 + approval policy 的 DefaultAgentMachine。
+  （store 不进 machine：machine 只持声明+policy，store 走 tool handler / scope 边界，
+  故另设 complex_tool_handler(store)；避免 unused-param 告警，属 helper 人体工学而非 spec 偏离。）
+- complex_tool_handler(store) -> Arc<ComplexToolHandler>。
+- complex_scope(llm, tool, interaction) -> 组装 TestScope。
 
-## 4 个必需测试（tests/agent_complex_support.rs）
-1. `plan_dependencies_reject_unknown_self_and_cycles`
-2. `claim_rejects_unfinished_dependencies_atomically`
-3. `claim_first_available_skips_blocked_and_claimed_items`
-4. `blackboard_is_append_only_and_offsets_are_monotonic`
+### 辅助改动
+- plan_blackboard.rs 的 TaskStatus 增加 from_label（tool adapter 解析 status 字符串需要）。
+- mod.rs 增加 pub mod tools;。
+
+## 新增单测（tests/agent_complex_support.rs）
+1. plan_tools_return_model_visible_errors
+2. dangerous_write_requires_approval_and_safe_tools_do_not
+3. dangerous_write_call_log_counts_executions
+（均 #[tokio::test]，通过 handler.fulfill / policy.approval_requirement 直接驱动。）
 
 ## 验证顺序
-- `cargo fmt --all -- --check`
-- `cargo test --test agent_complex_support <各测试名>`
-- `cargo clippy --all-targets -- -D warnings`
-- `cargo test --all --all-targets`（<=30min）
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
-- `git diff --check`
+- cargo fmt --all -- --check
+- cargo test --test agent_complex_support <三个测试名>
+- cargo clippy --all-targets -- -D warnings
+- cargo test --all --all-targets（<=30min）
+- RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+- git diff --check
 
 ## 完成后
-- TODO.md M1-1 标题 `[TODO]`→`[DONE]`，补完成记录。
-- 提交：`[M1-1] ...`。停止。
+- TODO.md M1-2 标题 [TODO]->[DONE]，补完成记录。提交 [M1-2] ...。停止。
 
 ## 进度
-- [完成] store + 4 测试 + 完成记录, 全部验证通过, 待提交
+- [完成] tools.rs + 3 单测 + from_label + TODO 完成记录，全部验证门通过，待提交。
