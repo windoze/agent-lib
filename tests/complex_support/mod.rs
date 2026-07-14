@@ -38,6 +38,6 @@ pub use plan_blackboard::{
 pub use tools::{
     BLACKBOARD_POST, BLACKBOARD_READ, ComplexToolHandler, DANGEROUS_WRITE, PLAN_ADD_TASK,
     PLAN_CLAIM, PLAN_CLAIM_FIRST_AVAILABLE, PLAN_CREATE, PLAN_UPDATE,
-    RequireDangerousWriteApprovalPolicy, SAFE_READ, ToolInvocation, complex_agent_machine,
-    complex_scope, complex_tool_handler, tool_declarations,
+    RequireDangerousWriteApprovalPolicy, SAFE_READ, SPAWN_REVIEWER, ToolInvocation,
+    complex_agent_machine, complex_scope, complex_tool_handler, tool_declarations,
 };

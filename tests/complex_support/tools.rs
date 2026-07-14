@@ -61,6 +61,15 @@ pub const BLACKBOARD_READ: &str = "blackboard_read";
 pub const DANGEROUS_WRITE: &str = "dangerous_write";
 /// A benign, auto-approved read tool.
 pub const SAFE_READ: &str = "safe_read";
+/// Delegates the remaining work to a freshly spawned reviewer subagent.
+///
+/// Unlike the other tools, this one is *not* a store operation the
+/// [`ComplexToolHandler`] dispatches: it is fulfilled by the host by deriving and
+/// driving a child agent whose opening turn is the `brief` argument (see the
+/// `complex_pivot_then_subagent_uses_rerendered_brief` scenario). It is declared
+/// here only so the coordinator agent can advertise and call it; the approval
+/// policy auto-approves it because it is not [`DANGEROUS_WRITE`].
+pub const SPAWN_REVIEWER: &str = "spawn_reviewer";
 
 // ----- tool declarations ---------------------------------------------------
 
@@ -176,6 +185,15 @@ pub fn tool_declarations() -> Vec<Tool> {
             json!({
                 "type": "object",
                 "properties": { "from": { "type": "integer", "minimum": 0 } }
+            }),
+        ),
+        tool(
+            SPAWN_REVIEWER,
+            "Delegate the remaining work to a reviewer subagent opened with `brief`.",
+            json!({
+                "type": "object",
+                "properties": { "brief": { "type": "string" } },
+                "required": ["brief"]
             }),
         ),
     ]

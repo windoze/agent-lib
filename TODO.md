@@ -853,7 +853,7 @@ continuation。两者都应有测试固定。
   无告警;`cargo test --all --all-targets` 全绿(所有测试二进制 0 failed);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
-### [TODO] M4-3 实现 pivot 后 subagent brief 使用重渲染 request 场景
+### [DONE] M4-3 实现 pivot 后 subagent brief 使用重渲染 request 场景
 
 **前置依赖**:M4-2。
 
@@ -879,6 +879,43 @@ pivot 前旧目标 spawn child 或执行危险 tool。
 - `cargo test --all --all-targets`。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - `git diff --check`。
+
+**完成记录**:
+
+- **落地**:在 `tests/agent_complex_subagent.rs` 新增 `#[tokio::test]`
+  `complex_pivot_then_subagent_uses_rerendered_brief`(对应 `docs/complex-tests.md` §4.2 P1-3)。coordinator 是
+  真实 `DefaultAgentMachine`,由 `StepHarness` 手动步进,使 pivot 在合法 post-tool-result 边界注入并**重渲染同一个
+  outstanding `NeedLlm`**。补充 import:`agent_lib::agent` 的 `InteractionKind, Requirement, RequirementKind,
+  ScopePop, SubagentHandler`、`agent_lib::model::content::ContentBlock`、`agent_lib::model::message::Message`、
+  `serde_json::Value`;支持层 assertions `assert_pivot_after_tool_result`、tools `SAFE_READ, SPAWN_REVIEWER`。
+  新增本地 helper `fulfill_tool / message_text / any_message_contains / llm_request_messages / question_prompt`。
+- **实现路径选择(lower-cost + 可观察 brief)**:勘查确认 `DefaultAgentMachine` 只 emit
+  NeedLlm/NeedTool/NeedInteraction,**从不 emit NeedSubagent**,而 `StepHarness::pivot` 的“重渲染”只在
+  `DefaultAgentMachine` 上成立。故 subagent 走**tool 化 `spawn_reviewer`**:coordinator 在 pivot 后的重渲染步
+  emit 一个 `spawn_reviewer { brief }` 工具调用;测试在该 `NeedTool` 边界用真实
+  `DrivingSubagentHandler` + `ScriptedSubagentSpawner` 驱动 reviewer child(`ScopePop::new(&empty, None)` 作
+  outer,child 自足不 pop),把 child summary 折回作为工具结果,coordinator turn 收尾为单一 committed turn。
+- **testkit 增强**:`crates/agent-testkit/src/subagent.rs` 给 `ScriptedSubagentSpawner` 增
+  `briefs: Mutex<Vec<Interaction>>`,在 `spawn()` 记录传入 brief,新增 `pub fn briefs()`。这是通用增强——
+  handler 把发起 `NeedSubagent` 的 brief 直接透传给 `spawn`,于是测试可观察 pivot 后的 brief 是否真正到达 child
+  derivation。既有 `subagent::tests` 与 M3-1 场景不受影响(仅新增字段/方法)。
+- **support 增强**:`tests/complex_support/tools.rs` 新增 `SPAWN_REVIEWER` 常量并加入 `tool_declarations()`
+  (host 侧作为 subagent spawn 工具,非 store dispatch;非 `DANGEROUS_WRITE` 故 approval policy 自动放行),
+  `tests/complex_support/mod.rs` re-export。未改动任何生产/被测代码。
+- **pivot 线索端到端断言**:①重渲染后的 coordinator request messages 含 `PIVOT_TEXT`;②coordinator 产出的
+  `spawn_reviewer` brief 含 pivot 意图子串 `REVIEW_ONLY` 且**不含**旧目标 `dangerous_write`;③`spawner.briefs()`
+  恰捕获 1 个 brief,其 question prompt 含 `REVIEW_ONLY`(证明 `NeedSubagent`→`spawn` 透传);④reviewer child
+  自己的首个 LLM request(由 brief 折进的 opening 渲染而来)含 `REVIEW_ONLY`。
+- **回归护栏**:pivot 前的旧目标 dangerous write 两侧都不执行——`assert_tool_executions(coord_handler,
+  DANGEROUS_WRITE, 0)` 与 `assert_tool_executions(reviewer_handler, DANGEROUS_WRITE, 0)`(共享 store、独立
+  handler 使执行计数可分辨),reviewer 改做一次 `SAFE_READ`(count==1)。另断言 spawner
+  `ids_calls/spawn_calls/summarize_calls` 各 1、`assert_trace(&ctx).subagent_count(1)`、单一 committed turn 无
+  pending、`assert_pivot_after_tool_result(conv, PIVOT_TEXT)`。无 provider wire mock、无真实 sleep/网络(<1s)。
+- **验证结果(全部通过)**:`cargo fmt --all -- --check` 干净;
+  `cargo test --test agent_complex_subagent complex_pivot_then_subagent_uses_rerendered_brief`(1 passed);
+  `cargo test --test agent_complex_subagent`(2 passed);`cargo clippy --all-targets -- -D warnings` 无告警;
+  `cargo test --all --all-targets` 全绿(所有测试二进制 0 failed);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
 ### [TODO] M4-4 更新文档、运行说明与测试矩阵
 

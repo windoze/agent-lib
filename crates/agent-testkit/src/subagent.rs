@@ -77,6 +77,7 @@ pub struct ScriptedSubagentSpawner {
     source: ChildSource,
     summaries: Mutex<VecDeque<String>>,
     default_summary: String,
+    briefs: Mutex<Vec<Interaction>>,
     ids_calls: AtomicUsize,
     spawn_calls: AtomicUsize,
     summarize_calls: AtomicUsize,
@@ -116,6 +117,18 @@ impl ScriptedSubagentSpawner {
         self.summarize_calls.load(Ordering::SeqCst)
     }
 
+    /// Returns, in `spawn` order, every brief the handler handed this spawner.
+    ///
+    /// The reference [`DrivingSubagentHandler`] passes the emitting
+    /// `NeedSubagent`'s brief straight through to [`spawn`](SubagentSpawner::spawn),
+    /// so this is where a test observes that the brief the parent produced (for
+    /// example after a mid-turn pivot re-rendered the parent's request) actually
+    /// reached the child derivation, rather than a stale opening goal.
+    #[must_use]
+    pub fn briefs(&self) -> Vec<Interaction> {
+        self.briefs.lock().expect("briefs mutex").clone()
+    }
+
     /// Wraps this spawner in a [`DrivingSubagentHandler`] that refuses to derive a
     /// child at depth `>= max_depth`.
     ///
@@ -136,9 +149,13 @@ impl SubagentSpawner for ScriptedSubagentSpawner {
     fn spawn(
         &self,
         _spec_ref: &AgentSpecRef,
-        _brief: &Interaction,
+        brief: &Interaction,
         _result_schema: Option<&Value>,
     ) -> Result<SpawnedChild, AgentError> {
+        self.briefs
+            .lock()
+            .expect("briefs mutex")
+            .push(brief.clone());
         let nth = self.spawn_calls.fetch_add(1, Ordering::SeqCst);
         match &self.source {
             ChildSource::Factory(factory) => Ok(factory()),
@@ -267,6 +284,7 @@ impl ScriptedSubagentSpawnerBuilder {
             source,
             summaries: Mutex::new(self.summaries),
             default_summary: self.default_summary,
+            briefs: Mutex::new(Vec::new()),
             ids_calls: AtomicUsize::new(0),
             spawn_calls: AtomicUsize::new(0),
             summarize_calls: AtomicUsize::new(0),
