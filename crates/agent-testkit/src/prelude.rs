@@ -4,8 +4,9 @@
 //! `agent-lib` agent-effect types alongside the kit's own helpers as later
 //! milestones fill in the [`crate`] modules. For now this surfaces the machine
 //! and step contract so downstream tests can name the effect boundary without a
-//! deep import path.
+//! deep import path, plus the deterministic id source.
 
+pub use crate::ids::{RequirementAllocation, SeqIds};
 pub use agent_lib::agent::{
     AgentMachine, DefaultAgentMachine, LlmStepMode, Requirement, RequirementKind, StepInput,
     StepOutcome,

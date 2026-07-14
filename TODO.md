@@ -68,7 +68,7 @@ provider raw body 录入 cassette;不得依赖真实 sleep、网络或 credentia
   `-p agent-testkit` 单独验证 testkit rustdoc 无 warning。后续里程碑如需默认一并出 testkit 文档,可再评估
   `default-members`,当前未做此改动以避免超出 M1-1 范围。
 
-### [TODO] M1-2 实现 deterministic id source: `SeqIds`
+### [DONE] M1-2 实现 deterministic id source: `SeqIds`
 
 **前置依赖**:M1-1。
 
@@ -94,6 +94,35 @@ testkit 需要一个 clone 后共享计数器的 id source,确保 parent/child/s
 - 单测:失败模式返回 `RequirementError::IdUnavailable` / `ToolRuntimeError::IdUnavailable`。
 - 单测:分配日志能按 tag 查询。
 - 跑全套验证命令。
+
+**完成记录**(2026-07-14):
+
+- **`SeqIds` 结构**:`crates/agent-testkit/src/ids.rs` 实现 `SeqIds { shared: Arc<Shared>, base: u64,
+  label: Arc<str> }`。`Shared { counter: AtomicU64, base_counter: AtomicU64,
+  requirement_log: Mutex<Vec<RequirementAllocation>>, remaining: AtomicI64 }` 被整棵 clone/fork 树共享。
+- **唯一性模型**:每个 UUID = `((base as u128) << 64) | seq`,`seq` 取自单一共享单调 `AtomicU64`
+  (从 1 起,永不为 nil UUID)。低 64 位全局单调不重复 → 无论 `base` 如何都不会碰撞;`base` 只做高位
+  可读区分。`clone` 保持同 `base` 并共享 counter;`fork(label)` 分配新 `base`(新子树)、共享 counter、
+  携带嵌套可读 label;`named(label)` 同 `base` 重贴 label。
+- **contract 实现**:`impl RequirementIds`(`next_requirement_id`)与 `impl ToolExecutionIds`
+  (`tool_call_id`/`tool_result_message_id`/`next_assistant_message_id`/`next_step_id`)。
+  inherent helpers:`requirement_id`/`run_id`/`agent_id`/`tool_set_id`/`conversation_id`/`turn_id`/
+  `message_id`/`tool_call_id`/`step_id`/`trace_node(node)`。注:inherent 无参 `tool_call_id()` 与
+  trait `ToolExecutionIds::tool_call_id(&call)` 同名共存(inherent 方法优先解析,driver 经 trait bound
+  仍调用 contract 方法),已在文档说明,测试用 UFCS 调用 contract 版本。
+- **分配日志**:`next_requirement_id` 按顺序记录 `RequirementAllocation { tag, id }`。
+  `requirement_log()` 返回全序,`requirement_ids(tag)` 按 tag 过滤(保序)。
+- **失败模式**:`SeqIds::exhausted()` / `with_budget(n)` 用共享 `remaining`(CAS 递减,`-1`=unlimited)
+  控制 contract 方法可成功次数;耗尽后 `next_requirement_id` 返回 `RequirementError::IdUnavailable`、
+  tool 方法返回 `ToolRuntimeError::IdUnavailable`。inherent helpers 不消耗 budget(供 fixtures 构造)。
+- **prelude**:re-export `SeqIds` 与 `RequirementAllocation`。
+- **测试**(`ids.rs` 内 8 个单测):clone 共享 counter 不重复;fork 唯一 + 嵌套 label;named 重贴 label
+  不碰撞;minted id 经 `agent-lib` `parse`/`to_string` 往返一致(证明可被 agent-lib 解析使用);
+  日志按 tag 查询保序;exhausted 两种 `IdUnavailable`;budget 跨 clone 共享且仅 contract 方法消耗。
+- **验证结果**(全绿):`cargo fmt --all`;`cargo clippy --all-targets -- -D warnings`(两 crate 干净);
+  `cargo test -p agent-testkit`(lib 8 + smoke 2 passed);`cargo test --all --all-targets`(全部通过,
+  0 failed;3+1 个 network-gated 用例照旧 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
+  与 `-p agent-testkit` 均干净(修掉两处 redundant-explicit-links);`git diff --check` 干净。
 
 ### [TODO] M1-3 实现 provider-neutral fixtures
 
