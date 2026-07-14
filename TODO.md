@@ -791,7 +791,7 @@ model-visible tool result 返回给 LLM,而不是 panic 或破坏 plan 状态。
   无告警;`cargo test --all --all-targets` 全绿(所有测试二进制 0 failed);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
-### [TODO] M4-2 实现 approval cancel vs context cancel 区分场景
+### [DONE] M4-2 实现 approval cancel vs context cancel 区分场景
 
 **前置依赖**:M4-1。
 
@@ -816,6 +816,42 @@ continuation。两者都应有测试固定。
 - `cargo test --all --all-targets`。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - `git diff --check`。
+
+**完成记录**:
+
+- **落地**:在 `tests/agent_complex_cancel.rs` 新增 `#[tokio::test]`
+  `complex_approval_cancel_does_not_cancel_context_unless_driver_cancels`(对应 `docs/complex-tests.md`
+  §5.2 P1-2),用两个独立 machine/store/ctx 的 phase 钉住 approval `Cancel` 与 `RunContext` cancel 的区别。
+  补充 import:`agent_lib::agent` 的 `InteractionHandler, LlmHandler, RequirementDisposition,
+  RequirementId, RunContext, TraceNodeKind`、`agent_lib::model::tool::ToolStatus`;支持层
+  assertions `assert_interaction_decisions`、tools `DANGEROUS_WRITE, SAFE_READ`;并扩写文件模块级 doc。
+  新增本地 helper `never_resumed_requirement_ids`(扫 trace 抽出 `NeverResumed` requirement id)与两个不同
+  plan-id 常量。未改动任何生产/被测代码或支持层(`tests/complex_support/`),纯新增测试。
+- **Phase A(approval Cancel 只取消单个 tool call)**:`ScriptedInteractionHandler::sequence([Cancel(Some
+  ("not now"))])` 解决 gated `dangerous_write`;机器把 `ApprovalDecision::Cancel` fold 成合成
+  `ToolStatus::Cancelled` result,dangerous tool 不执行,LLM loop 继续——后续 `safe_read` 正常执行,final
+  text 收尾。断言:`!ctx_a.is_cancelled()`(KEY:approval cancel 不动 context);
+  `assert_tool_executions(DANGEROUS_WRITE,0)` 且 `SAFE_READ,1`;`assert_interaction_decisions(log,1)`;
+  `never_resumed_requirement_ids(ctx_a)` 为空(无 never-resume);board 空(危险写无 side effect);committed
+  1 turn、pending none、`tool_result_status("a-danger",Cancelled)`(唯一识别 Cancel 决策,Deny 会 fold 成
+  Denied)、`("a-safe",Ok)`、`last_assistant_text("continued after the approval cancel")`。
+- **Phase B(driver cancel abandon outstanding requirement,never-resume)**:全新 machine/store/ctx 避免污染;
+  `CancelOnCall::after(ScriptedLlmHandler::from_steps([tool_use([safe_read "b-safe"])]))` 在 LLM 首次返回后取消
+  ctx,drain loop 顶部检测到 cancelled → abandon 那个 outstanding `NeedTool`(never-resume),tool handler 从不
+  执行。断言:`ctx_b.is_cancelled()`(KEY:与 phase A 相反);`cancel_llm.cancelled()`、
+  `cancel_log.cancelled_at()==Some(0)`、`dispatched()==1`(模型未被要求 resume);
+  `assert_tool_executions(SAFE_READ,0)` 且 board 空(handler 未跑、未碰 store);trace 恰有一个 never-resumed 且为
+  `Tool`,`resolved_at_scope(0).never_resumed()`;abandon 走 `CancelDisposition::ResumeTurn`,给 outstanding
+  call 合成 `Cancelled` result 使 pending turn coherent(`open_call_count(0)`),但因无 final answer 收尾故未提交
+  ——`committed_turns(0)`、`pending_present()`、`tool_result_status("b-safe",Cancelled)`。
+- **两 cancel 可区分性**:trace never-resumed 计数(A=0 / B=1)+ `is_cancelled` 标志(A=false / B=true)+ tool
+  执行计数(A 的 safe_read=1 vs B 的 safe_read=0)。无 panic、无 wrong-family error、无 provider wire mock、无真实
+  sleep/网络(<1s)。
+- **验证结果(全部通过)**:`cargo fmt --all -- --check` 干净;
+  `cargo test --test agent_complex_cancel complex_approval_cancel_does_not_cancel_context_unless_driver_cancels`
+  (1 passed);`cargo test --test agent_complex_cancel`(2 passed);`cargo clippy --all-targets -- -D warnings`
+  无告警;`cargo test --all --all-targets` 全绿(所有测试二进制 0 failed);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
 ### [TODO] M4-3 实现 pivot 后 subagent brief 使用重渲染 request 场景
 
