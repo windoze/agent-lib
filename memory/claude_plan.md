@@ -1,55 +1,53 @@
 # Claude 执行计划
 
-## 当前任务:M2-2 新增 `NeedExternalSession` requirement 与结果变体
+## 当前任务:M2-3 定义 `ExternalSessionHandler` trait 并接入 `HandlerScope`
 
-**前置依赖**:M2-1(已 DONE)。
+**前置依赖**:M2-2(已 DONE)。
 
 ### 思路
-在 `src/agent/requirement.rs` 的三个枚举里增量新增 external 家族,复用 M2-1 已落地的
-`ExternalSessionRequest` / `ExternalSessionResult` DTO,保持既有变体与 serde tag 名零回归。
+按既有 handler 家族(llm/tool/interaction/subagent/reconfig)的模式,在 `src/agent/drive.rs`
+增量新增 external-session handler 家族:定义 trait、给 `HandlerScope` 加 `external()` 访问器、
+把 M2-2 已留的两个占位分派臂(`scope_handles` / `fulfill_with_scope`)接到真实 handler。
 
-### 做什么(精确改动点)
-1. `RequirementKindTag` 增加 `ExternalSession` 变体(snake_case → `external_session`),更新其 `Display`。
-2. `RequirementKind` 增加 `NeedExternalSession { request: ExternalSessionRequest }`(可 serde);
-   更新 `RequirementKind::tag()`。
-3. `RequirementResult` 增加 `ExternalSession(Box<ExternalSessionResult>)`(Box 防 enum 膨胀);
-   更新 `RequirementResult::tag()`。
-4. `RequirementKind::accepts`:tag 对齐已覆盖 external(无需额外校验,与 Reconfig 一致)。
-5. drive.rs 编译修复(exhaustive match):
-   - `scope_handles`:`ExternalSession => false`(M2-3 才接 `external()` 访问器)。
-   - `fulfill_with_scope`:`NeedExternalSession { .. } => None`(暂无 handler,pop 到 outer;M2-3 接入)。
-   这不是 workaround 掩盖 spec:external handler 属 M2-3 范围,本轮无 handler 是正确增量态。
-6. 编译器指出的其它 exhaustive match 一并补齐。
-7. mod.rs 重导出:新增的是枚举变体,`ExternalSessionRequest`/`ExternalSessionResult` 及三枚举已在重导出列表,
-   无需新增命名类型。
+### 精确改动点
+1. `drive.rs` 导入:agent 导入列表加入 `ExternalSessionRequest`。
+2. 新增 `#[async_trait] pub trait ExternalSessionHandler: Send + Sync`,
+   `async fn fulfill(&self, request: &ExternalSessionRequest, ctx: &RunContext) -> RequirementResult;`
+   rustdoc 写明语义(把 session 推进到下一决策点 Completed/PausedForInteraction/Failed,
+   期间 event 放进 observations;返回值必须是 `RequirementResult::ExternalSession`)。设计 §5.5。
+3. `HandlerScope` 加 `fn external(&self) -> Option<&dyn ExternalSessionHandler> { None }`。
+4. `scope_handles`:`ExternalSession => scope.external().is_some()`(替换 M2-2 的 `=> false`)。
+5. `fulfill_with_scope`:`NeedExternalSession { request } => Some(scope.external()?.fulfill(request, ctx).await)`
+   (替换 M2-2 的 `=> None`)。external 不加深 scope(与非 subagent 家族一致)。
+6. `mod.rs`:`pub use drive::{...}` 加 `ExternalSessionHandler`。
+7. 模块 rustdoc:去掉 "up to four handlers" 陈旧计数(现有 reconfig 已使其失真),
+   改为不带数字的措辞,并把 reconfig/external 补进家族列表。
 
-### 测试(requirement.rs tests 模块)
-- `ALL_TAGS` 增加 `ExternalSession`;`kind_of`/`result_of` 增加 external 分支(构造 sample request/result)。
-  这会让既有 `accepts_matrix`、`every_requirement_kind_round_trips` 自动覆盖 external。
-- 新增 `external_requirement_accepts_only_external_result`:断言 `NeedExternalSession` 只 accept
-  `RequirementResult::ExternalSession`,拒绝其它家族。
-- 新增 `external_requirement_tag_roundtrip`:`RequirementKind`/`RequirementResult` 的 `tag()` 一致 +
-  `RequirementKind` serde round-trip。
-- 过滤名:`cargo test --lib external_requirement`。
+### 测试(drive.rs tests,过滤名 `external_session_handler`)
+- 新增 external 构造子(参考 requirement.rs 测试:request=Start、result=Completed)。
+- `TestScope` 增加 `external: Option<...>` 字段与 `external()` 访问器;新增计数型
+  `CountingExternalSessionHandler` fixture 返回固定 `ExternalSessionResult::Completed`。
+- `external_session_handler_result_is_accepted_by_its_requirement`:直接 fulfill,结果被
+  `NeedExternalSession` 的 `accepts` 接受(对齐既有 `*_handler_result_is_accepted_by_its_requirement`)。
+- `external_session_handler_drain_fulfills_locally`:drain 一个 `NeedExternalSession`,scope 提供
+  `external()`,cursor Done、handler 被调 1 次、resume tag == ExternalSession。
+- `external_session_handler_default_scope_pops_to_outer`:inner 无 external、outer 有 external,
+  drain 后 outer handler 被调 1 次(popped to outer),inner 未被触及。
 
 ### 验证门
 1. `cargo fmt --all -- --check`
-2. `cargo test --lib external_requirement`(聚焦)
+2. `cargo test --lib external_session_handler`(聚焦)
 3. `cargo clippy --all-targets -- -D warnings`
 4. `cargo test --all --all-targets`(≤30min;credential-gated 保持 ignored)
 5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
 6. `git diff --check`
 
 ### 进度
-- (进行中)已完成前置代码核对,开始改 requirement.rs。
+- (进行中)已完成代码核对,开始改 drive.rs。
 
-## 进度更新(M2-2 完成)
-- requirement.rs 三枚举各加 external 家族(tag `external_session`、`NeedExternalSession { request }`、
-  `ExternalSession(Box<ExternalSessionResult>)`),两个 tag() + Display 各加一臂;accepts 无特例(tag 对齐)。
-- 编译修复:drive.rs `scope_handles => false`、`fulfill_with_scope => None`(M2-3 才接 external() 访问器,
-  正确增量态,非 workaround);testkit describe_requirement 加 external 摘要臂。
-- 测试:ALL_TAGS 5→6、kind_of/result_of 加 external;新增 accepts_only / tag_roundtrip 两测;display 补齐。
-- 完整验证序列全绿:fmt ✓;`cargo test --lib external_requirement` 2 passed ✓;clippy -D warnings ✓;
-  `cargo test --all --all-targets` 全绿(lib 427、testkit 131,0 failed)✓;doc -D warnings ✓;diff --check ✓。
-- TODO.md M2-2 [TODO]→[DONE] + 完成记录。PLAN.md 未改(纯 milestone 内推进)。
-- 下一步:提交 [M2-2],停止;下轮从 M2-3 继续。
+## 进度更新(M2-3 完成)
+- drive.rs 新增 `ExternalSessionHandler` trait + `HandlerScope::external()` 访问器;
+  `scope_handles`/`fulfill_with_scope` 两处 external 分派臂由 M2-2 占位改为真实 handler(不加深 scope)。
+- mod.rs 重导出 `ExternalSessionHandler`;模块/trait rustdoc 去掉陈旧 "four handlers" 计数并补 reconfig/external。
+- 3 个新测(过滤名 external_session_handler)全过;完整验证序列全绿(lib 430、testkit 131,0 failed)。
+- TODO.md 已标 [DONE] 并填完成记录。待提交。

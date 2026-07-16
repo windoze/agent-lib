@@ -12,7 +12,7 @@
 //!
 //! # Scope and handlers
 //!
-//! A [`HandlerScope`] offers up to four handlers, one per
+//! A [`HandlerScope`] offers up to one handler per
 //! [`RequirementKind`] family. Each accessor
 //! defaults to `None`, meaning "this layer cannot fulfill that family" — such a
 //! requirement pops outward. A layer overrides only the accessors it can serve:
@@ -27,6 +27,10 @@
 //! - [`SubagentHandler`] fulfills a `NeedSubagent` by deriving and driving a
 //!   child agent. Only its *signature* is defined in this stage; the
 //!   implementation lands in M5.
+//! - [`ReconfigHandler`] fulfills a `NeedReconfigRegistry` by swapping the
+//!   active tool registry at a turn boundary.
+//! - [`ExternalSessionHandler`] fulfills a `NeedExternalSession` by advancing an
+//!   external coding-agent session one decision point.
 //!
 //! Handlers are `async` because they perform the real IO the sans-io machine
 //! deferred; all `await`ing lives here, never in `step`.
@@ -44,7 +48,7 @@
 //!
 //! # What this module defines
 //!
-//! [`HandlerScope`] and the four handler traits give one drain layer its effect
+//! [`HandlerScope`] and its handler traits give one drain layer its effect
 //! handlers (M3-1). [`drain`] is the reference driver loop: it pulls an
 //! [`AgentMachine`] one [`step`](AgentMachine::step) at a time, fulfills each
 //! [`Requirement`] it hands back through the scope
@@ -80,6 +84,7 @@ use crate::{
         Notification, Requirement, RequirementDisposition, RequirementId, RequirementKind,
         RequirementResolution, RequirementResult, RunContext, RunContextError, StepInput,
         ToolSetRef, TraceNodeId,
+        external::ExternalSessionRequest,
         interaction::Interaction,
         requirement::{AgentSpecRef, RequirementKindTag},
     },
@@ -102,7 +107,7 @@ pub use subagent::{DrivingSubagentHandler, SpawnedChild, SubagentSpawner};
 
 /// One drain layer's set of effect handlers.
 ///
-/// A scope exposes up to four handlers, one per requirement family. Each
+/// A scope exposes up to one handler per requirement family. Each
 /// accessor defaults to `None`, so an empty scope handles nothing and every
 /// requirement pops to the outer scope. A layer overrides only the families it
 /// can fulfill. See the [module docs](self) for how scopes compose into a drain.
@@ -131,6 +136,12 @@ pub trait HandlerScope: Send + Sync {
     /// Returns this layer's [`ReconfigHandler`], if it fulfills
     /// `NeedReconfigRegistry`.
     fn reconfig(&self) -> Option<&dyn ReconfigHandler> {
+        None
+    }
+
+    /// Returns this layer's [`ExternalSessionHandler`], if it fulfills
+    /// `NeedExternalSession`.
+    fn external(&self) -> Option<&dyn ExternalSessionHandler> {
         None
     }
 }
@@ -221,6 +232,35 @@ pub trait SubagentHandler: Send + Sync {
 pub trait ReconfigHandler: Send + Sync {
     /// Resolves and installs the registry for `tool_set`, returning confirmation.
     async fn fulfill(&self, tool_set: &ToolSetRef, ctx: &RunContext) -> RequirementResult;
+}
+
+/// Fulfills a `NeedExternalSession` requirement by advancing an external
+/// coding-agent session (Claude Code / Codex / …) one decision point.
+///
+/// The machine holds no runtime connection, so the whole session lives on the
+/// driver side: this handler owns the runtime and advances the session
+/// described by `request` until it reaches its next decision point — the runtime
+/// finished this step ([`Completed`](crate::agent::ExternalSessionResult::Completed)),
+/// paused awaiting an interaction
+/// ([`PausedForInteraction`](crate::agent::ExternalSessionResult::PausedForInteraction)),
+/// or failed ([`Failed`](crate::agent::ExternalSessionResult::Failed)) — never
+/// running it to completion in one blocking call (design §5.5). Every event
+/// observed on the way to that decision point is buffered into the result's
+/// `observations` so the machine can convert them into notifications after
+/// resume.
+///
+/// The returned [`RequirementResult`] must be a
+/// [`RequirementResult::ExternalSession`]; launch or session-loss failures are
+/// carried inside its `Failed` variant, not by returning the wrong family.
+#[async_trait]
+pub trait ExternalSessionHandler: Send + Sync {
+    /// Advances the session described by `request` to its next decision point
+    /// and returns the observed result.
+    async fn fulfill(
+        &self,
+        request: &ExternalSessionRequest,
+        ctx: &RunContext,
+    ) -> RequirementResult;
 }
 
 /// Outcome of draining one machine to the end of a turn.
@@ -497,9 +537,7 @@ fn scope_handles(scope: &dyn HandlerScope, tag: RequirementKindTag) -> bool {
         RequirementKindTag::Interaction => scope.interaction().is_some(),
         RequirementKindTag::Subagent => scope.subagent().is_some(),
         RequirementKindTag::Reconfig => scope.reconfig().is_some(),
-        // Wiring the `external()` accessor is M2-3; until then no scope offers an
-        // external-session handler and the requirement pops outward.
-        RequirementKindTag::ExternalSession => false,
+        RequirementKindTag::ExternalSession => scope.external().is_some(),
     }
 }
 
@@ -532,9 +570,11 @@ async fn fulfill_with_scope(
         RequirementKind::NeedReconfigRegistry { tool_set } => {
             Some(scope.reconfig()?.fulfill(tool_set, ctx).await)
         }
-        // No external-session handler is wired into `HandlerScope` until M2-3, so
-        // this requirement is never fulfilled here and pops outward.
-        RequirementKind::NeedExternalSession { .. } => None,
+        // Like the other non-subagent families, an external session is fulfilled
+        // in place when this scope offers a handler, and otherwise pops outward.
+        RequirementKind::NeedExternalSession { request } => {
+            Some(scope.external()?.fulfill(request, ctx).await)
+        }
     }
 }
 
@@ -671,16 +711,26 @@ async fn fulfill_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::{HandlerScope, InteractionHandler, LlmHandler, ScopePop, ToolHandler, drain};
+    use super::{
+        ExternalSessionHandler, HandlerScope, InteractionHandler, LlmHandler, ScopePop,
+        ToolHandler, drain,
+    };
     use crate::{
         agent::{
-            AgentError, AgentErrorKind, AgentInput, AgentMachine, ApprovalDecision,
+            AgentError, AgentErrorKind, AgentId, AgentInput, AgentMachine, ApprovalDecision,
             ApprovalRequirement, ApprovalResponse, BudgetLimits, LlmStepMode, LoopCursor,
             LoopCursorKind, LoopDoneReason, Requirement, RequirementDisposition, RequirementId,
             RunContext, RunId, StepInput, StepOutcome, ToolApprovalPolicy, TraceNodeId,
             TraceNodeKind,
+            external::{
+                ExternalAgentOutput, ExternalPermissionMode, ExternalRuntimeKind,
+                ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef,
+                ExternalSessionRequest, ExternalSessionResult, ExternalStreamPolicy,
+                WorktreeIsolation,
+            },
             interaction::{Interaction, InteractionKind, InteractionResponse},
             requirement::{RequirementKind, RequirementKindTag, RequirementResult},
+            spec::WorktreeRef,
             tool::{ToolRegistry, ToolRuntimeError},
         },
         client::{Capability, ChatRequest, ClientError, LlmClient, Response},
@@ -752,6 +802,50 @@ mod tests {
             "stop_reason": { "value": "end_turn", "raw": "end_turn" }
         }))
         .expect("response")
+    }
+
+    fn agent_id() -> AgentId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890d1"
+            .parse()
+            .expect("agent id")
+    }
+
+    fn external_session_request() -> ExternalSessionRequest {
+        ExternalSessionRequest {
+            agent_id: agent_id(),
+            runtime: ExternalRuntimeKind::ClaudeCode,
+            worktree: WorktreeRef::new("/repo/agent-lib"),
+            session: None,
+            input: ExternalSessionInput::Start {
+                prompt: "Refactor the parser.".to_owned(),
+            },
+            tools: Vec::new(),
+            policy: ExternalSessionPolicy {
+                permission_mode: ExternalPermissionMode::Prompt,
+                isolation: WorktreeIsolation::Shared,
+                max_turns: Some(8),
+                stream_events: ExternalStreamPolicy::Buffered,
+            },
+        }
+    }
+
+    fn external_session_result() -> ExternalSessionResult {
+        ExternalSessionResult::Completed {
+            session: ExternalSessionRef {
+                runtime: ExternalRuntimeKind::ClaudeCode,
+                session_id: Some("sess-1".to_owned()),
+                transcript_ref: None,
+                resume_token: None,
+                last_event_seq: Some(3),
+            },
+            output: ExternalAgentOutput {
+                summary: "refactor complete".to_owned(),
+                artifacts: Vec::new(),
+                usage: None,
+                cost_micros: None,
+            },
+            observations: Vec::new(),
+        }
     }
 
     /// Minimal [`LlmClient`] that always returns a fixed complete response.
@@ -1052,6 +1146,15 @@ mod tests {
         )
     }
 
+    fn external_requirement(n: u8) -> Requirement {
+        Requirement::at_root(
+            requirement_id_n(n),
+            RequirementKind::NeedExternalSession {
+                request: external_session_request(),
+            },
+        )
+    }
+
     /// A minimal machine that emits a fixed requirement batch on the external
     /// input, then completes once every requirement in the batch is resumed.
     ///
@@ -1179,6 +1282,24 @@ mod tests {
         }
     }
 
+    /// Counts fulfillments and returns a fixed `Completed` external result.
+    #[derive(Clone, Default)]
+    struct CountingExternalSessionHandler {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ExternalSessionHandler for CountingExternalSessionHandler {
+        async fn fulfill(
+            &self,
+            _request: &ExternalSessionRequest,
+            _ctx: &RunContext,
+        ) -> RequirementResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            RequirementResult::ExternalSession(Box::new(external_session_result()))
+        }
+    }
+
     /// Records the completion order of a concurrent tool batch, delaying each
     /// fulfillment by the `delay` yield count carried in the tool call input.
     #[derive(Clone, Default)]
@@ -1209,6 +1330,7 @@ mod tests {
         tool: Option<CountingToolHandler>,
         interaction: Option<CountingInteractionHandler>,
         delay_tool: Option<DelayToolHandler>,
+        external: Option<CountingExternalSessionHandler>,
     }
 
     impl HandlerScope for TestScope {
@@ -1225,6 +1347,12 @@ mod tests {
             self.interaction
                 .as_ref()
                 .map(|handler| handler as &dyn InteractionHandler)
+        }
+
+        fn external(&self) -> Option<&dyn ExternalSessionHandler> {
+            self.external
+                .as_ref()
+                .map(|handler| handler as &dyn ExternalSessionHandler)
         }
     }
 
@@ -1345,6 +1473,89 @@ mod tests {
         // interaction did not loop back through any tool handler.
         assert_eq!(inner_tool.calls.load(Ordering::SeqCst), 0);
         assert_eq!(outer_tool.calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ----- M2-3: external-session handler dispatch -----
+
+    #[tokio::test]
+    async fn external_session_handler_result_is_accepted_by_its_requirement() {
+        let scope = TestScope {
+            external: Some(CountingExternalSessionHandler::default()),
+            ..TestScope::default()
+        };
+        let ctx = run_context();
+        let request = external_session_request();
+
+        let result = scope
+            .external()
+            .expect("external handler")
+            .fulfill(&request, &ctx)
+            .await;
+
+        assert!(matches!(
+            result,
+            RequirementResult::ExternalSession(ref boxed)
+                if matches!(**boxed, ExternalSessionResult::Completed { .. })
+        ));
+        let kind = RequirementKind::NeedExternalSession { request };
+        kind.accepts(&result)
+            .expect("external result aligns with kind");
+    }
+
+    #[tokio::test]
+    async fn external_session_handler_drain_fulfills_locally() {
+        let external = CountingExternalSessionHandler::default();
+        let scope = TestScope {
+            external: Some(external.clone()),
+            ..TestScope::default()
+        };
+        let mut machine = BatchMachine::new(vec![external_requirement(1)]);
+        let ctx = run_context();
+
+        let done = drain(&mut machine, external_input(), &scope, None, &ctx)
+            .await
+            .expect("drain completes");
+
+        assert!(matches!(done.cursor(), LoopCursor::Done(_)));
+        assert_eq!(external.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            machine.resume_tags,
+            vec![RequirementKindTag::ExternalSession]
+        );
+    }
+
+    #[tokio::test]
+    async fn external_session_handler_default_scope_pops_to_outer() {
+        // The inner layer offers no external handler; the requirement pops to the
+        // outer layer that does — resolved there, never re-entering the inner
+        // scope (the inner tool handler stays untouched).
+        let inner_tool = CountingToolHandler::default();
+        let inner = TestScope {
+            tool: Some(inner_tool.clone()),
+            ..TestScope::default()
+        };
+        let outer_external = CountingExternalSessionHandler::default();
+        let outer = TestScope {
+            external: Some(outer_external.clone()),
+            ..TestScope::default()
+        };
+        let mut parent = ScopePop::new(&outer, None);
+        let mut machine = BatchMachine::new(vec![external_requirement(2)]);
+        let ctx = run_context();
+
+        let done = drain(
+            &mut machine,
+            external_input(),
+            &inner,
+            Some(&mut parent),
+            &ctx,
+        )
+        .await
+        .expect("drain completes");
+
+        assert!(matches!(done.cursor(), LoopCursor::Done(_)));
+        assert_eq!(outer_external.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner_tool.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

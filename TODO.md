@@ -305,7 +305,7 @@ NeedSubagent/NeedReconfigRegistry`;`RequirementKindTag`(约 131 行)与之一一
   集成测试保持 ignored,与基线一致);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;
   `git diff --check` 干净。
 
-### [TODO] M2-3 定义 `ExternalSessionHandler` trait 并接入 `HandlerScope`
+### [DONE] M2-3 定义 `ExternalSessionHandler` trait 并接入 `HandlerScope`
 
 **前置依赖**:M2-2。
 
@@ -338,6 +338,38 @@ trait(`LlmHandler` 等)均为 `#[async_trait]`,`fulfill(...) -> RequirementResul
   `accepts`;另一个测试断言缺省 scope 会把该 requirement pop 到 outer。过滤名:
   `cargo test --lib external_session_handler`。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- `src/agent/drive.rs`:新增 `#[async_trait] pub trait ExternalSessionHandler: Send + Sync`,方法
+  `async fn fulfill(&self, request: &ExternalSessionRequest, ctx: &RunContext) -> RequirementResult`,
+  rustdoc 写明契约(把 session 推进到下一决策点 Completed/PausedForInteraction/Failed,期间 event 缓冲进
+  result 的 `observations`;返回值必须是 `RequirementResult::ExternalSession`,launch/session-lost 失败装进
+  `Failed` 变体而非返回错误家族;设计 §5.5)。
+- `HandlerScope` 增加 `fn external(&self) -> Option<&dyn ExternalSessionHandler> { None }` 访问器,与其它
+  家族一致默认 `None`。
+- 分派接线:`scope_handles` 的 `ExternalSession` 臂由 M2-2 占位 `=> false` 改为
+  `scope.external().is_some()`;`fulfill_with_scope` 的 `NeedExternalSession { request }` 臂由占位 `=> None`
+  改为 `Some(scope.external()?.fulfill(request, ctx).await)`。external 属非 subagent 家族,不加深 scope,未命中
+  本层则经既有 pop 路径外弹(§4.2/§7.3),行为与 llm/tool/interaction/reconfig 对齐。
+- 导入与重导出:`drive.rs` agent 导入加入 `external::ExternalSessionRequest`;`src/agent/mod.rs` 的
+  `pub use drive::{...}` 加入 `ExternalSessionHandler`。
+- 文档:模块级 rustdoc 去掉陈旧的 "up to four handlers" 计数(reconfig 已使其失真),改为「up to one handler
+  per family」并把 reconfig/external 两个家族补进 handler 列表;`HandlerScope` trait 文档同步去数字化;
+  "the four handler traits" → "its handler traits"。
+- 测试(`drive.rs` tests,过滤名 `external_session_handler`):新增 `agent_id()`/`external_session_request()`/
+  `external_session_result()`(Completed 变体)构造子与计数型 `CountingExternalSessionHandler` fixture;
+  `TestScope` 增加 `external` 字段与 `external()` 访问器;`external_requirement(n)` 构造子。三个新测:
+  `external_session_handler_result_is_accepted_by_its_requirement`(直接 fulfill,结果被
+  `NeedExternalSession::accepts` 接受)、`external_session_handler_drain_fulfills_locally`(drain 命中本层
+  `external()`,cursor Done、handler 调用 1 次、resume tag == `ExternalSession`)、
+  `external_session_handler_default_scope_pops_to_outer`(inner 无 external、outer 有,drain 后 outer handler
+  调 1 次、inner tool 未触及)。
+- **验证结果(完整序列全绿)**:`cargo fmt --all -- --check` 无差异;`cargo test --lib external_session_handler`
+  3 passed;`cargo clippy --all-targets -- -D warnings` 无告警;`cargo test --all --all-targets` 全绿
+  (lib 430 passed〔427 基线 +3 新测〕、testkit 131 passed、各集成/doc/replay 二进制 0 failed;仅既有
+  credential-gated 集成测试保持 ignored,与基线一致);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --workspace` 无告警;`git diff --check` 干净。
 
 ### [TODO] M2-4 在 testkit 实现 `ScriptedExternalSessionHandler` 与 fixtures
 
