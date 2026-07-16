@@ -209,6 +209,13 @@ External agent 可以被注入工具,但这些工具应是宿主能力的薄 ada
 这样 CC/CX/OpenCode 即使有自己的内置工具,也可以通过注入这些桥接工具参与同一个 mixed-agent
 Session。
 
+> **已实现(M6-3)。** 上表的桥接工具由 `agent::collab` 模块提供:`bridge_tool_set` /
+> `bridge_tool_declarations` 打包 model 可见声明供注入为 `initial_tools`;`CollabToolHandler`
+> 是执行内联(非 spawn)工具的 `ToolHandler`,它先检查 `RunContext` 取消状态,并用**注入的** agent
+> identity 作为 claim/post/send 的 owner/sender(model 不能伪造)。`spawn_agent` 因为要加深 scope
+> 链而不作为内联工具执行:`SpawnAgentRequest::parse` 把工具调用翻译成
+> `RequirementKind::NeedSubagent`,复用既有 `SubagentHandler` 派生路径。
+
 ### 3.5 外部 agent 通信走本库协议
 
 Claude Code 的普通 subagent 只把结果回报给调用方。Claude Code Agent Teams 有共享 task list 和 mailbox,
@@ -222,6 +229,12 @@ Claude Code 的普通 subagent 只把结果回报给调用方。Claude Code Agen
 
 外部 agent 通过注入工具访问这些原语。内部 agent、CC/CX/OpenCode agent 使用同一个协议,才能跨 runtime
 协作、测试和回放。
+
+> **已实现(M6-3)。** 三个原语都是 `agent::collab` 下的一等 Rust API:`Plan`(CAS + 依赖完成检查的
+> `claim` / `claim_first_available` / `update_status`,`depends_on` 边、非法转换与循环防御)、
+> `Blackboard`(按 channel 命名空间、零基单调 offset 的 append-only 日志)、`Mailbox`(全局单调
+> `seq` 的定向消息层)。数据形态(`PlanSnapshot` / `BoardMessage` / `MailMessage`)与 live handle
+> 分离(设计 §5 API-first),桥接工具只是它们之上的薄 adapter。
 
 ## 4. 概念数据模型
 

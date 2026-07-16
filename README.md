@@ -22,7 +22,7 @@
 | `client` | `EndpointConfig`、认证、结构化 capability、分类错误，以及 dyn-safe 的 `LlmClient` trait。 |
 | `adapter` | Anthropic Messages 与 OpenAI Responses 的 HTTP / SSE 适配器。 |
 | `conversation` | 强类型 identity、`Conversation`、`PendingTurn` 事务、`Boundary`、fork、projection / compaction、snapshot / restore。 |
-| `agent` | data-only 的 Agent 配置与状态、sans-io `AgentMachine`、`Requirement` 副作用模型和参考 driver。 |
+| `agent` | data-only 的 Agent 配置与状态、sans-io `AgentMachine`、`Requirement` 副作用模型和参考 driver;`agent::collab` 提供 plan / blackboard / mailbox 协作原语与桥接工具 adapter。 |
 
 ## 安装
 

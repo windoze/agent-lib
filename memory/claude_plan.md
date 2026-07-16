@@ -1,73 +1,52 @@
-# M6-2 — Task evaluator 与 dispatcher
+# M6-3 — spawn_agent / plan / blackboard / mailbox 工具 adapter
 
-**状态:完成(全绿,已提交)。** 本次执行 TODO.md 第一个未完成任务 = M6-2(Milestone 6 第二个任务)。
-前置 M6-1 已 `[DONE]`(worker profile registry / WorktreeIsolation)。
+**状态:已完成(M6-3 已标 `[DONE]`,待提交后停)。** 本次执行 TODO.md 第一个未完成任务 = M6-3。
+前置 M6-2 已 `[DONE]`(dispatcher / TaskEvaluator / WorkerChoice::into_subagent → NeedSubagent)。
 
-## 任务要求(TODO.md M6-2)
-- 定义 `TaskDescriptor`(任务类型/影响范围/风险/不确定性/预算等维度)与 `WorkerChoice`。
-- 实现 `RuleRouter`(确定性映射)与 `Dispatcher`:先跑规则路由,未决则回退到可插拔
-  `Evaluator` trait(LLM 版留接口,测试用 scripted evaluator)。
-- dispatcher 输出为「派生哪个 worker 的 `NeedSubagent`(spec_ref)」,复用现有 subagent 派生路径,
-  不新造 orchestration runtime。
-- dispatcher 依据 `WorkerProfile`(M6-1)与 `RunContext` 预算(`charge_*`/`check_*`)选择 worker。
-- 验证:`cargo test dispatcher`;完整验证序列全绿。
+## 执行结果(全部完成)
+- [x] `src/agent/collab/{plan,blackboard,mailbox,tools,mod}.rs` 实现完成并接线到 `src/agent/mod.rs`。
+- [x] `src/agent/collab/tests.rs` 24 单测 + `tests/agent_tool_adapter.rs` 2 集成测试(全部含 `tool_adapter`)。
+- [x] 三条必需验证覆盖:spawn_agent→NeedSubagent 并经真实 DrivingSubagentHandler 派生驱动到完成;
+      plan_claim 依赖未完成被拒且零改动;blackboard append-only 且 offset 单调。
+- [x] 文档:`docs/external-agent.md` §3.4/§3.5 增补「已实现(M6-3)」;`README.md` 模块表补 `agent::collab`。
+- [x] 验证序列全绿:`cargo fmt --all`;`cargo clippy --all-targets -- -D warnings` 干净;
+      `cargo test tool_adapter` 26 通过;`cargo test --all --all-targets` 全绿(lib 521 通过);
+      `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净。
+- [x] TODO.md M6-3 标 `[DONE]` 并填完成记录。下一步:commit `[M6-3] ...` 后停(不开始 M6-4)。
 
-## 设计输入(已读)
-- 设计文档 §8(worker 集合)、§9(两层调度:规则路由 + LLM evaluator;评估维度表;示例策略;升级规则)。
-- 现有类型:`WorkerProfile/WorkerProfileRef/WorkerProfileRegistry/Capability/CostTier`
-  (`external/profile.rs`);`AgentSpecRef` + `RequirementKind::NeedSubagent{spec_ref,brief,result_schema}`
-  (`requirement.rs`);`RunContext`(`charge_step/charge_*`、`budget().snapshot()`、`check_cancelled`);
-  `PermissionRisk`(Low<Medium<High<Critical,复用为任务风险维度);`Interaction::question`。
+## 任务要求(TODO.md M6-3)
+- 实现桥接工具 adapter:
+  - `spawn_agent`(→ 结构化请求 → `RequirementKind::NeedSubagent`,复用现有 SubagentHandler 派生路径)
+  - `plan_claim` / `plan_claim_first_available` / `plan_update`(+ `plan_add_task` / `plan_read`)
+  - `blackboard_post` / `blackboard_read`
+  - `send_message`(mailbox)
+  - `report_artifact`(记录为 artifact/notification)
+  - `run_host_tool`(受控转发宿主注册 tool)
+- adapter 必须经宿主 policy/护栏(RunContext:check_cancelled;owner/sender 用注入身份而非模型参数),
+  不直接写外部 runtime 私有 mailbox;claim 必须检查依赖已完成(对齐 docs/agent-layer.md §6.2)。
+- 提供把这些工具注入 external agent `initial_tools` 的构造入口(ToolSetRef 构造 + ToolHandler)。
 
-## 方案(新建 `src/agent/external/dispatch.rs`,与 profile 同模块,避免跨模块循环)
-维度枚举(均 serde + Ord where 有意义):
-- `ImpactScope`:SingleFile<MultiFile<CrossModule<Architectural(影响范围)。
-- `Uncertainty`:Clear<Exploratory<Ambiguous(不确定性)。
-- `CostPreference`:Balanced(default)/CostFirst/SpeedFirst/QualityFirst(§9 用户偏好)。
-- 风险维度复用 `PermissionRisk`。
+## 验证条件(TODO.md)
+- 新增测试:`spawn_agent` adapter 产生 `NeedSubagent` 并经 `SubagentHandler` 派生;`plan_claim` 在未完成
+  依赖时被拒;`blackboard_post`/`read` append-only 且偏移单调。过滤名:`cargo test tool_adapter`。
+- 完整验证序列全绿。
 
-核心类型:
-- `TaskDescriptor{ task_type:Capability, impact:ImpactScope, risk:PermissionRisk,
-  uncertainty:Uncertainty, preference:CostPreference }` + `new`/`with_preference`/accessors(serde data)。
-- `Worker{ profile:WorkerProfileRef, spec:AgentSpecRef }`:把调度 profile 绑定到要派生的子 agent spec。
-- `WorkerRoster{ registry:WorkerProfileRegistry, workers:Vec<Worker> }`:
-  `register(profile,spec)->ref`(同 id 覆盖)、`resolve_worker(ref)`、`profile(ref)`、
-  `cheapest_capable(cap)`、`strongest_capable(cap)`(按 cost_tier 选,tie-break id 升序)。
-- `DispatchReason`:RuleRoute/Evaluator/BudgetDowngrade。
-- `WorkerChoice{ worker:WorkerProfileRef, spec:AgentSpecRef, reason }` +
-  `into_subagent(brief,result_schema)->RequirementKind::NeedSubagent`(复用 subagent 派生路径)。
-- `RuleRouter`(确定性,有序规则):Ambiguous→None;Architectural/risk>=High/(QualityFirst&&>=CrossModule)
-  →strongest_capable;clear&low-risk&<=MultiFile 或 CostFirst&risk<=Medium→cheapest_capable;其余→None。
-- `TaskEvaluator` trait:`evaluate(task,roster)->Option<WorkerProfileRef>`(LLM 版实现此 trait,留接口)。
-- `ScriptedTaskEvaluator`(closure-based,`new`/`always`),用于测试与宿主脚本化决策。
-- `Dispatcher<E:TaskEvaluator>`:`new(evaluator)`/`with_router`/`with_budget_headroom(percent)`。
-  `dispatch(task,roster,ctx)->Result<WorkerChoice,DispatchError>`:
-  1) check_cancelled;
-  2) `budget_is_low(snapshot,headroom%)` → cheapest_capable + BudgetDowngrade(check_* 预算护栏);
-  3) router.route Some → RuleRoute;
-  4) 否则 `ctx.charge_step()`(evaluator 成本,charge_*);budget err → 降级 cheapest;
-  5) evaluator.evaluate Some → Evaluator;None → Err(NoWorker)。
-- `DispatchError`:NoCapableWorker{capability}/NoWorker/UnknownWorker{worker}/Context(RunContextError)(thiserror)。
-- `budget_is_low`:对每个已配置 limit 维度,remaining < headroom% * limit(u128)→low;无 limit→false。默认 20%。
+## 方案(新增 `src/agent/collab/` 一等垂直功能 + 桥接 adapter)
+- `plan.rs`:TaskStatus / Task / PlanSnapshot / Plan(Mutex live handle,Arc 共享)/ PlanError。
+  claim = 版本 CAS + owner + 状态可转 + 依赖全部 Completed;失败零改动。含 detect_cycle。
+- `blackboard.rs`:BoardMessage / Blackboard(命名空间,per-channel 偏移从 0 单调,append-only)。
+- `mailbox.rs`:MailMessage / Mailbox(全局单调 seq,定向 inbox)。
+- `tools.rs`:工具名常量 + Tool 声明 + bridge_tool_set(id)->ToolSetRef 注入入口;
+  SpawnAgentRequest.parse + into_requirement_kind(step_id)->NeedSubagent;ArtifactSink+RecordingArtifactSink;
+  CollabToolHandler(impl ToolHandler):fulfill 先 check_cancelled,再分派;owner/sender=注入身份。
+- tests.rs:单测名含 tool_adapter(3 项验证 + 覆盖)。
+- 接线:src/agent/mod.rs pub mod collab + pub use。
+- 集成测试:tests/agent_tool_adapter.rs(spawn_agent→NeedSubagent→DrivingSubagentHandler 端到端)。
+- 文档:docs/external-agent.md §3.4/§3.5 追加「已实现(M6-3)」。
 
-模块接线:
-- `external/mod.rs`:`mod dispatch;` + `pub use dispatch::{...}`。
-- `src/agent/mod.rs`:`pub use external::{...}` 追加同名导出。
+## 验证序列(完成前)
+cargo fmt --all → cargo clippy --all-targets -- -D warnings → cargo test tool_adapter →
+cargo test --all --all-targets(≤30min)→ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace。
 
-测试(名字含 `dispatcher`,`cargo test dispatcher`):
-1. rule route 命中:clear/low-risk/single-file search → RuleRoute → cheap worker。
-2. 回退 evaluator:ambiguous debug → router None → scripted evaluator 选 strong → Evaluator;断言 charge 了 1 step。
-3. 预算接近上限降级:max_steps=10 预扣 9,heavy 任务本应 strong → BudgetDowngrade → cheap。
-4. `WorkerChoice::into_subagent` 生成 NeedSubagent 且 spec_ref = worker.spec。
-5. evaluator 返回未注册 worker → UnknownWorker;无 capable worker → NoCapableWorker。
-6. `TaskDescriptor` serde round-trip;`budget_is_low` 阈值断言。
-
-## 验证序列
-`cargo fmt --all` → `cargo test dispatcher` → `cargo clippy --all-targets -- -D warnings` →
-`cargo test --all --all-targets`(≤30min)→ `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
-→ `git diff --check`。
-
-## 约束
-- 不新造 orchestration runtime;dispatcher 只“选 worker + 给出 NeedSubagent 输入”,派生走既有 subagent 路径。
-- 所有新公开 API 带 rustdoc;复用 `PermissionRisk`/`Capability`/`AgentSpecRef`,不重复造。
-- 完成后 TODO.md M6-2 标 `[DONE]` + 完成记录;提交 `[M6-2] ...`;停止。
+## 完成后
+标 TODO.md M6-3 为 [DONE] + 填完成记录;commit [M6-3] ...;停。

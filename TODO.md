@@ -1461,7 +1461,7 @@ resume 后一次性把它们转成 `Notification::ExternalAgent` 吐出(经 `Ste
   集成/testkit 全绿,仅 credential-gated ignored)✓;`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
   --workspace` 无告警 ✓;`git diff --check` 干净 ✓。
 
-### [TODO] M6-3 `spawn_agent` / plan / blackboard / mailbox 工具 adapter
+### [DONE] M6-3 `spawn_agent` / plan / blackboard / mailbox 工具 adapter
 
 **前置依赖**:M6-2。
 
@@ -1487,6 +1487,36 @@ API 语义(dependency、claim 前置完成检查、claim-first、CAS 更新)。`
 - 新增测试:`spawn_agent` adapter 产生 `NeedSubagent` 并经 `SubagentHandler` 派生;`plan_claim` 在未完成
   依赖时被拒;`blackboard_post`/`read` append-only 且偏移单调。过滤名:`cargo test tool_adapter`。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- 新增 `src/agent/collab/` 模块,把 plan/blackboard/mailbox 提升为一等 API-first 库原语,再在其上提供薄桥接
+  工具 adapter(设计 §3.4/§3.5、`agent-layer.md` §5/§6.2–§6.4):
+  - `collab/plan.rs`:`Plan`(`Mutex<PlanSnapshot>`,可 `Arc` 共享)。`claim` = 版本 CAS + owner 检查 +
+    合法状态转换 + 全部依赖 `Completed` 的原子检查,任一检查失败不改变 owner/status/version;另有
+    `claim_first_available`(稳定顺序跳过已完成/已认领/被依赖阻塞的任务)、`update_status`(owner + 合法转换)、
+    `add_task`(重复/自依赖/未知依赖/防御性循环检查)。`TaskStatus` 五态 + `can_transition_to` 终态粘滞。
+  - `collab/blackboard.rs`:`Blackboard` 按 channel 命名空间的 append-only 日志,每 channel 零基单调 offset
+    作为逻辑时钟(刻意不加墙钟时间以保持确定性)。
+  - `collab/mailbox.rs`:`Mailbox` 全局单调 `seq` 的定向消息层(设计 §3.5,走本库协议而非外部 runtime 私有
+    inbox)。
+  - `collab/tools.rs`:工具名常量、`bridge_tool_declarations` / `bridge_tool_set`(注入 `initial_tools` 入口)、
+    `CollabToolHandler`(实现 `ToolHandler`:先查 `RunContext` 取消护栏,再用**注入的** agent identity 作为
+    claim/post/send 的 owner/sender——model 不能伪造)、`report_artifact` → `ArtifactSink`、`run_host_tool` →
+    可选宿主 `ToolRegistry`。`spawn_agent` 因加深 scope 链不作内联执行:`SpawnAgentRequest::parse` →
+    `into_requirement_kind` 翻译成 `RequirementKind::NeedSubagent`,复用既有 `SubagentHandler` 派生路径;
+    内联误路由会返回 `ExecutionFailed` 护栏错误。
+- 在 `src/agent/mod.rs` 挂载 `pub mod collab;` 并在 agent 层 re-export 主要类型。
+- 测试:`src/agent/collab/tests.rs` 24 个单元测试 + `tests/agent_tool_adapter.rs` 2 个集成测试,全部以
+  `tool_adapter` 命名,覆盖三条必需验证——(1)`spawn_agent` 产生 `NeedSubagent` 且经真实
+  `DrivingSubagentHandler` 派生并驱动 child 到完成(集成测试);(2)`plan_claim` 依赖未完成时被拒且不改变
+  plan;(3)`blackboard` post/read append-only 且 offset 单调——外加 CAS 冲突、状态转换、claim-first、mailbox
+  定向投递、`report_artifact`、`run_host_tool`(有/无宿主)、取消护栏、未知工具、声明覆盖、serde 往返等。
+- 文档:`docs/external-agent.md` §3.4/§3.5 增补「已实现(M6-3)」说明;`README.md` 模块概览补充
+  `agent::collab`。
+- 验证序列全绿:`cargo fmt --all`;`cargo clippy --all-targets -- -D warnings` 干净;`cargo test tool_adapter`
+  26 通过;`cargo test --all --all-targets` 全绿(lib 521 通过,其余 target 全通过);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净。
 
 ### [TODO] M6-4 cheap → strong 升级与 verifier
 

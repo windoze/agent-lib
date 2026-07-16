@@ -11,6 +11,7 @@
 //! out of serde data shapes.
 
 pub mod approval;
+pub mod collab;
 pub mod context;
 pub mod drive;
 pub mod event;
@@ -28,6 +29,11 @@ pub mod tool;
 pub use approval::{
     ApprovalDecision, ApprovalError, ApprovalRequirement, ApprovalResponse, NoApprovalPolicy,
     ToolApprovalPolicy,
+};
+pub use collab::{
+    ArtifactSink, Blackboard, BoardMessage, CollabToolHandler, MailMessage, Mailbox, Plan,
+    PlanError, PlanSnapshot, RecordingArtifactSink, SpawnAgentRequest, TaskSnapshot, TaskStatus,
+    ToolAdapterError, bridge_tool_declarations, bridge_tool_set,
 };
 pub use context::{
     BudgetCharge, BudgetDimension, BudgetError, BudgetHandle, BudgetLimits, BudgetSnapshot,
