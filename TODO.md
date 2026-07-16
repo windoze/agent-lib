@@ -32,7 +32,7 @@
 目标:先把 managed external agent 需要的协议数据结构落地,但不改变 machine 行为。所有新增 DTO 都在
 `src/agent/external/mod.rs` 或其子模块中保持 provider-neutral、serde-friendly。
 
-### [TODO] M1-1 新增 `ExternalObservedEvent` 并把 observations 改成 sequenced payload
+### [DONE] M1-1 新增 `ExternalObservedEvent` 并把 observations 改成 sequenced payload
 
 **上下文**:
 
@@ -82,6 +82,40 @@
   - `cargo test -p agent-lib external_agent_emits_observation_notifications`
   - `cargo test -p agent-lib discard_sink_accepts_and_drops_events`
 - 完整验证序列 1-6 全过。
+
+**完成记录**(2026-07-17):
+
+- `src/agent/external/mod.rs`:新增 `pub struct ExternalObservedEvent { seq: u64, event:
+  ExternalAgentEvent }`,derive `Clone/Debug/PartialEq/Eq/Serialize/Deserialize`;附
+  `ExternalObservedEvent::new(seq, event)` 与仅供 fixture 的
+  `ExternalObservedEvent::unsequenced_for_tests(Vec<ExternalAgentEvent>)`(enumerate 赋 seq,
+  rustdoc 明确禁止用于生产 dedup)。
+- 三个 `ExternalSessionResult` 变体(`Completed`/`PausedForInteraction`/`Failed`)的
+  `observations` 由 `Vec<ExternalAgentEvent>` 改为 `Vec<ExternalObservedEvent>`。
+- 新增 `collect_file_patch_artifacts_from_observed(&[ExternalObservedEvent])`,保留旧
+  `collect_file_patch_artifacts(&[ExternalAgentEvent])`,让 adapter 免手动 map。
+- `machine.rs`:`observe` 改为逐事件 dedup(`filter(|o| consumed.is_none_or(|c| o.seq > c))`),
+  去掉 `incoming_seq` 参数,consumed 仍在存入 incoming session 之前读
+  `state.session().last_event_seq`;`fold_session_result` 三处调用同步更新;module/方法 doc 更新。
+- `machine/tests.rs`:重写 `external_agent_emits_observation_notifications`,新增 PARTIAL
+  overlap 用例(consumed=3,batch seqs 3..=5 → 仅 seq 4/5 replay)证明逐事件 replay;
+  `completed_with`/`paused_with` 改收 `Vec<ExternalObservedEvent>`,新增 `sequenced` helper。
+- `sink.rs`:trait 签名保持不变(sequenced live sink 升级留给 M4-1),文档改为说明 buffered
+  `ExternalObservedEvent` observations 是 exact-once 真源、按 `seq` 逐事件去重;
+  `discard_sink_accepts_and_drops_events` 不改并通过。
+- 其余 construction sites 同步:`src/agent/mod.rs` 导出新符号;`crates/agent-testkit/src/external.rs`
+  的 `completed/permission_pause/failed` 用 `unsequenced_for_tests` 包装并修正 `matches!` 模式;
+  `tests/agent_external_real_e2e.rs` 的 Completed 观测显式赋 seq 1..=3;drive.rs/requirement.rs/
+  assertions 的 `Vec::new()` 空 vec 自适应。
+- 新增测试:`external_observed_event_roundtrips`(DTO round-trip + seq 保序)、
+  `collect_file_patch_artifacts_from_observed_ignores_seqs_and_non_patches`。
+- 验证:`cargo fmt --all -- --check` FMT_OK;聚焦 6 tests 全过(external_dto_roundtrips /
+  external_agent_emits_observation_notifications / discard_sink_accepts_and_drops_events /
+  external_observed_event_roundtrips / collect_file_patch_artifacts_from_observed /
+  collect_file_patch_artifacts_keeps_only_patches_in_order);`cargo clippy --all-targets -- -D
+  warnings` 0 warning;`cargo test --all --all-targets` 全绿(agent-lib lib 554 passed,其余各
+  test binary 0 failed);`cargo test --all --doc` 7+12+2 passed(1 ignored);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` clean。
 
 ### [TODO] M1-2 新增 external tool DTO 与 `RespondToolResults` / `PausedForToolCalls`
 

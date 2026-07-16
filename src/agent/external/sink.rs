@@ -2,11 +2,13 @@
 //!
 //! The blocking continuation of an external session is always expressed through
 //! the [`ExternalSessionResult`](super::ExternalSessionResult): a handler
-//! advances the session to its next decision point, buffers every
-//! [`ExternalAgentEvent`] it saw in `observations`, and the
+//! advances the session to its next decision point, buffers every event it saw
+//! as a sequenced [`ExternalObservedEvent`](super::ExternalObservedEvent) in
+//! `observations`, and the
 //! [`ExternalAgentMachine`](super::ExternalAgentMachine) replays them as
 //! [`Notification::ExternalAgent`](crate::agent::Notification::ExternalAgent) on
-//! resume (design §5.5). That path is exact-once and drives control flow.
+//! resume (design §5.5). That path is exact-once — deduplicated per event by
+//! [`seq`](super::ExternalObservedEvent::seq) — and drives control flow.
 //!
 //! Some hosts additionally want to *see* tokens, commands, or patches **before**
 //! the decision point — a live UI tail. Design §5.5 reserves a separate,

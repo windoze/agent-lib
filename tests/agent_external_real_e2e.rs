@@ -22,14 +22,14 @@ use agent_lib::{
     agent::{
         AgentError, AgentInput, AgentMachine, AgentSpecRef, CursorRequirement, ExternalAgentError,
         ExternalAgentEvent, ExternalAgentMachine, ExternalAgentOutput, ExternalAgentSpec,
-        ExternalArtifactKind, ExternalArtifactRef, ExternalPermissionMode, ExternalRuntimeKind,
-        ExternalSessionHandler, ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef,
-        ExternalSessionRequest, ExternalSessionResult, ExternalStreamPolicy, Interaction,
-        InteractionKind, LlmHandler, LlmStepMode, LoopCursor, LoopCursorKind, LoopDoneReason,
-        Requirement, RequirementIds, RequirementKind, RequirementKindTag, RequirementResolution,
-        RequirementResult, RunContext, RunId, SpawnedChild, StepId, StepInput, StepOutcome,
-        SubagentOutput, SubagentSpawner, ToolSetRef, TraceNodeId, WorktreeIsolation, WorktreeRef,
-        drain,
+        ExternalArtifactKind, ExternalArtifactRef, ExternalObservedEvent, ExternalPermissionMode,
+        ExternalRuntimeKind, ExternalSessionHandler, ExternalSessionInput, ExternalSessionPolicy,
+        ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult, ExternalStreamPolicy,
+        Interaction, InteractionKind, LlmHandler, LlmStepMode, LoopCursor, LoopCursorKind,
+        LoopDoneReason, Requirement, RequirementIds, RequirementKind, RequirementKindTag,
+        RequirementResolution, RequirementResult, RunContext, RunId, SpawnedChild, StepId,
+        StepInput, StepOutcome, SubagentOutput, SubagentSpawner, ToolSetRef, TraceNodeId,
+        WorktreeIsolation, WorktreeRef, drain,
     },
     client::{ChatRequest, ClientError, Response as LlmResponse},
     conversation::{Conversation, ConversationConfig},
@@ -477,13 +477,19 @@ impl CliSessionHandler {
                         cost_micros: None,
                     },
                     observations: vec![
-                        ExternalAgentEvent::SessionStarted {
-                            session_id: session.session_id,
-                        },
-                        ExternalAgentEvent::TextDelta {
-                            text: bounded(&summary, 1_000),
-                        },
-                        ExternalAgentEvent::SessionCompleted,
+                        ExternalObservedEvent::new(
+                            1,
+                            ExternalAgentEvent::SessionStarted {
+                                session_id: session.session_id,
+                            },
+                        ),
+                        ExternalObservedEvent::new(
+                            2,
+                            ExternalAgentEvent::TextDelta {
+                                text: bounded(&summary, 1_000),
+                            },
+                        ),
+                        ExternalObservedEvent::new(3, ExternalAgentEvent::SessionCompleted),
                     ],
                 }
             }

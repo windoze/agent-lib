@@ -69,9 +69,9 @@
 //! keeps its own turn scratch. Observations buffered by the handler are threaded
 //! through the resume path and converted into
 //! [`Notification::ExternalAgent`](crate::agent::Notification::ExternalAgent)
-//! events on the resuming step, deduplicated against
-//! [`ExternalSessionRef::last_event_seq`] so a replayed decision point is not
-//! double-emitted (design §5.5).
+//! events on the resuming step, deduplicated per event against
+//! [`ExternalSessionRef::last_event_seq`] so a replayed or overlapping decision
+//! point re-emits only its unseen suffix (design §5.5).
 
 use std::sync::Arc;
 
@@ -84,7 +84,7 @@ use crate::{
         RequirementKindTag, RequirementResolution, RequirementResult, StepId, StepInput,
         StepOutcome,
         external::{
-            ExternalAgentCursor, ExternalAgentEvent, ExternalAgentOutput, ExternalAgentState,
+            ExternalAgentCursor, ExternalAgentOutput, ExternalAgentState, ExternalObservedEvent,
             ExternalSessionInput, ExternalSessionRef, ExternalSessionRequest,
             ExternalSessionResult,
         },
@@ -300,9 +300,10 @@ impl ExternalAgentMachine {
     ///
     /// Buffered `observations` are converted into
     /// [`Notification::ExternalAgent`] events (design §5.5) and carried out on the
-    /// resuming step's [`StepOutcome`]. Dedup uses
-    /// [`ExternalSessionRef::last_event_seq`]: the events already consumed on an
-    /// earlier resume are skipped so a replayed result does not double-emit — see
+    /// resuming step's [`StepOutcome`]. Dedup is per-event: each observation's
+    /// [`seq`](ExternalObservedEvent::seq) is compared against the last one
+    /// already consumed (recorded in [`ExternalSessionRef::last_event_seq`]), so a
+    /// replayed or overlapping result only re-emits its unseen suffix — see
     /// [`observe`](Self::observe).
     fn fold_session_result(&mut self, result: ExternalSessionResult) -> StepOutcome {
         match result {
@@ -311,7 +312,7 @@ impl ExternalAgentMachine {
                 output,
                 observations,
             } => {
-                let notifications = self.observe(session.last_event_seq, observations);
+                let notifications = self.observe(observations);
                 self.complete_session(session, output, notifications)
             }
             ExternalSessionResult::PausedForInteraction {
@@ -320,7 +321,7 @@ impl ExternalAgentMachine {
                 request,
                 observations,
             } => {
-                let notifications = self.observe(session.last_event_seq, observations);
+                let notifications = self.observe(observations);
                 self.pause_for_interaction(session, action_id, request, notifications)
             }
             ExternalSessionResult::Failed {
@@ -328,10 +329,7 @@ impl ExternalAgentMachine {
                 error,
                 observations,
             } => {
-                let notifications = self.observe(
-                    session.as_ref().and_then(|s| s.last_event_seq),
-                    observations,
-                );
+                let notifications = self.observe(observations);
                 if session.is_some() {
                     self.state.set_session(session);
                 }
@@ -344,34 +342,25 @@ impl ExternalAgentMachine {
     /// events, skipping any already consumed on a prior resume.
     ///
     /// Per design §5.5 the machine replays a decision point's observations exactly
-    /// once. It uses [`ExternalSessionRef::last_event_seq`] as the alignment
-    /// cursor: the last consumed sequence is recorded in the retained
-    /// [`session`](ExternalAgentState::session) facts, so this reads that recorded
-    /// value *before* the caller stores the incoming session. When the incoming
-    /// result reports a `last_event_seq` at or below the recorded one, its
-    /// observations were already emitted on an earlier resume (a replayed or
-    /// duplicated result), so nothing is emitted. When either sequence is absent
-    /// the events cannot be aligned and are emitted as-is.
-    fn observe(
-        &self,
-        incoming_seq: Option<u64>,
-        observations: Vec<ExternalAgentEvent>,
-    ) -> Vec<Notification> {
-        if observations.is_empty() {
-            return Vec::new();
-        }
+    /// once. Each [`ExternalObservedEvent`] carries its own runtime
+    /// [`seq`](ExternalObservedEvent::seq); the machine compares it against the
+    /// last consumed sequence recorded in the retained
+    /// [`session`](ExternalAgentState::session) facts
+    /// ([`ExternalSessionRef::last_event_seq`]), reading that value *before* the
+    /// caller stores the incoming session. Only events whose `seq` is strictly
+    /// greater than the consumed high-water mark are emitted, so a replayed
+    /// result (whose events all fall at or below the mark) emits nothing while an
+    /// overlapping result replays only its unseen suffix. When no session has been
+    /// consumed yet the events cannot be aligned and are all emitted as-is.
+    fn observe(&self, observations: Vec<ExternalObservedEvent>) -> Vec<Notification> {
         let consumed = self
             .state
             .session()
             .and_then(|session| session.last_event_seq);
-        if let (Some(incoming), Some(consumed)) = (incoming_seq, consumed)
-            && incoming <= consumed
-        {
-            return Vec::new();
-        }
         observations
             .into_iter()
-            .map(Notification::ExternalAgent)
+            .filter(|observed| consumed.is_none_or(|consumed| observed.seq > consumed))
+            .map(|observed| Notification::ExternalAgent(observed.event))
             .collect()
     }
 

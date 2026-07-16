@@ -21,9 +21,9 @@ use crate::agent::{
     StepInput, ToolSetId,
     external::{
         ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalAgentSpec,
-        ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef, ExternalPermissionMode,
-        ExternalRuntimeKind, ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef,
-        ExternalSessionResult, ExternalStreamPolicy, WorktreeIsolation,
+        ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef, ExternalObservedEvent,
+        ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput, ExternalSessionPolicy,
+        ExternalSessionRef, ExternalSessionResult, ExternalStreamPolicy, WorktreeIsolation,
     },
     spec::{ToolSetRef, WorktreeRef},
 };
@@ -254,9 +254,20 @@ fn sample_artifacts() -> Vec<ExternalArtifactRef> {
     ]
 }
 
-/// A `Completed` result carrying `observations` and reporting `seq` as the last
-/// consumed event sequence.
-fn completed_with(seq: u64, observations: Vec<ExternalAgentEvent>) -> ExternalSessionResult {
+/// Wraps a batch of raw events into sequenced observations whose seqs start at
+/// `start` and increase by one, mirroring how a runtime adapter tags a
+/// contiguous run of stream events.
+fn sequenced(start: u64, events: Vec<ExternalAgentEvent>) -> Vec<ExternalObservedEvent> {
+    events
+        .into_iter()
+        .enumerate()
+        .map(|(offset, event)| ExternalObservedEvent::new(start + offset as u64, event))
+        .collect()
+}
+
+/// A `Completed` result carrying sequenced `observations` and reporting `seq` as
+/// the last consumed event sequence.
+fn completed_with(seq: u64, observations: Vec<ExternalObservedEvent>) -> ExternalSessionResult {
     ExternalSessionResult::Completed {
         session: session_ref_seq(seq),
         output: output("refactor complete"),
@@ -264,11 +275,12 @@ fn completed_with(seq: u64, observations: Vec<ExternalAgentEvent>) -> ExternalSe
     }
 }
 
-/// A `PausedForInteraction` result carrying `observations` and reporting `seq`.
+/// A `PausedForInteraction` result carrying sequenced `observations` and
+/// reporting `seq`.
 fn paused_with(
     action_id: &str,
     seq: u64,
-    observations: Vec<ExternalAgentEvent>,
+    observations: Vec<ExternalObservedEvent>,
 ) -> ExternalSessionResult {
     ExternalSessionResult::PausedForInteraction {
         session: session_ref_seq(seq),
@@ -708,7 +720,7 @@ fn external_agent_emits_observation_notifications() {
     let batch = observation_batch("done");
     let completed = direct.step(StepInput::resume(external_resolution(
         opened.requirements[0].id,
-        completed_with(3, batch.clone()),
+        completed_with(3, sequenced(1, batch.clone())),
     )));
 
     assert!(completed.is_quiescent());
@@ -717,18 +729,20 @@ fn external_agent_emits_observation_notifications() {
     // Exactly the buffered observations, preserving order and count.
     assert_eq!(external_events(&completed.notifications), batch);
 
-    // The machine records `last_event_seq` in its retained session facts and uses
-    // it to align observations on resume: a replayed decision point reporting a
-    // sequence at or below the consumed one emits nothing, while a fresh sequence
-    // beyond it is replayed in full (design §5.5).
+    // The machine records `last_event_seq` in its retained session facts and
+    // dedups observations *per event* on resume: a replayed decision point whose
+    // events all fall at or below the consumed sequence emits nothing, and an
+    // overlapping batch straddling the boundary replays only its unseen suffix
+    // (design §5.5).
     let mut looped = machine();
     let opened = looped.step(StepInput::external(user_input("refactor the parser")));
 
-    // First pause consumes observations up to seq 2 and emits them.
+    // First pause buffers seqs 1..=3 with no prior consumed sequence, so all
+    // three events are emitted and seq 3 becomes the consumed high-water mark.
     let first_batch = observation_batch("first");
     let first_pause = looped.step(StepInput::resume(external_resolution(
         opened.requirements[0].id,
-        paused_with("act-1", 2, first_batch.clone()),
+        paused_with("act-1", 3, sequenced(1, first_batch.clone())),
     )));
     assert_eq!(external_events(&first_pause.notifications), first_batch);
 
@@ -738,27 +752,45 @@ fn external_agent_emits_observation_notifications() {
         "go ahead",
     )));
 
-    // A replayed pause reporting the same `last_event_seq` (2) is a duplicate:
-    // its observations were already consumed, so nothing is re-emitted.
+    // A replayed pause reporting the same events (seqs 1..=3) is a duplicate:
+    // every event is at or below the consumed sequence, so nothing is re-emitted.
     let replay_pause = looped.step(StepInput::resume(external_resolution(
         responded.requirements[0].id,
-        paused_with("act-1", 2, observation_batch("first")),
+        paused_with("act-1", 3, sequenced(1, observation_batch("first"))),
     )));
     assert!(
         replay_pause.notifications.is_empty(),
         "observations at or below the consumed sequence must not be replayed"
     );
 
-    // Answering again advances the session; a Completed result reporting a fresh
-    // sequence (4) beyond the consumed one replays its new observations in full.
+    // Answer again; the next pause overlaps the consumed boundary: seqs 3..=5
+    // against a consumed mark of 3. Only the strictly-greater suffix (seqs 4 and
+    // 5) is replayed, proving dedup is per event rather than per batch.
     let responded_again = looped.step(StepInput::resume(interaction_resolution(
         replay_pause.requirements[0].id,
         "go ahead",
     )));
+    let overlap_batch = observation_batch("overlap");
+    let overlap_pause = looped.step(StepInput::resume(external_resolution(
+        responded_again.requirements[0].id,
+        paused_with("act-1", 5, sequenced(3, overlap_batch.clone())),
+    )));
+    assert_eq!(
+        external_events(&overlap_pause.notifications),
+        overlap_batch[1..].to_vec(),
+        "only observations beyond the consumed sequence are replayed"
+    );
+
+    // A final Completed reporting a fresh sequence (seqs 6..=8) beyond the
+    // consumed one (5) replays its new observations in full.
+    let responded_final = looped.step(StepInput::resume(interaction_resolution(
+        overlap_pause.requirements[0].id,
+        "go ahead",
+    )));
     let final_batch = observation_batch("final");
     let final_completed = looped.step(StepInput::resume(external_resolution(
-        responded_again.requirements[0].id,
-        completed_with(4, final_batch.clone()),
+        responded_final.requirements[0].id,
+        completed_with(8, sequenced(6, final_batch.clone())),
     )));
 
     assert_eq!(looped.cursor().kind(), LoopCursorKind::Done);

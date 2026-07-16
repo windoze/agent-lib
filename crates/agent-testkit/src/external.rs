@@ -38,9 +38,9 @@ use std::sync::Arc;
 use agent_lib::agent::external::{
     ExternalAgentError, ExternalAgentEvent, ExternalAgentMachine, ExternalAgentOutput,
     ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef,
-    ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput, ExternalSessionPolicy,
-    ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult, ExternalStreamPolicy,
-    WorktreeIsolation,
+    ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
+    ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
+    ExternalStreamPolicy, WorktreeIsolation,
 };
 use agent_lib::agent::{
     ExternalSessionHandler, Interaction, PermissionCategory, PermissionRequest, PermissionRisk,
@@ -346,7 +346,10 @@ impl ExternalAgentFixture {
         ExternalSessionResult::Completed {
             session: self.session_ref(),
             output: self.output("refactor complete"),
-            observations: vec![self.command_finished_event(), self.file_patch_event()],
+            observations: ExternalObservedEvent::unsequenced_for_tests(vec![
+                self.command_finished_event(),
+                self.file_patch_event(),
+            ]),
         }
     }
 
@@ -387,7 +390,9 @@ impl ExternalAgentFixture {
             session: self.session_ref(),
             action_id: "act-1".to_owned(),
             request: Interaction::permission(self.ids.step_id(), self.permission_request()),
-            observations: vec![self.permission_requested_event("act-1", "run `cargo test`")],
+            observations: ExternalObservedEvent::unsequenced_for_tests(vec![
+                self.permission_requested_event("act-1", "run `cargo test`"),
+            ]),
         }
     }
 
@@ -400,7 +405,9 @@ impl ExternalAgentFixture {
             error: ExternalAgentError::LimitExceeded {
                 limit: "max_turns=8".to_owned(),
             },
-            observations: vec![self.command_finished_event()],
+            observations: ExternalObservedEvent::unsequenced_for_tests(vec![
+                self.command_finished_event(),
+            ]),
         }
     }
 }
@@ -412,7 +419,7 @@ mod tests {
     use crate::fixtures::root_context;
     use crate::ids::SeqIds;
     use agent_lib::agent::external::{
-        ExternalAgentError, ExternalAgentEvent, ExternalSessionResult,
+        ExternalAgentError, ExternalAgentEvent, ExternalObservedEvent, ExternalSessionResult,
     };
     use agent_lib::agent::{ExternalSessionHandler, RequirementResult};
 
@@ -482,8 +489,14 @@ mod tests {
         assert!(matches!(
             observations.as_slice(),
             [
-                ExternalAgentEvent::CommandFinished { .. },
-                ExternalAgentEvent::FilePatch { .. },
+                ExternalObservedEvent {
+                    event: ExternalAgentEvent::CommandFinished { .. },
+                    ..
+                },
+                ExternalObservedEvent {
+                    event: ExternalAgentEvent::FilePatch { .. },
+                    ..
+                },
             ]
         ));
     }

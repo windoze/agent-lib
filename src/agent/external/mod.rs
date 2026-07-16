@@ -44,7 +44,7 @@
 //! [`Failed`](ExternalSessionResult::Failed) — and returns every event observed
 //! before that point in `observations`, so the blocking result marks only the
 //! control-flow transfer while the non-blocking stream rides along as
-//! [`ExternalAgentEvent`] values.
+//! sequenced [`ExternalObservedEvent`] values.
 
 use crate::{
     agent::{
@@ -355,6 +355,55 @@ pub enum ExternalAgentEvent {
     SessionCompleted,
 }
 
+/// A buffered [`ExternalAgentEvent`] tagged with its runtime sequence number.
+///
+/// A handler advances a session to its next decision point and buffers every
+/// event it observed before that point. Rather than an unlabelled
+/// [`ExternalAgentEvent`] list, each observation carries a monotonically
+/// increasing `seq` so the [`ExternalAgentMachine`] can replay observations
+/// **exactly once, event by event** across resumes: on resume it emits only the
+/// events whose `seq` is greater than the last one it already consumed (design
+/// §5.5). This is strictly finer than a batch-level cursor — a decision point
+/// whose buffer overlaps the previously consumed prefix replays only its unseen
+/// suffix.
+///
+/// `seq` is assigned by the runtime adapter (or a cassette) as it decodes the
+/// stream; it is the sole replay-progress marker and must increase across the
+/// observations of a session. The companion
+/// [`ExternalSessionRef::last_event_seq`] records the high-water mark a machine
+/// has consumed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalObservedEvent {
+    /// Monotonic sequence number identifying this event in the session stream.
+    pub seq: u64,
+    /// The observed event.
+    pub event: ExternalAgentEvent,
+}
+
+impl ExternalObservedEvent {
+    /// Pairs an [`ExternalAgentEvent`] with its runtime `seq`.
+    #[must_use]
+    pub fn new(seq: u64, event: ExternalAgentEvent) -> Self {
+        Self { seq, event }
+    }
+
+    /// Wraps a list of events into sequenced observations by assigning each a
+    /// synthetic index-based `seq` (`0`, `1`, `2`, …), preserving order.
+    ///
+    /// This is a convenience for tests and fixtures that carry observations but
+    /// do not exercise per-event replay alignment. It **must not** back
+    /// production dedup: a real runtime adapter assigns `seq` from the decoded
+    /// stream, never from vector position.
+    #[must_use]
+    pub fn unsequenced_for_tests(events: Vec<ExternalAgentEvent>) -> Vec<Self> {
+        events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| Self::new(index as u64, event))
+            .collect()
+    }
+}
+
 /// Category of an artifact produced by an external session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -437,6 +486,28 @@ pub fn collect_file_patch_artifacts(events: &[ExternalAgentEvent]) -> Vec<Extern
         .collect()
 }
 
+/// Collects the [`FilePatch`](ExternalAgentEvent::FilePatch) observations in a
+/// sequenced `observations` buffer into [`Patch`](ExternalArtifactKind::Patch)
+/// artifact references, preserving order.
+///
+/// This is the [`ExternalObservedEvent`] counterpart of
+/// [`collect_file_patch_artifacts`]: a handler folding the observations it
+/// buffered before a decision point into
+/// [`ExternalAgentOutput::artifacts`](ExternalAgentOutput::artifacts) can call
+/// this directly instead of manually mapping each `ExternalObservedEvent` back
+/// to its inner event. The `seq` labels are irrelevant to artifact extraction
+/// and are ignored; only patch references (never diffs) are produced, keeping
+/// the result redaction-safe (design §11, §12).
+#[must_use]
+pub fn collect_file_patch_artifacts_from_observed(
+    observations: &[ExternalObservedEvent],
+) -> Vec<ExternalArtifactRef> {
+    observations
+        .iter()
+        .filter_map(|observed| ExternalArtifactRef::from_file_patch(&observed.event))
+        .collect()
+}
+
 /// Terminal output of an external session that reached
 /// [`Completed`](ExternalSessionResult::Completed).
 ///
@@ -476,7 +547,7 @@ pub enum ExternalSessionResult {
         output: ExternalAgentOutput,
         /// Events observed before completion.
         #[serde(default)]
-        observations: Vec<ExternalAgentEvent>,
+        observations: Vec<ExternalObservedEvent>,
     },
     /// The session paused awaiting an interaction (approval or clarification).
     ///
@@ -502,7 +573,7 @@ pub enum ExternalSessionResult {
         request: Interaction,
         /// Events observed before the pause.
         #[serde(default)]
-        observations: Vec<ExternalAgentEvent>,
+        observations: Vec<ExternalObservedEvent>,
     },
     /// The session failed; the error records whether side effects may remain.
     Failed {
@@ -513,7 +584,7 @@ pub enum ExternalSessionResult {
         error: ExternalAgentError,
         /// Events observed before the failure.
         #[serde(default)]
-        observations: Vec<ExternalAgentEvent>,
+        observations: Vec<ExternalObservedEvent>,
     },
 }
 
@@ -587,9 +658,10 @@ pub enum ExternalAgentError {
 mod tests {
     use super::{
         ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalArtifactKind,
-        ExternalArtifactRef, ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
-        ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
-        ExternalStreamPolicy, WorktreeIsolation, collect_file_patch_artifacts,
+        ExternalArtifactRef, ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeKind,
+        ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest,
+        ExternalSessionResult, ExternalStreamPolicy, WorktreeIsolation,
+        collect_file_patch_artifacts, collect_file_patch_artifacts_from_observed,
     };
     use crate::{
         agent::{AgentId, StepId, interaction::Interaction, spec::WorktreeRef},
@@ -648,8 +720,8 @@ mod tests {
         }
     }
 
-    fn sample_observations() -> Vec<ExternalAgentEvent> {
-        vec![
+    fn sample_observations() -> Vec<ExternalObservedEvent> {
+        ExternalObservedEvent::unsequenced_for_tests(vec![
             ExternalAgentEvent::SessionStarted {
                 session_id: Some("sess-42".to_owned()),
             },
@@ -670,7 +742,7 @@ mod tests {
                 summary: "handoff".to_owned(),
             },
             ExternalAgentEvent::SessionCompleted,
-        ]
+        ])
     }
 
     fn assert_json_round_trip<T>(value: &T)
@@ -712,10 +784,13 @@ mod tests {
             session: session_ref(),
             action_id: "act-1".to_owned(),
             request: Interaction::question(step_id(), "Delete build/ ?".to_owned()),
-            observations: vec![ExternalAgentEvent::PermissionRequested {
-                action_id: "act-1".to_owned(),
-                summary: "remove build/".to_owned(),
-            }],
+            observations: vec![ExternalObservedEvent::new(
+                5,
+                ExternalAgentEvent::PermissionRequested {
+                    action_id: "act-1".to_owned(),
+                    summary: "remove build/".to_owned(),
+                },
+            )],
         };
         assert_json_round_trip(&paused);
 
@@ -826,5 +901,76 @@ mod tests {
         );
 
         assert!(collect_file_patch_artifacts(&[]).is_empty());
+    }
+
+    #[test]
+    fn external_observed_event_roundtrips() {
+        // A sequenced observation preserves its seq and inner event across a
+        // JSON round-trip, and a buffered list keeps per-event seqs distinct and
+        // ordered.
+        let observed = ExternalObservedEvent::new(
+            7,
+            ExternalAgentEvent::TextDelta {
+                text: "chunk".to_owned(),
+            },
+        );
+        assert_json_round_trip(&observed);
+        assert_eq!(observed.seq, 7);
+
+        let buffer = sample_observations();
+        assert_json_round_trip(&buffer);
+        let seqs: Vec<u64> = buffer.iter().map(|observed| observed.seq).collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn collect_file_patch_artifacts_from_observed_ignores_seqs_and_non_patches() {
+        // The sequenced collector keeps only FilePatch observations, in order,
+        // regardless of the seq labels each carries.
+        let observations = vec![
+            ExternalObservedEvent::new(10, ExternalAgentEvent::SessionStarted { session_id: None }),
+            ExternalObservedEvent::new(
+                11,
+                ExternalAgentEvent::FilePatch {
+                    path: "a.rs".to_owned(),
+                    summary: "first".to_owned(),
+                    diff_ref: Some("blob://a".to_owned()),
+                },
+            ),
+            ExternalObservedEvent::new(
+                12,
+                ExternalAgentEvent::TextDelta {
+                    text: "chatter".to_owned(),
+                },
+            ),
+            ExternalObservedEvent::new(
+                13,
+                ExternalAgentEvent::FilePatch {
+                    path: "b.rs".to_owned(),
+                    summary: "second".to_owned(),
+                    diff_ref: None,
+                },
+            ),
+        ];
+        let artifacts = collect_file_patch_artifacts_from_observed(&observations);
+        assert_eq!(
+            artifacts,
+            vec![
+                ExternalArtifactRef {
+                    kind: ExternalArtifactKind::Patch,
+                    summary: "first".to_owned(),
+                    path: Some("a.rs".to_owned()),
+                    reference: Some("blob://a".to_owned()),
+                },
+                ExternalArtifactRef {
+                    kind: ExternalArtifactKind::Patch,
+                    summary: "second".to_owned(),
+                    path: Some("b.rs".to_owned()),
+                    reference: None,
+                },
+            ]
+        );
+
+        assert!(collect_file_patch_artifacts_from_observed(&[]).is_empty());
     }
 }
