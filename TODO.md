@@ -1518,7 +1518,7 @@ API 语义(dependency、claim 前置完成检查、claim-first、CAS 更新)。`
   26 通过;`cargo test --all --all-targets` 全绿(lib 521 通过,其余 target 全通过);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净。
 
-### [TODO] M6-4 cheap → strong 升级与 verifier
+### [DONE] M6-4 cheap → strong 升级与 verifier
 
 **前置依赖**:M6-3。
 
@@ -1538,6 +1538,52 @@ API 语义(dependency、claim 前置完成检查、claim-first、CAS 更新)。`
 - 新增测试:cheap worker 失败触发 strong worker 重派;超预算触发降级/停机问用户;verifier 失败触发升级。
   过滤名:`cargo test escalation`。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- **新增 `src/agent/external/escalation.rs`**(升级规则 + verifier 挂点,叠加在 M6-2 dispatcher 原语之上,
+  re-export 到 `agent::external` 与 `agent`),**不**新造 orchestration runtime:
+  - `WorkerReport { worker: WorkerProfileRef, triggers: Vec<EscalationTrigger> }`(serde;`succeeded`/
+    `failed`/`new`/`with_trigger`/`worker`/`triggers`/`is_clean`/`raised`;trigger 复用 M6-1 profile 枚举,
+    de-dup 保序;干净 report 省略空 triggers)记录一次 worker 运行结果。
+  - `Verifier` trait(`verify(task, report) -> Option<EscalationTrigger>`;None=通过)= 设计 §9「验证/升级」
+    的验证半(review-agent / tests 版实现此 trait);`ScriptedVerifier`(`new`(closure)/`passing`/
+    `rejecting`)供测试与固定策略用。
+  - `TaskDescriptor::warrants_verification()`(risk≥High 或 impact≥CrossModule 或 Ambiguous):engine 仅在
+    warranting 任务上调用 verifier;worker 自报的 report triggers 始终生效。
+  - `HumanGate { step: StepId, actor: AgentId }`:构造 human 交互所需身份,宿主注入,模型不可伪造。
+  - `EscalationOutcome`:`Accept` / `Reassign(WorkerChoice)` / `Human(Interaction)` /
+    `Exhausted { trigger }`。
+  - `Escalator<V: Verifier>`(`new(verifier)` / `with_budget_headroom`,默认 20% 与 dispatcher 一致):
+    `assess(task, report, roster, ctx, gate)` 顺序 = `check_cancelled` → 汇总有效 triggers(report ∪
+    warranting 时 verifier)→ 空则 `Accept` → **预算压力**(`BudgetExhausted` 或 `budget_is_low(ctx)`,复用
+    dispatcher 的 `budget_is_low`,改 `pub(super)`)优先于向上升级:严格更便宜 worker →
+    `Reassign(BudgetDowngrade)`,否则 `Human(Question)` 停机问用户(无 capable worker → `NoCapableWorker`)→
+    否则向上升级:规则 `escalate_to`(命中 trigger 且注册/capable/tier 更高)或 `strongest_capable`(严格更强)
+    → `Reassign(Escalation)`;无更强 worker 时若 `human_fallback` 则 `Human`(ReviewRejected→`Permission`
+    携带任务风险与 actor,其余→`Question`),否则 `Exhausted { trigger }`。
+  - 升级/降级产物仍是 `WorkerChoice`,由既有 `WorkerChoice::into_subagent` → `NeedSubagent` 走
+    `SubagentHandler` 派生路径;human gate 产物走既有 `InteractionKind::Permission`/`Question` 交互机制。
+  - `EscalationError`(thiserror):`UnknownWorker{worker}` / `NoCapableWorker{capability}` /
+    `Context(RunContextError)`。
+- **dispatch.rs 扩展**:新增 `DispatchReason::Escalation` 变体;`budget_is_low` 改 `pub(super)` 供复用;
+  新增 `TaskDescriptor::warrants_verification()`。
+- **模块接线**:`external/mod.rs` `mod escalation;` + `pub use escalation::{Escalator, EscalationOutcome,
+  EscalationError, Verifier, ScriptedVerifier, WorkerReport, HumanGate}`;`src/agent/mod.rs` 追加同名导出。
+  所有新公开 API 带 rustdoc。
+- **测试**:`src/agent/external/escalation/tests.rs` 24 个单测(名字含 `escalation`),覆盖三条必需验证——
+  (1)cheap worker TestFailure/Timeout/LowConfidence → strong 重派;(2)超预算 → 更便宜 worker 降级 /
+  无更便宜时 `Human(Question)` 停机问用户;(3)verifier 失败(ReviewRejected)→ 升级——外加低预算压过升级、
+  ReviewRejected 无更强 worker → `Permission` 人工门、显式 `escalate_to` 目标、terminal `Exhausted`、
+  `Reassign`→`into_subagent`、verifier 非 warranting 任务跳过、clean→Accept、UnknownWorker/NoCapableWorker/
+  cancelled 错误、`warrants_verification` 谓词、report builders/serde、`primary_upward`/`upgrade_target`
+  helper、`HumanGate` 访问器、`ScriptedVerifier` helpers、headroom=0 禁用降级。
+- **文档**:`docs/external-agent.md` §9 追加「收敛(Milestone 6-4 已实现)」段落;`profile.rs`
+  `EscalationRules` 文档指向已实现的 `Escalator`;`README.md` 模块表补 `agent::external` 调度/升级。
+- **验证(完整序列全绿)**:`cargo fmt --all` ✓;`cargo test escalation` = 24 passed ✓;
+  `cargo clippy --all-targets -- -D warnings` 无告警(collapsible_if → let-chain)✓;
+  `cargo test --all --all-targets` 无回归(lib 545 passed = 521+24,集成/testkit 全绿,仅
+  credential-gated ignored)✓;`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警 ✓。
 
 ### [TODO] M6-5 Milestone 6 Review 与文档并轨
 

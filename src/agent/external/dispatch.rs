@@ -165,6 +165,22 @@ impl TaskDescriptor {
     pub const fn preference(&self) -> CostPreference {
         self.preference
     }
+
+    /// Returns `true` when the task is high-risk or complex enough to warrant an
+    /// independent verifier pass after a worker runs (design §9 "验证/升级").
+    ///
+    /// The escalation engine ([`Escalator`](super::escalation::Escalator)) only
+    /// consults its [`Verifier`](super::escalation::Verifier) for tasks matching
+    /// this predicate — high risk (`>= High`), a cross-module-or-wider blast
+    /// radius, or an ambiguous requirement — so cheap, obviously-safe work is not
+    /// gated behind a review pass. A worker's own reported triggers still drive
+    /// escalation regardless of this predicate.
+    #[must_use]
+    pub fn warrants_verification(&self) -> bool {
+        self.risk >= PermissionRisk::High
+            || self.impact >= ImpactScope::CrossModule
+            || self.uncertainty == Uncertainty::Ambiguous
+    }
 }
 
 /// One dispatchable worker: its scheduling [`WorkerProfileRef`] paired with the
@@ -317,6 +333,9 @@ pub enum DispatchReason {
     Evaluator,
     /// Budget was near exhaustion, forcing a downgrade to the cheapest worker.
     BudgetDowngrade,
+    /// A worker failed / self-reported low confidence / was review-rejected,
+    /// forcing an escalation to a stronger worker (design §9, Milestone 6-4).
+    Escalation,
 }
 
 /// The dispatcher's decision: which worker to run and why.
@@ -619,8 +638,10 @@ impl<E: TaskEvaluator> Dispatcher<E> {
 /// `min_headroom_percent` of its limit remaining.
 ///
 /// Unbounded dimensions never count as low, so a run with no limits is never
-/// downgraded. A `min_headroom_percent` of `0` disables the check.
-fn budget_is_low(ctx: &RunContext, min_headroom_percent: u8) -> bool {
+/// downgraded. A `min_headroom_percent` of `0` disables the check. Shared with
+/// the escalation engine ([`Escalator`](super::escalation::Escalator)) so budget
+/// pressure is judged identically at dispatch and re-dispatch time.
+pub(super) fn budget_is_low(ctx: &RunContext, min_headroom_percent: u8) -> bool {
     if min_headroom_percent == 0 {
         return false;
     }

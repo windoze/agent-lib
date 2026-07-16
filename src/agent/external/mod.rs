@@ -61,6 +61,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod dispatch;
+mod escalation;
 mod machine;
 mod profile;
 mod runtime;
@@ -73,6 +74,10 @@ pub use dispatch::{
     CostPreference, DispatchError, DispatchReason, Dispatcher, ImpactScope, RuleRouter,
     ScriptedTaskEvaluator, TaskDescriptor, TaskEvaluator, Uncertainty, Worker, WorkerChoice,
     WorkerRoster,
+};
+pub use escalation::{
+    EscalationError, EscalationOutcome, Escalator, HumanGate, ScriptedVerifier, Verifier,
+    WorkerReport,
 };
 pub use machine::ExternalAgentMachine;
 pub use profile::{

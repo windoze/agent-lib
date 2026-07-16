@@ -702,7 +702,29 @@ Session root
   `charge_*`(每次调用 evaluator 计一个 step,代表其 LLM 成本;若该 charge 触及预算上限则同样降级)。
 - 产物 `WorkerChoice::into_subagent(brief, result_schema)` 生成 `RequirementKind::NeedSubagent`,
   worker 仍由既有 `SubagentHandler` 派生驱动——dispatcher **不**引入新的 orchestration runtime。
-  cheap→strong 升级与 verifier 挂点见 §9 升级规则,由 Milestone 6-4 实现。
+  cheap→strong 升级与 verifier 挂点见下方「收敛(Milestone 6-4 已实现)」。
+
+**收敛(Milestone 6-4 已实现)**:升级规则与 verifier 挂点落在 `agent::external::escalation`
+(re-export 到 `agent`),叠加在 M6-2 dispatcher 原语之上,**不**新造 orchestration runtime:
+
+- `WorkerReport { worker, triggers: Vec<EscalationTrigger> }`(serde;`succeeded`/`failed`/`new`/
+  `with_trigger`)记录一次 worker 运行结果:干净运行无 trigger,失败/超时/低置信度/超预算各对应一个
+  `EscalationTrigger`(复用 M6-1 profile 的枚举)。
+- `Verifier` trait(`verify(task, report) -> Option<EscalationTrigger>`)是「验证/升级」表里的验证半:
+  review-agent / tests 版实现此 trait,`ScriptedVerifier`(`passing`/`rejecting`/closure)供测试与固定
+  策略用。engine 仅在 `TaskDescriptor::warrants_verification()`(risk≥High 或影响≥跨模块或 ambiguous)
+  为真的任务上调用 verifier;worker 自报的 report triggers 始终生效。
+- `Escalator<V: Verifier>::assess(task, report, roster, ctx, gate)` 决策顺序 = `check_cancelled` →
+  汇总有效 triggers(report ∪ verifier)→ 空则 `Accept` → 预算压力(`BudgetExhausted` 或
+  `budget_is_low(ctx)`,与 dispatcher 同一护栏)优先:严格更便宜的 worker → `Reassign(BudgetDowngrade)`,
+  否则停机问用户 `Human(Question)`(对齐「降级到 cheap summarizer 或停机问用户」)→ 否则向上升级:
+  规则 `escalate_to`(命中 trigger 且注册、capable、tier 更高)或 `strongest_capable`(严格更强)→
+  `Reassign(Escalation)`;无更强 worker 时若 `human_fallback` 则 `Human`(ReviewRejected→`Permission`
+  携带任务风险,其余→`Question`),否则 `Exhausted { trigger }`。
+- 升级/降级产物同样是 `WorkerChoice`,由既有 `WorkerChoice::into_subagent` → `NeedSubagent` 走
+  `SubagentHandler` 派生路径;human gate 产物是 `Interaction`,走既有交互机制
+  (`InteractionKind::Permission` / `Question`)。`HumanGate { step, actor }` 由宿主注入身份,模型不可伪造。
+- 预算压力永远压过向上升级:预算接近上限时不会升级到更贵 worker(design §9「budget 接近上限 → 降级」)。
 
 ## 10. Permission 与安全边界
 

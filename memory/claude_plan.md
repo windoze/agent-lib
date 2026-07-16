@@ -1,52 +1,65 @@
-# M6-3 — spawn_agent / plan / blackboard / mailbox 工具 adapter
+# M6-4 — cheap → strong 升级与 verifier
 
-**状态:已完成(M6-3 已标 `[DONE]`,待提交后停)。** 本次执行 TODO.md 第一个未完成任务 = M6-3。
-前置 M6-2 已 `[DONE]`(dispatcher / TaskEvaluator / WorkerChoice::into_subagent → NeedSubagent)。
+**当前执行 TODO.md 第一个未完成任务 = M6-4**(M6-1..M6-3 均 `[DONE]`)。前置 M6-3 已完成
+(`src/agent/collab/*`,plan/blackboard/mailbox + 桥接工具)。M6-2 提供 `Dispatcher` /
+`WorkerRoster` / `WorkerChoice`(`into_subagent` → `NeedSubagent`) / `DispatchReason`。
 
-## 执行结果(全部完成)
-- [x] `src/agent/collab/{plan,blackboard,mailbox,tools,mod}.rs` 实现完成并接线到 `src/agent/mod.rs`。
-- [x] `src/agent/collab/tests.rs` 24 单测 + `tests/agent_tool_adapter.rs` 2 集成测试(全部含 `tool_adapter`)。
-- [x] 三条必需验证覆盖:spawn_agent→NeedSubagent 并经真实 DrivingSubagentHandler 派生驱动到完成;
-      plan_claim 依赖未完成被拒且零改动;blackboard append-only 且 offset 单调。
-- [x] 文档:`docs/external-agent.md` §3.4/§3.5 增补「已实现(M6-3)」;`README.md` 模块表补 `agent::collab`。
-- [x] 验证序列全绿:`cargo fmt --all`;`cargo clippy --all-targets -- -D warnings` 干净;
-      `cargo test tool_adapter` 26 通过;`cargo test --all --all-targets` 全绿(lib 521 通过);
-      `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净。
-- [x] TODO.md M6-3 标 `[DONE]` 并填完成记录。下一步:commit `[M6-3] ...` 后停(不开始 M6-4)。
+## 任务要求(TODO.md M6-4)
+1. 在 dispatcher 之上实现 escalation:根据 worker 结果(失败 / 低置信度 / 超预算)触发重新分派到
+   更强 worker,或降级 / 升到 human(经 `InteractionKind::Permission` 或 `Question`)。
+2. 提供 `verifier` 挂点(review-agent / tests),在高风险或复杂任务后运行并驱动升级判断。
 
-## 任务要求(TODO.md M6-3)
-- 实现桥接工具 adapter:
-  - `spawn_agent`(→ 结构化请求 → `RequirementKind::NeedSubagent`,复用现有 SubagentHandler 派生路径)
-  - `plan_claim` / `plan_claim_first_available` / `plan_update`(+ `plan_add_task` / `plan_read`)
-  - `blackboard_post` / `blackboard_read`
-  - `send_message`(mailbox)
-  - `report_artifact`(记录为 artifact/notification)
-  - `run_host_tool`(受控转发宿主注册 tool)
-- adapter 必须经宿主 policy/护栏(RunContext:check_cancelled;owner/sender 用注入身份而非模型参数),
-  不直接写外部 runtime 私有 mailbox;claim 必须检查依赖已完成(对齐 docs/agent-layer.md §6.2)。
-- 提供把这些工具注入 external agent `initial_tools` 的构造入口(ToolSetRef 构造 + ToolHandler)。
-
-## 验证条件(TODO.md)
-- 新增测试:`spawn_agent` adapter 产生 `NeedSubagent` 并经 `SubagentHandler` 派生;`plan_claim` 在未完成
-  依赖时被拒;`blackboard_post`/`read` append-only 且偏移单调。过滤名:`cargo test tool_adapter`。
+## 验证条件(过滤名 `cargo test escalation`)
+- cheap worker 失败触发 strong worker 重派;
+- 超预算触发降级 / 停机问用户;
+- verifier 失败触发升级。
 - 完整验证序列全绿。
 
-## 方案(新增 `src/agent/collab/` 一等垂直功能 + 桥接 adapter)
-- `plan.rs`:TaskStatus / Task / PlanSnapshot / Plan(Mutex live handle,Arc 共享)/ PlanError。
-  claim = 版本 CAS + owner + 状态可转 + 依赖全部 Completed;失败零改动。含 detect_cycle。
-- `blackboard.rs`:BoardMessage / Blackboard(命名空间,per-channel 偏移从 0 单调,append-only)。
-- `mailbox.rs`:MailMessage / Mailbox(全局单调 seq,定向 inbox)。
-- `tools.rs`:工具名常量 + Tool 声明 + bridge_tool_set(id)->ToolSetRef 注入入口;
-  SpawnAgentRequest.parse + into_requirement_kind(step_id)->NeedSubagent;ArtifactSink+RecordingArtifactSink;
-  CollabToolHandler(impl ToolHandler):fulfill 先 check_cancelled,再分派;owner/sender=注入身份。
-- tests.rs:单测名含 tool_adapter(3 项验证 + 覆盖)。
-- 接线:src/agent/mod.rs pub mod collab + pub use。
-- 集成测试:tests/agent_tool_adapter.rs(spawn_agent→NeedSubagent→DrivingSubagentHandler 端到端)。
-- 文档:docs/external-agent.md §3.4/§3.5 追加「已实现(M6-3)」。
+## 设计(新增 `src/agent/external/escalation.rs`)
+复用既有类型:EscalationTrigger/EscalationRules(profile.rs)、WorkerRoster/WorkerChoice/
+DispatchReason(dispatch.rs)、PermissionRisk/PermissionRequest/Interaction。不新造 orchestration
+runtime——输出仍是 WorkerChoice,由 into_subagent 走既有 SubagentHandler。
+
+- WorkerReport { worker, triggers }(serde;succeeded/failed/new/with_trigger/worker/triggers/is_clean/raised)。
+- Verifier trait:verify(task, report) -> Option<EscalationTrigger>(None=通过)。
+  ScriptedVerifier(closure,new/passing/rejecting)。
+- TaskDescriptor::warrants_verification()(risk>=High || impact>=CrossModule || Ambiguous):
+  engine 仅在 warranting 任务上跑 verifier;report.triggers 始终生效。
+- HumanGate { step, actor }。
+- EscalationOutcome:Accept / Reassign(WorkerChoice) / Human(Interaction) / Exhausted { trigger }。
+- Escalator<V: Verifier>(new(verifier) / with_budget_headroom,默认 20%):
+  assess(task, report, roster, ctx, gate):
+  1. check_cancelled。2. triggers = report ∪ verifier(warranting)。3. 空→Accept。
+  4. 预算压力(BudgetExhausted 或 budget_is_low)→ 严格更便宜则 Reassign(BudgetDowngrade),否则 Human(Question)。
+  5. 否则 upward:escalate_to 或 strongest(严格 tier>current)则 Reassign(Escalation);
+     否则 human_fallback→Human(ReviewRejected→Permission,余→Question),否则 Exhausted。
+- DispatchReason::Escalation 新增变体;budget_is_low 改 pub(super) 复用。
+- EscalationError:UnknownWorker / NoCapableWorker / Context(RunContextError)。
+
+## 接线
+- external/mod.rs:mod escalation; + pub use。 agent/mod.rs:追加同名导出。
+
+## 测试(src/agent/external/escalation/tests.rs,名字含 escalation)
+三条必需验证 + 预算精度、explicit escalate_to、Exhausted、UnknownWorker、cancelled、
+LowConfidence、warrants_verification、report builders、into_subagent、verifier gating、
+Permission human gate、serde round-trip。
+
+## 文档
+- docs/external-agent.md §9「收敛(Milestone 6-4 已实现)」;profile.rs 文档更新;README 模块表。
 
 ## 验证序列(完成前)
-cargo fmt --all → cargo clippy --all-targets -- -D warnings → cargo test tool_adapter →
-cargo test --all --all-targets(≤30min)→ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace。
+cargo fmt --all → cargo clippy --all-targets -- -D warnings → cargo test escalation →
+cargo test --all --all-targets(≤30min) → RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace。
 
 ## 完成后
-标 TODO.md M6-3 为 [DONE] + 填完成记录;commit [M6-3] ...;停。
+TODO.md M6-4 标 [DONE] + 填完成记录;commit [M6-4] ...;停(不开始 M6-5)。
+
+---
+
+## 执行结果(M6-4 已完成)
+- [x] 新增 `src/agent/external/escalation.rs` + `escalation/tests.rs`(24 单测,名字含 escalation)。
+- [x] dispatch.rs:`DispatchReason::Escalation`、`budget_is_low` pub(super)、`warrants_verification`。
+- [x] 接线 external/mod.rs + agent/mod.rs;文档 external-agent.md §9 / profile.rs / README。
+- [x] 验证序列全绿:fmt ✓;test escalation=24 ✓;clippy -D warnings ✓;test --all --all-targets
+      (lib 545 passed)✓;doc -D warnings ✓。
+- [x] TODO.md M6-4 标 [DONE] + 完成记录。下一步:commit `[M6-4] ...` 后停(不开始 M6-5)。

@@ -133,10 +133,10 @@ pub enum EscalationTrigger {
 
 /// Rules governing how the scheduler escalates away from a worker (design §9).
 ///
-/// This is data only; the dispatcher (Milestone 6-2) and escalation logic
-/// (Milestone 6-4) interpret it. A profile with an empty
-/// [`EscalationRules`] (see [`none`](Self::none) / [`Default`]) is terminal: the
-/// scheduler does not automatically re-dispatch off it.
+/// This is data only; the dispatcher (Milestone 6-2) and the escalation engine
+/// ([`Escalator`](super::Escalator), Milestone 6-4) interpret it. A profile with
+/// an empty [`EscalationRules`] (see [`none`](Self::none) / [`Default`]) is
+/// terminal: the scheduler does not automatically re-dispatch off it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EscalationRules {
     /// Conditions that should trigger an escalation.
