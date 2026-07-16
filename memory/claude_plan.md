@@ -1,80 +1,52 @@
-# M3-3 — 切换到宏产物、删除手写版(刀 (A) 第三步)
+# M3-4 — Milestone 3 review:刀 (A) 正确性、等价性与可维护性
 
-**当前执行 = TODO.md 第一个未完成任务 = M3-3**(M1-*/M2-*/M3-1/M3-2 已 DONE)。
+**当前执行 = TODO.md 第一个未完成任务 = M3-4**(M1-*/M2-*/M3-1/M3-2/M3-3 均 [DONE])。
+这是 TODO.md 的最后一个任务;完成后应做整体收尾并打 `endtag`。
 
-## 目标(TODO M3-3 / design §4.2–4.4)
-- 删除手写的三个 enum + `accepts` + `HandlerScope`/`scope_handles`/`fulfill_with_scope`,
-  让宏产物接管**正式名**(去掉 `*Gen` 临时名)。
-- 全库编译:引用 `RequirementKind::NeedLlm{..}` 等的地方(machine/drive/testkit/tests/examples)
-  无需改动(变体名/字段/serde 形状不变)。
-- 删除 M3-2「对比手写版」的等价性测试,保留对宏产物本身的行为测试(serde 往返、accepts 矩阵、
-  fan-out 路由 + `scope_handles⟺fulfill_with_scope` 不变量)。
-- 在 `docs/effect-refine.md` 补附录:演示「新增 effect = 清单加一段」的完整 diff。
+## 这是 review 任务:验收刀 (A),不改生产代码(只补 TODO 完成记录)
 
-## 关键设计决策:回调式清单宏(保持 design §4.1 文件落位)
-单个 `define_effects!` 只能在**一个模块**展开;但 design 要求 coproduct 在 requirement.rs、
-fan-out 在 drive.rs,且 `HandlerScope` 是公开 API(`agent::HandlerScope`,经 `drive` 再导出),
-`scope_handles`/`fulfill_with_scope` 是 drive.rs 私有。为同时满足「单一清单」+「各就各位」+
-「零对外 API 改动」,改成**回调式**:
-- `effect_manifest.rs`:`with_effect_manifest!($gen:ident)` 持有唯一清单(6 段),把 token 传给
-  `$gen`;两个生成器 `define_effect_coproduct!`(coproduct)与 `define_effect_fan_out!`(fan-out)。
-- `requirement.rs`:`with_effect_manifest!(define_effect_coproduct);` → 生成
-  `RequirementKindTag`/`RequirementKind`/`RequirementResult` + `Display`/`tag()`/`accepts`(正式名)。
-- `drive.rs`:`with_effect_manifest!(define_effect_fan_out);` → 生成 `HandlerScope`(pub)+
-  `scope_handles`/`fulfill_with_scope`(私有,取 `&RequirementKind`)。
+### 验收点(TODO M3-4)
+1. 第 1–7 处已全部由宏生成、第 8 处(机器 resume 分派)仍手写且未被误宏化。
+2. 两处特例在宏产物里正确:
+   - `NeedSubagent`(`needs_outer: true`)→ `fulfill_with_scope` 返回 `None`,走
+     `resolve_requirement` + `ScopePop` 串行路径。
+   - `NeedInteraction`(`accepts_check: request.accepts_response`)→ accepts 后置校验生效
+     (`accepts_delegates_permission_action_id_check`)。
+3. 「加 effect 成本」实验:临时加一个虚构 effect,确认只改清单一处即可编译通过,验证后回退。
+4. 完整验证序列 1–6 + `cargo test --all --all-targets` 全绿;`git diff --stat` 范围合理。
+5. `docs/effect-refine.md` §5 矩阵三行(语义变化=无、序列化风险=无)兑现。
 
-### 卫生性验证(已用 rustc 探针确认)
-- 回调式 `$gen!{...}` 可行。
-- 清单里裸写的类型路径(ChatRequest/LlmHandler…)在**展开处**解析:coproduct 类型在 requirement.rs
-  已 import;fan-out 只发出 handler trait(drive.rs 本地定义)与字段名,无需额外 import。
-- match 绑定的 `$field` 与调用实参 `$fulfill_arg` 同源(同一 `with_effect_manifest!` 体),局部变量
-  卫生一致,可协同解析(探针 probe5=15 通过)。
+## 已复核(静态)
+- 清单唯一来源:`effect_manifest.rs::with_effect_manifest!`(6 段 stanza)。
+- 两个生成器:`define_effect_coproduct`(requirement.rs 第 1–4 处)、`define_effect_fan_out`
+  (drive.rs 第 5–7 处),各只在一个模块 invoke(requirement.rs:333 / drive.rs:116)。
+- 第 8 处手写:`machine/default/mod.rs::resume/resume_llm/resume_reconfig`,不引用
+  effect_manifest;两处对 `RequirementResult` 的 match 均有 `other =>` 兜底(加变体不破坏编译)。
+- 无遗留 `define_effects` / `*Gen` / `_gen` 名字于生产代码。
+- §5 矩阵三行 + §7 附录(加 Timer effect 的一段 diff)存在。
 
-## 落点与改动
-- `effect_manifest.rs`:重写为回调式三宏 + 更新模块/宏 doc(去掉「*Gen 并存/transitional」措辞,
-  改成「单清单驱动、跨 requirement/drive 生成正式产物」)。`pub(crate) use` 三宏。
-- `requirement.rs`:删手写 `RequirementKindTag`(126-160)/`RequirementKind`(443-543)/
-  `RequirementResult`(545-587);把 `define_effects!{…}` 换成 `with_effect_manifest!(define_effect_coproduct);`
-  并将清单数据迁入 effect_manifest.rs;更新 import;删 M3-2 `*Gen` 等价性测试(1128-1253)与
-  相关 import;保留 accepts 矩阵/serde 往返/tag display 等行为测试(现在直接测正式产物)。
-- `drive.rs`:删手写 `HandlerScope`(114-147)/`scope_handles`(532-542)/`fulfill_with_scope`(544-579);
-  加 `with_effect_manifest!(define_effect_fan_out);` + import;两处调用改传 `&requirement.kind`;
-  测试:删 `HandlerScopeGen for EqScope`、`gen_tag_of`、把 `generated_fan_out_*` 改为直接测正式
-  fan-out 路由 + 不变量;清理 `*Gen`/`*_gen` import。
-- `docs/effect-refine.md`:新增「§7 附录:新增一个 effect」的一段清单 diff 指南。
+## 执行步骤
+- [x] 读 TODO/memory/源码,选定 M3-4
+- [x] 静态复核第 1–8 处 + 两处特例 + §5/§7 文档
+- [x] 更新 memory 计划(本文件)
+- [ ] 验证序列:fmt --check / clippy / 聚焦 requirement+drive / 全量 --all-targets / doc / diff --check
+- [ ] 加 effect 成本实验:临时给清单加一段复用现有类型的 stanza → `cargo build -p agent-lib --lib` 通过 → 回退
+- [ ] 写 M3-4 完成记录 → 标 [DONE]
+- [ ] commit
+- [ ] 整体收尾复核 + 打 `endtag`(TODO 全部完成)
 
-## 第 8 处(机器 resume 分派)保持手写不动。
-
-## 验证序列(default)
-1. `cargo fmt --all`
-2. `cargo clippy --all-targets -- -D warnings`
-3. 聚焦:`cargo test -p agent-lib --lib requirement drive`
-4. 全量:`cargo test --all --all-targets`(≤30min)
-5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
-6. `git diff --check`
-
-## 步骤
-- [x] 读 TODO/PLAN/design/源码,选定 M3-3
-- [x] 探针验证回调宏 + 卫生性
-- [x] 写 memory 计划(本文件)
-- [x] 重写 effect_manifest.rs(回调式三宏 + 清单迁入 + doc)
-- [x] requirement.rs 删手写 + 换调用 + 清理测试
-- [x] drive.rs 删手写 + 换调用 + 改测试
-- [x] docs/effect-refine.md 附录
-- [x] fmt/clippy/聚焦/全量/doc/diff --check
-- [ ] 写完成记录 → TODO.md 标 [DONE] → commit → 停
-
-## 验证记录
-- `cargo build`:通过(库先行编译,确认回调宏在真实代码里展开无误)。
-- `cargo fmt --all`:无改动残留。
+## 验证记录(2026-07-17,M3-4)
+- `cargo fmt --all -- --check`:FMT_OK。
 - `cargo clippy --all-targets -- -D warnings`:0 warning。
-- `cargo test -p agent-lib --lib`:552 passed / 0 failed(含 requirement/drive 模块)。
-- `cargo test --all --all-targets`:**778 passed / 0 failed**(断言未改,证明对外形状/行为不变)。
-- `cargo test --all --doc`:doctest 全绿(7+12+2,1 ignored 为 effect_manifest 的 ```ignore 语法示意)。
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`:通过(宏产物 rustdoc 可编译、有文档)。
+- `cargo test -p agent-lib --lib`:552 passed / 0 failed。
+- `cargo test --all --all-targets`:全绿(所有 test result `0 failed`,无 FAILED/panicked)。
+- `cargo test --all --doc`:7+12+2 passed(1 ignored=effect_manifest ```ignore 语法示意)。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`:通过。
 - `git diff --check`:CLEAN。
-- diff 范围:requirement.rs / drive.rs / effect_manifest.rs / docs/effect-refine.md / memory,
-  净 −333 行(删手写三 enum+accepts+三处扇出+M3-2 等价性测试,换成两行宏调用)。PLAN.md 无需改
-  (阶段计划未变);PROMPT.md 未被改动。
-- 遗留引用检查:`define_effects`/`*Gen` 仅存于 TODO.md 的 M3-1/M3-2 历史 DONE 记录(应保留为历史)
-  与本 memory 文件;生产代码/公开 doc 已无这些名字。
+- 加 effect 成本实验:临时给清单加 `TimerProbe`(复用现有类型)→ `cargo build -p agent-lib --lib`
+  EXIT=0(仅改清单一处)→ `git checkout` 回退,`grep TimerProbe`=0。
+- 刀 (A) 累计 diff stat(`62b9e76..1ba7875`):effect_manifest.rs +435 / drive.rs 306 / requirement.rs 188
+  / docs/effect-refine.md 114 / mod.rs +1;未引入 proc-macro crate。
+- 第 8 处(machine resume 分派)仍手写、未误宏化;两处特例(Subagent needs_outer→None、Interaction
+  accepts_check)正确;§5 矩阵三行兑现。
+- 结论:M3-4 通过。TODO.md 13 个任务全部 [DONE],下一步整体收尾 + 打 `endtag`。

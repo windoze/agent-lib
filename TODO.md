@@ -1030,7 +1030,7 @@ mid-turn scratch,而不是反序列化 scratch(scratch 有意非序列化)。这
   `docs/effect-refine.md` / `memory/claude_plan.md`,净 −333 行。`define_effects`/`*Gen` 仅余于
   M3-1/M3-2 的历史 DONE 记录(保留为历史),生产代码与公开 doc 已无这些名字。
 
-### [TODO] M3-4 Milestone 3 review:刀 (A) 正确性、等价性与可维护性
+### [DONE] M3-4 Milestone 3 review:刀 (A) 正确性、等价性与可维护性
 
 **前置依赖**:M3-1 ~ M3-3。
 
@@ -1059,4 +1059,71 @@ rustdoc 完整。
 
 **完成记录**:
 
-（待补充）
+刀 (A) 验收通过——对外类型形状/运行时语义逐字节不变,加 effect 成本从 8 处降到 1 处,宏可读且
+rustdoc 完整。本任务为纯 review,不改生产代码(仅补本完成记录 + `memory/`)。
+
+**1. 第 1–7 处宏覆盖确认 / 第 8 处仍手写。** 清单唯一来源为
+`src/agent/effect_manifest.rs::with_effect_manifest!`(6 段 stanza)。两个生成器各只在其 design §4.1
+指定的模块 invoke 一次:
+- `with_effect_manifest!(define_effect_coproduct);`(`requirement.rs:333`)展开第 1–4 处:
+  `RequirementKindTag`/`RequirementKind`/`RequirementResult` 三 enum + `RequirementKindTag: Display`
+  + 两个 `tag()` + `RequirementKind::accepts`。
+- `with_effect_manifest!(define_effect_fan_out);`(`drive.rs:116`)展开第 5–7 处:
+  `HandlerScope`(每 accessor 默认 `None`)+ `scope_handles` + `fulfill_with_scope`。
+- 第 8 处(机器 resume 分派)仍手写于 `machine/default/mod.rs::resume/resume_llm/resume_reconfig`,
+  不引用 `effect_manifest`,未被误宏化;两处对 `RequirementResult` 的 `match` 均含 `other =>` 兜底,
+  故非本机消费的新 effect 变体不破坏其编译。
+- 全库无遗留 `define_effects` / `*Gen` / `*_gen` 名字于生产代码(仅 TODO 历史 DONE 记录中作为过程记载)。
+
+**2. 两处特例在宏产物里正确成立。**
+- `NeedSubagent`(清单 `needs_outer: true`,无 `fulfill` 子句)→ `fulfill_with_scope` 该臂展开为
+  `let _: bool = true; None`,恒返回 `None`;`resolve_requirement`(`drive.rs:532–545`)先命中
+  `NeedSubagent` 分支,经 `ScopePop::new` + `handler.fulfill(..., &mut outer, ctx)` 串行路径处理;
+  `fulfill_batch` 亦以 `tag != Subagent && scope_handles` 把它排除出并发本地集,强制串行(`drive.rs:599`)。
+  测试 `fan_out_routes_every_family_consistently`(drive.rs;`EqSubagent::fulfill` 内 `unreachable!` 断言)
+  证明其 handler 永不经 `fulfill_with_scope` 触达。
+- `NeedInteraction`(清单 `accepts_check: request.accepts_response`)→ `accepts` 在 family match 之后
+  多出一条后置校验臂 `request.accepts_response(response)?`,错误经变体 `#[from]` 折进 `RequirementError`。
+  测试 `accepts_delegates_permission_action_id_check` 通过:action id 匹配→`Ok(())`,不匹配→
+  `RequirementError::Interaction(InteractionError::ActionMismatch{..})`。
+
+**3. 加 effect 成本验证(临时草稿,已回退)。** 按 §7 指南,在
+`with_effect_manifest!` 末尾临时加一段虚构 `TimerProbe` stanza(复用现有
+`ChatRequest/LlmStepMode/LlmHandler/Response/ClientError`,故无需任何新类型/trait/import)。**仅改清单一处**,
+`cargo build -p agent-lib --lib` 即通过(EXIT=0):两个生成器宏自动补齐 coproduct 第 1–4 处与扇出第 5–7 处,
+手写第 8 处凭 `other =>` 兜底无需改动。随后 `git checkout -- src/agent/effect_manifest.rs` 回退,
+`grep -c TimerProbe` = 0,未提交该虚构 effect。这实证「8 处对齐塌缩成 1 段 stanza,漏改一处在结构上不再可能」。
+
+**4. 完整验证序列 1–6 + 全量测试(2026-07-17,clean 已提交状态)。**
+- `cargo fmt --all -- --check`:FMT_OK(无残留)。
+- 聚焦:`cargo test -p agent-lib --lib`:552 passed / 0 failed(含 requirement/drive 全部行为测试:
+  `accepts_matrix_*`、`accepts_delegates_permission_action_id_check`、serde 往返、fan-out 路由 +
+  `scope_handles⟺fulfill_with_scope` 不变量)。
+- `cargo clippy --all-targets -- -D warnings`:0 warning。
+- `cargo test --all --all-targets`:全绿(所有 test result 均 `0 failed`;无 FAILED/panicked;lib 552 +
+  集成/testkit 全通过)。
+- `cargo test --all --doc`:7 + 12 + 2 passed(1 ignored 为 effect_manifest 的 ```ignore 语法示意)。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`:通过(宏产物 rustdoc 可编译、有文档)。
+- `git diff --check`:CHECK_CLEAN。
+- 现有测试断言未改即全绿——满足刀 (A)「等价性」核心验收(对外形状/行为不变)。
+
+**5. `git diff --stat` 触及范围(刀 (A) 累计 `62b9e76..1ba7875`)。**
+```
+docs/effect-refine.md        | 114 +++--    宏操作指南 §4/§7
+src/agent/drive.rs           | 306 +++--    第 5–7 处换宏 + 测试改测正式产物
+src/agent/effect_manifest.rs | 435 +++++    新增:单清单 + 两生成器宏
+src/agent/mod.rs             |   1 +        挂载 effect_manifest 模块
+src/agent/requirement.rs     | 188 +--      第 1–4 处换宏、删手写三 enum + M3-2 等价性测试
+TODO.md / memory/…           |              任务记录
+```
+范围合理且与 M3-4 预期一致(`requirement.rs`、`drive.rs`、宏文件、宏操作指南文档)。未引入独立
+proc-macro crate:design §4.4 允许降级但 `macro_rules!` 已足以表达清单(拆分 derive、struct/tuple 变体、
+per-field serde、boxed payload、`needs_outer`/`accepts_check` 可选标记),故保持零新 crate。
+
+**6. 三刀合计 / §5 落地矩阵三行兑现。** `docs/effect-refine.md` §5 矩阵:
+- 刀 (C) `?` 层(`machine/default/`,语义变化=无、序列化风险=无):M1-* 已 DONE。
+- 刀 (B) cursor/scratch 合一(落点 2,语义变化=无、序列化风险=无):M2-* 已 DONE,`LoopCursor` serde
+  形状未变(M2-4 已验)。
+- 刀 (A) effect 宏(`requirement.rs`/`drive.rs`,语义变化=无 + 等价性测试):M3-* 已 DONE,本 review
+  确认对外运行时语义自始至终未变(现有测试断言零修改全绿)、序列化形状不变(`RequirementKind` serde
+  往返 + 全量测试)。三行(语义变化=无、序列化风险=无)全部兑现。
