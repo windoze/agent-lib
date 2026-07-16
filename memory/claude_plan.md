@@ -1,38 +1,37 @@
-# M3-5 — Milestone 3 Review(external agent machine sign-off)
+# M4-1 — 新增 `InteractionKind::Permission` 与 `PermissionRequest`
 
-**状态:完成(已全绿,待提交)。**
+**状态:进行中。**
 
-## 目标(TODO.md M3-5)
-- 审阅 machine 状态迁移是否穷尽(Idle/AwaitingSession/AwaitingInteraction/Done/Error 无悬空态)。
-- 确认 `step` 无 `await`/无 IO(sans-io)。
-- 确认清理归属与设计 §6.4 一致(abandon never-resume,清理在 handle 层,不 emit Shutdown)。
-- 用 harness 跑完整场景(Start→Paused→Respond→Completed)与取消场景,确认无回归。
-- 完整验证序列全绿,`cargo test --all --all-targets` 无回归。
-- Review 结论与遗留项写入完成记录。
+## 目标(TODO.md M4-1)
+- 新增 `PermissionRequest`、`PermissionCategory`、`PermissionRisk`(Low/Medium/High/Critical)类型。
+- `InteractionKind` 增加 `Permission { request: PermissionRequest }`;`InteractionKindTag` 增加 `Permission`,
+  更新 `tag()`/Display/所有相关 `match`。
+- 增加构造器 `Interaction::permission(step_id, PermissionRequest)`。
+- 现有 `Approval` 家族保持不变。
 
-## 审阅结论(已核对)
-- 状态迁移穷尽:`ExternalAgentCursor` 5 态,`step` match 覆盖 External(UserMessage/Pivot)/Resume/Abandon;
-  所有 `match` 通配臂(cursor `other`、result `other`、ContentBlock `_`)都是**有意的错误/过滤处理**,
-  非悬空态。`requirement()`/`is_terminal()`/`is_idle()` 显式列出所有 variant,无 wildcard。
-- sans-io:machine.rs 无 `.await`/`async fn`/`std::{fs,io,net,process}`/`tokio::`/`spawn`/`block_on`;
-  `block_on_session` 只是「reify 一个 NeedExternalSession requirement 并 park」的纯函数命名,非真实阻塞。
-- 清理归属:abandon 只 `mark_cleanup_required()` + 丢弃悬空 turn + 收敛 Idle,不 emit requirement/Shutdown;
-  disposition(`ExternalSessionShutdown`)由 handle 层记 trace,与 §6.4/§10 一致。
-- 场景覆盖(已有测试,无需新增):
-  - Start→Completed / Start→Failed / Continue:`tests/agent_external_basic.rs`
-  - Start→Paused→Respond→Completed:`tests/agent_external_interaction.rs` + 单元
-    `external_pause_then_respond_then_complete_commits_the_turn`
-  - 取消(never-resume abandon):`tests/agent_external_lifecycle.rs::external_agent_abandon_...` + 3 单元
-  - 挂载:`external_agent_mounts_under_nested_machine`
+## 设计决策
+- 依设计文档 §3.3 字段集:`PermissionRequest { action_id: String, actor: AgentId,
+  category: PermissionCategory, summary: String, subject: serde_json::Value, risk: PermissionRisk,
+  reason: Option<String> }`。
+- 新建独立模块 `src/agent/permission.rs`(与 `approval.rs` 对称,interaction 复用它),避免 interaction.rs 膨胀。
+- `serde_json::Value` 已实现 `Eq`(`ToolCall` 亦 derive Eq 且含 Value),故 `PermissionRequest` 可 derive Eq,
+  `InteractionKind`/`Interaction` 的 `Eq` 派生不受影响。
+- M4-1 仅有 request 侧,`InteractionResponse` 无 Permission 变体(M4-2 才加)。因此:
+  - `Interaction::accepts_response` 的 catch-all 臂天然把任何响应对 Permission 请求判为 ResponseKindMismatch,无需改。
+  - 现有 auto-responder 的 exhaustive `match request.kind()` 需补 `Permission` 臂。M4-1 没有合法 permission 响应可返,
+    故补 `panic!`(与既有 `subagent/tests.rs` "never approvals" 风格一致)。reference.rs / testkit handlers.rs 的
+    真实 deny-by-default 由 **M4-3** 追踪替换。测试模块内的 handler 永不收到 Permission,panic 臂长期有效。
 
-## 发现的遗留项(review finding)
-- machine.rs `initial_loop_cursor` rustdoc 旧引用「out of scope until the mount/cleanup work in M3-4」已过时
-  (M3-4 已完成且未加 mid-flight restore)。已改写为「mid-flight restore 是超出 milestone 3 的持久化关注点」。
-  这是**仅注释**改动,但为稳妥仍跑 clippy + doc + 全量测试。
+## 需要更新的 exhaustive match
+- src/agent/drive/reference.rs `ApprovalInteractionHandler::fulfill`(库,M4-3 替换)
+- crates/agent-testkit/src/handlers.rs `approval_response`(testkit,M4-3 替换)
+- src/agent/drive.rs test-mod `PolicyInteractionHandler`、`CountingInteractionHandler`(测试,长期 panic)
+- src/agent/drive/subagent/tests.rs `CountingInteractionHandler`(测试,长期 panic)
 
 ## 步骤
-1. [x] 审阅 machine/state/shutdown/runtime,确认三项不变量。
-2. [x] 修正 `initial_loop_cursor` 过时注释。
-3. [x] fmt 无差异 / clippy 0 告警 / `cargo test external_agent` 13 过 / 全量 672 passed 0 failed / doc 0 告警。
-4. [x] TODO.md 标 [DONE] + 完成记录(review 结论 + 遗留项)。
-5. [ ] 提交 `[M3-5] ...`,停止。
+1. [ ] 新建 `src/agent/permission.rs`(3 类型 + 构造器 + serde round-trip 单测)。
+2. [ ] mod.rs 挂 `pub mod permission;` + re-export。
+3. [ ] interaction.rs:加 `Permission` variant / `Interaction::permission` / tag / Tag / Display / 单测。
+4. [ ] 补 4 处 exhaustive match 的 Permission 臂。
+5. [ ] fmt → clippy(-D warnings)→ `cargo test --lib permission` → `cargo test --all --all-targets` → doc → git diff --check。
+6. [ ] TODO.md 标 [DONE] + 完成记录;提交 `[M4-1] ...`;停止。
