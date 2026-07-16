@@ -532,7 +532,7 @@ impl RequirementResolution {
 }
 
 /// Classified error from requirement addressing or return-path type checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum RequirementError {
     /// A result of the wrong family was offered for a requirement kind.
     #[error("requirement kind `{expected}` cannot accept a `{actual}` result")]
@@ -564,9 +564,10 @@ pub enum RequirementError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentPath, AgentSlot, AgentSpecRef, Interaction, InteractionResponse, NoRequirementIds,
-        Requirement, RequirementError, RequirementId, RequirementIds, RequirementKind,
-        RequirementKindTag, RequirementResolution, RequirementResult, SubagentOutput,
+        AgentPath, AgentSlot, AgentSpecRef, Interaction, InteractionError, InteractionResponse,
+        NoRequirementIds, Requirement, RequirementError, RequirementId, RequirementIds,
+        RequirementKind, RequirementKindTag, RequirementResolution, RequirementResult,
+        SubagentOutput,
     };
     use crate::{
         agent::{
@@ -575,6 +576,9 @@ mod tests {
                 ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
                 ExternalSessionPolicy, ExternalSessionRequest, ExternalSessionResult,
                 ExternalStreamPolicy, WorktreeIsolation,
+            },
+            permission::{
+                PermissionCategory, PermissionRequest, PermissionResponse, PermissionRisk,
             },
             spec::WorktreeRef,
         },
@@ -841,6 +845,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn accepts_delegates_permission_action_id_check() {
+        let request = PermissionRequest::new(
+            "act-1".to_owned(),
+            agent_id(),
+            PermissionCategory::Shell,
+            "run tests".to_owned(),
+            json!({ "command": "cargo test" }),
+            PermissionRisk::Medium,
+            None,
+        );
+        let kind = RequirementKind::NeedInteraction {
+            request: Interaction::permission(step_id(), request),
+        };
+
+        let matching = RequirementResult::Interaction(InteractionResponse::Permission(
+            PermissionResponse::approve("act-1".to_owned()),
+        ));
+        assert_eq!(kind.accepts(&matching), Ok(()));
+
+        let mismatched = RequirementResult::Interaction(InteractionResponse::Permission(
+            PermissionResponse::deny("act-2".to_owned(), None),
+        ));
+        assert_eq!(
+            kind.accepts(&mismatched),
+            Err(RequirementError::Interaction(
+                InteractionError::ActionMismatch {
+                    expected: "act-1".to_owned(),
+                    actual: "act-2".to_owned(),
+                }
+            ))
+        );
     }
 
     #[test]

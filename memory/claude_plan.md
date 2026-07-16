@@ -1,37 +1,26 @@
-# M4-1 — 新增 `InteractionKind::Permission` 与 `PermissionRequest`
+# M4-2 — 扩展 `InteractionResponse` 的 permission 响应并校验
 
 **状态:完成(已全绿,已提交)。**
 
-## 目标(TODO.md M4-1)
-- 新增 `PermissionRequest`、`PermissionCategory`、`PermissionRisk`(Low/Medium/High/Critical)类型。
-- `InteractionKind` 增加 `Permission { request: PermissionRequest }`;`InteractionKindTag` 增加 `Permission`,
-  更新 `tag()`/Display/所有相关 `match`。
-- 增加构造器 `Interaction::permission(step_id, PermissionRequest)`。
-- 现有 `Approval` 家族保持不变。
+## 目标(TODO.md M4-2)
+- 新增 `PermissionDecision { Approve, Deny { reason: Option<String> }, Cancel }`(不绑定 `ToolCallId`)。
+- 新增 `PermissionResponse { action_id: String, decision: PermissionDecision }`。
+- `InteractionResponse` 增加 `Permission(PermissionResponse)` 变体,更新 `tag()`。
+- `Interaction::accepts_response`:`Permission` 请求只接受 `Permission` 响应,且 `action_id` 必须匹配。
+- `RequirementKind::accepts` 的 `NeedInteraction` 家族校验:已通过 `accepts_response` 委派,自动生效;补测试确认。
 
 ## 设计决策
-- 依设计文档 §3.3 字段集:`PermissionRequest { action_id: String, actor: AgentId,
-  category: PermissionCategory, summary: String, subject: serde_json::Value, risk: PermissionRisk,
-  reason: Option<String> }`。
-- 新建独立模块 `src/agent/permission.rs`(与 `approval.rs` 对称,interaction 复用它),避免 interaction.rs 膨胀。
-- `serde_json::Value` 已实现 `Eq`(`ToolCall` 亦 derive Eq 且含 Value),故 `PermissionRequest` 可 derive Eq,
-  `InteractionKind`/`Interaction` 的 `Eq` 派生不受影响。
-- M4-1 仅有 request 侧,`InteractionResponse` 无 Permission 变体(M4-2 才加)。因此:
-  - `Interaction::accepts_response` 的 catch-all 臂天然把任何响应对 Permission 请求判为 ResponseKindMismatch,无需改。
-  - 现有 auto-responder 的 exhaustive `match request.kind()` 需补 `Permission` 臂。M4-1 没有合法 permission 响应可返,
-    故补 `panic!`(与既有 `subagent/tests.rs` "never approvals" 风格一致)。reference.rs / testkit handlers.rs 的
-    真实 deny-by-default 由 **M4-3** 追踪替换。测试模块内的 handler 永不收到 Permission,panic 臂长期有效。
-
-## 需要更新的 exhaustive match
-- src/agent/drive/reference.rs `ApprovalInteractionHandler::fulfill`(库,M4-3 替换)
-- crates/agent-testkit/src/handlers.rs `approval_response`(testkit,M4-3 替换)
-- src/agent/drive.rs test-mod `PolicyInteractionHandler`、`CountingInteractionHandler`(测试,长期 panic)
-- src/agent/drive/subagent/tests.rs `CountingInteractionHandler`(测试,长期 panic)
+- 响应侧类型放入 `src/agent/permission.rs`(与 `approval.rs` 同时含 request/response 对称)。
+- `PermissionDecision`:externally-tagged enum,`rename_all=snake_case`;`Deny.reason` 用 `#[serde(default, skip_serializing_if)]`;`deny` 空 reason 归一化为 None。
+- `PermissionResponse`:`deny_unknown_fields`;构造器 `new/approve/deny/cancel` + accessor `action_id()/decision()`。
+- `accepts_response` 新增臂:`(Permission{request}, Permission(resp))` => 校验 `resp.action_id()==request.action_id()`,否则 `InteractionError::ActionMismatch`。
+- 新增 `InteractionError::ActionMismatch { expected: String, actual: String }` 含 String 字段 → 必须去掉 `InteractionError` 的 `Copy` 派生 → 连带去掉 `RequirementError`(含 `#[from] InteractionError`)的 `Copy`。已确认无处依赖二者的 Copy 语义(仅在 Result 中移动)。
+- 新增便捷构造器 `InteractionResponse::permission_for(interaction, response)`,与 `approval_for`/`choice_for` 对称。
 
 ## 步骤
-1. [x] 新建 `src/agent/permission.rs`(3 类型 + 构造器 + serde round-trip 单测)。
-2. [x] mod.rs 挂 `pub mod permission;` + re-export。
-3. [x] interaction.rs:加 `Permission` variant / `Interaction::permission` / tag / Tag / Display / 单测。
-4. [x] 补 4 处 exhaustive match 的 Permission 臂。
-5. [x] fmt → clippy(-D warnings)→ `cargo test --lib permission` → `cargo test --all --all-targets` → doc → git diff --check。
-6. [x] TODO.md 标 [DONE] + 完成记录;提交 `[M4-1] ...`;停止。
+1. [x] permission.rs:加 `PermissionDecision`、`PermissionResponse` + 构造器 + 单测。
+2. [x] mod.rs re-export `PermissionDecision`、`PermissionResponse`。
+3. [x] interaction.rs:import、`InteractionResponse::Permission`、`tag()`、`accepts_response` Permission 臂、`permission_for`、`InteractionError::ActionMismatch`、去 Copy、单测。
+4. [x] requirement.rs:`RequirementError` 去 Copy;补 permission accepts 对齐测试。
+5. [x] fmt → clippy(-D warnings)→ `cargo test --lib permission_response` → `cargo test --all --all-targets` → doc → git diff --check。
+6. [x] TODO.md 标 [DONE] + 完成记录;提交 `[M4-2] ...`;停止。

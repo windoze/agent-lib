@@ -164,9 +164,93 @@ impl PermissionRequest {
     }
 }
 
+/// External decision supplied for a pending [`PermissionRequest`].
+///
+/// Mirrors [`ApprovalDecision`](crate::agent::ApprovalDecision) in intent, but
+/// is not bound to a [`ToolCallId`](crate::conversation::ToolCallId): it answers
+/// a provider-neutral permission ask instead of the framework's own tool
+/// approval. A denial carries an optional rationale inline; a timeout is
+/// expressed by the backend as a [`Deny`](Self::Deny) or [`Cancel`](Self::Cancel)
+/// rather than a distinct variant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    /// The privileged action may proceed.
+    Approve,
+    /// The privileged action is refused, with an optional rationale.
+    Deny {
+        /// Stable reason shown to the requesting agent, if supplied.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// The pending privileged action should be cancelled.
+    Cancel,
+}
+
+/// Data-only response to a [`PermissionRequest`].
+///
+/// The [`action_id`](Self::action_id) correlates the decision back to the
+/// originating request; validation rejects a response whose `action_id` does not
+/// match the pending [`Interaction`](crate::agent::Interaction).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionResponse {
+    action_id: String,
+    decision: PermissionDecision,
+}
+
+impl PermissionResponse {
+    /// Creates a permission response correlated to `action_id`.
+    #[must_use]
+    pub fn new(action_id: String, decision: PermissionDecision) -> Self {
+        Self {
+            action_id,
+            decision,
+        }
+    }
+
+    /// Creates an approve response.
+    #[must_use]
+    pub fn approve(action_id: String) -> Self {
+        Self::new(action_id, PermissionDecision::Approve)
+    }
+
+    /// Creates a deny response; an empty `reason` is normalized to `None`.
+    #[must_use]
+    pub fn deny(action_id: String, reason: Option<String>) -> Self {
+        Self::new(
+            action_id,
+            PermissionDecision::Deny {
+                reason: reason.filter(|text| !text.is_empty()),
+            },
+        )
+    }
+
+    /// Creates a cancel response.
+    #[must_use]
+    pub fn cancel(action_id: String) -> Self {
+        Self::new(action_id, PermissionDecision::Cancel)
+    }
+
+    /// Returns the identity correlating this response to its request.
+    #[must_use]
+    pub fn action_id(&self) -> &str {
+        &self.action_id
+    }
+
+    /// Returns the external decision.
+    #[must_use]
+    pub const fn decision(&self) -> &PermissionDecision {
+        &self.decision
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PermissionCategory, PermissionRequest, PermissionRisk};
+    use super::{
+        PermissionCategory, PermissionDecision, PermissionRequest, PermissionResponse,
+        PermissionRisk,
+    };
     use crate::agent::AgentId;
     use serde::{Serialize, de::DeserializeOwned};
     use serde_json::json;
@@ -250,5 +334,35 @@ mod tests {
         assert_eq!(PermissionCategory::FileWrite.to_string(), "file_write");
         assert_eq!(PermissionCategory::SpawnAgent.to_string(), "spawn_agent");
         assert_eq!(PermissionRisk::Critical.to_string(), "critical");
+    }
+
+    #[test]
+    fn permission_response_round_trips_with_each_decision() {
+        for response in [
+            PermissionResponse::approve("act-1".to_owned()),
+            PermissionResponse::deny("act-1".to_owned(), Some("policy denied".to_owned())),
+            PermissionResponse::deny("act-1".to_owned(), None),
+            PermissionResponse::cancel("act-1".to_owned()),
+        ] {
+            assert_json_round_trip(&response);
+        }
+    }
+
+    #[test]
+    fn permission_deny_normalizes_empty_reason() {
+        let response = PermissionResponse::deny("act-1".to_owned(), Some(String::new()));
+        assert_eq!(
+            response.decision(),
+            &PermissionDecision::Deny { reason: None }
+        );
+        let encoded = serde_json::to_value(&response).expect("serialize");
+        assert!(encoded["decision"]["deny"].get("reason").is_none());
+    }
+
+    #[test]
+    fn permission_response_exposes_action_id_and_decision() {
+        let response = PermissionResponse::approve("act-42".to_owned());
+        assert_eq!(response.action_id(), "act-42");
+        assert_eq!(response.decision(), &PermissionDecision::Approve);
     }
 }

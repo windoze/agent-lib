@@ -30,7 +30,7 @@ use crate::{
     agent::{
         StepId,
         approval::{ApprovalRequirement, ApprovalResponse},
-        permission::PermissionRequest,
+        permission::{PermissionRequest, PermissionResponse},
     },
     conversation::ToolCallId,
 };
@@ -108,18 +108,21 @@ impl Interaction {
     ///
     /// The response family must match the request family, and family-specific
     /// invariants must hold: a `Choice` index must fall within the options
-    /// range, and an `Approval` response must address this interaction's
-    /// `step_id` and tool `call_id`.
+    /// range, an `Approval` response must address this interaction's `step_id`
+    /// and tool `call_id`, and a `Permission` response must carry the same
+    /// `action_id` as the pending request.
     ///
     /// # Errors
     ///
     /// Returns a classified [`InteractionError`]:
     /// [`ResponseKindMismatch`](InteractionError::ResponseKindMismatch) when the
     /// response family does not match, [`ChoiceOutOfRange`](InteractionError::ChoiceOutOfRange)
-    /// for an index past the options, or
+    /// for an index past the options,
     /// [`StepMismatch`](InteractionError::StepMismatch) /
     /// [`CallMismatch`](InteractionError::CallMismatch) when an approval
-    /// response addresses a different step or tool call.
+    /// response addresses a different step or tool call, or
+    /// [`ActionMismatch`](InteractionError::ActionMismatch) when a permission
+    /// response addresses a different action.
     pub fn accepts_response(&self, response: &InteractionResponse) -> Result<(), InteractionError> {
         match (&self.kind, response) {
             (
@@ -148,6 +151,19 @@ impl Interaction {
                     Err(InteractionError::ChoiceOutOfRange {
                         index: *index,
                         options: options.len(),
+                    })
+                }
+            }
+            (
+                InteractionKind::Permission { request },
+                InteractionResponse::Permission(response),
+            ) => {
+                if response.action_id() == request.action_id() {
+                    Ok(())
+                } else {
+                    Err(InteractionError::ActionMismatch {
+                        expected: request.action_id().to_owned(),
+                        actual: response.action_id().to_owned(),
                     })
                 }
             }
@@ -216,6 +232,9 @@ pub enum InteractionResponse {
     Answer(String),
     /// Zero-based selected index for an [`InteractionKind::Choice`].
     Choice(usize),
+    /// Decision on an [`InteractionKind::Permission`]; carries a
+    /// [`PermissionResponse`] correlated by `action_id`.
+    Permission(PermissionResponse),
 }
 
 impl InteractionResponse {
@@ -255,6 +274,23 @@ impl InteractionResponse {
         Ok(wrapped)
     }
 
+    /// Wraps a [`PermissionResponse`], validated against `interaction`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InteractionError::ResponseKindMismatch`] when `interaction` is
+    /// not a [`Permission`](InteractionKind::Permission), or
+    /// [`InteractionError::ActionMismatch`] when `response` addresses a
+    /// different action than the pending request.
+    pub fn permission_for(
+        interaction: &Interaction,
+        response: PermissionResponse,
+    ) -> Result<Self, InteractionError> {
+        let wrapped = Self::Permission(response);
+        interaction.accepts_response(&wrapped)?;
+        Ok(wrapped)
+    }
+
     /// Returns the family this response satisfies.
     #[must_use]
     pub const fn tag(&self) -> InteractionKindTag {
@@ -262,6 +298,7 @@ impl InteractionResponse {
             Self::Approval(_) => InteractionKindTag::Approval,
             Self::Answer(_) => InteractionKindTag::Question,
             Self::Choice(_) => InteractionKindTag::Choice,
+            Self::Permission(_) => InteractionKindTag::Permission,
         }
     }
 }
@@ -315,7 +352,7 @@ impl fmt::Display for InteractionKindTag {
 
 /// Classified error from validating an [`InteractionResponse`] against its
 /// [`Interaction`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum InteractionError {
     /// The response family does not match the interaction family.
     #[error("interaction `{expected}` cannot accept a `{actual}` response")]
@@ -349,6 +386,14 @@ pub enum InteractionError {
         /// Tool call carried by the approval response.
         actual: ToolCallId,
     },
+    /// A permission response addressed a different action than the interaction.
+    #[error("permission response action `{actual}` does not match interaction action `{expected}`")]
+    ActionMismatch {
+        /// Action identity the interaction awaits.
+        expected: String,
+        /// Action identity carried by the permission response.
+        actual: String,
+    },
 }
 
 #[cfg(test)]
@@ -356,13 +401,34 @@ mod tests {
     use super::{Interaction, InteractionError, InteractionKindTag, InteractionResponse};
     use crate::{
         agent::{
-            StepId,
+            AgentId, StepId,
             approval::{ApprovalRequirement, ApprovalResponse},
+            permission::{
+                PermissionCategory, PermissionRequest, PermissionResponse, PermissionRisk,
+            },
         },
         conversation::ToolCallId,
     };
     use serde::{Serialize, de::DeserializeOwned};
     use std::fmt::Debug;
+
+    fn actor() -> AgentId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890c1"
+            .parse()
+            .expect("agent id")
+    }
+
+    fn permission_request(action_id: &str) -> PermissionRequest {
+        PermissionRequest::new(
+            action_id.to_owned(),
+            actor(),
+            PermissionCategory::Shell,
+            "run tests".to_owned(),
+            serde_json::json!({ "command": "cargo test" }),
+            PermissionRisk::Medium,
+            None,
+        )
+    }
 
     fn step_id() -> StepId {
         "018f0d9c-7b6a-7c12-8f31-1234567890a1"
@@ -423,6 +489,7 @@ mod tests {
             InteractionResponse::Approval(ApprovalResponse::approve(step_id(), call_id())),
             InteractionResponse::answer("free text".to_owned()),
             InteractionResponse::Choice(1),
+            InteractionResponse::Permission(PermissionResponse::approve("act-1".to_owned())),
         ];
         for response in &responses {
             assert_json_round_trip(response);
@@ -492,27 +559,56 @@ mod tests {
 
     #[test]
     fn permission_interaction_has_permission_tag_and_round_trips() {
-        use crate::agent::{
-            AgentId,
-            permission::{PermissionCategory, PermissionRequest, PermissionRisk},
-        };
-
-        let actor: AgentId = "018f0d9c-7b6a-7c12-8f31-1234567890c1"
-            .parse()
-            .expect("agent id");
-        let request = PermissionRequest::new(
-            "act-1".to_owned(),
-            actor,
-            PermissionCategory::Shell,
-            "run tests".to_owned(),
-            serde_json::json!({ "command": "cargo test" }),
-            PermissionRisk::Medium,
-            None,
-        );
-        let interaction = Interaction::permission(step_id(), request);
+        let interaction = Interaction::permission(step_id(), permission_request("act-1"));
 
         assert_eq!(interaction.kind().tag(), InteractionKindTag::Permission);
         assert_json_round_trip(&interaction);
+    }
+
+    #[test]
+    fn permission_response_family_matches() {
+        let interaction = Interaction::permission(step_id(), permission_request("act-1"));
+
+        let response = PermissionResponse::approve("act-1".to_owned());
+        assert_eq!(
+            InteractionResponse::permission_for(&interaction, response.clone()),
+            Ok(InteractionResponse::Permission(response))
+        );
+
+        let wrong_family = InteractionResponse::answer("nope".to_owned());
+        assert_eq!(
+            interaction.accepts_response(&wrong_family),
+            Err(InteractionError::ResponseKindMismatch {
+                expected: InteractionKindTag::Permission,
+                actual: InteractionKindTag::Question,
+            })
+        );
+
+        let permission_for_non_permission = Interaction::question(step_id(), "how?".to_owned());
+        assert_eq!(
+            InteractionResponse::permission_for(
+                &permission_for_non_permission,
+                PermissionResponse::approve("act-1".to_owned())
+            ),
+            Err(InteractionError::ResponseKindMismatch {
+                expected: InteractionKindTag::Question,
+                actual: InteractionKindTag::Permission,
+            })
+        );
+    }
+
+    #[test]
+    fn permission_response_action_id_mismatch_rejected() {
+        let interaction = Interaction::permission(step_id(), permission_request("act-1"));
+
+        let mismatched = PermissionResponse::deny("act-2".to_owned(), Some("no".to_owned()));
+        assert_eq!(
+            InteractionResponse::permission_for(&interaction, mismatched),
+            Err(InteractionError::ActionMismatch {
+                expected: "act-1".to_owned(),
+                actual: "act-2".to_owned(),
+            })
+        );
     }
 
     #[test]

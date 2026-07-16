@@ -58,7 +58,9 @@ pub use interaction::{
 };
 pub use machine::{AgentMachine, DefaultAgentMachine, StepInput, StepOutcome};
 pub use machine::{MachineTreeState, NestedMachine, NestedMachineError};
-pub use permission::{PermissionCategory, PermissionRequest, PermissionRisk};
+pub use permission::{
+    PermissionCategory, PermissionDecision, PermissionRequest, PermissionResponse, PermissionRisk,
+};
 pub use requirement::{
     AgentPath, AgentSlot, AgentSpecRef, LlmStepMode, NoRequirementIds, Requirement,
     RequirementError, RequirementId, RequirementIds, RequirementKind, RequirementKindTag,
