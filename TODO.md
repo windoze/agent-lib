@@ -350,7 +350,7 @@ notification,如 `emit_tool_batch` / `emit_approval` 里的 requirement-id-unava
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。
   源码改动仅限 `src/agent/machine/default/`(`tools.rs` / `mod.rs` / `error.rs` doc)。
 
-### [TODO] M1-5 Milestone 1 review:刀 (C) 正确性与完整性
+### [DONE] M1-5 Milestone 1 review:刀 (C) 正确性与完整性
 
 **前置依赖**:M1-1 ~ M1-4。
 
@@ -379,7 +379,52 @@ notification,如 `emit_tool_batch` / `emit_approval` 里的 requirement-id-unava
 
 **完成记录**:
 
-（待补充）
+刀 (C) 里程碑验收通过,对外行为逐字节不变、噪音显著下降。纯 review 任务,未改运行时代码
+(未发现任何行为漂移)。
+
+**审阅结论(逐条对照验证条件)**:
+
+- **`step()` 是唯一 `StepError → Error` 折叠点**:`step()`(`mod.rs:835-846`)以
+  `match result { Ok(outcome) => outcome, Err(error) => self.fail_from(error) }` 收敛,
+  `fail_from`(`mod.rs:829-831`)= `self.fail(error.message())`。裸 `self.fail(` 仅出现在
+  `fail_from` 内部一处,无残留临时桥接。
+- **纯失败已 `?` 化;带副产品失败就地保留**:`mod.rs` 已无 `if let Err`;`tools.rs` 残留的
+  3 处 `if let Err`(`281/317/503`)与 10 处 `self.fail_with_notifications`(`241/275/282/304/318/
+  497/504/540/551/560`)全部携带此前已发的 `notifications`/`vec![finished]` 副产品,符合 M1-4
+  设计(带副产品失败不可裸 `?`),notification 完整。
+- **错误文案逐字节一致**:提取 baseline(`7ee6254`,M1-1 之前)与 HEAD 的全部失败字符串字面量,
+  两侧集合完全相同(24 条,含 `"tool id unavailable: {error}"`、`"conversation operation
+  failed: {error}"`、`"agent loop step limit {max_steps} ..."`、`"interaction result rejected:
+  {error}"`、`"NeedTool requirement cannot accept a \`{}\` result"` 等),`StepError::message()`
+  渲染与旧 `self.fail(format!(..))` 一致。
+- **改动范围仅限 `src/agent/machine/default/`**:M1 全部代码改动仅
+  `error.rs`(+104)/`mod.rs`/`tools.rs`,`git diff --name-only c50ec79^..HEAD -- src` 无任何
+  `default/` 之外的源文件;`LoopCursor`/`state/cursor.rs`/`drive.rs`/trait 均未误伤。
+
+**噪音下降量化(baseline `7ee6254` → HEAD)**:
+
+| 文件 | `self.fail*` | `if let Err` |
+|------|-------------|--------------|
+| `mod.rs`   | 33 → 4  | 10 → 0 |
+| `tools.rs` | 32 → 10 | 8 → 3  |
+| **合计**   | **65 → 14(-51,-78%)** | **18 → 3(-15,-83%)** |
+
+- `mod.rs` 残留 4 处 `self.fail*` 均为定义体/doc/折叠点(`797` `fail_with_notifications` 定义、
+  `828` doc 注释、`830` `fail_from`、`844` `step` 折叠),非失败噪音。
+- 残留的 `self.fail_with_notifications` + `if let Err` 全部是「带副产品失败」的就地折叠,是刀 (C)
+  刻意保留的语义,非可消除噪音。
+
+**验证序列(1–6 全过 + 额外全量机器测试)**:
+
+1. `cargo fmt --all -- --check` — 通过。
+2. `cargo test -p agent-lib agent::machine::default`(聚焦)— 39 passed; 0 failed(断言未改)。
+3. `cargo clippy --all-targets -- -D warnings` — 无警告。
+4. `cargo test --all --all-targets` — 全绿。
+5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` — 无警告。
+6. `git diff --check` — 干净。
+
+Milestone 1(刀 C)关闭:内部 `Result` 层落地,`step` 最外层单点折叠,sans-io 契约与序列化
+形状零变化。
 
 ---
 

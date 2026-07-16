@@ -1,51 +1,51 @@
-# M1-4 — 把 `tools.rs` 的纯失败路径改为 `?`，保留带副产品失败
+# M1-5 — Milestone 1 review：刀 (C) 正确性与完整性
 
-**当前执行 TODO.md 第一个未完成任务 = M1-4**（M1-1~M1-3 已 DONE）。刀 (C) 第四步：
-把 `src/agent/machine/default/tools.rs` 里返回 `StepOutcome` 的方法改签名为
-`Result<StepOutcome, StepError>`，纯失败改 `?`/`Err(Protocol)`，带副产品失败保留
-`Ok(self.fail_with_notifications(..))` 就地折叠。
+**当前执行 TODO.md 第一个未完成任务 = M1-5**（M1-1~M1-4 已 DONE）。这是刀 (C) 的里程碑
+review 任务，验收核心：「对外行为逐字节不变、噪音显著下降」。仅审阅 + 跑验证 + 补完成记录，
+不改运行时代码（除非发现行为漂移）。
 
-## 关键约束（对外行为逐字节不变）
-- 现有测试断言不改。需保留文案：`"tool id unavailable"`（tests/mod.rs:386）、
-  `"conversation operation failed"`、`"step limit"`、`"not an in-flight tool call"`、
-  `"NeedTool"`、`"interaction result rejected"`、`"get_weather"`。
-- `StepError::ToolRuntime.message()` = `"tool runtime operation failed: {e}"`，与
-  `"tool id unavailable: {e}"` 不同 → tool_ids 失败**不能**用裸 `?`，须
-  `.map_err(|e| StepError::Protocol(format!("tool id unavailable: {e}")))?`。
-- `register_tool_calls`/`append_tool_response`/`cancel_pending` 均返回 `ConversationError`
-  → 裸 `?`（From<ConversationError> → Conversation → "conversation operation failed: {e}"）文案一致。
-- `next_requirement_id` 返回 `RequirementError` → 渲染 "requirement id unavailable: {e}"
-  与现文案一致（但这些点是**带副产品**，保留 fail_with_notifications）。
+## 审阅清单（做什么）
+1. 通读 mod.rs / tools.rs，确认：
+   - `step()` 是唯一 `StepError → Error` 折叠点（`fail_from`），无残留临时桥接。
+   - 纯失败已 `?` 化；带副产品失败保留 `fail_with_notifications` 且 notification 完整。
+   - 错误文案与改造前逐字节一致（git 对照）。
+2. 统计 `if let Err` 与 `self.fail*` 前后计数，量化噪音下降。
+3. 跑完整验证序列 1–6 + 额外全量机器测试。
+4. 确认 `git diff --stat` 代码改动只在 `src/agent/machine/default/`。
+5. 发现行为漂移 → 记录并修复后再关闭。
 
-## 逐方法改造（tools.rs）
-1. begin_tool_phase → Result。pending_tool_calls .map_err(Protocol)?；tool_call_id /
-   tool_result_message_id .map_err(|e| Protocol("tool id unavailable: {e}"))?；
-   register_tool_calls 裸 ?；in_flight None → Err(Protocol("...opened without an in-flight turn"))；
-   末尾 advance_tool_phase 传播。
-2. advance_tool_phase → Result。无 phase → Err(Protocol("...advanced without an active phase"))；三分支传播。
-3. emit_tool_batch → Result。三处失败带副产品 → Ok(fail_with_notifications)；成功 Ok(..)。
-4. emit_approval → Result。同上。
-5. resume_tool → Result。纯失败 → Err(Protocol)；append 裸 ?；末尾 idle 传播 advance / else Ok(..)。
-6. resume_approval → Result。纯失败 → Err(Protocol)；accepts_response/try_from
-   .map_err(|e| Protocol("interaction result rejected: {e}"))?；append 裸 ?；
-   Approve 传播 emit_tool_batch；Deny 分支 finished 后 cursor 失败带副产品 → Ok(fail_with_notifications)；末尾传播 advance。
-7. finish_tool_phase → Result。step-limit / next_step_id / next_assistant_message_id 带副产品 →
-   Ok(fail_with_notifications)；末尾 self.block_on_llm(..) 传播（去 unwrap_or_else + M1-4 注释）。
-8. abandon_tool_phase → Result。open None → Err(Protocol)；cancel_pending 裸 ?；末尾 finish_cancel 传播。
-9. pending_tool_calls 保留 Result<Vec<ToolCall>, String>。
+## 审阅结论（已核对）
+- **fail_from 唯一折叠点**：`step()`@mod.rs:842-845 `match result { Ok=>outcome, Err=>self.fail_from(error) }`；
+  `fail_from`@830 = `self.fail(error.message())`；裸 `self.fail(` 仅出现在 fail_from 内部。✅
+- **残留 self.fail\* 全为带副产品**：mod.rs 仅 4 处（797 fail_with_notifications 定义体、828 doc、
+  830 fail_from、844 step 折叠）；tools.rs 10 处全部 `Ok(self.fail_with_notifications(notifications/vec![finished], ..))`
+  且携带此前已发的 notifications。✅
+- **残留 if let Err 全为带副产品 cursor transition**：mod.rs 0 处；tools.rs 3 处（281/317/503）均 `return Ok(fail_with_notifications(notifications, "cursor transition failed"))`。✅
+- **文案逐字节一致**：baseline(7ee6254) 与 current 的失败字符串集合完全相同（已 diff，24 条全等）。✅
+- **改动范围**：代码改动仅 error.rs/mod.rs/tools.rs，全在 src/agent/machine/default/；无 trait/drive/cursor/state 误伤。✅
 
-## mod.rs 调用点去 Ok(..) 包裹
-- L543 begin_tool_phase / L469 resume_tool / L472 resume_approval / L741 abandon_tool_phase
+## 噪音计数（baseline 7ee6254 → HEAD）
+| 文件 | self.fail\* | if let Err |
+|------|-------------|-----------|
+| mod.rs   | 33 → 4  | 10 → 0 |
+| tools.rs | 32 → 10 | 8 → 3  |
+- self.fail\*：65 → 14（-51，-78%）；if let Err：18 → 3（-15，-83%）。
+- 残留均为「带副产品失败」就地折叠，符合 M1-4 设计，非噪音。
 
-## 验证序列（1–6）
-fmt / 聚焦(tools+default) / clippy / 全量(≤30min) / doc / git diff --check
+## 验证序列（1–6 + 额外）
+1. cargo fmt --all -- --check
+2. cargo test -p agent-lib agent::machine::default（聚焦）
+3. cargo clippy --all-targets -- -D warnings
+4. cargo test --all --all-targets（≤30min）
+5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+6. git diff --check
 
 ## 完成后
-TODO.md M1-4 标 [DONE] + 完成记录；commit `[M1-4] ...`；停。
+TODO.md M1-5 标 [DONE] + 完成记录（含计数表 + 行为不变确认）；commit `[M1-5] ...`；停。
 
 ## 进度
-- [x] tools.rs 8 方法改签名 + 纯/副产品分流（+ error.rs doc 追加 M1-4）
-- [x] mod.rs 4 调用点去 Ok 包裹
-- [x] fmt / 聚焦(39 passed) / clippy / 全量(全绿) / doc / diff 全过
-- [x] TODO.md 标 DONE + 完成记录
+- [x] 审阅 mod.rs/tools.rs：fail_from 唯一折叠点、残留全带副产品、文案逐字节一致
+- [x] 噪音计数（65→14 fail*，18→3 if let Err）
+- [x] 验证序列 1–6 + 全量（fmt/聚焦39/clippy/全量全绿/doc/diff 全过）
+- [x] TODO.md 标 DONE + 完成记录（含计数表 + 行为不变确认）
 - [x] commit；停
