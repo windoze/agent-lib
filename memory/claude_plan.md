@@ -87,3 +87,39 @@
 - TODO.md M1-2 标 [DONE] 并写完成记录；M1-3 heading 完好。
 - 纯文档改动、git diff --check 干净、无断链；复用上次全量绿，跳过 cargo test。
 - 下一步：提交 [M1-2]，停止；下轮从 M1-3 继续。
+
+---
+
+# 当前任务：M1-3 Milestone 1 Review
+
+## 定位
+- `TODO.md` 首个未完成任务 = **M1-3**（第 131 行 `[TODO]`）。M1-1/M1-2 均 `[DONE]` 且已提交。
+- HEAD=4a7bde4，工作树干净。这是一个 review 任务（`*Review`），**不拆分**。
+
+## 前置核对（已完成）
+- M1-1 提交 320dcb4 仅动 examples/external_cli_spike.rs + TODO.md + memory；M1-2 提交 4a7bde4 仅动 docs/external-agent.md + TODO.md + memory。`src/` 自 M1 起未改（最后 src 改动为 d8c2d9a README 重写，早于 M1）。
+- spike 位于 `examples/`（非 src/），符合「不进核心库」。
+
+## 做什么（review）
+1. 核对 spike 只在 examples/、src/ 无改动、附录 A 结论完整。
+2. 确认三条行为（启动/流/取消）有可复现入口：`cargo run --example external_cli_spike`。
+3. 记录进入 Milestone 2 的前置结论（黑盒 fallback 取舍、取消清理最小要求、go/no-go）。
+
+## 验证门（M1-3 明确要求全量）
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test --all --all-targets`（**必须真跑**：M1-1 新增了 example 但当时只跑了 fmt+clippy+run，未跑全量；M1-2 纯文档。故 example 尚未经全量套件校验。）
+
+## 完成
+- TODO.md M1-3 `[TODO]`→`[DONE]` + 完成记录（写明 M2 go/no-go 与调整项）。
+- 提交 `[M1-3] ...`；停止。
+
+## 进度
+- (进行中) 已定位 M1-3、核对 M1-1/M1-2 提交范围，开始跑验证门。
+
+## 进度更新（M1-3 完成）
+- 全量验证门本轮真跑并全绿：fmt 无差异；clippy 无告警；`cargo test --all --all-targets` 0 failed（lib 423 + testkit 131 + 集成/doc/replay，仅 4 个 credential-gated ignored）。
+- `cargo run --example external_cli_spike` 三条行为（启动/流/取消）跑通，入口可复现。
+- 核对：spike 仅在 examples/，src/ 自 M1 起零改动；附录 A 完整；§3.1/§5.5 spike 修正标注在。
+- TODO.md M1-3 标 [DONE]，写完成记录（含 M2 go/no-go=Go、黑盒 fallback 取舍、取消清理最小要求、成本字段结论）。M2-1 heading 完好。
+- 下一步：提交 [M1-3]，停止；下轮从 M2-1 继续。

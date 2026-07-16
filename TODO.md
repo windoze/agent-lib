@@ -128,7 +128,7 @@ pub trait LlmHandler: Send + Sync {
 - 验证:纯文档改动(仅 `docs/external-agent.md`,`src/` 无变更),`git diff --check` 干净、无断链;
   按 PROMPT「仅文档改动可复用上次全量绿结果」跳过全量 `cargo test`(自上次绿以来无编译产物变化)。
 
-### [TODO] M1-3 Milestone 1 Review
+### [DONE] M1-3 Milestone 1 Review
 
 **前置依赖**:M1-1、M1-2。
 
@@ -144,6 +144,39 @@ pub trait LlmHandler: Send + Sync {
 
 - `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets` 全绿。
 - Review 结论写入本任务「完成记录」,明确 Milestone 2 的 go/no-go 与调整项。
+
+**完成记录**:
+
+- **产出核对(spike 未污染核心库)**:M1-1 提交 `320dcb4` 仅改
+  `examples/external_cli_spike.rs` + `TODO.md` + `memory/claude_plan.md`;M1-2 提交 `4a7bde4` 仅改
+  `docs/external-agent.md` + `TODO.md` + `memory/claude_plan.md`。`src/` 自 Milestone 1 起零改动
+  (最后一次 `src/` 变更是 `d8c2d9a` README 重写,早于 M1)。spike 落在 `examples/`(root package,
+  受 `cargo clippy --all-targets` / `cargo test --all --all-targets` 编译校验),符合「不进 `src/`、
+  不作稳定 API」的约束。`git diff --check` 干净。
+- **附录结论完整**:`docs/external-agent.md` §750「附录 A:Phase 0 spike 结论」齐全
+  (A.1 启动/A.2 decoder/A.3 取消/A.4 成本 + A.5 对 M2 的 5 条可操作影响 + A.6 go/no-go);§3.1(第 83 行)、
+  §5.5(第 402 行)各以「(spike 修正,见附录 A)」引用块标注,未删原设计文本。
+- **三条行为可复现**:统一入口 `cargo run --example external_cli_spike`,本轮实测三条均跑通——
+  1. 正常启动 + 返回文本(NonStreaming):EOF 后 fold 出 16 output token(echo 行 + 3 chunk);
+  2. 流式增量(Streaming):逐行 `[stream +N]` 增量后再 fold;
+  3. 取消/kill:长跑 stub 于 ~150ms `cancel()`,handler 侦测取消后 `start_kill()`+`wait()`,
+     返回 `Err(... killed external CLI after 4 streamed chunk(s))`。
+- **进入 Milestone 2 的前置结论**:
+  - *黑盒 fallback 取舍*:低保真 fold(黑盒文本→`Response`)已验证可跑但**有损**(无 per-event
+    usage、无 permission 表达、无结构化 event)。故 Milestone 2 起 **不把黑盒 fold 作为主路径**:
+    `ExternalAgentEvent` 必须是结构化枚举(附录 A.2),黑盒文本仅作降级兜底,且降级路径需在 DTO 上显式可辨。
+  - *取消清理最小要求*:cancel 走 never-resume(§6.4 已由 spike 证实)。最小要求——进程/decoder 句柄
+    由 runtime handle 长存并通过 `Drop`(`kill_on_drop` + 显式 `start_kill()`+`wait()`)清理,
+    结果 DTO 必须携带显式 shutdown disposition(区分正常完成 / 取消 kill / 失败),不得静默丢弃副作用。
+  - *成本量级*:黑盒拿不到真实 token/成本,`ExternalAgentOutput` 需独立 `usage`/`cost_micros` 字段
+    (runtime 自报或标记未知),不得用词数估算冒充真实成本。
+- **验证结果(本轮全绿)**:`cargo fmt --all -- --check` 无差异;`cargo clippy --all-targets -- -D warnings`
+  无告警;`cargo test --all --all-targets` 全绿(lib 423 + testkit 131 + 各集成/doc/replay 二进制,
+  0 failed;仅 4 个 credential-gated 集成测试保持 ignored,符合预期);`cargo run --example external_cli_spike`
+  三条行为跑通。本轮**真跑了全量套件**——M1-1 新增了 example 但当时只跑 fmt+clippy+run、M1-2 纯文档,
+  故 example 到本任务才首次经全量套件校验,结果绿。
+- **Milestone 2 go/no-go**:**Go**。进入 M2-1 定义 external session DTO,核心库不引入真实进程/网络依赖,
+  外部 runtime 交互一律 scripted/cassette 替身。
 
 ---
 
