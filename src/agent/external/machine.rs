@@ -73,6 +73,7 @@
 //! [`ExternalSessionRef::last_event_seq`] so a replayed or overlapping decision
 //! point re-emits only its unseen suffix (design §5.5).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::Map;
@@ -86,7 +87,7 @@ use crate::{
         external::{
             ExternalAgentCursor, ExternalAgentOutput, ExternalAgentState, ExternalObservedEvent,
             ExternalSessionInput, ExternalSessionRef, ExternalSessionRequest,
-            ExternalSessionResult,
+            ExternalSessionResult, ExternalToolBatchId, ExternalToolCall, ExternalToolResult,
         },
     },
     client::Response,
@@ -129,6 +130,50 @@ struct InFlight {
     assistant_message_id: MessageId,
 }
 
+/// Non-serialized scratch for a batch of host tool calls a paused session is
+/// waiting on.
+///
+/// When a runtime pauses on
+/// [`PausedForToolCalls`](ExternalSessionResult::PausedForToolCalls) the machine
+/// emits one [`NeedTool`](RequirementKind::NeedTool) per call and parks on
+/// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool). The serializable cursor
+/// records only the resumable addressing (`ToolCallId -> RequirementId`); this
+/// scratch holds the volatile per-call facts a completed batch needs to feed
+/// [`RespondToolResults`](ExternalSessionInput::RespondToolResults) back: the
+/// [`ExternalToolBatchId`], the original [`ExternalToolCall`] order, the
+/// bidirectional map between each runtime `provider_call_id` and the
+/// [`RequirementId`] the host fulfills, and the [`ExternalToolResult`] values
+/// collected so far. Like [`InFlight`], it lives only while a turn is unfinished
+/// and is deliberately absent from [`ExternalAgentState`], so a mid-turn restore
+/// (which recovers the cursor but not this scratch) cannot resume a partially
+/// answered batch.
+///
+/// The batch is populated when a session pauses for tool calls (milestone 2's
+/// `PausedForToolCalls` fold) and drained as each result arrives (milestone 2's
+/// `RespondToolResults` collection); this milestone lands the cursor phase and
+/// its scratch together so those transitions have a stable shape to build on.
+#[expect(
+    dead_code,
+    reason = "populated by the PausedForToolCalls fold and drained by the \
+              RespondToolResults collection in the following milestone-2 tasks; \
+              the cursor phase and its scratch land together here"
+)]
+#[derive(Clone, Debug)]
+struct PendingExternalToolBatch {
+    /// Runtime-assigned batch token echoed back through `RespondToolResults`.
+    batch_id: ExternalToolBatchId,
+    /// Original tool calls in the order the runtime emitted them, so the
+    /// collected results can be returned in that same stable order.
+    calls: Vec<ExternalToolCall>,
+    /// Maps each runtime `provider_call_id` to the host `RequirementId`.
+    call_to_requirement: BTreeMap<String, RequirementId>,
+    /// Maps each host `RequirementId` back to its runtime `provider_call_id`,
+    /// so an out-of-order resume routes to the right call.
+    requirement_to_call: BTreeMap<RequirementId, String>,
+    /// Results collected so far, keyed by `provider_call_id`.
+    results: BTreeMap<String, ExternalToolResult>,
+}
+
 /// Sans-io machine that drives one external coding-agent session step at a time.
 ///
 /// See the [external-agent module docs](crate::agent::external) for the
@@ -146,6 +191,19 @@ pub struct ExternalAgentMachine {
     /// Non-serialized scratch for the in-flight turn; `Some` only between opening
     /// a turn and settling it.
     in_flight: Option<InFlight>,
+    /// Non-serialized scratch for a tool-call batch a paused session is waiting
+    /// on; `Some` only while the machine is parked on
+    /// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) mid-turn. It cannot be
+    /// rebuilt from a restored [`ExternalAgentState`], so a mid-turn restore
+    /// leaves it `None` (design: the serializable cursor keeps the resumable
+    /// addressing; this scratch keeps the volatile per-call correlation).
+    #[expect(
+        dead_code,
+        reason = "populated by the PausedForToolCalls fold and drained by the \
+                  RespondToolResults collection in the following milestone-2 \
+                  tasks; the cursor phase and its scratch land together here"
+    )]
+    pending_tool_batch: Option<PendingExternalToolBatch>,
 }
 
 impl ExternalAgentMachine {
@@ -159,6 +217,7 @@ impl ExternalAgentMachine {
             requirement_ids,
             loop_cursor,
             in_flight: None,
+            pending_tool_batch: None,
         }
     }
 
@@ -562,10 +621,11 @@ impl ExternalAgentMachine {
     /// ([`ExternalSessionShutdown`](super::ExternalSessionShutdown)) is recorded
     /// by the handle layer into the trace, not here.
     fn abandon(&mut self, _id: RequirementId) -> StepOutcome {
-        // An outstanding session/interaction step means the runtime may have a
-        // live session the handle layer must force-close (§6.4). Idle/terminal
-        // cursors have nothing in flight, so there is nothing to sweep.
-        if self.state.cursor().requirement().is_some() {
+        // An outstanding session/interaction/tool step means the runtime may
+        // have a live session the handle layer must force-close (§6.4).
+        // Idle/terminal cursors have nothing in flight, so there is nothing to
+        // sweep.
+        if self.state.cursor().has_outstanding_requirement() {
             self.state.mark_cleanup_required();
         }
         if self.state.conversation().pending().is_some() {
@@ -647,15 +707,21 @@ impl AgentMachine for ExternalAgentMachine {
 ///
 /// A fresh machine is [`Idle`](ExternalAgentCursor::Idle); the terminal states
 /// map to their [`LoopCursor`] equivalents. A machine restored while parked on an
-/// awaiting state has no step scratch to rebuild a streaming-step view, so it
-/// falls back to [`LoopCursor::Idle`]; faithfully rehydrating the driver-facing
-/// view of a mid-flight external machine is a persistence concern beyond
-/// milestone 3's scope.
+/// awaiting state — including the
+/// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) batch — has no step
+/// scratch to rebuild a streaming-step or tool-wait view, so it falls back to the
+/// non-terminal [`LoopCursor::Idle`] rather than misreporting a terminal outcome.
+/// Faithfully rehydrating the driver-facing view of a mid-flight external machine
+/// is the persistence concern tracked in `PLAN.md` under the "恢复 mid-turn
+/// scratch" risk (lift the pending tool/subagent facts into the serializable
+/// cursor and add restore coverage); it is out of scope for the tool-parity
+/// milestone that only lands the cursor phase here.
 fn initial_loop_cursor(cursor: &ExternalAgentCursor) -> LoopCursor {
     match cursor {
         ExternalAgentCursor::Idle
         | ExternalAgentCursor::AwaitingSession { .. }
-        | ExternalAgentCursor::AwaitingInteraction { .. } => LoopCursor::Idle,
+        | ExternalAgentCursor::AwaitingInteraction { .. }
+        | ExternalAgentCursor::AwaitingTool { .. } => LoopCursor::Idle,
         ExternalAgentCursor::Done => LoopCursor::done(LoopDoneReason::Completed),
         ExternalAgentCursor::Error { message } => {
             LoopCursor::error(message.clone()).unwrap_or(LoopCursor::Idle)
@@ -669,6 +735,7 @@ const fn cursor_label(cursor: &ExternalAgentCursor) -> &'static str {
         ExternalAgentCursor::Idle => "idle",
         ExternalAgentCursor::AwaitingSession { .. } => "awaiting_session",
         ExternalAgentCursor::AwaitingInteraction { .. } => "awaiting_interaction",
+        ExternalAgentCursor::AwaitingTool { .. } => "awaiting_tool",
         ExternalAgentCursor::Done => "done",
         ExternalAgentCursor::Error { .. } => "error",
     }

@@ -448,7 +448,7 @@ serde、rustdoc、导出面和设计文档一致。
 目标:当 runtime 暂停在 `PausedForToolCalls` 时,`ExternalAgentMachine` 能发出 host `NeedTool` batch,
 收齐结果后用 `NeedExternalSession(RespondToolResults)` 回灌 runtime。
 
-### [TODO] M2-1 扩展 `ExternalAgentCursor` 与 machine scratch 支持 pending tool batch
+### [DONE] M2-1 扩展 `ExternalAgentCursor` 与 machine scratch 支持 pending tool batch
 
 **上下文**:
 
@@ -496,6 +496,54 @@ serde、rustdoc、导出面和设计文档一致。
 - `cargo test -p agent-lib external_agent_state_cursor_variants_round_trip`
 - `cargo test -p agent-lib external_agent_state_serde_round_trips_through_conversation_snapshot`
 - 完整验证序列 1-6 全过。
+
+**完成记录**(2026-07-17):
+
+本任务只做 M2 tool parity 的**数据结构脚手架**:cursor 新增 tool-batch 变体 + machine 新增非序列化
+scratch。`PausedForToolCalls` fold(M2-2)与 result 收集回灌(M2-3)保持未动。
+
+*改动*:
+
+- `src/agent/external/state.rs`:
+  - `ExternalAgentCursor` 新增变体
+    `AwaitingTool { batch_id: ExternalToolBatchId, requirements: ToolWaitRequirements }`(含 rustdoc)。
+    cursor 只持久化**可恢复寻址**:runtime batch token + `ToolCallId -> RequirementId` 绑定,
+    供 restore 后重建 pending-requirement registry。
+  - `requirement()` 新增 `AwaitingTool => None`(batch 无单一 requirement);新增
+    `requirements() -> Option<&ToolWaitRequirements>` 暴露整张绑定;新增
+    `has_outstanding_requirement()`(覆盖 Session/Interaction/Tool 三个 awaiting 变体)。
+  - 测试 `external_agent_state_cursor_variants_round_trip` 覆盖 `AwaitingTool` serde round-trip,
+    并断言 `requirement()`=None、`requirements()`=Some、`has_outstanding_requirement()`=true。
+- `src/agent/external/machine.rs`:
+  - 新增私有非序列化 scratch `PendingExternalToolBatch { batch_id, calls,
+    call_to_requirement(provider_call_id→RequirementId), requirement_to_call(RequirementId→provider_call_id),
+    results }`;machine 新增字段 `pending_tool_batch: Option<PendingExternalToolBatch>`(`new` 初始化 None)。
+    该 scratch 构造在 M2-2、drain 在 M2-3,故用 **`#[expect(dead_code, reason=…)]`** 标注 staging
+    (自清理:M2-2/M2-3 消费后 expectation 未兑现即报警强制移除;codebase 目前零 `allow`,选用 `expect`
+    保持「无 warning」约定,且非 spec 绕过,只是明确的前置声明脚手架)。
+  - `initial_loop_cursor` / `cursor_label` 新增 `AwaitingTool` 分支。
+  - `abandon` 用 `has_outstanding_requirement()` 取代 `requirement().is_some()`,前向正确:tool-batch
+    abandon 也需 `mark_cleanup_required`。
+  - 新增测试 `awaiting_tool_cursor_restores_without_a_terminal_view`:snapshot→restore 后 cursor 保留
+    batch 寻址(`requirements()` 可取回),而 driver-facing `LoopCursor` 降级为**非 terminal 的 Idle**
+    (不误报 Done/Error),`pending_requirement_ids()` 为空。
+
+*降级行为记录*(TODO.md 要求):`initial_loop_cursor(AwaitingTool)` 返回 `LoopCursor::Idle`(非 terminal),
+与 `AwaitingSession`/`AwaitingInteraction` 一致 —— mid-turn restore 无 step scratch 重建 streaming/tool-wait
+view。**后续任务**:此为 `PLAN.md`「恢复 mid-turn scratch」风险项已跟踪(把 pending tool/subagent facts 提入
+serializable cursor + 补 restore 测试);无需新建 TODO 任务,已在测试注释与本记录中指向。
+
+*验证*(完整序列 1-6 全过):
+
+- `cargo fmt --all -- --check` FMT_OK。
+- 聚焦:`external_agent_state_cursor_variants_round_trip`、
+  `external_agent_state_serde_round_trips_through_conversation_snapshot`、
+  `awaiting_tool_cursor_restores_without_a_terminal_view`(3 passed）。
+- `cargo clippy --all-targets -- -D warnings` 0 warning(`#[expect(dead_code)]` 在 lib 与 test 两种 cfg
+  下均兑现,无 unfulfilled-expectation)。
+- `cargo test --all --all-targets`:789 passed / 0 failed。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过(新增 intra-doc link 无破损)。
+- `git diff --check` clean。
 
 ### [TODO] M2-2 将 `PausedForToolCalls` 折成 `NeedTool` batch
 

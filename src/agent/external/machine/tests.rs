@@ -18,16 +18,19 @@ use crate::agent::{
     AgentId, AgentInput, AgentMachine, Interaction, InteractionResponse, LoopCursorKind,
     Notification, PivotMessage, PivotSource, RequirementError, RequirementId, RequirementIds,
     RequirementKind, RequirementKindTag, RequirementResolution, RequirementResult, StepId,
-    StepInput, ToolSetId,
+    StepInput, ToolSetId, ToolWaitRequirements,
     external::{
-        ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalAgentSpec,
-        ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef, ExternalObservedEvent,
-        ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput, ExternalSessionPolicy,
-        ExternalSessionRef, ExternalSessionResult, ExternalStreamPolicy, WorktreeIsolation,
+        ExternalAgentCursor, ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput,
+        ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef,
+        ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
+        ExternalSessionPolicy, ExternalSessionRef, ExternalSessionResult, ExternalStreamPolicy,
+        ExternalToolBatchId, WorktreeIsolation,
     },
     spec::{ToolSetRef, WorktreeRef},
 };
-use crate::conversation::{Conversation, ConversationConfig, ConversationId, MessageId, TurnId};
+use crate::conversation::{
+    Conversation, ConversationConfig, ConversationId, MessageId, ToolCallId, TurnId,
+};
 use crate::model::{
     content::ContentBlock,
     message::{Message, Role},
@@ -853,4 +856,63 @@ fn external_agent_records_no_artifacts_when_output_reports_none() {
         encoded.get("artifacts").is_none(),
         "an empty artifact list is skipped in the snapshot"
     );
+}
+
+#[test]
+fn awaiting_tool_cursor_restores_without_a_terminal_view() {
+    // A machine restored while a session is parked on a tool batch keeps the
+    // resumable requirement addressing on its serializable cursor, but the
+    // non-serialized batch scratch and driver-facing streaming view cannot be
+    // rebuilt from state alone. `initial_loop_cursor` must therefore surface a
+    // non-terminal `Idle` view (never a false `Done`/`Error`) so the driver does
+    // not mistake a mid-flight batch for a finished turn. Faithfully rehydrating
+    // the streaming/tool-wait view is the "恢复 mid-turn scratch" follow-up
+    // tracked in PLAN.md.
+    let batch_id = ExternalToolBatchId::new("batch-91");
+    let requirement: RequirementId = "018f0d9c-7b6a-7c12-8f31-1234567890cf"
+        .parse()
+        .expect("requirement id");
+    let call_id: ToolCallId = "018f0d9c-7b6a-7c12-8f31-1234567890ce"
+        .parse()
+        .expect("tool call id");
+    let requirements = ToolWaitRequirements::root({
+        let mut ids = std::collections::BTreeMap::new();
+        ids.insert(call_id, requirement);
+        ids
+    });
+
+    let mut state = ExternalAgentState::new(spec(), empty_conversation());
+    state.set_cursor(ExternalAgentCursor::AwaitingTool {
+        batch_id: batch_id.clone(),
+        requirements: requirements.clone(),
+    });
+
+    // Persist and restore the state to prove the resumable addressing survives
+    // the snapshot boundary while the volatile scratch does not.
+    let encoded = serde_json::to_value(&state).expect("serialize state");
+    assert_eq!(
+        encoded["cursor"]["state"],
+        serde_json::json!("awaiting_tool")
+    );
+    let decoded: ExternalAgentState = serde_json::from_value(encoded).expect("deserialize state");
+    assert_eq!(
+        decoded.cursor(),
+        &ExternalAgentCursor::AwaitingTool {
+            batch_id,
+            requirements: requirements.clone(),
+        }
+    );
+    assert_eq!(decoded.cursor().requirements(), Some(&requirements));
+
+    let restored = ExternalAgentMachine::new(decoded, Arc::new(SeqRequirementIds::default()));
+
+    // Degraded driver-facing view: non-terminal `Idle`, not a false terminal.
+    let kind = restored.cursor().kind();
+    assert_eq!(kind, LoopCursorKind::Idle);
+    assert_ne!(kind, LoopCursorKind::Done);
+    assert_ne!(kind, LoopCursorKind::Error);
+    // The streaming view is not rebuilt, so the driver-facing cursor reports no
+    // pending requirements; the outstanding ids remain recoverable from the
+    // serializable external cursor above.
+    assert!(restored.cursor().pending_requirement_ids().is_empty());
 }

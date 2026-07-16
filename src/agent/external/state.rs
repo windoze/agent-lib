@@ -10,8 +10,10 @@
 
 use crate::{
     agent::{
-        CursorRequirement,
-        external::{ExternalAgentSpec, ExternalArtifactRef, ExternalSessionRef},
+        CursorRequirement, ToolWaitRequirements,
+        external::{
+            ExternalAgentSpec, ExternalArtifactRef, ExternalSessionRef, ExternalToolBatchId,
+        },
         spec::ToolSetRef,
     },
     conversation::{Conversation, ConversationError, ConversationSnapshot},
@@ -49,6 +51,32 @@ pub enum ExternalAgentCursor {
         /// crate::agent::external::ExternalSessionInput::RespondInteraction
         pending_action: String,
     },
+    /// A session paused for a batch of tool calls; the machine emitted one
+    /// `NeedTool` requirement per call and is waiting for every host tool
+    /// result.
+    ///
+    /// The cursor persists only the resumable addressing: the runtime-assigned
+    /// [`ExternalToolBatchId`] echoed back through
+    /// [`ExternalSessionInput::RespondToolResults`], and the batch's
+    /// [`ToolWaitRequirements`] mapping each provider-independent
+    /// [`ToolCallId`](crate::conversation::ToolCallId) to the
+    /// [`RequirementId`](crate::agent::RequirementId) the driver must fulfill.
+    /// That lets a driver rebuild its pending-requirement registry from a
+    /// restored machine. The volatile per-call correlation (provider call id)
+    /// and the results collected so far live only in the machine's
+    /// non-serialized scratch, so a mid-turn restore cannot resume a partially
+    /// answered batch — see the machine's tool-phase docs.
+    ///
+    /// [`ExternalSessionInput::RespondToolResults`]:
+    /// crate::agent::external::ExternalSessionInput::RespondToolResults
+    AwaitingTool {
+        /// Runtime-assigned batch token echoed back through
+        /// [`RespondToolResults`](crate::agent::external::ExternalSessionInput::RespondToolResults).
+        batch_id: ExternalToolBatchId,
+        /// Outstanding tool requirement addressing
+        /// (`ToolCallId -> RequirementId`) for the awaited batch.
+        requirements: ToolWaitRequirements,
+    },
     /// The session reached a normal terminal outcome.
     Done,
     /// The session ended with a classified failure recorded as a message.
@@ -72,13 +100,59 @@ impl ExternalAgentCursor {
     }
 
     /// Returns the requirement address the cursor is stuck on, if any.
+    ///
+    /// Only the single-requirement awaiting variants
+    /// ([`AwaitingSession`](Self::AwaitingSession) /
+    /// [`AwaitingInteraction`](Self::AwaitingInteraction)) carry one
+    /// [`CursorRequirement`]. The [`AwaitingTool`](Self::AwaitingTool) batch
+    /// awaits many requirements at once — read those through
+    /// [`requirements`](Self::requirements).
     #[must_use]
     pub const fn requirement(&self) -> Option<&CursorRequirement> {
         match self {
             Self::AwaitingSession { requirement }
             | Self::AwaitingInteraction { requirement, .. } => Some(requirement),
-            Self::Idle | Self::Done | Self::Error { .. } => None,
+            Self::Idle | Self::AwaitingTool { .. } | Self::Done | Self::Error { .. } => None,
         }
+    }
+
+    /// Returns the outstanding tool-batch requirement addressing, if the cursor
+    /// is parked on [`AwaitingTool`](Self::AwaitingTool).
+    ///
+    /// The returned [`ToolWaitRequirements`] maps every awaited
+    /// [`ToolCallId`](crate::conversation::ToolCallId) to the
+    /// [`RequirementId`](crate::agent::RequirementId) the driver must fulfill,
+    /// so a restored machine can rebuild its pending-requirement registry from
+    /// the persisted cursor alone.
+    #[must_use]
+    pub const fn requirements(&self) -> Option<&ToolWaitRequirements> {
+        match self {
+            Self::AwaitingTool { requirements, .. } => Some(requirements),
+            Self::Idle
+            | Self::AwaitingSession { .. }
+            | Self::AwaitingInteraction { .. }
+            | Self::Done
+            | Self::Error { .. } => None,
+        }
+    }
+
+    /// Returns `true` when the cursor is parked on an outstanding host
+    /// requirement — a session step, an interaction, or a tool batch — that a
+    /// live runtime session may still back.
+    ///
+    /// Unlike [`requirement`](Self::requirement) (which only reports the
+    /// single-requirement variants), this also covers the
+    /// [`AwaitingTool`](Self::AwaitingTool) batch, so a never-resume abandon can
+    /// flag every awaiting state for the handle layer to force-close (design
+    /// §6.4).
+    #[must_use]
+    pub const fn has_outstanding_requirement(&self) -> bool {
+        matches!(
+            self,
+            Self::AwaitingSession { .. }
+                | Self::AwaitingInteraction { .. }
+                | Self::AwaitingTool { .. }
+        )
     }
 }
 
@@ -310,16 +384,18 @@ mod tests {
     use crate::{
         agent::{
             AgentId, AgentPath, AgentSlot, CursorRequirement, RequirementId, ToolSetId,
+            ToolWaitRequirements,
             external::{
                 ExternalAgentSpec, ExternalArtifactKind, ExternalArtifactRef,
                 ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionPolicy,
-                ExternalSessionRef, ExternalStreamPolicy, WorkerProfileRef, WorktreeIsolation,
+                ExternalSessionRef, ExternalStreamPolicy, ExternalToolBatchId, WorkerProfileRef,
+                WorktreeIsolation,
             },
             spec::{ToolSetRef, WorktreeRef},
         },
         conversation::{
-            AssistantFinish, Conversation, ConversationConfig, ConversationId, MessageId, TurnId,
-            TurnMeta,
+            AssistantFinish, Conversation, ConversationConfig, ConversationId, MessageId,
+            ToolCallId, TurnId, TurnMeta,
         },
         model::{
             content::ContentBlock,
@@ -331,6 +407,7 @@ mod tests {
     };
     use serde::{Serialize, de::DeserializeOwned};
     use serde_json::{Map, json};
+    use std::collections::BTreeMap;
     use std::fmt::Debug;
 
     fn agent_id() -> AgentId {
@@ -349,6 +426,12 @@ mod tests {
         "018f0d9c-7b6a-7c12-8f31-1234567890f2"
             .parse()
             .expect("requirement id")
+    }
+
+    fn tool_call_id() -> ToolCallId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890f3"
+            .parse()
+            .expect("tool call id")
     }
 
     fn message_id(offset: u8) -> MessageId {
@@ -554,6 +637,11 @@ mod tests {
     #[test]
     fn external_agent_state_cursor_variants_round_trip() {
         let origin = AgentPath::from_slots(vec![AgentSlot::new(1), AgentSlot::new(3)]);
+        let tool_requirements = ToolWaitRequirements::new(origin.clone(), {
+            let mut ids = BTreeMap::new();
+            ids.insert(tool_call_id(), requirement_id());
+            ids
+        });
         for cursor in [
             ExternalAgentCursor::Idle,
             ExternalAgentCursor::AwaitingSession {
@@ -562,6 +650,10 @@ mod tests {
             ExternalAgentCursor::AwaitingInteraction {
                 requirement: CursorRequirement::new(requirement_id(), origin.clone()),
                 pending_action: "act-9".to_owned(),
+            },
+            ExternalAgentCursor::AwaitingTool {
+                batch_id: ExternalToolBatchId::new("batch-7"),
+                requirements: tool_requirements.clone(),
             },
             ExternalAgentCursor::Done,
             ExternalAgentCursor::Error {
@@ -588,6 +680,30 @@ mod tests {
             .map(CursorRequirement::id),
             Some(requirement_id())
         );
+
+        // The tool-batch cursor awaits many requirements, so the single-value
+        // `requirement()` accessor reports none while `requirements()` surfaces
+        // the whole `ToolCallId -> RequirementId` binding. A restored driver
+        // rebuilds its pending registry from that binding alone.
+        let awaiting_tool = ExternalAgentCursor::AwaitingTool {
+            batch_id: ExternalToolBatchId::new("batch-7"),
+            requirements: tool_requirements.clone(),
+        };
+        assert!(!awaiting_tool.is_terminal());
+        assert!(awaiting_tool.has_outstanding_requirement());
+        assert!(awaiting_tool.requirement().is_none());
+        assert_eq!(awaiting_tool.requirements(), Some(&tool_requirements));
+
+        // The single-requirement awaiting variants and the resting states agree
+        // with `has_outstanding_requirement()`.
+        assert!(
+            ExternalAgentCursor::AwaitingSession {
+                requirement: CursorRequirement::root(requirement_id()),
+            }
+            .has_outstanding_requirement()
+        );
+        assert!(!ExternalAgentCursor::Idle.has_outstanding_requirement());
+        assert!(!ExternalAgentCursor::Done.has_outstanding_requirement());
     }
 
     #[test]
