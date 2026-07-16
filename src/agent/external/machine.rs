@@ -43,11 +43,14 @@
 //!   [`ToolCallId`](crate::conversation::ToolCallId) from the injected
 //!   [`ToolExecutionIds`] and a [`RequirementId`] per call), parking on
 //!   [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) with the batch's
-//!   volatile per-call correlation held in non-serialized scratch. Tool results
-//!   are relayed straight back to the runtime — never written into the
-//!   Conversation. Collecting the results and feeding
-//!   [`RespondToolResults`](ExternalSessionInput::RespondToolResults) back lands
-//!   with milestone-2 task M2-3.
+//!   volatile per-call correlation held in non-serialized scratch. Each host
+//!   tool result then resumes the machine on its own hop; results are collected
+//!   in the scratch and, once the whole batch is answered, relayed straight back
+//!   to the runtime as one
+//!   [`RespondToolResults`](ExternalSessionInput::RespondToolResults) in the
+//!   original call order — never written into the Conversation — reparking on
+//!   [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so the turn can
+//!   advance to its next decision point.
 //! - `step(Abandon)` is the never-resume cancel close (design §6.4): it discards
 //!   the dangling turn, flags
 //!   [`ExternalAgentState::mark_cleanup_required`](ExternalAgentState::mark_cleanup_required)
@@ -123,6 +126,10 @@ enum Awaiting {
         requirement: RequirementId,
         pending_action: String,
     },
+    /// Parked on an outstanding batch of `NeedTool` requirements. The volatile
+    /// per-call correlation the resume routes against lives in the
+    /// [`PendingExternalToolBatch`] scratch, so no addressing is carried here.
+    Tool,
 }
 
 /// Mid-turn scratch for the external session step currently in flight.
@@ -152,26 +159,19 @@ struct InFlight {
 /// records only the resumable addressing (`ToolCallId -> RequirementId`); this
 /// scratch holds the volatile per-call facts a completed batch needs to feed
 /// [`RespondToolResults`](ExternalSessionInput::RespondToolResults) back: the
-/// [`ExternalToolBatchId`], the original [`ExternalToolCall`] order, the
-/// bidirectional map between each runtime `provider_call_id` and the
-/// [`RequirementId`] the host fulfills, and the [`ExternalToolResult`] values
-/// collected so far. Like [`InFlight`], it lives only while a turn is unfinished
-/// and is deliberately absent from [`ExternalAgentState`], so a mid-turn restore
-/// (which recovers the cursor but not this scratch) cannot resume a partially
-/// answered batch.
+/// [`ExternalToolBatchId`], the original [`ExternalToolCall`] order, the map from
+/// each host [`RequirementId`] back to its runtime `provider_call_id` (so an
+/// out-of-order resume routes to the right call), and the
+/// [`ExternalToolResult`] values collected so far. Like [`InFlight`], it lives
+/// only while a turn is unfinished and is deliberately absent from
+/// [`ExternalAgentState`], so a mid-turn restore (which recovers the cursor but
+/// not this scratch) cannot resume a partially answered batch.
 ///
 /// This scratch is populated when a session pauses for tool calls (the
-/// [`PausedForToolCalls`](ExternalSessionResult::PausedForToolCalls) fold landed
-/// with this milestone-2 task) and is drained as each result arrives (the
-/// [`RespondToolResults`](ExternalSessionInput::RespondToolResults) collection,
-/// milestone-2 task M2-3). Only the batch producer runs so far, so the collected
-/// per-call fields are written but not yet read back.
-#[expect(
-    dead_code,
-    reason = "the per-call correlation and collected results are read back by \
-              the RespondToolResults collection in milestone-2 task M2-3; this \
-              task (M2-2) only populates the batch on a tool-call pause"
-)]
+/// [`PausedForToolCalls`](ExternalSessionResult::PausedForToolCalls) fold) and
+/// drained as each result arrives and the completed batch feeds
+/// [`RespondToolResults`](ExternalSessionInput::RespondToolResults) back — see
+/// [`resume_tool`](ExternalAgentMachine::resume_tool).
 #[derive(Clone, Debug)]
 struct PendingExternalToolBatch {
     /// Runtime-assigned batch token echoed back through `RespondToolResults`.
@@ -179,8 +179,6 @@ struct PendingExternalToolBatch {
     /// Original tool calls in the order the runtime emitted them, so the
     /// collected results can be returned in that same stable order.
     calls: Vec<ExternalToolCall>,
-    /// Maps each runtime `provider_call_id` to the host `RequirementId`.
-    call_to_requirement: BTreeMap<String, RequirementId>,
     /// Maps each host `RequirementId` back to its runtime `provider_call_id`,
     /// so an out-of-order resume routes to the right call.
     requirement_to_call: BTreeMap<RequirementId, String>,
@@ -348,6 +346,7 @@ impl ExternalAgentMachine {
                 requirement: requirement.id(),
                 pending_action: pending_action.clone(),
             }),
+            ExternalAgentCursor::AwaitingTool { .. } => Ok(Awaiting::Tool),
             other => Err(format!(
                 "resume received while cursor is `{}`, no outstanding external requirement",
                 cursor_label(other)
@@ -360,6 +359,7 @@ impl ExternalAgentMachine {
                 requirement,
                 pending_action,
             }) => self.resume_interaction(requirement, pending_action, resolution),
+            Ok(Awaiting::Tool) => self.resume_tool(resolution),
             Err(message) => self.fail(message),
         }
     }
@@ -534,13 +534,13 @@ impl ExternalAgentMachine {
     /// [`ToolExecutionIds`] and a [`RequirementId`] per call — and parks on
     /// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool), whose driver-facing
     /// [`LoopCursor::awaiting_tool`] view carries every outstanding requirement
-    /// id. The volatile per-call correlation (`provider_call_id` ↔
-    /// `RequirementId`) and the initially empty result set live in the
+    /// id. The volatile per-call correlation (`RequirementId` →
+    /// `provider_call_id`) and the initially empty result set live in the
     /// non-serialized [`PendingExternalToolBatch`] scratch so a completed batch
     /// can feed [`RespondToolResults`](ExternalSessionInput::RespondToolResults)
-    /// back in the original call order (milestone-2 task M2-3). The in-flight
-    /// turn stays open across the pause so the eventual results fold back into
-    /// the same turn.
+    /// back in the original call order (see [`resume_tool`](Self::resume_tool)).
+    /// The in-flight turn stays open across the pause so the eventual results
+    /// fold back into the same turn.
     ///
     /// No tool result is ever written into the [`Conversation`] — the external
     /// runtime is the consumer of tool results, not host history; the machine
@@ -573,12 +573,11 @@ impl ExternalAgentMachine {
 
         // Bridge each runtime tool call into a `NeedTool` requirement, allocating
         // a host tool-call id and a requirement id per call. `ids` addresses the
-        // driver-facing awaiting-tool cursor; the bidirectional
-        // provider-id ↔ requirement-id maps address the eventual
-        // `RespondToolResults` fan-out (kept in the batch scratch).
+        // driver-facing awaiting-tool cursor; the `requirement_to_call` map
+        // addresses the eventual `RespondToolResults` fan-out (kept in the batch
+        // scratch) so an out-of-order resume routes to the right call.
         let mut requirements = Vec::with_capacity(calls.len());
         let mut ids: BTreeMap<ToolCallId, RequirementId> = BTreeMap::new();
-        let mut call_to_requirement: BTreeMap<String, RequirementId> = BTreeMap::new();
         let mut requirement_to_call: BTreeMap<RequirementId, String> = BTreeMap::new();
         for call in &calls {
             let tool_call: ToolCall = call.to_tool_call();
@@ -608,7 +607,6 @@ impl ExternalAgentMachine {
                 },
             ));
             ids.insert(call_id, requirement_id);
-            call_to_requirement.insert(call.provider_call_id.clone(), requirement_id);
             requirement_to_call.insert(requirement_id, call.provider_call_id.clone());
         }
 
@@ -631,7 +629,6 @@ impl ExternalAgentMachine {
         self.pending_tool_batch = Some(PendingExternalToolBatch {
             batch_id: batch_id.clone(),
             calls,
-            call_to_requirement,
             requirement_to_call,
             results: BTreeMap::new(),
         });
@@ -644,6 +641,130 @@ impl ExternalAgentMachine {
         );
 
         StepOutcome::new(notifications, requirements, true)
+    }
+
+    /// Folds one fulfilled `NeedTool` result into the pending tool batch,
+    /// relaying the whole batch back to the runtime once every call is answered.
+    ///
+    /// Each host tool result arrives on its own resume. The result is routed to
+    /// its runtime `provider_call_id` through the
+    /// [`PendingExternalToolBatch`] scratch (keyed by [`RequirementId`], so a
+    /// parallel batch may resolve out of order) and collected there:
+    ///
+    /// - A [`RequirementResult::Tool(Ok(response))`](RequirementResult::Tool) is
+    ///   bridged into an [`ExternalToolResult`] preserving the host's four-state
+    ///   status and multimodal content, re-keyed to the batch's authoritative
+    ///   `provider_call_id`.
+    /// - A [`RequirementResult::Tool(Err(error))`](RequirementResult::Tool) is
+    ///   returned to the runtime as a failed tool result carrying the framework's
+    ///   stable diagnostic (the fixed *return-error-to-runtime* policy — the
+    ///   external runtime, not the host, decides how to react to a failed call),
+    ///   never stopping the host turn.
+    /// - Any other result family is a protocol violation and settles the machine
+    ///   on a classified [`Error`](ExternalAgentCursor::Error) cursor.
+    ///
+    /// While the batch is incomplete the machine stays parked on
+    /// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) with a quiescent, empty
+    /// outcome — it emits no new requirement and does not advance the session.
+    /// When the final result lands the collected [`ExternalToolResult`] values
+    /// are assembled in the runtime's original call order (never completion
+    /// order) and fed back through one
+    /// [`RespondToolResults`](ExternalSessionInput::RespondToolResults) under the
+    /// paused [`ExternalToolBatchId`], reparking on
+    /// [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so the session
+    /// can advance to its next decision point within the same turn.
+    ///
+    /// A resume with no live batch scratch (for example after a mid-turn restore
+    /// that recovered the cursor but not the volatile scratch), an unknown
+    /// requirement id, or a duplicate result for an already-answered call is a
+    /// protocol violation and settles on a classified error cursor.
+    fn resume_tool(&mut self, resolution: RequirementResolution) -> StepOutcome {
+        // The batch scratch holds the volatile per-call correlation the resume
+        // routes against. A mid-turn restore recovers the cursor but not this
+        // scratch, so a resume with no scratch cannot reassemble the batch.
+        let Some(batch) = self.pending_tool_batch.as_ref() else {
+            return self.fail("tool result resumed without a pending tool batch");
+        };
+        let Some(in_flight) = self.in_flight else {
+            return self.fail("tool result resumed without an in-flight turn");
+        };
+
+        // Route by requirement id: an id outside the batch is not one this pause
+        // is waiting on.
+        let Some(provider_call_id) = batch.requirement_to_call.get(&resolution.id).cloned() else {
+            return self.fail(format!(
+                "resume targets requirement {}, which is not part of the pending tool batch",
+                resolution.id
+            ));
+        };
+
+        // A second result for the same call is a duplicate resume.
+        if batch.results.contains_key(&provider_call_id) {
+            return self.fail(format!(
+                "resume targets requirement {}, whose tool result was already collected",
+                resolution.id
+            ));
+        }
+
+        // Bridge the host result into the runtime-facing tool result. A runtime
+        // error is returned to the runtime as a failed tool result (the fixed
+        // return-error-to-runtime policy) rather than stopping the turn. The
+        // `provider_call_id` is taken from the batch mapping, the authoritative
+        // correlation the runtime paused on.
+        let tool_result = match resolution.result {
+            RequirementResult::Tool(Ok(response)) => {
+                let mut result = ExternalToolResult::from_tool_response(&response);
+                result.provider_call_id = provider_call_id.clone();
+                result
+            }
+            RequirementResult::Tool(Err(error)) => {
+                ExternalToolResult::from_tool_runtime_error(provider_call_id.clone(), &error)
+            }
+            other => {
+                return self.fail(format!(
+                    "NeedTool requirement cannot accept a `{}` result",
+                    other.tag()
+                ));
+            }
+        };
+
+        let batch = self
+            .pending_tool_batch
+            .as_mut()
+            .expect("pending tool batch present after the immutable borrow above");
+        batch.results.insert(provider_call_id, tool_result);
+        if batch.results.len() < batch.calls.len() {
+            // The batch is still incomplete: stay parked on AwaitingTool without
+            // emitting a new requirement or advancing the session.
+            return StepOutcome::new(Vec::new(), Vec::new(), true);
+        }
+
+        // Every call is answered: assemble the results in the runtime's original
+        // call order and feed them back under the paused batch id.
+        let batch = self
+            .pending_tool_batch
+            .take()
+            .expect("pending tool batch present after the collection above");
+        let mut results = Vec::with_capacity(batch.calls.len());
+        for call in &batch.calls {
+            match batch.results.get(&call.provider_call_id) {
+                Some(result) => results.push(result.clone()),
+                None => {
+                    return self.fail(format!(
+                        "tool batch completed without a result for call `{}`",
+                        call.provider_call_id
+                    ));
+                }
+            }
+        }
+
+        self.block_on_session(
+            in_flight.step_id,
+            ExternalSessionInput::RespondToolResults {
+                batch_id: batch.batch_id,
+                results,
+            },
+        )
     }
 
     /// Feeds a resolved interaction back into the paused session.
