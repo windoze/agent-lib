@@ -9,10 +9,12 @@
 //! effect boundary without a deep import path.
 
 pub use crate::assertions::{
-    BudgetAssertions, CallAssertions, ConversationAssertions, NotificationAssertions,
-    RequirementAssertions, RequirementTraceView, RequirementView, TraceAssertions, TraceNodeView,
-    TurnDoneAssertions, assert_budget, assert_budget_snapshot, assert_calls, assert_conversation,
-    assert_done, assert_notifications, assert_requirements, assert_trace, assert_trace_records,
+    BudgetAssertions, CallAssertions, ConversationAssertions, ExternalAgentCallAssertions,
+    ExternalInputKind, ExternalResultKind, NotificationAssertions, RequirementAssertions,
+    RequirementTraceView, RequirementView, TraceAssertions, TraceNodeView, TurnDoneAssertions,
+    assert_budget, assert_budget_snapshot, assert_calls, assert_conversation, assert_done,
+    assert_external_calls, assert_notifications, assert_requirements, assert_trace,
+    assert_trace_records,
 };
 pub use crate::cassette::{
     CASSETTE_SCHEMA_VERSION, Cassette, CassetteEntry, CassetteError, CassetteInteractionHandler,
@@ -27,6 +29,9 @@ pub use crate::cassette::{
 pub use crate::concurrency::{
     Barrier, BarrierWait, CancelEvent, CancelLog, CancelOnCall, CancelTiming, Delay,
     DelayingToolHandler, InFlightGuard, PanicOnCall, PeakInFlight, YieldTicks,
+};
+pub use crate::external::{
+    ExternalAgentCallLog, ExternalAgentFixture, ExternalSessionStep, ScriptedExternalSessionHandler,
 };
 pub use crate::fixtures::{
     agent_spec, agent_spec_with_tools, agent_state, assistant_text, assistant_tool_use,

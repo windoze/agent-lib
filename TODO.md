@@ -371,7 +371,7 @@ trait(`LlmHandler` 等)均为 `#[async_trait]`,`fulfill(...) -> RequirementResul
   credential-gated 集成测试保持 ignored,与基线一致);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
   --workspace` 无告警;`git diff --check` 干净。
 
-### [TODO] M2-4 在 testkit 实现 `ScriptedExternalSessionHandler` 与 fixtures
+### [DONE] M2-4 在 testkit 实现 `ScriptedExternalSessionHandler` 与 fixtures
 
 **前置依赖**:M2-3。
 
@@ -399,6 +399,44 @@ trait(`LlmHandler` 等)均为 `#[async_trait]`,`fulfill(...) -> RequirementResul
 - 新增 testkit 单测:用 `ScriptedExternalSessionHandler` 依次返回 Completed 与 PausedForInteraction,
   断言 call log 顺序与摘要正确。过滤名:`cargo test -p agent-testkit external`。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- 新增模块 `crates/agent-testkit/src/external.rs`:
+  - `ExternalAgentCallLog` = `CallLog<ExternalSessionRequest, RequirementResult>` 类型别名(记录调用序号、
+    request、result、完成顺序,对齐设计 §12)。
+  - `ExternalSessionStep`:实现 `ScriptStep`(`FAMILY = RequirementKindTag::ExternalSession`),`into_result`
+    → `RequirementResult::ExternalSession(Box::new(result))`;构造子 `ExternalSessionStep::result(..)`。
+  - `ScriptedExternalSessionHandler`:`#[async_trait] impl ExternalSessionHandler`,按 dispatch 顺序返回
+    脚本化 `ExternalSessionResult`,每次 `fulfill` 记录 request/result 到 `log()`;脚本耗尽(`StrictMode::Error`)
+    折叠为**同族** `ExternalSessionResult::Failed { error: ExternalAgentError::Runtime, .. }`,不返回错族
+    (对齐 `ScriptedReconfigHandler` 的耗尽折叠语义)。`new` / `from_steps` / `script()` / `log()` 与既有
+    scripted handler 一致。
+  - `ExternalAgentFixture`(持 `SeqIds` 克隆,id 树确定且唯一):`start_request`/`continue_request`、
+    `session_ref`、`policy`、`output`(带 patch artifact)、`file_patch_event`/`command_finished_event`/
+    `permission_requested_event`,以及三态结果构造子 `completed`(带 command→patch observations)、
+    `permission_pause`(以 `Interaction::question` 表达权限澄清 + `PermissionRequested` observation;
+    M4 落地 `InteractionKind::Permission` 后可原地升级)、`failed`。
+- 新增断言模块 `crates/agent-testkit/src/assertions/external.rs`(风格对齐 `assertions/calls.rs`):
+  `ExternalInputKind`(Start/Continue/RespondInteraction/Shutdown)、`ExternalResultKind`
+  (Completed/PausedForInteraction/Failed)判别枚举;`assert_external_calls(&log) -> ExternalAgentCallAssertions`
+  fluent builder,count/completed/all_completed/completion_order 委托给 `assert_calls`,新增
+  `input_kinds`/`result_kinds` 摘要断言。
+- 接线:`lib.rs` `pub mod external;` 与 module-map 文档;`assertions/mod.rs` `mod external;` 与 `pub use`;
+  `prelude.rs` 导出 `ExternalAgentCallLog`/`ExternalAgentFixture`/`ExternalSessionStep`/
+  `ScriptedExternalSessionHandler` 及 `ExternalAgentCallAssertions`/`ExternalInputKind`/`ExternalResultKind`/
+  `assert_external_calls`。
+- 测试(5 个,过滤名含 `external`):`returns_scripted_results_in_dispatch_order`(两次 fulfill start→continue,
+  断言 Completed→Paused 与 count/completion_order/input_kinds/result_kinds)、
+  `completed_result_carries_structured_observations`(结构化 observations = CommandFinished→FilePatch)、
+  `exhausted_script_folds_into_family_aligned_failure`(空脚本折叠为同族 Failed(Runtime),count=1、
+  result_kinds=[Failed]);assertions 侧 `summaries_track_request_and_result_kinds`、`wrong_input_kinds_panic`。
+  `CassetteExternalSessionHandler` 按 §12 留待后续里程碑。
+- **验证结果(完整序列全绿)**:`cargo fmt --all -- --check` 无差异;`cargo test -p agent-testkit external`
+  5 passed;`cargo clippy --all-targets -- -D warnings` 无告警(修正一处 module-map bullet 触发的
+  `doc_nested_refdefs`);`cargo test --all --all-targets` 全绿(testkit lib 136 passed〔131 基线 +5 新测〕、
+  各集成/doc/replay 二进制 0 failed,30 个 `test result: ok`;credential-gated 集成测试保持 ignored);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
 ### [TODO] M2-5 Milestone 2 Review
 

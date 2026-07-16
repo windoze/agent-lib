@@ -102,6 +102,8 @@
 //! - [`script`]: the scripted effect model, strict mode, and call log.
 //! - [`handlers`]: scripted [`LlmHandler`](agent_lib::agent::LlmHandler),
 //!   [`ToolHandler`](agent_lib::agent::ToolHandler), and other effect handlers.
+//! - [`external`]: scripted external session handler, external-agent fixtures,
+//!   and the external-session call log.
 //! - [`cassette`]: record/replay of provider-neutral effect req/resp.
 //! - [`scope`]: the `TestScope` handler-scope builder.
 //! - [`machine`]: the `ScriptMachine` [`AgentMachine`](agent_lib::agent::AgentMachine)
@@ -118,6 +120,7 @@
 pub mod assertions;
 pub mod cassette;
 pub mod concurrency;
+pub mod external;
 pub mod fixtures;
 pub mod handlers;
 pub mod harness;

@@ -46,6 +46,7 @@ mod budget;
 mod calls;
 mod conversation;
 mod done;
+mod external;
 mod notifications;
 mod requirements;
 mod trace;
@@ -54,6 +55,9 @@ pub use budget::{BudgetAssertions, assert_budget, assert_budget_snapshot};
 pub use calls::{CallAssertions, assert_calls};
 pub use conversation::{ConversationAssertions, assert_conversation};
 pub use done::{TurnDoneAssertions, assert_done};
+pub use external::{
+    ExternalAgentCallAssertions, ExternalInputKind, ExternalResultKind, assert_external_calls,
+};
 pub use notifications::{NotificationAssertions, assert_notifications};
 pub use requirements::{RequirementAssertions, RequirementView, assert_requirements};
 pub use trace::{
