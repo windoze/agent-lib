@@ -48,7 +48,8 @@ pub use external::{
     ExternalAgentOutput, ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind,
     ExternalArtifactRef, ExternalPermissionMode, ExternalRuntimeHandles, ExternalRuntimeKind,
     ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest,
-    ExternalSessionResult, ExternalStreamPolicy, WorkerProfileRef, WorktreeIsolation,
+    ExternalSessionResult, ExternalSessionShutdown, ExternalStreamPolicy, WorkerProfileRef,
+    WorktreeIsolation,
 };
 pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};
 pub use interaction::{

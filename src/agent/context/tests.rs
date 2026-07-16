@@ -319,3 +319,34 @@ fn requirement_trace_node_round_trips_through_serde() {
         serde_json::from_value(encoded).expect("deserialize requirement trace record");
     assert_eq!(decoded, record);
 }
+
+#[test]
+fn external_shutdown_trace_node_records_disposition_under_parent() {
+    use crate::agent::external::ExternalSessionShutdown;
+
+    let context = context_with_limits(BudgetLimits::unbounded());
+    let shutdown = context
+        .trace()
+        .record_external_shutdown(node_id("shutdown-1"), ExternalSessionShutdown::ForcedKill)
+        .expect("record external shutdown");
+
+    assert_eq!(shutdown.parent(), Some(context.trace().current_parent()));
+    assert_eq!(
+        shutdown.kind(),
+        TraceNodeKind::ExternalShutdown {
+            disposition: ExternalSessionShutdown::ForcedKill,
+        }
+    );
+    // The forced-kill disposition is surfaced as the node label for diagnostics.
+    assert_eq!(shutdown.label(), Some("forced_kill"));
+
+    let encoded = serde_json::to_value(&shutdown).expect("serialize external shutdown record");
+    assert_eq!(
+        encoded["kind"]["external_shutdown"],
+        json!({ "disposition": "forced_kill" })
+    );
+
+    let decoded: TraceRecord =
+        serde_json::from_value(encoded).expect("deserialize external shutdown record");
+    assert_eq!(decoded, shutdown);
+}

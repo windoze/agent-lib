@@ -11,7 +11,7 @@
 //! real runtime to its next decision point and feeds the
 //! [`ExternalSessionResult`] back through [`StepInput::Resume`].
 //!
-//! # What this machine covers (M3-2, M3-3)
+//! # What this machine covers (M3-2, M3-3, M3-4)
 //!
 //! - `step(External(UserMessage))` opens a Conversation turn and blocks on one
 //!   `NeedExternalSession`, choosing
@@ -33,9 +33,25 @@
 //!   echoes the paused action id, reparking on
 //!   [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so a turn can loop
 //!   pause↔respond until it completes or fails.
+//! - `step(Abandon)` is the never-resume cancel close (design §6.4): it discards
+//!   the dangling turn, flags
+//!   [`ExternalAgentState::mark_cleanup_required`](ExternalAgentState::mark_cleanup_required)
+//!   so the handle layer force-closes any live session, and settles back to a
+//!   feedable [`Idle`](ExternalAgentCursor::Idle). It never emits a `Shutdown`
+//!   effect — cleanup and its
+//!   [`ExternalSessionShutdown`](super::ExternalSessionShutdown) disposition live
+//!   at the handle layer, not in this sans-io step.
 //!
-//! The cancel/abandon cleanup accounting lands in M3-4; abandon is settled here
-//! as a defined, quiescent transition rather than left to misbehave.
+//! # Mounting under a subagent hierarchy
+//!
+//! `ExternalAgentMachine` is a plain [`AgentMachine`], so a
+//! [`SubagentHandler`](crate::agent::SubagentHandler) can mount it as the child
+//! of a `NeedSubagent`: the reference
+//! [`DrivingSubagentHandler`](crate::agent::DrivingSubagentHandler) opens a
+//! nested drain layer for it under a derived child
+//! [`RunContext`](crate::agent::RunContext), so it advances Start→Completed just
+//! like any other child machine while inheriting depth / budget / cancel from the
+//! parent.
 //!
 //! # Persistence boundary
 //!
@@ -425,13 +441,40 @@ impl ExternalAgentMachine {
         StepOutcome::new(Vec::new(), Vec::new(), true)
     }
 
-    /// Handles a never-resume [`StepInput::Abandon`].
+    /// Handles a never-resume [`StepInput::Abandon`] (cancel, design §6.4).
     ///
-    /// Full cancel accounting — shutdown disposition and orphan-session flagging
-    /// (design §6.4) — lands in M3-4. This milestone only needs a safe settle so
-    /// a cancelled drain does not misbehave: discard any dangling pending turn
-    /// and return the cursor to a feedable [`Idle`](ExternalAgentCursor::Idle).
+    /// Cancellation of an external agent is **never-resume**: once the driver
+    /// abandons the continuation the machine is not stepped again, so it can
+    /// never emit a graceful
+    /// [`Shutdown`](ExternalSessionInput::Shutdown). Closing the live session
+    /// (killing the CLI process, dropping the SDK connection, aborting the
+    /// background reader task) is therefore **the handle layer's job**, not the
+    /// machine's — see [`ExternalRuntimeHandles`](super::ExternalRuntimeHandles).
+    /// This step only settles the pure state:
+    ///
+    /// - When abandoning an outstanding session/interaction step
+    ///   ([`AwaitingSession`](ExternalAgentCursor::AwaitingSession) /
+    ///   [`AwaitingInteraction`](ExternalAgentCursor::AwaitingInteraction)) a
+    ///   runtime session may be live, so it flags
+    ///   [`ExternalAgentState::mark_cleanup_required`] for the handle layer to
+    ///   sweep; the resumable [`session`](ExternalAgentState::session) facts stay
+    ///   recorded so the runtime can still be resumed if it supports it.
+    /// - The dangling pending turn is discarded and the cursor settles back to a
+    ///   feedable [`Idle`](ExternalAgentCursor::Idle), so a fresh
+    ///   [`AgentInput::UserMessage`](crate::agent::AgentInput::UserMessage) can
+    ///   open the next turn.
+    ///
+    /// It emits no new requirement: the abandon does not perform a
+    /// `Shutdown` effect. The forced-close disposition
+    /// ([`ExternalSessionShutdown`](super::ExternalSessionShutdown)) is recorded
+    /// by the handle layer into the trace, not here.
     fn abandon(&mut self, _id: RequirementId) -> StepOutcome {
+        // An outstanding session/interaction step means the runtime may have a
+        // live session the handle layer must force-close (§6.4). Idle/terminal
+        // cursors have nothing in flight, so there is nothing to sweep.
+        if self.state.cursor().requirement().is_some() {
+            self.state.mark_cleanup_required();
+        }
         if self.state.conversation().pending().is_some() {
             let _ = self
                 .state

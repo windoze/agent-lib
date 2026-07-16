@@ -1,54 +1,33 @@
-# Claude 执行计划
+# M3-4 — cancel/abandon 清理、shutdown disposition 与挂载验证
 
-## 当前任务:M3-3 实现两段式交互(Paused → NeedInteraction → RespondInteraction)
+**状态:完成(已全绿,待提交)。**
 
-**前置依赖**:M3-2(DONE)。
+## 目标(TODO.md M3-4)
+- `step(Abandon(id))`:never-resume 关闭,cursor 收敛到可复用终止态并标注外部 session 清理,不 emit 新 requirement。
+- 明确清理归属:handle 层(`ExternalRuntimeHandles` Drop / 容器 teardown)负责关进程,machine 不 emit `Shutdown`。
+- 定义 shutdown disposition 小枚举并在 trace 体现。
+- 验证 `ExternalAgentMachine` 能作为 child 经 `NeedSubagent` 派生驱动。
 
-### 目标(TODO M3-3)
-扩展 `ExternalAgentMachine`,覆盖 external session 的两段式交互:
-- `Resume(ExternalSession(PausedForInteraction { session, action_id, request, .. }))`
-  → 记录 session facts、保存 `pending_action`(action_id)、cursor → `AwaitingInteraction`、
-    emit `NeedInteraction { request }`。
-- `Resume(Interaction(response))`(cursor 为 `AwaitingInteraction`)
-  → emit `NeedExternalSession { input: RespondInteraction { action_id: pending_action, response } }`,
-    cursor 回到 `AwaitingSession`。
-- 支持一个 turn 内多次 Paused↔Respond 循环,直到 Completed/Failed。
-- action_id 对齐:`RespondInteraction.action_id` 必须与触发它的 `PausedForInteraction` 一致。
+## 关键设计决策
+- `ExternalSessionShutdown` 必须 `Copy`(`TraceNodeKind` 派生 `Copy`),故为 C-like 枚举;详细失败文本留在
+  `ExternalAgentError::ShutdownFailed`。
+- machine 是 sans-io,abandon 只能在 state 上 `mark_cleanup_required()`,真正 kill + disposition 记录在 handle 层。
+- `NestedMachine.own` 是具体 `DefaultAgentMachine`、子槽是 `NestedMachine`,外部 machine 不能字面做 slot child;
+  走 `SpawnedChild.machine: Box<dyn AgentMachine>` + `DrivingSubagentHandler` + `ScriptedSubagentSpawner` 的嵌套 drain 路径。
+- drain cancel 路径(`src/agent/drive.rs` ~436):cancel 后记 `NeverResumed` + `step(Abandon)` 再 break;
+  集成 abandon 测试即「先 cancel ctx 再 run_user」。
 
-### 关键设计决策:DTO 补 `action_id`(非 workaround)
-`ExternalSessionResult::PausedForInteraction` 当前只有 `{ session, request, observations }`,
-没有 machine 回喂 `RespondInteraction` 所需的 action_id。设计文档 §6.2 的 action_id 来自
-`Permission(PermissionRequest { action_id })`,但 `InteractionKind::Permission` 属 M4-1,当前不可用。
-TODO M3-3 明确要求从 `PausedForInteraction { request, .. }` 里「保存 pending_action(action_id)」,
-因此正确做法是给 `PausedForInteraction` 补一个显式 `action_id: String` 字段(runtime 暂停动作的句柄,
-machine 存为 `pending_action` 并在 `RespondInteraction` 里原样回喂)。这是补全 effect 契约,不是绕过。
-同步更新 docs/external-agent.md §5.2。
+## 落地清单(全部完成)
+- [x] `src/agent/external/shutdown.rs`(新)+ mod/re-export
+- [x] trace:`TraceNodeKind::ExternalShutdown` + `record_external_shutdown` + testkit describe_kind + context 测试
+- [x] state:`cleanup_required` 字段 + 三方法 + serde(default/skip)+ 单元测试
+- [x] machine:`abandon` 重写 + rustdoc + 模块头文档
+- [x] runtime:`ExternalRuntimeHandles` 清理归属 rustdoc
+- [x] machine 单元测试:重写 abandon 测试 + 2 个新增
+- [x] 集成测试 `tests/agent_external_lifecycle.rs`(abandon + mounts)
+- [x] `docs/external-agent.md` §6.4 更新
+- [x] 验证门:fmt / clippy / 焦点测试 / 全量 672 passed / doc 全绿
+- [x] TODO.md 标 [DONE] + 完成记录
 
-### 实施步骤
-1. `src/agent/external/mod.rs`:`PausedForInteraction` 增加 `action_id: String` 字段(+ 文档 + 更新单测)。
-2. `src/agent/external/machine.rs`:
-   - `InFlight` 增加 `step_id: StepId`。
-   - `resume` 按 cursor 分派:AwaitingSession→resume_session,AwaitingInteraction→resume_interaction。
-   - 新增 `pause_for_interaction` / `resume_interaction`。
-   - `fold_session_result` 的 PausedForInteraction 分支改为调用 pause_for_interaction。
-   - 更新模块文档。
-3. `src/agent/external/machine/tests.rs`:新增单测(pause→NeedInteraction、respond→RespondInteraction 对齐、
-   AwaitingInteraction 收到非 Interaction 结果→Error)。
-4. `crates/agent-testkit/src/external.rs`:`permission_pause` 补 `action_id`。
-5. `tests/agent_external_interaction.rs`(新文件):pause_resume + pop_to_outer。
-6. `docs/external-agent.md` §5.2 补 `action_id`。
-
-### 验证门
-1. cargo fmt --all
-2. cargo clippy --all-targets -- -D warnings
-3. cargo test external_agent_pause
-4. cargo test --all --all-targets(≤30min)
-5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-
-### 进度
-- (进行中)实现与测试。
-- (完成)DTO 补 `action_id`、machine 两段式交互、5 单测 + 2 集成测试、testkit fixture、design doc。
-- (完成)验证门全绿:fmt 无差异、clippy 0 告警、`cargo test external_agent_pause` 2 passed、
-  `cargo test --all --all-targets` 663 passed/0 failed、`cargo doc -D warnings` 0 告警。
-- (完成)TODO.md 标记 M3-3 `[DONE]` 并补完成记录。
-- 待办:提交(带 Co-authored-by trailer)后停止。M3-4(cancel/abandon 清理与挂载)为下一次调用。
+## 下一步
+提交(`[M3-4] ...` + Co-authored-by 尾注),然后停止,不启动 M3-5。

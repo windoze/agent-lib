@@ -11,6 +11,35 @@
 /// None of these handles belong in [`ExternalAgentState`]'s serde shape; only
 /// resumable facts are persisted (design §4.2/§4.3).
 ///
+/// # Cleanup ownership (design §6.4)
+///
+/// The live session's process lifecycle is owned **here**, at the handle layer,
+/// not by the machine. Cancelling an external agent is *never-resume*: the
+/// driver abandons the continuation and the machine is not stepped again, so the
+/// abandoned continuation can never emit a graceful
+/// [`Shutdown`](crate::agent::ExternalSessionInput::Shutdown). The machine's
+/// abandon step therefore only flags
+/// [`ExternalAgentState::mark_cleanup_required`](crate::agent::ExternalAgentState::mark_cleanup_required);
+/// the actual close is this holder's responsibility. By convention that close
+/// happens one of two ways, so no continuation is required to run one more
+/// effect:
+///
+/// - **Handle `Drop`.** This crate deliberately does not name the concrete
+///   runtime handle types, so it cannot implement a meaningful blanket `Drop`;
+///   instead each handle a host stores is expected to release its own resource
+///   when this holder drops — a `tokio::process::Child` with `kill_on_drop`, an
+///   aborting `JoinSet`/task set in `session_tasks`, a closing SDK client. This
+///   is the same idiom as [`AgentRuntimeHandles`](crate::agent::AgentRuntimeHandles).
+/// - **Container teardown.** Alternatively an owning session container/registry
+///   sweeps orphaned sessions on teardown, closing any this holder still owns.
+///
+/// Either way the close is classified as an
+/// [`ExternalSessionShutdown`](super::ExternalSessionShutdown) (graceful /
+/// forced kill / failed) and recorded into the trace via
+/// [`TraceHandle::record_external_shutdown`](crate::agent::TraceHandle::record_external_shutdown),
+/// so a scheduler can decide whether the worktree is safe to reuse as clean
+/// (design §6.4, §10).
+///
 /// [`ExternalAgentState`]: super::ExternalAgentState
 #[derive(Debug)]
 pub struct ExternalRuntimeHandles<

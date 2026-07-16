@@ -273,6 +273,9 @@ fn describe_kind(kind: TraceNodeKind) -> String {
             resolved_at_scope,
             disposition,
         } => format!("requirement({kind_tag}, scope={resolved_at_scope}, {disposition:?})"),
+        TraceNodeKind::ExternalShutdown { disposition } => {
+            format!("external_shutdown({})", disposition.label())
+        }
     }
 }
 

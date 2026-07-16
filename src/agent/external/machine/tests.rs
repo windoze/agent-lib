@@ -369,10 +369,13 @@ fn external_pivot_input_is_rejected() {
 }
 
 #[test]
-fn external_abandon_settles_back_to_idle() {
+fn external_agent_abandon_settles_and_flags_cleanup() {
     let mut machine = machine();
     machine.step(StepInput::external(user_input("refactor the parser")));
     assert!(machine.state().conversation().pending().is_some());
+    // Opening the turn parked the machine on AwaitingSession, so a live runtime
+    // session may exist and abandon must flag it for the handle layer.
+    assert!(!machine.state().cleanup_required());
 
     let stray: RequirementId = "018f0d9c-7b6a-7c12-8f31-1234567890c9"
         .parse()
@@ -381,8 +384,56 @@ fn external_abandon_settles_back_to_idle() {
 
     assert!(outcome.is_quiescent());
     assert!(outcome.requirements.is_empty());
+    // Never-resume abandon settles to a feedable Idle without emitting Shutdown.
     assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
     assert!(machine.state().conversation().pending().is_none());
+    // The orphaned session is flagged for the handle layer to force-close (§6.4).
+    assert!(machine.state().cleanup_required());
+}
+
+#[test]
+fn external_agent_abandon_while_awaiting_interaction_flags_cleanup() {
+    let mut machine = machine();
+    let opened = machine.step(StepInput::external(user_input("refactor the parser")));
+    let session_requirement_id = opened.requirements[0].id;
+
+    // Drive to a pause so the cursor parks on AwaitingInteraction with a live
+    // session behind it.
+    machine.step(StepInput::resume(external_resolution(
+        session_requirement_id,
+        paused_result("act-42"),
+    )));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert!(machine.state().conversation().pending().is_some());
+    assert!(!machine.state().cleanup_required());
+
+    let stray: RequirementId = "018f0d9c-7b6a-7c12-8f31-1234567890ca"
+        .parse()
+        .expect("stray requirement id");
+    let outcome = machine.step(StepInput::abandon(stray));
+
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
+    assert!(machine.state().conversation().pending().is_none());
+    assert!(machine.state().cleanup_required());
+}
+
+#[test]
+fn external_agent_abandon_when_idle_does_not_flag_cleanup() {
+    // Abandoning a machine that never opened a session has nothing to sweep.
+    let mut machine = machine();
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
+
+    let stray: RequirementId = "018f0d9c-7b6a-7c12-8f31-1234567890cb"
+        .parse()
+        .expect("stray requirement id");
+    let outcome = machine.step(StepInput::abandon(stray));
+
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
+    assert!(!machine.state().cleanup_required());
 }
 
 #[test]

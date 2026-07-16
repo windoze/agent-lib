@@ -86,11 +86,13 @@ impl ExternalAgentCursor {
 ///
 /// The state owns one active [`Conversation`] and records only resumable facts:
 /// the static [`ExternalAgentSpec`], the [`ExternalSessionRef`] needed to realign
-/// with the runtime across restarts, the active tool declarations, and the
-/// recovery [`ExternalAgentCursor`]. Serialization crosses the Conversation
-/// persistence boundary via [`Conversation::snapshot`]; deserialization rebuilds
-/// the live Conversation via [`Conversation::restore`]. Runtime handles never
-/// appear in this shape.
+/// with the runtime across restarts, the active tool declarations, the recovery
+/// [`ExternalAgentCursor`], and a pending-cleanup flag a never-resume abandon
+/// raises so the handle layer knows it still owes an orphaned session a
+/// force-close (design §6.4). Serialization crosses the Conversation persistence
+/// boundary via [`Conversation::snapshot`]; deserialization rebuilds the live
+/// Conversation via [`Conversation::restore`]. Runtime handles never appear in
+/// this shape.
 #[derive(Debug)]
 pub struct ExternalAgentState {
     spec: ExternalAgentSpec,
@@ -98,6 +100,7 @@ pub struct ExternalAgentState {
     session: Option<ExternalSessionRef>,
     cursor: ExternalAgentCursor,
     active_tools: ToolSetRef,
+    cleanup_required: bool,
 }
 
 impl ExternalAgentState {
@@ -115,6 +118,7 @@ impl ExternalAgentState {
             session: None,
             cursor: ExternalAgentCursor::Idle,
             active_tools,
+            cleanup_required: false,
         }
     }
 
@@ -174,6 +178,37 @@ impl ExternalAgentState {
         self.active_tools = active_tools;
     }
 
+    /// Returns `true` when a never-resume abandon left an external session the
+    /// handle layer still owes a force-close.
+    ///
+    /// A cancel abandons the machine's continuation while a runtime session may
+    /// still be live (design §6.4). The machine cannot close the process itself
+    /// (it is sans-io), so it flags the orphan here for the handle layer /
+    /// session registry to sweep. The resumable [`session`](Self::session) facts
+    /// are retained alongside the flag so the runtime can still be resumed if it
+    /// supports it.
+    #[must_use]
+    pub const fn cleanup_required(&self) -> bool {
+        self.cleanup_required
+    }
+
+    /// Flags that an external session needs a handle-layer force-close after a
+    /// never-resume abandon (design §6.4).
+    ///
+    /// This never closes anything itself; it only records that the handle layer
+    /// owes a sweep. The abandoning machine calls it instead of emitting a
+    /// `Shutdown` effect, because a cancelled continuation is never stepped
+    /// again.
+    pub fn mark_cleanup_required(&mut self) {
+        self.cleanup_required = true;
+    }
+
+    /// Clears the pending-cleanup flag once the handle layer has swept the
+    /// session (or once a fresh session supersedes the orphaned one).
+    pub fn clear_cleanup_required(&mut self) {
+        self.cleanup_required = false;
+    }
+
     fn from_record(record: ExternalAgentStateRecord) -> Result<Self, ConversationError> {
         let conversation = Conversation::restore(record.conversation)?;
         Ok(Self {
@@ -182,6 +217,7 @@ impl ExternalAgentState {
             session: record.session,
             cursor: record.cursor,
             active_tools: record.active_tools,
+            cleanup_required: record.cleanup_required,
         })
     }
 }
@@ -198,6 +234,7 @@ impl Serialize for ExternalAgentState {
             session: self.session.clone(),
             cursor: self.cursor.clone(),
             active_tools: self.active_tools.clone(),
+            cleanup_required: self.cleanup_required,
         }
         .serialize(serializer)
     }
@@ -223,6 +260,15 @@ struct ExternalAgentStateRecord {
     #[serde(default)]
     cursor: ExternalAgentCursor,
     active_tools: ToolSetRef,
+    #[serde(default, skip_serializing_if = "is_false")]
+    cleanup_required: bool,
+}
+
+/// Serde predicate: skips the pending-cleanup flag when it is not set, keeping
+/// the common clean-state shape byte-for-byte compatible with the pre-M3-4
+/// snapshot.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[cfg(test)]
@@ -509,5 +555,36 @@ mod tests {
             .map(CursorRequirement::id),
             Some(requirement_id())
         );
+    }
+
+    #[test]
+    fn cleanup_required_flag_round_trips_and_is_skipped_when_clear() {
+        let mut state = ExternalAgentState::new(spec(), committed_conversation());
+        assert!(!state.cleanup_required());
+
+        // A clean state omits the flag entirely, keeping the pre-M3-4 shape.
+        let clean = serde_json::to_value(&state).expect("serialize clean state");
+        assert!(
+            clean
+                .as_object()
+                .expect("object")
+                .get("cleanup_required")
+                .is_none(),
+            "clear cleanup flag must be skipped"
+        );
+
+        state.mark_cleanup_required();
+        assert!(state.cleanup_required());
+
+        let flagged = serde_json::to_value(&state).expect("serialize flagged state");
+        assert_eq!(flagged["cleanup_required"], json!(true));
+
+        let decoded: ExternalAgentState =
+            serde_json::from_value(flagged).expect("deserialize flagged state");
+        assert!(decoded.cleanup_required());
+
+        let mut swept = decoded;
+        swept.clear_cleanup_required();
+        assert!(!swept.cleanup_required());
     }
 }

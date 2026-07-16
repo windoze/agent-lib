@@ -62,11 +62,13 @@ use thiserror::Error;
 
 mod machine;
 mod runtime;
+mod shutdown;
 mod spec;
 mod state;
 
 pub use machine::ExternalAgentMachine;
 pub use runtime::ExternalRuntimeHandles;
+pub use shutdown::ExternalSessionShutdown;
 pub use spec::{ExternalAgentSpec, WorkerProfileRef};
 pub use state::{ExternalAgentCursor, ExternalAgentState};
 

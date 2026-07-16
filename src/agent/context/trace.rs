@@ -1,6 +1,7 @@
 //! Trace record DTOs and append-only trace handles.
 
 use crate::agent::{
+    external::ExternalSessionShutdown,
     id::{RunId, StepId},
     requirement::RequirementKindTag,
 };
@@ -93,6 +94,17 @@ pub enum TraceNodeKind {
         resolved_at_scope: u32,
         /// Whether the requirement was resumed or never resumed.
         disposition: RequirementDisposition,
+    },
+    /// How an external session's process/connection was closed.
+    ///
+    /// Cancelling an external agent is a never-resume close: the machine can no
+    /// longer emit a graceful `Shutdown`, so the handle layer force-closes the
+    /// session and records *how* it went here (design §6.4). A close that
+    /// [leaves residual side effects](ExternalSessionShutdown::leaves_residual_side_effects)
+    /// tells a scheduler the worktree may be dirty (design §10).
+    ExternalShutdown {
+        /// The recorded disposition of the session close.
+        disposition: ExternalSessionShutdown,
     },
 }
 
@@ -287,6 +299,29 @@ impl TraceHandle {
                 disposition,
             },
             None,
+        )
+    }
+
+    /// Records how an external session was closed under the current parent.
+    ///
+    /// Cancelling an external agent is a never-resume close: the machine can no
+    /// longer emit a graceful `Shutdown`, so the handle layer force-closes the
+    /// session and records the resulting [`ExternalSessionShutdown`] here so a
+    /// scheduler can tell whether the worktree may be dirty (design §6.4, §10).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TraceError`] when the node id is duplicate or the current
+    /// parent is not present.
+    pub fn record_external_shutdown(
+        &self,
+        id: TraceNodeId,
+        disposition: ExternalSessionShutdown,
+    ) -> Result<TraceRecord, TraceError> {
+        self.record_node(
+            id,
+            TraceNodeKind::ExternalShutdown { disposition },
+            Some(disposition.label().to_owned()),
         )
     }
 

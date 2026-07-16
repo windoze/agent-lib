@@ -737,7 +737,7 @@ response } }` 把结果喂回。`Interaction`/`InteractionResponse` 在 `src/age
   `cargo test external_agent_pause` 2 passed;`cargo test --all --all-targets` 全绿(total 663 passed,0 failed;
   credential-gated 集成测试保持 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 0 告警。
 
-### [TODO] M3-4 cancel/abandon 清理、shutdown disposition 与 `NestedMachine` 挂载
+### [DONE] M3-4 cancel/abandon 清理、shutdown disposition 与 `NestedMachine` 挂载
 
 **前置依赖**:M3-3。
 
@@ -769,6 +769,49 @@ response } }` 把结果喂回。`Interaction`/`InteractionResponse` 在 `src/age
   requirement);`external_agent_mounts_under_nested_machine`(作为 child 被派生并跑完 Start→Completed)。
   过滤名:`cargo test external_agent_abandon` 与 `cargo test external_agent_mounts`。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- shutdown disposition 类型(新文件 `src/agent/external/shutdown.rs`):`ExternalSessionShutdown` 三态
+  `Graceful` / `ForcedKill` / `Failed`,`Copy`(因 `TraceNodeKind` 需保持 `Copy`,详细失败文本仍留在
+  `ExternalAgentError::ShutdownFailed`);`leaves_residual_side_effects()` 对 `ForcedKill`/`Failed` 返回
+  `true`(§6.4/§10),`label()` 给稳定 snake_case;snake_case serde;3 个单元测试。`mod` 与 re-export 加到
+  `src/agent/external/mod.rs` 与 `src/agent/mod.rs`。
+- trace 记录:`src/agent/context/trace.rs` 新增 `TraceNodeKind::ExternalShutdown { disposition }` 变体与
+  `TraceHandle::record_external_shutdown(id, disposition)`(把 disposition 记为节点 + label);testkit
+  `crates/agent-testkit/src/assertions/trace.rs` 的 `describe_kind` 补 `external_shutdown(<label>)` 分支;
+  `src/agent/context/tests.rs` 新增 `external_shutdown_trace_node_records_disposition_under_parent`。
+- state 清理标注(`src/agent/external/state.rs`):`ExternalAgentState` 增 `cleanup_required: bool` 字段 +
+  `cleanup_required()` / `mark_cleanup_required()` / `clear_cleanup_required()`;record 结构 + serde
+  `#[serde(default, skip_serializing_if = "is_false")]`(clean 态不落盘,保持 pre-M3-4 shape);新增
+  `cleanup_required_flag_round_trips_and_is_skipped_when_clear` 单元测试。
+- machine abandon(`src/agent/external/machine.rs`):`abandon` 重写为 never-resume 关闭——当 cursor 有
+  outstanding requirement(`AwaitingSession`/`AwaitingInteraction`)时 `mark_cleanup_required()`,丢弃悬空 turn、
+  清 `in_flight`、收敛回可复用 `Idle`,不 emit 新 requirement / 不 emit `Shutdown`;更新 abandon rustdoc 与
+  模块头文档(覆盖 M3-4,写明「清理在 handle 层、disposition 由 handle 层记 trace」,§6.4)。
+- 清理归属(`src/agent/external/runtime.rs`):扩写 `ExternalRuntimeHandles` rustdoc,写明进程生命周期归 handle
+  层所有(inner-handle `Drop` / 容器 teardown 清扫),abandon 不 emit `Shutdown`,disposition 经
+  `ExternalSessionShutdown` 记入 trace(§6.4/§10)。
+- 挂载验证:`ExternalAgentMachine` 是普通 `AgentMachine`,经标准 `NeedSubagent` → `DrivingSubagentHandler`
+  在派生子 `RunContext` 下开嵌套 drain 驱动(`NestedMachine.own` 为具体 `DefaultAgentMachine`,子槽为
+  `NestedMachine`,故外部 machine 走 `SpawnedChild.machine: Box<dyn AgentMachine>` 路径,而非字面 slot child)。
+- 测试:
+  - 单元(`src/agent/external/machine/tests.rs`):把旧 `external_abandon_settles_back_to_idle` 重写为
+    `external_agent_abandon_settles_and_flags_cleanup`(断言收敛 Idle + `cleanup_required()`),新增
+    `external_agent_abandon_while_awaiting_interaction_flags_cleanup` 与
+    `external_agent_abandon_when_idle_does_not_flag_cleanup`(idle 无 outstanding session 不标注清理)。
+  - 集成(新文件 `tests/agent_external_lifecycle.rs`,2 个,过滤名 `cargo test external_agent_abandon` 与
+    `cargo test external_agent_mounts` 命中):`external_agent_abandon_settles_and_flags_cleanup`(先 cancel
+    `RunContext` 再 `run_user`,drain 走 never-resume abandon,断言 Idle + 未调用 runtime handler + 标注清理 +
+    未提交 turn)、`external_agent_mounts_under_nested_machine`(父 `ScriptMachine` 发一个 `NeedSubagent`,child =
+    `ExternalAgentMachine` 经 `SpawnedChildBuilder` + `ScriptedSubagentSpawner` 驱动 Start→Completed,断言父
+    turn 收敛 Done、spawn 一次、child 外部调用 `[Start]`→`[Completed]`)。
+- 文档:`docs/external-agent.md` §6.4 补「M3-4 落地的具体类型」段(`ExternalSessionShutdown`、
+  `record_external_shutdown`、`cleanup_required` 三方法、子 agent 走 `NeedSubagent`)。
+- **验证结果(完整序列全绿)**:`cargo fmt --all` 无差异;`cargo clippy --all-targets -- -D warnings` 0 告警;
+  `cargo test external_agent_abandon` 命中 4 个全过、`cargo test external_agent_mounts` 命中 1 个全过;
+  `cargo test --all --all-targets` 全绿(total 672 passed,0 failed;credential-gated 集成测试保持 ignored);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 0 告警。
 
 ### [TODO] M3-5 Milestone 3 Review
 
