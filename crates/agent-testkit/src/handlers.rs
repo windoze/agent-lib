@@ -33,8 +33,8 @@ use std::sync::{Arc, Mutex};
 
 use agent_lib::agent::{
     ApprovalDecision, ApprovalResponse, Interaction, InteractionHandler, InteractionKind,
-    InteractionResponse, LlmHandler, LlmStepMode, ReconfigHandler, RequirementResult, RunContext,
-    ToolHandler, ToolRegistry, ToolRuntimeError, ToolSetRef,
+    InteractionResponse, LlmHandler, LlmStepMode, PermissionResponse, ReconfigHandler,
+    RequirementResult, RunContext, ToolHandler, ToolRegistry, ToolRuntimeError, ToolSetRef,
 };
 use agent_lib::client::{ChatRequest, ClientError};
 use agent_lib::conversation::ToolCallId;
@@ -237,9 +237,13 @@ impl ReconfigHandler for ScriptedReconfigHandler {
 /// interaction request it is handed.
 ///
 /// A decision is resolved against the *live* request so an approval response
-/// always addresses the request's `step_id`/`call_id`. The approval-oriented
+/// always addresses the request's `step_id`/`call_id`, and a permission
+/// response always echoes the request's `action_id`. The approval-oriented
 /// variants ([`Approve`](Self::Approve), [`ApproveWith`](Self::ApproveWith),
-/// [`Deny`](Self::Deny)) fall back to a trivial in-family response for the
+/// [`Deny`](Self::Deny), [`Timeout`](Self::Timeout), [`Cancel`](Self::Cancel))
+/// map onto the matching [`PermissionDecision`](agent_lib::agent::PermissionDecision)
+/// for an [`InteractionKind::Permission`] request (a timeout folds into a
+/// deny-by-default), and fall back to a trivial in-family response for the
 /// question/choice interactions the
 /// [`DefaultAgentMachine`](agent_lib::agent::DefaultAgentMachine) never emits.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,8 +299,9 @@ impl InteractionDecision {
     }
 }
 
-/// Builds an approval response addressed to `request`, or a trivial in-family
-/// response for the non-approval kinds the default machine never emits.
+/// Builds an approval response addressed to `request`, a permission response
+/// echoing its `action_id`, or a trivial in-family response for the
+/// question/choice kinds the default machine never emits.
 fn approval_response(
     request: &Interaction,
     decision: ApprovalDecision,
@@ -308,9 +313,30 @@ fn approval_response(
         ),
         InteractionKind::Question { .. } => InteractionResponse::answer(String::new()),
         InteractionKind::Choice { .. } => InteractionResponse::Choice(0),
-        InteractionKind::Permission { .. } => {
-            panic!("permission interactions are wired in milestone 4.3")
+        InteractionKind::Permission { request } => InteractionResponse::Permission(
+            permission_from_approval(request.action_id(), decision, message),
+        ),
+    }
+}
+
+/// Maps an approval-family disposition onto a [`PermissionResponse`] for
+/// `action_id`.
+///
+/// A [`Timeout`](ApprovalDecision::Timeout) folds into a deny-by-default,
+/// mirroring how the approval side folds a timeout into a denied tool status;
+/// [`Approve`](ApprovalDecision::Approve) and [`Cancel`](ApprovalDecision::Cancel)
+/// drop the message because a permission approve/cancel carries no rationale.
+fn permission_from_approval(
+    action_id: &str,
+    decision: ApprovalDecision,
+    message: Option<String>,
+) -> PermissionResponse {
+    match decision {
+        ApprovalDecision::Approve => PermissionResponse::approve(action_id.to_owned()),
+        ApprovalDecision::Deny | ApprovalDecision::Timeout => {
+            PermissionResponse::deny(action_id.to_owned(), message)
         }
+        ApprovalDecision::Cancel => PermissionResponse::cancel(action_id.to_owned()),
     }
 }
 

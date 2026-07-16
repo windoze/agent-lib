@@ -40,8 +40,8 @@ use super::{
 use crate::{
     agent::{
         AgentError, AgentInput, AgentMachine, ApprovalDecision, ApprovalResponse,
-        DeclaredOnlyToolRegistryResolver, LlmStepMode, RequirementResult, RunContext, ToolRegistry,
-        ToolRegistryResolver, ToolRuntimeError, ToolSetRef,
+        DeclaredOnlyToolRegistryResolver, LlmStepMode, PermissionResponse, RequirementResult,
+        RunContext, ToolRegistry, ToolRegistryResolver, ToolRuntimeError, ToolSetRef,
         interaction::{Interaction, InteractionKind, InteractionResponse},
     },
     client::{ChatRequest, ClientError, LlmClient},
@@ -215,6 +215,15 @@ impl ReconfigHandler for ReconfigRegistryHandler {
 /// [`Choice`](InteractionKind::Choice)) are answered with a trivial in-family
 /// response so the result still type-aligns with its requirement; the
 /// [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine) never emits them.
+///
+/// A [`Permission`](InteractionKind::Permission) interaction — surfaced by an
+/// external agent runtime rather than the default machine — is answered by
+/// mapping the configured [`ApprovalDecision`] onto a
+/// [`PermissionResponse`](crate::agent::PermissionResponse) echoing the
+/// request's `action_id` (a [`Timeout`](ApprovalDecision::Timeout) folds into a
+/// deny). A headless layer that wants a safe default should construct this
+/// handler with [`deny`](Self::deny), yielding deny-by-default for every
+/// permission ask.
 #[derive(Clone, Debug)]
 pub struct ApprovalInteractionHandler {
     decision: ApprovalDecision,
@@ -255,9 +264,19 @@ impl InteractionHandler for ApprovalInteractionHandler {
             }
             InteractionKind::Question { .. } => InteractionResponse::answer(String::new()),
             InteractionKind::Choice { .. } => InteractionResponse::Choice(0),
-            InteractionKind::Permission { .. } => {
-                panic!("permission interactions are wired in milestone 4.3")
-            }
+            InteractionKind::Permission { request } => InteractionResponse::Permission(match self
+                .decision
+            {
+                ApprovalDecision::Approve => {
+                    PermissionResponse::approve(request.action_id().to_owned())
+                }
+                ApprovalDecision::Deny | ApprovalDecision::Timeout => {
+                    PermissionResponse::deny(request.action_id().to_owned(), self.message.clone())
+                }
+                ApprovalDecision::Cancel => {
+                    PermissionResponse::cancel(request.action_id().to_owned())
+                }
+            }),
         };
         RequirementResult::Interaction(response)
     }

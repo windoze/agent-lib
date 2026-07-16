@@ -43,8 +43,8 @@ use agent_lib::agent::external::{
     WorktreeIsolation,
 };
 use agent_lib::agent::{
-    ExternalSessionHandler, Interaction, RequirementKindTag, RequirementResult, RunContext,
-    ToolSetRef, WorktreeRef,
+    ExternalSessionHandler, Interaction, PermissionCategory, PermissionRequest, PermissionRisk,
+    RequirementKindTag, RequirementResult, RunContext, ToolSetRef, WorktreeRef,
 };
 use agent_lib::conversation::{Conversation, ConversationConfig};
 use async_trait::async_trait;
@@ -173,11 +173,12 @@ impl ExternalSessionHandler for ScriptedExternalSessionHandler {
 /// launches a runtime.
 ///
 /// The permission-style pause is modelled with an
-/// [`Interaction::question`] paired with a
+/// [`Interaction::permission`] paired with a matching
 /// [`PermissionRequested`](ExternalAgentEvent::PermissionRequested) observation,
-/// because a dedicated `InteractionKind::Permission` only arrives in milestone 4;
-/// once it lands, [`permission_pause`](Self::permission_pause) can be upgraded
-/// without changing its role in these tests.
+/// so the runtime's `action_id` flows through the neutral
+/// [`InteractionKind::Permission`](agent_lib::agent::InteractionKind::Permission)
+/// request and is echoed back verbatim in the resolving
+/// [`RespondInteraction`](ExternalSessionInput::RespondInteraction).
 #[derive(Clone)]
 pub struct ExternalAgentFixture {
     ids: SeqIds,
@@ -349,12 +350,33 @@ impl ExternalAgentFixture {
         }
     }
 
+    /// The [`PermissionRequest`] a [`permission_pause`](Self::permission_pause)
+    /// asks the host to resolve.
+    ///
+    /// Its [`action_id`](PermissionRequest::action_id) is the runtime handle
+    /// (`"act-1"`) the pause echoes back through a
+    /// [`RespondInteraction`](ExternalSessionInput::RespondInteraction), and it
+    /// matches the [`PermissionRequested`](ExternalAgentEvent::PermissionRequested)
+    /// observation carried alongside the pause.
+    #[must_use]
+    pub fn permission_request(&self) -> PermissionRequest {
+        PermissionRequest::new(
+            "act-1".to_owned(),
+            self.ids.agent_id(),
+            PermissionCategory::Shell,
+            "run `cargo test`".to_owned(),
+            serde_json::json!({ "command": "cargo test" }),
+            PermissionRisk::Medium,
+            Some("verify the refactor".to_owned()),
+        )
+    }
+
     /// A [`PausedForInteraction`](ExternalSessionResult::PausedForInteraction)
     /// result modelling a permission prompt.
     ///
-    /// The paused interaction is an [`Interaction::question`] describing the
-    /// gated action, and the result carries the runtime's `action_id` (`"act-1"`)
-    /// that a
+    /// The paused interaction is an [`Interaction::permission`] carrying the
+    /// fixture's [`permission_request`](Self::permission_request), and the result
+    /// carries the runtime's `action_id` (`"act-1"`) that a
     /// [`RespondInteraction`](ExternalSessionInput::RespondInteraction) echoes
     /// back. The matching
     /// [`PermissionRequested`](ExternalAgentEvent::PermissionRequested)
@@ -364,10 +386,7 @@ impl ExternalAgentFixture {
         ExternalSessionResult::PausedForInteraction {
             session: self.session_ref(),
             action_id: "act-1".to_owned(),
-            request: Interaction::question(
-                self.ids.step_id(),
-                "Allow the external agent to run `cargo test`?".to_owned(),
-            ),
+            request: Interaction::permission(self.ids.step_id(), self.permission_request()),
             observations: vec![self.permission_requested_event("act-1", "run `cargo test`")],
         }
     }

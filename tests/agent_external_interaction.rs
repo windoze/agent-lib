@@ -7,7 +7,7 @@
 //! [`ScriptedExternalSessionHandler`](agent_testkit::prelude::ScriptedExternalSessionHandler)
 //! first pauses the session for an interaction and then completes it, while a
 //! [`ScriptedInteractionHandler`](agent_testkit::prelude::ScriptedInteractionHandler)
-//! resolves the clarification. Each `#[tokio::test]` proves one invariant:
+//! resolves the permission request. Each `#[tokio::test]` proves one invariant:
 //!
 //! - pause → respond → completed — a paused session reifies one
 //!   `NeedInteraction`; once resolved, the machine feeds a `RespondInteraction`
@@ -40,9 +40,7 @@ async fn external_agent_pause_resume_interaction() {
     ]);
     let external_log = Arc::clone(external.log());
 
-    let interaction = ScriptedInteractionHandler::sequence([InteractionDecision::Answer(
-        "yes, proceed".to_owned(),
-    )]);
+    let interaction = ScriptedInteractionHandler::sequence([InteractionDecision::Approve]);
     let interaction_log = Arc::clone(interaction.log());
 
     let scope = TestScope::builder()
@@ -102,8 +100,7 @@ async fn external_agent_pause_pops_interaction_to_outer_scope() {
     ]);
     let external_log = Arc::clone(external.log());
 
-    let interaction =
-        ScriptedInteractionHandler::sequence([InteractionDecision::Answer("approved".to_owned())]);
+    let interaction = ScriptedInteractionHandler::sequence([InteractionDecision::Approve]);
     let interaction_log = Arc::clone(interaction.log());
 
     // The outer layer serves interaction; the local layer serves only the
