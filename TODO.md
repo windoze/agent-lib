@@ -954,7 +954,7 @@ mid-turn scratch,而不是反序列化 scratch(scratch 有意非序列化)。这
   `cargo test -p agent-lib --lib` **556 passed / 0 failed**;`cargo test --all --all-targets` 全绿(36 个测试二进制全部 ok,无失败);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 无空白错误。
 
-### [TODO] M3-3 切换到宏产物、删除手写版、更新 external-agent 接入示例
+### [DONE] M3-3 切换到宏产物、删除手写版、更新 external-agent 接入示例
 
 **前置依赖**:M3-2(等价性已证)。
 
@@ -984,7 +984,51 @@ mid-turn scratch,而不是反序列化 scratch(scratch 有意非序列化)。这
 
 **完成记录**:
 
-（待补充）
+已把生产代码切到宏产物、删除全部手写版,并让宏产物接管**正式名**(不再有 `*Gen` 临时名)。
+
+- **单一清单 + 回调式两生成器**:`src/agent/effect_manifest.rs` 里 `with_effect_manifest!` 持有
+  唯一的 6 段 effect 清单,把整份清单转发给调用方点名的生成器宏。之所以用回调式而非单个
+  `define_effects!`:一个 `macro_rules!` 只在一个模块展开,而 design §4.1 要求 coproduct 落在
+  `requirement.rs`、handler 扇出落在 `drive.rs`,且 `HandlerScope` 是公开 API、
+  `scope_handles`/`fulfill_with_scope` 是 `drive.rs` 私有——回调式让「单一清单」「各就各位」
+  「零对外 API 改动」三者同时成立。清单里的裸类型名在各生成器**展开点**解析,故 coproduct 的
+  字段/结果类型在 `requirement.rs` 解析、扇出的 handler trait 在 `drive.rs` 解析,互不需要对方
+  的 import。
+- **删除的手写版**:`requirement.rs` 手写的 `RequirementKindTag`(+`Display`)、`RequirementKind`
+  (+`tag()`/`accepts`)、`RequirementResult`(+`tag()`)已删除,替换为
+  `with_effect_manifest!(define_effect_coproduct);` 一行(第 1–4 处)。`drive.rs` 手写的
+  `HandlerScope` trait、`scope_handles`、`fulfill_with_scope` 已删除,替换为
+  `with_effect_manifest!(define_effect_fan_out);` 一行(第 5–7 处)。第 8 处(机器内 resume
+  分派)保持手写不动。
+- **对外形状/行为不变**:`fulfill_with_scope` 的生成签名改取 `&RequirementKind`(而非旧的
+  `&Requirement`),`drive.rs` 内两处调用相应改传 `&requirement.kind`;其余引用
+  `RequirementKind::NeedLlm{..}` 等的地方(machine/drive/testkit/tests)**无需改动**即通过,证明
+  变体名/字段/serde 形状与手写版一致。
+- **测试改造**:删除 M3-2「对比手写版」的等价性断言(手写版已不存在),把 `drive.rs` 的
+  `generated_fan_out_matches_hand_written_across_families` 改为 `fan_out_routes_every_family_consistently`
+  ——直接对宏产物断言 fan-out 路由 + `scope_handles ⟺ fulfill_with_scope` 不变量(每个 family
+  `scope_handles` 为真;`Subagent` 因 `needs_outer` 返回 `None`,其余 family 就地兑现且结果
+  family 与请求 family 一致)。`requirement.rs` 的 serde 往返 / accepts 矩阵 / tag display 等行为
+  测试保留,现在直接测正式产物。删除随之无用的 `HandlerScopeGen for EqScope`、`gen_tag_of` 及
+  全部 `*Gen`/`*_gen` import。
+- **文档**:`docs/effect-refine.md` §4.2 更新为已落地的回调式清单形状(裸类型名在展开点解析),
+  §4.4 记录「先验证等价性再删旧码」的 M3-1→M3-2→M3-3 三步已完成,并新增 **§7 附录**——以一个
+  虚构 `Timer` effect 的完整 diff 演示「新增一个 effect = 清单里加一段」,作为将来加 effect 的
+  操作指南(设计文档 §4.2 承诺的收益)。
+
+**验证**(完整序列 1–6 全过):
+
+- `cargo fmt --all`:无残留改动。
+- `cargo clippy --all-targets -- -D warnings`:0 warning。
+- `cargo test -p agent-lib --lib`:552 passed / 0 failed(覆盖 requirement/drive)。
+- `cargo test --all --all-targets`:**778 passed / 0 failed,断言未修改**(对外类型形状与行为
+  逐字节不变)。
+- `cargo test --all --doc`:doctest 全绿。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`:通过(宏生成项 rustdoc 可编译
+  且有文档)。
+- `git diff --check`:CLEAN。触及范围:`requirement.rs` / `drive.rs` / `effect_manifest.rs` /
+  `docs/effect-refine.md` / `memory/claude_plan.md`,净 −333 行。`define_effects`/`*Gen` 仅余于
+  M3-1/M3-2 的历史 DONE 记录(保留为历史),生产代码与公开 doc 已无这些名字。
 
 ### [TODO] M3-4 Milestone 3 review:刀 (A) 正确性、等价性与可维护性
 

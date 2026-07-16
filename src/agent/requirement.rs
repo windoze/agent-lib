@@ -29,8 +29,8 @@
 
 use crate::{
     agent::{
-        AgentError, AgentId, RunContext, ToolSetRef,
-        effect_manifest::define_effects,
+        AgentError, AgentId, ToolSetRef,
+        effect_manifest::{define_effect_coproduct, with_effect_manifest},
         external::{ExternalSessionRequest, ExternalSessionResult},
         interaction::{Interaction, InteractionError, InteractionResponse},
         tool::ToolRuntimeError,
@@ -120,42 +120,6 @@ impl FromStr for RequirementId {
 impl fmt::Display for RequirementId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.0, formatter)
-    }
-}
-
-/// Discriminant identifying which family a [`RequirementKind`] or
-/// [`RequirementResult`] belongs to.
-///
-/// The tag drives return-path type alignment ([`RequirementKind::accepts`]) and
-/// lets a host allocate ids per requirement family via [`RequirementIds`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequirementKindTag {
-    /// One LLM generation.
-    Llm,
-    /// One tool execution.
-    Tool,
-    /// One interaction with the "user" (approval / question / choice).
-    Interaction,
-    /// Deriving and driving a child agent.
-    Subagent,
-    /// Resolving a live tool registry for a queued tool-set reconfiguration.
-    Reconfig,
-    /// Advancing an external coding-agent session to its next decision point.
-    ExternalSession,
-}
-
-impl fmt::Display for RequirementKindTag {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let text = match self {
-            Self::Llm => "llm",
-            Self::Tool => "tool",
-            Self::Interaction => "interaction",
-            Self::Subagent => "subagent",
-            Self::Reconfig => "reconfig",
-            Self::ExternalSession => "external_session",
-        };
-        formatter.write_str(text)
     }
 }
 
@@ -361,230 +325,12 @@ impl Requirement {
     }
 }
 
-// --- Transitional macro-generated coproduct (刀 (A), milestones M3-1/M3-2) ----
-//
-// `define_effects!` renders the effect coproduct and its handler fan-out from a
-// single manifest. It emits the three enums + `RequirementKindTagGen::Display` +
-// `tag()` (M3-1), and `accepts` + the `drive` fan-out `HandlerScopeGen` /
-// `scope_handles_gen` / `fulfill_with_scope_gen` (M3-2), all under `*Gen` /
-// `*_gen` names that coexist with the hand-written definitions below. M3-2
-// asserts byte-for-byte and behaviour equivalence (see the tests); M3-3 deletes
-// the hand-written twins and promotes these to the canonical names. See
-// `crate::agent::effect_manifest` for the grammar.
-define_effects! {
-    Llm {
-        tag_name: "llm",
-        kind: NeedLlm {
-            request: ChatRequest,
-            mode: LlmStepMode,
-        },
-        result: Result<Response, ClientError>,
-        handler: LlmHandler,
-        accessor: llm,
-        fulfill: (request, *mode),
-    }
-    Tool {
-        tag_name: "tool",
-        kind: NeedTool {
-            call_id: ToolCallId,
-            call: ToolCall,
-        },
-        result: Result<ToolResponse, ToolRuntimeError>,
-        handler: ToolHandler,
-        accessor: tool,
-        fulfill: (*call_id, call),
-    }
-    Interaction {
-        tag_name: "interaction",
-        kind: NeedInteraction {
-            request: Interaction,
-        },
-        result: InteractionResponse,
-        handler: InteractionHandler,
-        accessor: interaction,
-        fulfill: (request),
-        accepts_check: request.accepts_response,
-    }
-    Subagent {
-        tag_name: "subagent",
-        kind: NeedSubagent {
-            spec_ref: AgentSpecRef,
-            brief: Interaction,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            result_schema: Option<Value>,
-        },
-        result: Result<SubagentOutput, AgentError>,
-        handler: SubagentHandler,
-        accessor: subagent,
-        needs_outer: true,
-    }
-    Reconfig {
-        tag_name: "reconfig",
-        kind: NeedReconfigRegistry {
-            tool_set: ToolSetRef,
-        },
-        result: Result<(), ToolRuntimeError>,
-        handler: ReconfigHandler,
-        accessor: reconfig,
-        fulfill: (tool_set),
-    }
-    ExternalSession {
-        tag_name: "external_session",
-        kind: NeedExternalSession {
-            request: ExternalSessionRequest,
-        },
-        result: Box<ExternalSessionResult>,
-        handler: ExternalSessionHandler,
-        accessor: external,
-        fulfill: (request),
-    }
-}
-
-/// What a [`Requirement`] needs fulfilled. Payloads reuse existing types.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequirementKind {
-    /// One LLM generation; payload reuses [`ChatRequest`].
-    NeedLlm {
-        /// Provider-neutral request to send to the model.
-        request: ChatRequest,
-        /// Transport mode (streaming / non-streaming) for the generation.
-        mode: LlmStepMode,
-    },
-    /// One tool execution; ids and call reuse existing Conversation types.
-    NeedTool {
-        /// Framework tool-call identity paired through Conversation.
-        call_id: ToolCallId,
-        /// Provider-neutral tool call selected by the model.
-        call: ToolCall,
-    },
-    /// One interaction with the "user" (generalizes approval).
-    NeedInteraction {
-        /// The interaction to present externally.
-        request: Interaction,
-    },
-    /// Deriving and driving a child agent (the only scope-deepening kind).
-    NeedSubagent {
-        /// Reference to the child agent's static specification.
-        spec_ref: AgentSpecRef,
-        /// Brief presented to the child agent as an interaction.
-        brief: Interaction,
-        /// Optional JSON schema the child result must conform to.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        result_schema: Option<Value>,
-    },
-    /// Resolving a live tool registry for a queued tool-set reconfiguration.
-    ///
-    /// Emitted at a turn boundary when a queued reconfiguration changes the
-    /// active tool set. The driver resolves `tool_set` to a live registry,
-    /// validates its declarations against the requested set, swaps it in, and
-    /// confirms with a [`RequirementResult::Reconfig`]. The machine itself holds
-    /// no registry, so the swap stays a driver-side side effect.
-    NeedReconfigRegistry {
-        /// The queued tool set whose live registry the driver must resolve.
-        tool_set: ToolSetRef,
-    },
-    /// Advancing an external coding-agent session (Claude Code / Codex / …).
-    ///
-    /// The driver's external-session handler (added in a later milestone)
-    /// advances the runtime to its next decision point (completed, paused for an
-    /// interaction, or failed), buffering observed events, and confirms with a
-    /// [`RequirementResult::ExternalSession`]. The machine holds no runtime
-    /// connection, so the session lives entirely on the driver side.
-    NeedExternalSession {
-        /// Provider-neutral description of the session step to advance.
-        request: ExternalSessionRequest,
-    },
-}
-
-impl RequirementKind {
-    /// Returns the family this kind belongs to.
-    #[must_use]
-    pub const fn tag(&self) -> RequirementKindTag {
-        match self {
-            Self::NeedLlm { .. } => RequirementKindTag::Llm,
-            Self::NeedTool { .. } => RequirementKindTag::Tool,
-            Self::NeedInteraction { .. } => RequirementKindTag::Interaction,
-            Self::NeedSubagent { .. } => RequirementKindTag::Subagent,
-            Self::NeedReconfigRegistry { .. } => RequirementKindTag::Reconfig,
-            Self::NeedExternalSession { .. } => RequirementKindTag::ExternalSession,
-        }
-    }
-
-    /// Checks that `result` is type-aligned with this requirement kind.
-    ///
-    /// A `NeedLlm` requirement only accepts an
-    /// [`RequirementResult::Llm`] result, and so on for each family. For a
-    /// `NeedInteraction` requirement, the carried [`InteractionResponse`] is
-    /// additionally validated against the [`Interaction`] request (choice range,
-    /// approval step/call match, response family).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RequirementError::ResultKindMismatch`] when the result family
-    /// does not match this requirement's family, or
-    /// [`RequirementError::Interaction`] when an interaction response fails its
-    /// request-specific check.
-    pub fn accepts(&self, result: &RequirementResult) -> Result<(), RequirementError> {
-        let expected = self.tag();
-        let actual = result.tag();
-        if expected != actual {
-            return Err(RequirementError::ResultKindMismatch { expected, actual });
-        }
-        if let (Self::NeedInteraction { request }, RequirementResult::Interaction(response)) =
-            (self, result)
-        {
-            request
-                .accepts_response(response)
-                .map_err(RequirementError::Interaction)?;
-        }
-        Ok(())
-    }
-}
-
-/// Fulfilled result for one requirement, delivered back on the return path.
-///
-/// This is the runtime half: it carries live values and runtime errors
-/// ([`ClientError`], [`ToolRuntimeError`], [`AgentError`]) and is intentionally
-/// not persistable. See the [module docs](self#persistence-boundary).
-#[derive(Clone, Debug)]
-pub enum RequirementResult {
-    /// Result of an LLM generation.
-    Llm(Result<Response, ClientError>),
-    /// Result of a tool execution.
-    Tool(Result<ToolResponse, ToolRuntimeError>),
-    /// Result of an interaction with the "user".
-    Interaction(InteractionResponse),
-    /// Result of a driven subagent.
-    Subagent(Result<SubagentOutput, AgentError>),
-    /// Result of resolving a live registry for a tool-set reconfiguration.
-    ///
-    /// `Ok(())` confirms the driver swapped in a validated registry for the
-    /// requested tool set; `Err` reports a resolution or declaration-mismatch
-    /// failure, which fails the parked turn boundary.
-    Reconfig(Result<(), ToolRuntimeError>),
-    /// Result of advancing an external coding-agent session.
-    ///
-    /// Boxed to keep the enum compact: [`ExternalSessionResult`] is a large
-    /// multi-variant payload carrying buffered observations, so inlining it
-    /// would bloat every `RequirementResult` value.
-    ExternalSession(Box<ExternalSessionResult>),
-}
-
-impl RequirementResult {
-    /// Returns the family this result belongs to.
-    #[must_use]
-    pub const fn tag(&self) -> RequirementKindTag {
-        match self {
-            Self::Llm(_) => RequirementKindTag::Llm,
-            Self::Tool(_) => RequirementKindTag::Tool,
-            Self::Interaction(_) => RequirementKindTag::Interaction,
-            Self::Subagent(_) => RequirementKindTag::Subagent,
-            Self::Reconfig(_) => RequirementKindTag::Reconfig,
-            Self::ExternalSession(_) => RequirementKindTag::ExternalSession,
-        }
-    }
-}
+// The effect coproduct — `RequirementKind`, `RequirementResult`, and
+// `RequirementKindTag`, plus their `Display`, `tag()`, and `accepts` — is
+// generated from the single effect manifest in
+// [`effect_manifest`](crate::agent::effect_manifest). The handler fan-out half
+// of the same manifest is generated in [`drive`](crate::agent::drive).
+with_effect_manifest!(define_effect_coproduct);
 
 /// A requirement result addressed back to the requirement it fulfills.
 ///
@@ -646,8 +392,8 @@ mod tests {
     use super::{
         AgentPath, AgentSlot, AgentSpecRef, Interaction, InteractionError, InteractionResponse,
         NoRequirementIds, Requirement, RequirementError, RequirementId, RequirementIds,
-        RequirementKind, RequirementKindGen, RequirementKindTag, RequirementKindTagGen,
-        RequirementResolution, RequirementResult, RequirementResultGen, SubagentOutput,
+        RequirementKind, RequirementKindTag, RequirementResolution, RequirementResult,
+        SubagentOutput,
     };
     use crate::{
         agent::{
@@ -1123,132 +869,5 @@ mod tests {
 
         // The tag itself round-trips as snake_case.
         assert_json_round_trip(&RequirementKindTag::ExternalSession);
-    }
-
-    // --- Macro-generated coproduct equivalence (milestone M3-2) --------------
-    //
-    // `define_effects!` renders `*Gen` twins that coexist with the hand-written
-    // coproduct. These assert the generated products are byte-for-byte and
-    // behaviour equivalent to the hand-written ones (serde, `tag()`, `accepts`);
-    // the `scope_handles` / `fulfill_with_scope` fan-out equivalence lives in
-    // `drive.rs`, next to the hand-written (private) functions it compares.
-
-    fn gen_kind_of(tag: RequirementKindTag) -> RequirementKindGen {
-        // Rebuild the generated twin from the hand-written kind's wire form. The
-        // round-trip only succeeds if the two enums share variant and field
-        // names, so it doubles as a serde-shape check.
-        let json = serde_json::to_string(&kind_of(tag)).expect("serialize hand-written kind");
-        serde_json::from_str(&json).expect("deserialize generated kind")
-    }
-
-    fn gen_result_of(tag: RequirementKindTag) -> RequirementResultGen {
-        match tag {
-            RequirementKindTag::Llm => RequirementResultGen::Llm(Ok(response())),
-            RequirementKindTag::Tool => RequirementResultGen::Tool(Ok(tool_response())),
-            RequirementKindTag::Interaction => {
-                RequirementResultGen::Interaction(InteractionResponse::Answer("yes".to_owned()))
-            }
-            RequirementKindTag::Subagent => RequirementResultGen::Subagent(Ok(SubagentOutput {
-                summary: "done".to_owned(),
-            })),
-            RequirementKindTag::Reconfig => RequirementResultGen::Reconfig(Ok(())),
-            RequirementKindTag::ExternalSession => {
-                RequirementResultGen::ExternalSession(Box::new(external_session_result()))
-            }
-        }
-    }
-
-    #[test]
-    fn generated_tag_display_matches_hand_written() {
-        for tag in ALL_TAGS {
-            let generated = match tag {
-                RequirementKindTag::Llm => RequirementKindTagGen::Llm,
-                RequirementKindTag::Tool => RequirementKindTagGen::Tool,
-                RequirementKindTag::Interaction => RequirementKindTagGen::Interaction,
-                RequirementKindTag::Subagent => RequirementKindTagGen::Subagent,
-                RequirementKindTag::Reconfig => RequirementKindTagGen::Reconfig,
-                RequirementKindTag::ExternalSession => RequirementKindTagGen::ExternalSession,
-            };
-            assert_eq!(generated.to_string(), tag.to_string());
-            assert_eq!(
-                serde_json::to_value(generated).expect("serialize generated tag"),
-                serde_json::to_value(tag).expect("serialize hand-written tag"),
-            );
-        }
-    }
-
-    #[test]
-    fn generated_kind_serde_and_tag_match_hand_written_for_every_family() {
-        for tag in ALL_TAGS {
-            let hand = kind_of(tag);
-            let generated = gen_kind_of(tag);
-            // Byte-for-byte wire equivalence between the two kind enums.
-            assert_eq!(
-                serde_json::to_string(&generated).expect("serialize generated kind"),
-                serde_json::to_string(&hand).expect("serialize hand-written kind"),
-                "generated kind wire form must match hand-written for {tag}"
-            );
-            // The kind and result `tag()` accessors agree across the twin
-            // discriminants (compared via their shared `snake_case` display).
-            assert_eq!(generated.tag().to_string(), hand.tag().to_string());
-            assert_eq!(
-                gen_result_of(tag).tag().to_string(),
-                result_of(tag).tag().to_string(),
-            );
-        }
-    }
-
-    #[test]
-    fn generated_accepts_matches_hand_written_across_matrix() {
-        for kind_tag in ALL_TAGS {
-            for result_tag in ALL_TAGS {
-                let hand = kind_of(kind_tag).accepts(&result_of(result_tag));
-                let generated = gen_kind_of(kind_tag).accepts(&gen_result_of(result_tag));
-                assert_eq!(
-                    hand, generated,
-                    "accepts({kind_tag}, {result_tag}) must agree between hand-written and generated"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn generated_accepts_delegates_interaction_check_like_hand_written() {
-        let permission = PermissionRequest::new(
-            "act-1".to_owned(),
-            agent_id(),
-            PermissionCategory::Shell,
-            "run tests".to_owned(),
-            json!({ "command": "cargo test" }),
-            PermissionRisk::Medium,
-            None,
-        );
-        let request = Interaction::permission(step_id(), permission);
-        let hand_kind = RequirementKind::NeedInteraction {
-            request: request.clone(),
-        };
-        let gen_kind = RequirementKindGen::NeedInteraction { request };
-
-        // A matching approval is accepted by both twins.
-        let matching =
-            InteractionResponse::Permission(PermissionResponse::approve("act-1".to_owned()));
-        assert_eq!(
-            hand_kind.accepts(&RequirementResult::Interaction(matching.clone())),
-            gen_kind.accepts(&RequirementResultGen::Interaction(matching)),
-        );
-
-        // A mismatched action id is rejected identically, via the delegated
-        // `accepts_response` check the manifest declares for `Interaction`.
-        let mismatched =
-            InteractionResponse::Permission(PermissionResponse::deny("act-2".to_owned(), None));
-        let hand = hand_kind.accepts(&RequirementResult::Interaction(mismatched.clone()));
-        let generated = gen_kind.accepts(&RequirementResultGen::Interaction(mismatched));
-        assert_eq!(hand, generated);
-        assert!(matches!(
-            generated,
-            Err(RequirementError::Interaction(
-                InteractionError::ActionMismatch { .. }
-            ))
-        ));
     }
 }

@@ -1,64 +1,80 @@
-# M3-2 — 宏覆盖 `accepts` 与 `drive.rs` 扇出(第 4–7 处),并加等价性断言
+# M3-3 — 切换到宏产物、删除手写版(刀 (A) 第三步)
 
-**当前执行 = TODO.md 第一个未完成任务 = M3-2**(M1-*/M2-*/M3-1 已 DONE)。刀 (A) 第二步。
+**当前执行 = TODO.md 第一个未完成任务 = M3-3**(M1-*/M2-*/M3-1/M3-2 已 DONE)。
 
-## 目标(TODO M3-2 / design §4.2–4.4)
-- 扩展 `define_effects!` 宏体,从**同一清单**再生成设计 §4.1 表格:
-  - 第 4 处 `accepts`:`RequirementKindGen::accepts(&self, &RequirementResultGen) -> Result<(), RequirementError>`
-    (tag 对齐 + `accepts_check` 后置校验特例)。
-  - 第 5 处 `HandlerScopeGen` trait:每 family 一个访问器,默认 `None`。
-  - 第 6 处 `scope_handles_gen(&dyn HandlerScopeGen, RequirementKindTagGen) -> bool`。
-  - 第 7 处 `fulfill_with_scope_gen(&RequirementKindGen, &dyn HandlerScopeGen, &RunContext) -> Option<RequirementResult>`;
-    `needs_outer`(Subagent)生成 `None` 分支。
-- 产物仍与手写版**并存**(`*Gen` / `*_gen` 名),不删旧码(删旧码是 M3-3)。
-- 加等价性测试证明宏版 == 手写版(serde / accepts / scope_handles / fulfill_with_scope)。
+## 目标(TODO M3-3 / design §4.2–4.4)
+- 删除手写的三个 enum + `accepts` + `HandlerScope`/`scope_handles`/`fulfill_with_scope`,
+  让宏产物接管**正式名**(去掉 `*Gen` 临时名)。
+- 全库编译:引用 `RequirementKind::NeedLlm{..}` 等的地方(machine/drive/testkit/tests/examples)
+  无需改动(变体名/字段/serde 形状不变)。
+- 删除 M3-2「对比手写版」的等价性测试,保留对宏产物本身的行为测试(serde 往返、accepts 矩阵、
+  fan-out 路由 + `scope_handles⟺fulfill_with_scope` 不变量)。
+- 在 `docs/effect-refine.md` 补附录:演示「新增 effect = 清单加一段」的完整 diff。
 
-## 关键发现(阻塞点 → 必须处理,非绕过)
-M3-1 清单**未编码 handler 调用的按值/按引用参数形状**(`fulfill(request, *mode, ..)` vs `fulfill(*call_id, call, ..)`)。
-`mode:LlmStepMode`、`call_id:ToolCallId` 是 Copy 按值传;其余按引用。design §4.3 明确承认"各 handler 参数形状差异大"。
-仅凭 `field: Ty` 无法在 `macro_rules` 里区分按值/按引用,故**必须给清单每个非 needs_outer effect 增补 `fulfill: ( args )` 子句**。
-- 这不是绕过:它是生成 `fulfill_with_scope` 的正确清单信息,与 design §4 一致。
-- 它修正了 M3-1 完成记录里"清单自 M3-1 起即终态"的乐观说法(该说法不是权威 spec;权威是 design + TODO)。
-- 在完成记录里透明记录此清单增补。
+## 关键设计决策:回调式清单宏(保持 design §4.1 文件落位)
+单个 `define_effects!` 只能在**一个模块**展开;但 design 要求 coproduct 在 requirement.rs、
+fan-out 在 drive.rs,且 `HandlerScope` 是公开 API(`agent::HandlerScope`,经 `drive` 再导出),
+`scope_handles`/`fulfill_with_scope` 是 drive.rs 私有。为同时满足「单一清单」+「各就各位」+
+「零对外 API 改动」,改成**回调式**:
+- `effect_manifest.rs`:`with_effect_manifest!($gen:ident)` 持有唯一清单(6 段),把 token 传给
+  `$gen`;两个生成器 `define_effect_coproduct!`(coproduct)与 `define_effect_fan_out!`(fan-out)。
+- `requirement.rs`:`with_effect_manifest!(define_effect_coproduct);` → 生成
+  `RequirementKindTag`/`RequirementKind`/`RequirementResult` + `Display`/`tag()`/`accepts`(正式名)。
+- `drive.rs`:`with_effect_manifest!(define_effect_fan_out);` → 生成 `HandlerScope`(pub)+
+  `scope_handles`/`fulfill_with_scope`(私有,取 `&RequirementKind`)。
 
-## 落点
-- `src/agent/effect_manifest.rs`:matcher 增补可选 `fulfill: ( $($fulfill_arg:tt)* )`;宏体新增第 4–7 处生成,
-  用 `concat!/stringify!` 合成 doc 满足 `#![warn(missing_docs)]`。模块 doc 更新(M3-2 覆盖 4–7)。
-- `src/agent/requirement.rs`:清单每个非 needs_outer effect 加 `fulfill:` 子句;`use` 增补 `RunContext`;
-  扩展/新增 accepts+serde 等价性测试(在本文件 tests,可访问手写 accepts + *Gen)。
-- `src/agent/drive.rs`:tests 里加 scope_handles/fulfill_with_scope 等价性测试(手写 fn 私有,须在 drive.rs;
-  宏版 `*_gen` pub 从 requirement 引入)。构造覆盖 6 family 的测试替身,同时 impl `HandlerScope` + `HandlerScopeGen`。
+### 卫生性验证(已用 rustc 探针确认)
+- 回调式 `$gen!{...}` 可行。
+- 清单里裸写的类型路径(ChatRequest/LlmHandler…)在**展开处**解析:coproduct 类型在 requirement.rs
+  已 import;fan-out 只发出 handler trait(drive.rs 本地定义)与字段名,无需额外 import。
+- match 绑定的 `$field` 与调用实参 `$fulfill_arg` 同源(同一 `with_effect_manifest!` 体),局部变量
+  卫生一致,可协同解析(探针 probe5=15 通过)。
 
-## 宏技巧要点
-- accepts 的 expected/actual 直接映射到手写 `RequirementKindTag::$tag`,使错误复用手写 `RequirementError`(可 `==` 比较)。
-- accepts_check 用 `?`(经 `RequirementError::Interaction` 的 `#[from]`)自动转换;要求该 effect 单字段(仅 Interaction)。
-- fulfill_with_scope_gen 用两个互斥可选块:`$(needs_outer→None)?` 与 `$(fulfill→handler 调用)?`,每 effect 恰好命中一个。
-- HandlerScopeGen 访问器返回 `Option<&dyn crate::agent::drive::$handler>`。
+## 落点与改动
+- `effect_manifest.rs`:重写为回调式三宏 + 更新模块/宏 doc(去掉「*Gen 并存/transitional」措辞,
+  改成「单清单驱动、跨 requirement/drive 生成正式产物」)。`pub(crate) use` 三宏。
+- `requirement.rs`:删手写 `RequirementKindTag`(126-160)/`RequirementKind`(443-543)/
+  `RequirementResult`(545-587);把 `define_effects!{…}` 换成 `with_effect_manifest!(define_effect_coproduct);`
+  并将清单数据迁入 effect_manifest.rs;更新 import;删 M3-2 `*Gen` 等价性测试(1128-1253)与
+  相关 import;保留 accepts 矩阵/serde 往返/tag display 等行为测试(现在直接测正式产物)。
+- `drive.rs`:删手写 `HandlerScope`(114-147)/`scope_handles`(532-542)/`fulfill_with_scope`(544-579);
+  加 `with_effect_manifest!(define_effect_fan_out);` + import;两处调用改传 `&requirement.kind`;
+  测试:删 `HandlerScopeGen for EqScope`、`gen_tag_of`、把 `generated_fan_out_*` 改为直接测正式
+  fan-out 路由 + 不变量;清理 `*Gen`/`*_gen` import。
+- `docs/effect-refine.md`:新增「§7 附录:新增一个 effect」的一段清单 diff 指南。
+
+## 第 8 处(机器 resume 分派)保持手写不动。
 
 ## 验证序列(default)
-1. `cargo fmt`  2. `cargo clippy --all-targets -- -D warnings`
-3. 聚焦:`cargo test -p agent-lib --lib requirement drive`(含新等价性测试)
+1. `cargo fmt --all`
+2. `cargo clippy --all-targets -- -D warnings`
+3. 聚焦:`cargo test -p agent-lib --lib requirement drive`
 4. 全量:`cargo test --all --all-targets`(≤30min)
 5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
 6. `git diff --check`
 
 ## 步骤
+- [x] 读 TODO/PLAN/design/源码,选定 M3-3
+- [x] 探针验证回调宏 + 卫生性
 - [x] 写 memory 计划(本文件)
-- [x] 扩展宏体(accepts + HandlerScopeGen + scope_handles_gen + fulfill_with_scope_gen)+ 更新模块 doc
-- [x] 清单加 fulfill 子句 + import RunContext
-- [x] cargo build 通过(先验证宏展开)
-- [x] 加等价性测试(requirement.rs + drive.rs)
-- [x] fmt / clippy / 聚焦测试 / 全量测试 / doc / git diff --check
-- [x] 写完成记录 → TODO.md 标 [DONE] → commit → 停
+- [x] 重写 effect_manifest.rs(回调式三宏 + 清单迁入 + doc)
+- [x] requirement.rs 删手写 + 换调用 + 清理测试
+- [x] drive.rs 删手写 + 换调用 + 改测试
+- [x] docs/effect-refine.md 附录
+- [x] fmt/clippy/聚焦/全量/doc/diff --check
+- [ ] 写完成记录 → TODO.md 标 [DONE] → commit → 停
 
 ## 验证记录
-- `cargo fmt --all`:通过。
-- `cargo clippy --all-targets -- -D warnings`:零告警。
-- `cargo test -p agent-lib --lib`:**556 passed / 0 failed / 0 ignored**。
-- `cargo test --all --all-targets`:全绿,36 个测试二进制全部 `test result: ok`,无失败。
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`:通过。
-- `git diff --check`:无空白/冲突标记错误。
-- 新增测试:`drive::tests::generated_fan_out_matches_hand_written_across_families`,以及 `requirement.rs`
-  的 serde/`tag`/`accepts` 矩阵/`accepts_response` 委派等价性测试。
-- 说明:因 M3-1 清单未编码 handler 实参形态,按设计 §4.3 为清单新增 `fulfill: (args)` 子句并把
-  `accepts_check` 改为 `receiver.method`;手写版未删(留待 M3-3)。
+- `cargo build`:通过(库先行编译,确认回调宏在真实代码里展开无误)。
+- `cargo fmt --all`:无改动残留。
+- `cargo clippy --all-targets -- -D warnings`:0 warning。
+- `cargo test -p agent-lib --lib`:552 passed / 0 failed(含 requirement/drive 模块)。
+- `cargo test --all --all-targets`:**778 passed / 0 failed**(断言未改,证明对外形状/行为不变)。
+- `cargo test --all --doc`:doctest 全绿(7+12+2,1 ignored 为 effect_manifest 的 ```ignore 语法示意)。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`:通过(宏产物 rustdoc 可编译、有文档)。
+- `git diff --check`:CLEAN。
+- diff 范围:requirement.rs / drive.rs / effect_manifest.rs / docs/effect-refine.md / memory,
+  净 −333 行(删手写三 enum+accepts+三处扇出+M3-2 等价性测试,换成两行宏调用)。PLAN.md 无需改
+  (阶段计划未变);PROMPT.md 未被改动。
+- 遗留引用检查:`define_effects`/`*Gen` 仅存于 TODO.md 的 M3-1/M3-2 历史 DONE 记录(应保留为历史)
+  与本 memory 文件;生产代码/公开 doc 已无这些名字。

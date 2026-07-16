@@ -293,32 +293,44 @@ coproduct 的核心税,也是"感觉乱"的最大来源。
 
 ### 4.2 目标形状:单一 effect 清单驱动的声明宏
 
-用一个宏从**单一 effect 定义清单**生成第 1–7 处的全部样板:
+用一份**单一 effect 清单**生成第 1–7 处的全部样板。清单只有一处,但第 1–4 处(coproduct)
+要落在 `requirement.rs`、第 5–7 处(handler 扇出)要落在 `drive.rs`,而一个 `macro_rules!`
+只在**一个模块**里展开。为此清单以**回调宏**的形式存在:`with_effect_manifest!` 持有清单本
+身,把整份清单转发给调用方点名的生成器宏;两个生成器各生成一半:
 
 ```rust
-// 概念示意:唯一的事实来源
-define_effects! {
-    Llm {
-        request: { request: ChatRequest, mode: LlmStepMode },
-        result:  Result<Response, ClientError>,
-        handler: LlmHandler,
-        // 访问器 fn llm(), tag Llm, accepts 分支全部由宏生成
-    }
-    Tool {
-        request: { call_id: ToolCallId, call: ToolCall },
-        result:  Result<ToolResponse, ToolRuntimeError>,
-        handler: ToolHandler,
-    }
-    Interaction { ... }
-    Subagent    { ... }   // 标注 needs_outer:让宏知道它走 resolve_requirement 串行路径
-    Reconfig    { ... }
-    ExternalSession { ... }
+// 概念示意:唯一的事实来源(src/agent/effect_manifest.rs)
+macro_rules! with_effect_manifest {
+    ($generator:ident) => { $generator! {
+        Llm {
+            tag_name: "llm",
+            kind: NeedLlm { request: ChatRequest, mode: LlmStepMode },
+            result: Result<Response, ClientError>,
+            handler: LlmHandler,
+            accessor: llm,
+            fulfill: (request, *mode),   // 交给 handler 的实参形状(值/引用)
+        }
+        Tool { .. }
+        Interaction { .. accepts_check: request.accepts_response, }  // 唯一带后置校验
+        Subagent    { .. needs_outer: true, }  // 唯一走 resolve_requirement 串行路径
+        Reconfig    { .. }
+        ExternalSession { .. }
+    } };
 }
+
+// requirement.rs:唯一一行,生成第 1–4 处
+with_effect_manifest!(define_effect_coproduct);
+// drive.rs:唯一一行,生成第 5–7 处
+with_effect_manifest!(define_effect_fan_out);
 ```
 
-宏产出:`RequirementKind` / `RequirementResult` / `RequirementKindTag` 三个 enum、
-`RequirementKind::accepts`、`HandlerScope` 的访问器默认实现、`scope_handles`、
-`fulfill_with_scope`。**加一个 effect 从"改 8 处"变成"清单里加一段"。**
+`define_effect_coproduct` 产出 `RequirementKind` / `RequirementResult` /
+`RequirementKindTag` 三个 enum、`RequirementKindTag::Display`、各 `tag()`、
+`RequirementKind::accepts`;`define_effect_fan_out` 产出 `HandlerScope` 的访问器默认实现、
+`scope_handles`、`fulfill_with_scope`。清单里的裸类型名(`ChatRequest`、`LlmHandler` …)在
+**各生成器的展开点**解析,所以 coproduct 的字段/结果类型在 `requirement.rs` 解析、扇出的
+handler trait 在 `drive.rs` 解析,两个模块互不需要对方的 import。**加一个 effect 从"改 8 处"
+变成"清单里加一段"**(完整 diff 见 [§7 附录](#7-附录加一个-effect-的完整-diff))。
 
 ### 4.3 边界与不做什么
 
@@ -340,10 +352,12 @@ define_effects! {
 
 ### 4.4 影响面与验证
 
-- 动 `requirement.rs` 与 `drive.rs`,以及新增一个 `macros.rs`(或独立 proc-macro crate,
-  若声明宏表达力不够)。
-- **先验证等价性再删旧码**:宏生成的 enum/函数应与现有手写版**逐字段等价**。做法是先让
-  宏与手写版并存、用一个 `#[test]` 断言两者的 serde 输出与 `accepts` 行为一致,再删手写版。
+- 动 `requirement.rs` 与 `drive.rs`,以及新增一个 `src/agent/effect_manifest.rs`(私有模块,
+  内含 `with_effect_manifest!` 清单 + 两个生成器宏;声明宏表达力足够,未引入独立 proc-macro
+  crate)。
+- **先验证等价性再删旧码**(已按 M3-1 → M3-2 → M3-3 三步落地):M3-1 让宏产物取 `*Gen` 临时名
+  与手写版**并存**;M3-2 用 `#[test]` 断言两者的 serde 输出与 `accepts`/扇出行为逐字段一致;
+  M3-3 删除手写版、让宏产物接管正式名,并把等价性测试改为对宏产物本身的行为测试。
 - 验证:`requirement.rs` 现有测试、`drive.rs` 的 dispatch 测试全绿;`RUSTDOCFLAGS="-D
   warnings" cargo doc` 通过(宏生成项的 rustdoc 需可编译)。
 - **时机建议**:等 external-agent 里程碑把 `NeedExternalSession` 等新变体落定、effect
@@ -371,3 +385,53 @@ define_effects! {
   之外的东西,与本库取向冲突(见 [`docs/agent-effect-model.md`](agent-effect-model.md) §5)。
 - 不在本轮动 `NestedMachine` / external-agent 的机器实现;三刀都聚焦"单机器 + 扇出点"的
   可读性,nested 层自然受益于同样的改动,但不作为本文验收目标。
+
+## 7. 附录:加一个 effect 的完整 diff
+
+刀 (A) 落地后,新增一个 effect 只需在 `src/agent/effect_manifest.rs` 的
+`with_effect_manifest!` 清单里**加一段 stanza**,其余第 1–7 处由两个生成器宏自动展开。下面以
+一个虚构的 `Timer` effect(机器请求"睡到某个时刻",由驱动侧计时器兑现)为例,展示完整 diff。
+
+**唯一需要手写的改动**——在清单里加一段(第 8 处「机器内 resume 分派」按各机器语义单独接线,
+不在本清单覆盖范围):
+
+```diff
+ // src/agent/effect_manifest.rs, macro_rules! with_effect_manifest
+         ExternalSession {
+             tag_name: "external_session",
+             kind: NeedExternalSession { request: ExternalSessionRequest },
+             result: Box<ExternalSessionResult>,
+             handler: ExternalSessionHandler,
+             accessor: external,
+             fulfill: (request),
+         }
++        Timer {
++            tag_name: "timer",
++            kind: NeedTimer { deadline: Instant },
++            result: Result<(), TimerError>,
++            handler: TimerHandler,
++            accessor: timer,
++            fulfill: (*deadline),
++        }
+```
+
+加上这段后,两个生成器宏自动补齐:
+
+- **coproduct(`requirement.rs`,第 1–4 处)**:`RequirementKindTag::Timer` 及其 `Display`
+  (`"timer"`)、`RequirementKind::NeedTimer { deadline }`、`RequirementResult::Timer(Result<(),
+  TimerError>)`、两个 `tag()` 分支、以及 `accepts` 里的 `Timer ⟷ Timer` 对齐分支。
+- **handler 扇出(`drive.rs`,第 5–7 处)**:`HandlerScope::timer()`(默认 `None`)、
+  `scope_handles` 的 `Timer => scope.timer().is_some()`、`fulfill_with_scope` 的
+  `NeedTimer { deadline } => Some(scope.timer()?.fulfill(*deadline, ctx).await)`。
+
+**清单之外仅需的配套**(不是"改扇出点",而是提供被扇出点引用的类型/trait):
+
+1. 让 `NeedTimer` 的字段/结果类型在 `requirement.rs` 可见(`Instant`、`TimerError`)——与手写
+   时代要为任何新变体引类型一样。
+2. 在 `drive.rs` 定义 `TimerHandler` trait(它的 `fulfill` 具体签名有意保持手写,见 §4.3)。
+3. 若某台 `AgentMachine` 会**发起**或**消费** `NeedTimer`,在它的 cursor 相位里接线 resume
+   分派(第 8 处,按机器语义各自实现)。
+
+对比刀 (A) 之前:同样一个 effect 要在 `requirement.rs` 的三个 enum + `accepts`、`drive.rs` 的
+`HandlerScope` + `scope_handles` + `fulfill_with_scope` 共 7 处手工对齐,漏改任意一处只在运行期
+或 review 时才暴露。清单化后,7 处对齐塌缩成一段 stanza,"漏改一处"在结构上不再可能。

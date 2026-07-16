@@ -1,31 +1,48 @@
-//! Single source of truth for the effect coproduct: the [`define_effects!`]
-//! declarative macro.
+//! Single source of truth for the effect coproduct: the effect manifest and the
+//! declarative macros that expand it.
 //!
 //! # Why this exists
 //!
-//! Adding one effect to the Agent layer today means editing eight aligned
-//! places (design doc [`docs/effect-refine.md`](../../../docs/effect-refine.md)
-//! §4.1). Three of those are the coproduct enums in
-//! [`requirement`](crate::agent::requirement) —
+//! Adding one effect to the Agent layer once meant editing eight aligned places
+//! (design doc [`docs/effect-refine.md`](../../../docs/effect-refine.md) §4.1):
+//! the three coproduct enums in [`requirement`](crate::agent::requirement) —
 //! [`RequirementKind`](crate::agent::requirement::RequirementKind),
 //! [`RequirementResult`](crate::agent::requirement::RequirementResult), and
 //! [`RequirementKindTag`](crate::agent::requirement::RequirementKindTag) — plus
-//! their `accepts` alignment; the other four are the handler fan-out in
-//! [`drive`](crate::agent::drive). Every one of the eight is aligned only by
-//! convention. `define_effects!` collapses that fan-out into a single effect
-//! manifest so "add an effect" becomes "add one manifest stanza".
+//! their `accepts` alignment; and the handler fan-out in
+//! [`drive`](crate::agent::drive) — the
+//! [`HandlerScope`](crate::agent::drive::HandlerScope) accessors, `scope_handles`,
+//! and `fulfill_with_scope`. Every one of them was aligned only by convention.
+//! This module collapses that fan-out into a single effect manifest so "add an
+//! effect" becomes "add one manifest stanza" (see the appendix of the design doc
+//! for the one-stanza diff).
 //!
-//! This module lands the macro (刀 (A) milestones M3-1 and M3-2). It generates
-//! the first seven fan-out points from the manifest — the three coproduct enums,
-//! [`RequirementKindTag`]'s `Display`, the `tag()` accessors,
-//! `RequirementKind::accepts`, the [`HandlerScope`](crate::agent::drive)
-//! accessors, `scope_handles`, and `fulfill_with_scope` — under the transitional
-//! names `RequirementKindGen` / `RequirementResultGen` / `RequirementKindTagGen`
-//! / `HandlerScopeGen` / `scope_handles_gen` / `fulfill_with_scope_gen`, which
-//! **coexist** with the hand-written definitions rather than replace them. M3-2
-//! adds `#[test]` assertions proving the generated products byte-for-byte and
-//! behaviour equivalent to the hand-written ones; M3-3 deletes the hand-written
-//! definitions and promotes the macro products to the canonical names.
+//! The machine-internal resume dispatch (design doc §4.1 point 8) stays
+//! hand-written: it depends on a concrete machine's cursor phases and is not
+//! generated here.
+//!
+//! # Shape: one manifest, two generators
+//!
+//! [`with_effect_manifest`] holds the manifest — one stanza per effect — and
+//! nothing else. It is a *callback* macro: it forwards the whole manifest to a
+//! generator macro named by the caller. Two generators consume it:
+//!
+//! - [`define_effect_coproduct`], invoked in
+//!   [`requirement`](crate::agent::requirement), renders design doc §4.1 points
+//!   1–4: the `RequirementKindTag` / `RequirementKind` / `RequirementResult`
+//!   enums, `RequirementKindTag`'s `Display`, the `tag()` accessors, and
+//!   `RequirementKind::accepts`.
+//! - [`define_effect_fan_out`], invoked in [`drive`](crate::agent::drive),
+//!   renders points 5–7: the `HandlerScope` accessors (each defaulting to
+//!   `None`), `scope_handles`, and `fulfill_with_scope`.
+//!
+//! Splitting the generators keeps each fan-out point in the module design doc
+//! §4.1 assigns it — the coproduct next to its serde types, the handler fan-out
+//! next to the handler traits — while the manifest itself lives in exactly one
+//! place. The bare type names in the manifest (`ChatRequest`, `LlmHandler`, …)
+//! resolve at each generator's expansion site, so the coproduct's field/result
+//! types resolve in `requirement` and the fan-out's handler traits resolve in
+//! `drive`; neither module needs the other's imports.
 //!
 //! # Choice of `macro_rules!` over a proc-macro crate
 //!
@@ -35,8 +52,8 @@
 //! struct-shaped kind variants versus single-payload tuple result variants,
 //! per-field `serde` attributes (`NeedSubagent::result_schema`), boxed result
 //! payloads (`ExternalSession(Box<…>)`), and the optional `needs_outer` /
-//! `accepts_check` markers all fit a single `macro_rules!` matcher. Following
-//! the [`define_id!`](crate::agent::id) precedent, per-item rustdoc is
+//! `accepts_check` / `fulfill` markers all fit a single `macro_rules!` matcher.
+//! Following the [`define_id!`](crate::agent::id) precedent, per-item rustdoc is
 //! synthesized with `concat!`/`stringify!`, so the generated items satisfy
 //! `#![warn(missing_docs)]` without hand-threaded doc strings. No proc-macro
 //! crate is introduced.
@@ -44,7 +61,7 @@
 //! # Manifest grammar
 //!
 //! ```ignore
-//! define_effects! {
+//! with_effect_manifest! {
 //!     <TagName> {
 //!         // snake_case wire/display name for this family's tag.
 //!         tag_name: "<snake_case>",
@@ -59,8 +76,7 @@
 //!         // Inner payload of the tuple-shaped result variant
 //!         // (`RequirementResult::<TagName>(<ResultTy>)`).
 //!         result: <ResultTy>,
-//!         // Handler trait fulfilling this family and its `HandlerScope` accessor
-//!         // (consumed by M3-2's `drive` fan-out; captured but unused in M3-1).
+//!         // Handler trait fulfilling this family and its `HandlerScope` accessor.
 //!         handler: <HandlerTrait>,
 //!         accessor: <accessor_fn>,
 //!         // Optional (required for every non-`needs_outer` family): the exact
@@ -86,22 +102,103 @@
 //! }
 //! ```
 //!
-//! Each stanza is the whole truth about one effect. The macro body consumes
-//! `TagName`, `tag_name`, `kind`, and `result` for the coproduct enums (M3-1),
-//! and `handler`, `accessor`, `fulfill`, `needs_outer`, and `accepts_check` for
-//! `accepts` and the `drive` fan-out (M3-2). Later milestones only grow the
-//! macro body and promote the generated names, never re-shape the manifest.
+//! Each stanza is the whole truth about one effect. `define_effect_coproduct`
+//! consumes `TagName`, `tag_name`, `kind`, `result`, and `accepts_check`; while
+//! `define_effect_fan_out` consumes `TagName`, `handler`, `accessor`, `fulfill`,
+//! and `needs_outer`. Both parse the full grammar and ignore the fields they do
+//! not need.
 
-/// Generates the effect coproduct and its handler fan-out from a single effect
-/// manifest. See the [module docs](self) for the grammar and staging.
+/// Holds the effect manifest and forwards it to a generator macro.
 ///
-/// It emits the transitional `RequirementKindGen` / `RequirementResultGen` /
-/// `RequirementKindTagGen` types (fan-out points 1–3 of design doc §4.1) plus
-/// [`RequirementKindTagGen`]'s `Display`, the `tag()` accessors, and (point 4)
-/// `RequirementKindGen::accepts`, then (points 5–7) the `HandlerScopeGen`
-/// accessors, `scope_handles_gen`, and `fulfill_with_scope_gen`. The machine
-/// resume dispatch (point 8) stays hand-written.
-macro_rules! define_effects {
+/// The single source of truth for the effect coproduct: one stanza per effect,
+/// in the grammar documented on the [module](self). Invoked as
+/// `with_effect_manifest!(<generator>)`, it expands to `<generator>! { <manifest> }`,
+/// so [`define_effect_coproduct`] and [`define_effect_fan_out`] each render their
+/// half of the fan-out from the same manifest. Adding an effect means adding one
+/// stanza here and nothing else.
+macro_rules! with_effect_manifest {
+    ($generator:ident) => {
+        $generator! {
+            Llm {
+                tag_name: "llm",
+                kind: NeedLlm {
+                    request: ChatRequest,
+                    mode: LlmStepMode,
+                },
+                result: Result<Response, ClientError>,
+                handler: LlmHandler,
+                accessor: llm,
+                fulfill: (request, *mode),
+            }
+            Tool {
+                tag_name: "tool",
+                kind: NeedTool {
+                    call_id: ToolCallId,
+                    call: ToolCall,
+                },
+                result: Result<ToolResponse, ToolRuntimeError>,
+                handler: ToolHandler,
+                accessor: tool,
+                fulfill: (*call_id, call),
+            }
+            Interaction {
+                tag_name: "interaction",
+                kind: NeedInteraction {
+                    request: Interaction,
+                },
+                result: InteractionResponse,
+                handler: InteractionHandler,
+                accessor: interaction,
+                fulfill: (request),
+                accepts_check: request.accepts_response,
+            }
+            Subagent {
+                tag_name: "subagent",
+                kind: NeedSubagent {
+                    spec_ref: AgentSpecRef,
+                    brief: Interaction,
+                    #[serde(default, skip_serializing_if = "Option::is_none")]
+                    result_schema: Option<Value>,
+                },
+                result: Result<SubagentOutput, AgentError>,
+                handler: SubagentHandler,
+                accessor: subagent,
+                needs_outer: true,
+            }
+            Reconfig {
+                tag_name: "reconfig",
+                kind: NeedReconfigRegistry {
+                    tool_set: ToolSetRef,
+                },
+                result: Result<(), ToolRuntimeError>,
+                handler: ReconfigHandler,
+                accessor: reconfig,
+                fulfill: (tool_set),
+            }
+            ExternalSession {
+                tag_name: "external_session",
+                kind: NeedExternalSession {
+                    request: ExternalSessionRequest,
+                },
+                result: Box<ExternalSessionResult>,
+                handler: ExternalSessionHandler,
+                accessor: external,
+                fulfill: (request),
+            }
+        }
+    };
+}
+
+/// Renders the effect coproduct (design doc §4.1 points 1–4) from the manifest.
+///
+/// Invoked as `with_effect_manifest!(define_effect_coproduct)` in
+/// [`requirement`](crate::agent::requirement). It emits the `RequirementKindTag`
+/// / `RequirementKind` / `RequirementResult` enums, `RequirementKindTag`'s
+/// `Display`, the `tag()` accessors, and `RequirementKind::accepts`. The field
+/// and result types name themselves in the manifest and resolve in the invoking
+/// module. `RequirementError` (returned by `accepts`) is hand-written and stays
+/// in `requirement`.
+macro_rules! define_effect_coproduct {
     ($(
         $tag:ident {
             tag_name: $tag_name:literal,
@@ -116,22 +213,23 @@ macro_rules! define_effects {
             $( accepts_check: $accepts_recv:ident . $accepts_check:ident, )?
         }
     )+) => {
-        /// Family discriminant generated from the effect manifest.
+        /// Discriminant identifying which family a [`RequirementKind`] or
+        /// [`RequirementResult`] belongs to.
         ///
-        /// Transitional twin of
-        /// [`RequirementKindTag`](crate::agent::requirement::RequirementKindTag)
-        /// while the hand-written and generated coproducts coexist (milestone
-        /// M3-1); see the `effect_manifest` module for the generating macro.
+        /// The tag drives return-path type alignment
+        /// ([`RequirementKind::accepts`]) and lets a host allocate ids per
+        /// requirement family via [`RequirementIds`]. Generated from the effect
+        /// manifest (see the `effect_manifest` module).
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
-        pub enum RequirementKindTagGen {
+        pub enum RequirementKindTag {
             $(
                 #[doc = concat!("The `", stringify!($tag), "` requirement family.")]
                 $tag,
             )+
         }
 
-        impl fmt::Display for RequirementKindTagGen {
+        impl fmt::Display for RequirementKindTag {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 let text = match self {
                     $( Self::$tag => $tag_name, )+
@@ -140,16 +238,14 @@ macro_rules! define_effects {
             }
         }
 
-        /// Persistable requirement description generated from the effect
-        /// manifest.
+        /// What a [`Requirement`] needs fulfilled. Payloads reuse existing types.
         ///
-        /// Transitional twin of
-        /// [`RequirementKind`](crate::agent::requirement::RequirementKind); it
-        /// derives `serde` with the same `snake_case` renaming so its wire form
-        /// matches variant-for-variant (milestone M3-1).
+        /// The persistable *description* of a request; it derives `serde` for
+        /// cross-process persistence. Generated from the effect manifest (see the
+        /// `effect_manifest` module).
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
-        pub enum RequirementKindGen {
+        pub enum RequirementKind {
             $(
                 #[doc = concat!(
                     "Reified `", stringify!($tag), "` effect requirement (`",
@@ -168,39 +264,36 @@ macro_rules! define_effects {
             )+
         }
 
-        impl RequirementKindGen {
+        impl RequirementKind {
             /// Returns the family this kind belongs to.
             #[must_use]
-            pub const fn tag(&self) -> RequirementKindTagGen {
+            pub const fn tag(&self) -> RequirementKindTag {
                 match self {
-                    $( Self::$kind_variant { .. } => RequirementKindTagGen::$tag, )+
+                    $( Self::$kind_variant { .. } => RequirementKindTag::$tag, )+
                 }
             }
 
             /// Checks that `result` is type-aligned with this requirement kind.
             ///
-            /// Generated twin of
-            /// [`RequirementKind::accepts`](crate::agent::requirement::RequirementKind::accepts):
-            /// it first rejects a cross-family result with
-            /// [`RequirementError::ResultKindMismatch`], then runs any manifest
-            /// `accepts_check` post-validation (only `Interaction`'s
-            /// `accepts_response`). The family discriminants it reports reuse the
-            /// hand-written [`RequirementKindTag`](crate::agent::requirement::RequirementKindTag)
-            /// so the returned [`RequirementError`](crate::agent::requirement::RequirementError)
-            /// is value-equal to the hand-written one while both coexist
-            /// (milestone M3-2).
+            /// A `NeedLlm` requirement only accepts an [`RequirementResult::Llm`]
+            /// result, and so on for each family. A family that declares an
+            /// `accepts_check` in the manifest (only `NeedInteraction`, whose
+            /// carried [`InteractionResponse`] is validated against its
+            /// [`Interaction`] request) runs that extra post-validation after the
+            /// family match.
             ///
             /// # Errors
             ///
             /// Returns [`RequirementError::ResultKindMismatch`] when the result
-            /// family differs, or the family-specific error surfaced by an
-            /// `accepts_check` (e.g. [`RequirementError::Interaction`]).
-            pub fn accepts(&self, result: &RequirementResultGen) -> Result<(), RequirementError> {
+            /// family does not match this requirement's family, or the
+            /// family-specific error surfaced by an `accepts_check` (e.g.
+            /// [`RequirementError::Interaction`]).
+            pub fn accepts(&self, result: &RequirementResult) -> Result<(), RequirementError> {
                 let expected = match self {
                     $( Self::$kind_variant { .. } => RequirementKindTag::$tag, )+
                 };
                 let actual = match result {
-                    $( RequirementResultGen::$tag(_) => RequirementKindTag::$tag, )+
+                    $( RequirementResult::$tag(_) => RequirementKindTag::$tag, )+
                 };
                 if expected != actual {
                     return Err(RequirementError::ResultKindMismatch { expected, actual });
@@ -214,7 +307,7 @@ macro_rules! define_effects {
                     $(
                         if let (
                             Self::$kind_variant { $accepts_recv, .. },
-                            RequirementResultGen::$tag(response),
+                            RequirementResult::$tag(response),
                         ) = (self, result)
                         {
                             $accepts_recv.$accepts_check(response)?;
@@ -225,47 +318,71 @@ macro_rules! define_effects {
             }
         }
 
-        /// Runtime requirement result generated from the effect manifest.
+        /// Fulfilled result for one requirement, delivered back on the return
+        /// path.
         ///
-        /// Transitional twin of
-        /// [`RequirementResult`](crate::agent::requirement::RequirementResult);
-        /// like the hand-written half it carries live values and runtime errors
-        /// and therefore deliberately does **not** derive `serde` (milestone
-        /// M3-1).
+        /// The runtime half: it carries live values and runtime errors
+        /// ([`ClientError`], [`ToolRuntimeError`], [`AgentError`]) and is
+        /// intentionally not persistable (it does **not** derive `serde`).
+        /// Generated from the effect manifest (see the `effect_manifest`
+        /// module).
         #[derive(Clone, Debug)]
-        pub enum RequirementResultGen {
+        pub enum RequirementResult {
             $(
                 #[doc = concat!("Fulfilled result for the `", stringify!($tag), "` requirement family.")]
                 $tag($result_ty),
             )+
         }
 
-        impl RequirementResultGen {
+        impl RequirementResult {
             /// Returns the family this result belongs to.
             #[must_use]
-            pub const fn tag(&self) -> RequirementKindTagGen {
+            pub const fn tag(&self) -> RequirementKindTag {
                 match self {
-                    $( Self::$tag(_) => RequirementKindTagGen::$tag, )+
+                    $( Self::$tag(_) => RequirementKindTag::$tag, )+
                 }
             }
         }
+    };
+}
 
-        /// One drain layer's effect handlers, generated from the effect
-        /// manifest.
+/// Renders the handler fan-out (design doc §4.1 points 5–7) from the manifest.
+///
+/// Invoked as `with_effect_manifest!(define_effect_fan_out)` in
+/// [`drive`](crate::agent::drive). It emits the [`HandlerScope`] trait (one
+/// accessor per family, each defaulting to `None`), `scope_handles`, and
+/// `fulfill_with_scope`. The handler traits it borrows name themselves in the
+/// manifest and resolve in the invoking module, next to their definitions.
+macro_rules! define_effect_fan_out {
+    ($(
+        $tag:ident {
+            tag_name: $tag_name:literal,
+            kind: $kind_variant:ident {
+                $( $( #[$field_meta:meta] )* $field:ident : $field_ty:ty ),* $(,)?
+            },
+            result: $result_ty:ty,
+            handler: $handler:ident,
+            accessor: $accessor:ident,
+            $( fulfill: ( $( $fulfill_arg:tt )* ), )?
+            $( needs_outer: $needs_outer:literal, )?
+            $( accepts_check: $accepts_recv:ident . $accepts_check:ident, )?
+        }
+    )+) => {
+        /// One drain layer's set of effect handlers.
         ///
-        /// Transitional twin of
-        /// [`HandlerScope`](crate::agent::drive::HandlerScope): it exposes one
-        /// accessor per family, each defaulting to `None`, so an empty scope
-        /// handles nothing and every requirement pops to the outer scope
-        /// (milestone M3-2). Each accessor borrows the same hand-written handler
-        /// trait the manifest names.
-        pub trait HandlerScopeGen: Send + Sync {
+        /// A scope exposes up to one handler per requirement family. Each
+        /// accessor defaults to `None`, so an empty scope handles nothing and
+        /// every requirement pops to the outer scope. A layer overrides only the
+        /// families it can fulfill. Generated from the effect manifest (see the
+        /// `effect_manifest` module); see the [module docs](self) for how scopes
+        /// compose into a drain.
+        pub trait HandlerScope: Send + Sync {
             $(
                 #[doc = concat!(
-                    "Returns this layer's `", stringify!($handler),
-                    "`, if it fulfills the `", stringify!($tag), "` family."
+                    "Returns this layer's [`", stringify!($handler),
+                    "`], if it fulfills the `", stringify!($tag), "` family."
                 )]
-                fn $accessor(&self) -> Option<&dyn crate::agent::drive::$handler> {
+                fn $accessor(&self) -> Option<&dyn $handler> {
                     None
                 }
             )+
@@ -274,43 +391,38 @@ macro_rules! define_effects {
         /// Returns whether `scope` offers a handler for the given requirement
         /// family.
         ///
-        /// Generated twin of `drive::scope_handles` (milestone M3-2); it must
-        /// stay consistent with [`fulfill_with_scope_gen`] for the same tag.
-        #[must_use]
-        pub fn scope_handles_gen(
-            scope: &dyn HandlerScopeGen,
-            tag: RequirementKindTagGen,
-        ) -> bool {
+        /// Generated from the effect manifest; it must stay consistent with
+        /// `fulfill_with_scope` for the same tag.
+        fn scope_handles(scope: &dyn HandlerScope, tag: RequirementKindTag) -> bool {
             match tag {
-                $( RequirementKindTagGen::$tag => scope.$accessor().is_some(), )+
+                $( RequirementKindTag::$tag => scope.$accessor().is_some(), )+
             }
         }
 
         /// Fulfills `kind` with this scope's handler, if it has one.
         ///
-        /// Generated twin of `drive::fulfill_with_scope` (milestone M3-2).
         /// Returns `None` when the scope offers no handler for the family (the
         /// caller then pops it outward). Families marked `needs_outer` in the
         /// manifest (only `Subagent`) always yield `None`: they deepen the scope
         /// chain and are routed serially through `resolve_requirement` instead of
-        /// being fulfilled in place.
-        pub async fn fulfill_with_scope_gen(
-            kind: &RequirementKindGen,
-            scope: &dyn HandlerScopeGen,
+        /// being fulfilled in place. Generated from the effect manifest.
+        async fn fulfill_with_scope(
+            kind: &RequirementKind,
+            scope: &dyn HandlerScope,
             ctx: &RunContext,
         ) -> Option<RequirementResult> {
             match kind {
                 $(
-                    // One arm per family. The payload fields are bound at this
-                    // (effect) level so the manifest `fulfill` arguments can name
-                    // them; `#[allow(unused_variables)]` covers the `needs_outer`
-                    // family (`Subagent`), whose fields go unused because its body
-                    // is `None`. Exactly one of the two mutually exclusive bodies
-                    // below expands: `needs_outer` families yield `None` (they are
-                    // routed serially through `resolve_requirement`), every other
-                    // family calls its handler in place.
+                    // One arm per family. The payload fields are bound so the
+                    // manifest `fulfill` arguments can name them;
+                    // `#[allow(unused_variables)]` covers the `needs_outer`
+                    // family (`Subagent`), whose fields go unused because its
+                    // body is `None`. Exactly one of the two mutually exclusive
+                    // bodies below expands: `needs_outer` families yield `None`
+                    // (routed serially through `resolve_requirement`), every
+                    // other family calls its handler in place.
                     #[allow(unused_variables)]
-                    RequirementKindGen::$kind_variant { $( $field ),* } => {
+                    RequirementKind::$kind_variant { $( $field ),* } => {
                         $( let _: bool = $needs_outer; None )?
                         $( Some(scope.$accessor()?.fulfill( $( $fulfill_arg )*, ctx ).await) )?
                     }
@@ -320,4 +432,4 @@ macro_rules! define_effects {
     };
 }
 
-pub(crate) use define_effects;
+pub(crate) use {define_effect_coproduct, define_effect_fan_out, with_effect_manifest};

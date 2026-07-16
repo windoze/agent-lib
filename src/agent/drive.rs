@@ -84,6 +84,7 @@ use crate::{
         Notification, Requirement, RequirementDisposition, RequirementId, RequirementKind,
         RequirementResolution, RequirementResult, RunContext, RunContextError, StepInput,
         ToolSetRef, TraceNodeId,
+        effect_manifest::{define_effect_fan_out, with_effect_manifest},
         external::ExternalSessionRequest,
         interaction::Interaction,
         requirement::{AgentSpecRef, RequirementKindTag},
@@ -105,46 +106,14 @@ pub use reference::{
 };
 pub use subagent::{DrivingSubagentHandler, SpawnedChild, SubagentSpawner};
 
-/// One drain layer's set of effect handlers.
-///
-/// A scope exposes up to one handler per requirement family. Each
-/// accessor defaults to `None`, so an empty scope handles nothing and every
-/// requirement pops to the outer scope. A layer overrides only the families it
-/// can fulfill. See the [module docs](self) for how scopes compose into a drain.
-pub trait HandlerScope: Send + Sync {
-    /// Returns this layer's [`LlmHandler`], if it fulfills `NeedLlm`.
-    fn llm(&self) -> Option<&dyn LlmHandler> {
-        None
-    }
-
-    /// Returns this layer's [`ToolHandler`], if it fulfills `NeedTool`.
-    fn tool(&self) -> Option<&dyn ToolHandler> {
-        None
-    }
-
-    /// Returns this layer's [`InteractionHandler`], if it fulfills
-    /// `NeedInteraction`.
-    fn interaction(&self) -> Option<&dyn InteractionHandler> {
-        None
-    }
-
-    /// Returns this layer's [`SubagentHandler`], if it fulfills `NeedSubagent`.
-    fn subagent(&self) -> Option<&dyn SubagentHandler> {
-        None
-    }
-
-    /// Returns this layer's [`ReconfigHandler`], if it fulfills
-    /// `NeedReconfigRegistry`.
-    fn reconfig(&self) -> Option<&dyn ReconfigHandler> {
-        None
-    }
-
-    /// Returns this layer's [`ExternalSessionHandler`], if it fulfills
-    /// `NeedExternalSession`.
-    fn external(&self) -> Option<&dyn ExternalSessionHandler> {
-        None
-    }
-}
+// `HandlerScope`, `scope_handles`, and `fulfill_with_scope` are generated from
+// the single effect manifest in
+// [`effect_manifest`](crate::agent::effect_manifest) (the coproduct half is
+// generated in [`requirement`](crate::agent::requirement)). Each accessor
+// defaults to `None`, so an empty scope handles nothing and every requirement
+// pops to the outer scope; the handler traits the accessors borrow are defined
+// below. See the module docs for how scopes compose into a drain.
+with_effect_manifest!(define_effect_fan_out);
 
 /// Fulfills a `NeedLlm` requirement by running one LLM generation.
 ///
@@ -529,55 +498,6 @@ fn is_terminal(cursor: &LoopCursor) -> bool {
     matches!(cursor.kind(), LoopCursorKind::Done | LoopCursorKind::Error)
 }
 
-/// Returns whether `scope` offers a handler for the given requirement family.
-fn scope_handles(scope: &dyn HandlerScope, tag: RequirementKindTag) -> bool {
-    match tag {
-        RequirementKindTag::Llm => scope.llm().is_some(),
-        RequirementKindTag::Tool => scope.tool().is_some(),
-        RequirementKindTag::Interaction => scope.interaction().is_some(),
-        RequirementKindTag::Subagent => scope.subagent().is_some(),
-        RequirementKindTag::Reconfig => scope.reconfig().is_some(),
-        RequirementKindTag::ExternalSession => scope.external().is_some(),
-    }
-}
-
-/// Fulfills `requirement` with this scope's handler, if it has one.
-///
-/// Returns `None` when the scope does not offer a handler for the requirement's
-/// family (the caller then pops it outward).
-async fn fulfill_with_scope(
-    requirement: &Requirement,
-    scope: &dyn HandlerScope,
-    ctx: &RunContext,
-) -> Option<RequirementResult> {
-    match &requirement.kind {
-        RequirementKind::NeedLlm { request, mode } => {
-            Some(scope.llm()?.fulfill(request, *mode, ctx).await)
-        }
-        RequirementKind::NeedTool { call_id, call } => {
-            Some(scope.tool()?.fulfill(*call_id, call, ctx).await)
-        }
-        RequirementKind::NeedInteraction { request } => {
-            Some(scope.interaction()?.fulfill(request, ctx).await)
-        }
-        // A subagent opens another drain layer and needs the outer layer as a
-        // pop target for the child's unhandled requirements (§7.3). That outer
-        // layer is only reachable in `resolve_requirement`, which builds a
-        // `ScopePop` over this scope and its parent, so `NeedSubagent` is never
-        // fulfilled here — it is always routed serially through
-        // `resolve_requirement`.
-        RequirementKind::NeedSubagent { .. } => None,
-        RequirementKind::NeedReconfigRegistry { tool_set } => {
-            Some(scope.reconfig()?.fulfill(tool_set, ctx).await)
-        }
-        // Like the other non-subagent families, an external session is fulfilled
-        // in place when this scope offers a handler, and otherwise pops outward.
-        RequirementKind::NeedExternalSession { request } => {
-            Some(scope.external()?.fulfill(request, ctx).await)
-        }
-    }
-}
-
 /// Checks that a handler's result family matches the requirement it fulfilled.
 fn validate(requirement: &Requirement, result: &RequirementResult) -> Result<(), AgentError> {
     requirement.kind.accepts(result).map_err(|error| {
@@ -623,7 +543,7 @@ async fn resolve_requirement(
             validate(requirement, &result)?;
             return Ok((result, 0));
         }
-    } else if let Some(result) = fulfill_with_scope(requirement, scope, ctx).await {
+    } else if let Some(result) = fulfill_with_scope(&requirement.kind, scope, ctx).await {
         validate(requirement, &result)?;
         return Ok((result, 0));
     }
@@ -678,7 +598,7 @@ async fn fulfill_batch(
         let tag = requirement.tag();
         if tag != RequirementKindTag::Subagent && scope_handles(scope, tag) {
             local.push(async move {
-                let result = fulfill_with_scope(requirement, scope, ctx)
+                let result = fulfill_with_scope(&requirement.kind, scope, ctx)
                     .await
                     .expect("scope_handles confirmed a handler for this family");
                 validate(requirement, &result)?;
@@ -729,11 +649,7 @@ mod tests {
                 WorktreeIsolation,
             },
             interaction::{Interaction, InteractionKind, InteractionResponse},
-            requirement::{
-                AgentSpecRef, HandlerScopeGen, RequirementKind, RequirementKindGen,
-                RequirementKindTag, RequirementKindTagGen, RequirementResult,
-                fulfill_with_scope_gen, scope_handles_gen,
-            },
+            requirement::{AgentSpecRef, RequirementKind, RequirementKindTag, RequirementResult},
             spec::WorktreeRef,
             tool::{ToolRegistry, ToolRuntimeError},
         },
@@ -1715,15 +1631,13 @@ mod tests {
         );
     }
 
-    // --- M3-2: generated drive fan-out equivalence (design points 4–7) -------
+    // --- Generated drive fan-out routing (design points 5–7) -----------------
     //
-    // The hand-written `scope_handles`/`fulfill_with_scope` and their manifest
-    // twins `scope_handles_gen`/`fulfill_with_scope_gen` must route every family
-    // identically while both coexist. These ZST handlers let one scope satisfy
-    // all six families so the two fan-outs can be compared arm for arm. Each
-    // returns a fixed, matching-family result; `EqSubagent` is never invoked
-    // because `Subagent` is `needs_outer` (both paths short to `None`), so its
-    // body asserts unreachability.
+    // `scope_handles` and `fulfill_with_scope` are generated from the effect
+    // manifest. These ZST handlers let one scope satisfy all six families so the
+    // fan-out can be exercised per family: each returns a fixed, matching-family
+    // result. `EqSubagent` is never invoked because `Subagent` is `needs_outer`
+    // (`fulfill_with_scope` shorts to `None`), so its body asserts unreachability.
 
     struct EqLlm;
     #[async_trait]
@@ -1801,33 +1715,11 @@ mod tests {
     static EQ_RECONFIG: EqReconfig = EqReconfig;
     static EQ_EXTERNAL: EqExternal = EqExternal;
 
-    /// A scope offering a handler for every family. It implements both the
-    /// hand-written [`HandlerScope`] and its generated twin [`HandlerScopeGen`]
-    /// so one value drives both fan-out paths under test.
+    /// A scope offering a handler for every family, so the fan-out can be
+    /// exercised for each requirement kind.
     struct EqScope;
 
     impl HandlerScope for EqScope {
-        fn llm(&self) -> Option<&dyn LlmHandler> {
-            Some(&EQ_LLM)
-        }
-        fn tool(&self) -> Option<&dyn ToolHandler> {
-            Some(&EQ_TOOL)
-        }
-        fn interaction(&self) -> Option<&dyn InteractionHandler> {
-            Some(&EQ_INTERACTION)
-        }
-        fn subagent(&self) -> Option<&dyn SubagentHandler> {
-            Some(&EQ_SUBAGENT)
-        }
-        fn reconfig(&self) -> Option<&dyn ReconfigHandler> {
-            Some(&EQ_RECONFIG)
-        }
-        fn external(&self) -> Option<&dyn ExternalSessionHandler> {
-            Some(&EQ_EXTERNAL)
-        }
-    }
-
-    impl HandlerScopeGen for EqScope {
         fn llm(&self) -> Option<&dyn LlmHandler> {
             Some(&EQ_LLM)
         }
@@ -1892,20 +1784,8 @@ mod tests {
         ToolSetRef::new(id, Vec::new())
     }
 
-    /// Maps a hand-written family tag onto its generated twin.
-    fn gen_tag_of(tag: RequirementKindTag) -> RequirementKindTagGen {
-        match tag {
-            RequirementKindTag::Llm => RequirementKindTagGen::Llm,
-            RequirementKindTag::Tool => RequirementKindTagGen::Tool,
-            RequirementKindTag::Interaction => RequirementKindTagGen::Interaction,
-            RequirementKindTag::Subagent => RequirementKindTagGen::Subagent,
-            RequirementKindTag::Reconfig => RequirementKindTagGen::Reconfig,
-            RequirementKindTag::ExternalSession => RequirementKindTagGen::ExternalSession,
-        }
-    }
-
     #[tokio::test]
-    async fn generated_fan_out_matches_hand_written_across_families() {
+    async fn fan_out_routes_every_family_consistently() {
         let scope = EqScope;
         let ctx = run_context();
         let tags = [
@@ -1918,41 +1798,29 @@ mod tests {
         ];
 
         for tag in tags {
-            // Routing predicate: the scope handles every family, so both agree
-            // `true` — but they must also agree arm for arm per family.
-            assert_eq!(
-                scope_handles(&scope, tag),
-                scope_handles_gen(&scope, gen_tag_of(tag)),
-                "scope_handles disagree for {tag}"
-            );
+            // `EqScope` offers a handler for every family, so the routing
+            // predicate holds for all six.
+            assert!(scope_handles(&scope, tag), "scope must handle {tag}");
 
-            let kind = kind_of(tag);
-            let requirement = Requirement::at_root(requirement_id_n(1), kind.clone());
-            // Derive the generated kind through the shared wire form, proving the
-            // twin coproduct is serde-compatible with the hand-written one.
-            let json = serde_json::to_string(&kind).expect("serialize kind");
-            let kind_gen: RequirementKindGen =
-                serde_json::from_str(&json).expect("deserialize generated kind");
-
-            let hand = fulfill_with_scope(&requirement, &scope, &ctx).await;
-            let generated = fulfill_with_scope_gen(&kind_gen, &scope, &ctx).await;
-
-            // `RequirementResult` derives neither `PartialEq` nor `serde`, so the
-            // fulfilled `Option<RequirementResult>` is compared by `Debug`.
-            assert_eq!(
-                format!("{hand:?}"),
-                format!("{generated:?}"),
-                "fulfill_with_scope disagree for {tag}"
-            );
-
-            // `Subagent` is `needs_outer`: both paths route it out (`None`)
-            // rather than invoking its handler in place.
+            let result = fulfill_with_scope(&kind_of(tag), &scope, &ctx).await;
             if tag == RequirementKindTag::Subagent {
-                assert!(hand.is_none(), "hand-written Subagent must route outward");
-                assert!(generated.is_none(), "generated Subagent must route outward");
+                // `Subagent` is `needs_outer`: it is routed out (`None`) rather
+                // than fulfilled in place, even though the scope offers a handler.
+                assert!(
+                    result.is_none(),
+                    "Subagent must route outward, not fulfill in place"
+                );
             } else {
-                assert!(hand.is_some(), "hand-written {tag} must fulfill in place");
-                assert!(generated.is_some(), "generated {tag} must fulfill in place");
+                // The `scope_handles`/`fulfill_with_scope` consistency invariant
+                // that `fulfill_batch` relies on (its `expect` after a positive
+                // `scope_handles`): a handled family fulfills in place with a
+                // result of the matching family.
+                let result = result.expect("handled family must fulfill in place");
+                assert_eq!(
+                    result.tag(),
+                    tag,
+                    "fulfilled result family must match the requirement family"
+                );
             }
         }
     }
