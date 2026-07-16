@@ -553,7 +553,7 @@ Milestone 1(刀 C)关闭:内部 `Result` 层落地,`step` 最外层单点折叠,
 - 附加:`git diff --stat -- src/**` 仅触及 `src/agent/machine/default/mod.rs`(+/-)与
   `tools.rs`(+/-);`state/cursor.rs`、trait、drive 均未误伤,serde 形状零变化。
 
-### [TODO] M2-2 用相位 match 消灭 resume/pivot/abandon 的 scratch 对齐防御
+### [DONE] M2-2 用相位 match 消灭 resume/pivot/abandon 的 scratch 对齐防御
 
 **前置依赖**:M2-1。
 
@@ -595,7 +595,51 @@ Milestone 1(刀 C)关闭:内部 `Result` 层落地,`step` 最外层单点折叠,
 
 **完成记录**:
 
-（待补充）
+M2-1 已把全部 scratch 读写路由到 `TurnScratch` 访问器,因此本任务聚焦「消灭对齐防御的
+最后一步」:把「cursor 相位 ⇒ scratch 相位」这一由类型保证的不变量接入运行时可测试的
+`debug_assert!`,并让 `matches_cursor` 正式上线(去掉 M2-1 暂挂的 `#[allow(dead_code)]`)。
+对外错误文案、`LoopCursor` / `state/cursor.rs`(serde 形状)零变化。
+
+**做了什么**(仅 `src/agent/machine/default/mod.rs`):
+
+- 去掉 `TurnScratch::matches_cursor` 的 `#[allow(dead_code)]`,rustdoc 更新为「wired into
+  `debug_assert!`s on the `resume` / `abandon` dispatch and the pivot injection path」。
+- `resume()`(dispatch 入口)顶部插
+  `debug_assert!(self.scratch.matches_cursor(self.state.loop_cursor()), ...)`——一处覆盖
+  `resume_llm`/`fold_llm_response`、`resume_tool`、`resume_approval`、`resume_reconfig`
+  四条 resume 分派。这正是设计文档 §3.2 所说「match 到 cursor 相位即拿到 scratch,二者不可能
+  drift」的可测试化:旧模型里那条「先 re-match cursor、再另处摸 scratch、再处理对不上」的双重
+  防御被这一条不变量收敛。
+- `abandon()` 顶部插同样的 `matches_cursor` debug_assert——覆盖
+  `abandon_llm_step`/`abandon_tool_phase`/`abandon_reconfig`,补齐标题里的 abandon 相位。
+- `inject_pivot()` 在 `StreamingStep` + `requirement_id` 相位判定通过后插
+  `debug_assert!(self.in_flight().is_some(), ...)`——记录「`StreamingStep` ⇒ `TurnScratch::InTurn`
+  ⇒ `in_flight()` 必 `Some`」不变量,pivot 路径无需任何额外「turn 是否真的在飞」防御。
+
+**语义/文案核对**:
+
+- `resume_reconfig` 仍走 `take_pending_reconfig()` 且保留 "reconfig resume with no deferred
+  reconfiguration in flight";`fold_llm_response` 仍走 `in_flight()` 且保留 "missing in-flight
+  assistant message id for the LLM response"——两处 `None` 分支作为不可能路径的兜底守卫按任务
+  要求逐字节保留,现由 debug_assert 佐证其不可达。
+- 三处均为 `debug_assert!`,release 构建无副作用,运行时语义零变化;`git diff` 确认仅
+  `mod.rs` 改动,`state/cursor.rs` / trait / drive 未触及,serde 形状不变。
+
+**不变量正确性核对**:遍历每个 cursor 相位——`StreamingStep`/`AwaitingTool`/`AwaitingApproval`
+⇒ `InTurn`;`AwaitingReconfig` ⇒ `Reconfig`(during-turn `Commit` 已在 `emit_reconfig_effect`
+把 `InTurn` 覆盖为 `Reconfig` 后才 transition,入口一致);`Idle`/`Done`/`Error`/`CancelRecovery`
+⇒ `None`——`matches_cursor` 在 resume/abandon 入口对全部相位为真。
+
+**验证序列(1–6 全过)**:
+
+1. `cargo fmt --all -- --check` — 通过。
+2. `cargo test -p agent-lib --lib agent::machine::default`(聚焦,含 reconfig/pivot/tool)—
+   39 passed / 0 failed(debug_assert 在 debug 测试构建下运行且未触发,与 M2-1 基线一致)。
+3. `cargo clippy --all-targets -- -D warnings` — 无警告。
+4. `cargo test --all --all-targets` — 36 个测试二进制全绿,0 failed。
+5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` — 无警告。
+6. `git diff --check` 干净;`git diff --stat` 确认 `src/` 仅 `mod.rs`(+22/-2),`cursor.rs`
+   未触及。
 
 ### [TODO] M2-3 显式化 `rebuild_scratch_from_state()` 并加 restore 往返测试
 

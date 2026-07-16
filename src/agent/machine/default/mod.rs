@@ -150,8 +150,9 @@ enum TurnScratch {
 impl TurnScratch {
     /// Reports whether this scratch's phase matches `cursor`'s phase, i.e. the
     /// "cursor and scratch stay aligned" invariant that the single-enum shape
-    /// guarantees. Wired into `debug_assert!`s on the resume paths in M2-2.
-    #[allow(dead_code)]
+    /// guarantees. Wired into `debug_assert!`s on the `resume` / `abandon`
+    /// dispatch and the pivot injection path so the alignment the type enforces
+    /// is also checked at runtime in debug builds (effect-refine doc §3.1/§3.2).
     fn matches_cursor(&self, cursor: &LoopCursor) -> bool {
         match self {
             Self::None => !matches!(
@@ -474,6 +475,15 @@ impl DefaultAgentMachine {
             ));
         };
 
+        // A `StreamingStep` cursor is isomorphic to the `TurnScratch::InTurn`
+        // phase, so the in-flight scratch is guaranteed present here; the pivot
+        // path needs no separate "is a turn actually in flight?" guard beyond
+        // the cursor match above (effect-refine doc §3.1).
+        debug_assert!(
+            self.in_flight().is_some(),
+            "pivot on a streaming step requires an in-flight turn scratch"
+        );
+
         // Reject non-user pivot payloads up front (mirrors the queued-pivot role
         // check); the injection entry re-validates the role as a second guard.
         pivot.validate()?;
@@ -542,6 +552,14 @@ impl DefaultAgentMachine {
     /// [`Response`], while a tool batch or a pending approval route into the tool
     /// phase (see [`tools`]).
     fn resume(&mut self, resolution: RequirementResolution) -> Result<StepOutcome, StepError> {
+        // With the single `TurnScratch`, matching the cursor phase *is* reaching
+        // the scratch: the two can no longer drift, so the former "re-match the
+        // cursor, then separately re-check the scratch" double guard collapses
+        // into this one invariant (effect-refine doc §3.2).
+        debug_assert!(
+            self.scratch.matches_cursor(self.state.loop_cursor()),
+            "resume: turn scratch phase must match the loop cursor phase"
+        );
         match self.state.loop_cursor() {
             LoopCursor::StreamingStep(cursor) => {
                 let step_id = cursor.step_id();
@@ -791,6 +809,10 @@ impl DefaultAgentMachine {
     ///   result for every still-open call, reason
     ///   [`CancelRecoveryReason::ToolInterrupted`].
     fn abandon(&mut self, id: RequirementId) -> Result<StepOutcome, StepError> {
+        debug_assert!(
+            self.scratch.matches_cursor(self.state.loop_cursor()),
+            "abandon: turn scratch phase must match the loop cursor phase"
+        );
         let cursor = self.state.loop_cursor();
         let outstanding = cursor.pending_requirement_ids();
         let plan: Option<(AbandonKind, Option<StepId>)> = match cursor {
