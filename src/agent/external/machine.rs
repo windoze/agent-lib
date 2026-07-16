@@ -544,8 +544,9 @@ impl AgentMachine for ExternalAgentMachine {
 /// A fresh machine is [`Idle`](ExternalAgentCursor::Idle); the terminal states
 /// map to their [`LoopCursor`] equivalents. A machine restored while parked on an
 /// awaiting state has no step scratch to rebuild a streaming-step view, so it
-/// falls back to [`LoopCursor::Idle`]; restoring a mid-flight external machine is
-/// out of scope until the mount/cleanup work in M3-4.
+/// falls back to [`LoopCursor::Idle`]; faithfully rehydrating the driver-facing
+/// view of a mid-flight external machine is a persistence concern beyond
+/// milestone 3's scope.
 fn initial_loop_cursor(cursor: &ExternalAgentCursor) -> LoopCursor {
     match cursor {
         ExternalAgentCursor::Idle

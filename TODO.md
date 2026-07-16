@@ -813,7 +813,7 @@ response } }` 把结果喂回。`Interaction`/`InteractionResponse` 在 `src/age
   `cargo test --all --all-targets` 全绿(total 672 passed,0 failed;credential-gated 集成测试保持 ignored);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 0 告警。
 
-### [TODO] M3-5 Milestone 3 Review
+### [DONE] M3-5 Milestone 3 Review
 
 **前置依赖**:M3-1..M3-4。
 
@@ -829,6 +829,45 @@ response } }` 把结果喂回。`Interaction`/`InteractionResponse` 在 `src/age
 
 - 完整验证序列全绿,`cargo test --all --all-targets` 无回归。
 - Review 结论与遗留项写入「完成记录」。
+
+**完成记录**:
+
+- **状态迁移穷尽性(通过)**:`ExternalAgentCursor` 恰有 5 态(`Idle` / `AwaitingSession` /
+  `AwaitingInteraction` / `Done` / `Error`)。`ExternalAgentMachine::step` 的顶层 `match` 覆盖
+  `External(UserMessage)` / `External(Pivot)`(显式 fail)/ `Resume` / `Abandon` 四路;`resume` 按 cursor 分派到
+  `AwaitingSession`/`AwaitingInteraction`,其余(`Idle`/`Done`/`Error`)统一走「无 outstanding requirement」的
+  fail 分支。`ExternalAgentCursor::requirement()` / `is_terminal()` / `is_idle()` 全部**显式列出每个 variant**,
+  无 `_` 通配。machine.rs 中的 3 处通配臂(cursor `other`、`RequirementResult` `other` ×2)与 `message_text`
+  的 `_ => None` 均为**有意的错误路由 / 内容过滤**,不是悬空态——任何非法输入都收敛到 `Error` 或 `fail(..)`,
+  不会遗留半推进状态。
+- **`step` 无 `await`/无 IO(通过)**:machine.rs 全文无 `.await`、无 `async fn`、无
+  `std::{fs,io,net,process}`、无 `tokio::`/`spawn`/`block_on`。`block_on_session` 仅是「reify 一个
+  `NeedExternalSession` requirement 并 park 到 `AwaitingSession`」的纯函数命名,不做真实阻塞;IO/运行时推进全部
+  由 driver 侧的 `ExternalSessionHandler` 承担。machine 满足 sans-io 契约,与 `DefaultAgentMachine` 同构。
+- **清理归属与 §6.4 一致(通过)**:`abandon` 为 never-resume——当 cursor 有 outstanding requirement 时
+  `mark_cleanup_required()`、丢弃悬空 pending turn、清 `in_flight`、收敛回可复用 `Idle`,**不 emit 新
+  requirement、不 emit `Shutdown`**;进程/连接 force-close 与 `ExternalSessionShutdown` disposition 记录归
+  handle 层(`ExternalRuntimeHandles` / registry),经 `TraceHandle::record_external_shutdown` 落 trace。
+  `shutdown.rs`/`runtime.rs`/machine rustdoc 对此归属描述一致。
+- **场景回归(通过,复用既有测试,无需新增)**:
+  - Start→Completed / Start→Failed / Continue:`tests/agent_external_basic.rs`(3)。
+  - 完整两段式 Start→Paused→Respond→Completed:`tests/agent_external_interaction.rs::external_agent_pause_resume_interaction`
+    与单元 `external_pause_then_respond_then_complete_commits_the_turn`;interaction 弹到外层由
+    `external_agent_pause_pops_interaction_to_outer_scope` 覆盖。
+  - 取消(never-resume abandon):`tests/agent_external_lifecycle.rs::external_agent_abandon_settles_and_flags_cleanup`
+    与 3 个单元 abandon 测试(awaiting_session / awaiting_interaction / idle-无清理)。
+  - 挂载:`external_agent_mounts_under_nested_machine`(经 `NeedSubagent` 派生 child 跑 Start→Completed)。
+- **遗留项(review finding,已就地修正)**:`initial_loop_cursor` 的 rustdoc 旧引用
+  「restoring a mid-flight external machine is out of scope until the mount/cleanup work in M3-4」已过时——M3-4
+  已完成且并未加入 mid-flight restore。已改写为「faithfully rehydrating the driver-facing view of a mid-flight
+  external machine is a persistence concern beyond milestone 3's scope」,准确反映现状(awaiting 态恢复仍回退
+  `LoopCursor::Idle`,忠实 rehydrate 属未来持久化关注点,不在 M3 范围)。此为仅注释改动,未改变运行时行为。
+- **无其它遗留 / 无未调度失败**:Milestone 3 全部特性(basic advance / 两段式交互 / abandon 清理 / shutdown
+  disposition / nested 挂载)均已实现且有测试守护;未发现新的规格偏差或需插入的前置任务。
+- **验证结果(完整序列全绿)**:`cargo fmt --all` 无差异;`cargo clippy --all-targets -- -D warnings` 0 告警;
+  `cargo test external_agent` 命中 13 个全过(6 lib + 3 basic + 2 interaction + 2 lifecycle);
+  `cargo test --all --all-targets` 全绿(total 672 passed,0 failed;credential-gated 集成测试保持 ignored);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 0 告警。
 
 ---
 
