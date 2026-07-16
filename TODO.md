@@ -438,7 +438,7 @@ trait(`LlmHandler` 等)均为 `#[async_trait]`,`fulfill(...) -> RequirementResul
   各集成/doc/replay 二进制 0 failed,30 个 `test result: ok`;credential-gated 集成测试保持 ignored);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;`git diff --check` 干净。
 
-### [TODO] M2-5 Milestone 2 Review
+### [DONE] M2-5 Milestone 2 Review
 
 **前置依赖**:M2-1..M2-4。
 
@@ -456,6 +456,71 @@ trait(`LlmHandler` 等)均为 `#[async_trait]`,`fulfill(...) -> RequirementResul
 
 - 完整验证序列全绿,`cargo test --all --all-targets` 无回归。
 - Review 结论(含决策点、遗留项)写入「完成记录」。
+
+**完成记录**:
+
+- **范围**:通读 M2-1..M2-4 diff(`7700af4`/`ab59f83`/`d76e524`/`063ac2a`),未改任何生产代码;本次仅
+  核对自洽性、跑全量验证、并回填 §14 决策点。external session effect 边界经复核判定完整、自洽、与既有
+  requirement 家族对齐、且未回归既有运行时语义。
+
+- **DTO serde round-trip 覆盖**(`src/agent/external/mod.rs`):`external_dto_roundtrips` 覆盖
+  `ExternalSessionRequest`(Start input + policy)与 `ExternalSessionResult` 全部三态
+  (`Completed` 携带 artifacts/usage/cost、`PausedForInteraction` 携带 `Interaction::question` +
+  `PermissionRequested` observation、`Failed` 携带 `ShutdownFailed` error);
+  `external_session_result_variants_serialize_snake_case` 另验 `#[serde(rename_all="snake_case")]`
+  外标签(`completed`/`launch`)。`Option`/`Vec` 字段带 `#[serde(default, skip_serializing_if)]`,
+  round-trip 稳定。
+
+- **三处变体对齐**(`src/agent/requirement.rs`):`RequirementKindTag::ExternalSession`(Display
+  `"external_session"`)、`RequirementKind::NeedExternalSession { request }`、
+  `RequirementResult::ExternalSession(Box<ExternalSessionResult>)` 三处新增一致;`RequirementKind::tag()`
+  与 `RequirementResult::tag()` 均映射到 `ExternalSession`;`accepts()` 走统一 tag 比对(external 无
+  interaction 那类额外的 request-specific 校验,符合家族语义)。`external_requirement_accepts_only_external_result`
+  交叉验证:external 需求只接受 external 结果、且 external 结果只被 external 需求接受(与其余 5 族两两互斥);
+  `external_requirement_tag_roundtrip` 验 tag ↔ 序列化。`ExternalSessionResult` 装箱以压小
+  `RequirementResult` 体积,合理。
+
+- **`HandlerScope::external()` 分派**(`src/agent/drive.rs`):新增 accessor 默认 `None`,与
+  `llm/tool/interaction/subagent/reconfig` 同构;`scope_handles()` 与 `fulfill_with_scope()` 均新增
+  `ExternalSession` 臂——就地兑现(`scope.external()?.fulfill(request, ctx).await`),无 handler 时向外
+  pop,**未加深 scope**(唯一加深的是 `NeedSubagent`,external 走非 subagent 就地兑现路径)。`validate()`
+  仍经 `accepts()` 拦截错族结果。测试 `external_session_handler_result_is_accepted_by_its_requirement` /
+  `_drain_fulfills_locally` / `_default_scope_pops_to_outer` 覆盖就地兑现与 pop-to-outer。
+
+- **testkit scripted 组件可用**(`crates/agent-testkit/src/external.rs`、`assertions/external.rs`):
+  `ScriptedExternalSessionHandler`(脚本耗尽折叠为**同族** `ExternalSession(Failed{Runtime})`,不返回错族)、
+  `ExternalSessionStep`(`FAMILY=ExternalSession`)、`ExternalAgentFixture`、`ExternalAgentCallLog` 别名、
+  `assert_external_calls` + `ExternalInputKind`/`ExternalResultKind` 摘要断言均已接线 lib.rs/assertions/prelude
+  并有 5 个单测(`returns_scripted_results_in_dispatch_order` / `completed_result_carries_structured_observations` /
+  `exhausted_script_folds_into_family_aligned_failure` / `summaries_track_request_and_result_kinds` /
+  `wrong_input_kinds_panic`)全过。
+
+- **§14 决策点(回填)**:`NeedExternalSession` **落在核心 `agent-lib`**(本计划采用),而非先在上层 crate 作为
+  custom machine + custom driver 扩展。理由:(1) requirement 家族是 effect-model 的枝干抽象,把 external
+  session 作为**增量家族**并入,可直接复用既有 addressing / return-path 类型对齐(`tag()`/`accepts()`)、
+  drain/pop 组合与 testkit 脚本设施,无需另造平行驱动;(2) DTO 保持 provider-neutral(未把真实 CLI/SDK 的
+  wire/私有 JSON 作为稳定协议进核心库),真实 runtime 交互全部隔离在 driver 侧 `ExternalSessionHandler`
+  实现里,核心库只承载可序列化事实;(3) 现有 `NeedLlm/NeedTool/NeedInteraction/NeedSubagent/NeedReconfigRegistry`
+  路径行为保持不变,external 为纯增量。此决策与 DESIGN §3.1/§13 收敛方向一致,后续 Milestone 3 的
+  `ExternalAgentMachine` 亦建立在此核心家族之上。
+
+- **遗留项**(非本里程碑,已在后续任务显式跟踪,不构成回归):
+  - `CassetteExternalSessionHandler`(§12 record/replay 替身)尚未落地——留待后续 external 端到端回放需要时补;
+    当前 scripted handler 已足以覆盖 M2 effect 边界测试。
+  - permission 型 pause 目前以 `Interaction::question` + `PermissionRequested` observation 表达;
+    专用 `InteractionKind::Permission` 由 **M4-1** 落地,届时 `ExternalAgentFixture::permission_pause`
+    可无损升级(已在 fixture rustdoc 注明)。
+  - `ExternalAgentSpec`/`ExternalAgentState`/machine 由 **M3-1+** 承接;`WorkerProfileRef` 调度耦合归 **M6**。
+
+- **验证结果(完整序列全绿)**:
+  1. `cargo fmt --all -- --check` 无差异;
+  2. 聚焦 `cargo test --lib external`(13 passed)、`cargo test -p agent-testkit --lib external`(5 passed);
+  3. `cargo clippy --all-targets -- -D warnings` 无告警;
+  4. `cargo test --all --all-targets` 全绿(agent-lib lib 430、testkit lib 136、各集成/replay 套件全过,
+     0 failed / 0 无预期外 ignored);
+  5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;
+  6. `git diff --check` 干净。
+  无新观察到的失败测试,无需新增修复/前置任务。Milestone 2 签核,放行 Milestone 3。
 
 ---
 
