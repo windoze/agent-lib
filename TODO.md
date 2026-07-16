@@ -721,7 +721,7 @@ mid-turn scratch,而不是反序列化 scratch(scratch 有意非序列化)。这
 
 （M2-4 review 将做刀 (B) 的量化收口:字段 2→1、防御分支消灭数、序列化不变性复核。）
 
-### [TODO] M2-4 Milestone 2 review:刀 (B) 正确性与序列化不变性
+### [DONE] M2-4 Milestone 2 review:刀 (B) 正确性与序列化不变性
 
 **前置依赖**:M2-1 ~ M2-3。
 
@@ -751,7 +751,59 @@ mid-turn scratch,而不是反序列化 scratch(scratch 有意非序列化)。这
 
 **完成记录**:
 
-（待补充）
+审查覆盖 M2-1~M2-3 全部改动(基线 `f1b0aa8` = M1-5)。结论:刀 (B) 验收通过——唯一真相成立、
+序列化边界零改动、隐式对齐约定被类型消灭,现有断言无需修改即全绿。未发现 spec 偏离或 workaround。
+
+**唯一真相(单 scratch)**:
+
+- **字段数变化:2 个 `Option` → 1 个 enum**。M2 前 `DefaultAgentMachine` 有两个各自独立的非序列化
+  mid-turn 字段 `in_flight: Option<InFlight>`(mod.rs:159)与 `pending_reconfig: Option<PendingReconfig>`
+  (mod.rs:164),靠隐式约定与 cursor 相位对齐;M2 后收敛为单一 `scratch: TurnScratch`(mod.rs:212),
+  变体 `None` / `InTurn(InFlight)` / `Reconfig(PendingReconfig)` 与 `LoopCursor` 相位同构。「两者同时
+  `Some`」这类非法态在类型上不可表达。
+- 无裸字段访问:`grep self.in_flight|self.pending_reconfig` 仅命中注释(引用「former field」);所有读写
+  经访问器 `in_flight()`(mod.rs:353)/ `in_flight_mut()`(362)/ `take_pending_reconfig()`(374,以
+  `mem::replace` 实现,替代 `self.pending_reconfig.take()`)。
+
+**消灭的防御分支(相位 + scratch 双重防御塌缩)**:
+
+- `resume`(mod.rs:666)former「先 re-match cursor,再单独 re-check scratch」的双重守卫塌缩为**单一**
+  `debug_assert!(scratch.matches_cursor(cursor))`(671),之后纯按 cursor 相位分派。
+- `matches_cursor` 不变量(mod.rs:156)现统一挂在 **4 处** `debug_assert!`:`resume`(671)、`abandon`
+  (924)、`begin_user_turn`(491)、pivot 注入(`in_flight().is_some()`,594),把「类型保证的对齐」在
+  debug 构建下也运行时校验(effect-refine §3.1/§3.2)。
+- 隐式「turn 边界处 scratch 必为 None/已对齐」约定被显式化为可测的 `rebuild_scratch_from_state()`
+  (mod.rs:429),并在 `begin_user_turn` 首行调用 + 断言;pivot 路径去掉了独立的「是否真有 turn 在飞?」
+  守卫(改由 `StreamingStep` cursor 与 `InTurn` 同构隐含)。
+
+**序列化不变性确认**:
+
+- `src/agent/state/cursor.rs` **零改动**:`git diff f1b0aa8..HEAD -- cursor.rs` 与工作树 diff 均为 0 行。
+- `git diff --stat`(M2 范围)仅触及 `src/agent/machine/default/`(`mod.rs` +269 / `tools.rs` +78 /
+  `tests/mod.rs` +1 / `tests/restore.rs` +389)与文档(`TODO.md` / `memory/`);无其他源码文件。
+- 三条指定序列化往返测试全绿:`streaming_step_cursor_round_trips_requirement_binding`、
+  `awaiting_tool_cursor_round_trips_requirement_ids`、
+  `agent_state_serde_round_trips_through_conversation_snapshot`(+ external 变体)。`LoopCursor` serde 形状
+  未动(scratch 从不进 `AgentState`)。
+
+**已知限制(诚实记录,非 workaround;已在 §3.5 / M3+ 显式 deferred)**:
+
+- 恢复时 `ToolPhase` 明细**不重建**(`InFlight { tools: None }`,tools.rs:73/82/140):mid-batch 精确恢复
+  是 driver/持久化职责,落点 2 下推迟到 M3+;重建出的 in-tool park 是**忠实的相位标记**,非可续跑批。
+- 两处 park 依赖未持久化的 host 输入,重建为 `TurnScratch::None`:首步 `StreamingStep`(无 frozen
+  assistant 可锚、待铸 id 未持久)与 start-of-turn `BeginTurn` reconfig(排队 `AgentUserInput` 未持久,
+  cursor 无 committing `step_id`)。唯一完整往返 + 可驱动的是 during-turn `AwaitingReconfig(Commit)` 边界。
+
+**完整验证序列 1–6(全过)**:
+
+1. `cargo fmt --all -- --check` — OK。
+2. 聚焦 `cargo test -p agent-lib agent::state` + 三条指定往返测试 — 全绿;M2-3 `restore::*` 6 个亦全绿。
+3. `cargo clippy --all-targets -- -D warnings` — 零告警。
+4. `cargo test --all --all-targets` — 0 failed(lib 550+、testkit 138、各 replay/cassette/smoke 集成全绿)。
+5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` — 干净。
+6. `git diff --check` — 干净。
+
+本任务仅改文档(TODO.md / memory),不改编译产物,故复用第 4 步同一 tree 的全量绿结果。
 
 ---
 
