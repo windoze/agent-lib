@@ -48,7 +48,7 @@
 
 use crate::{
     agent::{
-        AgentId,
+        AgentId, AgentSpecRef, SubagentOutput,
         interaction::{Interaction, InteractionResponse},
         spec::WorktreeRef,
         tool::ToolRuntimeError,
@@ -361,6 +361,94 @@ impl ExternalToolResult {
     }
 }
 
+/// Stable identifier correlating a runtime's subagent spawn request with the
+/// output fed back for it.
+///
+/// A runtime pauses on
+/// [`PausedForSubagent`](ExternalSessionResult::PausedForSubagent) carrying an
+/// [`ExternalSubagentRequest`] tagged with this id; the host drives the child
+/// agent and returns its [`ExternalSubagentOutput`] under the same id via
+/// [`RespondSubagent`](ExternalSessionInput::RespondSubagent), so the runtime can
+/// match the answer to the spawn it emitted. The value is an opaque
+/// runtime-assigned token — this crate never parses it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExternalSubagentRequestId(String);
+
+impl ExternalSubagentRequestId {
+    /// Wraps a runtime-assigned subagent request token.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// Returns the opaque request token as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One subagent spawn a runtime asks the host to drive during a paused session.
+///
+/// This is the provider-neutral shape a runtime adapter decodes a native child
+/// task request into. The host bridges it into a standard `NeedSubagent`
+/// requirement — reusing [`spec_ref`](Self::spec_ref), [`brief`](Self::brief),
+/// and [`result_schema`](Self::result_schema) unchanged — rather than spawning
+/// the child outside the host's own subagent machinery (design §4, §5.2). The
+/// child runs under the host's [`DrivingSubagentHandler`](crate::agent) with its
+/// depth, budget, and cancel accounting; its result is returned to the runtime
+/// under [`request_id`](Self::request_id). [`raw`](Self::raw) is an escape hatch
+/// for unmodeled provider fields and must not carry stable logic (design §5.3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalSubagentRequest {
+    /// Runtime-assigned identifier used to correlate the output.
+    pub request_id: ExternalSubagentRequestId,
+    /// Which subagent specification the host should drive.
+    pub spec_ref: AgentSpecRef,
+    /// The brief handed to the child agent as its opening interaction.
+    pub brief: Interaction,
+    /// Optional JSON schema the child's structured result must satisfy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_schema: Option<Value>,
+    /// Unmodeled provider fields preserved for forward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<Value>,
+}
+
+/// One subagent result the host feeds back to a runtime for a prior
+/// [`ExternalSubagentRequest`].
+///
+/// This is the serde-friendly counterpart of the runtime-only
+/// [`SubagentOutput`]: the host's subagent result never persists inside a
+/// [`RequirementResult`](crate::agent::RequirementResult), so a dedicated
+/// persistable DTO carries it across the external session boundary without
+/// giving [`SubagentOutput`] serde derives it does not otherwise need. Build one
+/// from a host result with the [`From<SubagentOutput>`](Self::from) conversion.
+/// [`raw`](Self::raw) is an escape hatch for unmodeled provider fields
+/// (design §5.3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalSubagentOutput {
+    /// Summary the child agent produced, echoed to the runtime.
+    pub summary: String,
+    /// Unmodeled provider fields preserved for forward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<Value>,
+}
+
+impl From<SubagentOutput> for ExternalSubagentOutput {
+    /// Bridges a host [`SubagentOutput`] into the persistable external DTO,
+    /// preserving the summary. The [`raw`](Self::raw) escape hatch starts empty:
+    /// it is reserved for runtime-specific fields an adapter attaches when
+    /// echoing the result back, never for host state.
+    fn from(output: SubagentOutput) -> Self {
+        Self {
+            summary: output.summary,
+            raw: None,
+        }
+    }
+}
+
 /// What a single external session effect is asked to do.
 ///
 /// A machine reifies one of these per [`ExternalSessionRequest`]: begin a new
@@ -399,6 +487,20 @@ pub enum ExternalSessionInput {
         batch_id: ExternalToolBatchId,
         /// One result per tool call in the batch, keyed by provider call id.
         results: Vec<ExternalToolResult>,
+    },
+    /// Feed a host subagent result back into a session paused on a subagent
+    /// spawn request.
+    ///
+    /// The runtime paused with
+    /// [`PausedForSubagent`](ExternalSessionResult::PausedForSubagent) carrying a
+    /// [`request_id`](Self::RespondSubagent::request_id); the host drives the
+    /// child agent and returns its [`ExternalSubagentOutput`] under that same id
+    /// so the runtime can correlate the result with the spawn it emitted.
+    RespondSubagent {
+        /// Request the output answers, echoed from the pause.
+        request_id: ExternalSubagentRequestId,
+        /// The child agent's result bridged back to the runtime.
+        output: ExternalSubagentOutput,
     },
     /// Shut the session down and release its runtime handles.
     Shutdown,
@@ -759,6 +861,25 @@ pub enum ExternalSessionResult {
         #[serde(default)]
         observations: Vec<ExternalObservedEvent>,
     },
+    /// The session paused awaiting host execution of a subagent spawn request.
+    ///
+    /// The handler surfaces the runtime's native child-task request as a
+    /// provider-neutral [`ExternalSubagentRequest`]. The machine bridges it into
+    /// a standard `NeedSubagent` requirement (reusing its `spec_ref`, `brief`,
+    /// and `result_schema`), drives the child under the host's own subagent
+    /// machinery, and feeds the result back with
+    /// [`RespondSubagent`](ExternalSessionInput::RespondSubagent) carrying the
+    /// same request id. Driving this decision point in the machine lands with
+    /// milestone 3; the protocol shape is defined here.
+    PausedForSubagent {
+        /// Updated resumable session facts.
+        session: ExternalSessionRef,
+        /// The subagent spawn the host must drive this step.
+        request: ExternalSubagentRequest,
+        /// Events observed before the pause.
+        #[serde(default)]
+        observations: Vec<ExternalObservedEvent>,
+    },
     /// The session failed; the error records whether side effects may remain.
     Failed {
         /// Resumable session facts, when a session existed before the failure.
@@ -844,13 +965,15 @@ mod tests {
         ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalArtifactKind,
         ExternalArtifactRef, ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeKind,
         ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest,
-        ExternalSessionResult, ExternalStreamPolicy, ExternalToolBatchId, ExternalToolCall,
+        ExternalSessionResult, ExternalStreamPolicy, ExternalSubagentOutput,
+        ExternalSubagentRequest, ExternalSubagentRequestId, ExternalToolBatchId, ExternalToolCall,
         ExternalToolResult, WorktreeIsolation, collect_file_patch_artifacts,
         collect_file_patch_artifacts_from_observed,
     };
     use crate::{
         agent::{
-            AgentId, StepId, interaction::Interaction, spec::WorktreeRef, tool::ToolRuntimeError,
+            AgentId, AgentSpecRef, StepId, SubagentOutput, interaction::Interaction,
+            spec::WorktreeRef, tool::ToolRuntimeError,
         },
         model::{
             content::ContentBlock,
@@ -1314,5 +1437,90 @@ mod tests {
 
         // The mapping round-trips like any other DTO.
         assert_json_round_trip(&external);
+    }
+
+    fn sample_subagent_request() -> ExternalSubagentRequest {
+        ExternalSubagentRequest {
+            request_id: ExternalSubagentRequestId::new("spawn-3"),
+            spec_ref: AgentSpecRef(agent_id()),
+            brief: Interaction::question(step_id(), "Investigate the flaky test.".to_owned()),
+            result_schema: Some(json!({ "type": "object" })),
+            raw: Some(json!({ "provider_only": true })),
+        }
+    }
+
+    #[test]
+    fn external_subagent_dto_roundtrips() {
+        // The subagent decision point and its response both survive a JSON
+        // round-trip, including the optional escape hatches.
+        let paused = ExternalSessionResult::PausedForSubagent {
+            session: session_ref(),
+            request: sample_subagent_request(),
+            observations: vec![ExternalObservedEvent::new(
+                11,
+                ExternalAgentEvent::TaskUpdated {
+                    task_id: "spawn-3".to_owned(),
+                    status: "running".to_owned(),
+                },
+            )],
+        };
+        assert_json_round_trip(&paused);
+
+        let respond = ExternalSessionInput::RespondSubagent {
+            request_id: ExternalSubagentRequestId::new("spawn-3"),
+            output: ExternalSubagentOutput {
+                summary: "root cause found".to_owned(),
+                raw: Some(json!({ "provider_only": 1 })),
+            },
+        };
+        assert_json_round_trip(&respond);
+
+        // A request with no optional provider fields also round-trips.
+        let minimal = ExternalSubagentRequest {
+            request_id: ExternalSubagentRequestId::new("spawn-4"),
+            spec_ref: AgentSpecRef(agent_id()),
+            brief: Interaction::question(step_id(), "Summarise the diff.".to_owned()),
+            result_schema: None,
+            raw: None,
+        };
+        assert_json_round_trip(&minimal);
+
+        // The request id is serde-transparent: it encodes as the bare string.
+        let encoded =
+            serde_json::to_value(ExternalSubagentRequestId::new("spawn-3")).expect("serialize");
+        assert_eq!(encoded, json!("spawn-3"));
+    }
+
+    #[test]
+    fn external_subagent_input_and_result_variants_serialize_snake_case() {
+        let respond = ExternalSessionInput::RespondSubagent {
+            request_id: ExternalSubagentRequestId::new("spawn-1"),
+            output: ExternalSubagentOutput {
+                summary: "done".to_owned(),
+                raw: None,
+            },
+        };
+        let encoded = serde_json::to_value(&respond).expect("serialize input");
+        assert!(encoded.get("respond_subagent").is_some());
+
+        let paused = ExternalSessionResult::PausedForSubagent {
+            session: session_ref(),
+            request: sample_subagent_request(),
+            observations: Vec::new(),
+        };
+        let encoded = serde_json::to_value(&paused).expect("serialize result");
+        assert!(encoded.get("paused_for_subagent").is_some());
+    }
+
+    #[test]
+    fn subagent_output_maps_from_host_result_preserving_summary() {
+        // The runtime-only host result bridges into the persistable DTO, keeping
+        // the summary while leaving the provider escape hatch empty.
+        let output = ExternalSubagentOutput::from(SubagentOutput {
+            summary: "child complete".to_owned(),
+        });
+        assert_eq!(output.summary, "child complete");
+        assert_eq!(output.raw, None);
+        assert_json_round_trip(&output);
     }
 }

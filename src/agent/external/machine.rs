@@ -339,6 +339,22 @@ impl ExternalAgentMachine {
                     notifications,
                 )
             }
+            ExternalSessionResult::PausedForSubagent { observations, .. } => {
+                // The sans-io machine does not yet bridge subagent spawn requests
+                // into a `NeedSubagent` requirement — that wiring (cursor phase +
+                // `RespondSubagent` fan-out under the host subagent machinery)
+                // lands with milestone 3. Until then the machine never emits a
+                // request that could elicit this decision point, so receiving one
+                // is an unsupported protocol transition. Buffered observations
+                // still replay exactly once (design §5.5) before the machine
+                // settles on a classified error.
+                let notifications = self.observe(observations);
+                self.fail_with(
+                    "external subagent pauses are not yet driven by the machine \
+                     (scheduled for milestone 3)",
+                    notifications,
+                )
+            }
             ExternalSessionResult::Failed {
                 session,
                 error,

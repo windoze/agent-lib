@@ -59,6 +59,7 @@ pub use external::{
     ExternalArtifactRef, ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeHandles,
     ExternalRuntimeKind, ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef,
     ExternalSessionRequest, ExternalSessionResult, ExternalSessionShutdown, ExternalStreamPolicy,
+    ExternalSubagentOutput, ExternalSubagentRequest, ExternalSubagentRequestId,
     ExternalToolBatchId, ExternalToolCall, ExternalToolResult, HumanGate, ImpactScope, RuleRouter,
     ScriptedTaskEvaluator, ScriptedVerifier, TaskDescriptor, TaskEvaluator, Uncertainty, Verifier,
     Worker, WorkerChoice, WorkerProfile, WorkerProfileRef, WorkerProfileRegistry, WorkerReport,

@@ -239,7 +239,7 @@
   `cargo test --all --doc` 7+12+2 passed(1 ignored);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` clean。
 
-### [TODO] M1-3 新增 external subagent DTO 与 `RespondSubagent` / `PausedForSubagent`
+### [DONE] M1-3 新增 external subagent DTO 与 `RespondSubagent` / `PausedForSubagent`
 
 **上下文**:
 
@@ -301,6 +301,50 @@
   - `cargo test -p agent-lib external_subagent_dto_roundtrips`
   - `cargo test -p agent-lib accepts_matrix_pairs_each_kind_with_its_result_only`
 - 完整验证序列 1-6 全过。
+
+**完成记录**(2026-07-17):
+
+- `src/agent/external/mod.rs`:新增三个 provider-neutral、serde-friendly DTO,均 derive
+  `Clone/Debug/PartialEq/Eq/Serialize/Deserialize`:
+  - `ExternalSubagentRequestId(String)`(`#[serde(transparent)]`,`new(impl Into<String>)` +
+    `as_str()`);
+  - `ExternalSubagentRequest { request_id, spec_ref: AgentSpecRef, brief: Interaction,
+    result_schema: Option<Value>, raw: Option<Value> }`(两个可选字段 `#[serde(default,
+    skip_serializing_if)]`);
+  - `ExternalSubagentOutput { summary: String, raw: Option<Value> }`,附 `From<SubagentOutput>`
+    (保留 summary,`raw=None`)。采用 TODO 推荐的方案二:新增 serde-friendly output DTO,而非给
+    runtime-only 的 `SubagentOutput` 补 serde,避免改动其 `RequirementResult` 边界。
+- 扩展 `ExternalSessionInput`:新增 `RespondSubagent { request_id, output: ExternalSubagentOutput }`
+  (snake_case `respond_subagent`)。
+- 扩展 `ExternalSessionResult`:新增 `PausedForSubagent { session, request: ExternalSubagentRequest,
+  observations }`(snake_case `paused_for_subagent`,`observations` 用 `Vec<ExternalObservedEvent>` 且
+  `#[serde(default)]`)。
+- 权威冲突处理:TODO.md(权威)采用嵌套 `ExternalSubagentRequest` 结构,与 `docs/managed-external-agent.md`
+  §5.2 的平铺 `spec_ref/brief/result_schema` + `output: SubagentOutput` 不同。依 TODO 实现;文档命名
+  同步明确划归 M1-4 review(其任务体已要求"如果实现中采用了不同命名,同步更新文档")。
+- imports 同步:`crate::agent::{AgentSpecRef, SubagentOutput}`。
+- `src/agent/mod.rs`:re-export `ExternalSubagentOutput`、`ExternalSubagentRequest`、
+  `ExternalSubagentRequestId`。
+- `src/agent/external/machine.rs`:`fold_session_result` 补 `PausedForSubagent` arm。M1 machine
+  尚未驱动 subagent(subagent parity 是 M3,PLAN.md 已显式排期);此 arm 先 `observe` 逐事件
+  replay(§5.5),再 `fail_with` 明确诊断 "external subagent pauses are not yet driven by the
+  machine (scheduled for milestone 3)"。属分阶段设计而非 workaround:M1 machine 不会 emit 会触发
+  subagent pause 的请求,收到即协议异常;M3 会替换该 arm 为 `NeedSubagent` 桥接。
+- `crates/agent-testkit/src/assertions/external.rs`:`ExternalInputKind::RespondSubagent`、
+  `ExternalResultKind::PausedForSubagent` + `input_kind`/`result_kind` 对应 arm + rustdoc。
+- `tests/agent_external_real_e2e.rs`:`session_prompt` 补 `RespondSubagent` arm 返回
+  `ExternalAgentError::Protocol`。
+- 新增测试(`src/agent/external/mod.rs`):`external_subagent_dto_roundtrips`(PausedForSubagent /
+  RespondSubagent round-trip、含无可选字段的最小 request、request id serde-transparent 断言)、
+  `external_subagent_input_and_result_variants_serialize_snake_case`、
+  `subagent_output_maps_from_host_result_preserving_summary`(`From<SubagentOutput>` 保真 + round-trip)。
+- `NeedSubagent` 的 serde shape 与 `SubagentOutput` 类型边界均未改动;`accepts_matrix_pairs_each_kind_with_its_result_only`
+  回归全绿。
+- 验证:`cargo fmt --all -- --check` FMT_OK;聚焦测试全过(lib 13 passed,含 3 新用例:subagent
+  round-trip / snake_case / From);`cargo clippy --all-targets -- -D warnings` 0 warning;
+  `cargo test --all --all-targets` 全绿(agent-lib lib 562 passed = 559+3,其余各 test binary 0 failed,
+  ignored 为真实 e2e);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过(修正一处
+  `RequirementResult` intra-doc link 为全限定路径);`git diff --check` clean。
 
 ### [TODO] M1-4 Review：协议层完整性与兼容性检查
 
