@@ -60,10 +60,12 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod machine;
 mod runtime;
 mod spec;
 mod state;
 
+pub use machine::ExternalAgentMachine;
 pub use runtime::ExternalRuntimeHandles;
 pub use spec::{ExternalAgentSpec, WorkerProfileRef};
 pub use state::{ExternalAgentCursor, ExternalAgentState};

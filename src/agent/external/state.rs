@@ -130,6 +130,17 @@ impl ExternalAgentState {
         &self.conversation
     }
 
+    /// Returns the unique active Conversation for the machine's checked folds.
+    ///
+    /// The [`ExternalAgentMachine`](super::ExternalAgentMachine) uses this to
+    /// open a turn on a fresh user message and to fold the runtime's terminal
+    /// output back into committed history at a completed decision point. It stays
+    /// crate-visible so only the machine's checked transitions mutate the
+    /// Conversation, mirroring [`AgentState`](crate::agent::AgentState).
+    pub(crate) const fn conversation_mut(&mut self) -> &mut Conversation {
+        &mut self.conversation
+    }
+
     /// Returns the resumable session facts, if a session has been established.
     #[must_use]
     pub const fn session(&self) -> Option<&ExternalSessionRef> {

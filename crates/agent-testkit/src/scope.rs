@@ -16,7 +16,8 @@
 //! ([`llm`](TestScopeBuilder::llm), [`tool`](TestScopeBuilder::tool),
 //! [`interaction`](TestScopeBuilder::interaction),
 //! [`subagent`](TestScopeBuilder::subagent),
-//! [`reconfig`](TestScopeBuilder::reconfig)). An unset family reports `None` from
+//! [`reconfig`](TestScopeBuilder::reconfig),
+//! [`external`](TestScopeBuilder::external)). An unset family reports `None` from
 //! its accessor. Interaction is never wired by default: a scope built without
 //! [`interaction`](TestScopeBuilder::interaction) (or its readability alias
 //! [`attended`](TestScopeBuilder::attended)) is *headless*, so any
@@ -41,7 +42,8 @@
 use std::sync::Arc;
 
 use agent_lib::agent::{
-    HandlerScope, InteractionHandler, LlmHandler, ReconfigHandler, SubagentHandler, ToolHandler,
+    ExternalSessionHandler, HandlerScope, InteractionHandler, LlmHandler, ReconfigHandler,
+    SubagentHandler, ToolHandler,
 };
 
 /// One drain layer whose per-family handlers are chosen explicitly.
@@ -60,6 +62,7 @@ pub struct TestScope {
     interaction: Option<Arc<dyn InteractionHandler>>,
     subagent: Option<Arc<dyn SubagentHandler>>,
     reconfig: Option<Arc<dyn ReconfigHandler>>,
+    external: Option<Arc<dyn ExternalSessionHandler>>,
     inner: Option<Arc<dyn HandlerScope>>,
 }
 
@@ -89,6 +92,7 @@ impl std::fmt::Debug for TestScope {
             .field("interaction", &self.interaction.is_some())
             .field("subagent", &self.subagent.is_some())
             .field("reconfig", &self.reconfig.is_some())
+            .field("external", &self.external.is_some())
             .field("wraps_inner", &self.inner.is_some())
             .finish()
     }
@@ -129,6 +133,13 @@ impl HandlerScope for TestScope {
             None => self.inner.as_ref().and_then(|scope| scope.reconfig()),
         }
     }
+
+    fn external(&self) -> Option<&dyn ExternalSessionHandler> {
+        match &self.external {
+            Some(handler) => Some(handler.as_ref()),
+            None => self.inner.as_ref().and_then(|scope| scope.external()),
+        }
+    }
 }
 
 /// A fluent builder for [`TestScope`].
@@ -145,6 +156,7 @@ pub struct TestScopeBuilder {
     interaction: Option<Arc<dyn InteractionHandler>>,
     subagent: Option<Arc<dyn SubagentHandler>>,
     reconfig: Option<Arc<dyn ReconfigHandler>>,
+    external: Option<Arc<dyn ExternalSessionHandler>>,
     inner: Option<Arc<dyn HandlerScope>>,
 }
 
@@ -205,6 +217,14 @@ impl TestScopeBuilder {
         self
     }
 
+    /// Attaches the [`ExternalSessionHandler`] that serves this layer's
+    /// `NeedExternalSession`.
+    #[must_use]
+    pub fn external(mut self, handler: Arc<dyn ExternalSessionHandler>) -> Self {
+        self.external = Some(handler);
+        self
+    }
+
     /// Wraps an inner [`HandlerScope`], delegating any family this layer does not
     /// override to it.
     ///
@@ -225,6 +245,7 @@ impl TestScopeBuilder {
             interaction: self.interaction,
             subagent: self.subagent,
             reconfig: self.reconfig,
+            external: self.external,
             inner: self.inner,
         }
     }
@@ -271,6 +292,7 @@ mod tests {
         assert!(scope.interaction().is_none());
         assert!(scope.subagent().is_none());
         assert!(scope.reconfig().is_none());
+        assert!(scope.external().is_none());
     }
 
     #[test]
@@ -287,6 +309,7 @@ mod tests {
         assert!(scope.interaction().is_none());
         assert!(scope.subagent().is_none());
         assert!(scope.reconfig().is_none());
+        assert!(scope.external().is_none());
     }
 
     #[test]

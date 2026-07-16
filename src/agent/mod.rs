@@ -44,11 +44,11 @@ pub use event::{
     StepBoundary, ToolCallFinished, ToolCallStarted,
 };
 pub use external::{
-    ExternalAgentCursor, ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput,
-    ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef,
-    ExternalPermissionMode, ExternalRuntimeHandles, ExternalRuntimeKind, ExternalSessionInput,
-    ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
-    ExternalStreamPolicy, WorkerProfileRef, WorktreeIsolation,
+    ExternalAgentCursor, ExternalAgentError, ExternalAgentEvent, ExternalAgentMachine,
+    ExternalAgentOutput, ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind,
+    ExternalArtifactRef, ExternalPermissionMode, ExternalRuntimeHandles, ExternalRuntimeKind,
+    ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest,
+    ExternalSessionResult, ExternalStreamPolicy, WorkerProfileRef, WorktreeIsolation,
 };
 pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};
 pub use interaction::{

@@ -36,15 +36,17 @@
 use std::sync::Arc;
 
 use agent_lib::agent::external::{
-    ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalArtifactKind,
-    ExternalArtifactRef, ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
-    ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
-    ExternalStreamPolicy, WorktreeIsolation,
+    ExternalAgentError, ExternalAgentEvent, ExternalAgentMachine, ExternalAgentOutput,
+    ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef,
+    ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput, ExternalSessionPolicy,
+    ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult, ExternalStreamPolicy,
+    WorktreeIsolation,
 };
 use agent_lib::agent::{
     ExternalSessionHandler, Interaction, RequirementKindTag, RequirementResult, RunContext,
-    WorktreeRef,
+    ToolSetRef, WorktreeRef,
 };
+use agent_lib::conversation::{Conversation, ConversationConfig};
 use async_trait::async_trait;
 
 use crate::ids::SeqIds;
@@ -197,6 +199,50 @@ impl ExternalAgentFixture {
             max_turns: Some(8),
             stream_events: ExternalStreamPolicy::Buffered,
         }
+    }
+
+    /// A data-only [`ExternalAgentSpec`] over a Claude Code runtime with no
+    /// initial tools, matching the request shapes this fixture scripts against.
+    ///
+    /// The runtime, worktree, empty tool set, and [`policy`](Self::policy) line
+    /// up with [`start_request`](Self::start_request) /
+    /// [`continue_request`](Self::continue_request), so a machine built from this
+    /// spec reifies the same provider-neutral request family the scripted handler
+    /// answers.
+    #[must_use]
+    pub fn spec(&self) -> ExternalAgentSpec {
+        ExternalAgentSpec::new(
+            self.ids.agent_id(),
+            ExternalRuntimeKind::ClaudeCode,
+            WorktreeRef::new("/repo/agent-lib"),
+            None,
+            ToolSetRef::new(self.ids.tool_set_id(), Vec::new()),
+            self.policy(),
+        )
+    }
+
+    /// Wraps [`spec`](Self::spec) in fresh [`ExternalAgentState`] over one active
+    /// Conversation, ready for an [`ExternalAgentMachine`] to drive.
+    #[must_use]
+    pub fn agent_state(&self) -> ExternalAgentState {
+        ExternalAgentState::new(
+            self.spec(),
+            Conversation::new(
+                self.ids.conversation_id(),
+                ConversationConfig::new(Some("Drive the external agent.".to_owned())),
+            ),
+        )
+    }
+
+    /// Builds an [`ExternalAgentMachine`] over [`agent_state`](Self::agent_state).
+    ///
+    /// The machine mints its `NeedExternalSession` requirement ids from the same
+    /// deterministic [`SeqIds`] tree as the rest of the fixtures, so a
+    /// [`DrainHarness`](crate::harness::DrainHarness) sharing that tree keeps
+    /// every fabricated id globally unique.
+    #[must_use]
+    pub fn machine(&self) -> ExternalAgentMachine {
+        ExternalAgentMachine::new(self.agent_state(), Arc::new(self.ids.clone()))
     }
 
     /// A `Start` [`ExternalSessionRequest`] carrying `prompt` and no prior

@@ -1,0 +1,431 @@
+//! Sans-io external-agent machine for the basic session-advance path.
+//!
+//! [`ExternalAgentMachine`] is the external-agent counterpart of
+//! [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine): instead of driving
+//! an LLM turn it drives a single blocking [external session
+//! effect](crate::agent::external). It never awaits, never touches a runtime, and
+//! never does IO — it advances its own [`ExternalAgentState`], *requests* the
+//! session step by handing back a [`RequirementKind::NeedExternalSession`], and
+//! parks on the matching [`ExternalAgentCursor`]. A driver's
+//! [`ExternalSessionHandler`](crate::agent::ExternalSessionHandler) advances the
+//! real runtime to its next decision point and feeds the
+//! [`ExternalSessionResult`] back through [`StepInput::Resume`].
+//!
+//! # What this milestone covers (M3-2)
+//!
+//! - `step(External(UserMessage))` opens a Conversation turn and blocks on one
+//!   `NeedExternalSession`, choosing
+//!   [`Start`](ExternalSessionInput::Start) when no session exists yet and
+//!   [`Continue`](ExternalSessionInput::Continue) to advance an established one.
+//! - `step(Resume(ExternalSession(Completed)))` records the resumable session
+//!   facts, folds the runtime's terminal output into committed history, and
+//!   settles the cursor on [`Done`](ExternalAgentCursor::Done).
+//! - `step(Resume(ExternalSession(Failed)))` records any retained session facts
+//!   and settles the cursor on [`Error`](ExternalAgentCursor::Error).
+//!
+//! The two-stage
+//! [`PausedForInteraction`](ExternalSessionResult::PausedForInteraction) path
+//! lands in M3-3, and the cancel/abandon cleanup accounting lands in M3-4; both
+//! are settled here as defined, quiescent no-op-or-error transitions rather than
+//! left to misbehave.
+//!
+//! # Persistence boundary
+//!
+//! The serializable machine state is the wrapped [`ExternalAgentState`], whose
+//! [`ExternalAgentCursor`] records the outstanding
+//! [`RequirementId`](crate::agent::RequirementId). The non-serialized fields are
+//! the host-supplied [`RequirementIds`] source, the [`LoopCursor`] *view*
+//! returned to the driver (kept in lockstep with the external cursor), and the
+//! mid-turn scratch ([`InFlight`]) that mirrors the in-flight turn's assistant
+//! identity the way [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine)
+//! keeps its own turn scratch. Observations buffered by the handler are threaded
+//! through the resume path but not yet converted into notifications — that
+//! conversion lands with `Notification::ExternalAgent` in M5.
+
+use std::sync::Arc;
+
+use serde_json::Map;
+
+use crate::{
+    agent::{
+        AgentInput, AgentMachine, AgentUserInput, CursorRequirement, LoopCursor, LoopDoneReason,
+        Requirement, RequirementId, RequirementIds, RequirementKind, RequirementKindTag,
+        RequirementResolution, RequirementResult, StepId, StepInput, StepOutcome,
+        external::{
+            ExternalAgentCursor, ExternalAgentOutput, ExternalAgentState, ExternalSessionInput,
+            ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
+        },
+    },
+    client::Response,
+    conversation::{CancelDisposition, MessageId, TurnMeta},
+    model::{
+        content::ContentBlock,
+        message::{Message, Role},
+        normalized::StopReason,
+    },
+};
+
+/// Mid-turn scratch for the external session step currently in flight.
+///
+/// Like [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine)'s turn
+/// scratch, this lives only while a turn is unfinished and is deliberately *not*
+/// part of the serializable [`ExternalAgentState`]; the cursor still records
+/// which requirement the machine is stuck on. It carries the host-supplied
+/// assistant identity used to freeze the turn on completion.
+#[derive(Clone, Copy, Debug)]
+struct InFlight {
+    assistant_message_id: MessageId,
+}
+
+/// Sans-io machine that drives one external coding-agent session step at a time.
+///
+/// See the [external-agent module docs](crate::agent::external) for the
+/// effect-model contract, and this module's own docs for the scope of this
+/// milestone.
+#[derive(Debug)]
+pub struct ExternalAgentMachine {
+    state: ExternalAgentState,
+    requirement_ids: Arc<dyn RequirementIds>,
+    /// Driver-facing [`LoopCursor`] view, kept in lockstep with
+    /// [`ExternalAgentState::cursor`]. `AgentMachine::cursor` must return a
+    /// `&LoopCursor`, so the machine maintains this mapped mirror rather than
+    /// re-deriving it on every call.
+    loop_cursor: LoopCursor,
+    /// Non-serialized scratch for the in-flight turn; `Some` only between opening
+    /// a turn and settling it.
+    in_flight: Option<InFlight>,
+}
+
+impl ExternalAgentMachine {
+    /// Creates a machine over `state`, using `requirement_ids` to stamp the
+    /// reified `NeedExternalSession` requirements it hands back.
+    #[must_use]
+    pub fn new(state: ExternalAgentState, requirement_ids: Arc<dyn RequirementIds>) -> Self {
+        let loop_cursor = initial_loop_cursor(state.cursor());
+        Self {
+            state,
+            requirement_ids,
+            loop_cursor,
+            in_flight: None,
+        }
+    }
+
+    /// Returns a read-only view of the wrapped serializable external-agent state.
+    #[must_use]
+    pub const fn state(&self) -> &ExternalAgentState {
+        &self.state
+    }
+
+    /// Consumes the machine and returns its serializable external-agent state.
+    #[must_use]
+    pub fn into_state(self) -> ExternalAgentState {
+        self.state
+    }
+
+    /// Opens a fresh Conversation turn and blocks on one `NeedExternalSession`.
+    fn begin_user_turn(&mut self, user: AgentUserInput) -> StepOutcome {
+        if let Err(error) = self.state.conversation_mut().begin_turn(
+            user.turn_id(),
+            user.message_id(),
+            user.message().clone(),
+        ) {
+            return self.fail(format!("conversation operation failed: {error}"));
+        }
+
+        self.in_flight = Some(InFlight {
+            assistant_message_id: user.assistant_message_id(),
+        });
+
+        // An established session continues; a fresh one starts. The user text is
+        // handed to the runtime as opaque prompt/message data.
+        let text = message_text(user.message());
+        let input = if self.state.session().is_some() {
+            ExternalSessionInput::Continue { message: text }
+        } else {
+            ExternalSessionInput::Start { prompt: text }
+        };
+
+        self.block_on_session(user.step_id(), input)
+    }
+
+    /// Reifies one external session effect and parks on
+    /// [`AwaitingSession`](ExternalAgentCursor::AwaitingSession).
+    fn block_on_session(&mut self, step_id: StepId, input: ExternalSessionInput) -> StepOutcome {
+        let requirement_id = match self
+            .requirement_ids
+            .next_requirement_id(RequirementKindTag::ExternalSession)
+        {
+            Ok(id) => id,
+            Err(error) => return self.fail(format!("requirement id unavailable: {error}")),
+        };
+
+        let request = self.build_request(input);
+        let cursor_requirement = CursorRequirement::root(requirement_id);
+        self.settle(
+            ExternalAgentCursor::AwaitingSession {
+                requirement: cursor_requirement.clone(),
+            },
+            LoopCursor::streaming_step(step_id, Some(cursor_requirement)),
+        );
+
+        let requirement = Requirement::at_root(
+            requirement_id,
+            RequirementKind::NeedExternalSession { request },
+        );
+        StepOutcome::new(Vec::new(), vec![requirement], true)
+    }
+
+    /// Builds the provider-neutral request the handler advances this step.
+    fn build_request(&self, input: ExternalSessionInput) -> ExternalSessionRequest {
+        let spec = self.state.spec();
+        ExternalSessionRequest {
+            agent_id: spec.id(),
+            runtime: spec.runtime().clone(),
+            worktree: spec.worktree().clone(),
+            session: self.state.session().cloned(),
+            input,
+            tools: self.state.active_tools().tools().to_vec(),
+            policy: *spec.session_policy(),
+        }
+    }
+
+    /// Feeds a fulfilled requirement result back into the parked machine.
+    fn resume(&mut self, resolution: RequirementResolution) -> StepOutcome {
+        // Read the outstanding requirement id (or a diagnostic) before releasing
+        // the borrow of the cursor so the mutable transitions below are free to
+        // run.
+        let expected = match self.state.cursor() {
+            ExternalAgentCursor::AwaitingSession { requirement } => Ok(requirement.id()),
+            ExternalAgentCursor::AwaitingInteraction { .. } => {
+                Err("external interaction resume is not yet supported (milestone M3-3)".to_owned())
+            }
+            other => Err(format!(
+                "resume received while cursor is `{}`, no outstanding external requirement",
+                cursor_label(other)
+            )),
+        };
+
+        match expected {
+            Ok(expected) => self.resume_session(expected, resolution),
+            Err(message) => self.fail(message),
+        }
+    }
+
+    /// Folds a fulfilled `NeedExternalSession` result into the in-flight turn.
+    fn resume_session(
+        &mut self,
+        expected: RequirementId,
+        resolution: RequirementResolution,
+    ) -> StepOutcome {
+        if resolution.id != expected {
+            return self.fail(format!(
+                "resume targets requirement {}, but the machine awaits {expected}",
+                resolution.id
+            ));
+        }
+
+        match resolution.result {
+            RequirementResult::ExternalSession(result) => self.fold_session_result(*result),
+            other => self.fail(format!(
+                "NeedExternalSession requirement cannot accept a `{}` result",
+                other.tag()
+            )),
+        }
+    }
+
+    /// Routes a decision-point [`ExternalSessionResult`] to its transition.
+    ///
+    /// Buffered `observations` are intentionally dropped here; converting them
+    /// into `Notification::ExternalAgent` events lands in M5.
+    fn fold_session_result(&mut self, result: ExternalSessionResult) -> StepOutcome {
+        match result {
+            ExternalSessionResult::Completed {
+                session, output, ..
+            } => self.complete_session(session, output),
+            ExternalSessionResult::Failed { session, error, .. } => {
+                if session.is_some() {
+                    self.state.set_session(session);
+                }
+                self.fail(error.to_string())
+            }
+            ExternalSessionResult::PausedForInteraction { .. } => self.fail(
+                "external session pause-for-interaction is not yet supported (milestone M3-3)",
+            ),
+        }
+    }
+
+    /// Records the terminal output, commits the turn, and settles on `Done`.
+    fn complete_session(
+        &mut self,
+        session: ExternalSessionRef,
+        output: ExternalAgentOutput,
+    ) -> StepOutcome {
+        let Some(in_flight) = self.in_flight.take() else {
+            return self.fail("external session completed without an in-flight turn to commit");
+        };
+
+        self.state.set_session(Some(session));
+
+        let response = assistant_response(&output);
+        if let Err(error) = self
+            .state
+            .conversation_mut()
+            .start_assistant_response(response)
+        {
+            return self.fail(format!("conversation operation failed: {error}"));
+        }
+        if let Err(error) = self
+            .state
+            .conversation_mut()
+            .finish_assistant(in_flight.assistant_message_id)
+        {
+            return self.fail(format!("conversation operation failed: {error}"));
+        }
+        if let Err(error) = self
+            .state
+            .conversation_mut()
+            .commit_pending(TurnMeta::default())
+        {
+            return self.fail(format!("conversation operation failed: {error}"));
+        }
+
+        self.settle(
+            ExternalAgentCursor::Done,
+            LoopCursor::done(LoopDoneReason::Completed),
+        );
+        StepOutcome::new(Vec::new(), Vec::new(), true)
+    }
+
+    /// Handles a never-resume [`StepInput::Abandon`].
+    ///
+    /// Full cancel accounting — shutdown disposition and orphan-session flagging
+    /// (design §6.4) — lands in M3-4. This milestone only needs a safe settle so
+    /// a cancelled drain does not misbehave: discard any dangling pending turn
+    /// and return the cursor to a feedable [`Idle`](ExternalAgentCursor::Idle).
+    fn abandon(&mut self, _id: RequirementId) -> StepOutcome {
+        if self.state.conversation().pending().is_some() {
+            let _ = self
+                .state
+                .conversation_mut()
+                .cancel_pending(CancelDisposition::DiscardTurn);
+        }
+        self.in_flight = None;
+        self.settle(ExternalAgentCursor::Idle, LoopCursor::Idle);
+        StepOutcome::new(Vec::new(), Vec::new(), true)
+    }
+
+    /// Discards any dangling pending turn and parks on a classified error cursor.
+    ///
+    /// `step` cannot return `Result`, so a runtime failure during a step surfaces
+    /// as an [`Error`](ExternalAgentCursor::Error) cursor with a quiescent
+    /// outcome, mirroring
+    /// [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine).
+    fn fail(&mut self, message: impl Into<String>) -> StepOutcome {
+        let message = {
+            let message = message.into();
+            if message.is_empty() {
+                "external agent machine failed".to_owned()
+            } else {
+                message
+            }
+        };
+        if self.state.conversation().pending().is_some() {
+            let _ = self
+                .state
+                .conversation_mut()
+                .cancel_pending(CancelDisposition::DiscardTurn);
+        }
+        self.in_flight = None;
+        let loop_cursor = LoopCursor::error(message.clone()).unwrap_or(LoopCursor::Idle);
+        self.settle(ExternalAgentCursor::Error { message }, loop_cursor);
+        StepOutcome::new(Vec::new(), Vec::new(), true)
+    }
+
+    /// Sets the serializable external cursor and its mirrored driver-facing view
+    /// together so the two never drift.
+    fn settle(&mut self, external: ExternalAgentCursor, loop_cursor: LoopCursor) {
+        self.state.set_cursor(external);
+        self.loop_cursor = loop_cursor;
+    }
+}
+
+impl AgentMachine for ExternalAgentMachine {
+    fn step(&mut self, input: StepInput) -> StepOutcome {
+        match input {
+            StepInput::External(AgentInput::UserMessage(user)) => self.begin_user_turn(user),
+            StepInput::External(AgentInput::Pivot(_)) => {
+                self.fail("external agent machine does not accept pivot input")
+            }
+            StepInput::Resume(resolution) => self.resume(resolution),
+            StepInput::Abandon(id) => self.abandon(id),
+        }
+    }
+
+    fn cursor(&self) -> &LoopCursor {
+        &self.loop_cursor
+    }
+}
+
+/// Maps an [`ExternalAgentCursor`] to the driver-facing [`LoopCursor`] view a
+/// freshly constructed or restored machine starts from.
+///
+/// A fresh machine is [`Idle`](ExternalAgentCursor::Idle); the terminal states
+/// map to their [`LoopCursor`] equivalents. A machine restored while parked on an
+/// awaiting state has no step scratch to rebuild a streaming-step view, so it
+/// falls back to [`LoopCursor::Idle`]; restoring a mid-flight external machine is
+/// out of scope until the mount/cleanup work in M3-4.
+fn initial_loop_cursor(cursor: &ExternalAgentCursor) -> LoopCursor {
+    match cursor {
+        ExternalAgentCursor::Idle
+        | ExternalAgentCursor::AwaitingSession { .. }
+        | ExternalAgentCursor::AwaitingInteraction { .. } => LoopCursor::Idle,
+        ExternalAgentCursor::Done => LoopCursor::done(LoopDoneReason::Completed),
+        ExternalAgentCursor::Error { message } => {
+            LoopCursor::error(message.clone()).unwrap_or(LoopCursor::Idle)
+        }
+    }
+}
+
+/// Returns the snake-case label of an external cursor for diagnostics.
+const fn cursor_label(cursor: &ExternalAgentCursor) -> &'static str {
+    match cursor {
+        ExternalAgentCursor::Idle => "idle",
+        ExternalAgentCursor::AwaitingSession { .. } => "awaiting_session",
+        ExternalAgentCursor::AwaitingInteraction { .. } => "awaiting_interaction",
+        ExternalAgentCursor::Done => "done",
+        ExternalAgentCursor::Error { .. } => "error",
+    }
+}
+
+/// Concatenates the text blocks of a user message into an opaque prompt string.
+fn message_text(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Builds a text-only assistant [`Response`] from an external session's terminal
+/// output, folding through the runtime's reported usage when present.
+fn assistant_response(output: &ExternalAgentOutput) -> Response {
+    Response {
+        message: Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: output.summary.clone(),
+                extra: Map::new(),
+            }],
+        },
+        usage: output.usage.clone().unwrap_or_default(),
+        stop_reason: StopReason::normalize("end_turn"),
+        extra: Map::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests;
