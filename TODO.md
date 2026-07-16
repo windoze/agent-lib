@@ -1040,7 +1040,7 @@ external subagent phase 与内部 subagent 的差异及保留原因:
   mixed_tool_and_subagent 1 passed)、clippy `-D warnings` 0 warning、全套件 38 组 0 failed、
   doc(`-D warnings`)通过、`git diff --check` clean。
 
-### [TODO] M3-4 Review：interaction/subagent parity 正确性检查
+### [DONE] M3-4 Review：interaction/subagent parity 正确性检查
 
 **上下文**:
 
@@ -1063,6 +1063,81 @@ M3 结束后 external machine 应具备 `NeedInteraction`、`NeedTool`、`NeedSu
 - `cargo test -p agent-lib drive`
 - 完整验证序列 1-6 全过。
 - 完成记录中给出 M3 能力 parity 摘要。
+
+**完成记录**(2026-07-17):
+
+纯 sign-off review,逐条核对 M3-1..M3-3 落地的 interaction/subagent parity 源码 + 测试,唯一改动是
+文档同步(`docs/managed-external-agent.md`),无代码改动、无 spec 偏差、无 workaround。
+
+*`src/agent/external/machine.rs` 四点核对(全部满足)*:
+
+1. **`resume` 所有 awaiting 相位都有 id/family 校验**:`resume` 先从 cursor 读出 `Awaiting`
+   相位再分派。
+   - `AwaitingSession` -> `resume_session`:`resolution.id != expected` -> `fail`;family 要求
+     `RequirementResult::ExternalSession`,否则 `fail`。
+   - `AwaitingInteraction` -> `resume_interaction`:id 校验 + family 要求
+     `RequirementResult::Interaction` + `Interaction::accepts_response` 校验(见第 4 点)。
+   - `AwaitingTool` -> `resume_tool`:按 `batch.pending.get(&resolution.id)` 路由(batch 有多个
+     requirement,id 不在 batch 内 -> `fail`);duplicate result -> `fail`;按 `PendingBridgeCall.kind`
+     校验 result family(`Tool` 收 `Tool(Ok/Err)`、`Subagent` 收 `Subagent(Ok/Err)`,family 不符 ->
+     `fail`)。
+   - `AwaitingSubagent` -> `resume_subagent`:id 校验 + family 要求 `RequirementResult::Subagent`。
+   - 非 awaiting cursor(`Idle`/`Done`/`Error`)上 resume -> `fail`(cursor_label 诊断)。
+2. **`NeedSubagent` 不在 machine 内执行 child,只 reify requirement**:`pause_for_subagent` 与
+   `pause_for_tool_calls` 的 spawn_agent 分支都只 `emit` 一个 `Requirement`(`NeedSubagent`),park 到
+   `AwaitingSubagent` / `AwaitingTool`,由 driver 的 `DrivingSubagentHandler`(serial `needs_outer`
+   路径)驱动子 agent;machine 从不构造/驱动 child,也不把 child 输出写入 `Conversation`。
+3. **`spawn_agent` 特判没有落入普通 `ToolRegistry`(即不发成 `NeedTool`)**:`pause_for_tool_calls`
+   逐 call 用 `SpawnAgentRequest::matches(&call.name)` 判定,命中则 `SpawnAgentRequest::parse` ->
+   `into_requirement_kind` 桥成 `NeedSubagent`(scope-deepening),而非 `NeedTool`;畸形 input ->
+   预置 runtime-visible error result(return-error-to-runtime §8.4),同样不发 `NeedTool`。普通 tool
+   才走 `NeedTool`。machine 本身不持有 `ToolRegistry`——tool 由 driver scope handler 兑现。
+4. **interaction response 通过 `Interaction::accepts_response` 校验后才回灌**:`resume_interaction`
+   在取出 `InteractionResponse` 后、`block_on_session(RespondInteraction)` 之前调用
+   `interaction.accepts_response(&response)`;校验失败 -> `fail`(error cursor),**绝不**把非法答案转发
+   给 runtime。
+
+*`drain` 无 external 特判*:`src/agent/drive.rs` 的 `drain` / `fulfill_batch` / `resolve_requirement`
+全部按 `RequirementKindTag`(泛型 effect family)路由,无任何 `External*` 分支。subagent 的 serial
+`needs_outer` outer-routing 是通用机制(`tag != Subagent && scope_handles` 才进并发 local set),external
+emit 的 `NeedTool`/`NeedSubagent`/`NeedInteraction` 与 `DefaultAgentMachine` 同形,复用同一 driver 路径,
+无需新增特判,因此无新增 trace 测试的需要。
+
+*文档同步*(`docs/managed-external-agent.md`):
+
+- §1 现状表:`external runtime 发起 host tool call` / `host subagent` 由「未实现」改为
+  「machine 已实现(runtime handler 待实现)」。
+- §3 parity 表:tool call / tool approval / user question / subagent 四行备注改为
+  「machine 已实现,runtime handler 待实现」。
+- §21 里程碑:新增编号说明(设计里程碑 ≠ 执行里程碑,见 PLAN.md/TODO.md);修正 M2 命名差异——
+  实际未引入 `AwaitingToolApproval` cursor(approval 复用 interaction 相位)、未引入
+  `ToolApprovalPolicy`/`ToolFailurePolicy` 类型(固定 return-error-to-runtime);M3 标注 observed
+  event sequence / replay dedup 已落地、streaming live sink 待执行侧 M4-1。
+
+*M3 能力 parity 摘要*(external machine 三类 host-mediated 能力,均 sans-io、只 reify requirement):
+
+| 能力 | 触发点 | reify | 回灌 | park cursor |
+|---|---|---|---|---|
+| interaction | `PausedForInteraction` | `NeedInteraction`(`accepts_response` 校验) | `RespondInteraction`(echo `action_id`) | `AwaitingInteraction` |
+| host tool | `PausedForToolCalls`(普通 call) | `NeedTool` batch(`ToolExecutionIds` 分配 `ToolCallId`) | `RespondToolResults`(原始 call 顺序) | `AwaitingTool` |
+| native subagent | `PausedForSubagent` | `NeedSubagent`(复用 spec_ref/brief/result_schema) | `RespondSubagent`(echo `request_id`) | `AwaitingSubagent` |
+| spawn_agent bridge | `PausedForToolCalls`(`spawn_agent` call) | `NeedSubagent`(§8.3 特判) | 折成 `ExternalToolResult(Ok,summary)` 进同 batch 的 `RespondToolResults` | `AwaitingTool` |
+
+共性:in-flight turn 跨 pause 保持 open,子结果折回同一 turn;失败区分 return-error-to-runtime
+(tool/畸形 spawn_agent input,turn 存活)与 host-orchestration error cursor(subagent 驱动失败、
+family/id 不符,停 turn);无 tool/subagent 结果写入 `Conversation`(runtime 自持 transcript)。
+
+*验证*(完整序列 1-6 全过):
+
+- `cargo fmt --all -- --check` FMT_OK。
+- 聚焦:`cargo test -p agent-lib external_agent`(lib external 132 passed)、
+  `cargo test -p agent-lib drive`(lib drive 27 passed)。
+- `cargo clippy --all-targets -- -D warnings` 0 warning。
+- `cargo test --all --all-targets`:本任务仅文档改动(无任何 `.rs` 变更),复用 M3-3 全套件绿快照
+  (38 组 0 failed);按 PROMPT「仅文档改动可复用上次 full run」跳过重跑。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过(该 md 未经 `include_str!` 进
+  rustdoc,不影响文档构建)。
+- `git diff --check` clean。
 
 ---
 

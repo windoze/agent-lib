@@ -55,8 +55,8 @@ scope wiring 决定 attended / headless 行为。
 | cancel / abandon 标记 `cleanup_required` | 已实现 |
 | 作为 subagent child 被 `DrivingSubagentHandler` 驱动 | 已实现 |
 | 真实 Claude Code / Codex / OpenCode runtime adapter | 未实现 |
-| external runtime 发起 host tool call | 未实现 |
-| external runtime 发起 host subagent | 未实现 |
+| external runtime 发起 host tool call | machine 已实现(runtime handler 待实现) |
+| external runtime 发起 host subagent | machine 已实现(runtime handler 待实现) |
 | 长生命周期 session registry / process handles | 未实现 |
 | structured streaming live sink + replay sequence | 部分实现 |
 | cassette replay 真实 external session | 未实现 |
@@ -111,10 +111,10 @@ scope wiring 决定 attended / headless 行为。
 | 文本 turn | `NeedLlm` -> assistant `Response` | `NeedExternalSession` -> `Completed.output` | 已有基础 |
 | 多轮会话 | Conversation + model history | `ExternalSessionRef` + runtime resume/continue | runtime-dependent |
 | 流式文本 | `StreamEvent` / `Notification::Llm` | `ExternalAgentEvent::TextDelta` / live sink | 需补 seq/live sink |
-| tool call | `ContentBlock::ToolUse` -> `NeedTool` | runtime tool call -> `NeedTool` -> `RespondToolResults` | 拟新增 |
-| tool approval | `NeedInteraction(Approval)` | runtime permission 或 host tool approval -> `NeedInteraction` | 部分已有 |
-| user question | `NeedInteraction(Question)` | runtime question -> `NeedInteraction(Question)` | 拟接 runtime |
-| subagent | `NeedSubagent` | runtime spawn request -> `NeedSubagent` | 拟新增 |
+| tool call | `ContentBlock::ToolUse` -> `NeedTool` | runtime tool call -> `NeedTool` -> `RespondToolResults` | machine 已实现,runtime handler 待实现 |
+| tool approval | `NeedInteraction(Approval)` | runtime permission 或 host tool approval -> `NeedInteraction` | machine 已实现(interaction 校验),runtime handler 待实现 |
+| user question | `NeedInteraction(Question)` | runtime question -> `NeedInteraction(Question)` | machine 已实现(`NeedInteraction`),runtime handler 待实现 |
+| subagent | `NeedSubagent` | runtime spawn request -> `NeedSubagent` | machine 已实现,runtime handler 待实现 |
 | tool failure policy | `ToolFailurePolicy` | external tool result error 回灌或 fail turn | 拟新增 |
 | cancel | `StepInput::Abandon` closes pending | abandon marks cleanup + handler kills session | machine 已有,handler 待实现 |
 | budget | handler/driver charge tokens/cost | runtime usage/cost event charge | 拟新增 |
@@ -1102,6 +1102,11 @@ cargo test --test agent_external_real_e2e -- --ignored --nocapture
 
 ## 21. 落地里程碑
 
+> **编号说明**:本节是设计初稿的里程碑拆分,与实际执行的里程碑编号(见
+> [`PLAN.md`](../PLAN.md) / [`TODO.md`](../TODO.md))并非一一对应。执行侧已落地:sequenced
+> observations(执行 M1)、`ExternalAgentMachine` tool parity(执行 M2)、subagent / interaction
+> parity(执行 M3,含 `spawn_agent` tool-bridge 特判)。下列条目保留设计意图,并就实现差异就地标注。
+
 ### M1: external tool/subagent 协议
 
 - 新增 `ExternalToolCall` / `ExternalToolResult` / batch id。
@@ -1113,18 +1118,25 @@ cargo test --test agent_external_real_e2e -- --ignored --nocapture
 
 ### M2: `ExternalAgentMachine` tool parity
 
-- 新增 AwaitingTool / AwaitingToolApproval cursor。
-- 增加 `ToolExecutionIds` / `ToolApprovalPolicy` / `ToolFailurePolicy`。
-- 实现 external tool phase。
-- 支持 `spawn_agent` -> `NeedSubagent`。
+- 新增 `AwaitingTool` cursor。**实现差异**:未引入独立的 `AwaitingToolApproval` cursor —
+  runtime permission / host tool approval 复用现有 interaction 相位(`NeedInteraction` /
+  `AwaitingInteraction`),不单独建 cursor。
+- 注入 `ToolExecutionIds` 分配 framework `ToolCallId`。**实现差异**:未引入 `ToolApprovalPolicy` /
+  `ToolFailurePolicy` 类型 — tool-failure 采用固定的 *return-error-to-runtime* 策略(`Tool(Err)` 回灌为
+  失败 `ExternalToolResult`,不停 turn),approval 由 interaction 相位承载。
+- 实现 external tool phase(`PausedForToolCalls` -> `NeedTool` batch -> `RespondToolResults`,按
+  runtime 原始 call 顺序回灌,支持乱序 resume)。
+- 支持 `spawn_agent` -> `NeedSubagent`(tool-bridge 特判,§8.3;实际落在执行侧 M3-3,混合 batch 里
+  普通 tool 与 spawn_agent 共存并折回同一 `RespondToolResults`)。
 - 补 cancel / failure / limit 测试。
 
 ### M3: observed event sequence + streaming sink
 
-- 新增 `ExternalObservedEvent { seq, event }`。
-- observations 改为 sequenced。
-- `ExternalStreamPolicy::Streaming` live sink。
-- replay dedup。
+- 新增 `ExternalObservedEvent { seq, event }`。**已落地**(执行 M1-1)。
+- observations 改为 sequenced。**已落地**(执行 M1-1)。
+- `ExternalStreamPolicy::Streaming` live sink。**待实现**(执行 M4-1)。
+- replay dedup。**已落地**:`observe` 按 `ExternalObservedEvent::seq` 对 `ExternalSessionRef::last_event_seq`
+  逐事件去重。
 - parser/testkit 更新。
 
 ### M4: runtime adapter abstraction + session registry
