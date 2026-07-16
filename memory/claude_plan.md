@@ -1,49 +1,52 @@
-# M3-1 实现 `PausedForSubagent` -> `NeedSubagent` -> `RespondSubagent`
+# M3-2 完善 runtime permission/question/choice 到 `NeedInteraction` 的映射
 
-**当前执行 = TODO.md 第一个未完成任务 = M3-1**（M1-*、M2-* 已 `[DONE]`）。
+**当前执行 = TODO.md 第一个未完成任务 = M3-2**（M1-*、M2-*、M3-1 已 `[DONE]`）。
 
 ## 目标
-让 `ExternalAgentMachine` 把 runtime 的 `PausedForSubagent` 决策点折成一个标准
-`NeedSubagent` requirement，由 host 的 subagent 机制（`DrivingSubagentHandler`）驱动子 agent，
-收到 `RequirementResult::Subagent(Ok/Err)` 后回灌 `RespondSubagent` 给 runtime（Err 首版转 error cursor）。
+补齐 `ExternalAgentMachine` 对 `PausedForInteraction` 的 resume 验证：resume 回灌
+`RespondInteraction` 前必须调用 `Interaction::accepts_response`，wrong response family /
+choice 越界 / permission action_id 不匹配都进入 error cursor，绝不把无效 response 传给 runtime。
+并为 permission/question/choice 补 machine 单测，更新 reference.rs 的 `ApprovalInteractionHandler`
+文档与测试。
 
-## 锚点
-- `src/agent/external/state.rs`：`ExternalAgentCursor` 需新增 `AwaitingSubagent { requirement, request_id }`。
-- `src/agent/external/machine.rs`：
-  - `fold_session_result` 的 `PausedForSubagent` 分支当前直接 fail（M3 占位），改为 `pause_for_subagent`。
-  - 新增 `Awaiting::Subagent`、`pause_for_subagent`、`resume_subagent`；更新 `resume`、`cursor_label`、
-    `initial_loop_cursor`、模块文档。
-- DTO 已就绪（M1）：`ExternalSubagentRequest{request_id,spec_ref,brief,result_schema,raw}`、
-  `ExternalSubagentOutput`、`ExternalSessionInput::RespondSubagent`、`ExternalSessionResult::PausedForSubagent`。
-- `NeedSubagent { spec_ref, brief, result_schema }`，result = `Result<SubagentOutput, AgentError>`，
-  `needs_outer: true`（driver 已有 serial outer routing，无需改 driver）。
+## 根因 / 现状
+- `resume_interaction`（machine.rs:955）当前直接把 `RequirementResult::Interaction(response)`
+  塞进 `RespondInteraction`，**没有**调用 `accepts_response`。这是本任务要补的 gap。
+- `AwaitingInteraction` cursor（state.rs:45）只存 `requirement` + `pending_action`(String)，
+  没有保留原始 `Interaction`，因此 resume 无法验证。→ 需要把 `Interaction` 存进 cursor。
 
 ## 实现步骤
-1. state.rs：AwaitingSubagent 变体 + `requirement()` / `has_outstanding_requirement()` 覆盖；
-   导入 `ExternalSubagentRequestId`。补 state 单测（cursor 断言）。
-2. machine.rs：
-   - `Awaiting::Subagent { requirement, request_id }`。
-   - `pause_for_subagent`：record session、alloc `RequirementKindTag::Subagent` id、
-     emit `NeedSubagent{spec_ref,brief,result_schema}`、settle `AwaitingSubagent`
-     + `LoopCursor::streaming_step`。无 in_flight -> fail_with（带 notifications）。
-   - `resume_subagent`：id 校验；`Subagent(Ok(out))` -> `RespondSubagent`；
-     `Subagent(Err)` -> error cursor；wrong family -> error cursor。
-   - `resume` 读 `AwaitingSubagent`；`cursor_label`、`initial_loop_cursor` 加 awaiting_subagent。
-   - 更新模块 doc（M3 覆盖范围）。
-3. 机器单测（machine/tests.rs）：
-   - `external_subagent_pause_emits_need_subagent`
-   - `external_subagent_result_responds_to_session`
-   - `external_subagent_wrong_family_fails`
-   - 追加：wrong requirement id、Err -> error cursor（class-wide）。
-4. drive 测试（tests/agent_external_subagent.rs，匹配 `driving_subagent` 过滤名）+
-   testkit fixture 助手（`ExternalAgentFixture::subagent_pause` / `subagent_request`）：
-   - `external_agent_driving_subagent_fulfills_child`
-   - `external_agent_driving_subagent_pops_child_interaction_to_outer`
+1. **state.rs**：`AwaitingInteraction` 增加 `interaction: Interaction` 字段（可序列化的
+   resumable fact）。导入 `Interaction`。更新 rustdoc。更新 cursor round-trip 测试 & requirement()
+   访问器 match arm（`AwaitingInteraction { requirement, .. }` 已用 `..`，无需改）。
+2. **machine.rs**：
+   - `Awaiting::Interaction` 枚举增加 `interaction: Interaction`。
+   - `resume` 读取 cursor 时 clone `interaction` 传入。
+   - `pause_for_interaction`：把 `request` clone 一份存进 cursor（另一份 emit 到 NeedInteraction）。
+   - `resume_interaction`：提取 `response` 后调用 `interaction.accepts_response(&response)`；
+     Err -> `self.fail(...)`（error cursor，稳定诊断，不泄漏 transcript）；Ok -> 原路 block_on_session。
+   - 更新模块 doc（M3-2 覆盖：resume 前校验 response）。
+3. **machine/tests.rs**：新增 helper（permission_paused_result / choice_paused_result +
+   permission/choice resolution），新增单测（class-wide 覆盖所有 family + 所有 error 类型）：
+   - `external_permission_interaction_relays_approve/deny/cancel`
+   - `external_question_interaction_relays_answer`
+   - `external_choice_interaction_relays_selected_index`
+   - `interaction_result_rejected_on_action_mismatch_settles_error`（permission 错 action_id）
+   - `interaction_result_rejected_on_choice_out_of_range_settles_error`
+   - `interaction_result_rejected_on_family_mismatch_settles_error`
+   - 断言 error cursor 且 **没有** RespondInteraction requirement 发给 runtime。
+4. **reference.rs**：为 `ApprovalInteractionHandler` 补 `#[cfg(test)] mod tests`：
+   - `approval_interaction_handler_approves_permission`
+   - `approval_interaction_handler_denies_permission`
+   - `approval_interaction_handler_maps_decision_to_permission_cancel/timeout`
+   - `approval_interaction_handler_answers_question_and_choice_trivially`
+   并按需补充/明确文档（reference handler 仅用于测试/默认 headless）。
 5. 更新 TODO.md 标 [DONE] + 完成记录。
 
 ## 验证序列
 1. `cargo fmt --all -- --check`
-2. 聚焦：`cargo test -p agent-lib external_subagent` + `cargo test -p agent-lib driving_subagent`
+2. 聚焦：`external_permission_interaction` / `interaction_result_rejected` / `approval_interaction_handler`
+   + `external_pause_then_respond_then_complete_commits_the_turn`
 3. `cargo clippy --all-targets -- -D warnings`
 4. `cargo test --all --all-targets`（<=30min）
 5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
@@ -51,11 +54,8 @@
 
 ## 状态：完成
 
-- state.rs：新增 `AwaitingSubagent` cursor + 接入访问器 + round-trip 测试。✅
-- machine.rs：`Awaiting::Subagent` + `pause_for_subagent` + `resume_subagent` + resume/fold 路由 + docs。✅
-- machine/tests.rs：新增 5 条 subagent 单测(pause emits / result responds / wrong family / wrong id / error cursor)。✅
-- testkit external.rs：新增 `subagent_request` / `subagent_pause` fixture 助手。✅
-- tests/agent_external_subagent.rs：新增 2 条 drive 测试(`driving_subagent` fulfill child / pop child interaction to outer)。✅
-- 验证序列 1-6 全过:fmt clean、clippy 0 warning、全套件 38 组 0 failed、doc 通过、`git diff --check` clean。✅
-- TODO.md M3-1 标 `[DONE]` + 完成记录。✅
-- driver 无改动(NeedSubagent 复用既有 `scope.subagent()` + ScopePop routing)。
+- state.rs：AwaitingInteraction 新增 interaction 字段 + round-trip 测试。✅
+- machine.rs：resume_interaction 前调用 accepts_response，无效 response -> error cursor（不回灌 runtime）。✅
+- machine/tests.rs：新增 permission/question/choice relay + 3 类 rejection + turn-recoverable 单测。✅
+- reference.rs：ApprovalInteractionHandler 文档 + 5 条 handler 单测。✅
+- 验证序列 1-6 全过；TODO.md M3-2 标 [DONE] + 完成记录。✅

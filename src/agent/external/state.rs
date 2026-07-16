@@ -10,7 +10,7 @@
 
 use crate::{
     agent::{
-        CursorRequirement, ToolWaitRequirements,
+        CursorRequirement, Interaction, ToolWaitRequirements,
         external::{
             ExternalAgentSpec, ExternalArtifactRef, ExternalSessionRef, ExternalSubagentRequestId,
             ExternalToolBatchId,
@@ -51,6 +51,17 @@ pub enum ExternalAgentCursor {
         /// [`ExternalSessionInput::RespondInteraction`]:
         /// crate::agent::external::ExternalSessionInput::RespondInteraction
         pending_action: String,
+        /// The neutral [`Interaction`] the runtime paused for, retained so the
+        /// machine can validate the host's [`InteractionResponse`] against it —
+        /// via [`Interaction::accepts_response`] — *before* relaying it back to
+        /// the runtime as a
+        /// [`RespondInteraction`](crate::agent::external::ExternalSessionInput::RespondInteraction).
+        /// A response of the wrong family, an out-of-range choice index, or a
+        /// mismatched permission `action_id` is rejected into an error cursor
+        /// instead of being forwarded to the runtime.
+        ///
+        /// [`InteractionResponse`]: crate::agent::InteractionResponse
+        interaction: Interaction,
     },
     /// A session paused for a batch of tool calls; the machine emitted one
     /// `NeedTool` requirement per call and is waiting for every host tool
@@ -409,8 +420,8 @@ mod tests {
     use super::{ExternalAgentCursor, ExternalAgentState};
     use crate::{
         agent::{
-            AgentId, AgentPath, AgentSlot, CursorRequirement, RequirementId, ToolSetId,
-            ToolWaitRequirements,
+            AgentId, AgentPath, AgentSlot, CursorRequirement, Interaction, RequirementId, StepId,
+            ToolSetId, ToolWaitRequirements,
             external::{
                 ExternalAgentSpec, ExternalArtifactKind, ExternalArtifactRef,
                 ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionPolicy,
@@ -464,6 +475,16 @@ mod tests {
         format!("018f0d9c-7b6a-7c12-8f31-1234567890a{offset}")
             .parse()
             .expect("message id")
+    }
+
+    fn paused_step_id() -> StepId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890e1"
+            .parse()
+            .expect("paused step id")
+    }
+
+    fn interaction() -> Interaction {
+        Interaction::question(paused_step_id(), "Run `cargo test`?".to_owned())
     }
 
     fn tool(name: &str) -> Tool {
@@ -676,6 +697,7 @@ mod tests {
             ExternalAgentCursor::AwaitingInteraction {
                 requirement: CursorRequirement::new(requirement_id(), origin.clone()),
                 pending_action: "act-9".to_owned(),
+                interaction: interaction(),
             },
             ExternalAgentCursor::AwaitingTool {
                 batch_id: ExternalToolBatchId::new("batch-7"),
@@ -705,6 +727,7 @@ mod tests {
             ExternalAgentCursor::AwaitingInteraction {
                 requirement: CursorRequirement::root(requirement_id()),
                 pending_action: "act-1".to_owned(),
+                interaction: interaction(),
             }
             .requirement()
             .map(CursorRequirement::id),

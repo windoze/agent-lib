@@ -16,9 +16,10 @@ use serde_json::Map;
 use super::ExternalAgentMachine;
 use crate::agent::{
     AgentError, AgentId, AgentInput, AgentMachine, AgentSpecRef, Interaction, InteractionResponse,
-    LoopCursorKind, Notification, PivotMessage, PivotSource, RequirementError, RequirementId,
-    RequirementIds, RequirementKind, RequirementKindTag, RequirementResolution, RequirementResult,
-    StepId, StepInput, StepOutcome, SubagentOutput, ToolExecutionIds, ToolRuntimeError, ToolSetId,
+    LoopCursorKind, Notification, PermissionCategory, PermissionRequest, PermissionResponse,
+    PermissionRisk, PivotMessage, PivotSource, RequirementError, RequirementId, RequirementIds,
+    RequirementKind, RequirementKindTag, RequirementResolution, RequirementResult, StepId,
+    StepInput, StepOutcome, SubagentOutput, ToolExecutionIds, ToolRuntimeError, ToolSetId,
     ToolWaitRequirements,
     external::{
         ExternalAgentCursor, ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput,
@@ -406,6 +407,74 @@ fn interaction_resolution(id: RequirementId, answer: &str) -> RequirementResolut
         id,
         RequirementResult::Interaction(InteractionResponse::answer(answer.to_owned())),
     )
+}
+
+/// The [`PermissionRequest`] a [`permission_paused_result`] asks the host to
+/// resolve, keyed by `action_id`.
+fn permission_request(action_id: &str) -> PermissionRequest {
+    PermissionRequest::new(
+        action_id.to_owned(),
+        agent_id(),
+        PermissionCategory::Shell,
+        "run `cargo test`".to_owned(),
+        serde_json::json!({ "command": "cargo test" }),
+        PermissionRisk::Medium,
+        Some("verify the refactor".to_owned()),
+    )
+}
+
+/// A `PausedForInteraction` result modelling a permission prompt keyed by
+/// `action_id`.
+fn permission_paused_result(action_id: &str) -> ExternalSessionResult {
+    ExternalSessionResult::PausedForInteraction {
+        session: session_ref(),
+        action_id: action_id.to_owned(),
+        request: Interaction::permission(paused_step_id(), permission_request(action_id)),
+        observations: Vec::new(),
+    }
+}
+
+/// A `PausedForInteraction` result modelling a fixed-option choice prompt.
+fn choice_paused_result(action_id: &str, options: Vec<String>) -> ExternalSessionResult {
+    ExternalSessionResult::PausedForInteraction {
+        session: session_ref(),
+        action_id: action_id.to_owned(),
+        request: Interaction::choice(paused_step_id(), "Pick a branch.".to_owned(), options),
+        observations: Vec::new(),
+    }
+}
+
+/// A resolution carrying an arbitrary [`InteractionResponse`] for requirement
+/// `id`.
+fn response_resolution(id: RequirementId, response: InteractionResponse) -> RequirementResolution {
+    RequirementResolution::new(id, RequirementResult::Interaction(response))
+}
+
+/// Unwraps the `RespondInteraction` a resumed session was fed, asserting it
+/// echoes `action_id`, and returns the response it carried.
+fn respond_interaction(
+    outcome: &StepOutcome,
+    action_id: &str,
+) -> (RequirementId, InteractionResponse) {
+    assert_eq!(
+        outcome.requirements.len(),
+        1,
+        "a valid interaction response relays exactly one RespondInteraction"
+    );
+    let requirement = &outcome.requirements[0];
+    match &requirement.kind {
+        RequirementKind::NeedExternalSession { request } => match &request.input {
+            ExternalSessionInput::RespondInteraction {
+                action_id: echoed,
+                response,
+            } => {
+                assert_eq!(echoed, action_id, "the pause's action_id is echoed back");
+                (requirement.id, response.clone())
+            }
+            other => panic!("resume must feed a RespondInteraction, got {other:?}"),
+        },
+        other => panic!("expected a NeedExternalSession requirement, got {other:?}"),
+    }
 }
 
 fn external_resolution(id: RequirementId, result: ExternalSessionResult) -> RequirementResolution {
@@ -846,6 +915,182 @@ fn external_interaction_resume_targeting_the_wrong_requirement_fails() {
 
     assert!(outcome.is_quiescent());
     assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+}
+
+/// Drives a machine to a pause on `paused`, returning the machine and the
+/// `NeedInteraction` requirement id the pause reified.
+fn paused_on_interaction(paused: ExternalSessionResult) -> (ExternalAgentMachine, RequirementId) {
+    let mut machine = machine();
+    let opened = machine.step(StepInput::external(user_input("refactor the parser")));
+    let pause = machine.step(StepInput::resume(external_resolution(
+        opened.requirements[0].id,
+        paused,
+    )));
+    let requirement_id = pause.requirements[0].id;
+    (machine, requirement_id)
+}
+
+#[test]
+fn external_permission_interaction_relays_approve() {
+    // An approved permission is validated against the pending request and reaches
+    // the runtime as a permission approve echoing the paused action id.
+    let (mut machine, requirement_id) = paused_on_interaction(permission_paused_result("act-1"));
+
+    let responded = machine.step(StepInput::resume(response_resolution(
+        requirement_id,
+        InteractionResponse::Permission(PermissionResponse::approve("act-1".to_owned())),
+    )));
+
+    let (fresh, response) = respond_interaction(&responded, "act-1");
+    assert_eq!(
+        response,
+        InteractionResponse::Permission(PermissionResponse::approve("act-1".to_owned()))
+    );
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert_eq!(machine.cursor().pending_requirement_ids(), vec![fresh]);
+    assert!(machine.state().conversation().pending().is_some());
+}
+
+#[test]
+fn external_permission_interaction_relays_deny() {
+    // A denied permission relays a deny carrying its rationale.
+    let (mut machine, requirement_id) = paused_on_interaction(permission_paused_result("act-1"));
+
+    let responded = machine.step(StepInput::resume(response_resolution(
+        requirement_id,
+        InteractionResponse::Permission(PermissionResponse::deny(
+            "act-1".to_owned(),
+            Some("shell is blocked by policy".to_owned()),
+        )),
+    )));
+
+    let (_, response) = respond_interaction(&responded, "act-1");
+    assert_eq!(
+        response,
+        InteractionResponse::Permission(PermissionResponse::deny(
+            "act-1".to_owned(),
+            Some("shell is blocked by policy".to_owned()),
+        ))
+    );
+}
+
+#[test]
+fn external_permission_interaction_relays_cancel() {
+    // A cancelled permission relays a cancel keyed to the paused action.
+    let (mut machine, requirement_id) = paused_on_interaction(permission_paused_result("act-1"));
+
+    let responded = machine.step(StepInput::resume(response_resolution(
+        requirement_id,
+        InteractionResponse::Permission(PermissionResponse::cancel("act-1".to_owned())),
+    )));
+
+    let (_, response) = respond_interaction(&responded, "act-1");
+    assert_eq!(
+        response,
+        InteractionResponse::Permission(PermissionResponse::cancel("act-1".to_owned()))
+    );
+}
+
+#[test]
+fn external_question_interaction_relays_answer() {
+    // An open question answer type-aligns and relays verbatim.
+    let (mut machine, requirement_id) = paused_on_interaction(paused_result("act-9"));
+
+    let responded = machine.step(StepInput::resume(response_resolution(
+        requirement_id,
+        InteractionResponse::answer("yes, run the tests".to_owned()),
+    )));
+
+    let (_, response) = respond_interaction(&responded, "act-9");
+    assert_eq!(
+        response,
+        InteractionResponse::answer("yes, run the tests".to_owned())
+    );
+}
+
+#[test]
+fn external_choice_interaction_relays_selected_index() {
+    // A choice index within the offered options is accepted and relayed.
+    let (mut machine, requirement_id) = paused_on_interaction(choice_paused_result(
+        "act-3",
+        vec!["main".to_owned(), "release".to_owned()],
+    ));
+
+    let responded = machine.step(StepInput::resume(response_resolution(
+        requirement_id,
+        InteractionResponse::Choice(1),
+    )));
+
+    let (_, response) = respond_interaction(&responded, "act-3");
+    assert_eq!(response, InteractionResponse::Choice(1));
+}
+
+#[test]
+fn interaction_result_rejected_on_action_mismatch_settles_error() {
+    // A permission response addressing a different action than the pending
+    // request is rejected into an error cursor and never relayed to the runtime.
+    let (mut machine, requirement_id) = paused_on_interaction(permission_paused_result("act-1"));
+
+    let outcome = machine.step(StepInput::resume(response_resolution(
+        requirement_id,
+        InteractionResponse::Permission(PermissionResponse::approve("act-99".to_owned())),
+    )));
+
+    assert!(outcome.is_quiescent());
+    assert!(
+        outcome.requirements.is_empty(),
+        "a rejected interaction response must not relay a RespondInteraction"
+    );
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+}
+
+#[test]
+fn interaction_result_rejected_on_choice_out_of_range_settles_error() {
+    // A choice index past the offered options is rejected into an error cursor
+    // and never relayed to the runtime.
+    let (mut machine, requirement_id) = paused_on_interaction(choice_paused_result(
+        "act-3",
+        vec!["main".to_owned(), "release".to_owned()],
+    ));
+
+    let outcome = machine.step(StepInput::resume(response_resolution(
+        requirement_id,
+        InteractionResponse::Choice(5),
+    )));
+
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+}
+
+#[test]
+fn interaction_result_rejected_on_family_mismatch_settles_error() {
+    // A wrong-family response (a free-form answer to a permission prompt) is
+    // rejected into an error cursor and never relayed to the runtime.
+    let (mut machine, requirement_id) = paused_on_interaction(permission_paused_result("act-1"));
+
+    let outcome = machine.step(StepInput::resume(response_resolution(
+        requirement_id,
+        InteractionResponse::answer("looks fine".to_owned()),
+    )));
+
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+}
+
+#[test]
+fn interaction_result_rejected_keeps_the_turn_recoverable_state() {
+    // The rejection path also discards the dangling pending turn, mirroring the
+    // machine's other `fail` transitions.
+    let (mut machine, requirement_id) = paused_on_interaction(permission_paused_result("act-1"));
+
+    machine.step(StepInput::resume(response_resolution(
+        requirement_id,
+        InteractionResponse::answer("looks fine".to_owned()),
+    )));
+
+    assert!(machine.state().conversation().pending().is_none());
 }
 
 #[test]

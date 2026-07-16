@@ -892,7 +892,7 @@ external subagent phase 与内部 subagent 的差异及保留原因:
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
 - `git diff --check` clean。
 
-### [TODO] M3-2 完善 runtime permission/question/choice 到 `NeedInteraction` 的映射
+### [DONE] M3-2 完善 runtime permission/question/choice 到 `NeedInteraction` 的映射
 
 **上下文**:
 
@@ -922,6 +922,33 @@ external subagent phase 与内部 subagent 的差异及保留原因:
   - `cargo test -p agent-lib approval_interaction_handler`
 - `cargo test -p agent-lib external_pause_then_respond_then_complete_commits_the_turn` 仍通过。
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- **根因**: `resume_interaction`(machine.rs)先前把 host 的 `RequirementResult::Interaction`
+  直接塞进 `RespondInteraction` 回灌 runtime,**从未**调用 `Interaction::accepts_response`,
+  wrong family / choice 越界 / permission `action_id` 不匹配的无效 response 会被原样转发给 runtime。
+- **state.rs**: `ExternalAgentCursor::AwaitingInteraction` 新增 `interaction: Interaction` 字段
+  (可序列化 resumable fact),保留 runtime 暂停时的 neutral `Interaction`,供 resume 前校验;
+  更新 rustdoc、cursor round-trip 测试与 `requirement()` 断言。
+- **machine.rs**:
+  - `Awaiting::Interaction` 增加 `interaction`;`resume` 从 cursor clone 后传入。
+  - `pause_for_interaction` 把 `request` clone 一份存进 cursor(另一份 emit 到 `NeedInteraction`)。
+  - `resume_interaction` 在取出 `response` 后调用 `interaction.accepts_response(&response)`;
+    校验失败 -> `self.fail(...)` error cursor(稳定诊断,只输出 `InteractionError` Display,
+    不含 transcript),**绝不**把无效 response 发给 runtime;通过才 `block_on_session` 回灌
+    `RespondInteraction`。更新模块 doc。
+- **machine/tests.rs**: 新增 permission/choice pause + response 助手,补 class-wide 单测:
+  `external_permission_interaction_relays_approve/deny/cancel`、
+  `external_question_interaction_relays_answer`、`external_choice_interaction_relays_selected_index`、
+  `interaction_result_rejected_on_action_mismatch/choice_out_of_range/family_mismatch_settles_error`
+  (断言 error cursor 且 0 RespondInteraction)、`interaction_result_rejected_keeps_the_turn_recoverable_state`。
+- **reference.rs**: 明确 `ApprovalInteractionHandler` 文档(reference/headless 默认,attended 应接真实 UI),
+  新增 `#[cfg(test)] mod tests`:`approval_interaction_handler_approves/denies_permission`、
+  `..._maps_timeout_and_cancel_to_permission_non_approval`、`..._answers_question_and_choice_trivially`、
+  `..._answers_approval_addressing_step_and_call`;每条都用 `accepts_response` 断言响应可被其 interaction 接受。
+- **验证序列 1-6 全过**: fmt clean、聚焦测试(interaction 26 passed / approval_interaction_handler 5 passed)、
+  clippy 0 warning、全套件 38 组 0 failed、doc(`-D warnings`)通过、`git diff --check` clean。
 
 ### [TODO] M3-3 支持 external runtime 的 `spawn_agent` tool bridge 特判
 

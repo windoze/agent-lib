@@ -27,16 +27,22 @@
 //! - `step(Resume(ExternalSession(Failed)))` records any retained session facts
 //!   and settles the cursor on [`Error`](ExternalAgentCursor::Error).
 //! - `step(Resume(ExternalSession(PausedForInteraction)))` records the session
-//!   facts and the paused action id, emits one
+//!   facts, the paused action id, and the neutral
+//!   [`Interaction`](crate::agent::Interaction) itself, emits one
 //!   [`NeedInteraction`](RequirementKind::NeedInteraction) for the standard
 //!   interaction pop rules to serve, and parks on
 //!   [`AwaitingInteraction`](ExternalAgentCursor::AwaitingInteraction). The
-//!   resolved [`InteractionResponse`](crate::agent::InteractionResponse) then
-//!   re-enters the session as a
+//!   host's [`InteractionResponse`](crate::agent::InteractionResponse) is
+//!   validated against that pending interaction
+//!   ([`Interaction::accepts_response`](crate::agent::Interaction::accepts_response))
+//!   before it re-enters the session as a
 //!   [`RespondInteraction`](ExternalSessionInput::RespondInteraction) that
 //!   echoes the paused action id, reparking on
 //!   [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so a turn can loop
-//!   pause↔respond until it completes or fails.
+//!   pause↔respond until it completes or fails. A response of the wrong family,
+//!   an out-of-range choice index, or a mismatched permission `action_id` is
+//!   rejected into an [`Error`](ExternalAgentCursor::Error) cursor and never
+//!   forwarded to the runtime.
 //! - `step(Resume(ExternalSession(PausedForToolCalls)))` records the session
 //!   facts and bridges every runtime [`ExternalToolCall`](super::ExternalToolCall)
 //!   into one [`NeedTool`](RequirementKind::NeedTool) requirement (minting a host
@@ -141,10 +147,12 @@ enum Awaiting {
     /// Parked on an outstanding `NeedExternalSession`.
     Session(RequirementId),
     /// Parked on an outstanding `NeedInteraction`, carrying the paused action id
-    /// echoed back through `RespondInteraction`.
+    /// echoed back through `RespondInteraction` and the neutral [`Interaction`]
+    /// the host's response is validated against before it is relayed.
     Interaction {
         requirement: RequirementId,
         pending_action: String,
+        interaction: Interaction,
     },
     /// Parked on an outstanding batch of `NeedTool` requirements. The volatile
     /// per-call correlation the resume routes against lives in the
@@ -368,9 +376,11 @@ impl ExternalAgentMachine {
             ExternalAgentCursor::AwaitingInteraction {
                 requirement,
                 pending_action,
+                interaction,
             } => Ok(Awaiting::Interaction {
                 requirement: requirement.id(),
                 pending_action: pending_action.clone(),
+                interaction: interaction.clone(),
             }),
             ExternalAgentCursor::AwaitingTool { .. } => Ok(Awaiting::Tool),
             ExternalAgentCursor::AwaitingSubagent {
@@ -391,7 +401,8 @@ impl ExternalAgentMachine {
             Ok(Awaiting::Interaction {
                 requirement,
                 pending_action,
-            }) => self.resume_interaction(requirement, pending_action, resolution),
+                interaction,
+            }) => self.resume_interaction(requirement, pending_action, interaction, resolution),
             Ok(Awaiting::Tool) => self.resume_tool(resolution),
             Ok(Awaiting::Subagent {
                 requirement,
@@ -543,6 +554,7 @@ impl ExternalAgentMachine {
             ExternalAgentCursor::AwaitingInteraction {
                 requirement: cursor_requirement.clone(),
                 pending_action: action_id,
+                interaction: request.clone(),
             },
             LoopCursor::streaming_step(in_flight.step_id, Some(cursor_requirement)),
         );
@@ -946,16 +958,33 @@ impl ExternalAgentMachine {
 
     /// Feeds a resolved interaction back into the paused session.
     ///
-    /// The resolved [`InteractionResponse`] is handed to the runtime as a fresh
-    /// [`RespondInteraction`](ExternalSessionInput::RespondInteraction) that
-    /// echoes the `pending_action` the pause carried, reparking on
+    /// The host's [`InteractionResponse`] is first validated against the
+    /// [`Interaction`] the runtime paused for via
+    /// [`Interaction::accepts_response`]: the response family must match the
+    /// request family, a [`Choice`](crate::agent::InteractionKind::Choice) index
+    /// must fall within the offered options, and a
+    /// [`Permission`](crate::agent::InteractionKind::Permission) response must
+    /// carry the same `action_id` as the pending request. A response that fails
+    /// this check is a protocol violation: the machine settles on a classified
+    /// [`Error`](ExternalAgentCursor::Error) cursor and *never* forwards the
+    /// invalid answer to the runtime.
+    ///
+    /// Only a validated [`InteractionResponse`] is handed to the runtime as a
+    /// fresh [`RespondInteraction`](ExternalSessionInput::RespondInteraction)
+    /// that echoes the `pending_action` the pause carried, reparking on
     /// [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so the session
     /// can advance to its next decision point (another pause, completion, or
     /// failure) within the same turn.
+    ///
+    /// A wrong requirement id, or a non-interaction result family, is likewise a
+    /// protocol violation that settles on an error cursor.
+    ///
+    /// [`InteractionResponse`]: crate::agent::InteractionResponse
     fn resume_interaction(
         &mut self,
         expected: RequirementId,
         pending_action: String,
+        interaction: Interaction,
         resolution: RequirementResolution,
     ) -> StepOutcome {
         if resolution.id != expected {
@@ -974,6 +1003,15 @@ impl ExternalAgentMachine {
                 ));
             }
         };
+
+        // The runtime has no contract for an ill-formed answer, so validate the
+        // response family/shape against the pending interaction before relaying
+        // it; a rejected response settles on an error cursor rather than being
+        // forwarded. The `InteractionError` `Display` is a stable diagnostic
+        // (families, indices, opaque action ids) and carries no transcript.
+        if let Err(error) = interaction.accepts_response(&response) {
+            return self.fail(format!("external interaction response rejected: {error}"));
+        }
 
         let Some(in_flight) = self.in_flight else {
             return self.fail("interaction resolved without an in-flight turn");

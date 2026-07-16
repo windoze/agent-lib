@@ -213,8 +213,13 @@ impl ReconfigHandler for ReconfigRegistryHandler {
 ///
 /// Non-approval interactions (open [`Question`](InteractionKind::Question) or
 /// [`Choice`](InteractionKind::Choice)) are answered with a trivial in-family
-/// response so the result still type-aligns with its requirement; the
-/// [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine) never emits them.
+/// response so the result still type-aligns with its requirement (an empty
+/// answer, or option index `0`); the
+/// [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine) never emits them,
+/// and an [`ExternalAgentMachine`](crate::agent::ExternalAgentMachine) validates
+/// the answer against the pending interaction before relaying it, so this
+/// reference backend is only a stand-in suitable for tests and headless
+/// defaults — an attended layer should supply a real interaction UI.
 ///
 /// A [`Permission`](InteractionKind::Permission) interaction — surfaced by an
 /// external agent runtime rather than the default machine — is answered by
@@ -375,4 +380,185 @@ where
     M: AgentMachine + ?Sized,
 {
     drain(machine, input, scope, None, ctx).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApprovalInteractionHandler;
+    use crate::agent::{
+        AgentId, ApprovalDecision, ApprovalRequirement, InteractionHandler, PermissionCategory,
+        PermissionDecision, PermissionRequest, PermissionRisk, RequirementResult,
+        context::{BudgetLimits, RunContext, TraceNodeId},
+        id::{RunId, StepId},
+        interaction::{Interaction, InteractionResponse},
+    };
+    use crate::conversation::ToolCallId;
+
+    fn run_id() -> RunId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890f1"
+            .parse()
+            .expect("run id")
+    }
+
+    fn step_id() -> StepId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890f2"
+            .parse()
+            .expect("step id")
+    }
+
+    fn agent_id() -> AgentId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890f3"
+            .parse()
+            .expect("agent id")
+    }
+
+    fn call_id() -> ToolCallId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890f4"
+            .parse()
+            .expect("tool call id")
+    }
+
+    fn context() -> RunContext {
+        RunContext::new_root(run_id(), BudgetLimits::default(), TraceNodeId::new("root"))
+    }
+
+    fn permission_request(action_id: &str) -> PermissionRequest {
+        PermissionRequest::new(
+            action_id.to_owned(),
+            agent_id(),
+            PermissionCategory::Shell,
+            "run `cargo test`".to_owned(),
+            serde_json::json!({ "command": "cargo test" }),
+            PermissionRisk::Medium,
+            Some("verify the refactor".to_owned()),
+        )
+    }
+
+    /// Fulfills `interaction` through `handler`, asserting an in-family response
+    /// the pending interaction accepts, and returns it.
+    async fn fulfilled(
+        handler: &ApprovalInteractionHandler,
+        interaction: &Interaction,
+    ) -> InteractionResponse {
+        let ctx = context();
+        let response = match handler.fulfill(interaction, &ctx).await {
+            RequirementResult::Interaction(response) => response,
+            other => panic!("interaction handler must return an Interaction result, got {other:?}"),
+        };
+        interaction
+            .accepts_response(&response)
+            .expect("the reference handler's response satisfies its interaction");
+        response
+    }
+
+    #[tokio::test]
+    async fn approval_interaction_handler_approves_permission() {
+        // `approve()` maps onto a permission approve echoing the request's action.
+        let handler = ApprovalInteractionHandler::approve();
+        let interaction = Interaction::permission(step_id(), permission_request("act-1"));
+
+        let response = fulfilled(&handler, &interaction).await;
+
+        match response {
+            InteractionResponse::Permission(permission) => {
+                assert_eq!(permission.action_id(), "act-1");
+                assert_eq!(permission.decision(), &PermissionDecision::Approve);
+            }
+            other => panic!("expected a permission response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_interaction_handler_denies_permission() {
+        // `deny()` maps onto a permission deny echoing the action and rationale.
+        let handler = ApprovalInteractionHandler::deny(Some("blocked by policy".to_owned()));
+        let interaction = Interaction::permission(step_id(), permission_request("act-1"));
+
+        let response = fulfilled(&handler, &interaction).await;
+
+        match response {
+            InteractionResponse::Permission(permission) => {
+                assert_eq!(permission.action_id(), "act-1");
+                assert_eq!(
+                    permission.decision(),
+                    &PermissionDecision::Deny {
+                        reason: Some("blocked by policy".to_owned()),
+                    }
+                );
+            }
+            other => panic!("expected a permission response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_interaction_handler_maps_timeout_and_cancel_to_permission_non_approval() {
+        // A `Timeout` folds into a permission deny; a `Cancel` into a permission
+        // cancel — both non-approving, both echoing the pending action.
+        for (decision, expected) in [
+            (
+                ApprovalDecision::Timeout,
+                PermissionDecision::Deny { reason: None },
+            ),
+            (ApprovalDecision::Cancel, PermissionDecision::Cancel),
+        ] {
+            let handler = ApprovalInteractionHandler::new(decision, None);
+            let interaction = Interaction::permission(step_id(), permission_request("act-1"));
+
+            let response = fulfilled(&handler, &interaction).await;
+
+            match response {
+                InteractionResponse::Permission(permission) => {
+                    assert_eq!(permission.action_id(), "act-1");
+                    assert_eq!(permission.decision(), &expected);
+                }
+                other => panic!("expected a permission response, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_interaction_handler_answers_question_and_choice_trivially() {
+        // Non-approval families get a trivial in-family answer that still aligns
+        // with the requirement (empty answer, option index 0).
+        let handler = ApprovalInteractionHandler::approve();
+
+        let question = Interaction::question(step_id(), "Which branch?".to_owned());
+        assert_eq!(
+            fulfilled(&handler, &question).await,
+            InteractionResponse::answer(String::new())
+        );
+
+        let choice = Interaction::choice(
+            step_id(),
+            "Pick a branch.".to_owned(),
+            vec!["main".to_owned(), "release".to_owned()],
+        );
+        assert_eq!(
+            fulfilled(&handler, &choice).await,
+            InteractionResponse::Choice(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_interaction_handler_answers_approval_addressing_step_and_call() {
+        // A degenerate approval is answered addressing the interaction's own step
+        // and tool call, carrying the configured decision.
+        let handler = ApprovalInteractionHandler::approve();
+        let interaction = Interaction::approval(
+            step_id(),
+            call_id(),
+            ApprovalRequirement::required(Some("touches src/".to_owned())),
+        );
+
+        let response = fulfilled(&handler, &interaction).await;
+
+        match response {
+            InteractionResponse::Approval(approval) => {
+                assert_eq!(approval.step_id(), step_id());
+                assert_eq!(approval.call_id(), call_id());
+                assert_eq!(approval.decision(), ApprovalDecision::Approve);
+            }
+            other => panic!("expected an approval response, got {other:?}"),
+        }
+    }
 }
