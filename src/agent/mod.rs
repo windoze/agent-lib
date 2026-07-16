@@ -14,6 +14,7 @@ pub mod approval;
 pub mod context;
 pub mod drive;
 pub mod event;
+pub mod external;
 pub mod id;
 pub mod interaction;
 pub mod machine;
@@ -41,6 +42,12 @@ pub use drive::{
 pub use event::{
     AgentError, AgentErrorKind, AgentInput, AgentUserInput, Notification, PivotMessage,
     StepBoundary, ToolCallFinished, ToolCallStarted,
+};
+pub use external::{
+    ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalArtifactKind,
+    ExternalArtifactRef, ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
+    ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
+    ExternalStreamPolicy, WorktreeIsolation,
 };
 pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};
 pub use interaction::{

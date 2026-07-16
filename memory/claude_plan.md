@@ -123,3 +123,54 @@
 - 核对：spike 仅在 examples/，src/ 自 M1 起零改动；附录 A 完整；§3.1/§5.5 spike 修正标注在。
 - TODO.md M1-3 标 [DONE]，写完成记录（含 M2 go/no-go=Go、黑盒 fallback 取舍、取消清理最小要求、成本字段结论）。M2-1 heading 完好。
 - 下一步：提交 [M1-3]，停止；下轮从 M2-1 继续。
+
+---
+
+# 本轮任务:M2-1 定义 external session DTO 模块
+
+## 定位
+- `TODO.md` 首个未完成任务 = **M2-1**(第 185 行 `[TODO]`)。M1-1/M1-2/M1-3 均 `[DONE]`。
+- HEAD=cd1d680,工作树干净。这是纯数据类型定义任务(不接 requirement/handler,那是 M2-2/M2-3)。**不拆分**。
+
+## 前置核对(已完成)
+- 复用类型确认:`AgentId`(Copy, src/agent/id.rs)、`WorktreeRef`/`ToolSetRef`(src/agent/spec.rs)、
+  `Tool`/`ToolStatus`(src/model/tool.rs,均 Eq)、`Usage`(src/model/usage.rs,Eq,手写 Deserialize)、
+  `Interaction`/`InteractionResponse`(src/agent/interaction.rs,均 Eq)。
+- 所有复用类型均 Eq,故新 DTO 可全部派生 Eq。
+- 设计 §4.2/§5.1/§5.2/§5.3/§5.4 给出目标形状。`ExternalArtifactRef` 设计未细化,自定义结构化形状。
+
+## 做什么
+- 新建 `src/agent/external/mod.rs`,`src/agent/mod.rs` 加 `pub mod external;` + 重导出。
+- 定义(全部派生 `Clone, Debug, PartialEq, Eq, Serialize, Deserialize`,`#[serde(rename_all="snake_case")]`):
+  - `ExternalRuntimeKind { ClaudeCode, Codex, OpenCode, Custom(String) }`
+  - `ExternalSessionRef { runtime, session_id, transcript_ref, resume_token, last_event_seq }`
+  - `ExternalPermissionMode`、`WorktreeIsolation { Shared/PerAgentWorktree/EphemeralGitWorktree }`、`ExternalStreamPolicy`
+  - `ExternalSessionPolicy { permission_mode, isolation, max_turns, stream_events }`
+  - `ExternalSessionInput { Start/Continue/RespondInteraction/Shutdown }`
+  - `ExternalSessionRequest { agent_id, runtime, worktree, session, input, tools, policy }`
+  - `ExternalAgentEvent`(§5.3 全部变体)
+  - `ExternalArtifactRef` + `ExternalArtifactKind`
+  - `ExternalAgentOutput { summary, artifacts, usage, cost_micros }`
+  - `ExternalSessionResult { Completed/PausedForInteraction/Failed }`
+  - `ExternalAgentError`(§5.4 全部变体)
+- 公开项写 rustdoc。**不**接 requirement/handler。
+
+## 验证门(M2-1 明确)
+- 新增单测 `external_dto_roundtrips`:`ExternalSessionRequest` + 三种 `ExternalSessionResult` serde round-trip。
+  过滤名 `cargo test --lib external_dto_roundtrips`。
+- 完整序列:fmt --check → 聚焦测试 → clippy -D warnings → cargo test --all --all-targets → cargo doc(-D warnings) → git diff --check。
+
+## 进度
+- (进行中) 已完成前置核对与设计,开始写模块。
+
+## 进度更新(M2-1 完成)
+- 新建 `src/agent/external/mod.rs`,`src/agent/mod.rs` 加 `pub mod external;` + 重导出 14 个公开类型。
+- 全部 DTO 派生 Clone/Debug/PartialEq/Eq/Serialize/Deserialize(字段皆 Eq);枚举 snake_case;
+  ExternalAgentError 另派生 thiserror::Error。补全 ExternalArtifactRef/ExternalArtifactKind、
+  ExternalPermissionMode、ExternalStreamPolicy(结构化,不偏离规格)。
+- 未接 requirement/handler(留 M2-2/M2-3),既有运行时枚举未改,零回归。
+- 完整验证序列全绿:fmt --check ✓;`cargo test --lib external_dto_roundtrips` 1 passed ✓;
+  clippy -D warnings ✓;`cargo test --all --all-targets` 全绿(lib 425、testkit 131,0 failed)✓;
+  `cargo doc -D warnings` ✓;`git diff --check` 干净 ✓。
+- TODO.md M2-1 [TODO]→[DONE] + 完成记录;M2-2 heading 完好(修复过一次误删)。PLAN.md 未改(纯 milestone 内推进)。
+- 下一步:提交 [M2-1],停止;下轮从 M2-2 继续。

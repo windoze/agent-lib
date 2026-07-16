@@ -182,7 +182,7 @@ pub trait LlmHandler: Send + Sync {
 
 ## Milestone 2 — External session DTO 与 handler(Phase 1)
 
-### [TODO] M2-1 定义 external session DTO 模块
+### [DONE] M2-1 定义 external session DTO 模块
 
 **前置依赖**:M1-3。
 
@@ -218,6 +218,34 @@ pub trait LlmHandler: Send + Sync {
 - 新增单测 `external_dto_roundtrips`:对 `ExternalSessionRequest` 与三种 `ExternalSessionResult` 做
   serde round-trip,断言相等。过滤名:`cargo test --lib external_dto_roundtrips`。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- 新建 `src/agent/external/mod.rs`(纯数据 DTO 模块),在 `src/agent/mod.rs` 加 `pub mod external;` 并重导出
+  全部公开类型(`ExternalRuntimeKind` / `ExternalSessionRef` / `ExternalPermissionMode` / `WorktreeIsolation` /
+  `ExternalStreamPolicy` / `ExternalSessionPolicy` / `ExternalSessionInput` / `ExternalSessionRequest` /
+  `ExternalAgentEvent` / `ExternalArtifactKind` / `ExternalArtifactRef` / `ExternalAgentOutput` /
+  `ExternalSessionResult` / `ExternalAgentError`)。复用类型来源核对:`AgentId`(`agent::id`,Copy)、
+  `WorktreeRef`(`agent::spec`)、`Tool`/`ToolStatus`(`model::tool`)、`Usage`(`model::usage`,均 `Eq`)、
+  `Interaction`/`InteractionResponse`(`agent::interaction`)。
+- 类型均按 §4.2/§5.1/§5.2/§5.3/§5.4 落地,全部派生 `Clone, Debug, PartialEq, Eq, Serialize, Deserialize`
+  (所有字段皆 `Eq`,故统一带 `Eq`);枚举用 `#[serde(rename_all = "snake_case")]`,与 `RequirementKind` 风格
+  一致;`Option`/`Vec` 字段加 `#[serde(default, skip_serializing_if = ...)]` 保证 round-trip 稳定。
+  `ExternalAgentError` 额外派生 `thiserror::Error`(与仓库其它错误枚举一致,提供 `Display`),不影响 serde。
+- 设计未细化处的补全(不偏离规格):`ExternalArtifactRef { kind: ExternalArtifactKind, summary, path, reference }`
+  以结构化 `kind`(Patch/Diff/TestResult/File/Other)承载 §11 的 patch/diff/test-result 记录需求,内容体
+  只放 `reference` 不内联;`ExternalPermissionMode { Prompt/AcceptEdits/Plan/BypassPermissions }` 与
+  `ExternalStreamPolicy { Buffered/Streaming/Disabled }` 为 provider-neutral 策略提示,均写明「外部输出按不可信
+  处理、不得据此放宽护栏」(§10)、「usage/cost 缺失时留 None 不冒充」(§5.4/成本量级结论)。
+- **本任务只定义数据类型**,未接入 requirement/handler(留给 M2-2/M2-3),`RequirementKind`/`RequirementResult`
+  等既有运行时枚举未改,既有语义零回归。
+- 新增单测:`external_dto_roundtrips`(`ExternalSessionRequest` + 三种 `ExternalSessionResult` serde round-trip
+  断言相等)、`external_session_result_variants_serialize_snake_case`(变体外标签为 snake_case)。
+- **验证结果(完整序列全绿)**:`cargo fmt --all -- --check` 无差异;`cargo test --lib external_dto_roundtrips`
+  1 passed;`cargo clippy --all-targets -- -D warnings` 无告警;`cargo test --all --all-targets` 全绿
+  (lib 425 passed〔+2 新测〕、testkit 131 passed、各集成/doc/replay 二进制 0 failed;仅既有 credential-gated
+  集成测试保持 ignored,与基线一致);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;
+  `git diff --check` 干净。
 
 ### [TODO] M2-2 新增 `NeedExternalSession` requirement 与结果变体
 
