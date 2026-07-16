@@ -247,7 +247,7 @@ pub trait LlmHandler: Send + Sync {
   集成测试保持 ignored,与基线一致);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;
   `git diff --check` 干净。
 
-### [TODO] M2-2 新增 `NeedExternalSession` requirement 与结果变体
+### [DONE] M2-2 新增 `NeedExternalSession` requirement 与结果变体
 
 **前置依赖**:M2-1。
 
@@ -276,6 +276,34 @@ NeedSubagent/NeedReconfigRegistry`;`RequirementKindTag`(约 131 行)与之一一
   round-trip)。过滤名:`cargo test --lib external_requirement`。
 - `cargo test --all --all-targets` 全绿(确认没有遗漏 `match` 分支破坏既有测试)。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- `src/agent/requirement.rs`:`RequirementKindTag` 增加 `ExternalSession`(`Display` → `external_session`);
+  `RequirementKind` 增加 `NeedExternalSession { request: ExternalSessionRequest }`(复用 M2-1 DTO,`serde`
+  变体名 `need_external_session`);`RequirementResult` 增加 `ExternalSession(Box<ExternalSessionResult>)`
+  (`Box` 防 enum 膨胀,`ExternalSessionResult` 是携带 observations 的大 payload)。两个 `tag()` 各加一臂。
+- `RequirementKind::accepts` 未加特例:external 只做家族 tag 对齐(与 `Reconfig` 一致),`NeedInteraction`
+  的 response 家族校验保持原样。既有变体行为与 serde tag 名零改动,纯增量。
+- 编译器指出的 exhaustive match 补齐:`src/agent/drive.rs` 的 `scope_handles`
+  (`ExternalSession => false`)与 `fulfill_with_scope`(`NeedExternalSession { .. } => None`);二者是
+  「external handler 尚未接入 `HandlerScope`」的正确增量态(接入 `external()` 访问器与分派臂属 M2-3 范围,
+  非 workaround),故当前 external requirement 会 pop 到 outer 变为 `UnhandledRequirement`。testkit 的
+  `assertions/requirements.rs::describe_requirement` 增加 `external(runtime, agent)` 摘要臂。
+- `src/agent/mod.rs`:新增的是枚举变体而非命名类型,`ExternalSessionRequest`/`ExternalSessionResult` 及
+  `RequirementKind`/`RequirementKindTag`/`RequirementResult` 均已在既有重导出列表,无需新增导出。
+- 测试:`requirement.rs` tests 的 `ALL_TAGS`(5→6)、`kind_of`/`result_of` 增加 external 分支(新增
+  `external_session_request()`/`external_session_result()` 构造子),使既有 `accepts_matrix` 与
+  `every_requirement_kind_round_trips` 自动覆盖 external;`requirement_kind_tag_display_is_stable` 补齐
+  reconfig/external 断言。新增 `external_requirement_accepts_only_external_result`(双向断言:external
+  requirement 只 accept external result,external result 只被 external requirement accept,其它均
+  `ResultKindMismatch`)、`external_requirement_tag_roundtrip`(kind/result `tag()` 一致 + `RequirementKind`
+  与 `RequirementKindTag` serde round-trip)。
+- **验证结果(完整序列全绿)**:`cargo fmt --all -- --check` 无差异;`cargo test --lib external_requirement`
+  2 passed;`cargo clippy --all-targets -- -D warnings` 无告警;`cargo test --all --all-targets` 全绿
+  (lib 427 passed〔+2 新测〕、testkit 131 passed、各集成/doc/replay 二进制 0 failed;仅既有 credential-gated
+  集成测试保持 ignored,与基线一致);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警;
+  `git diff --check` 干净。
 
 ### [TODO] M2-3 定义 `ExternalSessionHandler` trait 并接入 `HandlerScope`
 

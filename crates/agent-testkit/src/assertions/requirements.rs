@@ -243,6 +243,12 @@ fn describe_requirement(requirement: &Requirement) -> String {
         RequirementKind::NeedReconfigRegistry { tool_set } => {
             format!("reconfig(tool_set={:?})", tool_set.id())
         }
+        RequirementKind::NeedExternalSession { request } => {
+            format!(
+                "external({:?}, agent={:?})",
+                request.runtime, request.agent_id
+            )
+        }
     };
     format!("{{id={}, origin={origin}, {body}}}", requirement.id)
 }

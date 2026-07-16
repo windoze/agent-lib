@@ -497,6 +497,9 @@ fn scope_handles(scope: &dyn HandlerScope, tag: RequirementKindTag) -> bool {
         RequirementKindTag::Interaction => scope.interaction().is_some(),
         RequirementKindTag::Subagent => scope.subagent().is_some(),
         RequirementKindTag::Reconfig => scope.reconfig().is_some(),
+        // Wiring the `external()` accessor is M2-3; until then no scope offers an
+        // external-session handler and the requirement pops outward.
+        RequirementKindTag::ExternalSession => false,
     }
 }
 
@@ -529,6 +532,9 @@ async fn fulfill_with_scope(
         RequirementKind::NeedReconfigRegistry { tool_set } => {
             Some(scope.reconfig()?.fulfill(tool_set, ctx).await)
         }
+        // No external-session handler is wired into `HandlerScope` until M2-3, so
+        // this requirement is never fulfilled here and pops outward.
+        RequirementKind::NeedExternalSession { .. } => None,
     }
 }
 

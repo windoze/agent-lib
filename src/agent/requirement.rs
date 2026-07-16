@@ -30,6 +30,7 @@
 use crate::{
     agent::{
         AgentError, AgentId, ToolSetRef,
+        external::{ExternalSessionRequest, ExternalSessionResult},
         interaction::{Interaction, InteractionError, InteractionResponse},
         tool::ToolRuntimeError,
     },
@@ -139,6 +140,8 @@ pub enum RequirementKindTag {
     Subagent,
     /// Resolving a live tool registry for a queued tool-set reconfiguration.
     Reconfig,
+    /// Advancing an external coding-agent session to its next decision point.
+    ExternalSession,
 }
 
 impl fmt::Display for RequirementKindTag {
@@ -149,6 +152,7 @@ impl fmt::Display for RequirementKindTag {
             Self::Interaction => "interaction",
             Self::Subagent => "subagent",
             Self::Reconfig => "reconfig",
+            Self::ExternalSession => "external_session",
         };
         formatter.write_str(text)
     }
@@ -400,6 +404,17 @@ pub enum RequirementKind {
         /// The queued tool set whose live registry the driver must resolve.
         tool_set: ToolSetRef,
     },
+    /// Advancing an external coding-agent session (Claude Code / Codex / …).
+    ///
+    /// The driver's external-session handler (added in a later milestone)
+    /// advances the runtime to its next decision point (completed, paused for an
+    /// interaction, or failed), buffering observed events, and confirms with a
+    /// [`RequirementResult::ExternalSession`]. The machine holds no runtime
+    /// connection, so the session lives entirely on the driver side.
+    NeedExternalSession {
+        /// Provider-neutral description of the session step to advance.
+        request: ExternalSessionRequest,
+    },
 }
 
 impl RequirementKind {
@@ -412,6 +427,7 @@ impl RequirementKind {
             Self::NeedInteraction { .. } => RequirementKindTag::Interaction,
             Self::NeedSubagent { .. } => RequirementKindTag::Subagent,
             Self::NeedReconfigRegistry { .. } => RequirementKindTag::Reconfig,
+            Self::NeedExternalSession { .. } => RequirementKindTag::ExternalSession,
         }
     }
 
@@ -467,6 +483,12 @@ pub enum RequirementResult {
     /// requested tool set; `Err` reports a resolution or declaration-mismatch
     /// failure, which fails the parked turn boundary.
     Reconfig(Result<(), ToolRuntimeError>),
+    /// Result of advancing an external coding-agent session.
+    ///
+    /// Boxed to keep the enum compact: [`ExternalSessionResult`] is a large
+    /// multi-variant payload carrying buffered observations, so inlining it
+    /// would bloat every `RequirementResult` value.
+    ExternalSession(Box<ExternalSessionResult>),
 }
 
 impl RequirementResult {
@@ -479,6 +501,7 @@ impl RequirementResult {
             Self::Interaction(_) => RequirementKindTag::Interaction,
             Self::Subagent(_) => RequirementKindTag::Subagent,
             Self::Reconfig(_) => RequirementKindTag::Reconfig,
+            Self::ExternalSession(_) => RequirementKindTag::ExternalSession,
         }
     }
 }
@@ -546,7 +569,15 @@ mod tests {
         RequirementKindTag, RequirementResolution, RequirementResult, SubagentOutput,
     };
     use crate::{
-        agent::{AgentId, LlmStepMode, ToolSetRef},
+        agent::{
+            AgentId, LlmStepMode, ToolSetRef,
+            external::{
+                ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
+                ExternalSessionPolicy, ExternalSessionRequest, ExternalSessionResult,
+                ExternalStreamPolicy, WorktreeIsolation,
+            },
+            spec::WorktreeRef,
+        },
         client::{ChatRequest, Response},
         conversation::ToolCallId,
         model::tool::{Tool, ToolCall, ToolResponse, ToolStatus},
@@ -641,6 +672,39 @@ mod tests {
         Interaction::question(step_id(), "proceed?".to_owned())
     }
 
+    fn external_session_request() -> ExternalSessionRequest {
+        ExternalSessionRequest {
+            agent_id: agent_id(),
+            runtime: ExternalRuntimeKind::ClaudeCode,
+            worktree: WorktreeRef::new("/repo/agent-lib"),
+            session: None,
+            input: ExternalSessionInput::Start {
+                prompt: "Refactor the parser.".to_owned(),
+            },
+            tools: Vec::new(),
+            policy: ExternalSessionPolicy {
+                permission_mode: ExternalPermissionMode::Prompt,
+                isolation: WorktreeIsolation::Shared,
+                max_turns: Some(8),
+                stream_events: ExternalStreamPolicy::Buffered,
+            },
+        }
+    }
+
+    fn external_session_result() -> ExternalSessionResult {
+        ExternalSessionResult::PausedForInteraction {
+            session: crate::agent::external::ExternalSessionRef {
+                runtime: ExternalRuntimeKind::ClaudeCode,
+                session_id: Some("sess-1".to_owned()),
+                transcript_ref: None,
+                resume_token: None,
+                last_event_seq: Some(3),
+            },
+            request: interaction(),
+            observations: Vec::new(),
+        }
+    }
+
     fn kind_of(tag: RequirementKindTag) -> RequirementKind {
         match tag {
             RequirementKindTag::Llm => RequirementKind::NeedLlm {
@@ -662,6 +726,9 @@ mod tests {
             RequirementKindTag::Reconfig => RequirementKind::NeedReconfigRegistry {
                 tool_set: tool_set_ref(),
             },
+            RequirementKindTag::ExternalSession => RequirementKind::NeedExternalSession {
+                request: external_session_request(),
+            },
         }
     }
 
@@ -676,15 +743,19 @@ mod tests {
                 summary: "done".to_owned(),
             })),
             RequirementKindTag::Reconfig => RequirementResult::Reconfig(Ok(())),
+            RequirementKindTag::ExternalSession => {
+                RequirementResult::ExternalSession(Box::new(external_session_result()))
+            }
         }
     }
 
-    const ALL_TAGS: [RequirementKindTag; 5] = [
+    const ALL_TAGS: [RequirementKindTag; 6] = [
         RequirementKindTag::Llm,
         RequirementKindTag::Tool,
         RequirementKindTag::Interaction,
         RequirementKindTag::Subagent,
         RequirementKindTag::Reconfig,
+        RequirementKindTag::ExternalSession,
     ];
 
     fn assert_json_round_trip<T>(value: &T)
@@ -866,5 +937,72 @@ mod tests {
         assert_eq!(RequirementKindTag::Tool.to_string(), "tool");
         assert_eq!(RequirementKindTag::Interaction.to_string(), "interaction");
         assert_eq!(RequirementKindTag::Subagent.to_string(), "subagent");
+        assert_eq!(RequirementKindTag::Reconfig.to_string(), "reconfig");
+        assert_eq!(
+            RequirementKindTag::ExternalSession.to_string(),
+            "external_session"
+        );
+    }
+
+    #[test]
+    fn external_requirement_accepts_only_external_result() {
+        let kind = kind_of(RequirementKindTag::ExternalSession);
+        assert_eq!(kind.tag(), RequirementKindTag::ExternalSession);
+
+        // The external requirement accepts an external-session result.
+        assert_eq!(
+            kind.accepts(&result_of(RequirementKindTag::ExternalSession)),
+            Ok(())
+        );
+
+        // Every other result family is rejected with a classified mismatch.
+        for other in ALL_TAGS {
+            if other == RequirementKindTag::ExternalSession {
+                continue;
+            }
+            assert_eq!(
+                kind.accepts(&result_of(other)),
+                Err(RequirementError::ResultKindMismatch {
+                    expected: RequirementKindTag::ExternalSession,
+                    actual: other,
+                }),
+                "external requirement must reject {other} result"
+            );
+        }
+
+        // Conversely, an external result is only accepted by its own requirement.
+        let result = result_of(RequirementKindTag::ExternalSession);
+        for other in ALL_TAGS {
+            if other == RequirementKindTag::ExternalSession {
+                continue;
+            }
+            assert_eq!(
+                kind_of(other).accepts(&result),
+                Err(RequirementError::ResultKindMismatch {
+                    expected: other,
+                    actual: RequirementKindTag::ExternalSession,
+                }),
+                "{other} requirement must reject external result"
+            );
+        }
+    }
+
+    #[test]
+    fn external_requirement_tag_roundtrip() {
+        let kind = kind_of(RequirementKindTag::ExternalSession);
+        let result = result_of(RequirementKindTag::ExternalSession);
+
+        // Kind and result agree on the family tag.
+        assert_eq!(kind.tag(), RequirementKindTag::ExternalSession);
+        assert_eq!(result.tag(), RequirementKindTag::ExternalSession);
+
+        // The persistable requirement (kind) serde round-trips.
+        let requirement = Requirement::at_root(requirement_id("e2"), kind);
+        assert_eq!(requirement.tag(), RequirementKindTag::ExternalSession);
+        assert_json_round_trip(&requirement);
+        assert_json_round_trip(&requirement.kind);
+
+        // The tag itself round-trips as snake_case.
+        assert_json_round_trip(&RequirementKindTag::ExternalSession);
     }
 }
