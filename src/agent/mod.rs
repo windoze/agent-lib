@@ -45,13 +45,15 @@ pub use event::{
     StepBoundary, ToolCallFinished, ToolCallStarted,
 };
 pub use external::{
-    Capability, CostTier, EscalationRules, EscalationTrigger, ExternalAgentCursor,
-    ExternalAgentError, ExternalAgentEvent, ExternalAgentMachine, ExternalAgentOutput,
-    ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef,
-    ExternalPermissionMode, ExternalRuntimeHandles, ExternalRuntimeKind, ExternalSessionInput,
-    ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
-    ExternalSessionShutdown, ExternalStreamPolicy, WorkerProfile, WorkerProfileRef,
-    WorkerProfileRegistry, WorktreeIsolation, collect_file_patch_artifacts,
+    Capability, CostPreference, CostTier, DispatchError, DispatchReason, Dispatcher,
+    EscalationRules, EscalationTrigger, ExternalAgentCursor, ExternalAgentError,
+    ExternalAgentEvent, ExternalAgentMachine, ExternalAgentOutput, ExternalAgentSpec,
+    ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef, ExternalPermissionMode,
+    ExternalRuntimeHandles, ExternalRuntimeKind, ExternalSessionInput, ExternalSessionPolicy,
+    ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult, ExternalSessionShutdown,
+    ExternalStreamPolicy, ImpactScope, RuleRouter, ScriptedTaskEvaluator, TaskDescriptor,
+    TaskEvaluator, Uncertainty, Worker, WorkerChoice, WorkerProfile, WorkerProfileRef,
+    WorkerProfileRegistry, WorkerRoster, WorktreeIsolation, collect_file_patch_artifacts,
 };
 pub use external::{DiscardEventSink, ExternalEventSink};
 pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};

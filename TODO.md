@@ -1396,7 +1396,7 @@ resume 后一次性把它们转成 `Notification::ExternalAgent` 吐出(经 `Ste
   (lib 482 passed,集成全绿,仅 credential-gated ignored)✓;`RUSTDOCFLAGS="-D warnings" cargo doc
   --no-deps --workspace` 无告警 ✓;`git diff --check` 干净 ✓。
 
-### [TODO] M6-2 task evaluator 与 dispatcher
+### [DONE] M6-2 task evaluator 与 dispatcher
 
 **前置依赖**:M6-1。
 
@@ -1419,6 +1419,47 @@ resume 后一次性把它们转成 `Notification::ExternalAgent` 吐出(经 `Ste
 - 新增测试:规则路由命中(明确只读 shell → cheap worker)、回退 evaluator(模糊任务 → scripted evaluator
   决策)、预算接近上限时降级。过滤名:`cargo test dispatcher`。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- **新增 `src/agent/external/dispatch.rs`**(mixed-agent 两层调度器,re-export 到 `agent::external` 与
+  `agent`),内含调度维度、roster、router、evaluator、dispatcher 及错误类型:
+  - 维度枚举(serde;Ord where 有意义):`ImpactScope`(SingleFile<MultiFile<CrossModule<Architectural)、
+    `Uncertainty`(Clear<Exploratory<Ambiguous)、`CostPreference`(Balanced 默认 /CostFirst/SpeedFirst/
+    QualityFirst);风险维度**复用** `PermissionRisk`,任务类型**复用** `Capability`(不重复造)。
+  - `TaskDescriptor { task_type, impact, risk, uncertainty, preference }`(serde data,`new`/
+    `with_preference`/accessors);预算不落 descriptor,由 dispatcher 在派发时读 `RunContext`。
+  - `Worker { profile: WorkerProfileRef, spec: AgentSpecRef }` 把调度 profile 绑定到要派生的子 agent spec;
+    `WorkerRoster`(拥有 `WorkerProfileRegistry` + worker 列表):`register`(同 id 覆盖 profile 与 spec
+    绑定)、`resolve_worker`/`profile`、`cheapest_capable`/`strongest_capable`(按 `CostTier` 选,tie-break
+    profile id 升序,结果确定)。
+  - `RuleRouter`(确定性、有序、first-match):ambiguous→None(交 evaluator);architectural / `risk>=High` /
+    quality-first 跨模块→strongest_capable;clear&low-risk&`<=MultiFile` 或 cost-first 非高风险→
+    cheapest_capable;其余中间地带→None。
+  - `TaskEvaluator` trait(`evaluate(task,roster)->Option<WorkerProfileRef>`;LLM 版实现此 trait,留接口)+
+    `ScriptedTaskEvaluator`(closure-based,`new`/`always`;测试与宿主固定策略用)。
+  - `Dispatcher<E: TaskEvaluator>`(`new`/`with_router`/`with_budget_headroom`,默认 headroom 20%):
+    `dispatch(task,roster,ctx)` 顺序 = check_cancelled → 预算低(`budget_is_low` 用 snapshot 计算剩余额度,
+    check_* 护栏)则降级 cheapest(`BudgetDowngrade`)→ 规则路由命中则 `RuleRoute` → 否则 `charge_step`
+    计 evaluator 成本(charge_*;若 charge 触及预算上限则同样降级)→ evaluator 决策 `Evaluator`。
+  - `WorkerChoice { worker, spec, reason: DispatchReason(RuleRoute/Evaluator/BudgetDowngrade) }` +
+    `into_subagent(brief, result_schema) -> RequirementKind::NeedSubagent`——复用既有 `SubagentHandler`
+    派生路径,**不**新造 orchestration runtime。
+  - `DispatchError`(thiserror):`NoCapableWorker{capability}` / `NoWorker` / `UnknownWorker{worker}` /
+    `Context(RunContextError)`。
+- **模块接线**:`external/mod.rs` `mod dispatch;` + `pub use dispatch::{...}`;`src/agent/mod.rs` 在
+  `pub use external::{...}` 追加同名导出。所有新公开 API 带 rustdoc。
+- **测试**:`src/agent/external/dispatch/tests.rs` 15 个单测(名字含 `dispatcher`):规则路由命中 cheap
+  (明确只读 shell)、回退 scripted evaluator(模糊 debug→strong,断言计了 1 step)、预算接近上限降级、
+  evaluator charge 触上限降级、architectural→strong、cost-first→cheap、`into_subagent` 生成 NeedSubagent、
+  未注册 worker→UnknownWorker、无 capable→NoCapableWorker、evaluator decline→NoWorker、cancel→Context、
+  `TaskDescriptor` serde round-trip、`budget_is_low` 阈值、roster 同 id 覆盖、router defer ambiguous。
+- **文档**:`docs/external-agent.md` §9 追加「收敛(Milestone 6-2 已实现)」段落,记录两层调度落点与预算护栏。
+- **验证(完整序列全绿)**:`cargo fmt --all` ✓;`cargo test dispatcher` = 15 passed ✓;
+  `cargo clippy --all-targets -- -D warnings` 无告警(修正 type_complexity → `EvaluatorFn` 别名、
+  clone_on_copy → `*entry.spec()`)✓;`cargo test --all --all-targets` 无回归(lib 497 passed = 482+15,
+  集成/testkit 全绿,仅 credential-gated ignored)✓;`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --workspace` 无告警 ✓;`git diff --check` 干净 ✓。
 
 ### [TODO] M6-3 `spawn_agent` / plan / blackboard / mailbox 工具 adapter
 

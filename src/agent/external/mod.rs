@@ -60,6 +60,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod dispatch;
 mod machine;
 mod profile;
 mod runtime;
@@ -68,6 +69,11 @@ mod sink;
 mod spec;
 mod state;
 
+pub use dispatch::{
+    CostPreference, DispatchError, DispatchReason, Dispatcher, ImpactScope, RuleRouter,
+    ScriptedTaskEvaluator, TaskDescriptor, TaskEvaluator, Uncertainty, Worker, WorkerChoice,
+    WorkerRoster,
+};
 pub use machine::ExternalAgentMachine;
 pub use profile::{
     Capability, CostTier, EscalationRules, EscalationTrigger, WorkerProfile, WorkerProfileRef,

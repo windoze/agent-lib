@@ -672,6 +672,25 @@ Session root
 - review 发现架构/安全问题 -> cc/cx 或 human。
 - budget 接近上限 -> 降级到 cheap summarizer 或停机问用户。
 
+**收敛(Milestone 6-2 已实现)**:两层调度落在 `agent::external::dispatch`(re-export 到 `agent`):
+
+- `TaskDescriptor`(`task_type: Capability` / `impact: ImpactScope` / `risk: PermissionRisk` /
+  `uncertainty: Uncertainty` / `preference: CostPreference`)编码上表的评估维度;预算不落在 descriptor 上,
+  由 dispatcher 在派发时从 `RunContext` 读取,便于同一 descriptor 随预算变化重新派发。
+- `WorkerRoster` 把 `WorkerProfile`(M6-1)绑定到要派生的 `AgentSpecRef`,并提供
+  `cheapest_capable` / `strongest_capable`(按 `CostTier` 选,tie-break 用 profile id,结果确定)。
+- `RuleRouter` 是确定性规则层(有序、first-match):ambiguous 一律交给 evaluator;architectural /
+  `risk >= High` / quality-first 的跨模块工作 → strongest;clear & low-risk & `<= MultiFile`,或
+  cost-first 的非高风险工作 → cheapest;其余中间地带 → evaluator。
+- `TaskEvaluator` trait 是可插拔的第二层(LLM 版实现此 trait,留接口);`ScriptedTaskEvaluator` 供测试与
+  宿主固定策略使用。
+- `Dispatcher` 组合两层并叠加预算护栏:`check_*`(`budget().snapshot()` 计算剩余额度,低于
+  `min_budget_headroom_percent`,默认 20% 时降级到 cheapest → `DispatchReason::BudgetDowngrade`)与
+  `charge_*`(每次调用 evaluator 计一个 step,代表其 LLM 成本;若该 charge 触及预算上限则同样降级)。
+- 产物 `WorkerChoice::into_subagent(brief, result_schema)` 生成 `RequirementKind::NeedSubagent`,
+  worker 仍由既有 `SubagentHandler` 派生驱动——dispatcher **不**引入新的 orchestration runtime。
+  cheap→strong 升级与 verifier 挂点见 §9 升级规则,由 Milestone 6-4 实现。
+
 ## 10. Permission 与安全边界
 
 外部 agent 的高风险能力必须能被宿主拦截或至少记录。
