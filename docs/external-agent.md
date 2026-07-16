@@ -162,6 +162,35 @@ pub enum PermissionCategory {
 顶层可以挂真人 UI,也可以挂 headless policy。中间 external agent scope 不挂 interaction handler 时,
 权限请求自然 pop 到外层。
 
+> **最小字段集(Milestone 4 收敛)。** 上面的 `PermissionRequest` 七字段
+> (`action_id` / `actor` / `category` / `summary` / `subject` / `risk` / `reason`)即为已实现的最小字段集;
+> `reason` 为空串时归一化为 `None`。`PermissionCategory`(Shell / FileRead / FileWrite / Network /
+> SpawnAgent / Mcp / Other)与 `PermissionRisk`(Low < Medium < High < Critical,按严重度排序,便于 policy
+> 比较)随之落地。审批结果 shape 直接扩展 `InteractionResponse` 而非另立通道:
+>
+> ```rust
+> pub enum InteractionResponse {
+>     // ...既有 Approval / Answer / Choice 变体
+>     Permission(PermissionResponse),
+> }
+>
+> pub struct PermissionResponse {
+>     action_id: String,            // 回喂时须与请求一致
+>     decision: PermissionDecision,
+> }
+>
+> pub enum PermissionDecision {
+>     Approve,
+>     Deny { reason: Option<String> },
+>     Cancel,
+> }
+> ```
+>
+> 决策刻意不设独立 `Timeout` 变体:后端把 timeout 折叠为 deny-by-default(与 tool approval 侧
+> 「timeout 归入 denied tool status」一致),headless 层用 `ApprovalInteractionHandler::deny(..)` 即得安全默认。
+> `PermissionResponse.action_id` 由 `Interaction::accepts_response` 校验须与 `PermissionRequest.action_id` 相等,
+> 与 `RequirementKind::accepts` 的按族类型校验共同构成双重校验(§14 未定问题据此收敛)。
+
 ### 3.4 工具是 capability adapter
 
 External agent 可以被注入工具,但这些工具应是宿主能力的薄 adapter,不应绕过 `RunContext` 护栏。
@@ -743,7 +772,9 @@ cassette 记录点仍在 provider-neutral effect 边界:
 
 - `NeedExternalSession` 是否进入核心 `agent-lib`,还是先在上层 crate 作为 custom machine + custom driver 扩展。
 - `Notification` 是否应承载 external event,还是通过独立 app event sink 输出。
-- `InteractionKind::Permission` 的最小字段集与审批结果 shape。
+- ~~`InteractionKind::Permission` 的最小字段集与审批结果 shape。~~ **已定(Milestone 4):**
+  最小字段集为 `PermissionRequest` 七字段,审批结果为 `InteractionResponse::Permission(PermissionResponse)`
+  搭配 `PermissionDecision { Approve, Deny { reason }, Cancel }`(timeout 折叠为 deny-by-default);详见 §3.3。
 - 外部 runtime 的 session resume 能力差异如何归一化。
 - black-box 模式下如何定义“完成”和“文件改动归属”。
 - 多 external agent 同时编辑同一 worktree 时的冲突策略。

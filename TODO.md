@@ -1057,7 +1057,7 @@ interaction,提供 `approve_all`/`deny_all`/`sequence`。设计文档 §13 Phase
   136 过;`cargo test --all --all-targets` 全绿(lib 467 passed,workspace 全 0 failed;credential-gated 集成测试保持
   ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 0 告警;`git diff --check` 干净。
 
-### [TODO] M4-4 Milestone 4 Review
+### [DONE] M4-4 Milestone 4 Review
 
 **前置依赖**:M4-1..M4-3。
 
@@ -1073,6 +1073,45 @@ interaction,提供 `approve_all`/`deny_all`/`sequence`。设计文档 §13 Phase
 
 - 完整验证序列全绿,`cargo test --all --all-targets` 无回归。
 - Review 结论(含最小字段集决策)写入「完成记录」。
+
+**完成记录**:
+
+- **三处新增对齐(`InteractionKind` / `InteractionKindTag` / `InteractionResponse`)**:
+  `InteractionKind::Permission { request: PermissionRequest }`、`InteractionResponse::Permission(PermissionResponse)`、
+  `InteractionKindTag::Permission` 三者一一对应;`InteractionKind::tag()` 与 `InteractionResponse::tag()` 均含 Permission
+  臂并互相映射到同一 tag,`InteractionKindTag` 的 `Display` 渲染 `"permission"`。`Interaction::permission(..)` /
+  `InteractionResponse::permission_for(..)` 构造器齐备,serde `snake_case` round-trip 由 interaction.rs / permission.rs
+  单测覆盖。**结论:三处新增对齐,无缺失分派臂。**
+- **双重校验一致**:driver 边界 `drive::validate` → `RequirementKind::accepts`(`src/agent/requirement.rs:448`)先做
+  按族 tag 校验(`ResultKindMismatch`),再对 `NeedInteraction` 委派 `Interaction::accepts_response`
+  (`src/agent/interaction.rs:126`)。后者对 `Permission` 请求校验响应族匹配(`ResponseKindMismatch`)且
+  `PermissionResponse::action_id() == PermissionRequest::action_id()`(否则 `ActionMismatch`)。两层校验路径互不重复、
+  语义一致:type 层归 requirement,family/`action_id` 层归 interaction;`requirement.rs` 的
+  `accepts_delegates_permission_action_id_check` 与 interaction 层
+  `permission_response_action_id_mismatch_rejected` 双向覆盖。**结论:双重校验一致,无缝隙。**
+- **deny-by-default 安全默认到位**:两处 backend 共用同一 `ApprovalDecision → PermissionDecision` 映射——
+  Approve→`approve`;Deny/**Timeout**→`deny{reason:message}`;Cancel→`cancel`。timeout 折叠为 deny(与 tool approval
+  侧「timeout 归入 denied tool status」一致)。testkit `permission_from_approval`
+  (`crates/agent-testkit/src/handlers.rs:329`)与参考 headless `ApprovalInteractionHandler::fulfill` 的 Permission 臂
+  (`src/agent/drive/reference.rs:267`)映射完全一致;headless 层用 `ApprovalInteractionHandler::deny(..)` 即得
+  deny-by-default。中间 external scope 不挂 interaction handler 时权限请求按 pop 规则升到外层策略。**结论:安全默认到位。**
+- **文档 §3.3/§14 与实现一致 + 最小字段集结论回填**:§3.3 的 `PermissionRequest` 七字段
+  (`action_id`/`actor`/`category`/`summary`/`subject`/`risk`/`reason`)、`PermissionCategory`(7 variant)与实现
+  逐字一致;实现另有 `PermissionRisk`(Low<Medium<High<Critical)。原 §3.3 只给了请求侧、未给审批结果 shape,§14
+  仍把「`InteractionKind::Permission` 最小字段集与审批结果 shape」列为未定问题——本次**回填**:在 §3.3 增补审批结果
+  shape(`InteractionResponse::Permission(PermissionResponse)` + `PermissionDecision { Approve, Deny{reason}, Cancel }`,
+  刻意不设独立 Timeout 变体)与「最小字段集(Milestone 4 收敛)」结论,并在 §14 将该未定问题标注为「已定(Milestone 4)」
+  指回 §3.3。§5.1 关于 `action_id`「落地后仍是规范句柄」的前瞻说明已与实现相符,无需改动。
+- **验证结果(完整序列全绿)**:`cargo fmt --all -- --check` 无差异;`cargo clippy --all-targets -- -D warnings` 0 告警;
+  `cargo test external_agent_permission` 2 过;`cargo test --all --all-targets` 全绿(lib 467 passed、agent-testkit 136
+  passed、全部集成测试 0 failed;credential-gated 集成测试保持 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc
+  --no-deps --workspace` 0 告警;`git diff --check` 干净。**本任务仅改动设计文档与 TODO/PLAN 记录,未改编译代码,
+  故全量结果与 M4-3(commit 3e82f1c)一致,此处重跑复核仍全绿。**
+- **Milestone 4 review 结论**:permission 泛化端到端自洽(external→`InteractionKind::Permission`→interaction
+  handler→`RespondInteraction` 回喂,由 `tests/agent_external_permission.rs` approve/deny 两流覆盖),既有
+  approval/question/choice 语义未受影响(`DefaultAgentMachine` 从不 emit permission;legacy approval round-trip 保持
+  lossless)。Milestone 4 签核通过。
+
 
 ---
 
