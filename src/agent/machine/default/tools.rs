@@ -174,7 +174,7 @@ impl DefaultAgentMachine {
             running: BTreeMap::new(),
             awaiting_approval: None,
         };
-        match self.in_flight.as_mut() {
+        match self.in_flight_mut() {
             Some(in_flight) => in_flight.tools = Some(phase),
             None => {
                 return Err(StepError::Protocol(
@@ -527,14 +527,13 @@ impl DefaultAgentMachine {
             step_id, boundary, None,
         )));
 
-        if let Some(in_flight) = self.in_flight.as_mut() {
+        if let Some(in_flight) = self.in_flight_mut() {
             in_flight.tools = None;
         }
 
         let max_steps = self.state.current_loop_policy().max_steps().get();
         let steps_started = self
-            .in_flight
-            .as_ref()
+            .in_flight()
             .map_or(0, |in_flight| in_flight.steps_started);
         if steps_started >= max_steps {
             return Ok(self.fail_with_notifications(
@@ -563,7 +562,7 @@ impl DefaultAgentMachine {
                 ));
             }
         };
-        if let Some(in_flight) = self.in_flight.as_mut() {
+        if let Some(in_flight) = self.in_flight_mut() {
             in_flight.assistant_message_id = next_assistant_id;
             in_flight.steps_started += 1;
         }
@@ -614,15 +613,13 @@ impl DefaultAgentMachine {
 
     /// Returns the active tool phase, if any.
     fn tool_phase(&self) -> Option<&ToolPhase> {
-        self.in_flight
-            .as_ref()
+        self.in_flight()
             .and_then(|in_flight| in_flight.tools.as_ref())
     }
 
     /// Returns a mutable view of the active tool phase, if any.
     fn tool_phase_mut(&mut self) -> Option<&mut ToolPhase> {
-        self.in_flight
-            .as_mut()
+        self.in_flight_mut()
             .and_then(|in_flight| in_flight.tools.as_mut())
     }
 

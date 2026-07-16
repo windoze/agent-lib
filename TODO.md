@@ -435,7 +435,7 @@ Milestone 1(刀 C)关闭:内部 `Result` 层落地,`step` 最外层单点折叠,
 > **严格走落点 2**:`LoopCursor` 保持纯地址、全序列化不变;scratch 收敛成一个非序列化 enum,序列化
 > 零风险。
 
-### [TODO] M2-1 引入非序列化 `TurnScratch` enum 收拢 mid-turn scratch
+### [DONE] M2-1 引入非序列化 `TurnScratch` enum 收拢 mid-turn scratch
 
 **前置依赖**:Milestone 1 完成(在 `?` 化之后的干净基线上做)。
 
@@ -497,7 +497,61 @@ Milestone 1(刀 C)关闭:内部 `Result` 层落地,`step` 最外层单点折叠,
 
 **完成记录**:
 
-（待补充）
+严格走落点 2:`LoopCursor` / `state/cursor.rs` **完全未改**(serde 形状零变化,`git diff
+--name-only` 确认 cursor.rs 未触及),仅把两个游离的非序列化 `Option` 收敛成单个非序列化
+`scratch: TurnScratch`,对外运行时语义逐字节不变。
+
+**做了什么**:
+
+- 在 `mod.rs`(`impl PendingReconfig` 之后、struct 之前)新增非序列化(不 derive serde,与
+  `InFlight` / `PendingReconfig` 现状一致)`enum TurnScratch { None, InTurn(InFlight),
+  Reconfig(PendingReconfig) }`,rustdoc 说明其相位与 `LoopCursor` 同构、有意不入
+  `AgentState` 序列化(跨进程恢复从持久 Conversation pending + reconfig 队列重建)。
+- `DefaultAgentMachine` 结构体的 `in_flight: Option<InFlight>` + `pending_reconfig:
+  Option<PendingReconfig>` 两个字段 → 单个 `scratch: TurnScratch`;`new()` 初始化改为
+  `scratch: TurnScratch::None`。
+- 新增私有访问器(`validate_reconfig_registry` 之后):
+  - `fn in_flight(&self) -> Option<&InFlight>` / `fn in_flight_mut(&mut self) ->
+    Option<&mut InFlight>`(仅 `InTurn` 相位 `Some`)——`tools.rs` 的 `tool_phase` /
+    `tool_phase_mut` / `finish_tool_phase` / `begin_tool_phase` 与 `mod.rs` 的
+    `fold_llm_response` 全部改走这里。
+  - `fn take_pending_reconfig(&mut self) -> Option<PendingReconfig>`(仅 `Reconfig` 相位取出
+    并置 `None`,否则原样还原并返回 `None`)——替换 `resume_reconfig` 的
+    `self.pending_reconfig.take()`。
+- 各设置/清空点改为对 `TurnScratch` 的相位转移:`open_user_turn` → `InTurn(InFlight::new)`;
+  `emit_reconfig_effect` → `Reconfig(pending)`;`finalize_text_commit` / `finish_cancel` /
+  `abandon_reconfig` / `fail_with_notifications` → `TurnScratch::None`;`finish_tool_phase` 的
+  `in_flight.tools = None` 经 `in_flight_mut()` 就地转移。
+- 加 `impl TurnScratch { fn matches_cursor(&self, &LoopCursor) -> bool }` 作为「cursor 与
+  scratch 相位对齐」不变量的可测试断言辅助,带 rustdoc;因本任务尚未接入 `debug_assert!`
+  (M2-2 才在 resume 路径接线),暂标 `#[allow(dead_code)]`(注释注明 M2-2 移除)。
+
+**语义等价性核对(关键)**:
+
+- 旧模型下 during-turn `PendingReconfig::Commit` 在 `AwaitingReconfig` 时 `in_flight` 与
+  `pending_reconfig` **同时** `Some`;单枚举把它折成 `Reconfig` 会丢弃 `InFlight`。已核对:进入
+  `Reconfig` 相位后 `in_flight` **永不再被读取**(`resume_reconfig` 的 `Commit` 分支走
+  `finalize_text_commit` 直接置 `None`;`BeginTurn` 分支走 `open_user_turn` 重设 `InTurn`;
+  `abandon_reconfig` 走 `finish_cancel` 置 `None`),故合一语义安全。
+- `fail_with_notifications` 旧代码只清 `in_flight`、保留 `pending_reconfig`;新代码
+  `scratch = None` 全清。差异仅出现在「`emit_reconfig_effect` 的 `transition_cursor` 失败」这一
+  极端路径,此后 cursor 落在 `Error`(quiescent),scratch 为非序列化且此后永不再读,**非对外
+  可观测**,符合「语义零变化」。
+- `DefaultAgentMachine` 现只剩单个 `scratch: TurnScratch` 字段;`in_flight` /
+  `pending_reconfig` 两字段已删除;全部读写改走新访问器/相位转移。无测试直接引用这两个私有
+  字段(已 `grep` 确认)。
+
+**验证序列(1–6 全过)**:
+
+1. `cargo fmt --all -- --check` — 通过。
+2. `cargo test -p agent-lib --lib agent::machine::default`(聚焦)— 39 passed / 0 failed
+   (断言未改,与 M1-5 基线一致)。
+3. `cargo clippy --all-targets -- -D warnings` — 无警告。
+4. `cargo test --all --all-targets` — 全绿(36 个测试二进制,0 failed)。
+5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` — 无警告。
+6. `git diff --check` — 干净。
+- 附加:`git diff --stat -- src/**` 仅触及 `src/agent/machine/default/mod.rs`(+/-)与
+  `tools.rs`(+/-);`state/cursor.rs`、trait、drive 均未误伤,serde 形状零变化。
 
 ### [TODO] M2-2 用相位 match 消灭 resume/pivot/abandon 的 scratch 对齐防御
 

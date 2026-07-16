@@ -124,6 +124,54 @@ impl PendingReconfig {
     }
 }
 
+/// Single mid-turn scratch whose phase is isomorphic to the [`LoopCursor`]
+/// phase, replacing the two free-standing non-serialized `Option`s
+/// (`in_flight` + `pending_reconfig`) that were previously kept aligned with the
+/// cursor by implicit convention (effect-refine doc §3, 落点 2).
+///
+/// Like its [`InFlight`] and [`PendingReconfig`] payloads, this is intentionally
+/// *not* part of the serializable [`AgentState`]: a cross-process restore of a
+/// machine parked mid-turn re-drives the scratch from the persisted Conversation
+/// pending transaction and reconfiguration queue rather than deserializing it.
+#[derive(Debug)]
+enum TurnScratch {
+    /// No turn is in flight: the cursor rests in [`LoopCursor::Idle`],
+    /// [`LoopCursor::Done`], or [`LoopCursor::Error`] (or the transient
+    /// [`LoopCursor::CancelRecovery`]).
+    None,
+    /// A turn is in flight: the cursor is on [`LoopCursor::StreamingStep`],
+    /// [`LoopCursor::AwaitingTool`], or [`LoopCursor::AwaitingApproval`].
+    InTurn(InFlight),
+    /// A turn-boundary reconfiguration is parked on a registry requirement: the
+    /// cursor is on [`LoopCursor::AwaitingReconfig`].
+    Reconfig(PendingReconfig),
+}
+
+impl TurnScratch {
+    /// Reports whether this scratch's phase matches `cursor`'s phase, i.e. the
+    /// "cursor and scratch stay aligned" invariant that the single-enum shape
+    /// guarantees. Wired into `debug_assert!`s on the resume paths in M2-2.
+    #[allow(dead_code)]
+    fn matches_cursor(&self, cursor: &LoopCursor) -> bool {
+        match self {
+            Self::None => !matches!(
+                cursor,
+                LoopCursor::StreamingStep(_)
+                    | LoopCursor::AwaitingTool(_)
+                    | LoopCursor::AwaitingApproval(_)
+                    | LoopCursor::AwaitingReconfig(_)
+            ),
+            Self::InTurn(_) => matches!(
+                cursor,
+                LoopCursor::StreamingStep(_)
+                    | LoopCursor::AwaitingTool(_)
+                    | LoopCursor::AwaitingApproval(_)
+            ),
+            Self::Reconfig(_) => matches!(cursor, LoopCursor::AwaitingReconfig(_)),
+        }
+    }
+}
+
 /// Sans-io Agent machine that drives text and tool turns.
 ///
 /// See the [`machine`](crate::agent::machine) module docs for the effect-model
@@ -150,18 +198,17 @@ pub struct DefaultAgentMachine {
     /// never holds a live registry. Defaults to
     /// [`DeclaredOnlyToolRegistryResolver`].
     tool_registry_resolver: Arc<dyn ToolRegistryResolver>,
-    /// Scratch state for the turn currently in flight: the current step's
-    /// assistant message id, the count of LLM steps started this turn (for the
-    /// step limit), and the active tool phase, if any. This mirrors the legacy
-    /// segment's stack locals — it lives only while a turn is unfinished and is
-    /// therefore not part of the serializable [`AgentState`]. The cursor still
-    /// records *which* requirement the machine is stuck on.
-    in_flight: Option<InFlight>,
-    /// Deferred turn-boundary reconfiguration parked on a registry requirement.
-    /// Like [`in_flight`](Self::in_flight) this is non-serialized mid-turn
-    /// scratch; it is `Some` only while the cursor is
-    /// [`LoopCursor::AwaitingReconfig`].
-    pending_reconfig: Option<PendingReconfig>,
+    /// Single mid-turn scratch whose phase is isomorphic to the [`LoopCursor`]
+    /// phase (effect-refine doc §3, 落点 2). It carries the current turn's
+    /// [`InFlight`] state (assistant message id, LLM step count, active tool
+    /// phase) while a turn runs, and the deferred [`PendingReconfig`] while a
+    /// turn-boundary reconfiguration is parked, replacing the two free-standing
+    /// `Option`s that were previously aligned with the cursor only by implicit
+    /// convention. Like its payloads this mirrors the legacy segment's stack
+    /// locals: it lives only while a turn is unfinished and is therefore not
+    /// part of the serializable [`AgentState`]. The cursor still records *which*
+    /// requirement the machine is stuck on.
+    scratch: TurnScratch,
 }
 
 impl DefaultAgentMachine {
@@ -186,8 +233,7 @@ impl DefaultAgentMachine {
             tool_ids: Arc::new(NoToolExecutionIds),
             approval_policy: Arc::new(NoApprovalPolicy),
             tool_registry_resolver: Arc::new(DeclaredOnlyToolRegistryResolver),
-            in_flight: None,
-            pending_reconfig: None,
+            scratch: TurnScratch::None,
         }
     }
 
@@ -298,6 +344,42 @@ impl DefaultAgentMachine {
         Ok(())
     }
 
+    /// Returns the in-flight turn scratch, or `None` when no turn is running.
+    ///
+    /// The [`InFlight`] payload lives only in the [`TurnScratch::InTurn`] phase,
+    /// so this is the single read path replacing the former `self.in_flight`
+    /// field access.
+    fn in_flight(&self) -> Option<&InFlight> {
+        match &self.scratch {
+            TurnScratch::InTurn(in_flight) => Some(in_flight),
+            TurnScratch::None | TurnScratch::Reconfig(_) => None,
+        }
+    }
+
+    /// Returns a mutable view of the in-flight turn scratch, or `None` when no
+    /// turn is running.
+    fn in_flight_mut(&mut self) -> Option<&mut InFlight> {
+        match &mut self.scratch {
+            TurnScratch::InTurn(in_flight) => Some(in_flight),
+            TurnScratch::None | TurnScratch::Reconfig(_) => None,
+        }
+    }
+
+    /// Takes the deferred reconfiguration parked on a registry requirement,
+    /// resetting the scratch to [`TurnScratch::None`].
+    ///
+    /// Returns `None` (leaving the scratch untouched) when no reconfiguration is
+    /// parked, replacing the former `self.pending_reconfig.take()`.
+    fn take_pending_reconfig(&mut self) -> Option<PendingReconfig> {
+        match std::mem::replace(&mut self.scratch, TurnScratch::None) {
+            TurnScratch::Reconfig(pending) => Some(pending),
+            other => {
+                self.scratch = other;
+                None
+            }
+        }
+    }
+
     /// Opens a fresh user turn and blocks on one `NeedLlm` requirement.
     fn begin_user_turn(&mut self, user: AgentUserInput) -> Result<StepOutcome, StepError> {
         // A completed or errored turn settles the cursor at a terminal rest state
@@ -356,7 +438,7 @@ impl DefaultAgentMachine {
             user.message().clone(),
         )?;
 
-        self.in_flight = Some(InFlight::new(user.assistant_message_id()));
+        self.scratch = TurnScratch::InTurn(InFlight::new(user.assistant_message_id()));
         self.block_on_llm(user.step_id(), Vec::new())
     }
 
@@ -521,8 +603,7 @@ impl DefaultAgentMachine {
         step_id: StepId,
         response: Response,
     ) -> Result<StepOutcome, StepError> {
-        let Some(assistant_message_id) =
-            self.in_flight.as_ref().map(InFlight::assistant_message_id)
+        let Some(assistant_message_id) = self.in_flight().map(InFlight::assistant_message_id)
         else {
             return Err(StepError::Protocol(
                 "missing in-flight assistant message id for the LLM response".to_string(),
@@ -599,8 +680,7 @@ impl DefaultAgentMachine {
             .transition_cursor(LoopCursor::done(LoopDoneReason::Completed))
             .map_err(StepError::CursorTransition)?;
 
-        self.in_flight = None;
-        self.pending_reconfig = None;
+        self.scratch = TurnScratch::None;
 
         let notification = Notification::StepBoundary(StepBoundary::with_metadata(
             step_id, boundary, None, metadata,
@@ -622,7 +702,7 @@ impl DefaultAgentMachine {
 
         let tool_set = pending.application().current_tool_set().clone();
         let step_id = pending.step_id();
-        self.pending_reconfig = Some(pending);
+        self.scratch = TurnScratch::Reconfig(pending);
 
         let cursor =
             LoopCursor::awaiting_reconfig(step_id, Some(CursorRequirement::root(requirement_id)));
@@ -671,7 +751,7 @@ impl DefaultAgentMachine {
             }
         }
 
-        let Some(pending) = self.pending_reconfig.take() else {
+        let Some(pending) = self.take_pending_reconfig() else {
             return Err(StepError::Protocol(
                 "reconfig resume with no deferred reconfiguration in flight".to_string(),
             ));
@@ -767,7 +847,7 @@ impl DefaultAgentMachine {
                 .conversation_mut()
                 .cancel_pending(CancelDisposition::DiscardTurn)?;
         }
-        self.pending_reconfig = None;
+        self.scratch = TurnScratch::None;
         self.finish_cancel(step_id, CancelRecoveryReason::Cancelled)
     }
 
@@ -779,8 +859,7 @@ impl DefaultAgentMachine {
         step_id: Option<StepId>,
         reason: CancelRecoveryReason,
     ) -> Result<StepOutcome, StepError> {
-        self.in_flight = None;
-        self.pending_reconfig = None;
+        self.scratch = TurnScratch::None;
         self.state
             .transition_cursor(LoopCursor::cancel_recovery(step_id, reason))
             .map_err(StepError::CursorTransition)?;
@@ -811,7 +890,7 @@ impl DefaultAgentMachine {
                 .conversation_mut()
                 .cancel_pending(CancelDisposition::DiscardTurn);
         }
-        self.in_flight = None;
+        self.scratch = TurnScratch::None;
         if let Ok(cursor) = LoopCursor::error(message) {
             let _ = self.state.transition_cursor(cursor);
         }
