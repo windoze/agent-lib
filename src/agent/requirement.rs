@@ -29,7 +29,7 @@
 
 use crate::{
     agent::{
-        AgentError, AgentId, ToolSetRef,
+        AgentError, AgentId, RunContext, ToolSetRef,
         effect_manifest::define_effects,
         external::{ExternalSessionRequest, ExternalSessionResult},
         interaction::{Interaction, InteractionError, InteractionResponse},
@@ -361,14 +361,16 @@ impl Requirement {
     }
 }
 
-// --- Transitional macro-generated coproduct (刀 (A), milestone M3-1) ---------
+// --- Transitional macro-generated coproduct (刀 (A), milestones M3-1/M3-2) ----
 //
-// `define_effects!` renders the effect coproduct from a single manifest. For
-// now it emits only the three enums + `RequirementKindTagGen::Display` + `tag()`
-// under `*Gen` names that coexist with the hand-written definitions below. M3-2
-// asserts byte-for-byte equivalence and extends the macro to `accepts` and the
-// `drive` fan-out; M3-3 deletes the hand-written twins and promotes these to the
-// canonical names. See `crate::agent::effect_manifest` for the grammar.
+// `define_effects!` renders the effect coproduct and its handler fan-out from a
+// single manifest. It emits the three enums + `RequirementKindTagGen::Display` +
+// `tag()` (M3-1), and `accepts` + the `drive` fan-out `HandlerScopeGen` /
+// `scope_handles_gen` / `fulfill_with_scope_gen` (M3-2), all under `*Gen` /
+// `*_gen` names that coexist with the hand-written definitions below. M3-2
+// asserts byte-for-byte and behaviour equivalence (see the tests); M3-3 deletes
+// the hand-written twins and promotes these to the canonical names. See
+// `crate::agent::effect_manifest` for the grammar.
 define_effects! {
     Llm {
         tag_name: "llm",
@@ -379,6 +381,7 @@ define_effects! {
         result: Result<Response, ClientError>,
         handler: LlmHandler,
         accessor: llm,
+        fulfill: (request, *mode),
     }
     Tool {
         tag_name: "tool",
@@ -389,6 +392,7 @@ define_effects! {
         result: Result<ToolResponse, ToolRuntimeError>,
         handler: ToolHandler,
         accessor: tool,
+        fulfill: (*call_id, call),
     }
     Interaction {
         tag_name: "interaction",
@@ -398,7 +402,8 @@ define_effects! {
         result: InteractionResponse,
         handler: InteractionHandler,
         accessor: interaction,
-        accepts_check: accepts_response,
+        fulfill: (request),
+        accepts_check: request.accepts_response,
     }
     Subagent {
         tag_name: "subagent",
@@ -421,6 +426,7 @@ define_effects! {
         result: Result<(), ToolRuntimeError>,
         handler: ReconfigHandler,
         accessor: reconfig,
+        fulfill: (tool_set),
     }
     ExternalSession {
         tag_name: "external_session",
@@ -430,6 +436,7 @@ define_effects! {
         result: Box<ExternalSessionResult>,
         handler: ExternalSessionHandler,
         accessor: external,
+        fulfill: (request),
     }
 }
 
@@ -1118,12 +1125,38 @@ mod tests {
         assert_json_round_trip(&RequirementKindTag::ExternalSession);
     }
 
-    // --- Macro-generated coproduct skeleton (milestone M3-1) -----------------
+    // --- Macro-generated coproduct equivalence (milestone M3-2) --------------
     //
-    // A light smoke check that `define_effects!` renders usable twins: their
-    // `tag()`, `Display`, and `serde` behave, and one variant matches the
-    // hand-written wire form. The exhaustive kind/result/accepts equivalence
-    // matrix against the hand-written coproduct lands in M3-2.
+    // `define_effects!` renders `*Gen` twins that coexist with the hand-written
+    // coproduct. These assert the generated products are byte-for-byte and
+    // behaviour equivalent to the hand-written ones (serde, `tag()`, `accepts`);
+    // the `scope_handles` / `fulfill_with_scope` fan-out equivalence lives in
+    // `drive.rs`, next to the hand-written (private) functions it compares.
+
+    fn gen_kind_of(tag: RequirementKindTag) -> RequirementKindGen {
+        // Rebuild the generated twin from the hand-written kind's wire form. The
+        // round-trip only succeeds if the two enums share variant and field
+        // names, so it doubles as a serde-shape check.
+        let json = serde_json::to_string(&kind_of(tag)).expect("serialize hand-written kind");
+        serde_json::from_str(&json).expect("deserialize generated kind")
+    }
+
+    fn gen_result_of(tag: RequirementKindTag) -> RequirementResultGen {
+        match tag {
+            RequirementKindTag::Llm => RequirementResultGen::Llm(Ok(response())),
+            RequirementKindTag::Tool => RequirementResultGen::Tool(Ok(tool_response())),
+            RequirementKindTag::Interaction => {
+                RequirementResultGen::Interaction(InteractionResponse::Answer("yes".to_owned()))
+            }
+            RequirementKindTag::Subagent => RequirementResultGen::Subagent(Ok(SubagentOutput {
+                summary: "done".to_owned(),
+            })),
+            RequirementKindTag::Reconfig => RequirementResultGen::Reconfig(Ok(())),
+            RequirementKindTag::ExternalSession => {
+                RequirementResultGen::ExternalSession(Box::new(external_session_result()))
+            }
+        }
+    }
 
     #[test]
     fn generated_tag_display_matches_hand_written() {
@@ -1145,27 +1178,77 @@ mod tests {
     }
 
     #[test]
-    fn generated_kind_and_result_report_family_and_round_trip() {
-        let generated_kind = RequirementKindGen::NeedLlm {
-            request: chat_request(),
-            mode: LlmStepMode::NonStreaming,
-        };
-        assert!(matches!(generated_kind.tag(), RequirementKindTagGen::Llm));
+    fn generated_kind_serde_and_tag_match_hand_written_for_every_family() {
+        for tag in ALL_TAGS {
+            let hand = kind_of(tag);
+            let generated = gen_kind_of(tag);
+            // Byte-for-byte wire equivalence between the two kind enums.
+            assert_eq!(
+                serde_json::to_string(&generated).expect("serialize generated kind"),
+                serde_json::to_string(&hand).expect("serialize hand-written kind"),
+                "generated kind wire form must match hand-written for {tag}"
+            );
+            // The kind and result `tag()` accessors agree across the twin
+            // discriminants (compared via their shared `snake_case` display).
+            assert_eq!(generated.tag().to_string(), hand.tag().to_string());
+            assert_eq!(
+                gen_result_of(tag).tag().to_string(),
+                result_of(tag).tag().to_string(),
+            );
+        }
+    }
 
-        // The generated kind's wire form matches the hand-written kind for the
-        // same payload, and it serde round-trips on its own.
-        let hand_written_kind = RequirementKind::NeedLlm {
-            request: chat_request(),
-            mode: LlmStepMode::NonStreaming,
-        };
-        assert_eq!(
-            serde_json::to_value(&generated_kind).expect("serialize generated kind"),
-            serde_json::to_value(&hand_written_kind).expect("serialize hand-written kind"),
+    #[test]
+    fn generated_accepts_matches_hand_written_across_matrix() {
+        for kind_tag in ALL_TAGS {
+            for result_tag in ALL_TAGS {
+                let hand = kind_of(kind_tag).accepts(&result_of(result_tag));
+                let generated = gen_kind_of(kind_tag).accepts(&gen_result_of(result_tag));
+                assert_eq!(
+                    hand, generated,
+                    "accepts({kind_tag}, {result_tag}) must agree between hand-written and generated"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_accepts_delegates_interaction_check_like_hand_written() {
+        let permission = PermissionRequest::new(
+            "act-1".to_owned(),
+            agent_id(),
+            PermissionCategory::Shell,
+            "run tests".to_owned(),
+            json!({ "command": "cargo test" }),
+            PermissionRisk::Medium,
+            None,
         );
-        assert_json_round_trip(&generated_kind);
+        let request = Interaction::permission(step_id(), permission);
+        let hand_kind = RequirementKind::NeedInteraction {
+            request: request.clone(),
+        };
+        let gen_kind = RequirementKindGen::NeedInteraction { request };
 
-        // The runtime result twin reports its family without deriving serde.
-        let generated_result = RequirementResultGen::Llm(Ok(response()));
-        assert!(matches!(generated_result.tag(), RequirementKindTagGen::Llm));
+        // A matching approval is accepted by both twins.
+        let matching =
+            InteractionResponse::Permission(PermissionResponse::approve("act-1".to_owned()));
+        assert_eq!(
+            hand_kind.accepts(&RequirementResult::Interaction(matching.clone())),
+            gen_kind.accepts(&RequirementResultGen::Interaction(matching)),
+        );
+
+        // A mismatched action id is rejected identically, via the delegated
+        // `accepts_response` check the manifest declares for `Interaction`.
+        let mismatched =
+            InteractionResponse::Permission(PermissionResponse::deny("act-2".to_owned(), None));
+        let hand = hand_kind.accepts(&RequirementResult::Interaction(mismatched.clone()));
+        let generated = gen_kind.accepts(&RequirementResultGen::Interaction(mismatched));
+        assert_eq!(hand, generated);
+        assert!(matches!(
+            generated,
+            Err(RequirementError::Interaction(
+                InteractionError::ActionMismatch { .. }
+            ))
+        ));
     }
 }

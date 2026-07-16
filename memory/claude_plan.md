@@ -1,50 +1,64 @@
-# M3-1 — 设计 `define_effects!` 清单语法与宏骨架(与手写版并存)
+# M3-2 — 宏覆盖 `accepts` 与 `drive.rs` 扇出(第 4–7 处),并加等价性断言
 
-**当前执行 TODO.md 第一个未完成任务 = M3-1**(M1-*、M2-* 已 DONE)。刀 (A) 第一步。
+**当前执行 = TODO.md 第一个未完成任务 = M3-2**(M1-*/M2-*/M3-1 已 DONE)。刀 (A) 第二步。
 
-## 目标(设计文档 §4.2 / TODO M3-1)
-- 设计单一 effect 清单 `define_effects!` 的语法(先文档化再落宏骨架)。
-- 宏生成设计文档 §4.1 表格**第 1–3 处**:三个 coproduct enum + `RequirementKindTag::Display` + `tag()`。
-- 宏产物以**新名字** `RequirementKindGen` / `RequirementResultGen` / `RequirementKindTagGen` 与手写版**并存**,不替换(便于 M3-2 等价性断言、M3-3 替换)。
+## 目标(TODO M3-2 / design §4.2–4.4)
+- 扩展 `define_effects!` 宏体,从**同一清单**再生成设计 §4.1 表格:
+  - 第 4 处 `accepts`:`RequirementKindGen::accepts(&self, &RequirementResultGen) -> Result<(), RequirementError>`
+    (tag 对齐 + `accepts_check` 后置校验特例)。
+  - 第 5 处 `HandlerScopeGen` trait:每 family 一个访问器,默认 `None`。
+  - 第 6 处 `scope_handles_gen(&dyn HandlerScopeGen, RequirementKindTagGen) -> bool`。
+  - 第 7 处 `fulfill_with_scope_gen(&RequirementKindGen, &dyn HandlerScopeGen, &RunContext) -> Option<RequirementResult>`;
+    `needs_outer`(Subagent)生成 `None` 分支。
+- 产物仍与手写版**并存**(`*Gen` / `*_gen` 名),不删旧码(删旧码是 M3-3)。
+- 加等价性测试证明宏版 == 手写版(serde / accepts / scope_handles / fulfill_with_scope)。
 
-## 选型:`macro_rules!`(非 proc-macro crate)
-- 已用 /tmp 探针验证 `macro_rules!` 足以表达:半区 derive 差异(Kind derive serde / Result 不 derive)、
-  struct-variant(Kind) vs tuple-variant(Result) vs unit(Tag)、per-field serde 属性(result_schema 的
-  `#[serde(default, skip_serializing_if)]`)、`Box<..>` 结果、可选 `needs_outer` / `accepts_check` 标记。
-- 满足 `#![warn(missing_docs)]` + clippy `-D warnings`:宏用 `concat!`/`stringify!` 合成 doc(仿 id.rs 的
-  `define_id!`),每个 enum/变体/字段都有 doc,零 missing_docs 警告。
-- 无需新增 proc-macro crate(设计文档 §4.4 的退化路径未触发)。理由写进完成记录。
+## 关键发现(阻塞点 → 必须处理,非绕过)
+M3-1 清单**未编码 handler 调用的按值/按引用参数形状**(`fulfill(request, *mode, ..)` vs `fulfill(*call_id, call, ..)`)。
+`mode:LlmStepMode`、`call_id:ToolCallId` 是 Copy 按值传;其余按引用。design §4.3 明确承认"各 handler 参数形状差异大"。
+仅凭 `field: Ty` 无法在 `macro_rules` 里区分按值/按引用,故**必须给清单每个非 needs_outer effect 增补 `fulfill: ( args )` 子句**。
+- 这不是绕过:它是生成 `fulfill_with_scope` 的正确清单信息,与 design §4 一致。
+- 它修正了 M3-1 完成记录里"清单自 M3-1 起即终态"的乐观说法(该说法不是权威 spec;权威是 design + TODO)。
+- 在完成记录里透明记录此清单增补。
 
 ## 落点
-- 新增 `src/agent/effect_manifest.rs`:仅含 `macro_rules! define_effects` + 语法 doc + `pub(crate) use`。
-- `src/agent/mod.rs`:加 `mod effect_manifest;`。
-- `src/agent/requirement.rs`:`use` 宏并 invoke,生成三个 `*Gen`(pub,可达→无 dead_code;不从 agent/mod.rs 再导出,最小暴露面)。
-- 清单一次写全 6 个 effect(Llm/Tool/Interaction/Subagent/Reconfig/ExternalSession),含 handler/accessor/
-  needs_outer(Subagent)/accepts_check(Interaction)——M3-1 只消费 tag/kind/result 生成 1–3,M3-2 扩展宏体消费其余。
+- `src/agent/effect_manifest.rs`:matcher 增补可选 `fulfill: ( $($fulfill_arg:tt)* )`;宏体新增第 4–7 处生成,
+  用 `concat!/stringify!` 合成 doc 满足 `#![warn(missing_docs)]`。模块 doc 更新(M3-2 覆盖 4–7)。
+- `src/agent/requirement.rs`:清单每个非 needs_outer effect 加 `fulfill:` 子句;`use` 增补 `RunContext`;
+  扩展/新增 accepts+serde 等价性测试(在本文件 tests,可访问手写 accepts + *Gen)。
+- `src/agent/drive.rs`:tests 里加 scope_handles/fulfill_with_scope 等价性测试(手写 fn 私有,须在 drive.rs;
+  宏版 `*_gen` pub 从 requirement 引入)。构造覆盖 6 family 的测试替身,同时 impl `HandlerScope` + `HandlerScopeGen`。
 
-## 等价性/形状要求
-- Kind derive: `Clone, Debug, PartialEq, Serialize, Deserialize` + `#[serde(rename_all="snake_case")]`,变体名/字段/
-  serde 名与手写一致 → serde 逐字节相等(M3-2 断言)。
-- Result derive: `Clone, Debug`(不 serde)。
-- Tag derive: `Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize` + snake_case;`Display` 用 tag_name。
+## 宏技巧要点
+- accepts 的 expected/actual 直接映射到手写 `RequirementKindTag::$tag`,使错误复用手写 `RequirementError`(可 `==` 比较)。
+- accepts_check 用 `?`(经 `RequirementError::Interaction` 的 `#[from]`)自动转换;要求该 effect 单字段(仅 Interaction)。
+- fulfill_with_scope_gen 用两个互斥可选块:`$(needs_outer→None)?` 与 `$(fulfill→handler 调用)?`,每 effect 恰好命中一个。
+- HandlerScopeGen 访问器返回 `Option<&dyn crate::agent::drive::$handler>`。
+
+## 验证序列(default)
+1. `cargo fmt`  2. `cargo clippy --all-targets -- -D warnings`
+3. 聚焦:`cargo test -p agent-lib --lib requirement drive`(含新等价性测试)
+4. 全量:`cargo test --all --all-targets`(≤30min)
+5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+6. `git diff --check`
 
 ## 步骤
-- [x] 读 TODO/PLAN/design §4 + requirement.rs + drive.rs 扇出点
-- [x] /tmp 探针验证 macro_rules 方案(missing_docs + unused 干净)
-- [x] baseline: cargo test -p agent-lib agent::requirement = 13 passed
-- [ ] 写 effect_manifest.rs(宏 + 语法 doc)
-- [ ] mod 声明 + requirement.rs invoke 清单
-- [ ] 加最小 smoke test(#[cfg(test)] 用 *Gen,确保生成物可用;完整等价性留 M3-2)
-- [ ] fmt / clippy --all-targets -D warnings / cargo test -p agent-lib agent::requirement / doc -D warnings / git diff --check
-- [ ] 全量 cargo test --all --all-targets(有代码改动)
-- [ ] 写完成记录 → TODO.md 标 [DONE] → commit → 停
+- [x] 写 memory 计划(本文件)
+- [x] 扩展宏体(accepts + HandlerScopeGen + scope_handles_gen + fulfill_with_scope_gen)+ 更新模块 doc
+- [x] 清单加 fulfill 子句 + import RunContext
+- [x] cargo build 通过(先验证宏展开)
+- [x] 加等价性测试(requirement.rs + drive.rs)
+- [x] fmt / clippy / 聚焦测试 / 全量测试 / doc / git diff --check
+- [x] 写完成记录 → TODO.md 标 [DONE] → commit → 停
 
-## 验证记录(待填)
-
-## 验证记录(已填)— 全过
-1. fmt --check ✅  2. agent::requirement = 15 passed(13+2 smoke)✅  3. clippy --all-targets -D warnings ✅
-4. test --all --all-targets = 0 failed(lib 553 passed)✅  5. doc -D warnings ✅  6. git diff --check ✅
-- 选型 macro_rules(未退化 proc-macro crate);/tmp 探针先验;concat!/stringify! 合成 doc 满足 missing_docs
-- 新增 effect_manifest.rs;mod 声明;requirement.rs invoke 6-effect 清单(终态)+ 2 smoke test;手写码零删
-- 生成第 1–3 处(*Gen 三 enum + Display + tag());4–7 处留 M3-2;第 8 处不宏化
-- TODO.md M3-1 标 [DONE] + 完成记录已写(修复误删的 M3-2 heading);准备 commit;停
+## 验证记录
+- `cargo fmt --all`:通过。
+- `cargo clippy --all-targets -- -D warnings`:零告警。
+- `cargo test -p agent-lib --lib`:**556 passed / 0 failed / 0 ignored**。
+- `cargo test --all --all-targets`:全绿,36 个测试二进制全部 `test result: ok`,无失败。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`:通过。
+- `git diff --check`:无空白/冲突标记错误。
+- 新增测试:`drive::tests::generated_fan_out_matches_hand_written_across_families`,以及 `requirement.rs`
+  的 serde/`tag`/`accepts` 矩阵/`accepts_response` 委派等价性测试。
+- 说明:因 M3-1 清单未编码 handler 实参形态,按设计 §4.3 为清单新增 `fulfill: (args)` 子句并把
+  `accepts_check` 改为 `receiver.method`;手写版未删(留待 M3-3)。

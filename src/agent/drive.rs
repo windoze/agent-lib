@@ -712,16 +712,16 @@ async fn fulfill_batch(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalSessionHandler, HandlerScope, InteractionHandler, LlmHandler, ScopePop,
-        ToolHandler, drain,
+        ExternalSessionHandler, HandlerScope, InteractionHandler, LlmHandler, Pop, ReconfigHandler,
+        ScopePop, SubagentHandler, ToolHandler, drain, fulfill_with_scope, scope_handles,
     };
     use crate::{
         agent::{
             AgentError, AgentErrorKind, AgentId, AgentInput, AgentMachine, ApprovalDecision,
             ApprovalRequirement, ApprovalResponse, BudgetLimits, LlmStepMode, LoopCursor,
             LoopCursorKind, LoopDoneReason, Requirement, RequirementDisposition, RequirementId,
-            RunContext, RunId, StepInput, StepOutcome, ToolApprovalPolicy, TraceNodeId,
-            TraceNodeKind,
+            RunContext, RunId, StepInput, StepOutcome, ToolApprovalPolicy, ToolSetId, ToolSetRef,
+            TraceNodeId, TraceNodeKind,
             external::{
                 ExternalAgentOutput, ExternalPermissionMode, ExternalRuntimeKind,
                 ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef,
@@ -729,7 +729,11 @@ mod tests {
                 WorktreeIsolation,
             },
             interaction::{Interaction, InteractionKind, InteractionResponse},
-            requirement::{RequirementKind, RequirementKindTag, RequirementResult},
+            requirement::{
+                AgentSpecRef, HandlerScopeGen, RequirementKind, RequirementKindGen,
+                RequirementKindTag, RequirementKindTagGen, RequirementResult,
+                fulfill_with_scope_gen, scope_handles_gen,
+            },
             spec::WorktreeRef,
             tool::{ToolRegistry, ToolRuntimeError},
         },
@@ -1709,5 +1713,247 @@ mod tests {
             requirement_trace(&ctx, requirement_id_n(7), RequirementKindTag::Tool),
             (0, RequirementDisposition::NeverResumed)
         );
+    }
+
+    // --- M3-2: generated drive fan-out equivalence (design points 4–7) -------
+    //
+    // The hand-written `scope_handles`/`fulfill_with_scope` and their manifest
+    // twins `scope_handles_gen`/`fulfill_with_scope_gen` must route every family
+    // identically while both coexist. These ZST handlers let one scope satisfy
+    // all six families so the two fan-outs can be compared arm for arm. Each
+    // returns a fixed, matching-family result; `EqSubagent` is never invoked
+    // because `Subagent` is `needs_outer` (both paths short to `None`), so its
+    // body asserts unreachability.
+
+    struct EqLlm;
+    #[async_trait]
+    impl LlmHandler for EqLlm {
+        async fn fulfill(
+            &self,
+            _request: &ChatRequest,
+            _mode: LlmStepMode,
+            _ctx: &RunContext,
+        ) -> RequirementResult {
+            RequirementResult::Llm(Ok(response()))
+        }
+    }
+
+    struct EqTool;
+    #[async_trait]
+    impl ToolHandler for EqTool {
+        async fn fulfill(
+            &self,
+            _call_id: ToolCallId,
+            call: &ToolCall,
+            _ctx: &RunContext,
+        ) -> RequirementResult {
+            RequirementResult::Tool(Ok(ok_tool_response(call)))
+        }
+    }
+
+    struct EqInteraction;
+    #[async_trait]
+    impl InteractionHandler for EqInteraction {
+        async fn fulfill(&self, _request: &Interaction, _ctx: &RunContext) -> RequirementResult {
+            RequirementResult::Interaction(InteractionResponse::Answer("ok".to_owned()))
+        }
+    }
+
+    struct EqSubagent;
+    #[async_trait]
+    impl SubagentHandler for EqSubagent {
+        async fn fulfill(
+            &self,
+            _spec_ref: &AgentSpecRef,
+            _brief: &Interaction,
+            _result_schema: Option<&Value>,
+            _outer: &mut dyn Pop,
+            _ctx: &RunContext,
+        ) -> RequirementResult {
+            unreachable!("Subagent is needs_outer; fulfill_with_scope never calls its handler")
+        }
+    }
+
+    struct EqReconfig;
+    #[async_trait]
+    impl ReconfigHandler for EqReconfig {
+        async fn fulfill(&self, _tool_set: &ToolSetRef, _ctx: &RunContext) -> RequirementResult {
+            RequirementResult::Reconfig(Ok(()))
+        }
+    }
+
+    struct EqExternal;
+    #[async_trait]
+    impl ExternalSessionHandler for EqExternal {
+        async fn fulfill(
+            &self,
+            _request: &ExternalSessionRequest,
+            _ctx: &RunContext,
+        ) -> RequirementResult {
+            RequirementResult::ExternalSession(Box::new(external_session_result()))
+        }
+    }
+
+    static EQ_LLM: EqLlm = EqLlm;
+    static EQ_TOOL: EqTool = EqTool;
+    static EQ_INTERACTION: EqInteraction = EqInteraction;
+    static EQ_SUBAGENT: EqSubagent = EqSubagent;
+    static EQ_RECONFIG: EqReconfig = EqReconfig;
+    static EQ_EXTERNAL: EqExternal = EqExternal;
+
+    /// A scope offering a handler for every family. It implements both the
+    /// hand-written [`HandlerScope`] and its generated twin [`HandlerScopeGen`]
+    /// so one value drives both fan-out paths under test.
+    struct EqScope;
+
+    impl HandlerScope for EqScope {
+        fn llm(&self) -> Option<&dyn LlmHandler> {
+            Some(&EQ_LLM)
+        }
+        fn tool(&self) -> Option<&dyn ToolHandler> {
+            Some(&EQ_TOOL)
+        }
+        fn interaction(&self) -> Option<&dyn InteractionHandler> {
+            Some(&EQ_INTERACTION)
+        }
+        fn subagent(&self) -> Option<&dyn SubagentHandler> {
+            Some(&EQ_SUBAGENT)
+        }
+        fn reconfig(&self) -> Option<&dyn ReconfigHandler> {
+            Some(&EQ_RECONFIG)
+        }
+        fn external(&self) -> Option<&dyn ExternalSessionHandler> {
+            Some(&EQ_EXTERNAL)
+        }
+    }
+
+    impl HandlerScopeGen for EqScope {
+        fn llm(&self) -> Option<&dyn LlmHandler> {
+            Some(&EQ_LLM)
+        }
+        fn tool(&self) -> Option<&dyn ToolHandler> {
+            Some(&EQ_TOOL)
+        }
+        fn interaction(&self) -> Option<&dyn InteractionHandler> {
+            Some(&EQ_INTERACTION)
+        }
+        fn subagent(&self) -> Option<&dyn SubagentHandler> {
+            Some(&EQ_SUBAGENT)
+        }
+        fn reconfig(&self) -> Option<&dyn ReconfigHandler> {
+            Some(&EQ_RECONFIG)
+        }
+        fn external(&self) -> Option<&dyn ExternalSessionHandler> {
+            Some(&EQ_EXTERNAL)
+        }
+    }
+
+    /// Builds a representative requirement kind for `tag`.
+    fn kind_of(tag: RequirementKindTag) -> RequirementKind {
+        match tag {
+            RequirementKindTag::Llm => RequirementKind::NeedLlm {
+                request: chat_request(),
+                mode: LlmStepMode::NonStreaming,
+            },
+            RequirementKindTag::Tool => RequirementKind::NeedTool {
+                call_id: tool_call_id_n(1),
+                call: tool_call(),
+            },
+            RequirementKindTag::Interaction => RequirementKind::NeedInteraction {
+                request: Interaction::approval(
+                    step_id(),
+                    tool_call_id_n(1),
+                    ApprovalRequirement::AutoApprove,
+                ),
+            },
+            RequirementKindTag::Subagent => RequirementKind::NeedSubagent {
+                spec_ref: AgentSpecRef(agent_id()),
+                brief: Interaction::approval(
+                    step_id(),
+                    tool_call_id_n(1),
+                    ApprovalRequirement::AutoApprove,
+                ),
+                result_schema: None,
+            },
+            RequirementKindTag::Reconfig => RequirementKind::NeedReconfigRegistry {
+                tool_set: eq_tool_set(),
+            },
+            RequirementKindTag::ExternalSession => RequirementKind::NeedExternalSession {
+                request: external_session_request(),
+            },
+        }
+    }
+
+    /// A minimal tool-set reference for a `NeedReconfigRegistry` requirement.
+    fn eq_tool_set() -> ToolSetRef {
+        let id: ToolSetId = "018f0d9c-7b6a-7c12-8f31-1234567890f2"
+            .parse()
+            .expect("tool set id");
+        ToolSetRef::new(id, Vec::new())
+    }
+
+    /// Maps a hand-written family tag onto its generated twin.
+    fn gen_tag_of(tag: RequirementKindTag) -> RequirementKindTagGen {
+        match tag {
+            RequirementKindTag::Llm => RequirementKindTagGen::Llm,
+            RequirementKindTag::Tool => RequirementKindTagGen::Tool,
+            RequirementKindTag::Interaction => RequirementKindTagGen::Interaction,
+            RequirementKindTag::Subagent => RequirementKindTagGen::Subagent,
+            RequirementKindTag::Reconfig => RequirementKindTagGen::Reconfig,
+            RequirementKindTag::ExternalSession => RequirementKindTagGen::ExternalSession,
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_fan_out_matches_hand_written_across_families() {
+        let scope = EqScope;
+        let ctx = run_context();
+        let tags = [
+            RequirementKindTag::Llm,
+            RequirementKindTag::Tool,
+            RequirementKindTag::Interaction,
+            RequirementKindTag::Subagent,
+            RequirementKindTag::Reconfig,
+            RequirementKindTag::ExternalSession,
+        ];
+
+        for tag in tags {
+            // Routing predicate: the scope handles every family, so both agree
+            // `true` — but they must also agree arm for arm per family.
+            assert_eq!(
+                scope_handles(&scope, tag),
+                scope_handles_gen(&scope, gen_tag_of(tag)),
+                "scope_handles disagree for {tag}"
+            );
+
+            let kind = kind_of(tag);
+            let requirement = Requirement::at_root(requirement_id_n(1), kind.clone());
+            // Derive the generated kind through the shared wire form, proving the
+            // twin coproduct is serde-compatible with the hand-written one.
+            let json = serde_json::to_string(&kind).expect("serialize kind");
+            let kind_gen: RequirementKindGen =
+                serde_json::from_str(&json).expect("deserialize generated kind");
+
+            let hand = fulfill_with_scope(&requirement, &scope, &ctx).await;
+            let generated = fulfill_with_scope_gen(&kind_gen, &scope, &ctx).await;
+
+            // `RequirementResult` derives neither `PartialEq` nor `serde`, so the
+            // fulfilled `Option<RequirementResult>` is compared by `Debug`.
+            assert_eq!(
+                format!("{hand:?}"),
+                format!("{generated:?}"),
+                "fulfill_with_scope disagree for {tag}"
+            );
+
+            // `Subagent` is `needs_outer`: both paths route it out (`None`)
+            // rather than invoking its handler in place.
+            if tag == RequirementKindTag::Subagent {
+                assert!(hand.is_none(), "hand-written Subagent must route outward");
+                assert!(generated.is_none(), "generated Subagent must route outward");
+            } else {
+                assert!(hand.is_some(), "hand-written {tag} must fulfill in place");
+                assert!(generated.is_some(), "generated {tag} must fulfill in place");
+            }
+        }
     }
 }

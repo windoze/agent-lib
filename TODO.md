@@ -895,7 +895,7 @@ mid-turn scratch,而不是反序列化 scratch(scratch 有意非序列化)。这
 - **已知限制/边界**:第 8 处(机器内 resume 分派)明确不宏化;第 4–7 处(`accepts` + `drive.rs` 扇出)本任务
   未生成,是 M3-2 的范围。
 
-### [TODO] M3-2 宏覆盖 `accepts` 与 `drive.rs` 扇出(第 4–7 处),并加等价性断言
+### [DONE] M3-2 宏覆盖 `accepts` 与 `drive.rs` 扇出(第 4–7 处),并加等价性断言
 
 **前置依赖**:M3-1。
 
@@ -931,7 +931,28 @@ mid-turn scratch,而不是反序列化 scratch(scratch 有意非序列化)。这
 
 **完成记录**:
 
-（待补充）
+- **宏产物(第 4–7 处)**:在 `src/agent/effect_manifest.rs` 的 `define_effects!` 中新增生成:
+  - 第 4 处 `RequirementKindGen::accepts()`:先按 tag 对齐拒绝跨 family(`RequirementError::ResultKindMismatch`),
+    再对声明了 `accepts_check` 的 effect(仅 `Interaction` 的 `accepts_response`)生成后置校验分支。返回的
+    `RequirementError` 复用手写 `RequirementKindTag`,与手写版 `PartialEq` 值相等,便于 `assert_eq!`。
+  - 第 5 处 `HandlerScopeGen` trait:每 family 一个访问器,默认 `None`,借用手写的 handler trait。
+  - 第 6 处 `scope_handles_gen()`;第 7 处 `fulfill_with_scope_gen()`:带 `needs_outer` 标记的 `Subagent`
+    生成 `None` 分支(串行经 `resolve_requirement` 路由),其余 family 就地调用 handler。
+  - 产物均与手写版并存(`*Gen` / `*_gen` 命名),**未删手写版**(删除属 M3-3)。
+- **清单扩展说明(非规避,符合设计 §4.3)**:M3-1 的 manifest 只有 `field: Ty`,无法表达各 family 传给 handler 的
+  实参形态(部分按值 `*mode`/`*call_id`,部分按引用 `request`/`call`/`tool_set`)。据设计 §4.3「handler 参数形态不同」,
+  为清单新增最小化的 `fulfill: (args)` 子句,并把 `accepts_check` 改为 `receiver.method`(`request.accepts_response`)
+  以便宏在单一分支内绑定单个字段。同步更新了 `effect_manifest.rs` 的模块/宏/语法文档,更正 M3-1「清单已终态」的过度乐观表述。
+- **等价性测试**:
+  - `src/agent/requirement.rs`:替换 M3-1 冒烟测试为 M3-2 等价性测试——对 `ALL_TAGS` 的 serde JSON 逐字节相等与
+    `tag()` 相等、`ALL_TAGS × ALL_TAGS` 的 `accepts` 矩阵完全一致、`NeedInteraction` 的 `accepts_response` 委派场景。
+  - `src/agent/drive.rs`:新增 `generated_fan_out_matches_hand_written_across_families`,用覆盖全 6 family 的
+    `EqScope`(同时实现 `HandlerScope` 与 `HandlerScopeGen`)断言每个 tag 的 `scope_handles` 与
+    `fulfill_with_scope`(按 `Debug` 比较 `Option<RequirementResult>`)两版一致;`Subagent` 两版均返回 `None`,
+    覆盖 `drive.rs` 的 `expect("scope_handles confirmed a handler for this family")` 不变量(handles 与 fulfill 对同一 tag 一致)。
+- **验证**(序列 1–6 全过):`cargo fmt --all` 通过;`cargo clippy --all-targets -- -D warnings` 零告警;
+  `cargo test -p agent-lib --lib` **556 passed / 0 failed**;`cargo test --all --all-targets` 全绿(36 个测试二进制全部 ok,无失败);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 无空白错误。
 
 ### [TODO] M3-3 切换到宏产物、删除手写版、更新 external-agent 接入示例
 
