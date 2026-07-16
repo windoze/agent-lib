@@ -873,7 +873,7 @@ response } }` 把结果喂回。`Interaction`/`InteractionResponse` 在 `src/age
 
 ## Milestone 4 — Interaction permission 泛化(Phase 3)
 
-### [TODO] M4-1 新增 `InteractionKind::Permission` 与 `PermissionRequest`
+### [DONE] M4-1 新增 `InteractionKind::Permission` 与 `PermissionRequest`
 
 **前置依赖**:M3-5。
 
@@ -899,6 +899,35 @@ category: PermissionCategory, summary, subject: Value, risk: PermissionRisk, rea
 - 新增单测:`Interaction::permission` 的 tag 正确、serde round-trip。过滤名:`cargo test --lib permission`。
 - `cargo test --all --all-targets` 确认既有 interaction 测试无回归。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- **新增类型(`src/agent/permission.rs`)**:与 `approval.rs` 对称新建独立模块,interaction 层复用它。
+  `PermissionRequest { action_id: String, actor: AgentId, category: PermissionCategory, summary: String,
+  subject: serde_json::Value, risk: PermissionRisk, reason: Option<String> }`——字段集与设计文档 §3.3 一致;
+  提供 `new(..)` 构造器(空 `reason` 归一化为 `None`)与只读 accessor。`PermissionCategory { Shell, FileRead,
+  FileWrite, Network, SpawnAgent, Mcp, Other }`;`PermissionRisk { Low, Medium, High, Critical }`(派生 `Ord`,
+  least→most severe,便于 M4-3 的 deny-by-default 阈值比较);两枚举均 `#[serde(rename_all = "snake_case")]` 并实现
+  `Display`。经 `pub use permission::{PermissionCategory, PermissionRequest, PermissionRisk}` 从 `agent` re-export。
+- **`InteractionKind` 扩展**:新增 `Permission { request: PermissionRequest }`;`InteractionKind::tag()` 增补
+  `Permission => InteractionKindTag::Permission`。`InteractionKindTag` 新增 `Permission` variant 并补齐 `Display`
+  ("permission")。新增构造器 `Interaction::permission(step_id, request)`。`Approval` 家族完全不变(仍绑 `ToolCallId`,
+  服务本框架 tool approval)。`serde_json::Value` 已实现 `Eq`(`ToolCall` 亦 derive `Eq` 且含 `Value`),故
+  `PermissionRequest`/`InteractionKind`/`Interaction` 的 `Eq` 派生不受影响。
+- **响应侧留待 M4-2/M4-3(无 workaround)**:M4-1 仅落 request 侧,`InteractionResponse` 尚无 `Permission` 变体。
+  `Interaction::accepts_response` 的 catch-all 臂天然把任何响应对 `Permission` 请求判为 `ResponseKindMismatch`,无需改。
+  既有 auto-responder 的穷尽 `match request.kind()` 因新增 variant 需补 `Permission` 臂;因当前没有合法 permission
+  响应可返,统一补 `panic!` 且注明去向:`drive/reference.rs` `ApprovalInteractionHandler` 与
+  `agent-testkit/handlers.rs` `approval_response` 的真实 deny-by-default 由 **M4-3** 追踪替换;`drive.rs` 与
+  `subagent/tests.rs` 内的测试 handler 永不收到 `Permission`,panic 臂长期有效(与既有 "never approvals" 风格一致)。
+  `examples/agent_chat.rs` 的 `StdinApproval` 亦补 panic 臂(DefaultAgentMachine 从不 emit permission)。
+- **新增单测**:`permission.rs` 5 个(request round-trip / category+risk round-trip / risk 排序 / 空 reason 归一化 /
+  Display snake_case);`interaction.rs` 1 个(`Interaction::permission` tag 为 `Permission` 且 serde round-trip)。
+  `cargo test --lib permission` 命中 6 个全过。
+- **验证结果(完整序列全绿)**:`cargo fmt --all` 无差异;`cargo clippy --all-targets -- -D warnings` 0 告警;
+  `cargo test --lib permission` 6 过;`cargo test --all --all-targets` 全绿(total 678 passed,0 failed;
+  credential-gated 集成测试保持 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 0 告警;
+  `git diff --check` 干净。
 
 ### [TODO] M4-2 扩展 `InteractionResponse` 的 permission 响应并校验
 

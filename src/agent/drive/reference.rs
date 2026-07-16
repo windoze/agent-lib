@@ -255,6 +255,9 @@ impl InteractionHandler for ApprovalInteractionHandler {
             }
             InteractionKind::Question { .. } => InteractionResponse::answer(String::new()),
             InteractionKind::Choice { .. } => InteractionResponse::Choice(0),
+            InteractionKind::Permission { .. } => {
+                panic!("permission interactions are wired in milestone 4.3")
+            }
         };
         RequirementResult::Interaction(response)
     }

@@ -30,6 +30,7 @@ use crate::{
     agent::{
         StepId,
         approval::{ApprovalRequirement, ApprovalResponse},
+        permission::PermissionRequest,
     },
     conversation::ToolCallId,
 };
@@ -83,6 +84,12 @@ impl Interaction {
     #[must_use]
     pub fn choice(step_id: StepId, prompt: String, options: Vec<String>) -> Self {
         Self::new(step_id, InteractionKind::Choice { prompt, options })
+    }
+
+    /// Creates a permission interaction for a privileged agent action.
+    #[must_use]
+    pub fn permission(step_id: StepId, request: PermissionRequest) -> Self {
+        Self::new(step_id, InteractionKind::Permission { request })
     }
 
     /// Returns the step awaiting this interaction.
@@ -175,6 +182,15 @@ pub enum InteractionKind {
         /// Ordered options the "user" selects from by index.
         options: Vec<String>,
     },
+    /// A request to allow a privileged agent action (shell, edit, network,
+    /// sub-agent spawn, MCP, ...).
+    ///
+    /// Unlike [`Approval`](Self::Approval), a permission is not bound to a
+    /// framework tool call; it carries a provider-neutral [`PermissionRequest`].
+    Permission {
+        /// The privileged action awaiting a decision.
+        request: PermissionRequest,
+    },
 }
 
 impl InteractionKind {
@@ -185,6 +201,7 @@ impl InteractionKind {
             Self::Approval { .. } => InteractionKindTag::Approval,
             Self::Question { .. } => InteractionKindTag::Question,
             Self::Choice { .. } => InteractionKindTag::Choice,
+            Self::Permission { .. } => InteractionKindTag::Permission,
         }
     }
 }
@@ -280,6 +297,8 @@ pub enum InteractionKindTag {
     Question,
     /// Fixed-option choice.
     Choice,
+    /// Privileged-action permission request.
+    Permission,
 }
 
 impl fmt::Display for InteractionKindTag {
@@ -288,6 +307,7 @@ impl fmt::Display for InteractionKindTag {
             Self::Approval => "approval",
             Self::Question => "question",
             Self::Choice => "choice",
+            Self::Permission => "permission",
         };
         formatter.write_str(text)
     }
@@ -468,6 +488,31 @@ mod tests {
                 actual: InteractionKindTag::Choice,
             })
         );
+    }
+
+    #[test]
+    fn permission_interaction_has_permission_tag_and_round_trips() {
+        use crate::agent::{
+            AgentId,
+            permission::{PermissionCategory, PermissionRequest, PermissionRisk},
+        };
+
+        let actor: AgentId = "018f0d9c-7b6a-7c12-8f31-1234567890c1"
+            .parse()
+            .expect("agent id");
+        let request = PermissionRequest::new(
+            "act-1".to_owned(),
+            actor,
+            PermissionCategory::Shell,
+            "run tests".to_owned(),
+            serde_json::json!({ "command": "cargo test" }),
+            PermissionRisk::Medium,
+            None,
+        );
+        let interaction = Interaction::permission(step_id(), request);
+
+        assert_eq!(interaction.kind().tag(), InteractionKindTag::Permission);
+        assert_json_round_trip(&interaction);
     }
 
     #[test]

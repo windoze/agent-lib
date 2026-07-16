@@ -308,6 +308,9 @@ fn approval_response(
         ),
         InteractionKind::Question { .. } => InteractionResponse::answer(String::new()),
         InteractionKind::Choice { .. } => InteractionResponse::Choice(0),
+        InteractionKind::Permission { .. } => {
+            panic!("permission interactions are wired in milestone 4.3")
+        }
     }
 }
 

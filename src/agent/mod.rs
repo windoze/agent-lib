@@ -18,6 +18,7 @@ pub mod external;
 pub mod id;
 pub mod interaction;
 pub mod machine;
+pub mod permission;
 mod request;
 pub mod requirement;
 pub mod spec;
@@ -57,6 +58,7 @@ pub use interaction::{
 };
 pub use machine::{AgentMachine, DefaultAgentMachine, StepInput, StepOutcome};
 pub use machine::{MachineTreeState, NestedMachine, NestedMachineError};
+pub use permission::{PermissionCategory, PermissionRequest, PermissionRisk};
 pub use requirement::{
     AgentPath, AgentSlot, AgentSpecRef, LlmStepMode, NoRequirementIds, Requirement,
     RequirementError, RequirementId, RequirementIds, RequirementKind, RequirementKindTag,

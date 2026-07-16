@@ -975,6 +975,9 @@ mod tests {
                 }
                 InteractionKind::Question { .. } => InteractionResponse::answer("ok".to_owned()),
                 InteractionKind::Choice { .. } => InteractionResponse::Choice(0),
+                InteractionKind::Permission { .. } => {
+                    panic!("test interactions are approvals, never permissions")
+                }
             };
             RequirementResult::Interaction(response)
         }
@@ -1277,6 +1280,9 @@ mod tests {
                 }
                 InteractionKind::Question { .. } => InteractionResponse::answer("ok".to_owned()),
                 InteractionKind::Choice { .. } => InteractionResponse::Choice(0),
+                InteractionKind::Permission { .. } => {
+                    panic!("test interactions are approvals, never permissions")
+                }
             };
             RequirementResult::Interaction(response)
         }

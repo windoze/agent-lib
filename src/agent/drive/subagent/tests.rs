@@ -296,6 +296,9 @@ impl InteractionHandler for CountingInteractionHandler {
             InteractionKind::Approval { .. } => {
                 panic!("test interactions are questions, never approvals")
             }
+            InteractionKind::Permission { .. } => {
+                panic!("test interactions are questions, never permissions")
+            }
         };
         RequirementResult::Interaction(response)
     }

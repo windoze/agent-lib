@@ -1,6 +1,6 @@
 # M4-1 — 新增 `InteractionKind::Permission` 与 `PermissionRequest`
 
-**状态:进行中。**
+**状态:完成(已全绿,已提交)。**
 
 ## 目标(TODO.md M4-1)
 - 新增 `PermissionRequest`、`PermissionCategory`、`PermissionRisk`(Low/Medium/High/Critical)类型。
@@ -29,9 +29,9 @@
 - src/agent/drive/subagent/tests.rs `CountingInteractionHandler`(测试,长期 panic)
 
 ## 步骤
-1. [ ] 新建 `src/agent/permission.rs`(3 类型 + 构造器 + serde round-trip 单测)。
-2. [ ] mod.rs 挂 `pub mod permission;` + re-export。
-3. [ ] interaction.rs:加 `Permission` variant / `Interaction::permission` / tag / Tag / Display / 单测。
-4. [ ] 补 4 处 exhaustive match 的 Permission 臂。
-5. [ ] fmt → clippy(-D warnings)→ `cargo test --lib permission` → `cargo test --all --all-targets` → doc → git diff --check。
-6. [ ] TODO.md 标 [DONE] + 完成记录;提交 `[M4-1] ...`;停止。
+1. [x] 新建 `src/agent/permission.rs`(3 类型 + 构造器 + serde round-trip 单测)。
+2. [x] mod.rs 挂 `pub mod permission;` + re-export。
+3. [x] interaction.rs:加 `Permission` variant / `Interaction::permission` / tag / Tag / Display / 单测。
+4. [x] 补 4 处 exhaustive match 的 Permission 臂。
+5. [x] fmt → clippy(-D warnings)→ `cargo test --lib permission` → `cargo test --all --all-targets` → doc → git diff --check。
+6. [x] TODO.md 标 [DONE] + 完成记录;提交 `[M4-1] ...`;停止。

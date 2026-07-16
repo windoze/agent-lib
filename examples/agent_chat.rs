@@ -238,9 +238,12 @@ impl InteractionHandler for StdinApproval {
                     None,
                 ))
             }
-            // The default machine never emits open questions/choices.
+            // The default machine never emits open questions/choices/permissions.
             InteractionKind::Question { .. } => InteractionResponse::answer(String::new()),
             InteractionKind::Choice { .. } => InteractionResponse::Choice(0),
+            InteractionKind::Permission { .. } => {
+                panic!("the default machine never emits permission interactions")
+            }
         };
         RequirementResult::Interaction(response)
     }
