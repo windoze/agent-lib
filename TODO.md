@@ -278,7 +278,7 @@ fn step(&mut self, input: StepInput) -> StepOutcome {
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过；`git diff --check` 干净。
   `git diff --stat` 源码改动仅限 `src/agent/machine/default/`（未触及 trait/drive/cursor/state）。
 
-### [TODO] M1-4 把 `tools.rs` 的纯失败路径改为 `?`,保留带副产品失败
+### [DONE] M1-4 把 `tools.rs` 的纯失败路径改为 `?`,保留带副产品失败
 
 **前置依赖**:M1-3。
 
@@ -309,17 +309,46 @@ notification,如 `emit_tool_batch` / `emit_approval` 里的 requirement-id-unava
 - 复核 `mod.rs` 里调用 `tools.rs` 方法的点(`fold_llm_response` 调 `begin_tool_phase`/`commit_text_turn`;
   `resume` 调 `resume_tool`/`resume_approval`),确保 `Result` 链贯通。
 
-**验证条件**:
-
-- `tools.rs` 的纯失败路径不再是 `if let Err(..) return self.fail(..)`;带副产品失败仍显式
-  `fail_with_notifications` 且 notification 逐字节保留(现有 `tests/tools.rs` 里对
-  `ToolCallStarted`/`ToolCallFinished`/`StepBoundary` 的断言不变)。
-- `cargo test -p agent-lib agent::machine::default::tests::tools` 全绿。
-- 完整验证序列 1–6 全过。
-
 **完成记录**:
 
-（待补充）
+- `tools.rs` 8 个返回 `StepOutcome` 的方法统一改签名为 `Result<StepOutcome, StepError>`:
+  `begin_tool_phase`、`advance_tool_phase`、`emit_tool_batch`、`emit_approval`、`resume_tool`、
+  `resume_approval`、`finish_tool_phase`、`abandon_tool_phase`;新增 `use super::error::StepError;`。
+  `pending_tool_calls` 保留 `Result<Vec<ToolCall>, String>`(调用点 `.map_err(StepError::Protocol)?`)。
+- **纯失败路径**(尚未产出 notification 就失败)已 `?` 化,不再是 `if let Err(..) return self.fail(..)`:
+  - `register_tool_calls` / `append_tool_response`(×2) / `cancel_pending` 均返回 `ConversationError`,
+    直接裸 `?`,经 `From<ConversationError> → StepError::Conversation` 渲染
+    `"conversation operation failed: {e}"`,文案逐字节不变。
+  - `pending_tool_calls`(`Err(String)`)、`in_flight` 缺失、`tool phase advanced without an active phase`、
+    `tool result resumed ...`、`resume targets requirement ... not an in-flight tool call`、
+    `NeedTool/NeedInteraction ... cannot accept`、`` tool `{}` failed ``(StopRun)、approval 各校验失败等,
+    改为 `return Err(StepError::Protocol(..))`,文案与旧 `self.fail(..)` 一致。
+  - `tool_ids.tool_call_id` / `tool_result_message_id` 因 `StepError::ToolRuntime` 渲染前缀是
+    `"tool runtime operation failed"`(≠ 现有 `"tool id unavailable"`,且 `tests/mod.rs:386` 断言该文案),
+    改用 `.map_err(|e| StepError::Protocol(format!("tool id unavailable: {e}")))?` 保留原文案。
+  - `accepts_response` / `ApprovalResponse::try_from` 同理用
+    `.map_err(|e| StepError::Protocol(format!("interaction result rejected: {e}")))?`。
+- **带副产品失败**(已在同一 step 内产出 notification)仍走显式
+  `return Ok(self.fail_with_notifications(notifications, ..))` 在方法内**就地折叠**,不向上抛
+  `StepError`(避免经 `step()` 的 `fail_from` 丢 notification):共 10 处——`emit_tool_batch`
+  (requirement-id / cursor build / cursor transition)、`emit_approval`(requirement-id / cursor
+  transition)、`resume_approval` 拒绝分支(cursor build / cursor transition)、`finish_tool_phase`
+  (step-limit / next_step_id / next_assistant_message_id)。notification 逐字节保留。
+- `finish_tool_phase`→`block_on_llm`、`abandon_tool_phase`→`finish_cancel` 两处 M1-3 遗留的
+  `.unwrap_or_else(|error| self.fail_from(error))` 局部折叠**已消除**,改为直接传播
+  (`self.block_on_llm(..)` / `self.finish_cancel(..)`),连同 `// M1-4 will make this method return
+  Result ...` 注释一并删除。`block_on_llm` 失败经 `step()` 的 `fail_from` 折叠——与旧局部 `fail_from`
+  同样丢弃 notification,语义等价。
+- `mod.rs` 4 处调用点去掉临时 `Ok(..)` 包裹,让 `Result` 链贯通:`fold_llm_response`→
+  `begin_tool_phase`、`resume`→`resume_tool`/`resume_approval`、`abandon`→`abandon_tool_phase`。
+- 至此 `tools.rs` 内**不再有** `self.fail(..)`(仅剩 10 处带副产品的 `fail_with_notifications`);
+  `fail_from` 只存活于 `mod.rs` `step()` 最外层——刀 (C) 的单一折叠点契约完整。同步在 `error.rs`
+  模块 doc 追加一句 M1-4 已把 `Result` 层贯通到 `tools`。
+- 验证(完整序列 1–6 全过):`cargo fmt --all -- --check` 干净;
+  `cargo test -p agent-lib --lib agent::machine::default` 39 passed / 0 failed(**断言未改**);
+  `cargo clippy --all-targets -- -D warnings` 无告警;`cargo test --all --all-targets` 全绿;
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` 干净。
+  源码改动仅限 `src/agent/machine/default/`(`tools.rs` / `mod.rs` / `error.rs` doc)。
 
 ### [TODO] M1-5 Milestone 1 review:刀 (C) 正确性与完整性
 

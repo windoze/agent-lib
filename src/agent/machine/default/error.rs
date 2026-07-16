@@ -16,7 +16,10 @@
 //!
 //! M1-2 wired the variants into the machine's fallible methods; M1-3 collapsed
 //! the fold back into `LoopCursor::Error` to a single `fail_from` call at the
-//! outermost `step()` boundary.
+//! outermost `step()` boundary. M1-4 extended the `Result` layer through
+//! [`tools`](super::tools): its pure failure paths now propagate with `?`, while
+//! failures that already emitted notifications this step fold in place via
+//! `fail_with_notifications` so those side-products are preserved.
 
 use crate::{
     agent::{AgentStateError, RequirementError, ToolRuntimeError},

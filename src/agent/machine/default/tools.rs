@@ -42,6 +42,7 @@
 //!   mid-turn resumption is a driver/persistence concern deferred to M3+.
 
 use super::DefaultAgentMachine;
+use super::error::StepError;
 use crate::{
     agent::{
         ApprovalDecision, ApprovalRequirement, ApprovalResponse, CancelRecoveryReason,
@@ -126,36 +127,32 @@ impl DefaultAgentMachine {
     /// by approval policy, then advances to the first blocking point. Entered
     /// with the cursor on [`LoopCursor::StreamingStep`] (the LLM step that
     /// produced the calls).
-    pub(super) fn begin_tool_phase(&mut self, step_id: StepId) -> StepOutcome {
-        let calls = match self.pending_tool_calls() {
-            Ok(calls) => calls,
-            Err(message) => return self.fail(message),
-        };
+    pub(super) fn begin_tool_phase(&mut self, step_id: StepId) -> Result<StepOutcome, StepError> {
+        let calls = self.pending_tool_calls().map_err(StepError::Protocol)?;
 
         // Map provider ids → framework ids and register the open calls.
         let mut mappings = Vec::with_capacity(calls.len());
         let mut call_ids = Vec::with_capacity(calls.len());
         for call in &calls {
-            match self.tool_ids.tool_call_id(call) {
-                Ok(call_id) => {
-                    mappings.push(ToolCallMapping::new(call.id.clone(), call_id));
-                    call_ids.push(call_id);
-                }
-                Err(error) => return self.fail(format!("tool id unavailable: {error}")),
-            }
+            let call_id = self
+                .tool_ids
+                .tool_call_id(call)
+                .map_err(|error| StepError::Protocol(format!("tool id unavailable: {error}")))?;
+            mappings.push(ToolCallMapping::new(call.id.clone(), call_id));
+            call_ids.push(call_id);
         }
-        if let Err(error) = self.state.conversation_mut().register_tool_calls(mappings) {
-            return self.fail(format!("conversation operation failed: {error}"));
-        }
+        self.state
+            .conversation_mut()
+            .register_tool_calls(mappings)?;
 
         // Build one slot per call, split by approval requirement.
         let mut auto_pending = Vec::new();
         let mut approval_pending = VecDeque::new();
         for (call, call_id) in calls.into_iter().zip(call_ids) {
-            let result_message_id = match self.tool_ids.tool_result_message_id(call_id, &call) {
-                Ok(id) => id,
-                Err(error) => return self.fail(format!("tool id unavailable: {error}")),
-            };
+            let result_message_id = self
+                .tool_ids
+                .tool_result_message_id(call_id, &call)
+                .map_err(|error| StepError::Protocol(format!("tool id unavailable: {error}")))?;
             let approval = self.approval_policy.approval_requirement(call_id, &call);
             let slot = ToolSlot {
                 provider_call_id: call.id.clone(),
@@ -179,7 +176,11 @@ impl DefaultAgentMachine {
         };
         match self.in_flight.as_mut() {
             Some(in_flight) => in_flight.tools = Some(phase),
-            None => return self.fail("tool phase opened without an in-flight turn"),
+            None => {
+                return Err(StepError::Protocol(
+                    "tool phase opened without an in-flight turn".to_owned(),
+                ));
+            }
         }
 
         self.advance_tool_phase(Vec::new())
@@ -190,9 +191,14 @@ impl DefaultAgentMachine {
     /// `notifications` carries any events produced earlier in the same step (for
     /// example the [`ToolCallFinished`] that unblocked this advance) so they ride
     /// out with the next requirement or step boundary.
-    fn advance_tool_phase(&mut self, notifications: Vec<Notification>) -> StepOutcome {
+    fn advance_tool_phase(
+        &mut self,
+        notifications: Vec<Notification>,
+    ) -> Result<StepOutcome, StepError> {
         let Some(step_id) = self.tool_phase().map(|phase| phase.step_id) else {
-            return self.fail("tool phase advanced without an active phase");
+            return Err(StepError::Protocol(
+                "tool phase advanced without an active phase".to_owned(),
+            ));
         };
 
         // 1. Emit every auto-approved call as one batch (fires at most once).
@@ -222,7 +228,7 @@ impl DefaultAgentMachine {
         step_id: StepId,
         slots: Vec<ToolSlot>,
         mut notifications: Vec<Notification>,
-    ) -> StepOutcome {
+    ) -> Result<StepOutcome, StepError> {
         let mut requirements = Vec::with_capacity(slots.len());
         let mut ids: BTreeMap<ToolCallId, RequirementId> = BTreeMap::new();
         for slot in slots {
@@ -232,10 +238,10 @@ impl DefaultAgentMachine {
             {
                 Ok(id) => id,
                 Err(error) => {
-                    return self.fail_with_notifications(
+                    return Ok(self.fail_with_notifications(
                         notifications,
                         format!("requirement id unavailable: {error}"),
-                    );
+                    ));
                 }
             };
 
@@ -266,20 +272,20 @@ impl DefaultAgentMachine {
         ) {
             Ok(cursor) => cursor,
             Err(error) => {
-                return self.fail_with_notifications(
+                return Ok(self.fail_with_notifications(
                     notifications,
                     format!("cursor build failed: {error}"),
-                );
+                ));
             }
         };
         if let Err(error) = self.state.transition_cursor(cursor) {
-            return self.fail_with_notifications(
+            return Ok(self.fail_with_notifications(
                 notifications,
                 format!("cursor transition failed: {error}"),
-            );
+            ));
         }
 
-        StepOutcome::new(notifications, requirements, true)
+        Ok(StepOutcome::new(notifications, requirements, true))
     }
 
     /// Emits `slot` as one `NeedInteraction` and parks on `AwaitingApproval`.
@@ -288,17 +294,17 @@ impl DefaultAgentMachine {
         step_id: StepId,
         slot: ToolSlot,
         notifications: Vec<Notification>,
-    ) -> StepOutcome {
+    ) -> Result<StepOutcome, StepError> {
         let requirement_id = match self
             .requirement_ids
             .next_requirement_id(RequirementKindTag::Interaction)
         {
             Ok(id) => id,
             Err(error) => {
-                return self.fail_with_notifications(
+                return Ok(self.fail_with_notifications(
                     notifications,
                     format!("requirement id unavailable: {error}"),
-                );
+                ));
             }
         };
 
@@ -309,10 +315,10 @@ impl DefaultAgentMachine {
             Some(CursorRequirement::root(requirement_id)),
         );
         if let Err(error) = self.state.transition_cursor(cursor) {
-            return self.fail_with_notifications(
+            return Ok(self.fail_with_notifications(
                 notifications,
                 format!("cursor transition failed: {error}"),
-            );
+            ));
         }
 
         let requirement = Requirement::at_root(
@@ -324,7 +330,7 @@ impl DefaultAgentMachine {
         if let Some(phase) = self.tool_phase_mut() {
             phase.awaiting_approval = Some((requirement_id, slot));
         }
-        StepOutcome::new(notifications, vec![requirement], true)
+        Ok(StepOutcome::new(notifications, vec![requirement], true))
     }
 
     /// Folds a `NeedTool` result into the pending turn.
@@ -332,22 +338,33 @@ impl DefaultAgentMachine {
     /// Routes by requirement id so a parallel batch may resolve out of order,
     /// appends the (possibly failure-synthesized) tool response, and advances the
     /// phase once the whole batch is idle.
-    pub(super) fn resume_tool(&mut self, resolution: RequirementResolution) -> StepOutcome {
+    pub(super) fn resume_tool(
+        &mut self,
+        resolution: RequirementResolution,
+    ) -> Result<StepOutcome, StepError> {
         let slot = match self.tool_phase_mut() {
             Some(phase) => match phase.running.remove(&resolution.id) {
                 Some(slot) => slot,
                 None => {
-                    return self.fail(format!(
+                    return Err(StepError::Protocol(format!(
                         "resume targets requirement {}, which is not an in-flight tool call",
                         resolution.id
-                    ));
+                    )));
                 }
             },
-            None => return self.fail("tool result resumed without an active tool phase"),
+            None => {
+                return Err(StepError::Protocol(
+                    "tool result resumed without an active tool phase".to_owned(),
+                ));
+            }
         };
         let step_id = match self.tool_phase() {
             Some(phase) => phase.step_id,
-            None => return self.fail("tool result resumed without an active tool phase"),
+            None => {
+                return Err(StepError::Protocol(
+                    "tool result resumed without an active tool phase".to_owned(),
+                ));
+            }
         };
 
         let response = match resolution.result {
@@ -357,24 +374,23 @@ impl DefaultAgentMachine {
                     error.to_tool_response(slot.provider_call_id.clone())
                 }
                 ToolFailurePolicy::StopRun => {
-                    return self.fail(format!("tool `{}` failed: {error}", slot.call.name));
+                    return Err(StepError::Protocol(format!(
+                        "tool `{}` failed: {error}",
+                        slot.call.name
+                    )));
                 }
             },
             other => {
-                return self.fail(format!(
+                return Err(StepError::Protocol(format!(
                     "NeedTool requirement cannot accept a `{}` result",
                     other.tag()
-                ));
+                )));
             }
         };
 
-        if let Err(error) = self
-            .state
+        self.state
             .conversation_mut()
-            .append_tool_response(slot.result_message_id, response.clone())
-        {
-            return self.fail(format!("conversation operation failed: {error}"));
-        }
+            .append_tool_response(slot.result_message_id, response.clone())?;
 
         let finished = Notification::ToolCallFinished(ToolCallFinished::new(
             step_id,
@@ -386,7 +402,7 @@ impl DefaultAgentMachine {
         if self.tool_batch_idle() {
             self.advance_tool_phase(vec![finished])
         } else {
-            StepOutcome::new(vec![finished], Vec::new(), true)
+            Ok(StepOutcome::new(vec![finished], Vec::new(), true))
         }
     }
 
@@ -401,52 +417,59 @@ impl DefaultAgentMachine {
         &mut self,
         expected_id: Option<RequirementId>,
         resolution: RequirementResolution,
-    ) -> StepOutcome {
+    ) -> Result<StepOutcome, StepError> {
         let (requirement_id, slot) = match self
             .tool_phase_mut()
             .and_then(|phase| phase.awaiting_approval.take())
         {
             Some(pair) => pair,
-            None => return self.fail("approval resumed without a pending interaction"),
+            None => {
+                return Err(StepError::Protocol(
+                    "approval resumed without a pending interaction".to_owned(),
+                ));
+            }
         };
         let step_id = match self.tool_phase() {
             Some(phase) => phase.step_id,
-            None => return self.fail("approval resumed without an active tool phase"),
+            None => {
+                return Err(StepError::Protocol(
+                    "approval resumed without an active tool phase".to_owned(),
+                ));
+            }
         };
 
         if let Some(expected) = expected_id
             && resolution.id != expected
         {
-            return self.fail(format!(
+            return Err(StepError::Protocol(format!(
                 "resume targets requirement {}, but the machine awaits {expected}",
                 resolution.id
-            ));
+            )));
         }
         if resolution.id != requirement_id {
-            return self.fail(format!(
+            return Err(StepError::Protocol(format!(
                 "resume targets requirement {}, but the pending approval is {requirement_id}",
                 resolution.id
-            ));
+            )));
         }
 
         let response = match resolution.result {
             RequirementResult::Interaction(response) => response,
             other => {
-                return self.fail(format!(
+                return Err(StepError::Protocol(format!(
                     "NeedInteraction requirement cannot accept a `{}` result",
                     other.tag()
-                ));
+                )));
             }
         };
 
         let interaction = Interaction::approval(step_id, slot.call_id, slot.approval.clone());
-        if let Err(error) = interaction.accepts_response(&response) {
-            return self.fail(format!("interaction result rejected: {error}"));
-        }
-        let approval = match ApprovalResponse::try_from(response) {
-            Ok(approval) => approval,
-            Err(error) => return self.fail(format!("interaction result rejected: {error}")),
-        };
+        interaction.accepts_response(&response).map_err(|error| {
+            StepError::Protocol(format!("interaction result rejected: {error}"))
+        })?;
+        let approval = ApprovalResponse::try_from(response).map_err(|error| {
+            StepError::Protocol(format!("interaction result rejected: {error}"))
+        })?;
 
         match approval.decision() {
             ApprovalDecision::Approve => self.emit_tool_batch(step_id, vec![slot], Vec::new()),
@@ -455,13 +478,9 @@ impl DefaultAgentMachine {
             | ApprovalDecision::Cancel) => {
                 let synthetic =
                     approval_response_for_decision(&slot.call, decision, approval.message());
-                if let Err(error) = self
-                    .state
+                self.state
                     .conversation_mut()
-                    .append_tool_response(slot.result_message_id, synthetic.clone())
-                {
-                    return self.fail(format!("conversation operation failed: {error}"));
-                }
+                    .append_tool_response(slot.result_message_id, synthetic.clone())?;
                 let finished = Notification::ToolCallFinished(ToolCallFinished::new(
                     step_id,
                     slot.call_id,
@@ -475,17 +494,17 @@ impl DefaultAgentMachine {
                 let bounce = match LoopCursor::awaiting_tool(step_id, vec![slot.call_id], None) {
                     Ok(cursor) => cursor,
                     Err(error) => {
-                        return self.fail_with_notifications(
+                        return Ok(self.fail_with_notifications(
                             vec![finished],
                             format!("cursor build failed: {error}"),
-                        );
+                        ));
                     }
                 };
                 if let Err(error) = self.state.transition_cursor(bounce) {
-                    return self.fail_with_notifications(
+                    return Ok(self.fail_with_notifications(
                         vec![finished],
                         format!("cursor transition failed: {error}"),
-                    );
+                    ));
                 }
 
                 self.advance_tool_phase(vec![finished])
@@ -502,7 +521,7 @@ impl DefaultAgentMachine {
         &mut self,
         step_id: StepId,
         mut notifications: Vec<Notification>,
-    ) -> StepOutcome {
+    ) -> Result<StepOutcome, StepError> {
         let boundary = self.state.conversation().head();
         notifications.push(Notification::StepBoundary(StepBoundary::new(
             step_id, boundary, None,
@@ -518,30 +537,30 @@ impl DefaultAgentMachine {
             .as_ref()
             .map_or(0, |in_flight| in_flight.steps_started);
         if steps_started >= max_steps {
-            return self.fail_with_notifications(
+            return Ok(self.fail_with_notifications(
                 notifications,
                 format!(
                     "agent loop step limit {max_steps} reached before a final assistant response"
                 ),
-            );
+            ));
         }
 
         let next_step_id = match self.tool_ids.next_step_id() {
             Ok(id) => id,
             Err(error) => {
-                return self.fail_with_notifications(
+                return Ok(self.fail_with_notifications(
                     notifications,
                     format!("tool id unavailable: {error}"),
-                );
+                ));
             }
         };
         let next_assistant_id = match self.tool_ids.next_assistant_message_id() {
             Ok(id) => id,
             Err(error) => {
-                return self.fail_with_notifications(
+                return Ok(self.fail_with_notifications(
                     notifications,
                     format!("tool id unavailable: {error}"),
-                );
+                ));
             }
         };
         if let Some(in_flight) = self.in_flight.as_mut() {
@@ -549,9 +568,7 @@ impl DefaultAgentMachine {
             in_flight.steps_started += 1;
         }
 
-        // M1-4 will make this method return Result so step() folds via fail_from.
         self.block_on_llm(next_step_id, notifications)
-            .unwrap_or_else(|error| self.fail_from(error))
     }
 
     /// Extracts the tool-use calls from the pending turn's last assistant
@@ -625,22 +642,21 @@ impl DefaultAgentMachine {
     /// that already resolved keeps its real result, which is what lets a partial
     /// tool batch be abandoned coherently. The turn then settles to
     /// [`LoopCursor::Idle`] via [`finish_cancel`](Self::finish_cancel).
-    pub(super) fn abandon_tool_phase(&mut self, step_id: Option<StepId>) -> StepOutcome {
+    pub(super) fn abandon_tool_phase(
+        &mut self,
+        step_id: Option<StepId>,
+    ) -> Result<StepOutcome, StepError> {
         let Some(cancelled_results) = self.open_cancelled_results() else {
-            return self.fail("abandon reached a tool cursor without an active tool phase");
+            return Err(StepError::Protocol(
+                "abandon reached a tool cursor without an active tool phase".to_owned(),
+            ));
         };
 
-        if let Err(error) = self
-            .state
+        self.state
             .conversation_mut()
-            .cancel_pending(CancelDisposition::ResumeTurn { cancelled_results })
-        {
-            return self.fail(format!("conversation operation failed: {error}"));
-        }
+            .cancel_pending(CancelDisposition::ResumeTurn { cancelled_results })?;
 
-        // M1-4 will make this method return Result so step() folds via fail_from.
         self.finish_cancel(step_id, CancelRecoveryReason::ToolInterrupted)
-            .unwrap_or_else(|error| self.fail_from(error))
     }
 
     /// Collects a [`CancelledToolResult`] for every still-open call in the active

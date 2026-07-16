@@ -466,10 +466,10 @@ impl DefaultAgentMachine {
                 let expected = cursor.requirement_id();
                 self.resume_llm(step_id, expected, resolution)
             }
-            LoopCursor::AwaitingTool(_) => Ok(self.resume_tool(resolution)),
+            LoopCursor::AwaitingTool(_) => self.resume_tool(resolution),
             LoopCursor::AwaitingApproval(cursor) => {
                 let expected = cursor.requirement_id();
-                Ok(self.resume_approval(expected, resolution))
+                self.resume_approval(expected, resolution)
             }
             LoopCursor::AwaitingReconfig(cursor) => {
                 let expected = cursor.requirement_id();
@@ -540,7 +540,7 @@ impl DefaultAgentMachine {
 
         match finish {
             AssistantFinish::ReadyToCommit => self.commit_text_turn(step_id),
-            AssistantFinish::RequiresToolCallMappings => Ok(self.begin_tool_phase(step_id)),
+            AssistantFinish::RequiresToolCallMappings => self.begin_tool_phase(step_id),
         }
     }
 
@@ -738,7 +738,7 @@ impl DefaultAgentMachine {
 
         match kind {
             AbandonKind::Llm => self.abandon_llm_step(step_id),
-            AbandonKind::Tool => Ok(self.abandon_tool_phase(step_id)),
+            AbandonKind::Tool => self.abandon_tool_phase(step_id),
             AbandonKind::Reconfig => self.abandon_reconfig(step_id),
         }
     }
