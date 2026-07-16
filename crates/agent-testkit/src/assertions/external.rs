@@ -27,6 +27,9 @@ pub enum ExternalInputKind {
     /// The request fed a resolved interaction back
     /// ([`ExternalSessionInput::RespondInteraction`]).
     RespondInteraction,
+    /// The request fed host tool-execution results back
+    /// ([`ExternalSessionInput::RespondToolResults`]).
+    RespondToolResults,
     /// The request shut the session down
     /// ([`ExternalSessionInput::Shutdown`]).
     Shutdown,
@@ -41,6 +44,9 @@ pub enum ExternalResultKind {
     /// The session paused awaiting an interaction
     /// ([`ExternalSessionResult::PausedForInteraction`]).
     PausedForInteraction,
+    /// The session paused awaiting host tool execution
+    /// ([`ExternalSessionResult::PausedForToolCalls`]).
+    PausedForToolCalls,
     /// The session failed ([`ExternalSessionResult::Failed`]).
     Failed,
 }
@@ -51,6 +57,7 @@ fn input_kind(input: &ExternalSessionInput) -> ExternalInputKind {
         ExternalSessionInput::Start { .. } => ExternalInputKind::Start,
         ExternalSessionInput::Continue { .. } => ExternalInputKind::Continue,
         ExternalSessionInput::RespondInteraction { .. } => ExternalInputKind::RespondInteraction,
+        ExternalSessionInput::RespondToolResults { .. } => ExternalInputKind::RespondToolResults,
         ExternalSessionInput::Shutdown => ExternalInputKind::Shutdown,
     }
 }
@@ -62,6 +69,7 @@ fn result_kind(result: &ExternalSessionResult) -> ExternalResultKind {
         ExternalSessionResult::PausedForInteraction { .. } => {
             ExternalResultKind::PausedForInteraction
         }
+        ExternalSessionResult::PausedForToolCalls { .. } => ExternalResultKind::PausedForToolCalls,
         ExternalSessionResult::Failed { .. } => ExternalResultKind::Failed,
     }
 }

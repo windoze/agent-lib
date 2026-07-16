@@ -566,6 +566,11 @@ fn session_prompt(request: &ExternalSessionRequest) -> Result<String, Box<Extern
                 detail: "real e2e CLI handler does not expect permission pauses".to_owned(),
             }))
         }
+        ExternalSessionInput::RespondToolResults { .. } => {
+            Err(Box::new(ExternalAgentError::Protocol {
+                detail: "real e2e CLI handler does not expect tool-call pauses".to_owned(),
+            }))
+        }
         ExternalSessionInput::Shutdown => Err(Box::new(ExternalAgentError::Protocol {
             detail: "real e2e CLI handler is not used for shutdown".to_owned(),
         })),

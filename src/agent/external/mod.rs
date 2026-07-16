@@ -51,13 +51,16 @@ use crate::{
         AgentId,
         interaction::{Interaction, InteractionResponse},
         spec::WorktreeRef,
+        tool::ToolRuntimeError,
     },
     model::{
-        tool::{Tool, ToolStatus},
+        content::ContentBlock,
+        tool::{Tool, ToolCall, ToolResponse, ToolStatus},
         usage::Usage,
     },
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 mod dispatch;
@@ -213,6 +216,151 @@ pub struct ExternalSessionPolicy {
     pub stream_events: ExternalStreamPolicy,
 }
 
+/// Stable identifier correlating a batch of external tool calls with the results
+/// fed back for them.
+///
+/// A runtime pauses on [`PausedForToolCalls`](ExternalSessionResult::PausedForToolCalls)
+/// carrying one batch of [`ExternalToolCall`] values plus a batch id; the host
+/// executes those calls and returns every result under the same id via
+/// [`RespondToolResults`](ExternalSessionInput::RespondToolResults), so the
+/// runtime can match the answers to the pause it emitted. The value is an opaque
+/// runtime-assigned token — this crate never parses it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExternalToolBatchId(String);
+
+impl ExternalToolBatchId {
+    /// Wraps a runtime-assigned batch token.
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// Returns the opaque batch token as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One tool call a runtime asks the host to execute during a paused session.
+///
+/// This is the provider-neutral shape a runtime adapter decodes each pending
+/// tool call into. [`provider_call_id`](Self::provider_call_id) is the runtime's
+/// own correlation id: it becomes the [`ToolCall::id`] the machine bridges into a
+/// `NeedTool` requirement (see [`to_tool_call`](Self::to_tool_call)) and the id
+/// the matching [`ExternalToolResult`] answers, so the runtime can line the
+/// result up with the call. [`raw`](Self::raw) is an escape hatch for unmodeled
+/// provider fields and must not carry stable logic (design §5.3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalToolCall {
+    /// Runtime-assigned identifier used to correlate the result.
+    pub provider_call_id: String,
+    /// Name of the tool the runtime selected.
+    pub name: String,
+    /// Fully parsed JSON input supplied by the runtime.
+    pub input: Value,
+    /// Unmodeled provider fields preserved for forward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<Value>,
+}
+
+impl ExternalToolCall {
+    /// Bridges this runtime tool call into a provider-neutral [`ToolCall`].
+    ///
+    /// The [`provider_call_id`](Self::provider_call_id) is preserved as the
+    /// [`ToolCall::id`] so the host response can answer the runtime's own
+    /// correlation id, while `name` and `input` are copied verbatim. The
+    /// [`raw`](Self::raw) escape hatch is intentionally dropped: it holds
+    /// unmodeled provider fields that must not leak into the stable
+    /// tool-execution path (design §5.3).
+    #[must_use]
+    pub fn to_tool_call(&self) -> ToolCall {
+        ToolCall {
+            id: self.provider_call_id.clone(),
+            name: self.name.clone(),
+            input: self.input.clone(),
+        }
+    }
+}
+
+/// One tool result the host feeds back to a runtime for a prior
+/// [`ExternalToolCall`].
+///
+/// [`provider_call_id`](Self::provider_call_id) echoes the call's runtime
+/// correlation id so the runtime can pair the answer with the call it paused on.
+/// [`status`](Self::status) and [`content`](Self::content) mirror the host's
+/// [`ToolResponse`]; [`error`](Self::error) carries a stable diagnostic when the
+/// tool could not be executed at all (a [`ToolRuntimeError`], distinct from a
+/// tool that ran and returned [`ToolStatus::Error`] content). [`raw`](Self::raw)
+/// is an escape hatch for unmodeled provider fields (design §5.3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalToolResult {
+    /// Runtime correlation id this result answers.
+    pub provider_call_id: String,
+    /// Provider-neutral outcome of attempting the tool call.
+    pub status: ToolStatus,
+    /// Multimodal content returned to the runtime.
+    #[serde(default)]
+    pub content: Vec<ContentBlock>,
+    /// Stable diagnostic text when the tool could not be executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Unmodeled provider fields preserved for forward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<Value>,
+}
+
+impl ExternalToolResult {
+    /// Builds a result from a host [`ToolResponse`], preserving the runtime
+    /// correlation id, four-state status, and multimodal content.
+    ///
+    /// The response's [`tool_call_id`](ToolResponse::tool_call_id) is the
+    /// provider correlation id the runtime paused on (design §5.3), so it is
+    /// echoed as [`provider_call_id`](Self::provider_call_id). A `ToolResponse`
+    /// is a tool that *ran* — even a [`ToolStatus::Error`] outcome carries its
+    /// detail in [`content`](ToolResponse::content) — so [`error`](Self::error)
+    /// stays `None`; it is reserved for orchestration failures surfaced through
+    /// [`from_tool_runtime_error`](Self::from_tool_runtime_error).
+    #[must_use]
+    pub fn from_tool_response(response: &ToolResponse) -> Self {
+        Self {
+            provider_call_id: response.tool_call_id.clone(),
+            status: response.status,
+            content: response.content.clone(),
+            error: None,
+            raw: None,
+        }
+    }
+
+    /// Builds an [`Error`](ToolStatus::Error) result from a
+    /// [`ToolRuntimeError`] that prevented the call from executing.
+    ///
+    /// The framework's stable diagnostic ([`ToolRuntimeError`]'s `Display`) is
+    /// retained in both [`error`](Self::error) and as a
+    /// [`Text`](ContentBlock::Text) content block, so the runtime receives the
+    /// failure as tool output while callers keep a stable typed reason. The text
+    /// is a fixed diagnostic that never embeds secrets or tool input (design
+    /// §5.3, §12).
+    #[must_use]
+    pub fn from_tool_runtime_error(
+        provider_call_id: impl Into<String>,
+        error: &ToolRuntimeError,
+    ) -> Self {
+        let detail = error.to_string();
+        Self {
+            provider_call_id: provider_call_id.into(),
+            status: ToolStatus::Error,
+            content: vec![ContentBlock::Text {
+                text: detail.clone(),
+                extra: serde_json::Map::new(),
+            }],
+            error: Some(detail),
+            raw: None,
+        }
+    }
+}
+
 /// What a single external session effect is asked to do.
 ///
 /// A machine reifies one of these per [`ExternalSessionRequest`]: begin a new
@@ -237,6 +385,20 @@ pub enum ExternalSessionInput {
         action_id: String,
         /// The resolution the host produced for that action.
         response: InteractionResponse,
+    },
+    /// Feed host tool-execution results back into a session paused on a tool-call
+    /// batch.
+    ///
+    /// The runtime paused with
+    /// [`PausedForToolCalls`](ExternalSessionResult::PausedForToolCalls) carrying
+    /// a [`batch_id`](Self::RespondToolResults::batch_id); the host executes the
+    /// bridged calls and returns every [`ExternalToolResult`] under that same id
+    /// so the runtime can correlate the answers with the batch it emitted.
+    RespondToolResults {
+        /// Batch the results answer, echoed from the pause.
+        batch_id: ExternalToolBatchId,
+        /// One result per tool call in the batch, keyed by provider call id.
+        results: Vec<ExternalToolResult>,
     },
     /// Shut the session down and release its runtime handles.
     Shutdown,
@@ -575,6 +737,28 @@ pub enum ExternalSessionResult {
         #[serde(default)]
         observations: Vec<ExternalObservedEvent>,
     },
+    /// The session paused awaiting host execution of a batch of tool calls.
+    ///
+    /// The handler surfaces the runtime's pending tool calls as provider-neutral
+    /// [`ExternalToolCall`] values under a [`batch_id`](Self::PausedForToolCalls::batch_id).
+    /// The machine bridges each into a `NeedTool` requirement (via
+    /// [`ExternalToolCall::to_tool_call`]), gathers the host results, and feeds
+    /// them back with
+    /// [`RespondToolResults`](ExternalSessionInput::RespondToolResults) carrying
+    /// the same batch id. Driving this decision point in the machine lands with
+    /// milestone 2; the protocol shape is defined here.
+    PausedForToolCalls {
+        /// Updated resumable session facts.
+        session: ExternalSessionRef,
+        /// Identifier the matching
+        /// [`RespondToolResults`](ExternalSessionInput::RespondToolResults) echoes.
+        batch_id: ExternalToolBatchId,
+        /// Tool calls the host must execute this step.
+        calls: Vec<ExternalToolCall>,
+        /// Events observed before the pause.
+        #[serde(default)]
+        observations: Vec<ExternalObservedEvent>,
+    },
     /// The session failed; the error records whether side effects may remain.
     Failed {
         /// Resumable session facts, when a session existed before the failure.
@@ -660,15 +844,22 @@ mod tests {
         ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalArtifactKind,
         ExternalArtifactRef, ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeKind,
         ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest,
-        ExternalSessionResult, ExternalStreamPolicy, WorktreeIsolation,
-        collect_file_patch_artifacts, collect_file_patch_artifacts_from_observed,
+        ExternalSessionResult, ExternalStreamPolicy, ExternalToolBatchId, ExternalToolCall,
+        ExternalToolResult, WorktreeIsolation, collect_file_patch_artifacts,
+        collect_file_patch_artifacts_from_observed,
     };
     use crate::{
-        agent::{AgentId, StepId, interaction::Interaction, spec::WorktreeRef},
-        model::{tool::Tool, tool::ToolStatus, usage::Usage},
+        agent::{
+            AgentId, StepId, interaction::Interaction, spec::WorktreeRef, tool::ToolRuntimeError,
+        },
+        model::{
+            content::ContentBlock,
+            tool::{Tool, ToolCall, ToolResponse, ToolStatus},
+            usage::Usage,
+        },
     };
     use serde::{Serialize, de::DeserializeOwned};
-    use serde_json::json;
+    use serde_json::{Map, json};
     use std::fmt::Debug;
 
     fn agent_id() -> AgentId {
@@ -972,5 +1163,156 @@ mod tests {
         );
 
         assert!(collect_file_patch_artifacts_from_observed(&[]).is_empty());
+    }
+
+    fn sample_tool_call() -> ExternalToolCall {
+        ExternalToolCall {
+            provider_call_id: "call_provider_1".to_owned(),
+            name: "apply_patch".to_owned(),
+            input: json!({ "path": "src/parser.rs" }),
+            raw: Some(json!({ "provider_only": true })),
+        }
+    }
+
+    #[test]
+    fn external_tool_dto_roundtrips() {
+        // The tool decision point and its response both survive a JSON round-trip.
+        let paused = ExternalSessionResult::PausedForToolCalls {
+            session: session_ref(),
+            batch_id: ExternalToolBatchId::new("batch-7"),
+            calls: vec![
+                sample_tool_call(),
+                ExternalToolCall {
+                    provider_call_id: "call_provider_2".to_owned(),
+                    name: "run_tests".to_owned(),
+                    input: json!({}),
+                    raw: None,
+                },
+            ],
+            observations: vec![ExternalObservedEvent::new(
+                9,
+                ExternalAgentEvent::ToolStarted {
+                    name: "apply_patch".to_owned(),
+                },
+            )],
+        };
+        assert_json_round_trip(&paused);
+
+        let respond = ExternalSessionInput::RespondToolResults {
+            batch_id: ExternalToolBatchId::new("batch-7"),
+            results: vec![
+                ExternalToolResult {
+                    provider_call_id: "call_provider_1".to_owned(),
+                    status: ToolStatus::Ok,
+                    content: vec![ContentBlock::Text {
+                        text: "patched".to_owned(),
+                        extra: Map::new(),
+                    }],
+                    error: None,
+                    raw: Some(json!({ "provider_only": 1 })),
+                },
+                ExternalToolResult {
+                    provider_call_id: "call_provider_2".to_owned(),
+                    status: ToolStatus::Error,
+                    content: Vec::new(),
+                    error: Some("tests failed".to_owned()),
+                    raw: None,
+                },
+            ],
+        };
+        assert_json_round_trip(&respond);
+
+        // The batch id is serde-transparent: it encodes as the bare string.
+        let encoded = serde_json::to_value(ExternalToolBatchId::new("batch-7")).expect("serialize");
+        assert_eq!(encoded, json!("batch-7"));
+    }
+
+    #[test]
+    fn external_tool_input_and_result_variants_serialize_snake_case() {
+        let respond = ExternalSessionInput::RespondToolResults {
+            batch_id: ExternalToolBatchId::new("batch-1"),
+            results: Vec::new(),
+        };
+        let encoded = serde_json::to_value(&respond).expect("serialize input");
+        assert!(encoded.get("respond_tool_results").is_some());
+
+        let paused = ExternalSessionResult::PausedForToolCalls {
+            session: session_ref(),
+            batch_id: ExternalToolBatchId::new("batch-1"),
+            calls: Vec::new(),
+            observations: Vec::new(),
+        };
+        let encoded = serde_json::to_value(&paused).expect("serialize result");
+        assert!(encoded.get("paused_for_tool_calls").is_some());
+    }
+
+    #[test]
+    fn external_tool_call_maps_to_provider_neutral_tool_call() {
+        // The provider correlation id, tool name, and input are preserved so a
+        // host response can answer the runtime's own call id; the `raw` escape
+        // hatch is dropped from the stable tool-execution shape.
+        let call = sample_tool_call();
+        let bridged = call.to_tool_call();
+        assert_eq!(
+            bridged,
+            ToolCall {
+                id: "call_provider_1".to_owned(),
+                name: "apply_patch".to_owned(),
+                input: json!({ "path": "src/parser.rs" }),
+            }
+        );
+    }
+
+    #[test]
+    fn tool_response_maps_to_external_result_preserving_status_and_content() {
+        for status in [
+            ToolStatus::Ok,
+            ToolStatus::Error,
+            ToolStatus::Denied,
+            ToolStatus::Cancelled,
+        ] {
+            let response = ToolResponse {
+                tool_call_id: "call_provider_1".to_owned(),
+                content: vec![ContentBlock::Text {
+                    text: "tool output".to_owned(),
+                    extra: Map::new(),
+                }],
+                status,
+                extra: Map::from_iter([("provider_trace".to_owned(), json!("trace-1"))]),
+            };
+            let external = ExternalToolResult::from_tool_response(&response);
+            assert_eq!(external.provider_call_id, "call_provider_1");
+            assert_eq!(external.status, status);
+            assert_eq!(external.content, response.content);
+            // A response that ran carries its detail in content; the separate
+            // orchestration-error slot stays empty.
+            assert_eq!(external.error, None);
+            assert_eq!(external.raw, None);
+        }
+    }
+
+    #[test]
+    fn tool_runtime_error_maps_to_external_result_without_losing_error_text() {
+        let error = ToolRuntimeError::UnknownTool {
+            name: "apply_patch".to_owned(),
+        };
+        let external = ExternalToolResult::from_tool_runtime_error("call_provider_1", &error);
+        let detail = error.to_string();
+
+        assert_eq!(external.provider_call_id, "call_provider_1");
+        assert_eq!(external.status, ToolStatus::Error);
+        assert_eq!(external.error.as_deref(), Some(detail.as_str()));
+        // The same stable text is echoed as tool output so the runtime sees it.
+        assert_eq!(
+            external.content,
+            vec![ContentBlock::Text {
+                text: detail,
+                extra: Map::new(),
+            }]
+        );
+        assert_eq!(external.raw, None);
+
+        // The mapping round-trips like any other DTO.
+        assert_json_round_trip(&external);
     }
 }

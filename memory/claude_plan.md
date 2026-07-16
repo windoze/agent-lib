@@ -1,61 +1,58 @@
-# M1-1 — 新增 `ExternalObservedEvent` 并把 observations 改成 sequenced payload
+# M1-2 — 新增 external tool DTO 与 `RespondToolResults` / `PausedForToolCalls`
 
-**当前执行 = TODO.md 第一个未完成任务 = M1-1**(全部任务仍为 `[TODO]`;这是全新
-"Managed External Agent" 计划,上一轮 effect-refine 计划已归档)。
+**当前执行 = TODO.md 第一个未完成任务 = M1-2**(M1-1 已 `[DONE]`)。
 
 ## 目标
-把 `ExternalSessionResult::{Completed,PausedForInteraction,Failed}.observations` 从
-`Vec<ExternalAgentEvent>` 升级为 `Vec<ExternalObservedEvent>`(带 `seq`),并把 machine
-的 observation dedup 从「批级 last_event_seq 粗粒度」改为「逐事件 seq 精确 replay」。
-不改 machine 的 sans-io 边界;不动 effect family。
+在 external DTO 层落地 host tool bridge 的协议数据结构(provider-neutral、serde-friendly),
+但**不**在 machine 里真正驱动 tool call(machine tool parity 是 M2)。
 
-## 关键设计决策
-- 新 DTO `ExternalObservedEvent { seq: u64, event: ExternalAgentEvent }`,放在
-  `src/agent/external/mod.rs`,derive `Clone,Debug,PartialEq,Eq,Serialize,Deserialize`。
-- helper:`ExternalObservedEvent::new(seq, event)` 与
-  `ExternalObservedEvent::unsequenced_for_tests(Vec<ExternalAgentEvent>) -> Vec<Self>`
-  (enumerate 赋 seq;仅供 fixture,rustdoc 注明不得用于生产 dedup)。
-- 新增 artifact helper `collect_file_patch_artifacts_from_observed(&[ExternalObservedEvent])`;
-  保留旧 `collect_file_patch_artifacts(&[ExternalAgentEvent])`。
-- machine `observe`:去掉 `incoming_seq` 参数,改为
-  `filter(|o| consumed.is_none_or(|c| o.seq > c))`。consumed 仍读
-  `state.session().last_event_seq`(在存入 incoming session 之前读取,顺序已验证正确)。
-- Sink trait 签名**不动**(接收 `&ExternalAgentEvent`)——完整 sequenced live sink 升级
-  是 M4-1 的任务。M1-1 只更新 sink 文档说明 buffered observations 是 exact-once 真源。
+## 要新增 / 修改
+1. `src/agent/external/mod.rs`
+   - `ExternalToolBatchId(String)` newtype(`#[serde(transparent)]`,`new`/`as_str`),
+     derive `Clone,Debug,PartialEq,Eq,Serialize,Deserialize`。
+   - `ExternalToolCall { provider_call_id, name, input: Value, raw: Option<Value> }`
+     + `to_tool_call(&self) -> ToolCall`(id=provider_call_id, name, input)。
+   - `ExternalToolResult { provider_call_id, status: ToolStatus, content: Vec<ContentBlock>,
+     error: Option<String>, raw: Option<Value> }`
+     + `from_tool_response(&ToolResponse)`(provider_call_id=tool_call_id,保留 status/content)
+     + `from_tool_runtime_error(provider_call_id, &ToolRuntimeError)`(status=Error,
+       error=Some(stable text),content=Text{stable text})。
+   - `ExternalSessionInput::RespondToolResults { batch_id, results }`。
+   - `ExternalSessionResult::PausedForToolCalls { session, batch_id, calls, observations }`。
+   - imports:`model::content::ContentBlock`、`model::tool::{ToolCall, ToolResponse}`、
+     `agent::tool::ToolRuntimeError`、`serde_json::Value`。
+   - 新增测试:`external_tool_dto_roundtrips`、
+     `external_tool_call_maps_to_provider_neutral_tool_call`、
+     tool response/runtime-error -> ExternalToolResult 保真;snake_case 变体。
+2. `src/agent/mod.rs` — re-export 新的 3 个 public DTO。
+3. `src/agent/external/machine.rs` — `fold_session_result` 加 `PausedForToolCalls` arm。
+   M1 machine 还不驱动 tool call(M2 才 wire),此 arm:observe 后 `fail_with` 明确诊断
+   "external tool-call pauses are not yet wired (scheduled for M2)"。分阶段设计(非 workaround):
+   机器目前不会 emit 会产生 tool-call pause 的请求,收到即协议异常;M2 会替换该 arm。
+4. `crates/agent-testkit/src/assertions/external.rs` — `ExternalInputKind::RespondToolResults`、
+   `ExternalResultKind::PausedForToolCalls` + input_kind/result_kind arm + rustdoc。
+5. `tests/agent_external_real_e2e.rs` — `session_prompt` 加 `RespondToolResults` arm 返回 Protocol 错误。
 
-## 触及文件
-1. src/agent/external/mod.rs — 新 DTO + helper + 新 artifact helper + result 变体字段类型 +
-   round-trip 测试。
-2. src/agent/external/machine.rs — observe 逐事件 dedup + fold_session_result 三处调用 + doc。
-3. src/agent/external/machine/tests.rs — completed_with/paused_with 改签名 + 重写
-   external_agent_emits_observation_notifications(含 PARTIAL overlap 证明逐事件 replay)。
-4. src/agent/external/sink.rs — 文档说明(不改签名);discard_sink_... 保持通过。
-5. src/agent/mod.rs — 导出 ExternalObservedEvent + collect_file_patch_artifacts_from_observed。
-6. crates/agent-testkit/src/external.rs — completed/permission_pause/failed 用 unsequenced_for_tests。
-7. tests/agent_external_real_e2e.rs — Completed 观测包装。
-8. drive.rs / requirement.rs / assertions/external.rs 的 Vec::new() 保持不变。
+## 不改
+- `ExternalSessionResult::{Completed,PausedForInteraction,Failed}` 行为、observe 逐事件 dedup。
+- machine cursor / state.rs(tool 相位是 M2)。
+- 设计文档字段小差异(`error` 字段 doc 同步是 M1-4 review 的事,TODO 为权威)。
 
 ## 验证序列
 1. cargo fmt --all -- --check
-2. 聚焦:external_dto_roundtrips / external_agent_emits_observation_notifications /
-   discard_sink_accepts_and_drops_events
+2. 聚焦:external_tool_dto_roundtrips / external_tool_call_maps_to_provider_neutral_tool_call
+   + external_dto_roundtrips(回归)
 3. cargo clippy --all-targets -- -D warnings
 4. cargo test --all --all-targets (<=30min)
 5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 6. git diff --check
 
 ## 进度
-- [x] 读 TODO/PLAN/memory/源码,选定 M1-1,梳理全部 construction sites
-- [ ] 实现 DTO + helper + result 字段
-- [ ] machine observe 逐事件 dedup
-- [ ] 更新全部 fixture / 测试
-- [ ] 验证序列
-- [ ] TODO.md 标 [DONE] + 完成记录;commit
-
-## 完成状态(2026-07-17)
-- [x] 实现 DTO + helper + result 字段
-- [x] machine observe 逐事件 dedup
-- [x] 更新全部 fixture / 测试(含 PARTIAL overlap 证明)
-- [x] 验证序列 1-6 全绿 + doc tests
-- [x] TODO.md 标 [DONE] + 完成记录
-- 下一任务:M1-2(external tool DTO 与 RespondToolResults / PausedForToolCalls)。
+- [x] 读 TODO/PLAN/memory/源码,选定 M1-2,梳理全部 exhaustive match sites
+- [x] mod.rs DTO + helper + enum 变体
+- [x] machine fold arm(observe + fail_with,M2 替换)
+- [x] testkit assertions kinds
+- [x] real e2e match arm
+- [x] mod.rs re-export
+- [x] 测试 + 验证序列 1-6 全绿(lib 559 passed;clippy 0;doc OK)
+- [x] TODO.md 标 [DONE] + 完成记录;待 commit

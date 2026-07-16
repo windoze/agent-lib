@@ -324,6 +324,21 @@ impl ExternalAgentMachine {
                 let notifications = self.observe(observations);
                 self.pause_for_interaction(session, action_id, request, notifications)
             }
+            ExternalSessionResult::PausedForToolCalls { observations, .. } => {
+                // The sans-io machine does not yet bridge tool-call pauses into a
+                // `NeedTool` batch — that wiring (cursor phase + `RespondToolResults`
+                // fan-out) lands with milestone 2. Until then the machine never
+                // emits a request that could elicit this decision point, so
+                // receiving one is an unsupported protocol transition. Buffered
+                // observations still replay exactly once (design §5.5) before the
+                // machine settles on a classified error.
+                let notifications = self.observe(observations);
+                self.fail_with(
+                    "external tool-call pauses are not yet driven by the machine \
+                     (scheduled for milestone 2)",
+                    notifications,
+                )
+            }
             ExternalSessionResult::Failed {
                 session,
                 error,

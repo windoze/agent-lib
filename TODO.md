@@ -117,7 +117,7 @@
   test binary 0 failed);`cargo test --all --doc` 7+12+2 passed(1 ignored);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` clean。
 
-### [TODO] M1-2 新增 external tool DTO 与 `RespondToolResults` / `PausedForToolCalls`
+### [DONE] M1-2 新增 external tool DTO 与 `RespondToolResults` / `PausedForToolCalls`
 
 **上下文**:
 
@@ -195,6 +195,49 @@
   - `cargo test -p agent-lib external_tool_dto_roundtrips`
   - `cargo test -p agent-lib external_tool_call_maps_to_provider_neutral_tool_call`
 - 完整验证序列 1-6 全过。
+
+**完成记录**(2026-07-17):
+
+- `src/agent/external/mod.rs`:新增三个 provider-neutral DTO,均 derive
+  `Clone/Debug/PartialEq/Eq/Serialize/Deserialize`:
+  - `ExternalToolBatchId(String)`(`#[serde(transparent)]`,`new(impl Into<String>)` +
+    `as_str()`);
+  - `ExternalToolCall { provider_call_id, name, input: Value, raw: Option<Value> }`,附
+    `to_tool_call(&self) -> ToolCall`(id=provider_call_id、name、input 原样,丢弃 raw escape hatch);
+  - `ExternalToolResult { provider_call_id, status: ToolStatus, content: Vec<ContentBlock>,
+    error: Option<String>, raw: Option<Value> }`,附
+    `from_tool_response(&ToolResponse)`(provider_call_id=tool_call_id,保留 status/content,
+    error=None)与 `from_tool_runtime_error(provider_call_id, &ToolRuntimeError)`(status=Error,
+    稳定诊断文本同时写入 `error` 与一个 `ContentBlock::Text`,不丢失)。
+- 扩展 `ExternalSessionInput`:新增 `RespondToolResults { batch_id, results }`(snake_case
+  `respond_tool_results`)。
+- 扩展 `ExternalSessionResult`:新增 `PausedForToolCalls { session, batch_id, calls,
+  observations }`(snake_case `paused_for_tool_calls`,`observations` 用
+  `Vec<ExternalObservedEvent>` 且 `#[serde(default)]`)。
+- imports 同步:`model::content::ContentBlock`、`model::tool::{ToolCall, ToolResponse}`、
+  `agent::tool::ToolRuntimeError`、`serde_json::Value`。
+- `src/agent/mod.rs`:re-export `ExternalToolBatchId`、`ExternalToolCall`、`ExternalToolResult`。
+- `src/agent/external/machine.rs`:`fold_session_result` 补 `PausedForToolCalls` arm。M1 machine
+  尚未驱动 tool-call(machine tool parity 是 M2,PLAN.md 已显式排期);此 arm 先 `observe`
+  逐事件 replay(§5.5),再 `fail_with` 明确诊断 "external tool-call pauses are not yet driven by
+  the machine (scheduled for milestone 2)"。属分阶段设计而非 workaround:M1 machine 不会 emit 会
+  触发 tool-call pause 的请求,收到即协议异常;M2 会替换该 arm 为 `NeedTool` batch。
+- `crates/agent-testkit/src/assertions/external.rs`:`ExternalInputKind::RespondToolResults`、
+  `ExternalResultKind::PausedForToolCalls` + `input_kind`/`result_kind` 对应 arm + rustdoc。
+- `tests/agent_external_real_e2e.rs`:`session_prompt` 补 `RespondToolResults` arm 返回
+  `ExternalAgentError::Protocol`。
+- 新增测试(`src/agent/external/mod.rs`):`external_tool_dto_roundtrips`(PausedForToolCalls /
+  RespondToolResults round-trip + batch id serde-transparent 断言)、
+  `external_tool_input_and_result_variants_serialize_snake_case`、
+  `external_tool_call_maps_to_provider_neutral_tool_call`、
+  `tool_response_maps_to_external_result_preserving_status_and_content`(四态 status)、
+  `tool_runtime_error_maps_to_external_result_without_losing_error_text`(error 文本 + content 双写
+  + round-trip)。
+- 验证:`cargo fmt --all -- --check` FMT_OK;聚焦测试全过(external lib 99 passed,含 5 新用例);
+  `cargo clippy --all-targets -- -D warnings` 0 warning;`cargo test --all --all-targets` 全绿
+  (agent-lib lib 559 passed = 554+5,其余各 test binary 0 failed,ignored 为真实 e2e);
+  `cargo test --all --doc` 7+12+2 passed(1 ignored);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过;`git diff --check` clean。
 
 ### [TODO] M1-3 新增 external subagent DTO 与 `RespondSubagent` / `PausedForSubagent`
 
