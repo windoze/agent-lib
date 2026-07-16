@@ -681,6 +681,10 @@ Session root
 - 默认 worktree 隔离。复杂 worker 优先使用临时 git worktree。`WorktreeIsolation`(§4.1,拟新增)
   应至少区分 shared / per-agent-worktree / ephemeral-git-worktree 三级;多个 external agent 并发编辑
   同一 worktree 属于高冲突场景,默认应给强 worker 分配独立 worktree(冲突归并策略见 §14 开放问题)。
+  - **收敛(Milestone 6-1 已实现)**:`WorktreeIsolation::default()` = `PerAgentWorktree`(无调度上下文时
+    默认每个 agent 独占 worktree);成本档位推荐隔离 `CostTier::recommended_isolation()` 映射为
+    Cheap→`Shared`、Standard→`PerAgentWorktree`、Premium→`EphemeralGitWorktree`,即强 worker 默认独立
+    (临时)worktree。`WorkerProfile` 不存隔离字段,由 `cost_tier` 派生。
 - 写 `.git`、配置、secret、home/root、网络、长时间命令时进入 `InteractionKind::Permission`。
 - **外部 agent 输出一律按不可信处理**。外部 runtime 的文本、command 说明、patch 描述、teammate 消息
   都可能携带 prompt injection,不能作为放宽护栏的依据:

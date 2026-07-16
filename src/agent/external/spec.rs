@@ -10,45 +10,21 @@
 
 use crate::agent::{
     AgentId,
-    external::{ExternalRuntimeKind, ExternalSessionPolicy},
+    external::{ExternalRuntimeKind, ExternalSessionPolicy, WorkerProfileRef},
     spec::{ToolSetRef, WorktreeRef},
 };
 use serde::{Deserialize, Serialize};
-
-/// Placeholder reference to a worker capability and cost profile (design §9).
-///
-/// Milestone 6 introduces the mixed-agent scheduler and fleshes out worker
-/// profiles (capability tags, cost tier, upgrade rules). This task only reserves
-/// a stable, provider-neutral reference so the [`ExternalAgentSpec`] shape does
-/// not change when the scheduler lands; it is stored as an `Option` on the spec
-/// to keep external-agent execution decoupled from scheduling for now.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct WorkerProfileRef {
-    id: String,
-}
-
-impl WorkerProfileRef {
-    /// Creates a worker-profile reference from a caller-supplied identifier.
-    #[must_use]
-    pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into() }
-    }
-
-    /// Returns the referenced worker-profile identifier.
-    #[must_use]
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-}
 
 /// Data-only recipe for constructing or restoring an external-agent runtime.
 ///
 /// `ExternalAgentSpec` is a template that records stable identity, the backing
 /// [`ExternalRuntimeKind`], the worktree boundary, an optional
-/// [`WorkerProfileRef`] (reserved for the Milestone 6 scheduler), the initial
-/// tool declarations exposed to the runtime, and the per-session policy. It does
-/// not hold a live session, process, SDK client, tool registry, or task handle.
+/// [`WorkerProfileRef`] into the mixed-agent scheduler's
+/// [`WorkerProfileRegistry`](super::WorkerProfileRegistry), the initial tool
+/// declarations exposed to the runtime, and the per-session policy. It does not
+/// hold a live session, process, SDK client, tool registry, or task handle. The
+/// profile is an `Option` so external-agent execution stays decoupled from
+/// scheduling when no profile applies.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalAgentSpec {
     id: AgentId,

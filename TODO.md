@@ -1343,7 +1343,7 @@ resume 后一次性把它们转成 `Notification::ExternalAgent` 吐出(经 `Ste
 
 ## Milestone 6 — Mixed-agent scheduler(Phase 5)
 
-### [TODO] M6-1 `WorkerProfileRef`、worker profile registry 与 `WorktreeIsolation`
+### [DONE] M6-1 `WorkerProfileRef`、worker profile registry 与 `WorktreeIsolation`
 
 **前置依赖**:M5-4。
 
@@ -1365,6 +1365,36 @@ resume 后一次性把它们转成 `Notification::ExternalAgent` 吐出(经 `Ste
 - 新增单测:registry 注册/解析、profile serde round-trip、`WorktreeIsolation` 默认策略断言。过滤名:
   `cargo test --lib worker_profile`。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- **新增 `src/agent/external/profile.rs`**(mixed-agent scheduler 的 worker 画像数据层):
+  - `Capability`(Search/Shell/Test/BugFix/Feature/Refactor/Review/Debug/CodeGeneration/Planning +
+    `Custom(String)` 逃生舱,对齐 §9 任务类型)。
+  - `CostTier`(Cheap < Standard < Premium,`Ord`,`Default = Cheap`;`recommended_isolation()` 与
+    `is_stronger_than()`)。
+  - `EscalationTrigger`(Timeout/TestFailure/LowConfidence/ReviewRejected/BudgetExhausted,§9 升级规则)
+    与 `EscalationRules { triggers, escalate_to: Option<WorkerProfileRef>, human_fallback }`(数据层,
+    由 M6-4 解释;`none()`/`triggers_on()` 等访问器)。
+  - `WorkerProfileRef`(轻量 transparent String id,从 `spec.rs` 移来)。
+  - `WorkerProfile { id, capabilities, cost_tier, escalation }`,严格对齐任务字段;隔离不落字段,
+    由 `cost_tier` 派生(`recommended_isolation()`);`reference()`/`has_capability()`。
+  - `WorkerProfileRegistry`(内存 `BTreeMap`):`register`(同 id 覆盖并返回 ref)/`resolve`/`get`/
+    `contains`/`len`/`is_empty`/`iter`。
+- **`ExternalAgentSpec.profile` 去占位**:`external/spec.rs` 删除本地占位 `WorkerProfileRef`,改从
+  `external::profile` 引入真实 registry-backed ref;更新 rustdoc,去掉「placeholder / reserved」措辞。
+- **`WorktreeIsolation` 语义与默认**:`external/mod.rs` 新增 `impl Default`(= `PerAgentWorktree`,§10
+  「默认隔离」);成本档位推荐隔离 Cheap→Shared / Standard→PerAgentWorktree / Premium→
+  EphemeralGitWorktree(强 worker 默认独立临时 worktree)。`docs/external-agent.md` §10 记录该收敛。
+- **re-export**:`external/mod.rs` 与 `src/agent/mod.rs` 导出 `Capability`/`CostTier`/`EscalationRules`/
+  `EscalationTrigger`/`WorkerProfile`/`WorkerProfileRef`/`WorkerProfileRegistry`。所有新公开 API 带 rustdoc。
+- **测试**:`profile.rs` 内 7 个单测(名字含 `worker_profile`):registry 注册+解析、未知 ref 返回 None、
+  同 id 覆盖、profile serde round-trip(含 `Custom` capability / 终态 escalation 省略)、
+  `WorktreeIsolation`/`CostTier` 默认与推荐隔离策略断言、`CostTier` 排序。未改动 machine/state 运行语义。
+- **验证(完整序列全绿)**:`cargo fmt --all` ✓;`cargo test --lib worker_profile` = 7 passed ✓;
+  `cargo clippy --all-targets -- -D warnings` 无告警 ✓;`cargo test --all --all-targets` 无回归
+  (lib 482 passed,集成全绿,仅 credential-gated ignored)✓;`RUSTDOCFLAGS="-D warnings" cargo doc
+  --no-deps --workspace` 无告警 ✓;`git diff --check` 干净 ✓。
 
 ### [TODO] M6-2 task evaluator 与 dispatcher
 

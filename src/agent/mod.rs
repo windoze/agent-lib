@@ -44,15 +44,16 @@ pub use event::{
     AgentError, AgentErrorKind, AgentInput, AgentUserInput, Notification, PivotMessage,
     StepBoundary, ToolCallFinished, ToolCallStarted,
 };
-pub use external::{DiscardEventSink, ExternalEventSink};
 pub use external::{
-    ExternalAgentCursor, ExternalAgentError, ExternalAgentEvent, ExternalAgentMachine,
-    ExternalAgentOutput, ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind,
-    ExternalArtifactRef, ExternalPermissionMode, ExternalRuntimeHandles, ExternalRuntimeKind,
-    ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest,
-    ExternalSessionResult, ExternalSessionShutdown, ExternalStreamPolicy, WorkerProfileRef,
-    WorktreeIsolation, collect_file_patch_artifacts,
+    Capability, CostTier, EscalationRules, EscalationTrigger, ExternalAgentCursor,
+    ExternalAgentError, ExternalAgentEvent, ExternalAgentMachine, ExternalAgentOutput,
+    ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef,
+    ExternalPermissionMode, ExternalRuntimeHandles, ExternalRuntimeKind, ExternalSessionInput,
+    ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
+    ExternalSessionShutdown, ExternalStreamPolicy, WorkerProfile, WorkerProfileRef,
+    WorkerProfileRegistry, WorktreeIsolation, collect_file_patch_artifacts,
 };
+pub use external::{DiscardEventSink, ExternalEventSink};
 pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};
 pub use interaction::{
     Interaction, InteractionError, InteractionKind, InteractionKindTag, InteractionResponse,

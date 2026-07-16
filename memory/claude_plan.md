@@ -1,42 +1,46 @@
-# M5-4 — Milestone 5 Review(Event sink 与 artifact)
+# M6-1 — `WorkerProfileRef`、worker profile registry 与 `WorktreeIsolation`
 
-**状态:完成(全绿,已提交)。** 本次执行 TODO.md 第一个未完成任务 = M5-4(review 任务)。
+**状态:完成(全绿,已提交)。** 本次执行 TODO.md 第一个未完成任务 = M6-1(Milestone 6 首个任务)。
 
-## 任务要求(TODO.md M5-4)
-- 核对 observation→notification 顺序与去重(§5.5);artifact 记录不落敏感原文(§11/§12);
-  实时旁路接口不阻塞 continuation。
-- 确认 `assertions/notifications.rs` 能覆盖新的 `ExternalAgent` notification 断言。
-- 验证:完整验证序列全绿,`cargo test --all --all-targets` 无回归;review 结论写入完成记录。
+## 任务要求(TODO.md M6-1)
+- 定义 `WorkerProfile { id, capabilities: Vec<Capability>, cost_tier, escalation: EscalationRules }`
+  与 `WorkerProfileRef`,以及内存 `WorkerProfileRegistry`(注册/按 ref 解析)。
+- 把 `ExternalAgentSpec.profile` 从占位 `WorkerProfileRef` 升级为真实的 registry-backed ref。
+- 明确 `WorktreeIsolation` 各级语义与默认(强 worker 默认独立 worktree,见 §10)。
+- 验证:`cargo test --lib worker_profile`;完整验证序列全绿。
 
-## 复核结论(已核对源码)
-1. **observation→notification 顺序/去重(§5.5)——通过。**
-   - `fold_session_result`(machine.rs:307)三个决策点(Completed/PausedForInteraction/Failed)
-     都在 `set_session` 之前调用 `observe(incoming_seq, observations)`,故读取旧的已消费游标。
-   - `observe`(machine.rs:355):空→空;`incoming<=consumed`(两者都 Some)→判定已消费,发 0 条;
-     否则 `into_iter().map(Notification::ExternalAgent)` 按序全发。任一 seq 缺失→按 as-is 全发。
-   - Failed 用 `session.as_ref().and_then(last_event_seq)`,仅 Some 时 set_session。
-2. **artifact 记录不落原文(§11/§12)——通过。**
-   - `complete_session`(machine.rs:487)`record_artifacts(output.artifacts)`,move,仅存
-     `ExternalArtifactRef{kind,summary,path,reference}`,`reference` opaque(`blob://`)。仅 Completed 记录。
-   - `from_file_patch`/`collect_file_patch_artifacts` 仅产 ref,不含 diff 原文。
-3. **实时旁路不阻塞(sink.rs)——通过。**
-   - `ExternalEventSink::emit` + `DiscardEventSink` no-op;rustdoc 明确可丢弃/不阻塞/可跳过/untrusted,
-     刻意不接进 sans-io `step`——只有 `Requirement` 阻塞 continuation。
-4. **穷尽 match 复核**:全库唯一对 `Notification` 的穷尽 `match` 是 testkit `describe()`(notifications.rs:191),
-   已含 `ExternalAgent` 臂;其余为 `find_map`/`filter_map`。无遗漏。
+## 设计输入
+- 设计文档 §4.1(static spec,`profile: WorkerProfileRef`)、§8(worker 集合:internal-cheap /
+  deepseek / cc / cx / opencode / review)、§9(能力/成本维度与升级规则)、§10(worktree 隔离默认)。
+- 现有类型:`WorkerProfileRef`(占位,`external/spec.rs`)、`WorktreeIsolation`(`external/mod.rs`,
+  Shared / PerAgentWorktree / EphemeralGitWorktree)、`PermissionRisk`(有序枚举参考)。
 
-## 发现的缺口(需闭合,class-wide 一致性)
-`NotificationAssertions` 对每个既有 family 都有 `*_count` 断言 + 访问器,**唯独缺 `ExternalAgent`**:
-`describe()` 只做诊断渲染,没有可断言的 count/accessor。要让 review 结论「能覆盖 ExternalAgent 断言」
-为真,按 class-wide-fix 原则补齐同族断言。
+## 方案(全部落在 `src/agent/external/` 内,避免跨模块循环依赖)
+1. 新建 `src/agent/external/profile.rs`:
+   - `Capability`:Search/Shell/Test/BugFix/Feature/Refactor/Review/Debug/CodeGeneration/Planning +
+     `Custom(String)`(对齐 §9 任务类型 + 逃生舱)。
+   - `CostTier`:Cheap < Standard < Premium(`Ord`,`Default = Cheap`);`recommended_isolation()`
+     映射 Cheap→Shared、Standard→PerAgentWorktree、Premium→EphemeralGitWorktree(强 worker 独立 worktree)。
+   - `EscalationTrigger`:Timeout/TestFailure/LowConfidence/ReviewRejected/BudgetExhausted(§9 升级规则)。
+   - `EscalationRules { triggers, escalate_to: Option<WorkerProfileRef>, human_fallback }`。
+   - `WorkerProfileRef`(从 spec.rs 移来,transparent String id)。
+   - `WorkerProfile { id, capabilities, cost_tier, escalation }` + `reference()` / `has_capability()` /
+     `recommended_isolation()`。
+   - `WorkerProfileRegistry`(BTreeMap<id, WorkerProfile>):`register`/`resolve`/`get`/`contains`/`len`。
+   - 单测(名字含 `worker_profile`):registry 注册+解析(含未知返回 None)、profile serde round-trip、
+     WorktreeIsolation/CostTier 默认与推荐隔离策略断言。
+2. `external/mod.rs`:`mod profile;`;`pub use profile::{...}`;`WorkerProfileRef` 改从 profile 导出;
+   新增 `impl Default for WorktreeIsolation`(= PerAgentWorktree,§10「默认隔离」)+ 文档。
+3. `external/spec.rs`:删除本地 `WorkerProfileRef` 定义,改从 `super::profile` 引入;更新 rustdoc,
+   去掉「placeholder」措辞。
+4. `src/agent/mod.rs`:re-export 新 profile 类型。
+5. 文档:`docs/external-agent.md` §10 追加隔离默认策略的收敛说明(保持简洁)。
 
-## 方案
-1. `crates/agent-testkit/src/assertions/notifications.rs`:
-   - import `ExternalAgentEvent`;新增 `external_agent_count(expected)` + 访问器
-     `external_agent_events() -> Vec<&ExternalAgentEvent>`(stream order);加单测。
-2. 验证:fmt --check → clippy -D warnings → `cargo test -p agent-testkit notification` →
-   `cargo test --all --all-targets`(≤30min)→ doc -D warnings → `git diff --check`。
-3. TODO.md M5-4 标 `[DONE]` + 完成记录;提交 `[M5-4] ...`;停止。
+## 验证序列
+fmt --check → `cargo test --lib worker_profile` → clippy -D warnings →
+`cargo test --all --all-targets`(≤30min)→ doc -D warnings → `git diff --check`。
 
 ## 约束
-- 只补 testkit 断言对称缺口;不改 machine/state 语义。新公开 API 带 rustdoc。
+- `WorkerProfile` 字段严格对齐任务要求(id/capabilities/cost_tier/escalation),隔离由 cost_tier 派生。
+- 所有新公开 API 带 rustdoc;不改动现有 external machine/state 运行语义。
+- 完成后 TODO.md M6-1 标 `[DONE]` + 完成记录;提交 `[M6-1] ...`;停止。

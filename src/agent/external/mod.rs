@@ -61,6 +61,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod machine;
+mod profile;
 mod runtime;
 mod shutdown;
 mod sink;
@@ -68,10 +69,14 @@ mod spec;
 mod state;
 
 pub use machine::ExternalAgentMachine;
+pub use profile::{
+    Capability, CostTier, EscalationRules, EscalationTrigger, WorkerProfile, WorkerProfileRef,
+    WorkerProfileRegistry,
+};
 pub use runtime::ExternalRuntimeHandles;
 pub use shutdown::ExternalSessionShutdown;
 pub use sink::{DiscardEventSink, ExternalEventSink};
-pub use spec::{ExternalAgentSpec, WorkerProfileRef};
+pub use spec::ExternalAgentSpec;
 pub use state::{ExternalAgentCursor, ExternalAgentState};
 
 /// Which external coding-agent runtime backs a session.
@@ -152,6 +157,20 @@ pub enum WorktreeIsolation {
     PerAgentWorktree,
     /// Each session runs in an ephemeral git worktree torn down afterward.
     EphemeralGitWorktree,
+}
+
+impl Default for WorktreeIsolation {
+    /// Isolates each agent by default (design §10 "默认 worktree 隔离").
+    ///
+    /// With no scheduling policy in play the safe default gives every agent its
+    /// own [`PerAgentWorktree`](Self::PerAgentWorktree) so concurrent edits do
+    /// not collide. A cost-aware scheduler refines this per worker via
+    /// [`CostTier::recommended_isolation`](crate::agent::external::CostTier::recommended_isolation),
+    /// which shares a worktree only for cheap workers and gives strong workers
+    /// an independent (ephemeral) worktree.
+    fn default() -> Self {
+        Self::PerAgentWorktree
+    }
 }
 
 /// Whether and how a handler surfaces fine-grained session events.
