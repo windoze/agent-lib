@@ -1,50 +1,53 @@
-# M1-1 — 定义 `StepError` 内部错误类型与 `From` 转换
+# M1-2 — 把 `mod.rs` 的 fallible 方法改造为返回 `Result<StepOutcome, StepError>`
 
-**当前执行 TODO.md 第一个未完成任务 = M1-1**（新任务单「Effect 层清理（三刀重构）」，
-M1-1 是首个 `[TODO]`）。这是刀 (C) 的第一步:只定义类型,不改调用点。
+**当前执行 TODO.md 第一个未完成任务 = M1-2**（M1-1 已 DONE）。刀 (C) 第二步：
+把 `src/agent/machine/default/mod.rs` 里除 tools.rs 外的 fallible 方法改成返回
+`Result<StepOutcome, StepError>`，`if let Err(..) return self.fail(..)` 塌缩成 `?`。
+本任务不做 step() 最外层折叠（M1-3）、不做 tools.rs 失败路径重写（M1-4）。
 
-## 任务要求（TODO.md M1-1）
-1. 在 `src/agent/machine/default/` 内定义仅 crate 内可见、不对外暴露的 `StepError` 枚举。
-2. 为每个非 `Protocol` 变体实现 `From<...>`,让 `?` 可用;显式分别实现 `From<ConversationError>`
-   与 `From<AgentStateError>`,映射到不同变体(避免经 `AgentStateError: From<ConversationError>`
-   的歧义)。
-3. 提供 `message()` 复刻现有文案前缀,折叠后落在 `ErrorCursor` 的文本逐字节一致。
+## 需改造方法（全部 -> Result<StepOutcome, StepError>）
+begin_user_turn, open_user_turn, inject_pivot, block_on_llm, resume, resume_llm,
+fold_llm_response, commit_text_turn, finalize_text_commit, emit_reconfig_effect,
+resume_reconfig, abandon, abandon_llm_step, abandon_reconfig, finish_cancel
 
-## 现有文案前缀（来自 mod.rs 的 self.fail(format!(...))）
-- `conversation operation failed: {error}`  <- ConversationError
-- `agent state operation failed: {error}`   <- AgentStateError（state 操作）
-- `cursor transition failed: {error}`        <- AgentStateError（transition_cursor）★同类型不同文案
-- `tool runtime operation failed: {error}`   <- ToolRuntimeError
-- `requirement id unavailable: {error}`      <- RequirementError
-- 其余纯协议违例走 `Protocol(String)` 原样透传。
+## 错误变体路由（保证文案逐字节一致）
+- ConversationError (begin_turn/cancel_pending/inject_user_message/start_assistant_response/
+  finish_assistant/commit_pending) -> `?` -> Conversation -> "conversation operation failed: {e}"
+- queued_reconfig_application / pivot.validate() (均 AgentStateError) -> `?` -> State ->
+  "agent state operation failed: {e}"
+- transition_cursor (AgentStateError, 但文案不同) -> `.map_err(StepError::CursorTransition)?`
+  -> "cursor transition failed: {e}"
+- next_requirement_id (RequirementError) -> `?` -> Requirement -> "requirement id unavailable: {e}"
+- RequirementResult::Reconfig(Err(ToolRuntimeError)) -> StepError::ToolRuntime(e) ->
+  "tool runtime operation failed: {e}"（已确认 Reconfig 的 Err 是 ToolRuntimeError）
+- 纯协议违例 & "client operation failed"(ClientError) -> StepError::Protocol(格式化字符串原样)
 
-## 设计决定
-`cursor transition failed` 与 `agent state operation failed` 都是 `AgentStateError` 但文案不同,
-单一 `From<AgentStateError>` 无法同时复刻两种文案。因此在建议 5 变体基础上**新增
-`CursorTransition(AgentStateError)` 变体**(TODO 允许「字段名可微调」,且 M1-1 明确要求 message()
-能复刻 `cursor transition failed`)。`From<AgentStateError>` -> `State`(默认 `?` 路径);cursor
-transition 站点在 M1-2 用 `.map_err(StepError::CursorTransition)` 显式构造,不算 workaround。
+## 跨模块调用桥接
+- mod.rs(Result) 调 tools.rs(StepOutcome) 方法：`Ok(self.resume_tool(..))` /
+  `Ok(self.resume_approval(..))` / `Ok(self.begin_tool_phase(..))` / `Ok(self.abandon_tool_phase(..))`
+- tools.rs(StepOutcome) 调 mod.rs 现在返回 Result 的方法（2 处）：
+  - tools.rs:552 finish_tool_phase -> block_on_llm
+  - tools.rs:639 abandon_tool_phase -> finish_cancel
+  两处临时桥接 `.unwrap_or_else(|error| self.fail(error.message()))`，标注 `// M1-3 will replace with fail_from`
+- step()(mod.rs:853) 临时桥接同上，标注 `// M1-3 will replace with fail_from`
+- error.rs 顶部 `#![allow(dead_code)]` 现可移除（变体已被使用）；若 message()/某变体仍未用到再局部处理
 
-新增私有子模块 `src/agent/machine/default/error.rs`(mod.rs 加 `mod error;`),提高模块化:
-- `pub(super) enum StepError { Conversation, State, CursorTransition, ToolRuntime, Requirement, Protocol }`
-- `From<ConversationError|AgentStateError|ToolRuntimeError|RequirementError> for StepError`
-- `pub(super) fn message(&self) -> String`
-- 本任务未接线 -> 全部 `#[allow(dead_code)]`(M1-2 移除)。
-
-错误类型路径:`crate::agent::{AgentStateError, RequirementError, ToolRuntimeError}`、
-`crate::conversation::ConversationError`。
-
-## 验证条件（M1-1）
-- `cargo build` 通过。
-- `cargo test -p agent-lib agent::machine::default` 全绿(调用点未改)。
-- `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings` 通过。
-- `git diff --check` 干净。
+## 验证条件
+1. cargo fmt --all -- --check
+2. cargo test -p agent-lib agent::machine::default（断言不改）
+3. cargo clippy --all-targets -- -D warnings
+4. cargo test --all --all-targets
+5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+6. git diff --check
 
 ## 完成后
-TODO.md M1-1 标 `[DONE]` + 完成记录;commit `[M1-1] ...`;停(不做 M1-2)。
+TODO.md M1-2 标 [DONE] + 完成记录；commit `[M1-2] ...`；停（不做 M1-3）。
 
 ## 进度
-- [x] 读 TODO/源码,确定文案前缀与类型路径
-- [x] 新增 error.rs + `mod error;`
-- [x] fmt/clippy/build/聚焦测试(+doc) 全绿
-- [x] TODO.md 标 DONE + commit
+- [x] 读 TODO/源码，确认类型路由与跨模块桥接点
+- [x] 改 mod.rs 15 个方法签名 + 体（if let Err 计数 10 -> 0）
+- [x] tools.rs 2 处桥接 + step() 桥接（均标注 M1-3 will replace with fail_from）
+- [x] error.rs 移除 dead_code allow + 更新模块 doc
+- [x] fmt/clippy/build/聚焦(39 passed)/全量测试/doc/diff 全绿
+- [x] TODO.md 标 DONE + 完成记录（并修复误删的 M1-3 标题）
+- [x] commit `[M1-2] ...`；停（不做 M1-3）

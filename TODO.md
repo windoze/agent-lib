@@ -121,7 +121,7 @@ fallible 调用会返回这些错误类型:
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警；`git diff --check` 干净。
   （M1-1 明确放宽为聚焦测试，未跑 `cargo test --all`；调用点零改动，运行时语义不变。）
 
-### [TODO] M1-2 把 `mod.rs` 的 fallible 方法改造为返回 `Result<StepOutcome, StepError>`
+### [DONE] M1-2 把 `mod.rs` 的 fallible 方法改造为返回 `Result<StepOutcome, StepError>`
 
 **前置依赖**:M1-1。
 
@@ -172,7 +172,45 @@ fn open_user_turn(&mut self, user: AgentUserInput) -> Result<StepOutcome, StepEr
 
 **完成记录**:
 
-（待补充）
+- 将 `mod.rs` 中除 `tools.rs` 外的 15 个 fallible 方法签名改为
+  `-> Result<StepOutcome, StepError>`：`begin_user_turn`、`open_user_turn`、`inject_pivot`、
+  `block_on_llm`、`resume`、`resume_llm`、`fold_llm_response`、`commit_text_turn`、
+  `finalize_text_commit`、`emit_reconfig_effect`、`resume_reconfig`、`abandon`、
+  `abandon_llm_step`、`abandon_reconfig`、`finish_cancel`。方法体内 `if let Err(error) = ..
+  { return self.fail(format!("..: {error}")); }` 全部塌缩为 `?`；`mod.rs` 的 `if let Err`
+  计数从 10 降至 **0**。
+- **错误变体路由**（保证折叠文案逐字节不变）：
+  - `ConversationError`（`begin_turn` / `cancel_pending` / `inject_user_message` /
+    `start_assistant_response` / `finish_assistant` / `commit_pending`）经裸 `?` →
+    `From<ConversationError>` → `Conversation` → `conversation operation failed:`。
+  - `queued_reconfig_application` 与 `pivot.validate()`（均 `AgentStateError`）经裸 `?` →
+    `From<AgentStateError>` → `State` → `agent state operation failed:`。
+  - `transition_cursor`（同为 `AgentStateError` 但历史文案不同）用
+    `.map_err(StepError::CursorTransition)?` → `cursor transition failed:`。
+  - `next_requirement_id`（`RequirementError`）经裸 `?` → `Requirement` →
+    `requirement id unavailable:`。
+  - `RequirementResult::Reconfig(Err(error))` 的 `error` 经核实为 `ToolRuntimeError`
+    （`requirement.rs:485`），改用 `StepError::ToolRuntime(error)` →
+    `tool runtime operation failed:`（与旧 `self.fail(format!(..))` 逐字节一致）。
+  - 纯协议违例与 `client operation failed:`（`ClientError`，非 typed 前缀）走
+    `StepError::Protocol(format!(..))` 原样透传。
+- **跨模块桥接**（M1-2 不改 `tools.rs` 失败路径、不做 `step()` 正式折叠，均留给 M1-3/M1-4）：
+  - `mod.rs`(Result) 调 `tools.rs`(仍 `StepOutcome`) 处包 `Ok(..)`：`resume` 里
+    `resume_tool`/`resume_approval`、`fold_llm_response` 里 `begin_tool_phase`、`abandon`
+    里 `abandon_tool_phase`。
+  - `tools.rs`(`StepOutcome`) 调现返回 `Result` 的 `mod.rs` 方法两处
+    （`finish_tool_phase→block_on_llm`、`abandon_tool_phase→finish_cancel`）临时桥接
+    `.unwrap_or_else(|error| self.fail(error.message()))`，注释标注 `// M1-3 will replace
+    with fail_from`。
+  - `step()` 最外层临时桥接 `result.unwrap_or_else(|error| self.fail(error.message()))`，
+    同样标注 `// M1-3 will replace with fail_from`。
+- `fail()` / `fail_with_notifications()` 方法体保留不动（供 `tools.rs` 与桥接复用，M1-3 再加
+  `fail_from`）。移除 `error.rs` 顶部临时 `#![allow(dead_code)]`（变体已全部接线）并更新其模块
+  doc 注释。
+- 验证（完整序列 1–6 全过）：`cargo fmt --all -- --check` 干净；`cargo build` 通过；
+  `cargo test -p agent-lib --lib agent::machine::default` 39 passed / 0 failed（**断言未改**）；
+  `cargo clippy --all-targets -- -D warnings` 无告警；`cargo test --all --all-targets` 全绿；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过；`git diff --check` 干净。
 
 ### [TODO] M1-3 在 `step()` 最外层收敛错误折叠(`fail_from`)
 

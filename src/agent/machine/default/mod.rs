@@ -41,6 +41,8 @@
 mod error;
 mod tools;
 
+use error::StepError;
+
 use crate::{
     agent::{
         AgentError, AgentInput, AgentMachine, AgentPath, AgentState, AgentUserInput,
@@ -297,7 +299,7 @@ impl DefaultAgentMachine {
     }
 
     /// Opens a fresh user turn and blocks on one `NeedLlm` requirement.
-    fn begin_user_turn(&mut self, user: AgentUserInput) -> StepOutcome {
+    fn begin_user_turn(&mut self, user: AgentUserInput) -> Result<StepOutcome, StepError> {
         // A completed or errored turn settles the cursor at a terminal rest state
         // (`Done` / `Error`). The same machine is reused across turns, so a new
         // user message supersedes that finished turn: reset the cursor to the
@@ -306,9 +308,10 @@ impl DefaultAgentMachine {
         if matches!(
             self.state.loop_cursor(),
             LoopCursor::Done(_) | LoopCursor::Error(_)
-        ) && let Err(error) = self.state.transition_cursor(LoopCursor::Idle)
-        {
-            return self.fail(format!("cursor transition failed: {error}"));
+        ) {
+            self.state
+                .transition_cursor(LoopCursor::Idle)
+                .map_err(StepError::CursorTransition)?;
         }
 
         // A never-resume abandon of a tool batch leaves a *coherent* pending turn
@@ -318,22 +321,17 @@ impl DefaultAgentMachine {
         // `begin_turn` opens the next one (which rejects a second open pending).
         if matches!(self.state.loop_cursor(), LoopCursor::Idle)
             && self.state.conversation().pending().is_some()
-            && let Err(error) = self
-                .state
-                .conversation_mut()
-                .cancel_pending(CancelDisposition::DiscardTurn)
         {
-            return self.fail(format!("conversation operation failed: {error}"));
+            self.state
+                .conversation_mut()
+                .cancel_pending(CancelDisposition::DiscardTurn)?;
         }
 
         // Apply (or defer) any queued reconfiguration at the turn boundary before
         // the turn opens. A start-of-turn application writes no step-boundary
         // metadata (mirroring the legacy `apply_queued_reconfigs_before_turn`).
         // A tool-set change parks on a registry effect; the turn opens on resume.
-        let application = match self.state.queued_reconfig_application() {
-            Ok(application) => application,
-            Err(error) => return self.fail(format!("agent state operation failed: {error}")),
-        };
+        let application = self.state.queued_reconfig_application()?;
         match application {
             None => self.open_user_turn(user),
             Some(application)
@@ -351,14 +349,12 @@ impl DefaultAgentMachine {
     /// Opens a fresh user turn's Conversation transaction and blocks on the first
     /// `NeedLlm` requirement. Shared by the direct turn open and the resume of a
     /// deferred start-of-turn reconfiguration.
-    fn open_user_turn(&mut self, user: AgentUserInput) -> StepOutcome {
-        if let Err(error) = self.state.conversation_mut().begin_turn(
+    fn open_user_turn(&mut self, user: AgentUserInput) -> Result<StepOutcome, StepError> {
+        self.state.conversation_mut().begin_turn(
             user.turn_id(),
             user.message_id(),
             user.message().clone(),
-        ) {
-            return self.fail(format!("conversation operation failed: {error}"));
-        }
+        )?;
 
         self.in_flight = Some(InFlight::new(user.assistant_message_id()));
         self.block_on_llm(user.step_id(), Vec::new())
@@ -382,34 +378,31 @@ impl DefaultAgentMachine {
     /// from the updated pending turn (so the pivot reaches the model on the next
     /// fulfillment) and re-emitted under the *same* requirement id. This is the
     /// same LLM step, so the cursor does not move.
-    fn inject_pivot(&mut self, pivot: PivotMessage) -> StepOutcome {
+    fn inject_pivot(&mut self, pivot: PivotMessage) -> Result<StepOutcome, StepError> {
         let LoopCursor::StreamingStep(cursor) = self.state.loop_cursor() else {
             let kind = self.state.loop_cursor().kind();
-            return self.fail(format!(
+            return Err(StepError::Protocol(format!(
                 "pivot injection requires a streaming step boundary, but cursor is `{kind:?}`"
-            ));
+            )));
         };
         let Some(requirement_id) = cursor.requirement_id() else {
-            return self.fail(
-                "streaming step has no outstanding LLM requirement to re-render for a pivot",
-            );
+            return Err(StepError::Protocol(
+                "streaming step has no outstanding LLM requirement to re-render for a pivot"
+                    .to_string(),
+            ));
         };
 
         // Reject non-user pivot payloads up front (mirrors the queued-pivot role
         // check); the injection entry re-validates the role as a second guard.
-        if let Err(error) = pivot.validate() {
-            return self.fail(format!("agent state operation failed: {error}"));
-        }
+        pivot.validate()?;
 
         let boundary = self.state.conversation().head();
-        if let Err(error) = self.state.conversation_mut().inject_user_message(
+        self.state.conversation_mut().inject_user_message(
             boundary,
             pivot.message_id(),
             pivot.message().clone(),
             pivot.message_meta(),
-        ) {
-            return self.fail(format!("conversation operation failed: {error}"));
-        }
+        )?;
 
         // Re-render the outstanding LLM request so the pivot is part of the next
         // generation. Same step id and requirement id, re-rendered request, so
@@ -423,7 +416,7 @@ impl DefaultAgentMachine {
                 mode: self.mode,
             },
         );
-        StepOutcome::new(Vec::new(), vec![requirement], true)
+        Ok(StepOutcome::new(Vec::new(), vec![requirement], true))
     }
 
     /// Builds the next generation request and parks on one `NeedLlm` requirement.
@@ -433,23 +426,23 @@ impl DefaultAgentMachine {
     /// from current state, and transition to [`LoopCursor::StreamingStep`]. The
     /// caller supplies any notifications produced earlier in the same step (for
     /// example a tool step boundary) to emit alongside the requirement.
-    fn block_on_llm(&mut self, step_id: StepId, notifications: Vec<Notification>) -> StepOutcome {
-        let requirement_id = match self
+    fn block_on_llm(
+        &mut self,
+        step_id: StepId,
+        notifications: Vec<Notification>,
+    ) -> Result<StepOutcome, StepError> {
+        let requirement_id = self
             .requirement_ids
-            .next_requirement_id(RequirementKindTag::Llm)
-        {
-            Ok(id) => id,
-            Err(error) => return self.fail(format!("requirement id unavailable: {error}")),
-        };
+            .next_requirement_id(RequirementKindTag::Llm)?;
 
         let tools = self.state.current_tool_set().tools().to_vec();
         let request = build_chat_request(&self.state, tools, self.mode.request_stream_flag());
 
         let cursor =
             LoopCursor::streaming_step(step_id, Some(CursorRequirement::root(requirement_id)));
-        if let Err(error) = self.state.transition_cursor(cursor) {
-            return self.fail(format!("cursor transition failed: {error}"));
-        }
+        self.state
+            .transition_cursor(cursor)
+            .map_err(StepError::CursorTransition)?;
 
         let requirement = Requirement::at_root(
             requirement_id,
@@ -458,7 +451,7 @@ impl DefaultAgentMachine {
                 mode: self.mode,
             },
         );
-        StepOutcome::new(notifications, vec![requirement], true)
+        Ok(StepOutcome::new(notifications, vec![requirement], true))
     }
 
     /// Feeds a fulfilled requirement result back into the in-flight turn.
@@ -466,17 +459,17 @@ impl DefaultAgentMachine {
     /// The cursor selects the return path: an outstanding LLM step folds a
     /// [`Response`], while a tool batch or a pending approval route into the tool
     /// phase (see [`tools`]).
-    fn resume(&mut self, resolution: RequirementResolution) -> StepOutcome {
+    fn resume(&mut self, resolution: RequirementResolution) -> Result<StepOutcome, StepError> {
         match self.state.loop_cursor() {
             LoopCursor::StreamingStep(cursor) => {
                 let step_id = cursor.step_id();
                 let expected = cursor.requirement_id();
                 self.resume_llm(step_id, expected, resolution)
             }
-            LoopCursor::AwaitingTool(_) => self.resume_tool(resolution),
+            LoopCursor::AwaitingTool(_) => Ok(self.resume_tool(resolution)),
             LoopCursor::AwaitingApproval(cursor) => {
                 let expected = cursor.requirement_id();
-                self.resume_approval(expected, resolution)
+                Ok(self.resume_approval(expected, resolution))
             }
             LoopCursor::AwaitingReconfig(cursor) => {
                 let expected = cursor.requirement_id();
@@ -484,9 +477,9 @@ impl DefaultAgentMachine {
             }
             other => {
                 let kind = other.kind();
-                self.fail(format!(
+                Err(StepError::Protocol(format!(
                     "resume received while cursor is `{kind:?}`, no outstanding requirement"
-                ))
+                )))
             }
         }
     }
@@ -497,25 +490,25 @@ impl DefaultAgentMachine {
         step_id: StepId,
         expected_id: Option<RequirementId>,
         resolution: RequirementResolution,
-    ) -> StepOutcome {
+    ) -> Result<StepOutcome, StepError> {
         if let Some(expected) = expected_id
             && resolution.id != expected
         {
-            return self.fail(format!(
+            return Err(StepError::Protocol(format!(
                 "resume targets requirement {}, but the machine awaits {expected}",
                 resolution.id
-            ));
+            )));
         }
 
         match resolution.result {
             RequirementResult::Llm(Ok(response)) => self.fold_llm_response(step_id, response),
-            RequirementResult::Llm(Err(error)) => {
-                self.fail(format!("client operation failed: {error}"))
-            }
-            other => self.fail(format!(
+            RequirementResult::Llm(Err(error)) => Err(StepError::Protocol(format!(
+                "client operation failed: {error}"
+            ))),
+            other => Err(StepError::Protocol(format!(
                 "NeedLlm requirement cannot accept a `{}` result",
                 other.tag()
-            )),
+            ))),
         }
     }
 
@@ -523,33 +516,31 @@ impl DefaultAgentMachine {
     ///
     /// A tool-free response commits the turn; a tool-use response opens the tool
     /// phase (M2-4) rather than being rejected.
-    fn fold_llm_response(&mut self, step_id: StepId, response: Response) -> StepOutcome {
+    fn fold_llm_response(
+        &mut self,
+        step_id: StepId,
+        response: Response,
+    ) -> Result<StepOutcome, StepError> {
         let Some(assistant_message_id) =
             self.in_flight.as_ref().map(InFlight::assistant_message_id)
         else {
-            return self.fail("missing in-flight assistant message id for the LLM response");
+            return Err(StepError::Protocol(
+                "missing in-flight assistant message id for the LLM response".to_string(),
+            ));
         };
 
-        if let Err(error) = self
-            .state
+        self.state
             .conversation_mut()
-            .start_assistant_response(response)
-        {
-            return self.fail(format!("conversation operation failed: {error}"));
-        }
+            .start_assistant_response(response)?;
 
-        let finish = match self
+        let finish = self
             .state
             .conversation_mut()
-            .finish_assistant(assistant_message_id)
-        {
-            Ok(finish) => finish,
-            Err(error) => return self.fail(format!("conversation operation failed: {error}")),
-        };
+            .finish_assistant(assistant_message_id)?;
 
         match finish {
             AssistantFinish::ReadyToCommit => self.commit_text_turn(step_id),
-            AssistantFinish::RequiresToolCallMappings => self.begin_tool_phase(step_id),
+            AssistantFinish::RequiresToolCallMappings => Ok(self.begin_tool_phase(step_id)),
         }
     }
 
@@ -563,11 +554,8 @@ impl DefaultAgentMachine {
     /// the legacy loop resolving the registry before `commit_pending`). A
     /// reconfiguration that leaves the tool set unchanged, or no queued
     /// reconfiguration at all, commits immediately.
-    fn commit_text_turn(&mut self, step_id: StepId) -> StepOutcome {
-        let application = match self.state.queued_reconfig_application() {
-            Ok(application) => application,
-            Err(error) => return self.fail(format!("agent state operation failed: {error}")),
-        };
+    fn commit_text_turn(&mut self, step_id: StepId) -> Result<StepOutcome, StepError> {
+        let application = self.state.queued_reconfig_application()?;
         match application {
             None => self.finalize_text_commit(step_id, None),
             Some(application)
@@ -593,14 +581,10 @@ impl DefaultAgentMachine {
         &mut self,
         step_id: StepId,
         reconfig: Option<(ReconfigApplication, Vec<Value>)>,
-    ) -> StepOutcome {
-        if let Err(error) = self
-            .state
+    ) -> Result<StepOutcome, StepError> {
+        self.state
             .conversation_mut()
-            .commit_pending(TurnMeta::default())
-        {
-            return self.fail(format!("conversation operation failed: {error}"));
-        }
+            .commit_pending(TurnMeta::default())?;
 
         let boundary = self.state.conversation().head();
         let metadata = match &reconfig {
@@ -611,12 +595,9 @@ impl DefaultAgentMachine {
             self.state.apply_reconfig_application(application);
         }
 
-        if let Err(error) = self
-            .state
+        self.state
             .transition_cursor(LoopCursor::done(LoopDoneReason::Completed))
-        {
-            return self.fail(format!("cursor transition failed: {error}"));
-        }
+            .map_err(StepError::CursorTransition)?;
 
         self.in_flight = None;
         self.pending_reconfig = None;
@@ -624,7 +605,7 @@ impl DefaultAgentMachine {
         let notification = Notification::StepBoundary(StepBoundary::with_metadata(
             step_id, boundary, None, metadata,
         ));
-        StepOutcome::new(vec![notification], Vec::new(), true)
+        Ok(StepOutcome::new(vec![notification], Vec::new(), true))
     }
 
     /// Emits a `NeedReconfigRegistry` requirement and parks on
@@ -634,14 +615,10 @@ impl DefaultAgentMachine {
     /// resolves it to a live registry, validates its declarations, swaps it in,
     /// and confirms with a [`RequirementResult::Reconfig`]. The pending
     /// application is folded into state on resume.
-    fn emit_reconfig_effect(&mut self, pending: PendingReconfig) -> StepOutcome {
-        let requirement_id = match self
+    fn emit_reconfig_effect(&mut self, pending: PendingReconfig) -> Result<StepOutcome, StepError> {
+        let requirement_id = self
             .requirement_ids
-            .next_requirement_id(RequirementKindTag::Reconfig)
-        {
-            Ok(id) => id,
-            Err(error) => return self.fail(format!("requirement id unavailable: {error}")),
-        };
+            .next_requirement_id(RequirementKindTag::Reconfig)?;
 
         let tool_set = pending.application().current_tool_set().clone();
         let step_id = pending.step_id();
@@ -649,15 +626,15 @@ impl DefaultAgentMachine {
 
         let cursor =
             LoopCursor::awaiting_reconfig(step_id, Some(CursorRequirement::root(requirement_id)));
-        if let Err(error) = self.state.transition_cursor(cursor) {
-            return self.fail(format!("cursor transition failed: {error}"));
-        }
+        self.state
+            .transition_cursor(cursor)
+            .map_err(StepError::CursorTransition)?;
 
         let requirement = Requirement::at_root(
             requirement_id,
             RequirementKind::NeedReconfigRegistry { tool_set },
         );
-        StepOutcome::new(Vec::new(), vec![requirement], true)
+        Ok(StepOutcome::new(Vec::new(), vec![requirement], true))
     }
 
     /// Feeds a fulfilled `NeedReconfigRegistry` result back into the parked
@@ -671,31 +648,33 @@ impl DefaultAgentMachine {
         &mut self,
         expected_id: Option<RequirementId>,
         resolution: RequirementResolution,
-    ) -> StepOutcome {
+    ) -> Result<StepOutcome, StepError> {
         if let Some(expected) = expected_id
             && resolution.id != expected
         {
-            return self.fail(format!(
+            return Err(StepError::Protocol(format!(
                 "resume targets requirement {}, but the machine awaits {expected}",
                 resolution.id
-            ));
+            )));
         }
 
         match resolution.result {
             RequirementResult::Reconfig(Ok(())) => {}
             RequirementResult::Reconfig(Err(error)) => {
-                return self.fail(format!("tool runtime operation failed: {error}"));
+                return Err(StepError::ToolRuntime(error));
             }
             other => {
-                return self.fail(format!(
+                return Err(StepError::Protocol(format!(
                     "NeedReconfigRegistry requirement cannot accept a `{}` result",
                     other.tag()
-                ));
+                )));
             }
         }
 
         let Some(pending) = self.pending_reconfig.take() else {
-            return self.fail("reconfig resume with no deferred reconfiguration in flight");
+            return Err(StepError::Protocol(
+                "reconfig resume with no deferred reconfiguration in flight".to_string(),
+            ));
         };
 
         match pending {
@@ -731,7 +710,7 @@ impl DefaultAgentMachine {
     ///   [`CancelDisposition::ResumeTurn`] carrying a synthesized `Cancelled`
     ///   result for every still-open call, reason
     ///   [`CancelRecoveryReason::ToolInterrupted`].
-    fn abandon(&mut self, id: RequirementId) -> StepOutcome {
+    fn abandon(&mut self, id: RequirementId) -> Result<StepOutcome, StepError> {
         let cursor = self.state.loop_cursor();
         let outstanding = cursor.pending_requirement_ids();
         let plan: Option<(AbandonKind, Option<StepId>)> = match cursor {
@@ -746,34 +725,31 @@ impl DefaultAgentMachine {
 
         let Some((kind, step_id)) = plan else {
             let cursor_kind = self.state.loop_cursor().kind();
-            return self.fail(format!(
+            return Err(StepError::Protocol(format!(
                 "abandon received while cursor is `{cursor_kind:?}`, no outstanding requirement"
-            ));
+            )));
         };
 
         if !outstanding.contains(&id) {
-            return self.fail(format!(
+            return Err(StepError::Protocol(format!(
                 "abandon targets requirement {id}, which is not outstanding this step"
-            ));
+            )));
         }
 
         match kind {
             AbandonKind::Llm => self.abandon_llm_step(step_id),
-            AbandonKind::Tool => self.abandon_tool_phase(step_id),
+            AbandonKind::Tool => Ok(self.abandon_tool_phase(step_id)),
             AbandonKind::Reconfig => self.abandon_reconfig(step_id),
         }
     }
 
     /// Never-resume close for an outstanding LLM step: discard the pending turn
     /// wholesale, since no tool_use has been committed for it yet.
-    fn abandon_llm_step(&mut self, step_id: Option<StepId>) -> StepOutcome {
-        if self.state.conversation().pending().is_some()
-            && let Err(error) = self
-                .state
+    fn abandon_llm_step(&mut self, step_id: Option<StepId>) -> Result<StepOutcome, StepError> {
+        if self.state.conversation().pending().is_some() {
+            self.state
                 .conversation_mut()
-                .cancel_pending(CancelDisposition::DiscardTurn)
-        {
-            return self.fail(format!("conversation operation failed: {error}"));
+                .cancel_pending(CancelDisposition::DiscardTurn)?;
         }
         self.finish_cancel(step_id, CancelRecoveryReason::LlmInterrupted)
     }
@@ -785,14 +761,11 @@ impl DefaultAgentMachine {
     /// A start-of-turn reconfiguration has not opened a turn yet (no pending),
     /// while a during-turn reconfiguration folded but did not commit its text
     /// turn — both are closed by discarding any pending transaction.
-    fn abandon_reconfig(&mut self, step_id: Option<StepId>) -> StepOutcome {
-        if self.state.conversation().pending().is_some()
-            && let Err(error) = self
-                .state
+    fn abandon_reconfig(&mut self, step_id: Option<StepId>) -> Result<StepOutcome, StepError> {
+        if self.state.conversation().pending().is_some() {
+            self.state
                 .conversation_mut()
-                .cancel_pending(CancelDisposition::DiscardTurn)
-        {
-            return self.fail(format!("conversation operation failed: {error}"));
+                .cancel_pending(CancelDisposition::DiscardTurn)?;
         }
         self.pending_reconfig = None;
         self.finish_cancel(step_id, CancelRecoveryReason::Cancelled)
@@ -805,19 +778,16 @@ impl DefaultAgentMachine {
         &mut self,
         step_id: Option<StepId>,
         reason: CancelRecoveryReason,
-    ) -> StepOutcome {
+    ) -> Result<StepOutcome, StepError> {
         self.in_flight = None;
         self.pending_reconfig = None;
-        if let Err(error) = self
-            .state
+        self.state
             .transition_cursor(LoopCursor::cancel_recovery(step_id, reason))
-        {
-            return self.fail(format!("cursor transition failed: {error}"));
-        }
-        if let Err(error) = self.state.transition_cursor(LoopCursor::Idle) {
-            return self.fail(format!("cursor transition failed: {error}"));
-        }
-        StepOutcome::new(Vec::new(), Vec::new(), true)
+            .map_err(StepError::CursorTransition)?;
+        self.state
+            .transition_cursor(LoopCursor::Idle)
+            .map_err(StepError::CursorTransition)?;
+        Ok(StepOutcome::new(Vec::new(), Vec::new(), true))
     }
 
     /// Discards any dangling pending turn and parks the machine on a classified
@@ -851,12 +821,14 @@ impl DefaultAgentMachine {
 
 impl AgentMachine for DefaultAgentMachine {
     fn step(&mut self, input: StepInput) -> StepOutcome {
-        match input {
+        let result = match input {
             StepInput::External(AgentInput::UserMessage(user)) => self.begin_user_turn(user),
             StepInput::External(AgentInput::Pivot(pivot)) => self.inject_pivot(pivot),
             StepInput::Resume(resolution) => self.resume(resolution),
             StepInput::Abandon(id) => self.abandon(id),
-        }
+        };
+        // M1-3 will replace with fail_from.
+        result.unwrap_or_else(|error| self.fail(error.message()))
     }
 
     fn cursor(&self) -> &LoopCursor {
