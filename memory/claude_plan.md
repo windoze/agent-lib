@@ -1,62 +1,54 @@
 # Claude 执行计划
 
-## 当前任务:M3-2 实现 `ExternalAgentMachine` 基本推进
+## 当前任务:M3-3 实现两段式交互(Paused → NeedInteraction → RespondInteraction)
 
-**前置依赖**:M3-1(DONE)。
+**前置依赖**:M3-2(DONE)。
 
-### 目标(TODO M3-2)
-实现 `ExternalAgentMachine`(实现 `AgentMachine` trait,纯函数 `step`),覆盖基本推进:
-- `step(External(UserMessage))`:begin_turn,依据是否已有 session 选择
-  `NeedExternalSession { Start { prompt } }` 或 `Continue { message }`,park 到 `AwaitingSession`。
-- `step(Resume(ExternalSession(Completed)))`:记录 session/output,把 output.summary 折进 Conversation
-  (start_assistant_response → finish_assistant → commit_pending),cursor → `Done`,quiescent。
-- `step(Resume(ExternalSession(Failed)))`:记录 session(若有),cursor → `Error { message }`。
-- observations 暂不转 notification(留 M5),但 resume 分支要接收透传。
-- `cursor()` 返回与 `ExternalAgentCursor` 对应的 `LoopCursor` 视图(存一个非 serde 的 `loop_cursor` 字段,
-  与 external cursor 同步:Idle→Idle,AwaitingSession/AwaitingInteraction→streaming_step(step_id, req),
-  Done→done(Completed),Error→error(msg))。
-- PausedForInteraction 属 M3-3;M3-2 遇到时以清晰 `fail` 收敛(M3-3 覆盖)。
-- Abandon 属 M3-4;M3-2 做最小安全收敛(settle Idle,不 emit requirement)。
+### 目标(TODO M3-3)
+扩展 `ExternalAgentMachine`,覆盖 external session 的两段式交互:
+- `Resume(ExternalSession(PausedForInteraction { session, action_id, request, .. }))`
+  → 记录 session facts、保存 `pending_action`(action_id)、cursor → `AwaitingInteraction`、
+    emit `NeedInteraction { request }`。
+- `Resume(Interaction(response))`(cursor 为 `AwaitingInteraction`)
+  → emit `NeedExternalSession { input: RespondInteraction { action_id: pending_action, response } }`,
+    cursor 回到 `AwaitingSession`。
+- 支持一个 turn 内多次 Paused↔Respond 循环,直到 Completed/Failed。
+- action_id 对齐:`RespondInteraction.action_id` 必须与触发它的 `PausedForInteraction` 一致。
 
-### 依据
-- `AgentMachine` trait / `StepInput` / `StepOutcome`(src/agent/machine/mod.rs)。
-- `DefaultAgentMachine`(src/agent/machine/default/mod.rs)park/emit/fold/fail 模式。
-- DTO:`ExternalSessionRequest`/`ExternalSessionInput`/`ExternalSessionResult`(src/agent/external/mod.rs)。
-- state/cursor:`ExternalAgentState`/`ExternalAgentCursor`(src/agent/external/state.rs)。
-- requirement:`RequirementKind::NeedExternalSession` / `RequirementResult::ExternalSession`(src/agent/requirement.rs)。
-- 测试:testkit `ScriptedExternalSessionHandler` + `DrainHarness` + `TestScope`。
+### 关键设计决策:DTO 补 `action_id`(非 workaround)
+`ExternalSessionResult::PausedForInteraction` 当前只有 `{ session, request, observations }`,
+没有 machine 回喂 `RespondInteraction` 所需的 action_id。设计文档 §6.2 的 action_id 来自
+`Permission(PermissionRequest { action_id })`,但 `InteractionKind::Permission` 属 M4-1,当前不可用。
+TODO M3-3 明确要求从 `PausedForInteraction { request, .. }` 里「保存 pending_action(action_id)」,
+因此正确做法是给 `PausedForInteraction` 补一个显式 `action_id: String` 字段(runtime 暂停动作的句柄,
+machine 存为 `pending_action` 并在 `RespondInteraction` 里原样回喂)。这是补全 effect 契约,不是绕过。
+同步更新 docs/external-agent.md §5.2。
 
 ### 实施步骤
-1. `src/agent/external/state.rs`:新增 `conversation_mut()`(M3-1 record 已声明留待 M3-2)。
-2. 新增 `src/agent/external/machine.rs`:`ExternalAgentMachine`(state + requirement_ids + loop_cursor +
-   in_flight scratch),`AgentMachine` impl,单测(fail/pivot 拒绝等)。
-3. `external/mod.rs`:`mod machine; pub use machine::ExternalAgentMachine;` + 模块 doc。
-4. `agent/mod.rs`:re-export `ExternalAgentMachine`。
-5. testkit:`TestScope`/`TestScopeBuilder` 增加 `external` handler;`ExternalAgentFixture` 增加
-   `spec()`/`agent_state()`/`machine()`;prelude 无需改(已导出 fixture 类型)。
-6. 新增集成测试 `tests/agent_external_basic.rs`:`external_agent_start_to_completed`、
-   `external_agent_start_to_failed`(DrainHarness + scripted external handler)。
+1. `src/agent/external/mod.rs`:`PausedForInteraction` 增加 `action_id: String` 字段(+ 文档 + 更新单测)。
+2. `src/agent/external/machine.rs`:
+   - `InFlight` 增加 `step_id: StepId`。
+   - `resume` 按 cursor 分派:AwaitingSession→resume_session,AwaitingInteraction→resume_interaction。
+   - 新增 `pause_for_interaction` / `resume_interaction`。
+   - `fold_session_result` 的 PausedForInteraction 分支改为调用 pause_for_interaction。
+   - 更新模块文档。
+3. `src/agent/external/machine/tests.rs`:新增单测(pause→NeedInteraction、respond→RespondInteraction 对齐、
+   AwaitingInteraction 收到非 Interaction 结果→Error)。
+4. `crates/agent-testkit/src/external.rs`:`permission_pause` 补 `action_id`。
+5. `tests/agent_external_interaction.rs`(新文件):pause_resume + pop_to_outer。
+6. `docs/external-agent.md` §5.2 补 `action_id`。
 
-### 验证门(完整序列)
-1. `cargo fmt --all`
-2. `cargo clippy --all-targets -- -D warnings`
-3. 聚焦:`cargo test external_agent_start`
-4. `cargo test --all --all-targets`(≤30min)
-5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+### 验证门
+1. cargo fmt --all
+2. cargo clippy --all-targets -- -D warnings
+3. cargo test external_agent_pause
+4. cargo test --all --all-targets(≤30min)
+5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ### 进度
-- (完成)`src/agent/external/state.rs` 补 `conversation_mut()`。
-- (完成)`src/agent/external/machine.rs` 实现 `ExternalAgentMachine`(state + requirement_ids + loop_cursor +
-  in_flight scratch),`AgentMachine` impl。
-- (完成)`src/agent/external/machine/tests.rs` 8 个单测(park/commit/continue/fail/pivot/abandon 等)。
-- (完成)`external/mod.rs` + `agent/mod.rs` 接线与 re-export。
-- (完成)testkit:`TestScope`/`TestScopeBuilder` 增加 `external` family;`ExternalAgentFixture` 增加
-  `spec()`/`agent_state()`/`machine()`。
-- (完成)集成测试 `tests/agent_external_basic.rs` 3 个:`external_agent_start_to_completed`、
-  `external_agent_start_to_failed`、`external_agent_continue_advances_established_session`。
-- (完成)修 rustdoc 私有 intra-doc link(struct doc 改指 `crate::agent::external`)。
-- (完成)验证门全绿:fmt 无差异、clippy 0 告警、`cargo test external_agent_start` 2 passed、
-  `cargo test --all --all-targets` 全绿、`cargo doc -D warnings` 0 告警。
-- (完成)TODO.md 标记 M3-2 `[DONE]` 并补完成记录。
-- 待办:提交(带 Co-authored-by trailer)后停止。M3-3(两段式交互)为下一次调用。
-
+- (进行中)实现与测试。
+- (完成)DTO 补 `action_id`、machine 两段式交互、5 单测 + 2 集成测试、testkit fixture、design doc。
+- (完成)验证门全绿:fmt 无差异、clippy 0 告警、`cargo test external_agent_pause` 2 passed、
+  `cargo test --all --all-targets` 663 passed/0 failed、`cargo doc -D warnings` 0 告警。
+- (完成)TODO.md 标记 M3-3 `[DONE]` 并补完成记录。
+- 待办:提交(带 Co-authored-by trailer)后停止。M3-4(cancel/abandon 清理与挂载)为下一次调用。

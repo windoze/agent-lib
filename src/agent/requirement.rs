@@ -700,6 +700,7 @@ mod tests {
                 resume_token: None,
                 last_event_seq: Some(3),
             },
+            action_id: "act-1".to_owned(),
             request: interaction(),
             observations: Vec::new(),
         }

@@ -353,15 +353,17 @@ impl ExternalAgentFixture {
     /// result modelling a permission prompt.
     ///
     /// The paused interaction is an [`Interaction::question`] describing the
-    /// gated action, paired with the matching
+    /// gated action, and the result carries the runtime's `action_id` (`"act-1"`)
+    /// that a
+    /// [`RespondInteraction`](ExternalSessionInput::RespondInteraction) echoes
+    /// back. The matching
     /// [`PermissionRequested`](ExternalAgentEvent::PermissionRequested)
-    /// observation whose `action_id` a
-    /// [`RespondInteraction`](ExternalSessionInput::RespondInteraction) would
-    /// answer.
+    /// observation repeats that same `action_id`.
     #[must_use]
     pub fn permission_pause(&self) -> ExternalSessionResult {
         ExternalSessionResult::PausedForInteraction {
             session: self.session_ref(),
+            action_id: "act-1".to_owned(),
             request: Interaction::question(
                 self.ids.step_id(),
                 "Allow the external agent to run `cargo test`?".to_owned(),

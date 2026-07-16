@@ -667,7 +667,7 @@ machine 必须是纯函数:`step` 不 `await`、不做 IO。
   `cargo test external_agent_start` 2 passed;`cargo test --all --all-targets` 全绿(0 failed;credential-gated
   集成测试保持 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 0 告警。
 
-### [TODO] M3-3 实现两段式交互(Paused → NeedInteraction → RespondInteraction)
+### [DONE] M3-3 实现两段式交互(Paused → NeedInteraction → RespondInteraction)
 
 **前置依赖**:M3-2。
 
@@ -696,6 +696,46 @@ response } }` 把结果喂回。`Interaction`/`InteractionResponse` 在 `src/age
   `action_id` 的 `NeedExternalSession(RespondInteraction)`,最终 Done。过滤名:`cargo test external_agent_pause`。
 - 缺省 local scope 无 interaction 时,`NeedInteraction` 正确 pop 到 outer(用 scope builder 构造两层)。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- DTO 补全(effect 契约,非 workaround):`src/agent/external/mod.rs` 给
+  `ExternalSessionResult::PausedForInteraction` 增加显式 `action_id: String` 字段——runtime 对暂停动作的句柄,
+  machine 存为 cursor 的 `pending_action`,并在 `RespondInteraction { action_id, response }` 里原样回喂,让
+  runtime 把回答对回它暂停的那个动作。设计文档 §6.2 的 action_id 本来自 `Permission(PermissionRequest {
+  action_id })`,但 `InteractionKind::Permission` 属 M4-1、当前不可用,TODO M3-3 又明确要求从
+  `PausedForInteraction { request, .. }` 保存 `pending_action`,故在此显式携带,`Permission` 落地后它仍是回喂的
+  规范句柄。同步更新 `docs/external-agent.md` §5.2 与 mod.rs / requirement.rs 里既有的 `PausedForInteraction`
+  构造点与 serde round-trip 单测。
+- machine(`src/agent/external/machine.rs`):
+  - `InFlight` scratch 增加 `step_id: StepId`(loop cursor 视图跨 turn 内 pause↔respond 各跳复用同一 step id)。
+  - `resume` 改为按 cursor 分派:`AwaitingSession`→`resume_session`,`AwaitingInteraction`→`resume_interaction`
+    (经内部 `Awaiting` 枚举先从借用的 cursor 读出待决 id / pending_action,再放开借用做可变迁移)。
+  - 新增 `pause_for_interaction`:fold `PausedForInteraction`——`set_session` 记录会话事实,经
+    `next_requirement_id(Interaction)` reify 一个 `NeedInteraction { request }`,park 到
+    `AwaitingInteraction { requirement, pending_action }`,loop cursor 映射为
+    `streaming_step(step_id, Some(req))`;in-flight turn 跨 pause 保持打开。
+  - 新增 `resume_interaction`:校验 resolution.id 对齐、取 `RequirementResult::Interaction(response)`(错配家族
+    → clean `fail`→Error),经 `block_on_session` 以 `RespondInteraction { action_id: pending_action, response }`
+    回喂并重新 park 到 `AwaitingSession`。
+  - `fold_session_result` 的 `PausedForInteraction` 分支由「M3-3 not yet supported」占位改为调用
+    `pause_for_interaction`;模块文档更新为覆盖 M3-2+M3-3。
+- 测试:
+  - 单元(`src/agent/external/machine/tests.rs`,新增 5 个,共 13 个 `agent::external::machine`):
+    pause→emit `NeedInteraction`+park `AwaitingInteraction`、respond→emit `RespondInteraction` 且 action_id
+    对齐(`act-42`)+ 回 `AwaitingSession`、pause→respond→completed 折成单一 committed turn、`AwaitingInteraction`
+    收到非 Interaction 结果→Error、interaction resume 错配 requirement→Error。
+  - 集成(新文件 `tests/agent_external_interaction.rs`,2 个,过滤名 `cargo test external_agent_pause` 命中):
+    `external_agent_pause_resume_interaction`(scripted external `[permission_pause, completed]` +
+    `ScriptedInteractionHandler` answer,断言 input_kinds `[Start, RespondInteraction]`、result_kinds
+    `[PausedForInteraction, Completed]`、interaction 计一次、最终 Done、提交 1 turn)、
+    `external_agent_pause_pops_interaction_to_outer_scope`(local scope 仅 external,`wrapping` 外层供 interaction,
+    `NeedInteraction` 正确路由并跑到 Done)。
+  - testkit:`crates/agent-testkit/src/external.rs` 的 `permission_pause` fixture 补 `action_id: "act-1"`(与
+    `PermissionRequested` 观测的 action_id 对齐),更新其 rustdoc。
+- **验证结果(完整序列全绿)**:`cargo fmt --all` 无差异;`cargo clippy --all-targets -- -D warnings` 0 告警;
+  `cargo test external_agent_pause` 2 passed;`cargo test --all --all-targets` 全绿(total 663 passed,0 failed;
+  credential-gated 集成测试保持 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 0 告警。
 
 ### [TODO] M3-4 cancel/abandon 清理、shutdown disposition 与 `NestedMachine` 挂载
 

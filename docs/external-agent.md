@@ -309,6 +309,7 @@ pub enum ExternalSessionResult {
     },
     PausedForInteraction {
         session: ExternalSessionRef,
+        action_id: String,
         request: Interaction,
         observations: Vec<ExternalAgentEvent>,
     },
@@ -330,7 +331,10 @@ pub struct ExternalAgentOutput {
 `PausedForInteraction` 是关键:session handler 不需要自己调用 `InteractionHandler`。它把外部 runtime 的权限请求
 转换为一个普通 `Interaction`,返回给 external agent machine。machine 下一步 emit `NeedInteraction`,该 requirement
 按现有 pop 规则由 local 或 outer interaction handler 兑现。拿到 `InteractionResponse` 后,machine 再 emit
-`NeedExternalSession { input: RespondInteraction { .. } }` 把结果喂回外部 runtime。
+`NeedExternalSession { input: RespondInteraction { .. } }` 把结果喂回外部 runtime。`action_id` 是 runtime 对本次
+暂停动作的句柄:machine 存为 cursor 的 `pending_action`,并在 `RespondInteraction { action_id, response }` 里原样回喂,
+让 runtime 能把回答对回它暂停的那个动作。在 `InteractionKind::Permission`(§4)落地前,`action_id` 由这里显式携带;
+落地后它仍是 machine 回喂时使用的规范句柄。
 
 这个两段式设计比“给任意 handler 一个 `Pop`”更克制:
 

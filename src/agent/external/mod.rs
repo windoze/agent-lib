@@ -406,6 +406,17 @@ pub enum ExternalSessionResult {
     PausedForInteraction {
         /// Updated resumable session facts.
         session: ExternalSessionRef,
+        /// Runtime-assigned handle for the paused action.
+        ///
+        /// The machine records this as its pending action and echoes it back
+        /// verbatim in the
+        /// [`RespondInteraction`](ExternalSessionInput::RespondInteraction) it
+        /// emits once the interaction resolves, so the runtime can correlate the
+        /// answer with the action it paused on. It is carried explicitly here
+        /// because the neutral [`Interaction`] request does not yet model a
+        /// permission action id; once `InteractionKind::Permission` lands
+        /// (milestone 4) this stays the canonical handle the machine feeds back.
+        action_id: String,
         /// The interaction the host must resolve.
         request: Interaction,
         /// Events observed before the pause.
@@ -618,6 +629,7 @@ mod tests {
 
         let paused = ExternalSessionResult::PausedForInteraction {
             session: session_ref(),
+            action_id: "act-1".to_owned(),
             request: Interaction::question(step_id(), "Delete build/ ?".to_owned()),
             observations: vec![ExternalAgentEvent::PermissionRequested {
                 action_id: "act-1".to_owned(),

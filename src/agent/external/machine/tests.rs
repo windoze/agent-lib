@@ -15,9 +15,9 @@ use serde_json::Map;
 
 use super::ExternalAgentMachine;
 use crate::agent::{
-    AgentId, AgentInput, AgentMachine, LoopCursorKind, PivotMessage, PivotSource, RequirementError,
-    RequirementId, RequirementIds, RequirementKind, RequirementKindTag, RequirementResolution,
-    RequirementResult, StepId, StepInput, ToolSetId,
+    AgentId, AgentInput, AgentMachine, Interaction, InteractionResponse, LoopCursorKind,
+    PivotMessage, PivotSource, RequirementError, RequirementId, RequirementIds, RequirementKind,
+    RequirementKindTag, RequirementResolution, RequirementResult, StepId, StepInput, ToolSetId,
     external::{
         ExternalAgentError, ExternalAgentOutput, ExternalAgentSpec, ExternalAgentState,
         ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput, ExternalSessionPolicy,
@@ -174,6 +174,31 @@ fn failed_result() -> ExternalSessionResult {
         },
         observations: Vec::new(),
     }
+}
+
+fn paused_step_id() -> StepId {
+    "018f0d9c-7b6a-7c12-8f31-1234567890e1"
+        .parse()
+        .expect("paused step id")
+}
+
+fn paused_result(action_id: &str) -> ExternalSessionResult {
+    ExternalSessionResult::PausedForInteraction {
+        session: session_ref(),
+        action_id: action_id.to_owned(),
+        request: Interaction::question(
+            paused_step_id(),
+            "Allow the external agent to run `cargo test`?".to_owned(),
+        ),
+        observations: Vec::new(),
+    }
+}
+
+fn interaction_resolution(id: RequirementId, answer: &str) -> RequirementResolution {
+    RequirementResolution::new(
+        id,
+        RequirementResult::Interaction(InteractionResponse::answer(answer.to_owned())),
+    )
 }
 
 fn external_resolution(id: RequirementId, result: ExternalSessionResult) -> RequirementResolution {
@@ -358,4 +383,168 @@ fn external_abandon_settles_back_to_idle() {
     assert!(outcome.requirements.is_empty());
     assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
     assert!(machine.state().conversation().pending().is_none());
+}
+
+#[test]
+fn external_pause_emits_interaction_and_parks_on_awaiting_interaction() {
+    let mut machine = machine();
+    let opened = machine.step(StepInput::external(user_input("refactor the parser")));
+    let session_requirement_id = opened.requirements[0].id;
+
+    let paused = machine.step(StepInput::resume(external_resolution(
+        session_requirement_id,
+        paused_result("act-42"),
+    )));
+
+    assert!(paused.is_quiescent());
+    assert!(paused.notifications.is_empty());
+    assert_eq!(paused.requirements.len(), 1);
+
+    // The pause reifies exactly one NeedInteraction carrying the runtime's
+    // clarification, and no external session requirement.
+    let interaction_requirement = &paused.requirements[0];
+    assert_eq!(
+        interaction_requirement.tag(),
+        RequirementKindTag::Interaction
+    );
+    match &interaction_requirement.kind {
+        RequirementKind::NeedInteraction { request } => {
+            assert_eq!(request.step_id(), paused_step_id());
+        }
+        other => panic!("expected a NeedInteraction requirement, got {other:?}"),
+    }
+
+    // The resumable session facts reported at the pause are recorded, and the
+    // in-flight turn stays open across the pause.
+    assert_eq!(machine.state().session(), Some(&session_ref()));
+    assert!(machine.state().conversation().pending().is_some());
+
+    // The driver-facing cursor is a non-terminal streaming step stuck on the
+    // interaction requirement.
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert_eq!(
+        machine.cursor().pending_requirement_ids(),
+        vec![interaction_requirement.id]
+    );
+}
+
+#[test]
+fn external_interaction_resume_responds_with_the_paused_action_id() {
+    let mut machine = machine();
+    let opened = machine.step(StepInput::external(user_input("refactor the parser")));
+    let session_requirement_id = opened.requirements[0].id;
+
+    let paused = machine.step(StepInput::resume(external_resolution(
+        session_requirement_id,
+        paused_result("act-42"),
+    )));
+    let interaction_requirement_id = paused.requirements[0].id;
+
+    let responded = machine.step(StepInput::resume(interaction_resolution(
+        interaction_requirement_id,
+        "yes, run the tests",
+    )));
+
+    assert!(responded.is_quiescent());
+    assert!(responded.notifications.is_empty());
+    assert_eq!(responded.requirements.len(), 1);
+
+    // The resolved interaction re-enters the session as a RespondInteraction that
+    // echoes the exact action id the pause carried and reuses the established
+    // session facts.
+    let requirement = &responded.requirements[0];
+    match &requirement.kind {
+        RequirementKind::NeedExternalSession { request } => {
+            assert_eq!(request.session.as_ref(), Some(&session_ref()));
+            match &request.input {
+                ExternalSessionInput::RespondInteraction {
+                    action_id,
+                    response,
+                } => {
+                    assert_eq!(action_id, "act-42");
+                    assert_eq!(
+                        response,
+                        &InteractionResponse::answer("yes, run the tests".to_owned())
+                    );
+                }
+                other => panic!("resume must feed a RespondInteraction, got {other:?}"),
+            }
+        }
+        other => panic!("expected a NeedExternalSession requirement, got {other:?}"),
+    }
+
+    // The machine is back on AwaitingSession, stuck on the fresh external
+    // requirement, with the turn still open.
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert_eq!(
+        machine.cursor().pending_requirement_ids(),
+        vec![requirement.id]
+    );
+    assert!(machine.state().conversation().pending().is_some());
+}
+
+#[test]
+fn external_pause_then_respond_then_complete_commits_the_turn() {
+    let mut machine = machine();
+    let opened = machine.step(StepInput::external(user_input("refactor the parser")));
+
+    let paused = machine.step(StepInput::resume(external_resolution(
+        opened.requirements[0].id,
+        paused_result("act-7"),
+    )));
+    let responded = machine.step(StepInput::resume(interaction_resolution(
+        paused.requirements[0].id,
+        "go ahead",
+    )));
+    let completed = machine.step(StepInput::resume(external_resolution(
+        responded.requirements[0].id,
+        completed_result(),
+    )));
+
+    assert!(completed.is_quiescent());
+    assert!(completed.requirements.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Done);
+
+    // The whole pause↔respond loop folds into a single committed turn.
+    let conversation = machine.state().conversation();
+    assert!(conversation.pending().is_none());
+    assert_eq!(conversation.turns().len(), 1);
+}
+
+#[test]
+fn external_interaction_resume_rejecting_a_non_interaction_result_fails() {
+    let mut machine = machine();
+    let opened = machine.step(StepInput::external(user_input("refactor the parser")));
+    let paused = machine.step(StepInput::resume(external_resolution(
+        opened.requirements[0].id,
+        paused_result("act-42"),
+    )));
+    let interaction_requirement_id = paused.requirements[0].id;
+
+    // A wrong-family result for an outstanding NeedInteraction settles on Error.
+    let outcome = machine.step(StepInput::resume(external_resolution(
+        interaction_requirement_id,
+        completed_result(),
+    )));
+
+    assert!(outcome.is_quiescent());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+}
+
+#[test]
+fn external_interaction_resume_targeting_the_wrong_requirement_fails() {
+    let mut machine = machine();
+    let opened = machine.step(StepInput::external(user_input("refactor the parser")));
+    machine.step(StepInput::resume(external_resolution(
+        opened.requirements[0].id,
+        paused_result("act-42"),
+    )));
+
+    let stray: RequirementId = "018f0d9c-7b6a-7c12-8f31-1234567890ca"
+        .parse()
+        .expect("stray requirement id");
+    let outcome = machine.step(StepInput::resume(interaction_resolution(stray, "hi")));
+
+    assert!(outcome.is_quiescent());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
 }

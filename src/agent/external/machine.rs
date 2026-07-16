@@ -11,7 +11,7 @@
 //! real runtime to its next decision point and feeds the
 //! [`ExternalSessionResult`] back through [`StepInput::Resume`].
 //!
-//! # What this milestone covers (M3-2)
+//! # What this machine covers (M3-2, M3-3)
 //!
 //! - `step(External(UserMessage))` opens a Conversation turn and blocks on one
 //!   `NeedExternalSession`, choosing
@@ -22,12 +22,20 @@
 //!   settles the cursor on [`Done`](ExternalAgentCursor::Done).
 //! - `step(Resume(ExternalSession(Failed)))` records any retained session facts
 //!   and settles the cursor on [`Error`](ExternalAgentCursor::Error).
+//! - `step(Resume(ExternalSession(PausedForInteraction)))` records the session
+//!   facts and the paused action id, emits one
+//!   [`NeedInteraction`](RequirementKind::NeedInteraction) for the standard
+//!   interaction pop rules to serve, and parks on
+//!   [`AwaitingInteraction`](ExternalAgentCursor::AwaitingInteraction). The
+//!   resolved [`InteractionResponse`](crate::agent::InteractionResponse) then
+//!   re-enters the session as a
+//!   [`RespondInteraction`](ExternalSessionInput::RespondInteraction) that
+//!   echoes the paused action id, reparking on
+//!   [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so a turn can loop
+//!   pause↔respond until it completes or fails.
 //!
-//! The two-stage
-//! [`PausedForInteraction`](ExternalSessionResult::PausedForInteraction) path
-//! lands in M3-3, and the cancel/abandon cleanup accounting lands in M3-4; both
-//! are settled here as defined, quiescent no-op-or-error transitions rather than
-//! left to misbehave.
+//! The cancel/abandon cleanup accounting lands in M3-4; abandon is settled here
+//! as a defined, quiescent transition rather than left to misbehave.
 //!
 //! # Persistence boundary
 //!
@@ -48,9 +56,10 @@ use serde_json::Map;
 
 use crate::{
     agent::{
-        AgentInput, AgentMachine, AgentUserInput, CursorRequirement, LoopCursor, LoopDoneReason,
-        Requirement, RequirementId, RequirementIds, RequirementKind, RequirementKindTag,
-        RequirementResolution, RequirementResult, StepId, StepInput, StepOutcome,
+        AgentInput, AgentMachine, AgentUserInput, CursorRequirement, Interaction, LoopCursor,
+        LoopDoneReason, Requirement, RequirementId, RequirementIds, RequirementKind,
+        RequirementKindTag, RequirementResolution, RequirementResult, StepId, StepInput,
+        StepOutcome,
         external::{
             ExternalAgentCursor, ExternalAgentOutput, ExternalAgentState, ExternalSessionInput,
             ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
@@ -65,15 +74,34 @@ use crate::{
     },
 };
 
+/// Which awaiting cursor a [`resume`](ExternalAgentMachine::resume) is folding
+/// into, resolved once from the borrowed cursor so the mutable transition is
+/// free to run.
+enum Awaiting {
+    /// Parked on an outstanding `NeedExternalSession`.
+    Session(RequirementId),
+    /// Parked on an outstanding `NeedInteraction`, carrying the paused action id
+    /// echoed back through `RespondInteraction`.
+    Interaction {
+        requirement: RequirementId,
+        pending_action: String,
+    },
+}
+
 /// Mid-turn scratch for the external session step currently in flight.
 ///
 /// Like [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine)'s turn
 /// scratch, this lives only while a turn is unfinished and is deliberately *not*
 /// part of the serializable [`ExternalAgentState`]; the cursor still records
 /// which requirement the machine is stuck on. It carries the host-supplied
-/// assistant identity used to freeze the turn on completion.
+/// assistant identity used to freeze the turn on completion, plus the turn's
+/// step identity reused for the driver-facing cursor view across the turn's
+/// pause↔respond hops.
 #[derive(Clone, Copy, Debug)]
 struct InFlight {
+    /// Step identity of the turn, reused for the driver-facing cursor view
+    /// across every external-session and interaction hop the turn takes.
+    step_id: StepId,
     assistant_message_id: MessageId,
 }
 
@@ -133,6 +161,7 @@ impl ExternalAgentMachine {
         }
 
         self.in_flight = Some(InFlight {
+            step_id: user.step_id(),
             assistant_message_id: user.assistant_message_id(),
         });
 
@@ -191,22 +220,32 @@ impl ExternalAgentMachine {
 
     /// Feeds a fulfilled requirement result back into the parked machine.
     fn resume(&mut self, resolution: RequirementResolution) -> StepOutcome {
-        // Read the outstanding requirement id (or a diagnostic) before releasing
-        // the borrow of the cursor so the mutable transitions below are free to
-        // run.
-        let expected = match self.state.cursor() {
-            ExternalAgentCursor::AwaitingSession { requirement } => Ok(requirement.id()),
-            ExternalAgentCursor::AwaitingInteraction { .. } => {
-                Err("external interaction resume is not yet supported (milestone M3-3)".to_owned())
+        // Read the outstanding requirement (and, for an interaction, the paused
+        // action it answers) before releasing the borrow of the cursor so the
+        // mutable transitions below are free to run.
+        let awaiting = match self.state.cursor() {
+            ExternalAgentCursor::AwaitingSession { requirement } => {
+                Ok(Awaiting::Session(requirement.id()))
             }
+            ExternalAgentCursor::AwaitingInteraction {
+                requirement,
+                pending_action,
+            } => Ok(Awaiting::Interaction {
+                requirement: requirement.id(),
+                pending_action: pending_action.clone(),
+            }),
             other => Err(format!(
                 "resume received while cursor is `{}`, no outstanding external requirement",
                 cursor_label(other)
             )),
         };
 
-        match expected {
-            Ok(expected) => self.resume_session(expected, resolution),
+        match awaiting {
+            Ok(Awaiting::Session(expected)) => self.resume_session(expected, resolution),
+            Ok(Awaiting::Interaction {
+                requirement,
+                pending_action,
+            }) => self.resume_interaction(requirement, pending_action, resolution),
             Err(message) => self.fail(message),
         }
     }
@@ -242,16 +281,106 @@ impl ExternalAgentMachine {
             ExternalSessionResult::Completed {
                 session, output, ..
             } => self.complete_session(session, output),
+            ExternalSessionResult::PausedForInteraction {
+                session,
+                action_id,
+                request,
+                ..
+            } => self.pause_for_interaction(session, action_id, request),
             ExternalSessionResult::Failed { session, error, .. } => {
                 if session.is_some() {
                     self.state.set_session(session);
                 }
                 self.fail(error.to_string())
             }
-            ExternalSessionResult::PausedForInteraction { .. } => self.fail(
-                "external session pause-for-interaction is not yet supported (milestone M3-3)",
-            ),
         }
+    }
+
+    /// Parks on an interaction the runtime paused for and emits `NeedInteraction`.
+    ///
+    /// The handler translated the runtime's permission/clarification prompt into
+    /// a neutral [`Interaction`]; the machine records the resumable session facts
+    /// and the runtime's `action_id`, reifies one `NeedInteraction` for the
+    /// standard interaction pop rules to serve, and parks on
+    /// [`AwaitingInteraction`](ExternalAgentCursor::AwaitingInteraction). The
+    /// in-flight turn stays open across the pause so the resolved answer folds
+    /// back into the same turn.
+    fn pause_for_interaction(
+        &mut self,
+        session: ExternalSessionRef,
+        action_id: String,
+        request: Interaction,
+    ) -> StepOutcome {
+        let Some(in_flight) = self.in_flight else {
+            return self.fail("external session paused without an in-flight turn");
+        };
+
+        self.state.set_session(Some(session));
+
+        let requirement_id = match self
+            .requirement_ids
+            .next_requirement_id(RequirementKindTag::Interaction)
+        {
+            Ok(id) => id,
+            Err(error) => return self.fail(format!("requirement id unavailable: {error}")),
+        };
+
+        let cursor_requirement = CursorRequirement::root(requirement_id);
+        self.settle(
+            ExternalAgentCursor::AwaitingInteraction {
+                requirement: cursor_requirement.clone(),
+                pending_action: action_id,
+            },
+            LoopCursor::streaming_step(in_flight.step_id, Some(cursor_requirement)),
+        );
+
+        let requirement =
+            Requirement::at_root(requirement_id, RequirementKind::NeedInteraction { request });
+        StepOutcome::new(Vec::new(), vec![requirement], true)
+    }
+
+    /// Feeds a resolved interaction back into the paused session.
+    ///
+    /// The resolved [`InteractionResponse`] is handed to the runtime as a fresh
+    /// [`RespondInteraction`](ExternalSessionInput::RespondInteraction) that
+    /// echoes the `pending_action` the pause carried, reparking on
+    /// [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so the session
+    /// can advance to its next decision point (another pause, completion, or
+    /// failure) within the same turn.
+    fn resume_interaction(
+        &mut self,
+        expected: RequirementId,
+        pending_action: String,
+        resolution: RequirementResolution,
+    ) -> StepOutcome {
+        if resolution.id != expected {
+            return self.fail(format!(
+                "resume targets requirement {}, but the machine awaits {expected}",
+                resolution.id
+            ));
+        }
+
+        let response = match resolution.result {
+            RequirementResult::Interaction(response) => response,
+            other => {
+                return self.fail(format!(
+                    "NeedInteraction requirement cannot accept a `{}` result",
+                    other.tag()
+                ));
+            }
+        };
+
+        let Some(in_flight) = self.in_flight else {
+            return self.fail("interaction resolved without an in-flight turn");
+        };
+
+        self.block_on_session(
+            in_flight.step_id,
+            ExternalSessionInput::RespondInteraction {
+                action_id: pending_action,
+                response,
+            },
+        )
     }
 
     /// Records the terminal output, commits the turn, and settles on `Done`.
