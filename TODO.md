@@ -1475,3 +1475,42 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
   - OpenCode。
 - 在具备环境时运行真实 ignored e2e 并记录结果；不具备时记录 skip 条件。
 - 完成记录中给出最终能力矩阵摘要和剩余 runtime-dependent 限制。
+
+---
+
+## 交接任务
+
+### [TODO] H-1 归档当前计划并为 facade API 生成新的 PLAN/TODO
+
+**上下文**:
+
+- 当前 `PLAN.md` 和本 `TODO.md` 记录的是 Managed External Agent 工作线。下一轮工作要切换到
+  [`docs/facade-api.md`](docs/facade-api.md) 对应的 facade API 落地。
+- 执行本任务时,必须先保留当前计划/任务单的历史版本,再重写仓库根目录的 `PLAN.md` 和 `TODO.md`。
+- 新 `TODO.md` 要给后续 coding agent 直接执行,不能只写高层目标。
+
+**做什么**:
+
+- 将当前根目录 `PLAN.md` 和 `TODO.md` 归档到合适的历史位置:
+  - 如果仓库已有计划归档目录或命名惯例,沿用现有惯例。
+  - 如果没有现有惯例,新增清晰的归档路径,例如 `docs/archive/`,并使用能说明主题和日期的文件名。
+  - 归档内容必须是切换前的完整 `PLAN.md` 和完整 `TODO.md`,不得只保留摘要。
+- 阅读 [`docs/facade-api.md`](docs/facade-api.md),为该文档写一份新的落地计划到根目录 `PLAN.md`:
+  - 计划应按 milestone 展开,说明每个阶段的目标、关键实现点、风险和验证方式。
+  - 计划应只承诺 `docs/facade-api.md` 中有依据的内容；若发现文档缺口,在计划中列为待确认风险。
+- 重写根目录 `TODO.md`,为 facade API 落地生成新的任务单:
+  - 任务必须按实现顺序排列,并使用编号,例如 `M1-1` 表示 milestone 1 的第一个任务,依此类推。
+  - 每个任务标题必须保留一个 `[TODO]` 标记,让 coding agent 知道该任务尚未完成。
+  - 每个任务必须包含足够的细节和上下文,让 coding agent 实现时不需要反复搜索代码库。
+  - 每个任务必须定义完整的验证条件,包含必要的聚焦测试、格式/静态检查和相关文档检查。
+  - 每个阶段结尾必须加入一个单独的 review 任务,用于检查该阶段的正确性、完整性和文档一致性。
+  - 新任务单开头应说明通用执行规则:一次只执行首个标题带 `[TODO]` 的任务,完成后改为 `[DONE]`,并补充完成记录。
+
+**验证条件**:
+
+- 归档后的旧 `PLAN.md` 和旧 `TODO.md` 文件存在,且内容完整可读。
+- 新根目录 `PLAN.md` 明确以 [`docs/facade-api.md`](docs/facade-api.md) 为依据,并包含 milestone、风险和验证策略。
+- 新根目录 `TODO.md` 中的任务按实现顺序编号,所有未完成任务标题都包含 `[TODO]`。
+- 新根目录 `TODO.md` 的每个 milestone 末尾都有独立 review 任务。
+- 新根目录 `TODO.md` 的每个任务都有上下文、做什么、验证条件三类信息或等价结构。
+- `git diff --check` 通过。
