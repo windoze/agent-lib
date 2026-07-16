@@ -549,9 +549,9 @@ impl DefaultAgentMachine {
             in_flight.steps_started += 1;
         }
 
-        // M1-3 will replace with fail_from.
+        // M1-4 will make this method return Result so step() folds via fail_from.
         self.block_on_llm(next_step_id, notifications)
-            .unwrap_or_else(|error| self.fail(error.message()))
+            .unwrap_or_else(|error| self.fail_from(error))
     }
 
     /// Extracts the tool-use calls from the pending turn's last assistant
@@ -638,9 +638,9 @@ impl DefaultAgentMachine {
             return self.fail(format!("conversation operation failed: {error}"));
         }
 
-        // M1-3 will replace with fail_from.
+        // M1-4 will make this method return Result so step() folds via fail_from.
         self.finish_cancel(step_id, CancelRecoveryReason::ToolInterrupted)
-            .unwrap_or_else(|error| self.fail(error.message()))
+            .unwrap_or_else(|error| self.fail_from(error))
     }
 
     /// Collects a [`CancelledToolResult`] for every still-open call in the active

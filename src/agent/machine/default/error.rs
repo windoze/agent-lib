@@ -14,9 +14,9 @@
 //! the public API**; [`StepError::message`] reproduces the existing
 //! `self.fail(..)` text byte-for-byte so no observable runtime semantics change.
 //!
-//! M1-2 wires the variants into the machine's fallible methods; the single fold
-//! back into `LoopCursor::Error` at the outermost `step()` boundary lands in
-//! M1-3.
+//! M1-2 wired the variants into the machine's fallible methods; M1-3 collapsed
+//! the fold back into `LoopCursor::Error` to a single `fail_from` call at the
+//! outermost `step()` boundary.
 
 use crate::{
     agent::{AgentStateError, RequirementError, ToolRuntimeError},

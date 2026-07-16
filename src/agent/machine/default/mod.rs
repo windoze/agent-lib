@@ -817,6 +817,18 @@ impl DefaultAgentMachine {
         }
         StepOutcome::new(notifications, Vec::new(), true)
     }
+
+    /// Folds an internal [`StepError`] into a quiescent
+    /// [`LoopCursor::Error`], reusing [`fail`](Self::fail)'s teardown.
+    ///
+    /// This is the single conversion from the machine's internal `Result`
+    /// layer back to `step`'s infallible [`StepOutcome`] contract (刀 (C),
+    /// migration doc §2.2). The rendered text comes from
+    /// [`StepError::message`], so the resulting error cursor is byte-for-byte
+    /// identical to the legacy `self.fail(format!(..))` call sites.
+    fn fail_from(&mut self, error: StepError) -> StepOutcome {
+        self.fail(error.message())
+    }
 }
 
 impl AgentMachine for DefaultAgentMachine {
@@ -827,8 +839,10 @@ impl AgentMachine for DefaultAgentMachine {
             StepInput::Resume(resolution) => self.resume(resolution),
             StepInput::Abandon(id) => self.abandon(id),
         };
-        // M1-3 will replace with fail_from.
-        result.unwrap_or_else(|error| self.fail(error.message()))
+        match result {
+            Ok(outcome) => outcome,
+            Err(error) => self.fail_from(error),
+        }
     }
 
     fn cursor(&self) -> &LoopCursor {

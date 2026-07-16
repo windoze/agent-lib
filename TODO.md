@@ -212,7 +212,7 @@ fn open_user_turn(&mut self, user: AgentUserInput) -> Result<StepOutcome, StepEr
   `cargo clippy --all-targets -- -D warnings` 无告警；`cargo test --all --all-targets` 全绿；
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过；`git diff --check` 干净。
 
-### [TODO] M1-3 在 `step()` 最外层收敛错误折叠(`fail_from`)
+### [DONE] M1-3 在 `step()` 最外层收敛错误折叠(`fail_from`)
 
 **前置依赖**:M1-2。
 
@@ -255,7 +255,28 @@ fn step(&mut self, input: StepInput) -> StepOutcome {
 
 **完成记录**:
 
-（待补充）
+- 在 `src/agent/machine/default/mod.rs` 新增私有 `fn fail_from(&mut self, error: StepError)
+  -> StepOutcome`：直接委托 `self.fail(error.message())`，复用既有 `fail()` 收尾
+  （discard pending → `cancel_pending(DiscardTurn)` → 清 `in_flight` → 迁 `LoopCursor::Error`
+  → quiescent），因此折叠后落在 `ErrorCursor` 的文本与 M1-2 逐字节一致。带 rustdoc，说明它是
+  内部 `Result` 层折回 `step()` infallible 契约的唯一转换点。
+- 把 `step()`（`mod.rs`）改成设计文档 §2.2 的 `match result { Ok(outcome) => outcome,
+  Err(error) => self.fail_from(error) }` 形状，移除 M1-2 埋下的临时桥接
+  `result.unwrap_or_else(|error| self.fail(error.message()))`；`mod.rs` 内**不再有临时桥接**。
+- 兑现 M1-2 在三处 `// M1-3 will replace with fail_from` 注释处许下的承诺：`step()` 桥接已彻底
+  移除；`tools.rs` 两处（`finish_tool_phase→block_on_llm`、`abandon_tool_phase→finish_cancel`）
+  仍需局部折叠（这两个方法 M1-4 才改成返回 `Result`），其 `.unwrap_or_else(|error|
+  self.fail(error.message()))` 改为 `.unwrap_or_else(|error| self.fail_from(error))`，注释更新为
+  `// M1-4 will make this method return Result so step() folds via fail_from`。
+- **可选增强跳过**：未把 `StepError` 分类信息写入 `ErrorCursor`，保持 `ErrorCursor` 仅 `message`，
+  以确保现有断言零改动、失败文案逐字节不变。
+- `fail()` / `fail_with_notifications()` 方法体保留不动（仍供 `tools.rs` 带副产品失败与桥接复用）。
+  同步更新 `error.rs` 模块 doc，将「M1-3 将落地折叠点」改述为已完成事实。
+- 验证（完整序列 1–6 全过）：`cargo fmt --all -- --check` 干净；
+  `cargo test -p agent-lib --lib agent::machine::default` 39 passed / 0 failed（**断言未改**）；
+  `cargo clippy --all-targets -- -D warnings` 无告警；`cargo test --all --all-targets` 全绿；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过；`git diff --check` 干净。
+  `git diff --stat` 源码改动仅限 `src/agent/machine/default/`（未触及 trait/drive/cursor/state）。
 
 ### [TODO] M1-4 把 `tools.rs` 的纯失败路径改为 `?`,保留带副产品失败
 
