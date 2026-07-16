@@ -18,13 +18,13 @@ use crate::agent::{
     AgentId, AgentInput, AgentMachine, Interaction, InteractionResponse, LoopCursorKind,
     Notification, PivotMessage, PivotSource, RequirementError, RequirementId, RequirementIds,
     RequirementKind, RequirementKindTag, RequirementResolution, RequirementResult, StepId,
-    StepInput, ToolSetId, ToolWaitRequirements,
+    StepInput, ToolExecutionIds, ToolRuntimeError, ToolSetId, ToolWaitRequirements,
     external::{
         ExternalAgentCursor, ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput,
         ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef,
         ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
         ExternalSessionPolicy, ExternalSessionRef, ExternalSessionResult, ExternalStreamPolicy,
-        ExternalToolBatchId, WorktreeIsolation,
+        ExternalToolBatchId, ExternalToolCall, WorktreeIsolation,
     },
     spec::{ToolSetRef, WorktreeRef},
 };
@@ -34,7 +34,7 @@ use crate::conversation::{
 use crate::model::{
     content::ContentBlock,
     message::{Message, Role},
-    tool::Tool,
+    tool::{Tool, ToolCall},
 };
 
 /// Deterministic requirement-id source: hands out distinct ids per call.
@@ -51,6 +51,46 @@ impl RequirementIds for SeqRequirementIds {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
         let id = format!("018f0d9c-7b6a-7c12-8f31-20000000{n:04x}");
         Ok(RequirementId::parse_str(&id).expect("valid requirement id"))
+    }
+}
+
+/// Deterministic tool-call-id source: hands out distinct framework
+/// [`ToolCallId`]s per call. The external machine only ever needs
+/// [`tool_call_id`](ToolExecutionIds::tool_call_id) — the runtime, not the host,
+/// registers the tool result and continues the assistant step — so the remaining
+/// trait methods are never exercised and report an unavailable id if called.
+#[derive(Debug, Default)]
+struct SeqToolIds {
+    next: AtomicU64,
+}
+
+impl ToolExecutionIds for SeqToolIds {
+    fn tool_call_id(&self, _call: &ToolCall) -> Result<ToolCallId, ToolRuntimeError> {
+        let n = self.next.fetch_add(1, Ordering::Relaxed);
+        let id = format!("018f0d9c-7b6a-7c12-8f31-30000000{n:04x}");
+        Ok(id.parse().expect("valid tool call id"))
+    }
+
+    fn tool_result_message_id(
+        &self,
+        _call_id: ToolCallId,
+        _call: &ToolCall,
+    ) -> Result<MessageId, ToolRuntimeError> {
+        Err(ToolRuntimeError::IdUnavailable {
+            purpose: "tool result message (unused by the external machine)".to_owned(),
+        })
+    }
+
+    fn next_assistant_message_id(&self) -> Result<MessageId, ToolRuntimeError> {
+        Err(ToolRuntimeError::IdUnavailable {
+            purpose: "assistant continuation message (unused by the external machine)".to_owned(),
+        })
+    }
+
+    fn next_step_id(&self) -> Result<StepId, ToolRuntimeError> {
+        Err(ToolRuntimeError::IdUnavailable {
+            purpose: "assistant continuation step (unused by the external machine)".to_owned(),
+        })
     }
 }
 
@@ -195,6 +235,36 @@ fn paused_result(action_id: &str) -> ExternalSessionResult {
             paused_step_id(),
             "Allow the external agent to run `cargo test`?".to_owned(),
         ),
+        observations: Vec::new(),
+    }
+}
+
+/// A machine wired with a deterministic [`SeqToolIds`] source, ready to bridge a
+/// runtime tool-call pause into `NeedTool` requirements.
+fn machine_with_tool_ids() -> ExternalAgentMachine {
+    ExternalAgentMachine::new(
+        ExternalAgentState::new(spec(), empty_conversation()),
+        Arc::new(SeqRequirementIds::default()),
+    )
+    .with_tool_execution_ids(Arc::new(SeqToolIds::default()))
+}
+
+/// One runtime tool call carrying a provider correlation id and a name.
+fn external_tool_call(provider_call_id: &str, name: &str) -> ExternalToolCall {
+    ExternalToolCall {
+        provider_call_id: provider_call_id.to_owned(),
+        name: name.to_owned(),
+        input: serde_json::json!({ "path": "src/lib.rs" }),
+        raw: None,
+    }
+}
+
+/// A `PausedForToolCalls` result carrying `calls` under `batch_id`.
+fn paused_for_tools(batch_id: &str, calls: Vec<ExternalToolCall>) -> ExternalSessionResult {
+    ExternalSessionResult::PausedForToolCalls {
+        session: session_ref(),
+        batch_id: ExternalToolBatchId::new(batch_id),
+        calls,
         observations: Vec::new(),
     }
 }
@@ -915,4 +985,100 @@ fn awaiting_tool_cursor_restores_without_a_terminal_view() {
     // pending requirements; the outstanding ids remain recoverable from the
     // serializable external cursor above.
     assert!(restored.cursor().pending_requirement_ids().is_empty());
+}
+
+#[test]
+fn external_tool_pause_emits_need_tool_batch() {
+    let mut machine = machine_with_tool_ids();
+    let opened = machine.step(StepInput::external(user_input("refactor the parser")));
+    let session_requirement_id = opened.requirements[0].id;
+
+    let calls = vec![
+        external_tool_call("call-a", "apply_patch"),
+        external_tool_call("call-b", "run_tests"),
+    ];
+    let paused = machine.step(StepInput::resume(external_resolution(
+        session_requirement_id,
+        paused_for_tools("batch-7", calls.clone()),
+    )));
+
+    assert!(paused.is_quiescent());
+    assert!(paused.notifications.is_empty());
+
+    // The pause reifies exactly one NeedTool per runtime call, in call order, and
+    // no external-session requirement.
+    assert_eq!(paused.requirements.len(), calls.len());
+    let mut requirement_ids = Vec::new();
+    for (requirement, call) in paused.requirements.iter().zip(&calls) {
+        assert_eq!(requirement.tag(), RequirementKindTag::Tool);
+        match &requirement.kind {
+            RequirementKind::NeedTool {
+                call: tool_call, ..
+            } => {
+                // Each bridged NeedTool carries the runtime's provider_call_id as
+                // the provider-neutral ToolCall::id so the answer lines back up.
+                assert_eq!(tool_call.id, call.provider_call_id);
+                assert_eq!(tool_call.name, call.name);
+            }
+            other => panic!("expected a NeedTool requirement, got {other:?}"),
+        }
+        requirement_ids.push(requirement.id);
+    }
+
+    // The driver-facing cursor parks on AwaitingTool with every tool requirement
+    // id outstanding, so a driver can rebuild its pending registry from it.
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingTool);
+    let pending = machine.cursor().pending_requirement_ids();
+    assert_eq!(pending.len(), requirement_ids.len());
+    for id in &requirement_ids {
+        assert!(
+            pending.contains(id),
+            "pending requirement ids must include {id}"
+        );
+    }
+
+    // The serializable cursor records the batch id and the full tool addressing.
+    match machine.state().cursor() {
+        ExternalAgentCursor::AwaitingTool {
+            batch_id,
+            requirements,
+        } => {
+            assert_eq!(batch_id.as_str(), "batch-7");
+            assert_eq!(requirements.ids().len(), calls.len());
+        }
+        other => panic!("expected an AwaitingTool cursor, got {other:?}"),
+    }
+
+    // The resumable session facts reported at the pause are recorded.
+    assert_eq!(machine.state().session(), Some(&session_ref()));
+
+    // The in-flight turn stays open across the pause and is not committed; tool
+    // results are relayed to the runtime, never written into host history.
+    assert!(machine.state().conversation().pending().is_some());
+    assert_eq!(machine.state().conversation().turns().len(), 0);
+}
+
+#[test]
+fn external_tool_pause_without_tool_ids_fails() {
+    // The default machine has no ToolExecutionIds source (NoToolExecutionIds), so
+    // it cannot mint a host tool-call id for a runtime tool pause.
+    let mut machine = machine();
+    let opened = machine.step(StepInput::external(user_input("refactor the parser")));
+    let session_requirement_id = opened.requirements[0].id;
+    assert!(machine.state().conversation().pending().is_some());
+
+    let outcome = machine.step(StepInput::resume(external_resolution(
+        session_requirement_id,
+        paused_for_tools("batch-7", vec![external_tool_call("call-a", "apply_patch")]),
+    )));
+
+    // A tool pause without an id source settles on a classified error cursor and
+    // emits no requirement.
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+
+    // The dangling pending turn is discarded so no half-open turn lingers.
+    assert!(machine.state().conversation().pending().is_none());
+    assert_eq!(machine.state().conversation().turns().len(), 0);
 }

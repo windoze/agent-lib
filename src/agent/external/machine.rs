@@ -37,6 +37,17 @@
 //!   echoes the paused action id, reparking on
 //!   [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so a turn can loop
 //!   pause↔respond until it completes or fails.
+//! - `step(Resume(ExternalSession(PausedForToolCalls)))` records the session
+//!   facts and bridges every runtime [`ExternalToolCall`](super::ExternalToolCall)
+//!   into one [`NeedTool`](RequirementKind::NeedTool) requirement (minting a host
+//!   [`ToolCallId`](crate::conversation::ToolCallId) from the injected
+//!   [`ToolExecutionIds`] and a [`RequirementId`] per call), parking on
+//!   [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) with the batch's
+//!   volatile per-call correlation held in non-serialized scratch. Tool results
+//!   are relayed straight back to the runtime — never written into the
+//!   Conversation. Collecting the results and feeding
+//!   [`RespondToolResults`](ExternalSessionInput::RespondToolResults) back lands
+//!   with milestone-2 task M2-3.
 //! - `step(Abandon)` is the never-resume cancel close (design §6.4): it discards
 //!   the dangling turn, flags
 //!   [`ExternalAgentState::mark_cleanup_required`](ExternalAgentState::mark_cleanup_required)
@@ -81,9 +92,9 @@ use serde_json::Map;
 use crate::{
     agent::{
         AgentInput, AgentMachine, AgentUserInput, CursorRequirement, Interaction, LoopCursor,
-        LoopDoneReason, Notification, Requirement, RequirementId, RequirementIds, RequirementKind,
-        RequirementKindTag, RequirementResolution, RequirementResult, StepId, StepInput,
-        StepOutcome,
+        LoopDoneReason, NoToolExecutionIds, Notification, Requirement, RequirementId,
+        RequirementIds, RequirementKind, RequirementKindTag, RequirementResolution,
+        RequirementResult, StepId, StepInput, StepOutcome, ToolExecutionIds, ToolWaitRequirements,
         external::{
             ExternalAgentCursor, ExternalAgentOutput, ExternalAgentState, ExternalObservedEvent,
             ExternalSessionInput, ExternalSessionRef, ExternalSessionRequest,
@@ -91,11 +102,12 @@ use crate::{
         },
     },
     client::Response,
-    conversation::{CancelDisposition, MessageId, TurnMeta},
+    conversation::{CancelDisposition, MessageId, ToolCallId, TurnMeta},
     model::{
         content::ContentBlock,
         message::{Message, Role},
         normalized::StopReason,
+        tool::ToolCall,
     },
 };
 
@@ -148,15 +160,17 @@ struct InFlight {
 /// (which recovers the cursor but not this scratch) cannot resume a partially
 /// answered batch.
 ///
-/// The batch is populated when a session pauses for tool calls (milestone 2's
-/// `PausedForToolCalls` fold) and drained as each result arrives (milestone 2's
-/// `RespondToolResults` collection); this milestone lands the cursor phase and
-/// its scratch together so those transitions have a stable shape to build on.
+/// This scratch is populated when a session pauses for tool calls (the
+/// [`PausedForToolCalls`](ExternalSessionResult::PausedForToolCalls) fold landed
+/// with this milestone-2 task) and is drained as each result arrives (the
+/// [`RespondToolResults`](ExternalSessionInput::RespondToolResults) collection,
+/// milestone-2 task M2-3). Only the batch producer runs so far, so the collected
+/// per-call fields are written but not yet read back.
 #[expect(
     dead_code,
-    reason = "populated by the PausedForToolCalls fold and drained by the \
-              RespondToolResults collection in the following milestone-2 tasks; \
-              the cursor phase and its scratch land together here"
+    reason = "the per-call correlation and collected results are read back by \
+              the RespondToolResults collection in milestone-2 task M2-3; this \
+              task (M2-2) only populates the batch on a tool-call pause"
 )]
 #[derive(Clone, Debug)]
 struct PendingExternalToolBatch {
@@ -183,6 +197,13 @@ struct PendingExternalToolBatch {
 pub struct ExternalAgentMachine {
     state: ExternalAgentState,
     requirement_ids: Arc<dyn RequirementIds>,
+    /// Host-supplied identity source used to mint the [`ToolCallId`] each
+    /// bridged [`NeedTool`](RequirementKind::NeedTool) requirement carries.
+    /// Defaults to [`NoToolExecutionIds`]; a machine whose runtime pauses for
+    /// host tool calls must inject a real source via
+    /// [`with_tool_execution_ids`](Self::with_tool_execution_ids), or a
+    /// tool-call pause settles on a classified error.
+    tool_ids: Arc<dyn ToolExecutionIds>,
     /// Driver-facing [`LoopCursor`] view, kept in lockstep with
     /// [`ExternalAgentState::cursor`]. `AgentMachine::cursor` must return a
     /// `&LoopCursor`, so the machine maintains this mapped mirror rather than
@@ -193,32 +214,42 @@ pub struct ExternalAgentMachine {
     in_flight: Option<InFlight>,
     /// Non-serialized scratch for a tool-call batch a paused session is waiting
     /// on; `Some` only while the machine is parked on
-    /// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) mid-turn. It cannot be
-    /// rebuilt from a restored [`ExternalAgentState`], so a mid-turn restore
-    /// leaves it `None` (design: the serializable cursor keeps the resumable
-    /// addressing; this scratch keeps the volatile per-call correlation).
-    #[expect(
-        dead_code,
-        reason = "populated by the PausedForToolCalls fold and drained by the \
-                  RespondToolResults collection in the following milestone-2 \
-                  tasks; the cursor phase and its scratch land together here"
-    )]
+    /// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) mid-turn. It is
+    /// populated when a session pauses for tool calls and cleared when the turn
+    /// settles (completion, failure, or abandon). It cannot be rebuilt from a
+    /// restored [`ExternalAgentState`], so a mid-turn restore leaves it `None`
+    /// (design: the serializable cursor keeps the resumable addressing; this
+    /// scratch keeps the volatile per-call correlation).
     pending_tool_batch: Option<PendingExternalToolBatch>,
 }
 
 impl ExternalAgentMachine {
     /// Creates a machine over `state`, using `requirement_ids` to stamp the
     /// reified `NeedExternalSession` requirements it hands back.
+    ///
+    /// Tool orchestration defaults to [`NoToolExecutionIds`] (no host id
+    /// source); a machine whose runtime pauses for host tool calls supplies a
+    /// real source via [`with_tool_execution_ids`](Self::with_tool_execution_ids).
     #[must_use]
     pub fn new(state: ExternalAgentState, requirement_ids: Arc<dyn RequirementIds>) -> Self {
         let loop_cursor = initial_loop_cursor(state.cursor());
         Self {
             state,
             requirement_ids,
+            tool_ids: Arc::new(NoToolExecutionIds),
             loop_cursor,
             in_flight: None,
             pending_tool_batch: None,
         }
+    }
+
+    /// Sets the host-supplied identity source used to mint the [`ToolCallId`]
+    /// each bridged [`NeedTool`](RequirementKind::NeedTool) requirement carries
+    /// when a runtime pauses for host tool calls.
+    #[must_use]
+    pub fn with_tool_execution_ids(mut self, tool_ids: Arc<dyn ToolExecutionIds>) -> Self {
+        self.tool_ids = tool_ids;
+        self
     }
 
     /// Returns a read-only view of the wrapped serializable external-agent state.
@@ -383,20 +414,14 @@ impl ExternalAgentMachine {
                 let notifications = self.observe(observations);
                 self.pause_for_interaction(session, action_id, request, notifications)
             }
-            ExternalSessionResult::PausedForToolCalls { observations, .. } => {
-                // The sans-io machine does not yet bridge tool-call pauses into a
-                // `NeedTool` batch — that wiring (cursor phase + `RespondToolResults`
-                // fan-out) lands with milestone 2. Until then the machine never
-                // emits a request that could elicit this decision point, so
-                // receiving one is an unsupported protocol transition. Buffered
-                // observations still replay exactly once (design §5.5) before the
-                // machine settles on a classified error.
+            ExternalSessionResult::PausedForToolCalls {
+                session,
+                batch_id,
+                calls,
+                observations,
+            } => {
                 let notifications = self.observe(observations);
-                self.fail_with(
-                    "external tool-call pauses are not yet driven by the machine \
-                     (scheduled for milestone 2)",
-                    notifications,
-                )
+                self.pause_for_tool_calls(session, batch_id, calls, notifications)
             }
             ExternalSessionResult::PausedForSubagent { observations, .. } => {
                 // The sans-io machine does not yet bridge subagent spawn requests
@@ -496,6 +521,129 @@ impl ExternalAgentMachine {
         let requirement =
             Requirement::at_root(requirement_id, RequirementKind::NeedInteraction { request });
         StepOutcome::new(notifications, vec![requirement], true)
+    }
+
+    /// Parks on a batch of host tool calls the runtime paused for and emits one
+    /// `NeedTool` per call.
+    ///
+    /// The handler surfaced the runtime's pending tool calls as provider-neutral
+    /// [`ExternalToolCall`] values under a runtime-assigned
+    /// [`ExternalToolBatchId`]. The machine records the resumable session facts,
+    /// bridges each call into a [`NeedTool`](RequirementKind::NeedTool)
+    /// requirement — allocating a host [`ToolCallId`] via the injected
+    /// [`ToolExecutionIds`] and a [`RequirementId`] per call — and parks on
+    /// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool), whose driver-facing
+    /// [`LoopCursor::awaiting_tool`] view carries every outstanding requirement
+    /// id. The volatile per-call correlation (`provider_call_id` ↔
+    /// `RequirementId`) and the initially empty result set live in the
+    /// non-serialized [`PendingExternalToolBatch`] scratch so a completed batch
+    /// can feed [`RespondToolResults`](ExternalSessionInput::RespondToolResults)
+    /// back in the original call order (milestone-2 task M2-3). The in-flight
+    /// turn stays open across the pause so the eventual results fold back into
+    /// the same turn.
+    ///
+    /// No tool result is ever written into the [`Conversation`] — the external
+    /// runtime is the consumer of tool results, not host history; the machine
+    /// only relays host results back to the runtime.
+    ///
+    /// When no [`ToolExecutionIds`] source was injected (the default
+    /// [`NoToolExecutionIds`]) the machine cannot mint a host tool-call
+    /// identity, so it settles on a classified
+    /// [`Error`](ExternalAgentCursor::Error) cursor and discards the in-flight
+    /// turn. Buffered `notifications` still ride out on the failing step so a
+    /// paused decision point replays its observations exactly once (design
+    /// §5.5).
+    ///
+    /// [`Conversation`]: crate::conversation::Conversation
+    fn pause_for_tool_calls(
+        &mut self,
+        session: ExternalSessionRef,
+        batch_id: ExternalToolBatchId,
+        calls: Vec<ExternalToolCall>,
+        notifications: Vec<Notification>,
+    ) -> StepOutcome {
+        let Some(in_flight) = self.in_flight else {
+            return self.fail_with(
+                "external session paused for tool calls without an in-flight turn",
+                notifications,
+            );
+        };
+
+        self.state.set_session(Some(session));
+
+        // Bridge each runtime tool call into a `NeedTool` requirement, allocating
+        // a host tool-call id and a requirement id per call. `ids` addresses the
+        // driver-facing awaiting-tool cursor; the bidirectional
+        // provider-id ↔ requirement-id maps address the eventual
+        // `RespondToolResults` fan-out (kept in the batch scratch).
+        let mut requirements = Vec::with_capacity(calls.len());
+        let mut ids: BTreeMap<ToolCallId, RequirementId> = BTreeMap::new();
+        let mut call_to_requirement: BTreeMap<String, RequirementId> = BTreeMap::new();
+        let mut requirement_to_call: BTreeMap<RequirementId, String> = BTreeMap::new();
+        for call in &calls {
+            let tool_call: ToolCall = call.to_tool_call();
+            let call_id = match self.tool_ids.tool_call_id(&tool_call) {
+                Ok(id) => id,
+                Err(error) => {
+                    return self.fail_with(format!("tool id unavailable: {error}"), notifications);
+                }
+            };
+            let requirement_id = match self
+                .requirement_ids
+                .next_requirement_id(RequirementKindTag::Tool)
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    return self.fail_with(
+                        format!("requirement id unavailable: {error}"),
+                        notifications,
+                    );
+                }
+            };
+            requirements.push(Requirement::at_root(
+                requirement_id,
+                RequirementKind::NeedTool {
+                    call_id,
+                    call: tool_call,
+                },
+            ));
+            ids.insert(call_id, requirement_id);
+            call_to_requirement.insert(call.provider_call_id.clone(), requirement_id);
+            requirement_to_call.insert(requirement_id, call.provider_call_id.clone());
+        }
+
+        let call_ids: Vec<ToolCallId> = ids.keys().copied().collect();
+        let requirements_addr = ToolWaitRequirements::root(ids);
+        let loop_cursor = match LoopCursor::awaiting_tool(
+            in_flight.step_id,
+            call_ids,
+            Some(requirements_addr.clone()),
+        ) {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                return self.fail_with(
+                    format!("tool-wait cursor build failed: {error}"),
+                    notifications,
+                );
+            }
+        };
+
+        self.pending_tool_batch = Some(PendingExternalToolBatch {
+            batch_id: batch_id.clone(),
+            calls,
+            call_to_requirement,
+            requirement_to_call,
+            results: BTreeMap::new(),
+        });
+        self.settle(
+            ExternalAgentCursor::AwaitingTool {
+                batch_id,
+                requirements: requirements_addr,
+            },
+            loop_cursor,
+        );
+
+        StepOutcome::new(notifications, requirements, true)
     }
 
     /// Feeds a resolved interaction back into the paused session.
@@ -635,6 +783,7 @@ impl ExternalAgentMachine {
                 .cancel_pending(CancelDisposition::DiscardTurn);
         }
         self.in_flight = None;
+        self.pending_tool_batch = None;
         self.settle(ExternalAgentCursor::Idle, LoopCursor::Idle);
         StepOutcome::new(Vec::new(), Vec::new(), true)
     }
@@ -672,6 +821,7 @@ impl ExternalAgentMachine {
                 .cancel_pending(CancelDisposition::DiscardTurn);
         }
         self.in_flight = None;
+        self.pending_tool_batch = None;
         let loop_cursor = LoopCursor::error(message.clone()).unwrap_or(LoopCursor::Idle);
         self.settle(ExternalAgentCursor::Error { message }, loop_cursor);
         StepOutcome::new(notifications, Vec::new(), true)

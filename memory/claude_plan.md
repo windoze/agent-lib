@@ -1,54 +1,49 @@
-# M2-1 — 扩展 ExternalAgentCursor 与 machine scratch 支持 pending tool batch
+# M2-2 — 将 `PausedForToolCalls` 折成 `NeedTool` batch
 
-**当前执行 = TODO.md 第一个未完成任务 = M2-1**(M1-1..M1-4 已 `[DONE]`)。
-Milestone 2 目标:runtime 暂停在 `PausedForToolCalls` 时,machine 发 host `NeedTool` batch,
-收齐后回灌 `RespondToolResults`。M2-1 只做**数据结构脚手架**(cursor 变体 + machine scratch),
-不做 fold(M2-2)也不做 result 收集(M2-3)。
+**当前执行 = TODO.md 第一个未完成任务 = M2-2**(M1-1..M1-4、M2-1 已 `[DONE]`)。
+M2-1 已落地数据结构脚手架:`ExternalAgentCursor::AwaitingTool { batch_id, requirements }`、
+machine 非序列化 scratch `PendingExternalToolBatch`(带 `#[expect(dead_code)]` staging)。
+M2-2 = **producer**:在 `fold_session_result` 新增 `PausedForToolCalls` 分支,构造 batch + 发 `NeedTool`。
+M2-3 = consumer:`resume_tool` 收齐 result 回灌 `RespondToolResults`(不在本次)。
 
-## 任务边界(严格 staging)
-- M2-1:cursor 新增 `AwaitingTool { batch_id, requirements }`;machine 新增非序列化 scratch
-  `pending_tool_batch: Option<PendingExternalToolBatch>`;更新 `requirement()`/`requirements()`/
-  `initial_loop_cursor`/`cursor_label`;cursor serde round-trip 覆盖 AwaitingTool;
-  `initial_loop_cursor(AwaitingTool)` 非 terminal 且测试记录降级行为。
-- M2-2:`fold_session_result` 新增 `PausedForToolCalls` 分支(构造 batch + 发 NeedTool)。
-- M2-3:`resume_tool` 收齐 result 回灌 `RespondToolResults`。
+## 关键事实(已核对)
+- `RequirementKind::NeedTool { call_id: ToolCallId, call: ToolCall }`;`RequirementResult::Tool(Result<ToolResponse,ToolRuntimeError>)`。
+- `ExternalToolCall::to_tool_call()` 保留 `provider_call_id` 作为 `ToolCall::id`。
+- `ToolExecutionIds::tool_call_id(&ToolCall) -> Result<ToolCallId, ToolRuntimeError>`;默认 `NoToolExecutionIds` 返回 `IdUnavailable`。
+- `LoopCursor::awaiting_tool(step_id, Vec<ToolCallId>, Some(ToolWaitRequirements::root(ids)))` → 校验 keys 与 call_ids 完全一致;空集 → `EmptyToolWait` err。
+- `pending_requirement_ids()` 对 `AwaitingTool` 返回 requirements.ids().values()。
+- 内部对照实现:`src/agent/machine/default/tools.rs::emit_tool_batch`。
 
-## 实现步骤
-- [ ] state.rs:import `ExternalToolBatchId`(external)、`ToolWaitRequirements`(agent)。
-- [ ] state.rs:cursor 新增 `AwaitingTool { batch_id: ExternalToolBatchId, requirements: ToolWaitRequirements }`
-      (含 rustdoc)。cursor 持久化 outstanding requirement ids(经 ToolWaitRequirements)。
-- [ ] state.rs:`requirement()` 加 `AwaitingTool => None`;新增 `requirements() -> Option<&ToolWaitRequirements>`;
-      新增 `has_outstanding_requirement()`(覆盖 Session/Interaction/Tool)。
-- [ ] state.rs 测试:`external_agent_state_cursor_variants_round_trip` 加 AwaitingTool;断言
-      `requirement()`=None、`requirements()`=Some、`has_outstanding_requirement()`=true。
-- [ ] machine.rs:import `ExternalToolBatchId, ExternalToolCall, ExternalToolResult`, `BTreeMap`。
-- [ ] machine.rs:新增私有 scratch `PendingExternalToolBatch { batch_id, calls, call_to_requirement,
-      requirement_to_call, results }`;machine 新增字段 `pending_tool_batch`;`new`=None,`abandon`/`fail_with` 清空。
-      构造在 M2-2、消费在 M2-3 → 用 `#[allow(dead_code)]` + 注释标注 staging(codebase 目前零 allow;
-      这是明确的前置声明脚手架,不是 spec 绕过)。
-- [ ] machine.rs:`abandon` 用 `has_outstanding_requirement()` 取代 `requirement().is_some()`(前向正确:
-      AwaitingTool 也需 mark_cleanup)。
-- [ ] machine.rs:`initial_loop_cursor` + `cursor_label` 加 `AwaitingTool`。initial_loop_cursor(AwaitingTool)
-      → LoopCursor::Idle(降级;mid-turn restore 无法重建 streaming view,PLAN.md §风险已跟踪)。
-- [ ] machine.rs 测试:`initial_loop_cursor(AwaitingTool)` 非 terminal 且为 Idle,注释记录降级 + 指向 PLAN.md。
+## dead_code 处理(已实测 rustc edition2024)
+- machine 字段 `pending_tool_batch`:一旦 M2-2 写入 `Some(构造值)`,字段不再被判 dead → **移除该字段上的 `#[expect(dead_code)]`**(留着会 unfulfilled 报错)。
+- `PendingExternalToolBatch` struct:字段在 M2-2 只构造不读取 → dead_code 仍触发 → **保留 struct 级 `#[expect(dead_code)]`**,reason 改为「drained by M2-3 RespondToolResults collection」。
 
-## 验证
-- cargo fmt --all -- --check
-- cargo test -p agent-lib external_agent_state_cursor_variants_round_trip
-- cargo test -p agent-lib external_agent_state_serde_round_trips_through_conversation_snapshot
-- cargo clippy --all-targets -- -D warnings
-- cargo test --all --all-targets(≤30min)
-- RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-- git diff --check
+## 实现步骤(machine.rs)
+- [ ] imports 增加:`agent::{NoToolExecutionIds, ToolExecutionIds, ToolWaitRequirements}`、`conversation::ToolCallId`、`model::tool::ToolCall`。
+- [ ] `ExternalAgentMachine` 新增字段 `tool_ids: Arc<dyn ToolExecutionIds>`;`new` 默认 `Arc::new(NoToolExecutionIds)`;新增 builder `with_tool_execution_ids`(兼容,不改 `new` 签名)。
+- [ ] 移除 `pending_tool_batch` 字段上的 `#[expect(dead_code)]`;更新字段 doc。
+- [ ] `PendingExternalToolBatch` struct 的 `#[expect(dead_code)]` reason 改为仅指向 M2-3 drain;更新 struct doc(fold 已实现,仅 drain 待做)。
+- [ ] `fold_session_result` 的 `PausedForToolCalls` 分支改为解构 `{session, batch_id, calls, observations}` → observe → `pause_for_tool_calls(...)`。
+- [ ] 新增 `pause_for_tool_calls`:要求 in_flight;`set_session`;逐 call 分配 `ToolCallId`+`RequirementId` 发 `NeedTool`;失败(无 tool ids / id 不可用 / cursor 构建失败)→ `fail_with(..., notifications)`;成功 → 写 scratch + settle `AwaitingTool` + `LoopCursor::awaiting_tool`。不写 Conversation。
+- [ ] `abandon` / `fail_with` 增加 `self.pending_tool_batch = None;` 清空(class-wide 正确性)。
+- [ ] 模块 doc 增加 tool-pause 覆盖 bullet。
 
-## 降级行为记录(TODO.md M2-1 要求)
-`initial_loop_cursor(AwaitingTool)` 返回 `LoopCursor::Idle`(非 terminal),与
-AwaitingSession/AwaitingInteraction 一致:restore 时无 step scratch 重建 streaming view。
-后续任务:PLAN.md「恢复 mid-turn scratch」风险项(把 pending facts 放入 serializable cursor + restore 测试)。
+## 测试(machine/tests.rs)
+- [ ] 新增 `SeqToolIds`(impl ToolExecutionIds:`tool_call_id` 从池按序发,其余方法返回 IdUnavailable/不被调用)+ helper `machine_with_tool_ids`、`paused_for_tools(batch, calls)`。
+- [ ] `external_tool_pause_emits_need_tool_batch`:requirements.len==calls.len;每个 NeedTool.call.id==provider_call_id;`cursor().pending_requirement_ids()` 含全部;cursor kind==AwaitingTool;pending Conversation 打开未提交;session 已记录。
+- [ ] `external_tool_pause_without_tool_ids_fails`:默认 machine(NoToolExecutionIds)→ 收到 PausedForToolCalls → cursor kind==Error;pending turn discard(pending().is_none())。
 
-## 完成状态(2026-07-17)
-全部步骤完成。state.rs 新增 `AwaitingTool` 变体 + `requirements()`/`has_outstanding_requirement()`;
-machine.rs 新增 `PendingExternalToolBatch` scratch(`#[expect(dead_code)]` staging)+ 字段、
-`initial_loop_cursor`/`cursor_label`/`abandon` 更新、restore 降级测试。
-验证:聚焦 3 passed;clippy 0;fmt/diff clean;doc -D warnings 绿;全量 789 passed/0 failed。
-M2-1 已在 TODO.md 标 [DONE] + 完成记录。待 commit。
+## 验证序列 1-6
+1. `cargo fmt --all -- --check`
+2. 聚焦:`cargo test -p agent-lib external_tool_pause_emits_need_tool_batch`
+3. 聚焦:`cargo test -p agent-lib external_tool_pause_without_tool_ids_fails`
+4. `cargo clippy --all-targets -- -D warnings`(含 expect 兑现检查)
+5. `cargo test --all --all-targets`(≤30min)
+6. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` + `git diff --check`
+
+## 状态:已完成(2026-07-17)
+machine.rs 落地 `tool_ids` 字段 + `with_tool_execution_ids` builder + `pause_for_tool_calls`;
+`fold_session_result` PausedForToolCalls 分支改为发 NeedTool batch;abandon/fail 清 pending_tool_batch;
+dead_code:移除 machine 字段 expect、保留 struct expect。tests 新增 SeqToolIds + 2 test。
+验证 1-6 全过:fmt OK / 聚焦 2 passed / clippy 0 / 全量 791 passed 0 failed / doc -D warnings 绿 / diff clean。
+M2-2 已在 TODO.md 标 [DONE] + 完成记录。待 commit。
