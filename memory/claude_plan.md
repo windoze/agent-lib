@@ -1,64 +1,61 @@
-# M2-4 Review：external tool phase 正确性检查
+# M3-1 实现 `PausedForSubagent` -> `NeedSubagent` -> `RespondSubagent`
 
-**当前执行 = TODO.md 第一个未完成任务 = M2-4**(M1-1..M1-4、M2-1..M2-3 已 `[DONE]`)。
-这是一个 Review/sign-off 任务:核对 M2 落地的 external tool phase 是否把 external tool
-result 错误写进 Conversation、是否绕过 existing ToolHandler / pop routing,并记录与
-DefaultAgentMachine tool phase 的差异。
+**当前执行 = TODO.md 第一个未完成任务 = M3-1**（M1-*、M2-* 已 `[DONE]`）。
 
-## 审查清单(已逐条核对源码 + 测试)
-1. requirement id 路由按 `RequirementId`,支持 out-of-order resume
-   - `resume_tool` 用 `batch.requirement_to_call.get(&resolution.id)` 路由(非按 emission 顺序)。
-   - 测试:`external_tool_batch_accepts_out_of_order_results`。OK
-2. batch 未完成时不 terminal
-   - `results.len() < calls.len()` -> `StepOutcome::new([], [], true)`,cursor 不变(仍 AwaitingTool)。
-   - 测试:`external_tool_partial_result_keeps_waiting`。OK
-3. batch 完成后只发 `NeedExternalSession(RespondToolResults)`
-   - 收齐后按 `batch.calls` 原始顺序组 results -> `block_on_session(RespondToolResults)`。
-   - 从不写 Conversation(与 Default 的 append_tool_response 相反)。
-   - 测试:`external_tool_results_resume_back_to_session_when_batch_complete`。OK
-4. tool execution failure 首版策略明确,不会 panic
-   - 固定 return-error-to-runtime:`Tool(Err)` -> `from_tool_runtime_error`,不 StopRun、不 panic。
-   - 测试:`external_tool_batch_returns_runtime_errors_to_the_runtime`。OK
-5. no ids / wrong family / wrong id -> error cursor
-   - no ids(NoToolExecutionIds)-> `external_tool_pause_without_tool_ids_fails`。
-   - wrong family(Interaction result 进 Tool 位)-> `external_tool_resume_wrong_family_fails`。
-   - wrong id(不在 batch 的 requirement)-> `external_tool_resume_wrong_requirement_fails`。
-   - 额外:duplicate resume、empty batch(EmptyToolWait)也进 error cursor,不 deadlock/panic。OK
-6. `ExternalAgentState` serde 不含 live tool registry / executor / handler
-   - state 字段仅 spec/conversation/session/cursor/active_tools(仅声明)/artifacts/cleanup_required。
-   - 自定义 serde 负测断言 forbidden keys 含 `tool_registry`(state.rs 测试)。OK
-   - 所有 volatile 关联(tool_ids / requirement_ids / in_flight / pending_tool_batch)都在 machine,非 state。OK
-7. drain trace 中 tool requirements 正常记录,无需改 driver
-   - external machine emit 的 `NeedTool` 与 DefaultAgentMachine 完全同形,复用同一 driver 路径。
-   - drive.rs 单测覆盖 NeedTool batch out-of-order + trace 记录
-     (`drain_resolves_a_concurrent_batch_out_of_order`、
-     `drain_records_resolved_at_scope_for_local_and_popped_requirements`)。无需改 driver。OK
+## 目标
+让 `ExternalAgentMachine` 把 runtime 的 `PausedForSubagent` 决策点折成一个标准
+`NeedSubagent` requirement，由 host 的 subagent 机制（`DrivingSubagentHandler`）驱动子 agent，
+收到 `RequirementResult::Subagent(Ok/Err)` 后回灌 `RespondSubagent` 给 runtime（Err 首版转 error cursor）。
 
-## external tool phase vs DefaultAgentMachine tool phase 差异(保留原因)
-- 结果去向:external 从不写 Conversation,收齐后 `RespondToolResults` 回灌 runtime;
-  Default `append_tool_response` 进 Conversation。原因:external runtime 自持 transcript,host 只做工具桥。
-- failure policy:external 固定 `ReturnErrorToRuntime`(无 StopRun 选项);Default 可配置
-  `ReturnErrorToModel` / `StopRun`。原因:external runtime 自行决定如何应对失败调用,首版不暴露 StopRun。
-- per-result 通知:external tool resume 不发 `ToolCallFinished`(runtime 活动经 `ExternalObservedEvent`
-  -> `Notification::ExternalAgent` 汇报);Default 每个 result 发 `ToolCallFinished`。原因:external 的可观测
-  事件模型是 observation-based,不是 host tool-call-based。
-- scratch 持久化:external 的 per-call 关联在非序列化 `PendingExternalToolBatch`,cursor 只存
-  可恢复寻址(ToolCallId->RequirementId);Default 的 `ToolPhase` 同样非序列化(phase marker)。mid-turn
-  restore 场景两者都留待后续(PLAN.md "恢复 mid-turn scratch" 风险)。
+## 锚点
+- `src/agent/external/state.rs`：`ExternalAgentCursor` 需新增 `AwaitingSubagent { requirement, request_id }`。
+- `src/agent/external/machine.rs`：
+  - `fold_session_result` 的 `PausedForSubagent` 分支当前直接 fail（M3 占位），改为 `pause_for_subagent`。
+  - 新增 `Awaiting::Subagent`、`pause_for_subagent`、`resume_subagent`；更新 `resume`、`cursor_label`、
+    `initial_loop_cursor`、模块文档。
+- DTO 已就绪（M1）：`ExternalSubagentRequest{request_id,spec_ref,brief,result_schema,raw}`、
+  `ExternalSubagentOutput`、`ExternalSessionInput::RespondSubagent`、`ExternalSessionResult::PausedForSubagent`。
+- `NeedSubagent { spec_ref, brief, result_schema }`，result = `Result<SubagentOutput, AgentError>`，
+  `needs_outer: true`（driver 已有 serial outer routing，无需改 driver）。
 
-## 结论
-无需代码修改:实现与 review 清单一致,无 spec 偏差 / 无 workaround。纯 sign-off。
-仅文档改动(TODO.md 标 [DONE] + 完成记录、memory 计划),因此可复用上次全量绿结果,但本任务仍按
-验证条件跑聚焦 external_tool / drain + fmt/clippy/doc/diff。
+## 实现步骤
+1. state.rs：AwaitingSubagent 变体 + `requirement()` / `has_outstanding_requirement()` 覆盖；
+   导入 `ExternalSubagentRequestId`。补 state 单测（cursor 断言）。
+2. machine.rs：
+   - `Awaiting::Subagent { requirement, request_id }`。
+   - `pause_for_subagent`：record session、alloc `RequirementKindTag::Subagent` id、
+     emit `NeedSubagent{spec_ref,brief,result_schema}`、settle `AwaitingSubagent`
+     + `LoopCursor::streaming_step`。无 in_flight -> fail_with（带 notifications）。
+   - `resume_subagent`：id 校验；`Subagent(Ok(out))` -> `RespondSubagent`；
+     `Subagent(Err)` -> error cursor；wrong family -> error cursor。
+   - `resume` 读 `AwaitingSubagent`；`cursor_label`、`initial_loop_cursor` 加 awaiting_subagent。
+   - 更新模块 doc（M3 覆盖范围）。
+3. 机器单测（machine/tests.rs）：
+   - `external_subagent_pause_emits_need_subagent`
+   - `external_subagent_result_responds_to_session`
+   - `external_subagent_wrong_family_fails`
+   - 追加：wrong requirement id、Err -> error cursor（class-wide）。
+4. drive 测试（tests/agent_external_subagent.rs，匹配 `driving_subagent` 过滤名）+
+   testkit fixture 助手（`ExternalAgentFixture::subagent_pause` / `subagent_request`）：
+   - `external_agent_driving_subagent_fulfills_child`
+   - `external_agent_driving_subagent_pops_child_interaction_to_outer`
+5. 更新 TODO.md 标 [DONE] + 完成记录。
 
 ## 验证序列
 1. `cargo fmt --all -- --check`
-2. 聚焦:`cargo test -p agent-lib external_tool` + `cargo test -p agent-lib drain`
+2. 聚焦：`cargo test -p agent-lib external_subagent` + `cargo test -p agent-lib driving_subagent`
 3. `cargo clippy --all-targets -- -D warnings`
-4. `cargo test --all --all-targets`(<=30min)
+4. `cargo test --all --all-targets`（<=30min）
 5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
 6. `git diff --check`
 
-## 状态:已完成(2026-07-17)
-验证 1-6 全过:fmt OK / external_tool 11 passed / drain 7 passed / clippy 0 / 全量绿 / doc -D warnings 绿 / diff clean。
-M2-4 已在 TODO.md 标 [DONE] + 完成记录。PLAN.md 无需改(phase 序列未变)。纯 sign-off,无代码改动。待 commit。
+## 状态：完成
+
+- state.rs：新增 `AwaitingSubagent` cursor + 接入访问器 + round-trip 测试。✅
+- machine.rs：`Awaiting::Subagent` + `pause_for_subagent` + `resume_subagent` + resume/fold 路由 + docs。✅
+- machine/tests.rs：新增 5 条 subagent 单测(pause emits / result responds / wrong family / wrong id / error cursor)。✅
+- testkit external.rs：新增 `subagent_request` / `subagent_pause` fixture 助手。✅
+- tests/agent_external_subagent.rs：新增 2 条 drive 测试(`driving_subagent` fulfill child / pop child interaction to outer)。✅
+- 验证序列 1-6 全过:fmt clean、clippy 0 warning、全套件 38 组 0 failed、doc 通过、`git diff --check` clean。✅
+- TODO.md M3-1 标 `[DONE]` + 完成记录。✅
+- driver 无改动(NeedSubagent 复用既有 `scope.subagent()` + ScopePop routing)。

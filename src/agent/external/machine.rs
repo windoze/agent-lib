@@ -11,7 +11,7 @@
 //! real runtime to its next decision point and feeds the
 //! [`ExternalSessionResult`] back through [`StepInput::Resume`].
 //!
-//! # What this machine covers (M3-2, M3-3, M3-4)
+//! # What this machine covers
 //!
 //! - `step(External(UserMessage))` opens a Conversation turn and blocks on one
 //!   `NeedExternalSession`, choosing
@@ -49,6 +49,25 @@
 //!   to the runtime as one
 //!   [`RespondToolResults`](ExternalSessionInput::RespondToolResults) in the
 //!   original call order — never written into the Conversation — reparking on
+//!   [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so the turn can
+//!   advance to its next decision point.
+//! - `step(Resume(ExternalSession(PausedForSubagent)))` records the session
+//!   facts and bridges the runtime's
+//!   [`ExternalSubagentRequest`](super::ExternalSubagentRequest) into one
+//!   [`NeedSubagent`](RequirementKind::NeedSubagent) requirement (reusing its
+//!   `spec_ref`, `brief`, and `result_schema` unchanged), parking on
+//!   [`AwaitingSubagent`](ExternalAgentCursor::AwaitingSubagent) with the
+//!   runtime's [`ExternalSubagentRequestId`](super::ExternalSubagentRequestId)
+//!   held in the serializable cursor. The child is driven by the host's own
+//!   [`DrivingSubagentHandler`](crate::agent) (depth / budget / cancel
+//!   accounting, outward pop of the child's unhandled requirements); the machine
+//!   only reifies the requirement. Its
+//!   [`SubagentOutput`](crate::agent::SubagentOutput) then resumes the machine,
+//!   is bridged into an
+//!   [`ExternalSubagentOutput`](super::ExternalSubagentOutput), and relayed back
+//!   to the runtime as one
+//!   [`RespondSubagent`](ExternalSessionInput::RespondSubagent) echoing the
+//!   request id — never written into the Conversation — reparking on
 //!   [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so the turn can
 //!   advance to its next decision point.
 //! - `step(Abandon)` is the never-resume cancel close (design §6.4): it discards
@@ -101,7 +120,8 @@ use crate::{
         external::{
             ExternalAgentCursor, ExternalAgentOutput, ExternalAgentState, ExternalObservedEvent,
             ExternalSessionInput, ExternalSessionRef, ExternalSessionRequest,
-            ExternalSessionResult, ExternalToolBatchId, ExternalToolCall, ExternalToolResult,
+            ExternalSessionResult, ExternalSubagentOutput, ExternalSubagentRequest,
+            ExternalSubagentRequestId, ExternalToolBatchId, ExternalToolCall, ExternalToolResult,
         },
     },
     client::Response,
@@ -130,6 +150,12 @@ enum Awaiting {
     /// per-call correlation the resume routes against lives in the
     /// [`PendingExternalToolBatch`] scratch, so no addressing is carried here.
     Tool,
+    /// Parked on an outstanding `NeedSubagent`, carrying the runtime's subagent
+    /// spawn request id echoed back through `RespondSubagent`.
+    Subagent {
+        requirement: RequirementId,
+        request_id: ExternalSubagentRequestId,
+    },
 }
 
 /// Mid-turn scratch for the external session step currently in flight.
@@ -347,6 +373,13 @@ impl ExternalAgentMachine {
                 pending_action: pending_action.clone(),
             }),
             ExternalAgentCursor::AwaitingTool { .. } => Ok(Awaiting::Tool),
+            ExternalAgentCursor::AwaitingSubagent {
+                requirement,
+                request_id,
+            } => Ok(Awaiting::Subagent {
+                requirement: requirement.id(),
+                request_id: request_id.clone(),
+            }),
             other => Err(format!(
                 "resume received while cursor is `{}`, no outstanding external requirement",
                 cursor_label(other)
@@ -360,6 +393,10 @@ impl ExternalAgentMachine {
                 pending_action,
             }) => self.resume_interaction(requirement, pending_action, resolution),
             Ok(Awaiting::Tool) => self.resume_tool(resolution),
+            Ok(Awaiting::Subagent {
+                requirement,
+                request_id,
+            }) => self.resume_subagent(requirement, request_id, resolution),
             Err(message) => self.fail(message),
         }
     }
@@ -423,21 +460,13 @@ impl ExternalAgentMachine {
                 let notifications = self.observe(observations);
                 self.pause_for_tool_calls(session, batch_id, calls, notifications)
             }
-            ExternalSessionResult::PausedForSubagent { observations, .. } => {
-                // The sans-io machine does not yet bridge subagent spawn requests
-                // into a `NeedSubagent` requirement — that wiring (cursor phase +
-                // `RespondSubagent` fan-out under the host subagent machinery)
-                // lands with milestone 3. Until then the machine never emits a
-                // request that could elicit this decision point, so receiving one
-                // is an unsupported protocol transition. Buffered observations
-                // still replay exactly once (design §5.5) before the machine
-                // settles on a classified error.
+            ExternalSessionResult::PausedForSubagent {
+                session,
+                request,
+                observations,
+            } => {
                 let notifications = self.observe(observations);
-                self.fail_with(
-                    "external subagent pauses are not yet driven by the machine \
-                     (scheduled for milestone 3)",
-                    notifications,
-                )
+                self.pause_for_subagent(session, request, notifications)
             }
             ExternalSessionResult::Failed {
                 session,
@@ -767,6 +796,154 @@ impl ExternalAgentMachine {
         )
     }
 
+    /// Parks on a subagent spawn the runtime paused for and emits one
+    /// `NeedSubagent`.
+    ///
+    /// The handler surfaced the runtime's native child-task request as a
+    /// provider-neutral [`ExternalSubagentRequest`]. The machine records the
+    /// resumable session facts, bridges the request into a standard
+    /// [`NeedSubagent`](RequirementKind::NeedSubagent) requirement — reusing its
+    /// [`spec_ref`](ExternalSubagentRequest::spec_ref),
+    /// [`brief`](ExternalSubagentRequest::brief), and
+    /// [`result_schema`](ExternalSubagentRequest::result_schema) unchanged, never
+    /// spawning the child outside the host's own subagent machinery (design §4,
+    /// §5.2) — and parks on
+    /// [`AwaitingSubagent`](ExternalAgentCursor::AwaitingSubagent). The child is
+    /// driven by the host's [`DrivingSubagentHandler`](crate::agent), which owns
+    /// the depth / budget / cancel accounting and pops the child's unhandled
+    /// requirements out past the subagent handler; the machine only reifies the
+    /// requirement. The runtime's [`ExternalSubagentRequestId`] is held in the
+    /// serializable cursor so the eventual output feeds a
+    /// [`RespondSubagent`](ExternalSessionInput::RespondSubagent) echoing it (see
+    /// [`resume_subagent`](Self::resume_subagent)). The in-flight turn stays open
+    /// across the pause so the child's result folds back into the same turn.
+    ///
+    /// The provider [`raw`](ExternalSubagentRequest::raw) escape hatch is not
+    /// carried into the host requirement — it holds unmodeled provider fields
+    /// that must not drive stable host logic (design §5.3).
+    ///
+    /// No subagent output is ever written into the [`Conversation`] — the
+    /// external runtime is the consumer of the child's result, not host history;
+    /// the machine only relays the summary back to the runtime.
+    ///
+    /// [`Conversation`]: crate::conversation::Conversation
+    fn pause_for_subagent(
+        &mut self,
+        session: ExternalSessionRef,
+        request: ExternalSubagentRequest,
+        notifications: Vec<Notification>,
+    ) -> StepOutcome {
+        let Some(in_flight) = self.in_flight else {
+            return self.fail_with(
+                "external session paused for a subagent without an in-flight turn",
+                notifications,
+            );
+        };
+
+        self.state.set_session(Some(session));
+
+        let requirement_id = match self
+            .requirement_ids
+            .next_requirement_id(RequirementKindTag::Subagent)
+        {
+            Ok(id) => id,
+            Err(error) => {
+                return self.fail_with(
+                    format!("requirement id unavailable: {error}"),
+                    notifications,
+                );
+            }
+        };
+
+        let ExternalSubagentRequest {
+            request_id,
+            spec_ref,
+            brief,
+            result_schema,
+            raw: _,
+        } = request;
+
+        let cursor_requirement = CursorRequirement::root(requirement_id);
+        self.settle(
+            ExternalAgentCursor::AwaitingSubagent {
+                requirement: cursor_requirement.clone(),
+                request_id,
+            },
+            LoopCursor::streaming_step(in_flight.step_id, Some(cursor_requirement)),
+        );
+
+        let requirement = Requirement::at_root(
+            requirement_id,
+            RequirementKind::NeedSubagent {
+                spec_ref,
+                brief,
+                result_schema,
+            },
+        );
+        StepOutcome::new(notifications, vec![requirement], true)
+    }
+
+    /// Feeds a resolved subagent result back into the paused session.
+    ///
+    /// The host drove the child under its own subagent machinery and delivered a
+    /// [`RequirementResult::Subagent`]:
+    ///
+    /// - A [`RequirementResult::Subagent(Ok(output))`](RequirementResult::Subagent)
+    ///   is bridged into an [`ExternalSubagentOutput`] and fed back to the runtime
+    ///   as a fresh [`RespondSubagent`](ExternalSessionInput::RespondSubagent)
+    ///   that echoes the `request_id` the pause carried, reparking on
+    ///   [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so the session
+    ///   can advance to its next decision point within the same turn.
+    /// - A [`RequirementResult::Subagent(Err(error))`](RequirementResult::Subagent)
+    ///   settles the machine on a classified
+    ///   [`Error`](ExternalAgentCursor::Error) cursor. A runtime-visible child
+    ///   error payload is deferred (design: this first version stops the host
+    ///   turn rather than fabricating a `RespondSubagent` error the runtime has
+    ///   no contract for).
+    /// - Any other result family is a protocol violation and settles on a
+    ///   classified error cursor.
+    ///
+    /// A wrong requirement id is likewise a protocol violation and settles on an
+    /// error cursor.
+    fn resume_subagent(
+        &mut self,
+        expected: RequirementId,
+        request_id: ExternalSubagentRequestId,
+        resolution: RequirementResolution,
+    ) -> StepOutcome {
+        if resolution.id != expected {
+            return self.fail(format!(
+                "resume targets requirement {}, but the machine awaits {expected}",
+                resolution.id
+            ));
+        }
+
+        let output = match resolution.result {
+            RequirementResult::Subagent(Ok(output)) => output,
+            RequirementResult::Subagent(Err(error)) => {
+                return self.fail(format!("external subagent failed: {error}"));
+            }
+            other => {
+                return self.fail(format!(
+                    "NeedSubagent requirement cannot accept a `{}` result",
+                    other.tag()
+                ));
+            }
+        };
+
+        let Some(in_flight) = self.in_flight else {
+            return self.fail("subagent resolved without an in-flight turn");
+        };
+
+        self.block_on_session(
+            in_flight.step_id,
+            ExternalSessionInput::RespondSubagent {
+                request_id,
+                output: ExternalSubagentOutput::from(output),
+            },
+        )
+    }
+
     /// Feeds a resolved interaction back into the paused session.
     ///
     /// The resolved [`InteractionResponse`] is handed to the runtime as a fresh
@@ -873,9 +1050,11 @@ impl ExternalAgentMachine {
     /// machine's — see [`ExternalRuntimeHandles`](super::ExternalRuntimeHandles).
     /// This step only settles the pure state:
     ///
-    /// - When abandoning an outstanding session/interaction step
+    /// - When abandoning an outstanding session/interaction/tool/subagent step
     ///   ([`AwaitingSession`](ExternalAgentCursor::AwaitingSession) /
-    ///   [`AwaitingInteraction`](ExternalAgentCursor::AwaitingInteraction)) a
+    ///   [`AwaitingInteraction`](ExternalAgentCursor::AwaitingInteraction) /
+    ///   [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) /
+    ///   [`AwaitingSubagent`](ExternalAgentCursor::AwaitingSubagent)) a
     ///   runtime session may be live, so it flags
     ///   [`ExternalAgentState::mark_cleanup_required`] for the handle layer to
     ///   sweep; the resumable [`session`](ExternalAgentState::session) facts stay
@@ -890,10 +1069,10 @@ impl ExternalAgentMachine {
     /// ([`ExternalSessionShutdown`](super::ExternalSessionShutdown)) is recorded
     /// by the handle layer into the trace, not here.
     fn abandon(&mut self, _id: RequirementId) -> StepOutcome {
-        // An outstanding session/interaction/tool step means the runtime may
-        // have a live session the handle layer must force-close (§6.4).
-        // Idle/terminal cursors have nothing in flight, so there is nothing to
-        // sweep.
+        // An outstanding session/interaction/tool/subagent step means the
+        // runtime may have a live session the handle layer must force-close
+        // (§6.4). Idle/terminal cursors have nothing in flight, so there is
+        // nothing to sweep.
         if self.state.cursor().has_outstanding_requirement() {
             self.state.mark_cleanup_required();
         }
@@ -979,20 +1158,22 @@ impl AgentMachine for ExternalAgentMachine {
 /// A fresh machine is [`Idle`](ExternalAgentCursor::Idle); the terminal states
 /// map to their [`LoopCursor`] equivalents. A machine restored while parked on an
 /// awaiting state — including the
-/// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) batch — has no step
-/// scratch to rebuild a streaming-step or tool-wait view, so it falls back to the
-/// non-terminal [`LoopCursor::Idle`] rather than misreporting a terminal outcome.
-/// Faithfully rehydrating the driver-facing view of a mid-flight external machine
-/// is the persistence concern tracked in `PLAN.md` under the "恢复 mid-turn
-/// scratch" risk (lift the pending tool/subagent facts into the serializable
-/// cursor and add restore coverage); it is out of scope for the tool-parity
-/// milestone that only lands the cursor phase here.
+/// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) batch and the
+/// [`AwaitingSubagent`](ExternalAgentCursor::AwaitingSubagent) spawn — has no
+/// step scratch to rebuild a streaming-step or tool-wait view, so it falls back
+/// to the non-terminal [`LoopCursor::Idle`] rather than misreporting a terminal
+/// outcome. Faithfully rehydrating the driver-facing view of a mid-flight
+/// external machine is the persistence concern tracked in `PLAN.md` under the
+/// "恢复 mid-turn scratch" risk (lift the pending tool/subagent facts into the
+/// serializable cursor and add restore coverage); it is out of scope for the
+/// parity milestones that only land the cursor phases here.
 fn initial_loop_cursor(cursor: &ExternalAgentCursor) -> LoopCursor {
     match cursor {
         ExternalAgentCursor::Idle
         | ExternalAgentCursor::AwaitingSession { .. }
         | ExternalAgentCursor::AwaitingInteraction { .. }
-        | ExternalAgentCursor::AwaitingTool { .. } => LoopCursor::Idle,
+        | ExternalAgentCursor::AwaitingTool { .. }
+        | ExternalAgentCursor::AwaitingSubagent { .. } => LoopCursor::Idle,
         ExternalAgentCursor::Done => LoopCursor::done(LoopDoneReason::Completed),
         ExternalAgentCursor::Error { message } => {
             LoopCursor::error(message.clone()).unwrap_or(LoopCursor::Idle)
@@ -1007,6 +1188,7 @@ const fn cursor_label(cursor: &ExternalAgentCursor) -> &'static str {
         ExternalAgentCursor::AwaitingSession { .. } => "awaiting_session",
         ExternalAgentCursor::AwaitingInteraction { .. } => "awaiting_interaction",
         ExternalAgentCursor::AwaitingTool { .. } => "awaiting_tool",
+        ExternalAgentCursor::AwaitingSubagent { .. } => "awaiting_subagent",
         ExternalAgentCursor::Done => "done",
         ExternalAgentCursor::Error { .. } => "error",
     }

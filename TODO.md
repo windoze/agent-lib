@@ -808,7 +808,7 @@ external tool phase 与 DefaultAgentMachine tool phase 的差异及保留原因:
 目标:external runtime 能通过 machine 触发 host subagent,并让 runtime permission/question/choice 走标准
 `NeedInteraction`。
 
-### [TODO] M3-1 实现 `PausedForSubagent` -> `NeedSubagent` -> `RespondSubagent`
+### [DONE] M3-1 实现 `PausedForSubagent` -> `NeedSubagent` -> `RespondSubagent`
 
 **上下文**:
 
@@ -844,6 +844,53 @@ external tool phase 与 DefaultAgentMachine tool phase 的差异及保留原因:
   - `cargo test -p agent-lib external_subagent`
   - `cargo test -p agent-lib driving_subagent`
 - 完整验证序列 1-6 全过。
+
+**完成记录**(2026-07-17):
+
+把 `ExternalAgentMachine` 的 subagent-spawn pause 桥接成标准 host `NeedSubagent`,并把 child 输出经
+`RespondSubagent` 回灌 runtime。实现镜像既有 tool-batch pause/resume 模式,无 spec 偏差 / 无 workaround。
+落地要点:
+
+- *cursor*:`ExternalAgentCursor` 新增 `AwaitingSubagent { requirement, request_id }`(在 `AwaitingTool`
+  之后),并接入 `requirement()` / `requirements()` / `has_outstanding_requirement()`,round-trip serde 由
+  `external_agent_state_cursor_variants_round_trip` 覆盖。volatile 关联(`in_flight` 的
+  `Awaiting::Subagent { requirement, request_id }`)留在 machine,不进 state。
+- *pause*:`fold_session_result` 的 `PausedForSubagent` 分支调用新 `pause_for_subagent`:guard in-flight ->
+  `set_session` -> emit observations -> alloc `RequirementKindTag::Subagent` id -> 拆 request(丢弃未建模的
+  `raw` 逃生字段,仅带 `spec_ref` / `brief` / `result_schema`)-> settle `AwaitingSubagent` cursor +
+  `LoopCursor::streaming_step`(复用单 outstanding requirement 通道,与 interaction 路径一致)-> emit
+  `Requirement::at_root(id, NeedSubagent { spec_ref, brief, result_schema })`。
+- *resume*:`resume` 读 `AwaitingSubagent` cursor 派发到新 `resume_subagent`:`Subagent(Ok(output))` ->
+  `block_on_session(RespondSubagent { request_id, output })`(echo 同一 `request_id`);`Subagent(Err)` -> 按
+  TODO 推荐先转 error cursor(`"external subagent failed: {error}"`),不伪造 runtime-visible child error
+  payload;wrong id / wrong family / 缺 in-flight -> error/fail cursor。
+- *driver 无改动*:external machine emit 的 `NeedSubagent`(`needs_outer: true`)与内部机同形,复用
+  `drive.rs::resolve_requirement` 既有 `scope.subagent()` + `ScopePop` outer routing。
+
+external subagent phase 与内部 subagent 的差异及保留原因:
+
+1. *结果去向*:external 从不写 Conversation,child summary 经 `RespondSubagent` 回灌 runtime;runtime 自持
+   transcript,host 只做 subagent 桥。
+2. *child error 策略*:首版固定 error cursor(不暴露 runtime-visible child error payload),与 M1 设计一致,
+   后续再设计 runtime 可见的 child 失败回灌。
+3. *raw 逃生字段*:`ExternalSubagentRequest.raw`(design §5.3 未建模 provider 逃生舱)刻意不带进
+   `NeedSubagent`,只桥接已建模的 spec_ref / brief / result_schema。
+
+*验证*(完整序列 1-6 全过):
+
+- `cargo fmt --all -- --check` FMT_CLEAN。
+- 聚焦:`cargo test -p agent-lib external_subagent`(7 passed:5 machine unit + 2 DTO)、
+  `cargo test -p agent-lib driving_subagent`(2 passed:新增 `tests/agent_external_subagent.rs` 两条 drive
+  测试)。machine unit 新增 `external_subagent_pause_emits_need_subagent` /
+  `external_subagent_result_responds_to_session` / `external_subagent_wrong_family_fails` /
+  `external_subagent_resume_wrong_requirement_fails` / `external_subagent_error_settles_error_cursor`;drive
+  新增 `external_agent_driving_subagent_fulfills_child`(经 `DrivingSubagentHandler` fulfill 并 respond)与
+  `external_agent_driving_subagent_pops_child_interaction_to_outer`(headless child interaction pop 到 parent,
+  不重入 subagent handler)。
+- `cargo clippy --all-targets -- -D warnings` 0 warning。
+- `cargo test --all --all-targets`:全绿(工作区各套件 38 组结果均 0 failed)。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
+- `git diff --check` clean。
 
 ### [TODO] M3-2 完善 runtime permission/question/choice 到 `NeedInteraction` 的映射
 

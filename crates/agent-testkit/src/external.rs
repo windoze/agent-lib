@@ -40,11 +40,11 @@ use agent_lib::agent::external::{
     ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef,
     ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
     ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
-    ExternalStreamPolicy, WorktreeIsolation,
+    ExternalStreamPolicy, ExternalSubagentRequest, ExternalSubagentRequestId, WorktreeIsolation,
 };
 use agent_lib::agent::{
-    ExternalSessionHandler, Interaction, PermissionCategory, PermissionRequest, PermissionRisk,
-    RequirementKindTag, RequirementResult, RunContext, ToolSetRef, WorktreeRef,
+    AgentSpecRef, ExternalSessionHandler, Interaction, PermissionCategory, PermissionRequest,
+    PermissionRisk, RequirementKindTag, RequirementResult, RunContext, ToolSetRef, WorktreeRef,
 };
 use agent_lib::conversation::{Conversation, ConversationConfig};
 use async_trait::async_trait;
@@ -392,6 +392,49 @@ impl ExternalAgentFixture {
             request: Interaction::permission(self.ids.step_id(), self.permission_request()),
             observations: ExternalObservedEvent::unsequenced_for_tests(vec![
                 self.permission_requested_event("act-1", "run `cargo test`"),
+            ]),
+        }
+    }
+
+    /// One runtime subagent spawn [`ExternalSubagentRequest`] tagged with
+    /// `request_id`, reusing the fixture agent as the child spec.
+    ///
+    /// The host bridges this into a standard `NeedSubagent` (reusing its
+    /// [`spec_ref`](ExternalSubagentRequest::spec_ref),
+    /// [`brief`](ExternalSubagentRequest::brief), and
+    /// [`result_schema`](ExternalSubagentRequest::result_schema)), drives the
+    /// child under its own subagent machinery, and feeds the result back through
+    /// a [`RespondSubagent`](ExternalSessionInput::RespondSubagent) echoing the
+    /// same `request_id`.
+    #[must_use]
+    pub fn subagent_request(&self, request_id: &str) -> ExternalSubagentRequest {
+        ExternalSubagentRequest {
+            request_id: ExternalSubagentRequestId::new(request_id),
+            spec_ref: AgentSpecRef(self.ids.agent_id()),
+            brief: Interaction::question(
+                self.ids.step_id(),
+                "Investigate the flaky test.".to_owned(),
+            ),
+            result_schema: Some(serde_json::json!({ "type": "object" })),
+            raw: None,
+        }
+    }
+
+    /// A [`PausedForSubagent`](ExternalSessionResult::PausedForSubagent) result
+    /// carrying the fixture's [`subagent_request`](Self::subagent_request) under
+    /// `request_id`.
+    ///
+    /// The machine bridges the carried request into one `NeedSubagent`, whose
+    /// child a host [`DrivingSubagentHandler`](agent_lib::agent::DrivingSubagentHandler)
+    /// drives; its output is relayed back to the runtime through a
+    /// [`RespondSubagent`](ExternalSessionInput::RespondSubagent).
+    #[must_use]
+    pub fn subagent_pause(&self, request_id: &str) -> ExternalSessionResult {
+        ExternalSessionResult::PausedForSubagent {
+            session: self.session_ref(),
+            request: self.subagent_request(request_id),
+            observations: ExternalObservedEvent::unsequenced_for_tests(vec![
+                self.command_finished_event(),
             ]),
         }
     }

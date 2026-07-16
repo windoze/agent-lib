@@ -12,7 +12,8 @@ use crate::{
     agent::{
         CursorRequirement, ToolWaitRequirements,
         external::{
-            ExternalAgentSpec, ExternalArtifactRef, ExternalSessionRef, ExternalToolBatchId,
+            ExternalAgentSpec, ExternalArtifactRef, ExternalSessionRef, ExternalSubagentRequestId,
+            ExternalToolBatchId,
         },
         spec::ToolSetRef,
     },
@@ -77,6 +78,27 @@ pub enum ExternalAgentCursor {
         /// (`ToolCallId -> RequirementId`) for the awaited batch.
         requirements: ToolWaitRequirements,
     },
+    /// A session paused for a subagent spawn; the machine emitted one
+    /// `NeedSubagent` requirement and is waiting for the host to drive the child
+    /// agent and return its output.
+    ///
+    /// The cursor persists the resumable addressing: the outstanding
+    /// [`CursorRequirement`] the driver must fulfill, and the runtime-assigned
+    /// [`ExternalSubagentRequestId`] echoed back through
+    /// [`ExternalSessionInput::RespondSubagent`] once the child's output is fed
+    /// back — so a restored machine can rebuild its pending-requirement registry
+    /// and correlate the eventual result with the runtime's spawn request.
+    ///
+    /// [`ExternalSessionInput::RespondSubagent`]:
+    /// crate::agent::external::ExternalSessionInput::RespondSubagent
+    AwaitingSubagent {
+        /// The outstanding subagent requirement being awaited.
+        requirement: CursorRequirement,
+        /// Identifier of the runtime's spawn request the resolved subagent
+        /// output answers, fed back through
+        /// [`RespondSubagent`](crate::agent::external::ExternalSessionInput::RespondSubagent).
+        request_id: ExternalSubagentRequestId,
+    },
     /// The session reached a normal terminal outcome.
     Done,
     /// The session ended with a classified failure recorded as a message.
@@ -103,7 +125,8 @@ impl ExternalAgentCursor {
     ///
     /// Only the single-requirement awaiting variants
     /// ([`AwaitingSession`](Self::AwaitingSession) /
-    /// [`AwaitingInteraction`](Self::AwaitingInteraction)) carry one
+    /// [`AwaitingInteraction`](Self::AwaitingInteraction) /
+    /// [`AwaitingSubagent`](Self::AwaitingSubagent)) carry one
     /// [`CursorRequirement`]. The [`AwaitingTool`](Self::AwaitingTool) batch
     /// awaits many requirements at once — read those through
     /// [`requirements`](Self::requirements).
@@ -111,7 +134,8 @@ impl ExternalAgentCursor {
     pub const fn requirement(&self) -> Option<&CursorRequirement> {
         match self {
             Self::AwaitingSession { requirement }
-            | Self::AwaitingInteraction { requirement, .. } => Some(requirement),
+            | Self::AwaitingInteraction { requirement, .. }
+            | Self::AwaitingSubagent { requirement, .. } => Some(requirement),
             Self::Idle | Self::AwaitingTool { .. } | Self::Done | Self::Error { .. } => None,
         }
     }
@@ -131,14 +155,15 @@ impl ExternalAgentCursor {
             Self::Idle
             | Self::AwaitingSession { .. }
             | Self::AwaitingInteraction { .. }
+            | Self::AwaitingSubagent { .. }
             | Self::Done
             | Self::Error { .. } => None,
         }
     }
 
     /// Returns `true` when the cursor is parked on an outstanding host
-    /// requirement — a session step, an interaction, or a tool batch — that a
-    /// live runtime session may still back.
+    /// requirement — a session step, an interaction, a tool batch, or a subagent
+    /// spawn — that a live runtime session may still back.
     ///
     /// Unlike [`requirement`](Self::requirement) (which only reports the
     /// single-requirement variants), this also covers the
@@ -152,6 +177,7 @@ impl ExternalAgentCursor {
             Self::AwaitingSession { .. }
                 | Self::AwaitingInteraction { .. }
                 | Self::AwaitingTool { .. }
+                | Self::AwaitingSubagent { .. }
         )
     }
 }
@@ -388,8 +414,8 @@ mod tests {
             external::{
                 ExternalAgentSpec, ExternalArtifactKind, ExternalArtifactRef,
                 ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionPolicy,
-                ExternalSessionRef, ExternalStreamPolicy, ExternalToolBatchId, WorkerProfileRef,
-                WorktreeIsolation,
+                ExternalSessionRef, ExternalStreamPolicy, ExternalSubagentRequestId,
+                ExternalToolBatchId, WorkerProfileRef, WorktreeIsolation,
             },
             spec::{ToolSetRef, WorktreeRef},
         },
@@ -655,6 +681,10 @@ mod tests {
                 batch_id: ExternalToolBatchId::new("batch-7"),
                 requirements: tool_requirements.clone(),
             },
+            ExternalAgentCursor::AwaitingSubagent {
+                requirement: CursorRequirement::root(requirement_id()),
+                request_id: ExternalSubagentRequestId::new("spawn-3"),
+            },
             ExternalAgentCursor::Done,
             ExternalAgentCursor::Error {
                 message: "runtime crashed".to_owned(),
@@ -702,6 +732,22 @@ mod tests {
             }
             .has_outstanding_requirement()
         );
+
+        // The subagent cursor carries the single outstanding requirement plus
+        // the runtime request id echoed back on `RespondSubagent`, so it reports
+        // through `requirement()` and counts as an outstanding requirement.
+        let awaiting_subagent = ExternalAgentCursor::AwaitingSubagent {
+            requirement: CursorRequirement::root(requirement_id()),
+            request_id: ExternalSubagentRequestId::new("spawn-3"),
+        };
+        assert!(!awaiting_subagent.is_terminal());
+        assert!(awaiting_subagent.has_outstanding_requirement());
+        assert_eq!(
+            awaiting_subagent.requirement().map(CursorRequirement::id),
+            Some(requirement_id())
+        );
+        assert!(awaiting_subagent.requirements().is_none());
+
         assert!(!ExternalAgentCursor::Idle.has_outstanding_requirement());
         assert!(!ExternalAgentCursor::Done.has_outstanding_requirement());
     }
