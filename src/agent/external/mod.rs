@@ -10,17 +10,28 @@
 //! stay behind the handler and runtime-handle boundary, mirroring the split used
 //! by [`AgentSpec`](crate::agent::AgentSpec) versus the tool registry traits.
 //!
-//! The types here are wired into the effect model in later milestones:
+//! The effect DTOs here are wired into the effect model in later milestones:
 //! `RequirementKind::NeedExternalSession` and the `ExternalSessionHandler` trait
-//! are added on top of these DTOs. This module only defines the data.
+//! are added on top of them.
+//!
+//! Alongside those DTOs this module also carries the external-agent machine's
+//! own persistence shapes — [`ExternalAgentSpec`] (static recipe),
+//! [`ExternalAgentState`] plus [`ExternalAgentCursor`] (serializable running
+//! state), and the non-serde [`ExternalRuntimeHandles`] holder — mirroring the
+//! [`AgentSpec`](crate::agent::AgentSpec) /
+//! [`AgentState`](crate::agent::AgentState) /
+//! [`AgentRuntimeHandles`](crate::agent::AgentRuntimeHandles) split (design §4).
 //!
 //! # Persistence boundary
 //!
-//! Every type in this module derives `Clone, Debug, PartialEq, Eq, Serialize,
-//! Deserialize`, so a driver can serialize an outstanding
+//! Every effect DTO in this module derives `Clone, Debug, PartialEq, Eq,
+//! Serialize, Deserialize`, so a driver can serialize an outstanding
 //! [`ExternalSessionRequest`], restore it in another process, and re-register
-//! it, and can persist an [`ExternalSessionResult`] for replay. Live handles are
-//! kept out of these shapes on purpose.
+//! it, and can persist an [`ExternalSessionResult`] for replay.
+//! [`ExternalAgentState`] serializes through the same Conversation snapshot
+//! boundary as [`AgentState`](crate::agent::AgentState). Live handles are kept
+//! out of these shapes on purpose: they live behind
+//! [`ExternalRuntimeHandles`].
 //!
 //! # Blocking effect versus continuous stream
 //!
@@ -48,6 +59,14 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod runtime;
+mod spec;
+mod state;
+
+pub use runtime::ExternalRuntimeHandles;
+pub use spec::{ExternalAgentSpec, WorkerProfileRef};
+pub use state::{ExternalAgentCursor, ExternalAgentState};
 
 /// Which external coding-agent runtime backs a session.
 ///

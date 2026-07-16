@@ -1,0 +1,502 @@
+//! Serializable external-agent machine state and its recovery cursor.
+//!
+//! [`ExternalAgentState`] is the data half of a running external-agent machine,
+//! mirroring [`AgentState`](crate::agent::AgentState): it owns exactly one live
+//! [`Conversation`], records the resumable [`ExternalSessionRef`], the active
+//! tool declarations, and a data-only [`ExternalAgentCursor`] for pause/restore.
+//! Live handles (CLI process, SDK client, stdout reader, watcher, task set) live
+//! in [`ExternalRuntimeHandles`](super::ExternalRuntimeHandles) instead of this
+//! serde shape (design §4.2).
+
+use crate::{
+    agent::{
+        CursorRequirement,
+        external::{ExternalAgentSpec, ExternalSessionRef},
+        spec::ToolSetRef,
+    },
+    conversation::{Conversation, ConversationError, ConversationSnapshot},
+};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
+
+/// Data-only recovery cursor for an external-agent machine.
+///
+/// The cursor records which decision point the machine is parked on, and — for
+/// the awaiting variants — the precise [`CursorRequirement`] it is stuck on, so a
+/// driver can serialize a paused machine, restore it elsewhere, and rebuild the
+/// pending-requirement registry straight from the cursor. It never contains a
+/// live session, process, task handle, or interaction responder (design §4.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "data", rename_all = "snake_case")]
+pub enum ExternalAgentCursor {
+    /// No external session step is currently outstanding.
+    #[default]
+    Idle,
+    /// The machine emitted a `NeedExternalSession` requirement and is waiting for
+    /// the session to advance to its next decision point.
+    AwaitingSession {
+        /// The outstanding external-session requirement being awaited.
+        requirement: CursorRequirement,
+    },
+    /// A session paused for an interaction; the machine emitted a
+    /// `NeedInteraction` requirement and is waiting for the host's response.
+    AwaitingInteraction {
+        /// The outstanding interaction requirement being awaited.
+        requirement: CursorRequirement,
+        /// Identifier of the paused action the resolved interaction answers,
+        /// fed back through [`ExternalSessionInput::RespondInteraction`].
+        ///
+        /// [`ExternalSessionInput::RespondInteraction`]:
+        /// crate::agent::external::ExternalSessionInput::RespondInteraction
+        pending_action: String,
+    },
+    /// The session reached a normal terminal outcome.
+    Done,
+    /// The session ended with a classified failure recorded as a message.
+    Error {
+        /// Stable, human-readable failure description.
+        message: String,
+    },
+}
+
+impl ExternalAgentCursor {
+    /// Returns `true` when the cursor is the [`Idle`](Self::Idle) resting state.
+    #[must_use]
+    pub const fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    /// Returns `true` when the cursor has reached a terminal outcome.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done | Self::Error { .. })
+    }
+
+    /// Returns the requirement address the cursor is stuck on, if any.
+    #[must_use]
+    pub const fn requirement(&self) -> Option<&CursorRequirement> {
+        match self {
+            Self::AwaitingSession { requirement }
+            | Self::AwaitingInteraction { requirement, .. } => Some(requirement),
+            Self::Idle | Self::Done | Self::Error { .. } => None,
+        }
+    }
+}
+
+/// Data half of a running external-agent machine.
+///
+/// The state owns one active [`Conversation`] and records only resumable facts:
+/// the static [`ExternalAgentSpec`], the [`ExternalSessionRef`] needed to realign
+/// with the runtime across restarts, the active tool declarations, and the
+/// recovery [`ExternalAgentCursor`]. Serialization crosses the Conversation
+/// persistence boundary via [`Conversation::snapshot`]; deserialization rebuilds
+/// the live Conversation via [`Conversation::restore`]. Runtime handles never
+/// appear in this shape.
+#[derive(Debug)]
+pub struct ExternalAgentState {
+    spec: ExternalAgentSpec,
+    conversation: Conversation,
+    session: Option<ExternalSessionRef>,
+    cursor: ExternalAgentCursor,
+    active_tools: ToolSetRef,
+}
+
+impl ExternalAgentState {
+    /// Creates external-agent state from a static spec and one active
+    /// Conversation.
+    ///
+    /// The active tool set is seeded from the spec's initial tools, no session
+    /// exists yet, and the cursor starts [`Idle`](ExternalAgentCursor::Idle).
+    #[must_use]
+    pub fn new(spec: ExternalAgentSpec, conversation: Conversation) -> Self {
+        let active_tools = spec.initial_tools().clone();
+        Self {
+            spec,
+            conversation,
+            session: None,
+            cursor: ExternalAgentCursor::Idle,
+            active_tools,
+        }
+    }
+
+    /// Returns the static external-agent specification.
+    #[must_use]
+    pub const fn spec(&self) -> &ExternalAgentSpec {
+        &self.spec
+    }
+
+    /// Returns the unique active Conversation through a read-only view.
+    #[must_use]
+    pub const fn conversation(&self) -> &Conversation {
+        &self.conversation
+    }
+
+    /// Returns the resumable session facts, if a session has been established.
+    #[must_use]
+    pub const fn session(&self) -> Option<&ExternalSessionRef> {
+        self.session.as_ref()
+    }
+
+    /// Returns the data-only recovery cursor.
+    #[must_use]
+    pub const fn cursor(&self) -> &ExternalAgentCursor {
+        &self.cursor
+    }
+
+    /// Returns the currently active tool declarations.
+    #[must_use]
+    pub const fn active_tools(&self) -> &ToolSetRef {
+        &self.active_tools
+    }
+
+    /// Replaces the recovery cursor.
+    pub fn set_cursor(&mut self, cursor: ExternalAgentCursor) {
+        self.cursor = cursor;
+    }
+
+    /// Records the latest resumable session facts.
+    pub fn set_session(&mut self, session: Option<ExternalSessionRef>) {
+        self.session = session;
+    }
+
+    /// Replaces the active tool declarations.
+    pub fn set_active_tools(&mut self, active_tools: ToolSetRef) {
+        self.active_tools = active_tools;
+    }
+
+    fn from_record(record: ExternalAgentStateRecord) -> Result<Self, ConversationError> {
+        let conversation = Conversation::restore(record.conversation)?;
+        Ok(Self {
+            spec: record.spec,
+            conversation,
+            session: record.session,
+            cursor: record.cursor,
+            active_tools: record.active_tools,
+        })
+    }
+}
+
+impl Serialize for ExternalAgentState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let conversation = self.conversation.snapshot().map_err(ser::Error::custom)?;
+        ExternalAgentStateRecord {
+            spec: self.spec.clone(),
+            conversation,
+            session: self.session.clone(),
+            cursor: self.cursor.clone(),
+            active_tools: self.active_tools.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExternalAgentState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let record = ExternalAgentStateRecord::deserialize(deserializer)?;
+        Self::from_record(record).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalAgentStateRecord {
+    spec: ExternalAgentSpec,
+    conversation: ConversationSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<ExternalSessionRef>,
+    #[serde(default)]
+    cursor: ExternalAgentCursor,
+    active_tools: ToolSetRef,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExternalAgentCursor, ExternalAgentState};
+    use crate::{
+        agent::{
+            AgentId, AgentPath, AgentSlot, CursorRequirement, RequirementId, ToolSetId,
+            external::{
+                ExternalAgentSpec, ExternalPermissionMode, ExternalRuntimeKind,
+                ExternalSessionPolicy, ExternalSessionRef, ExternalStreamPolicy, WorkerProfileRef,
+                WorktreeIsolation,
+            },
+            spec::{ToolSetRef, WorktreeRef},
+        },
+        conversation::{
+            AssistantFinish, Conversation, ConversationConfig, ConversationId, MessageId, TurnId,
+            TurnMeta,
+        },
+        model::{
+            content::ContentBlock,
+            message::{Message, Role},
+            normalized::StopReason,
+            tool::Tool,
+            usage::Usage,
+        },
+    };
+    use serde::{Serialize, de::DeserializeOwned};
+    use serde_json::{Map, json};
+    use std::fmt::Debug;
+
+    fn agent_id() -> AgentId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890f0"
+            .parse()
+            .expect("agent id")
+    }
+
+    fn tool_set_id() -> ToolSetId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890f1"
+            .parse()
+            .expect("tool set id")
+    }
+
+    fn requirement_id() -> RequirementId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890f2"
+            .parse()
+            .expect("requirement id")
+    }
+
+    fn message_id(offset: u8) -> MessageId {
+        format!("018f0d9c-7b6a-7c12-8f31-1234567890a{offset}")
+            .parse()
+            .expect("message id")
+    }
+
+    fn tool(name: &str) -> Tool {
+        Tool {
+            name: name.to_owned(),
+            description: format!("Tool {name}."),
+            input_schema: json!({ "type": "object" }),
+        }
+    }
+
+    fn spec() -> ExternalAgentSpec {
+        ExternalAgentSpec::new(
+            agent_id(),
+            ExternalRuntimeKind::ClaudeCode,
+            WorktreeRef::new("/repo/agent-lib"),
+            Some(WorkerProfileRef::new("cheap-worker")),
+            ToolSetRef::new(tool_set_id(), vec![tool("apply_patch")]),
+            ExternalSessionPolicy {
+                permission_mode: ExternalPermissionMode::AcceptEdits,
+                isolation: WorktreeIsolation::EphemeralGitWorktree,
+                max_turns: Some(12),
+                stream_events: ExternalStreamPolicy::Buffered,
+            },
+        )
+    }
+
+    fn session_ref() -> ExternalSessionRef {
+        ExternalSessionRef {
+            runtime: ExternalRuntimeKind::ClaudeCode,
+            session_id: Some("sess-77".to_owned()),
+            transcript_ref: Some("transcript://77".to_owned()),
+            resume_token: Some("resume-77".to_owned()),
+            last_event_seq: Some(4),
+        }
+    }
+
+    fn user_message(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.to_owned(),
+                extra: Map::new(),
+            }],
+        }
+    }
+
+    fn assistant_response(text: &str) -> crate::client::Response {
+        crate::client::Response {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: text.to_owned(),
+                    extra: Map::new(),
+                }],
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::normalize("end_turn"),
+            extra: Map::new(),
+        }
+    }
+
+    fn committed_conversation() -> Conversation {
+        let conversation_id: ConversationId = "018f0d9c-7b6a-7c12-8f31-1234567890fa"
+            .parse()
+            .expect("conversation id");
+        let turn_id: TurnId = "018f0d9c-7b6a-7c12-8f31-1234567890fb"
+            .parse()
+            .expect("turn id");
+        let mut conversation = Conversation::new(
+            conversation_id,
+            ConversationConfig::new(Some("Drive the external agent.".to_owned())),
+        );
+        conversation
+            .begin_turn(turn_id, message_id(0), user_message("refactor the parser"))
+            .expect("begin turn");
+        conversation
+            .start_assistant_response(assistant_response("on it"))
+            .expect("assistant response");
+        let finish = conversation
+            .finish_assistant(message_id(1))
+            .expect("finish assistant");
+        assert_eq!(finish, AssistantFinish::ReadyToCommit);
+        conversation
+            .commit_pending(TurnMeta::default())
+            .expect("commit pending");
+        conversation
+    }
+
+    fn assert_json_round_trip<T>(value: &T)
+    where
+        T: Debug + PartialEq + Serialize + DeserializeOwned,
+    {
+        let encoded = serde_json::to_value(value).expect("serialize");
+        let decoded: T = serde_json::from_value(encoded).expect("deserialize");
+        assert_eq!(&decoded, value);
+    }
+
+    #[test]
+    fn external_agent_state_serde_round_trips_through_conversation_snapshot() {
+        let mut state = ExternalAgentState::new(spec(), committed_conversation());
+        state.set_session(Some(session_ref()));
+        state.set_active_tools(ToolSetRef::new(
+            tool_set_id(),
+            vec![tool("apply_patch"), tool("run_tests")],
+        ));
+        state.set_cursor(ExternalAgentCursor::AwaitingSession {
+            requirement: CursorRequirement::root(requirement_id()),
+        });
+
+        let encoded = serde_json::to_value(&state).expect("serialize external agent state");
+        assert_eq!(encoded["spec"]["id"], json!(agent_id().to_string()));
+        assert_eq!(encoded["spec"]["runtime"], json!("claude_code"));
+        assert_eq!(
+            encoded["conversation"]["id"],
+            json!("018f0d9c-7b6a-7c12-8f31-1234567890fa")
+        );
+        assert_eq!(
+            encoded["conversation"]["history"]["raw_turns"]
+                .as_array()
+                .expect("raw turns array")
+                .len(),
+            1
+        );
+        assert_eq!(encoded["session"]["session_id"], json!("sess-77"));
+        assert_eq!(encoded["cursor"]["state"], json!("awaiting_session"));
+        assert_eq!(
+            encoded["active_tools"]["tools"]
+                .as_array()
+                .expect("tools array")
+                .len(),
+            2
+        );
+
+        let object = encoded.as_object().expect("state object");
+        for forbidden in [
+            "runtime_handles",
+            "interaction",
+            "tool_registry",
+            "session_tasks",
+            "process",
+            "task",
+            "watcher",
+        ] {
+            assert!(
+                !object.contains_key(forbidden),
+                "runtime handle key must not be serialized: {forbidden}"
+            );
+        }
+
+        let decoded: ExternalAgentState =
+            serde_json::from_value(encoded).expect("deserialize external agent state");
+        assert_eq!(decoded.spec().id(), agent_id());
+        assert_eq!(decoded.spec().runtime(), &ExternalRuntimeKind::ClaudeCode);
+        assert_eq!(
+            decoded.spec().profile(),
+            Some(&WorkerProfileRef::new("cheap-worker"))
+        );
+        assert_eq!(
+            decoded.conversation().id().to_string(),
+            "018f0d9c-7b6a-7c12-8f31-1234567890fa"
+        );
+        assert_eq!(decoded.conversation().turns().len(), 1);
+        assert_eq!(decoded.session(), Some(&session_ref()));
+        assert_eq!(decoded.active_tools().tools().len(), 2);
+        assert_eq!(
+            decoded.cursor(),
+            &ExternalAgentCursor::AwaitingSession {
+                requirement: CursorRequirement::root(requirement_id()),
+            }
+        );
+    }
+
+    #[test]
+    fn external_agent_state_defaults_to_idle_without_session() {
+        let state = ExternalAgentState::new(spec(), committed_conversation());
+        assert!(state.cursor().is_idle());
+        assert!(state.session().is_none());
+        assert_eq!(state.active_tools().tools().len(), 1);
+
+        let encoded = serde_json::to_value(&state).expect("serialize external agent state");
+        assert!(
+            encoded
+                .as_object()
+                .expect("object")
+                .get("session")
+                .is_none(),
+            "absent session must be skipped"
+        );
+        assert_eq!(encoded["cursor"]["state"], json!("idle"));
+
+        let decoded: ExternalAgentState =
+            serde_json::from_value(encoded).expect("deserialize external agent state");
+        assert!(decoded.cursor().is_idle());
+        assert!(decoded.session().is_none());
+    }
+
+    #[test]
+    fn external_agent_state_cursor_variants_round_trip() {
+        let origin = AgentPath::from_slots(vec![AgentSlot::new(1), AgentSlot::new(3)]);
+        for cursor in [
+            ExternalAgentCursor::Idle,
+            ExternalAgentCursor::AwaitingSession {
+                requirement: CursorRequirement::root(requirement_id()),
+            },
+            ExternalAgentCursor::AwaitingInteraction {
+                requirement: CursorRequirement::new(requirement_id(), origin.clone()),
+                pending_action: "act-9".to_owned(),
+            },
+            ExternalAgentCursor::Done,
+            ExternalAgentCursor::Error {
+                message: "runtime crashed".to_owned(),
+            },
+        ] {
+            assert_json_round_trip(&cursor);
+        }
+
+        assert!(ExternalAgentCursor::Idle.is_idle());
+        assert!(ExternalAgentCursor::Done.is_terminal());
+        assert!(
+            ExternalAgentCursor::Error {
+                message: "x".to_owned()
+            }
+            .is_terminal()
+        );
+        assert_eq!(
+            ExternalAgentCursor::AwaitingInteraction {
+                requirement: CursorRequirement::root(requirement_id()),
+                pending_action: "act-1".to_owned(),
+            }
+            .requirement()
+            .map(CursorRequirement::id),
+            Some(requirement_id())
+        );
+    }
+}
