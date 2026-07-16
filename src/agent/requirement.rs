@@ -30,6 +30,7 @@
 use crate::{
     agent::{
         AgentError, AgentId, ToolSetRef,
+        effect_manifest::define_effects,
         external::{ExternalSessionRequest, ExternalSessionResult},
         interaction::{Interaction, InteractionError, InteractionResponse},
         tool::ToolRuntimeError,
@@ -360,6 +361,78 @@ impl Requirement {
     }
 }
 
+// --- Transitional macro-generated coproduct (刀 (A), milestone M3-1) ---------
+//
+// `define_effects!` renders the effect coproduct from a single manifest. For
+// now it emits only the three enums + `RequirementKindTagGen::Display` + `tag()`
+// under `*Gen` names that coexist with the hand-written definitions below. M3-2
+// asserts byte-for-byte equivalence and extends the macro to `accepts` and the
+// `drive` fan-out; M3-3 deletes the hand-written twins and promotes these to the
+// canonical names. See `crate::agent::effect_manifest` for the grammar.
+define_effects! {
+    Llm {
+        tag_name: "llm",
+        kind: NeedLlm {
+            request: ChatRequest,
+            mode: LlmStepMode,
+        },
+        result: Result<Response, ClientError>,
+        handler: LlmHandler,
+        accessor: llm,
+    }
+    Tool {
+        tag_name: "tool",
+        kind: NeedTool {
+            call_id: ToolCallId,
+            call: ToolCall,
+        },
+        result: Result<ToolResponse, ToolRuntimeError>,
+        handler: ToolHandler,
+        accessor: tool,
+    }
+    Interaction {
+        tag_name: "interaction",
+        kind: NeedInteraction {
+            request: Interaction,
+        },
+        result: InteractionResponse,
+        handler: InteractionHandler,
+        accessor: interaction,
+        accepts_check: accepts_response,
+    }
+    Subagent {
+        tag_name: "subagent",
+        kind: NeedSubagent {
+            spec_ref: AgentSpecRef,
+            brief: Interaction,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            result_schema: Option<Value>,
+        },
+        result: Result<SubagentOutput, AgentError>,
+        handler: SubagentHandler,
+        accessor: subagent,
+        needs_outer: true,
+    }
+    Reconfig {
+        tag_name: "reconfig",
+        kind: NeedReconfigRegistry {
+            tool_set: ToolSetRef,
+        },
+        result: Result<(), ToolRuntimeError>,
+        handler: ReconfigHandler,
+        accessor: reconfig,
+    }
+    ExternalSession {
+        tag_name: "external_session",
+        kind: NeedExternalSession {
+            request: ExternalSessionRequest,
+        },
+        result: Box<ExternalSessionResult>,
+        handler: ExternalSessionHandler,
+        accessor: external,
+    }
+}
+
 /// What a [`Requirement`] needs fulfilled. Payloads reuse existing types.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -566,8 +639,8 @@ mod tests {
     use super::{
         AgentPath, AgentSlot, AgentSpecRef, Interaction, InteractionError, InteractionResponse,
         NoRequirementIds, Requirement, RequirementError, RequirementId, RequirementIds,
-        RequirementKind, RequirementKindTag, RequirementResolution, RequirementResult,
-        SubagentOutput,
+        RequirementKind, RequirementKindGen, RequirementKindTag, RequirementKindTagGen,
+        RequirementResolution, RequirementResult, RequirementResultGen, SubagentOutput,
     };
     use crate::{
         agent::{
@@ -1043,5 +1116,56 @@ mod tests {
 
         // The tag itself round-trips as snake_case.
         assert_json_round_trip(&RequirementKindTag::ExternalSession);
+    }
+
+    // --- Macro-generated coproduct skeleton (milestone M3-1) -----------------
+    //
+    // A light smoke check that `define_effects!` renders usable twins: their
+    // `tag()`, `Display`, and `serde` behave, and one variant matches the
+    // hand-written wire form. The exhaustive kind/result/accepts equivalence
+    // matrix against the hand-written coproduct lands in M3-2.
+
+    #[test]
+    fn generated_tag_display_matches_hand_written() {
+        for tag in ALL_TAGS {
+            let generated = match tag {
+                RequirementKindTag::Llm => RequirementKindTagGen::Llm,
+                RequirementKindTag::Tool => RequirementKindTagGen::Tool,
+                RequirementKindTag::Interaction => RequirementKindTagGen::Interaction,
+                RequirementKindTag::Subagent => RequirementKindTagGen::Subagent,
+                RequirementKindTag::Reconfig => RequirementKindTagGen::Reconfig,
+                RequirementKindTag::ExternalSession => RequirementKindTagGen::ExternalSession,
+            };
+            assert_eq!(generated.to_string(), tag.to_string());
+            assert_eq!(
+                serde_json::to_value(generated).expect("serialize generated tag"),
+                serde_json::to_value(tag).expect("serialize hand-written tag"),
+            );
+        }
+    }
+
+    #[test]
+    fn generated_kind_and_result_report_family_and_round_trip() {
+        let generated_kind = RequirementKindGen::NeedLlm {
+            request: chat_request(),
+            mode: LlmStepMode::NonStreaming,
+        };
+        assert!(matches!(generated_kind.tag(), RequirementKindTagGen::Llm));
+
+        // The generated kind's wire form matches the hand-written kind for the
+        // same payload, and it serde round-trips on its own.
+        let hand_written_kind = RequirementKind::NeedLlm {
+            request: chat_request(),
+            mode: LlmStepMode::NonStreaming,
+        };
+        assert_eq!(
+            serde_json::to_value(&generated_kind).expect("serialize generated kind"),
+            serde_json::to_value(&hand_written_kind).expect("serialize hand-written kind"),
+        );
+        assert_json_round_trip(&generated_kind);
+
+        // The runtime result twin reports its family without deriving serde.
+        let generated_result = RequirementResultGen::Llm(Ok(response()));
+        assert!(matches!(generated_result.tag(), RequirementKindTagGen::Llm));
     }
 }

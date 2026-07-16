@@ -815,7 +815,7 @@ mid-turn scratch,而不是反序列化 scratch(scratch 有意非序列化)。这
 > 「清单里加一段」。effect 变体集合已稳定为 6 个(`Llm`/`Tool`/`Interaction`/`Subagent`/`Reconfig`/
 > `ExternalSession`),满足设计文档 §4.4 的时机前置条件。**必须先并存 + 等价性断言,再删手写版。**
 
-### [TODO] M3-1 设计 `define_effects!` 清单语法与宏骨架(与手写版并存)
+### [DONE] M3-1 设计 `define_effects!` 清单语法与宏骨架(与手写版并存)
 
 **前置依赖**:Milestone 2 完成。
 
@@ -864,7 +864,36 @@ mid-turn scratch,而不是反序列化 scratch(scratch 有意非序列化)。这
 
 **完成记录**:
 
-（待补充）
+- **选型:`macro_rules!`(未触发 §4.4 的 proc-macro crate 退化)。** 新增
+  `src/agent/effect_manifest.rs`(私有 `mod effect_manifest;`),内含唯一的 `macro_rules! define_effects`
+  与完整清单语法 doc + `pub(crate) use define_effects;`。已用独立 `rustc --edition 2024 -W unused` 探针先行
+  验证声明宏足以表达全部差异:半区 derive(`RequirementKind` derive serde / `RequirementResult` 不 derive)、
+  struct-variant(Kind)vs tuple-variant(Result)vs unit(Tag)、per-field serde 属性
+  (`NeedSubagent::result_schema` 的 `#[serde(default, skip_serializing_if = "Option::is_none")]`)、
+  `Box<ExternalSessionResult>` 结果、可选 `needs_outer`(Subagent)/`accepts_check`(Interaction)标记。
+  仿 `id.rs` 的 `define_id!`,用 `concat!`/`stringify!` **合成每个 enum/变体/字段的 rustdoc**,在
+  `#![warn(missing_docs)]` + `clippy -D warnings` 下零 missing_docs 警告,无需在清单里手写 doc。
+- **清单一次写全 6 个 effect**(`src/agent/requirement.rs` 内 invoke):`Llm`/`Tool`/`Interaction`/
+  `Subagent`/`Reconfig`/`ExternalSession`,每段含 tag_name / kind(变体名+字段)/ result / handler /
+  accessor,并对 `Subagent` 标 `needs_outer: true`、对 `Interaction` 标 `accepts_check: accepts_response`。
+  M3-1 宏体只消费 tag_name/kind/result 生成**第 1–3 处**(三个 `*Gen` enum + `RequirementKindTagGen::Display`
+  + Kind/Result 的 `tag()`);handler/accessor/needs_outer/accepts_check 已被 matcher 捕获但暂不展开,
+  留给 M3-2 扩展宏体——**清单自 M3-1 起即为终态,后续里程碑只长宏体不改清单**。
+- **并存不替换**:产物取新名 `RequirementKindGen` / `RequirementResultGen` / `RequirementKindTagGen`,
+  与手写三 enum 逐字段对齐(变体名/字段/`snake_case` 名一致;Kind derive `Clone, Debug, PartialEq,
+  Serialize, Deserialize` + `rename_all="snake_case"`,Result 仅 `Clone, Debug` 不 serde,Tag 全 derive +
+  snake_case)。`*Gen` 为 `pub`(在 `pub mod requirement` 内可达→无 dead_code),但**不从 `agent/mod.rs`
+  再导出**,暴露面最小,M3-3 删手写版时一并促正名。
+- **验证(完整序列 1–6 全过)**:①`cargo fmt --check` 干净;②`cargo test -p agent-lib agent::requirement`
+  = **15 passed**(13 原有 + 2 新增 skeleton smoke:`generated_tag_display_matches_hand_written`、
+  `generated_kind_and_result_report_family_and_round_trip`,含一处 `NeedLlm` 宏版↔手写版 serde JSON 相等的
+  轻量等价 sanity;完整 kind/result/accepts 等价矩阵留 M3-2);③`cargo clippy --all-targets -- -D warnings`
+  干净;④`cargo test --all --all-targets` = **0 failed**(lib 553 passed);⑤`RUSTDOCFLAGS="-D warnings"
+  cargo doc --no-deps --workspace` 通过(`*Gen` 项 rustdoc 可编译且有合成文档);⑥`git diff --check` 干净。
+- **改动范围**:新增 `src/agent/effect_manifest.rs`;`src/agent/mod.rs` 加 `mod effect_manifest;`;
+  `src/agent/requirement.rs` 加宏 import + 清单 invoke + 2 个 smoke test。手写码零删除(本任务不删旧码)。
+- **已知限制/边界**:第 8 处(机器内 resume 分派)明确不宏化;第 4–7 处(`accepts` + `drive.rs` 扇出)本任务
+  未生成,是 M3-2 的范围。
 
 ### [TODO] M3-2 宏覆盖 `accepts` 与 `drive.rs` 扇出(第 4–7 处),并加等价性断言
 

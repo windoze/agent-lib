@@ -14,6 +14,7 @@ pub mod approval;
 pub mod collab;
 pub mod context;
 pub mod drive;
+mod effect_manifest;
 pub mod event;
 pub mod external;
 pub mod id;

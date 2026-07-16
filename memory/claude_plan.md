@@ -1,36 +1,50 @@
-# M2-4 — Milestone 2 review:刀 (B) 正确性与序列化不变性
+# M3-1 — 设计 `define_effects!` 清单语法与宏骨架(与手写版并存)
 
-**当前执行 TODO.md 第一个未完成任务 = M2-4**(M1-1~M1-5、M2-1~M2-3 已 DONE)。
-这是 review 任务(不可拆分)。需真正执行审查 + 完整验证,并把量化数据写入完成记录。
+**当前执行 TODO.md 第一个未完成任务 = M3-1**(M1-*、M2-* 已 DONE)。刀 (A) 第一步。
 
-## 验收目标(刀 B)
-- 唯一真相:scratch 仅一个 `TurnScratch`(2 个 Option → 1 个 enum)。
-- 序列化零风险:`LoopCursor` / cursor.rs 未变。
-- 隐式约定被类型消灭;无「相位 + scratch」双重防御残留。
+## 目标(设计文档 §4.2 / TODO M3-1)
+- 设计单一 effect 清单 `define_effects!` 的语法(先文档化再落宏骨架)。
+- 宏生成设计文档 §4.1 表格**第 1–3 处**:三个 coproduct enum + `RequirementKindTag::Display` + `tag()`。
+- 宏产物以**新名字** `RequirementKindGen` / `RequirementResultGen` / `RequirementKindTagGen` 与手写版**并存**,不替换(便于 M3-2 等价性断言、M3-3 替换)。
 
-## 做什么(TODO M2-4)
-1. 通读 mod.rs / tools.rs:确认无裸 `self.in_flight` / `self.pending_reconfig` 字段访问,全经 TurnScratch 访问器;无双重防御残留。
-2. `git diff src/agent/state/cursor.rs` = 零改动;跑 `cargo test -p agent-lib agent::state`
-   (含 streaming_step_cursor_round_trips_requirement_binding /
-   awaiting_tool_cursor_round_trips_requirement_ids /
-   agent_state_serde_round_trips_through_conversation_snapshot)全绿。
-3. 完整验证序列 1–6 + `cargo test --all --all-targets`。
-4. `git diff --stat` 仅触及 `src/agent/machine/default/`。
-5. 完成记录:字段数变化、消灭防御分支数、ToolPhase 明细不重建已知限制。
+## 选型:`macro_rules!`(非 proc-macro crate)
+- 已用 /tmp 探针验证 `macro_rules!` 足以表达:半区 derive 差异(Kind derive serde / Result 不 derive)、
+  struct-variant(Kind) vs tuple-variant(Result) vs unit(Tag)、per-field serde 属性(result_schema 的
+  `#[serde(default, skip_serializing_if)]`)、`Box<..>` 结果、可选 `needs_outer` / `accepts_check` 标记。
+- 满足 `#![warn(missing_docs)]` + clippy `-D warnings`:宏用 `concat!`/`stringify!` 合成 doc(仿 id.rs 的
+  `define_id!`),每个 enum/变体/字段都有 doc,零 missing_docs 警告。
+- 无需新增 proc-macro crate(设计文档 §4.4 的退化路径未触发)。理由写进完成记录。
 
-## 进度
-- [x] 确认 M2 diff 范围:仅 machine/default/ 源码 + TODO/memory 文档;cursor.rs 零改动
-- [ ] 代码审查:TurnScratch 唯一真相 + 无裸字段访问 + 无双重防御
-- [ ] cargo test -p agent-lib agent::state(序列化往返)
-- [ ] fmt --check / clippy / test --all / doc / git diff --check
-- [ ] 写完成记录量化数据 → TODO.md 标 DONE → commit → 停
+## 落点
+- 新增 `src/agent/effect_manifest.rs`:仅含 `macro_rules! define_effects` + 语法 doc + `pub(crate) use`。
+- `src/agent/mod.rs`:加 `mod effect_manifest;`。
+- `src/agent/requirement.rs`:`use` 宏并 invoke,生成三个 `*Gen`(pub,可达→无 dead_code;不从 agent/mod.rs 再导出,最小暴露面)。
+- 清单一次写全 6 个 effect(Llm/Tool/Interaction/Subagent/Reconfig/ExternalSession),含 handler/accessor/
+  needs_outer(Subagent)/accepts_check(Interaction)——M3-1 只消费 tag/kind/result 生成 1–3,M3-2 扩展宏体消费其余。
+
+## 等价性/形状要求
+- Kind derive: `Clone, Debug, PartialEq, Serialize, Deserialize` + `#[serde(rename_all="snake_case")]`,变体名/字段/
+  serde 名与手写一致 → serde 逐字节相等(M3-2 断言)。
+- Result derive: `Clone, Debug`(不 serde)。
+- Tag derive: `Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize` + snake_case;`Display` 用 tag_name。
+
+## 步骤
+- [x] 读 TODO/PLAN/design §4 + requirement.rs + drive.rs 扇出点
+- [x] /tmp 探针验证 macro_rules 方案(missing_docs + unused 干净)
+- [x] baseline: cargo test -p agent-lib agent::requirement = 13 passed
+- [ ] 写 effect_manifest.rs(宏 + 语法 doc)
+- [ ] mod 声明 + requirement.rs invoke 清单
+- [ ] 加最小 smoke test(#[cfg(test)] 用 *Gen,确保生成物可用;完整等价性留 M3-2)
+- [ ] fmt / clippy --all-targets -D warnings / cargo test -p agent-lib agent::requirement / doc -D warnings / git diff --check
+- [ ] 全量 cargo test --all --all-targets(有代码改动)
+- [ ] 写完成记录 → TODO.md 标 [DONE] → commit → 停
 
 ## 验证记录(待填)
 
 ## 验证记录(已填)— 全过
-1. fmt --check ✅  2. agent::state + 3 named 往返 ✅  3. clippy -D warnings ✅
-4. test --all --all-targets 0 failed ✅  5. doc -D warnings ✅  6. git diff --check ✅
-- cursor.rs 零改动(diff 0 行);M2 diff --stat 仅 machine/default/ + 文档
-- 字段:2 Option → 1 enum(scratch: TurnScratch);双重防御塌缩为 4 处 matches_cursor debug_assert
-- 已知限制:ToolPhase 明细不重建(tools:None,M3+ deferred);首步 StreamingStep/BeginTurn reconfig 重建为 None
-- TODO.md M2-4 标 [DONE] + 完成记录已写;准备 commit;停
+1. fmt --check ✅  2. agent::requirement = 15 passed(13+2 smoke)✅  3. clippy --all-targets -D warnings ✅
+4. test --all --all-targets = 0 failed(lib 553 passed)✅  5. doc -D warnings ✅  6. git diff --check ✅
+- 选型 macro_rules(未退化 proc-macro crate);/tmp 探针先验;concat!/stringify! 合成 doc 满足 missing_docs
+- 新增 effect_manifest.rs;mod 声明;requirement.rs invoke 6-effect 清单(终态)+ 2 smoke test;手写码零删
+- 生成第 1–3 处(*Gen 三 enum + Display + tag());4–7 处留 M3-2;第 8 处不宏化
+- TODO.md M3-1 标 [DONE] + 完成记录已写(修复误删的 M3-2 heading);准备 commit;停
