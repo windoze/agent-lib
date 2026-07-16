@@ -38,6 +38,7 @@
 //! wrapped [`AgentState`], whose [`LoopCursor`] records the outstanding
 //! [`RequirementId`](crate::agent::RequirementId)(s).
 
+mod error;
 mod tools;
 
 use crate::{

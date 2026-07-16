@@ -30,7 +30,7 @@ rustdoc 需可编译。核心验收标准:**现有测试无需修改断言即全
 > `src/agent/machine/default/`。当前 `mod.rs` 有 33 处 `self.fail*`、10 处 `if let Err`,`tools.rs`
 > 有 32 处 `self.fail*`。
 
-### [TODO] M1-1 定义 `StepError` 内部错误类型与 `From` 转换
+### [DONE] M1-1 定义 `StepError` 内部错误类型与 `From` 转换
 
 **前置依赖**:无。
 
@@ -96,7 +96,30 @@ fallible 调用会返回这些错误类型:
 
 **完成记录**:
 
-（待补充）
+- 新增私有子模块 `src/agent/machine/default/error.rs`（mod.rs 增 `mod error;`，提升模块化，
+  不改任何调用点），定义 crate 内可见、不对外暴露的 `pub(super) enum StepError`：
+  - `Conversation(ConversationError)`、`State(AgentStateError)`、
+    `CursorTransition(AgentStateError)`、`ToolRuntime(ToolRuntimeError)`、
+    `Requirement(RequirementError)`、`Protocol(String)`。
+- **设计增量**：在建议 5 变体基础上新增 `CursorTransition(AgentStateError)`。因为
+  `transition_cursor` 与其它 state 操作同为 `AgentStateError`，但历史文案分别是
+  `cursor transition failed:` 与 `agent state operation failed:`；单一 `From<AgentStateError>`
+  无法同时逐字节复刻两种前缀。故 `From<AgentStateError>` 默认映射到 `State`（供裸 `?` 使用），
+  cursor-transition 站点在 M1-2 用 `.map_err(StepError::CursorTransition)` 显式构造（非
+  workaround，仅是文案分流）。此变体不改变任何对外语义。
+- 显式实现 `From<ConversationError>`、`From<AgentStateError>`、`From<ToolRuntimeError>`、
+  `From<RequirementError>`（因 `AgentStateError: From<ConversationError>`，两者分别显式实现以
+  避免 `?` 歧义，并映射到不同变体）。
+- `pub(super) fn message(&self) -> String` 逐字节复刻现有 `self.fail(format!(..))` 前缀：
+  `conversation operation failed:` / `agent state operation failed:` / `cursor transition failed:`
+  / `tool runtime operation failed:` / `requirement id unavailable:`；`Protocol` 原样透传。
+- 本任务未接线调用点，`error.rs` 顶部加临时 `#![allow(dead_code)]`（含注释说明 M1-2/M1-3 移除）；
+  所有新增项均带 rustdoc（含 `intra-doc` 链接，`cargo doc -D warnings` 通过）。
+- 验证：`cargo fmt --all -- --check` 干净；`cargo build` 通过；
+  `cargo clippy --all-targets -- -D warnings` 无告警；`cargo test -p agent-lib --lib
+  agent::machine::default` 39 passed / 0 failed（断言未改）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警；`git diff --check` 干净。
+  （M1-1 明确放宽为聚焦测试，未跑 `cargo test --all`；调用点零改动，运行时语义不变。）
 
 ### [TODO] M1-2 把 `mod.rs` 的 fallible 方法改造为返回 `Result<StepOutcome, StepError>`
 
