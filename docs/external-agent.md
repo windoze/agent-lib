@@ -835,9 +835,18 @@ cassette 记录点仍在 provider-neutral effect 边界:
   搭配 `PermissionDecision { Approve, Deny { reason }, Cancel }`(timeout 折叠为 deny-by-default);详见 §3.3。
 - 外部 runtime 的 session resume 能力差异如何归一化。
 - black-box 模式下如何定义“完成”和“文件改动归属”。
-- 多 external agent 同时编辑同一 worktree 时的冲突策略。
-- task evaluator 是规则优先、模型优先,还是 policy engine + LLM fallback。
-- 是否需要稳定 `Mailbox` 一等 API,还是先用 `blackboard` + direct-message tool 组合。
+- ~~多 external agent 同时编辑同一 worktree 时的冲突策略。~~ **已定(Milestone 6):**
+  隔离而非事后合并——`WorktreeIsolation` 随 `CostTier` 递增
+  (`CostTier::recommended_isolation` / `WorkerProfile::recommended_isolation`),premium 外部 agent
+  默认拿独立 worktree,避免并发写同一树;调度层据此为每个 worker 选隔离级别(§4.1、M6-1)。
+- ~~task evaluator 是规则优先、模型优先,还是 policy engine + LLM fallback。~~ **已定(Milestone 6):**
+  规则优先 + LLM fallback——`RuleRouter` 是确定性 first-match 规则层,只有它 `None`(模糊/中间地带)
+  时才 charge 一个 step 调 `TaskEvaluator`(LLM 版实现此 trait);`Dispatcher` 组合两层并叠加预算护栏
+  (§9「收敛(Milestone 6-2 已实现)」)。
+- ~~是否需要稳定 `Mailbox` 一等 API,还是先用 `blackboard` + direct-message tool 组合。~~
+  **已定(Milestone 6):** 需要一等 API——`agent::collab::Mailbox` 作为定向 agent-to-agent 消息层
+  与 `Blackboard`(广播/append-only)并列为一等原语,`send_message` 桥接工具是其薄 adapter,
+  而非把定向消息塞进 blackboard 通道(§3.5、M6-3)。
 
 ## 15. 设计收敛
 
@@ -854,6 +863,16 @@ External agent 的正确抽象层次是:
 
 这样 cheap model、premium coding agent、内部 agent、外部 CLI agent 可以在同一个程序里协作,同时保留
 effect-model 的核心价值:可暂停、可恢复、可测试、可审计、可按动态作用域组合 handler。
+
+**收敛(Milestone 6-5 已实现)**:上面的目标层次已端到端落地并有离线测试背书。混合调度骨架由
+`agent::external::{dispatch, escalation}`(两层派发 + cheap→strong 升级 + verifier 挂点)与
+`agent::collab::{Plan, Blackboard, Mailbox}`(协作原语)加桥接工具组成,worker 一律经
+`WorkerChoice::into_subagent` → `NeedSubagent` → 既有 `SubagentHandler` 派生,**不**引入新的
+orchestration runtime。`tests/agent_mixed_scheduler.rs`(过滤名 `mixed_scheduler`)端到端演示一次混合
+run:coordinator 把明确任务经 `Dispatcher` 派给 cheap worker、复杂任务(cost-first 先试 cheap、失败后经
+`Escalator` 升级)派给 external agent worker,`Plan` 依赖 gating 与 `Blackboard` append-only 顺序贯穿全程,
+两个 worker 的 artifact 经 `ArtifactSink` 汇总。至此设计文档 §8/§9 的混合 agent 集与调度/升级规则均有
+可复现实现;§14 中调度策略取向、`Mailbox` 一等 API、worktree 冲突策略三项开放问题在本轮收敛。
 
 ## 附录 A:Phase 0 spike 结论
 

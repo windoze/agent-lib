@@ -1585,7 +1585,7 @@ API 语义(dependency、claim 前置完成检查、claim-first、CAS 更新)。`
   `cargo test --all --all-targets` 无回归(lib 545 passed = 521+24,集成/testkit 全绿,仅
   credential-gated ignored)✓;`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警 ✓。
 
-### [TODO] M6-5 Milestone 6 Review 与文档并轨
+### [DONE] M6-5 Milestone 6 Review 与文档并轨
 
 **前置依赖**:M6-1..M6-4。
 
@@ -1604,3 +1604,38 @@ API 语义(dependency、claim 前置完成检查、claim-first、CAS 更新)。`
   --no-deps --workspace` 无告警。
 - 端到端混合场景测试通过(给出过滤名)。
 - 文档并轨结论写入「完成记录」,并在 `docs/external-agent.md` §14 标注已收敛项。
+
+**完成记录**:
+
+- **新增端到端混合场景测试 `tests/agent_mixed_scheduler.rs`**(过滤名 `mixed_scheduler`,3 个
+  `#[tokio::test]`,纯集成 + 复用既有公开 API,**不**新增库代码):
+  - `mixed_scheduler_dispatch_routes_clear_to_cheap_and_complex_to_external`:`Dispatcher` 把明确低风险
+    Search 任务 rule-route 到 cheap worker(`DispatchReason::RuleRoute` → `internal-cheap`),把复杂高风险
+    Feature 任务 rule-route 到 external worker(`cc-agent`),对齐 §8/§9「明确任务派 cheap、复杂任务派
+    external」。
+  - `mixed_scheduler_plan_and_blackboard_gate_and_coordinate`:`Plan` 依赖 gating(`implement` 依赖
+    `locate`,未完成前 claim 返回 `PlanError::DependencyBlocked`)、claim/complete 生命周期,`Blackboard`
+    跨 agent append-only + 严格单调 offset,发送者顺序 `coordinator → internal-cheap → cc-agent`。
+  - `mixed_scheduler_cheap_failure_escalates_to_external_and_aggregates_artifacts`(主 E2E):coordinator 建
+    plan + kickoff blackboard;明确任务 dispatch → cheap 认领并派生(`WorkerChoice::into_subagent` →
+    `NeedSubagent` → `DrivingSubagentHandler` 驱动最小 child 到 Done),记 File artifact;复杂任务 cost-first
+    先 dispatch 到 cheap,派生后自报测试失败;`Escalator::assess`(`WorkerReport::failed(TestFailure)`)→
+    `EscalationOutcome::Reassign(Escalation)` 升到 `cc-agent`,external worker 认领 `implement` 派生完成,记
+    Patch artifact;最终断言 `ArtifactSink` 汇总两个 worker 的 artifact(File → Patch,顺序/引用正确)、
+    plan 两任务 Completed 且 owner 正确、blackboard 四条消息 append-only 顺序。worker 一律经既有
+    subagent 路径派生,**不**引入新 orchestration runtime。
+- **文档并轨(`docs/external-agent.md`)**:§14 三项开放问题标注本轮收敛——(1)worktree 冲突策略 →
+  隔离而非事后合并(`WorktreeIsolation` 随 `CostTier` 递增,M6-1);(2)task evaluator 取向 → 规则优先 +
+  LLM fallback(`RuleRouter` first-match,`None` 时才 charge step 调 `TaskEvaluator`,M6-2);(3)`Mailbox`
+  一等 API → 需要(`agent::collab::Mailbox` 与 `Blackboard` 并列一等原语,`send_message` 为薄 adapter,
+  M6-3)。§15「设计收敛」追加「收敛(Milestone 6-5 已实现)」段落,点名 dispatch/escalation/collab 骨架、
+  `WorkerChoice::into_subagent` 派生路径与 `tests/agent_mixed_scheduler.rs` 背书。
+- **API rustdoc 复核**:`#![warn(missing_docs)]` 已在 crate 根启用,`RUSTDOCFLAGS="-D warnings" cargo doc
+  --no-deps --workspace` 无告警,即各里程碑公开 API 均有 rustdoc;README 模块表已含 `agent::collab`
+  (plan/blackboard/mailbox)与 `agent::external`(`Dispatcher`/`Escalator`)。
+- **验证(完整序列全绿)**:`cargo fmt --all -- --check` ✓;`cargo test mixed_scheduler` = 3 passed ✓;
+  `cargo clippy --all-targets -- -D warnings` 无告警 ✓;`cargo test --all --all-targets` 无回归(lib 545
+  passed,mixed_scheduler 3 passed,其余 binary 全绿,仅 credential-gated 集成测试 ignored)✓;
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 无告警 ✓;`git diff --check` 干净 ✓。
+  仅新增/改动测试与文档,未改库代码路径,复用上一次全绿全量结果无回归。
+- **项目收官**:M6-5 是 TODO.md 最后一个任务,至此 M1..M6 全部 `[DONE]`;打 git tag `endtag`。
