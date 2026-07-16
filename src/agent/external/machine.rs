@@ -45,14 +45,23 @@
 //!   forwarded to the runtime.
 //! - `step(Resume(ExternalSession(PausedForToolCalls)))` records the session
 //!   facts and bridges every runtime [`ExternalToolCall`](super::ExternalToolCall)
-//!   into one [`NeedTool`](RequirementKind::NeedTool) requirement (minting a host
+//!   into a host requirement (minting a host
 //!   [`ToolCallId`](crate::conversation::ToolCallId) from the injected
-//!   [`ToolExecutionIds`] and a [`RequirementId`] per call), parking on
+//!   [`ToolExecutionIds`] and a [`RequirementId`] per bridged call), parking on
 //!   [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) with the batch's
-//!   volatile per-call correlation held in non-serialized scratch. Each host
-//!   tool result then resumes the machine on its own hop; results are collected
-//!   in the scratch and, once the whole batch is answered, relayed straight back
-//!   to the runtime as one
+//!   volatile per-call correlation held in non-serialized scratch. A plain call
+//!   becomes a [`NeedTool`](RequirementKind::NeedTool); a `spawn_agent` call is a
+//!   scope-deepening operation that instead bridges into a standard
+//!   [`NeedSubagent`](RequirementKind::NeedSubagent) (parsed with
+//!   [`SpawnAgentRequest`](crate::agent::collab::SpawnAgentRequest), design §8.3)
+//!   whose child summary folds back into the same batch as a tool result — so a
+//!   mixed batch of tools and spawns parks under one cursor, plain tools
+//!   fulfilling concurrently while each subagent is driven serially by the host.
+//!   A malformed `spawn_agent` input mints no requirement: a runtime-visible
+//!   error result is pre-seeded (return-error-to-runtime, design §8.4). Each host
+//!   result then resumes the machine on its own hop; results are collected in the
+//!   scratch and, once the whole batch is answered, relayed straight back to the
+//!   runtime as one
 //!   [`RespondToolResults`](ExternalSessionInput::RespondToolResults) in the
 //!   original call order — never written into the Conversation — reparking on
 //!   [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so the turn can
@@ -64,7 +73,10 @@
 //!   `spec_ref`, `brief`, and `result_schema` unchanged), parking on
 //!   [`AwaitingSubagent`](ExternalAgentCursor::AwaitingSubagent) with the
 //!   runtime's [`ExternalSubagentRequestId`](super::ExternalSubagentRequestId)
-//!   held in the serializable cursor. The child is driven by the host's own
+//!   held in the serializable cursor. This native subagent pause is distinct from
+//!   the `spawn_agent` tool bridge above: the child's output relays back through a
+//!   dedicated [`RespondSubagent`](ExternalSessionInput::RespondSubagent), not a
+//!   `RespondToolResults`. The child is driven by the host's own
 //!   [`DrivingSubagentHandler`](crate::agent) (depth / budget / cancel
 //!   accounting, outward pop of the child's unhandled requirements); the machine
 //!   only reifies the requirement. Its
@@ -122,7 +134,9 @@ use crate::{
         AgentInput, AgentMachine, AgentUserInput, CursorRequirement, Interaction, LoopCursor,
         LoopDoneReason, NoToolExecutionIds, Notification, Requirement, RequirementId,
         RequirementIds, RequirementKind, RequirementKindTag, RequirementResolution,
-        RequirementResult, StepId, StepInput, StepOutcome, ToolExecutionIds, ToolWaitRequirements,
+        RequirementResult, StepId, StepInput, StepOutcome, ToolExecutionIds, ToolRuntimeError,
+        ToolWaitRequirements,
+        collab::{SPAWN_AGENT, SpawnAgentRequest},
         external::{
             ExternalAgentCursor, ExternalAgentOutput, ExternalAgentState, ExternalObservedEvent,
             ExternalSessionInput, ExternalSessionRef, ExternalSessionRequest,
@@ -136,7 +150,7 @@ use crate::{
         content::ContentBlock,
         message::{Message, Role},
         normalized::StopReason,
-        tool::ToolCall,
+        tool::{ToolCall, ToolStatus},
     },
 };
 
@@ -188,18 +202,30 @@ struct InFlight {
 ///
 /// When a runtime pauses on
 /// [`PausedForToolCalls`](ExternalSessionResult::PausedForToolCalls) the machine
-/// emits one [`NeedTool`](RequirementKind::NeedTool) per call and parks on
-/// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool). The serializable cursor
+/// bridges every runtime [`ExternalToolCall`] into a host requirement and parks
+/// on [`AwaitingTool`](ExternalAgentCursor::AwaitingTool). A plain call becomes a
+/// [`NeedTool`](RequirementKind::NeedTool); a `spawn_agent` call is a
+/// scope-deepening operation and instead becomes a
+/// [`NeedSubagent`](RequirementKind::NeedSubagent) whose child output folds back
+/// into this same batch as a tool result (design §8.3). The serializable cursor
 /// records only the resumable addressing (`ToolCallId -> RequirementId`); this
 /// scratch holds the volatile per-call facts a completed batch needs to feed
 /// [`RespondToolResults`](ExternalSessionInput::RespondToolResults) back: the
 /// [`ExternalToolBatchId`], the original [`ExternalToolCall`] order, the map from
-/// each host [`RequirementId`] back to its runtime `provider_call_id` (so an
-/// out-of-order resume routes to the right call), and the
-/// [`ExternalToolResult`] values collected so far. Like [`InFlight`], it lives
-/// only while a turn is unfinished and is deliberately absent from
-/// [`ExternalAgentState`], so a mid-turn restore (which recovers the cursor but
-/// not this scratch) cannot resume a partially answered batch.
+/// each outstanding host [`RequirementId`] back to the call it fulfills (its
+/// runtime `provider_call_id` and whether it was bridged as a tool or a
+/// subagent, so an out-of-order resume routes to the right call and is validated
+/// against the right result family), and the [`ExternalToolResult`] values
+/// collected so far. Like [`InFlight`], it lives only while a turn is unfinished
+/// and is deliberately absent from [`ExternalAgentState`], so a mid-turn restore
+/// (which recovers the cursor but not this scratch) cannot resume a partially
+/// answered batch.
+///
+/// A malformed `spawn_agent` input never mints a requirement: its
+/// runtime-visible error [`ExternalToolResult`] is pre-seeded into
+/// [`results`](Self::results) at pause time (return-error-to-runtime, design
+/// §8.4), so it counts toward batch completion without an outstanding
+/// requirement.
 ///
 /// This scratch is populated when a session pauses for tool calls (the
 /// [`PausedForToolCalls`](ExternalSessionResult::PausedForToolCalls) fold) and
@@ -213,11 +239,38 @@ struct PendingExternalToolBatch {
     /// Original tool calls in the order the runtime emitted them, so the
     /// collected results can be returned in that same stable order.
     calls: Vec<ExternalToolCall>,
-    /// Maps each host `RequirementId` back to its runtime `provider_call_id`,
-    /// so an out-of-order resume routes to the right call.
-    requirement_to_call: BTreeMap<RequirementId, String>,
-    /// Results collected so far, keyed by `provider_call_id`.
+    /// Maps each outstanding host `RequirementId` back to the runtime call it
+    /// fulfills (provider call id + bridge kind), so an out-of-order resume
+    /// routes to the right call and validates against the right result family.
+    pending: BTreeMap<RequirementId, PendingBridgeCall>,
+    /// Results collected so far, keyed by `provider_call_id`. Pre-seeded with a
+    /// runtime-visible error for any malformed `spawn_agent` call.
     results: BTreeMap<String, ExternalToolResult>,
+}
+
+/// How a paused runtime tool call was bridged into a host requirement, recorded
+/// so a resume can be validated against the matching result family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalBridgeCallKind {
+    /// Bridged into a [`NeedTool`](RequirementKind::NeedTool); answered by a
+    /// host [`Tool`](RequirementResult::Tool) result.
+    Tool,
+    /// A `spawn_agent` call bridged into a
+    /// [`NeedSubagent`](RequirementKind::NeedSubagent); answered by a host
+    /// [`Subagent`](RequirementResult::Subagent) result folded into an
+    /// [`ExternalToolResult`] (design §8.3).
+    Subagent,
+}
+
+/// The outstanding runtime call a bridged host requirement is fulfilling.
+#[derive(Clone, Debug)]
+struct PendingBridgeCall {
+    /// Runtime correlation id this requirement answers, used to key the result
+    /// back into the batch under the runtime's own call id.
+    provider_call_id: String,
+    /// Which family the bridged requirement (and therefore its resume) belongs
+    /// to.
+    kind: ExternalBridgeCallKind,
 }
 
 /// Sans-io machine that drives one external coding-agent session step at a time.
@@ -564,28 +617,52 @@ impl ExternalAgentMachine {
         StepOutcome::new(notifications, vec![requirement], true)
     }
 
-    /// Parks on a batch of host tool calls the runtime paused for and emits one
-    /// `NeedTool` per call.
+    /// Parks on a batch of host tool calls the runtime paused for, bridging each
+    /// call into a host requirement.
     ///
     /// The handler surfaced the runtime's pending tool calls as provider-neutral
     /// [`ExternalToolCall`] values under a runtime-assigned
-    /// [`ExternalToolBatchId`]. The machine records the resumable session facts,
-    /// bridges each call into a [`NeedTool`](RequirementKind::NeedTool)
-    /// requirement — allocating a host [`ToolCallId`] via the injected
-    /// [`ToolExecutionIds`] and a [`RequirementId`] per call — and parks on
+    /// [`ExternalToolBatchId`]. The machine records the resumable session facts
+    /// and bridges each call, minting a host [`ToolCallId`] via the injected
+    /// [`ToolExecutionIds`] and a [`RequirementId`] per bridged call:
+    ///
+    /// - A plain tool call becomes one [`NeedTool`](RequirementKind::NeedTool)
+    ///   requirement.
+    /// - A `spawn_agent` call is a scope-deepening operation that cannot run as
+    ///   an inline tool, so it is parsed with
+    ///   [`SpawnAgentRequest::parse`](crate::agent::collab::SpawnAgentRequest::parse)
+    ///   and bridged into a standard
+    ///   [`NeedSubagent`](RequirementKind::NeedSubagent) instead — reusing the
+    ///   host's own subagent machinery (depth / budget / cancel / trace), never
+    ///   spawning the child inline. Its child output later folds back into *this*
+    ///   batch as an [`ExternalToolResult`] so the runtime sees the spawn as an
+    ///   ordinary tool call that returned a summary (design §8.3).
+    /// - A malformed `spawn_agent` input mints no requirement: a runtime-visible
+    ///   error [`ExternalToolResult`] is pre-seeded into the batch
+    ///   (return-error-to-runtime, design §8.4), so the runtime learns its call
+    ///   was ill-formed while the rest of the batch proceeds and the turn stays
+    ///   alive.
+    ///
+    /// The machine parks on
     /// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool), whose driver-facing
     /// [`LoopCursor::awaiting_tool`] view carries every outstanding requirement
-    /// id. The volatile per-call correlation (`RequirementId` →
-    /// `provider_call_id`) and the initially empty result set live in the
-    /// non-serialized [`PendingExternalToolBatch`] scratch so a completed batch
-    /// can feed [`RespondToolResults`](ExternalSessionInput::RespondToolResults)
-    /// back in the original call order (see [`resume_tool`](Self::resume_tool)).
-    /// The in-flight turn stays open across the pause so the eventual results
-    /// fold back into the same turn.
+    /// id (tool *and* subagent), so a mixed batch parks under one cursor. The
+    /// volatile per-call correlation (`RequirementId` → provider call id + bridge
+    /// kind) and the collected results live in the non-serialized
+    /// [`PendingExternalToolBatch`] scratch so a completed batch can feed
+    /// [`RespondToolResults`](ExternalSessionInput::RespondToolResults) back in
+    /// the original call order (see [`resume_tool`](Self::resume_tool)). The
+    /// in-flight turn stays open across the pause so the eventual results fold
+    /// back into the same turn.
     ///
-    /// No tool result is ever written into the [`Conversation`] — the external
-    /// runtime is the consumer of tool results, not host history; the machine
-    /// only relays host results back to the runtime.
+    /// When every call was a malformed `spawn_agent` (so no requirement is
+    /// minted) the batch is already complete: the machine skips the
+    /// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) park and relays the
+    /// pre-seeded error results straight back in call order.
+    ///
+    /// No tool or subagent result is ever written into the [`Conversation`] — the
+    /// external runtime is the consumer of tool results, not host history; the
+    /// machine only relays results back to the runtime.
     ///
     /// When no [`ToolExecutionIds`] source was injected (the default
     /// [`NoToolExecutionIds`]) the machine cannot mint a host tool-call
@@ -610,28 +687,93 @@ impl ExternalAgentMachine {
             );
         };
 
+        if calls.is_empty() {
+            return self.fail_with(
+                "external session paused for tool calls with an empty batch",
+                notifications,
+            );
+        }
+
         self.state.set_session(Some(session));
 
-        // Bridge each runtime tool call into a `NeedTool` requirement, allocating
-        // a host tool-call id and a requirement id per call. `ids` addresses the
-        // driver-facing awaiting-tool cursor; the `requirement_to_call` map
+        // Bridge each runtime tool call into a host requirement, allocating a
+        // host tool-call id and a requirement id per bridged call. `ids`
+        // addresses the driver-facing awaiting-tool cursor; the `pending` map
         // addresses the eventual `RespondToolResults` fan-out (kept in the batch
-        // scratch) so an out-of-order resume routes to the right call.
+        // scratch) so an out-of-order resume routes to the right call and is
+        // validated against the right result family. A malformed `spawn_agent`
+        // mints no requirement — its runtime-visible error result is pre-seeded
+        // into `results` (return-error-to-runtime, design §8.4).
         let mut requirements = Vec::with_capacity(calls.len());
         let mut ids: BTreeMap<ToolCallId, RequirementId> = BTreeMap::new();
-        let mut requirement_to_call: BTreeMap<RequirementId, String> = BTreeMap::new();
+        let mut pending: BTreeMap<RequirementId, PendingBridgeCall> = BTreeMap::new();
+        let mut results: BTreeMap<String, ExternalToolResult> = BTreeMap::new();
         for call in &calls {
             let tool_call: ToolCall = call.to_tool_call();
-            let call_id = match self.tool_ids.tool_call_id(&tool_call) {
-                Ok(id) => id,
-                Err(error) => {
-                    return self.fail_with(format!("tool id unavailable: {error}"), notifications);
+
+            // `spawn_agent` is a scope-deepening operation that cannot run as an
+            // inline tool: parse it up front so a malformed call is answered with
+            // a runtime-visible error instead of minting a subagent requirement
+            // the machine cannot build.
+            let (kind_tag, requirement_kind) = if SpawnAgentRequest::matches(&call.name) {
+                match SpawnAgentRequest::parse(&tool_call) {
+                    Ok(request) => (
+                        RequirementKindTag::Subagent,
+                        request.into_requirement_kind(in_flight.step_id),
+                    ),
+                    Err(error) => {
+                        // Return-error-to-runtime (design §8.4): pre-seed the
+                        // batch with a runtime-visible failure and mint no
+                        // requirement for this call.
+                        results.insert(
+                            call.provider_call_id.clone(),
+                            ExternalToolResult::from_tool_runtime_error(
+                                call.provider_call_id.clone(),
+                                &ToolRuntimeError::ExecutionFailed {
+                                    tool_name: SPAWN_AGENT.to_owned(),
+                                    message: error.to_string(),
+                                },
+                            ),
+                        );
+                        continue;
+                    }
                 }
+            } else {
+                (
+                    RequirementKindTag::Tool,
+                    RequirementKind::NeedTool {
+                        // The tool-call id is minted below; a placeholder here keeps
+                        // the two bridge arms symmetric.
+                        call_id: match self.tool_ids.tool_call_id(&tool_call) {
+                            Ok(id) => id,
+                            Err(error) => {
+                                return self.fail_with(
+                                    format!("tool id unavailable: {error}"),
+                                    notifications,
+                                );
+                            }
+                        },
+                        call: tool_call.clone(),
+                    },
+                )
             };
-            let requirement_id = match self
-                .requirement_ids
-                .next_requirement_id(RequirementKindTag::Tool)
-            {
+
+            // Every bridged call (tool or subagent) is addressed under a host
+            // tool-call id: it is the key the `AwaitingTool` cursor binds its
+            // requirement under, so the whole mixed batch parks on one cursor and
+            // recovers uniformly. A `NeedTool` already carries the minted id;
+            // mint a fresh one for a subagent bridge.
+            let call_id = match &requirement_kind {
+                RequirementKind::NeedTool { call_id, .. } => *call_id,
+                _ => match self.tool_ids.tool_call_id(&tool_call) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        return self
+                            .fail_with(format!("tool id unavailable: {error}"), notifications);
+                    }
+                },
+            };
+            let requirement_id = match self.requirement_ids.next_requirement_id(kind_tag) {
                 Ok(id) => id,
                 Err(error) => {
                     return self.fail_with(
@@ -640,15 +782,32 @@ impl ExternalAgentMachine {
                     );
                 }
             };
-            requirements.push(Requirement::at_root(
-                requirement_id,
-                RequirementKind::NeedTool {
-                    call_id,
-                    call: tool_call,
-                },
-            ));
+            requirements.push(Requirement::at_root(requirement_id, requirement_kind));
             ids.insert(call_id, requirement_id);
-            requirement_to_call.insert(requirement_id, call.provider_call_id.clone());
+            pending.insert(
+                requirement_id,
+                PendingBridgeCall {
+                    provider_call_id: call.provider_call_id.clone(),
+                    kind: if kind_tag == RequirementKindTag::Subagent {
+                        ExternalBridgeCallKind::Subagent
+                    } else {
+                        ExternalBridgeCallKind::Tool
+                    },
+                },
+            );
+        }
+
+        // Every call was a malformed `spawn_agent`: no requirement is
+        // outstanding, so the batch is already complete and relays its
+        // pre-seeded error results straight back in the original call order.
+        if requirements.is_empty() {
+            let batch = PendingExternalToolBatch {
+                batch_id,
+                calls,
+                pending,
+                results,
+            };
+            return self.respond_with_tool_batch(in_flight.step_id, batch);
         }
 
         let call_ids: Vec<ToolCallId> = ids.keys().copied().collect();
@@ -670,8 +829,8 @@ impl ExternalAgentMachine {
         self.pending_tool_batch = Some(PendingExternalToolBatch {
             batch_id: batch_id.clone(),
             calls,
-            requirement_to_call,
-            results: BTreeMap::new(),
+            pending,
+            results,
         });
         self.settle(
             ExternalAgentCursor::AwaitingTool {
@@ -684,25 +843,39 @@ impl ExternalAgentMachine {
         StepOutcome::new(notifications, requirements, true)
     }
 
-    /// Folds one fulfilled `NeedTool` result into the pending tool batch,
+    /// Folds one fulfilled batch requirement into the pending tool batch,
     /// relaying the whole batch back to the runtime once every call is answered.
     ///
-    /// Each host tool result arrives on its own resume. The result is routed to
-    /// its runtime `provider_call_id` through the
-    /// [`PendingExternalToolBatch`] scratch (keyed by [`RequirementId`], so a
-    /// parallel batch may resolve out of order) and collected there:
+    /// Each host result arrives on its own resume. The result is routed to its
+    /// runtime `provider_call_id` through the [`PendingExternalToolBatch`]
+    /// scratch (keyed by [`RequirementId`], so a parallel batch may resolve out
+    /// of order) and collected there, validated against the family the call was
+    /// bridged as:
     ///
-    /// - A [`RequirementResult::Tool(Ok(response))`](RequirementResult::Tool) is
+    /// - A [`Tool`](ExternalBridgeCallKind::Tool) bridge accepts a
+    ///   [`RequirementResult::Tool(Ok(response))`](RequirementResult::Tool) —
     ///   bridged into an [`ExternalToolResult`] preserving the host's four-state
     ///   status and multimodal content, re-keyed to the batch's authoritative
-    ///   `provider_call_id`.
-    /// - A [`RequirementResult::Tool(Err(error))`](RequirementResult::Tool) is
+    ///   `provider_call_id` — or a
+    ///   [`RequirementResult::Tool(Err(error))`](RequirementResult::Tool),
     ///   returned to the runtime as a failed tool result carrying the framework's
     ///   stable diagnostic (the fixed *return-error-to-runtime* policy — the
     ///   external runtime, not the host, decides how to react to a failed call),
     ///   never stopping the host turn.
-    /// - Any other result family is a protocol violation and settles the machine
-    ///   on a classified [`Error`](ExternalAgentCursor::Error) cursor.
+    /// - A [`Subagent`](ExternalBridgeCallKind::Subagent) bridge (a `spawn_agent`
+    ///   call) accepts a
+    ///   [`RequirementResult::Subagent(Ok(output))`](RequirementResult::Subagent),
+    ///   folding the child's summary into a successful [`ExternalToolResult`] so
+    ///   the runtime sees the spawn as a tool call that returned a summary
+    ///   (design §8.3). A
+    ///   [`RequirementResult::Subagent(Err(error))`](RequirementResult::Subagent)
+    ///   is a host-orchestration failure (depth / budget / cancel / internal),
+    ///   symmetric with the standalone
+    ///   [`resume_subagent`](Self::resume_subagent) path: it settles the machine
+    ///   on a classified [`Error`](ExternalAgentCursor::Error) cursor and stops
+    ///   the turn rather than fabricating a runtime result.
+    /// - A result whose family does not match how its call was bridged is a
+    ///   protocol violation and settles on a classified error cursor.
     ///
     /// While the batch is incomplete the machine stays parked on
     /// [`AwaitingTool`](ExternalAgentCursor::AwaitingTool) with a quiescent, empty
@@ -732,41 +905,80 @@ impl ExternalAgentMachine {
 
         // Route by requirement id: an id outside the batch is not one this pause
         // is waiting on.
-        let Some(provider_call_id) = batch.requirement_to_call.get(&resolution.id).cloned() else {
+        let Some(bridged) = batch.pending.get(&resolution.id).cloned() else {
             return self.fail(format!(
                 "resume targets requirement {}, which is not part of the pending tool batch",
                 resolution.id
             ));
         };
+        let PendingBridgeCall {
+            provider_call_id,
+            kind,
+        } = bridged;
 
         // A second result for the same call is a duplicate resume.
         if batch.results.contains_key(&provider_call_id) {
             return self.fail(format!(
-                "resume targets requirement {}, whose tool result was already collected",
+                "resume targets requirement {}, whose result was already collected",
                 resolution.id
             ));
         }
 
-        // Bridge the host result into the runtime-facing tool result. A runtime
-        // error is returned to the runtime as a failed tool result (the fixed
-        // return-error-to-runtime policy) rather than stopping the turn. The
-        // `provider_call_id` is taken from the batch mapping, the authoritative
-        // correlation the runtime paused on.
-        let tool_result = match resolution.result {
-            RequirementResult::Tool(Ok(response)) => {
-                let mut result = ExternalToolResult::from_tool_response(&response);
-                result.provider_call_id = provider_call_id.clone();
-                result
-            }
-            RequirementResult::Tool(Err(error)) => {
-                ExternalToolResult::from_tool_runtime_error(provider_call_id.clone(), &error)
-            }
-            other => {
-                return self.fail(format!(
-                    "NeedTool requirement cannot accept a `{}` result",
-                    other.tag()
-                ));
-            }
+        // Bridge the host result into the runtime-facing tool result, validated
+        // against the family this call was bridged as. The `provider_call_id` is
+        // taken from the batch mapping, the authoritative correlation the runtime
+        // paused on.
+        let tool_result = match kind {
+            ExternalBridgeCallKind::Tool => match resolution.result {
+                // A runtime error is returned to the runtime as a failed tool
+                // result (the fixed return-error-to-runtime policy) rather than
+                // stopping the turn.
+                RequirementResult::Tool(Ok(response)) => {
+                    let mut result = ExternalToolResult::from_tool_response(&response);
+                    result.provider_call_id = provider_call_id.clone();
+                    result
+                }
+                RequirementResult::Tool(Err(error)) => {
+                    ExternalToolResult::from_tool_runtime_error(provider_call_id.clone(), &error)
+                }
+                other => {
+                    return self.fail(format!(
+                        "NeedTool requirement cannot accept a `{}` result",
+                        other.tag()
+                    ));
+                }
+            },
+            ExternalBridgeCallKind::Subagent => match resolution.result {
+                // The child's summary folds back as a successful tool result so
+                // the runtime sees the spawn as a tool call that returned a
+                // summary (design §8.3).
+                RequirementResult::Subagent(Ok(output)) => {
+                    let ExternalSubagentOutput { summary, .. } =
+                        ExternalSubagentOutput::from(output);
+                    ExternalToolResult {
+                        provider_call_id: provider_call_id.clone(),
+                        status: ToolStatus::Ok,
+                        content: vec![ContentBlock::Text {
+                            text: summary,
+                            extra: Map::new(),
+                        }],
+                        error: None,
+                        raw: None,
+                    }
+                }
+                // A subagent drive failure is a host-orchestration failure,
+                // symmetric with the standalone subagent path: stop the turn on a
+                // classified error cursor rather than fabricating a runtime result.
+                RequirementResult::Subagent(Err(error)) => {
+                    return self.fail(format!("external spawn_agent subagent failed: {error}"));
+                }
+                other => {
+                    return self.fail(format!(
+                        "spawn_agent bridge (NeedSubagent) requirement cannot accept a `{}` result",
+                        other.tag()
+                    ));
+                }
+            },
         };
 
         let batch = self
@@ -786,6 +998,24 @@ impl ExternalAgentMachine {
             .pending_tool_batch
             .take()
             .expect("pending tool batch present after the collection above");
+        self.respond_with_tool_batch(in_flight.step_id, batch)
+    }
+
+    /// Assembles a fully answered batch in the runtime's original call order and
+    /// relays it back as one
+    /// [`RespondToolResults`](ExternalSessionInput::RespondToolResults).
+    ///
+    /// The results are ordered by the runtime's original
+    /// [`ExternalToolCall`] sequence (never completion order), reparking on
+    /// [`AwaitingSession`](ExternalAgentCursor::AwaitingSession) so the session
+    /// advances to its next decision point within the same turn. A call with no
+    /// collected result is a protocol violation and settles on a classified
+    /// error cursor.
+    fn respond_with_tool_batch(
+        &mut self,
+        step_id: StepId,
+        batch: PendingExternalToolBatch,
+    ) -> StepOutcome {
         let mut results = Vec::with_capacity(batch.calls.len());
         for call in &batch.calls {
             match batch.results.get(&call.provider_call_id) {
@@ -800,7 +1030,7 @@ impl ExternalAgentMachine {
         }
 
         self.block_on_session(
-            in_flight.step_id,
+            step_id,
             ExternalSessionInput::RespondToolResults {
                 batch_id: batch.batch_id,
                 results,

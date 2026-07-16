@@ -950,7 +950,7 @@ external subagent phase 与内部 subagent 的差异及保留原因:
 - **验证序列 1-6 全过**: fmt clean、聚焦测试(interaction 26 passed / approval_interaction_handler 5 passed)、
   clippy 0 warning、全套件 38 组 0 failed、doc(`-D warnings`)通过、`git diff --check` clean。
 
-### [TODO] M3-3 支持 external runtime 的 `spawn_agent` tool bridge 特判
+### [DONE] M3-3 支持 external runtime 的 `spawn_agent` tool bridge 特判
 
 **上下文**:
 
@@ -991,6 +991,54 @@ external subagent phase 与内部 subagent 的差异及保留原因:
   - `cargo test -p agent-lib external_spawn_agent`
   - `cargo test -p agent-lib external_mixed_tool`
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- **input contract 复用**: 复用既有 `crate::agent::collab::{SpawnAgentRequest, SPAWN_AGENT}`,
+  而非新造 contract。TODO 示例 JSON 写 `spec_ref`/`prompt`(标注「例如」);设计 §8.1 规定 runtime
+  拿到的是 `bridge_tool_declarations()`(声明 `spec`/`brief`/`result_schema`),§8.3 明确点名
+  `SpawnAgentRequest::parse`,故实际解析 contract 为 `{spec, brief, result_schema}`。
+- **machine.rs**:
+  - `PendingExternalToolBatch` scratch 把 `requirement_to_call: BTreeMap<RequirementId, String>`
+    换成 `pending: BTreeMap<RequirementId, PendingBridgeCall>`(`provider_call_id` + `kind`),
+    新增 `enum ExternalBridgeCallKind { Tool, Subagent }` 记录每个 bridged call 走哪个 result family。
+  - `pause_for_tool_calls`:逐个 call 判断——`SpawnAgentRequest::matches(name)` 则 `parse`;
+    成功 emit `NeedSubagent`(`into_requirement_kind(in_flight.step_id)`,tag Subagent),
+    失败按 §8.4 return-error-to-runtime 预置一条 runtime-visible error `ExternalToolResult`
+    进 `results`、**不** mint requirement;否则照常 `NeedTool`(tag Tool)。每个 bridged call
+    (含 subagent)都 mint 一个 `ToolCallId`,因为 `LoopCursor::awaiting_tool` 要求 tool_call_ids
+    与 `ToolWaitRequirements` keys 精确一致,mixed batch 才能停在同一 `AwaitingTool` cursor。
+    全部 spawn_agent 都畸形(requirements 为空)时跳过 park、立即 `respond_with_tool_batch`。
+  - `resume_tool`:经 `batch.pending.get(id)` 路由,按 `kind` 校验 result family——
+    `Tool` 收 `Tool(Ok/Err)`;`Subagent` 收 `Subagent(Ok(output))`(把 `summary` 折成
+    `ExternalToolResult{status:Ok, content:[Text]}`),`Subagent(Err)` 走 error cursor
+    (host-orchestration 失败,与独立 `resume_subagent` 对称),family 不符则 error cursor。
+  - 新增 `respond_with_tool_batch(step_id, batch)`:按 `batch.calls` 原始顺序装配 results 后
+    `block_on_session(RespondToolResults)`;`resume_tool` 收齐与 `pause_for_tool_calls` 全畸形
+    两条路径共用。
+  - 更新模块 doc 与 `AwaitingTool` cursor doc(state.rs),说明 spawn_agent bridge 语义与
+    native `PausedForSubagent` 的区别(前者回 `RespondToolResults`,后者回 `RespondSubagent`)。
+- **策略选择**(稳定并测试):
+  - 畸形 `spawn_agent` input = **runtime-visible error result**(非 error cursor):machine 充当
+    tool-input 校验方,与普通 tool 的 return-error-to-runtime 一致,mixed batch 更健壮;turn 存活。
+  - `spawn_agent` 的 subagent 驱动失败 = **error cursor**(停 turn):属 host orchestration 失败
+    (depth/budget/cancel/internal),与 native subagent 对称,而非 runtime-caused。
+- **machine/tests.rs**: 新增 spawn_agent bridge 段(helpers `spawn_agent_call`/
+  `malformed_spawn_agent_call`/`pause_on_spawn_agent`)与 7 条单测:
+  `external_spawn_agent_tool_call_emits_need_subagent`、
+  `external_spawn_agent_result_bridges_summary_into_respond_tool_results`、
+  `external_mixed_tool_and_spawn_agent_batch_returns_one_respond_tool_results`、
+  `external_mixed_valid_tool_and_malformed_spawn_agent_returns_one_batch`、
+  `external_spawn_agent_invalid_input_returns_runtime_error_result`、
+  `external_spawn_agent_subagent_failure_settles_error`、
+  `external_spawn_agent_bridge_wrong_family_fails`。
+- **drive.rs**: 新增 `mixed_tool_and_subagent_batch_routes_subagent_serially`——用真正返回 summary 的
+  `RealSubagent` handler + `MixedToolSubagentScope`,`fulfill_batch([NeedTool, NeedSubagent])`
+  两类都正确 resolve;subagent 若误入并发 local set 会因 `fulfill_with_scope` 返回 `None` 触发
+  `.expect` panic,故成功完成即证明其走 serial outer routing(设计不变,复核既有保证)。
+- **验证序列 1-6 全过**: fmt clean、聚焦测试(external_spawn_agent 5 passed、external_ lib 71 passed、
+  mixed_tool_and_subagent 1 passed)、clippy `-D warnings` 0 warning、全套件 38 组 0 failed、
+  doc(`-D warnings`)通过、`git diff --check` clean。
 
 ### [TODO] M3-4 Review：interaction/subagent parity 正确性检查
 

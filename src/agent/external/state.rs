@@ -63,21 +63,27 @@ pub enum ExternalAgentCursor {
         /// [`InteractionResponse`]: crate::agent::InteractionResponse
         interaction: Interaction,
     },
-    /// A session paused for a batch of tool calls; the machine emitted one
-    /// `NeedTool` requirement per call and is waiting for every host tool
-    /// result.
+    /// A session paused for a batch of tool calls; the machine bridged each call
+    /// into a host requirement and is waiting for every result.
+    ///
+    /// A plain call bridges into a `NeedTool`; a `spawn_agent` call is a
+    /// scope-deepening operation that bridges into a `NeedSubagent` whose child
+    /// output folds back into this same batch as a tool result (design §8.3).
     ///
     /// The cursor persists only the resumable addressing: the runtime-assigned
     /// [`ExternalToolBatchId`] echoed back through
     /// [`ExternalSessionInput::RespondToolResults`], and the batch's
     /// [`ToolWaitRequirements`] mapping each provider-independent
     /// [`ToolCallId`](crate::conversation::ToolCallId) to the
-    /// [`RequirementId`](crate::agent::RequirementId) the driver must fulfill.
-    /// That lets a driver rebuild its pending-requirement registry from a
-    /// restored machine. The volatile per-call correlation (provider call id)
-    /// and the results collected so far live only in the machine's
-    /// non-serialized scratch, so a mid-turn restore cannot resume a partially
-    /// answered batch — see the machine's tool-phase docs.
+    /// [`RequirementId`](crate::agent::RequirementId) the driver must fulfill —
+    /// for a `spawn_agent` bridge that mapped requirement is a `NeedSubagent`
+    /// rather than a `NeedTool`, so the whole mixed batch parks on one cursor and
+    /// its pending requirement ids recover uniformly. That lets a driver rebuild
+    /// its pending-requirement registry from a restored machine. The volatile
+    /// per-call correlation (provider call id, bridge kind) and the results
+    /// collected so far live only in the machine's non-serialized scratch, so a
+    /// mid-turn restore cannot resume a partially answered batch — see the
+    /// machine's tool-phase docs.
     ///
     /// [`ExternalSessionInput::RespondToolResults`]:
     /// crate::agent::external::ExternalSessionInput::RespondToolResults

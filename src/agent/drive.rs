@@ -633,15 +633,16 @@ async fn fulfill_batch(
 mod tests {
     use super::{
         ExternalSessionHandler, HandlerScope, InteractionHandler, LlmHandler, Pop, ReconfigHandler,
-        ScopePop, SubagentHandler, ToolHandler, drain, fulfill_with_scope, scope_handles,
+        ScopePop, SubagentHandler, ToolHandler, drain, fulfill_batch, fulfill_with_scope,
+        scope_handles,
     };
     use crate::{
         agent::{
             AgentError, AgentErrorKind, AgentId, AgentInput, AgentMachine, ApprovalDecision,
             ApprovalRequirement, ApprovalResponse, BudgetLimits, LlmStepMode, LoopCursor,
             LoopCursorKind, LoopDoneReason, Requirement, RequirementDisposition, RequirementId,
-            RunContext, RunId, StepInput, StepOutcome, ToolApprovalPolicy, ToolSetId, ToolSetRef,
-            TraceNodeId, TraceNodeKind,
+            RunContext, RunId, StepInput, StepOutcome, SubagentOutput, ToolApprovalPolicy,
+            ToolSetId, ToolSetRef, TraceNodeId, TraceNodeKind,
             external::{
                 ExternalAgentOutput, ExternalPermissionMode, ExternalRuntimeKind,
                 ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef,
@@ -1822,6 +1823,105 @@ mod tests {
                     "fulfilled result family must match the requirement family"
                 );
             }
+        }
+    }
+
+    /// A subagent handler that drives a child to a real summary, unlike the
+    /// `unreachable!` [`EqSubagent`] stub, so a mixed batch can be fulfilled to
+    /// completion.
+    struct RealSubagent;
+    #[async_trait]
+    impl SubagentHandler for RealSubagent {
+        async fn fulfill(
+            &self,
+            _spec_ref: &AgentSpecRef,
+            _brief: &Interaction,
+            _result_schema: Option<&Value>,
+            _outer: &mut dyn Pop,
+            _ctx: &RunContext,
+        ) -> RequirementResult {
+            RequirementResult::Subagent(Ok(SubagentOutput {
+                summary: "child summary".to_owned(),
+            }))
+        }
+    }
+
+    static REAL_SUBAGENT: RealSubagent = RealSubagent;
+
+    /// A scope offering tool and subagent handlers so a mixed batch can be
+    /// fulfilled: the tool joins the concurrent local set while the subagent must
+    /// be resolved serially.
+    struct MixedToolSubagentScope;
+
+    impl HandlerScope for MixedToolSubagentScope {
+        fn llm(&self) -> Option<&dyn LlmHandler> {
+            None
+        }
+        fn tool(&self) -> Option<&dyn ToolHandler> {
+            Some(&EQ_TOOL)
+        }
+        fn interaction(&self) -> Option<&dyn InteractionHandler> {
+            None
+        }
+        fn subagent(&self) -> Option<&dyn SubagentHandler> {
+            Some(&REAL_SUBAGENT)
+        }
+        fn reconfig(&self) -> Option<&dyn ReconfigHandler> {
+            None
+        }
+        fn external(&self) -> Option<&dyn ExternalSessionHandler> {
+            None
+        }
+    }
+
+    fn subagent_requirement(n: u8) -> Requirement {
+        Requirement::at_root(requirement_id_n(n), kind_of(RequirementKindTag::Subagent))
+    }
+
+    #[tokio::test]
+    async fn mixed_tool_and_subagent_batch_routes_subagent_serially() {
+        // A mixed batch of an ordinary tool and a subagent (as a `spawn_agent`
+        // bridge produces): the scope handles both families.
+        let scope = MixedToolSubagentScope;
+        let ctx = run_context();
+        let batch = vec![tool_requirement(1, 0), subagent_requirement(2)];
+
+        // `fulfill_batch` must not panic: a subagent is `needs_outer`, so if it
+        // had joined the concurrent local set, `fulfill_with_scope` would short to
+        // `None` and the `.expect` after `scope_handles` would panic. Completing
+        // successfully proves the subagent was routed serially instead.
+        let resolutions = fulfill_batch(&batch, &scope, None, &ctx)
+            .await
+            .expect("mixed batch resolves");
+
+        assert_eq!(resolutions.len(), 2);
+
+        // Each requirement is answered with a result of its own family: the tool
+        // in place (concurrent set), the subagent through the serial subagent
+        // handler.
+        let tool = resolutions
+            .iter()
+            .find(|resolved| resolved.resolution.id == requirement_id_n(1))
+            .expect("tool resolution present");
+        assert_eq!(tool.resolution.result.tag(), RequirementKindTag::Tool);
+        assert_eq!(tool.resolved_at_scope, 0);
+
+        let subagent = resolutions
+            .iter()
+            .find(|resolved| resolved.resolution.id == requirement_id_n(2))
+            .expect("subagent resolution present");
+        assert_eq!(
+            subagent.resolution.result.tag(),
+            RequirementKindTag::Subagent
+        );
+        // The emitting scope owns the subagent handler, so it settles in place
+        // (zero pop hops) rather than being popped outward.
+        assert_eq!(subagent.resolved_at_scope, 0);
+        match &subagent.resolution.result {
+            RequirementResult::Subagent(Ok(output)) => {
+                assert_eq!(output.summary, "child summary");
+            }
+            other => panic!("expected a Subagent(Ok) result, got {other:?}"),
         }
     }
 }
