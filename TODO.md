@@ -1158,7 +1158,7 @@ ToolCallStarted(..), ToolCallFinished(..) }`。设计文档 §5.3 提议新增
 - 说明:observation→notification 的实际转换与去重属 M5-2;`machine.rs` 中 “conversion … lands in M5”
   的注释仍准确,故不改动。
 
-### [TODO] M5-2 observation 缓冲 → notification 转换与 event sink
+### [DONE] M5-2 observation 缓冲 → notification 转换与 event sink
 
 **前置依赖**:M5-1。
 
@@ -1183,6 +1183,36 @@ resume 后一次性把它们转成 `Notification::ExternalAgent` 吐出(经 `Ste
   observations,断言 drain 后 `Notification::ExternalAgent` 按序出现且数量正确;再断言重复 resume 不重放
   已消费 event(用 `last_event_seq`)。过滤名:`cargo test external_agent_emits`。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- `src/agent/external/machine.rs`:`fold_session_result` 不再丢弃 observations。三个决策点变体
+  (`Completed`/`PausedForInteraction`/`Failed`)在**调用 `set_session(new)` 之前**读取旧
+  `session().last_event_seq` 作为“已消费游标”,经新增私有 helper `observe(incoming_seq, observations)`
+  把 `Vec<ExternalAgentEvent>` 依序映射为 `Notification::ExternalAgent`,放入本步 `StepOutcome.notifications`。
+  三个 transition(`complete_session` / `pause_for_interaction` / 新增 `fail_with`)改为接收并透传该
+  notifications 向量;`fail` 改为委托 `fail_with(msg, Vec::new())`。
+- 去重语义(§5.5):`observe` 读取 `state.session().last_event_seq` 作为上次消费的 seq;当本次 result 报告
+  的 `last_event_seq` 与已消费 seq 均为 `Some` 且 `incoming <= consumed` 时,判定这批 observations 已消费,
+  发 0 条;否则全部按序发出。任一 seq 缺失(`None`)则无法对齐,按 as-is 全量发出。因 seq 已随
+  `set_session` 持久化进 `ExternalAgentState`,无需新增字段。
+- `src/agent/external/sink.rs`(新增模块):定义可丢弃、非阻塞的实时旁路占位 `ExternalEventSink` trait
+  (`emit(&self, &ExternalAgentEvent)`,`Send + Sync`)与无操作实现 `DiscardEventSink`,rustdoc 说明其
+  只旁路、可跳过、只有 `Requirement` 才阻塞 continuation、事件为 untrusted;含一个 doc 示例与一个单测。
+  经 `external::{DiscardEventSink, ExternalEventSink}` 与 `crate::agent` 再导出。刻意不接进 sans-io 的
+  `step`——sink 属 handler 层。
+- 文档:更新 `machine.rs` 模块头与 `fold_session_result` 注释(不再说 observations “dropped / lands in M5”),
+  改述为“转成 `Notification::ExternalAgent` 并按 `last_event_seq` 去重”。
+- 新增单测 `external_agent_emits_observation_notifications`(`src/agent/external/machine/tests.rs`,过滤名含
+  `external_agent_emits`):(a) Completed 带三条 observations → drain 后 `Notification::ExternalAgent` 按序、
+  数量正确;(b) pause↔respond 循环里,首个 pause(seq=2)发出其 observations,重复投递同一 seq=2 的 pause
+  不再回放,随后 Completed(seq=4)重新按序发出新 observations。配套 helper:`session_ref_seq`、
+  `observation_batch`、`completed_with`、`paused_with`、`external_events`。
+- 验证(默认完整序列全绿):`cargo fmt --all -- --check` 无差异;`cargo test external_agent_emits`
+  1 passed;`cargo clippy --all-targets -- -D warnings` 0 告警;`cargo test --all --all-targets` 全绿
+  (lib 470、testkit 136,集成 0 failed,仅 credential-gated ignored);`RUSTDOCFLAGS="-D warnings"
+  cargo doc --no-deps --workspace` 0 告警;`git diff --check` 干净。
+- 说明:artifact ref 记录(`ExternalAgentOutput.artifacts` → state/trace)属 M5-3,本任务未触及。
 
 ### [TODO] M5-3 artifact ref 记录(patch / diff / test result)
 

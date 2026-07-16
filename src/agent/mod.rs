@@ -44,6 +44,7 @@ pub use event::{
     AgentError, AgentErrorKind, AgentInput, AgentUserInput, Notification, PivotMessage,
     StepBoundary, ToolCallFinished, ToolCallStarted,
 };
+pub use external::{DiscardEventSink, ExternalEventSink};
 pub use external::{
     ExternalAgentCursor, ExternalAgentError, ExternalAgentEvent, ExternalAgentMachine,
     ExternalAgentOutput, ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind,

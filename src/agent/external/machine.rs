@@ -63,8 +63,11 @@
 //! mid-turn scratch ([`InFlight`]) that mirrors the in-flight turn's assistant
 //! identity the way [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine)
 //! keeps its own turn scratch. Observations buffered by the handler are threaded
-//! through the resume path but not yet converted into notifications — that
-//! conversion lands with `Notification::ExternalAgent` in M5.
+//! through the resume path and converted into
+//! [`Notification::ExternalAgent`](crate::agent::Notification::ExternalAgent)
+//! events on the resuming step, deduplicated against
+//! [`ExternalSessionRef::last_event_seq`] so a replayed decision point is not
+//! double-emitted (design §5.5).
 
 use std::sync::Arc;
 
@@ -73,12 +76,13 @@ use serde_json::Map;
 use crate::{
     agent::{
         AgentInput, AgentMachine, AgentUserInput, CursorRequirement, Interaction, LoopCursor,
-        LoopDoneReason, Requirement, RequirementId, RequirementIds, RequirementKind,
+        LoopDoneReason, Notification, Requirement, RequirementId, RequirementIds, RequirementKind,
         RequirementKindTag, RequirementResolution, RequirementResult, StepId, StepInput,
         StepOutcome,
         external::{
-            ExternalAgentCursor, ExternalAgentOutput, ExternalAgentState, ExternalSessionInput,
-            ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
+            ExternalAgentCursor, ExternalAgentEvent, ExternalAgentOutput, ExternalAgentState,
+            ExternalSessionInput, ExternalSessionRef, ExternalSessionRequest,
+            ExternalSessionResult,
         },
     },
     client::Response,
@@ -290,26 +294,81 @@ impl ExternalAgentMachine {
 
     /// Routes a decision-point [`ExternalSessionResult`] to its transition.
     ///
-    /// Buffered `observations` are intentionally dropped here; converting them
-    /// into `Notification::ExternalAgent` events lands in M5.
+    /// Buffered `observations` are converted into
+    /// [`Notification::ExternalAgent`] events (design §5.5) and carried out on the
+    /// resuming step's [`StepOutcome`]. Dedup uses
+    /// [`ExternalSessionRef::last_event_seq`]: the events already consumed on an
+    /// earlier resume are skipped so a replayed result does not double-emit — see
+    /// [`observe`](Self::observe).
     fn fold_session_result(&mut self, result: ExternalSessionResult) -> StepOutcome {
         match result {
             ExternalSessionResult::Completed {
-                session, output, ..
-            } => self.complete_session(session, output),
+                session,
+                output,
+                observations,
+            } => {
+                let notifications = self.observe(session.last_event_seq, observations);
+                self.complete_session(session, output, notifications)
+            }
             ExternalSessionResult::PausedForInteraction {
                 session,
                 action_id,
                 request,
-                ..
-            } => self.pause_for_interaction(session, action_id, request),
-            ExternalSessionResult::Failed { session, error, .. } => {
+                observations,
+            } => {
+                let notifications = self.observe(session.last_event_seq, observations);
+                self.pause_for_interaction(session, action_id, request, notifications)
+            }
+            ExternalSessionResult::Failed {
+                session,
+                error,
+                observations,
+            } => {
+                let notifications = self.observe(
+                    session.as_ref().and_then(|s| s.last_event_seq),
+                    observations,
+                );
                 if session.is_some() {
                     self.state.set_session(session);
                 }
-                self.fail(error.to_string())
+                self.fail_with(error.to_string(), notifications)
             }
         }
+    }
+
+    /// Converts buffered `observations` into `Notification::ExternalAgent`
+    /// events, skipping any already consumed on a prior resume.
+    ///
+    /// Per design §5.5 the machine replays a decision point's observations exactly
+    /// once. It uses [`ExternalSessionRef::last_event_seq`] as the alignment
+    /// cursor: the last consumed sequence is recorded in the retained
+    /// [`session`](ExternalAgentState::session) facts, so this reads that recorded
+    /// value *before* the caller stores the incoming session. When the incoming
+    /// result reports a `last_event_seq` at or below the recorded one, its
+    /// observations were already emitted on an earlier resume (a replayed or
+    /// duplicated result), so nothing is emitted. When either sequence is absent
+    /// the events cannot be aligned and are emitted as-is.
+    fn observe(
+        &self,
+        incoming_seq: Option<u64>,
+        observations: Vec<ExternalAgentEvent>,
+    ) -> Vec<Notification> {
+        if observations.is_empty() {
+            return Vec::new();
+        }
+        let consumed = self
+            .state
+            .session()
+            .and_then(|session| session.last_event_seq);
+        if let (Some(incoming), Some(consumed)) = (incoming_seq, consumed)
+            && incoming <= consumed
+        {
+            return Vec::new();
+        }
+        observations
+            .into_iter()
+            .map(Notification::ExternalAgent)
+            .collect()
     }
 
     /// Parks on an interaction the runtime paused for and emits `NeedInteraction`.
@@ -326,6 +385,7 @@ impl ExternalAgentMachine {
         session: ExternalSessionRef,
         action_id: String,
         request: Interaction,
+        notifications: Vec<Notification>,
     ) -> StepOutcome {
         let Some(in_flight) = self.in_flight else {
             return self.fail("external session paused without an in-flight turn");
@@ -352,7 +412,7 @@ impl ExternalAgentMachine {
 
         let requirement =
             Requirement::at_root(requirement_id, RequirementKind::NeedInteraction { request });
-        StepOutcome::new(Vec::new(), vec![requirement], true)
+        StepOutcome::new(notifications, vec![requirement], true)
     }
 
     /// Feeds a resolved interaction back into the paused session.
@@ -404,6 +464,7 @@ impl ExternalAgentMachine {
         &mut self,
         session: ExternalSessionRef,
         output: ExternalAgentOutput,
+        notifications: Vec<Notification>,
     ) -> StepOutcome {
         let Some(in_flight) = self.in_flight.take() else {
             return self.fail("external session completed without an in-flight turn to commit");
@@ -438,7 +499,7 @@ impl ExternalAgentMachine {
             ExternalAgentCursor::Done,
             LoopCursor::done(LoopDoneReason::Completed),
         );
-        StepOutcome::new(Vec::new(), Vec::new(), true)
+        StepOutcome::new(notifications, Vec::new(), true)
     }
 
     /// Handles a never-resume [`StepInput::Abandon`] (cancel, design §6.4).
@@ -493,6 +554,17 @@ impl ExternalAgentMachine {
     /// outcome, mirroring
     /// [`DefaultAgentMachine`](crate::agent::DefaultAgentMachine).
     fn fail(&mut self, message: impl Into<String>) -> StepOutcome {
+        self.fail_with(message, Vec::new())
+    }
+
+    /// Like [`fail`](Self::fail), but carries observation notifications collected
+    /// before the failure so a failed decision point still replays its buffered
+    /// events (design §5.5).
+    fn fail_with(
+        &mut self,
+        message: impl Into<String>,
+        notifications: Vec<Notification>,
+    ) -> StepOutcome {
         let message = {
             let message = message.into();
             if message.is_empty() {
@@ -510,7 +582,7 @@ impl ExternalAgentMachine {
         self.in_flight = None;
         let loop_cursor = LoopCursor::error(message.clone()).unwrap_or(LoopCursor::Idle);
         self.settle(ExternalAgentCursor::Error { message }, loop_cursor);
-        StepOutcome::new(Vec::new(), Vec::new(), true)
+        StepOutcome::new(notifications, Vec::new(), true)
     }
 
     /// Sets the serializable external cursor and its mirrored driver-facing view

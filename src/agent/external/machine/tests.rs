@@ -16,12 +16,14 @@ use serde_json::Map;
 use super::ExternalAgentMachine;
 use crate::agent::{
     AgentId, AgentInput, AgentMachine, Interaction, InteractionResponse, LoopCursorKind,
-    PivotMessage, PivotSource, RequirementError, RequirementId, RequirementIds, RequirementKind,
-    RequirementKindTag, RequirementResolution, RequirementResult, StepId, StepInput, ToolSetId,
+    Notification, PivotMessage, PivotSource, RequirementError, RequirementId, RequirementIds,
+    RequirementKind, RequirementKindTag, RequirementResolution, RequirementResult, StepId,
+    StepInput, ToolSetId,
     external::{
-        ExternalAgentError, ExternalAgentOutput, ExternalAgentSpec, ExternalAgentState,
-        ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput, ExternalSessionPolicy,
-        ExternalSessionRef, ExternalSessionResult, ExternalStreamPolicy, WorktreeIsolation,
+        ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalAgentSpec,
+        ExternalAgentState, ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
+        ExternalSessionPolicy, ExternalSessionRef, ExternalSessionResult, ExternalStreamPolicy,
+        WorktreeIsolation,
     },
     spec::{ToolSetRef, WorktreeRef},
 };
@@ -192,6 +194,70 @@ fn paused_result(action_id: &str) -> ExternalSessionResult {
         ),
         observations: Vec::new(),
     }
+}
+
+/// Resumable session facts reporting a specific `last_event_seq`, used to
+/// exercise observation dedup on resume (design §5.5).
+fn session_ref_seq(seq: u64) -> ExternalSessionRef {
+    ExternalSessionRef {
+        runtime: ExternalRuntimeKind::ClaudeCode,
+        session_id: Some("sess-1".to_owned()),
+        transcript_ref: None,
+        resume_token: Some("resume-1".to_owned()),
+        last_event_seq: Some(seq),
+    }
+}
+
+/// A distinct, ordered batch of buffered observations.
+fn observation_batch(tag: &str) -> Vec<ExternalAgentEvent> {
+    vec![
+        ExternalAgentEvent::SessionStarted {
+            session_id: Some("sess-1".to_owned()),
+        },
+        ExternalAgentEvent::TextDelta {
+            text: format!("delta-{tag}"),
+        },
+        ExternalAgentEvent::SessionCompleted,
+    ]
+}
+
+/// A `Completed` result carrying `observations` and reporting `seq` as the last
+/// consumed event sequence.
+fn completed_with(seq: u64, observations: Vec<ExternalAgentEvent>) -> ExternalSessionResult {
+    ExternalSessionResult::Completed {
+        session: session_ref_seq(seq),
+        output: output("refactor complete"),
+        observations,
+    }
+}
+
+/// A `PausedForInteraction` result carrying `observations` and reporting `seq`.
+fn paused_with(
+    action_id: &str,
+    seq: u64,
+    observations: Vec<ExternalAgentEvent>,
+) -> ExternalSessionResult {
+    ExternalSessionResult::PausedForInteraction {
+        session: session_ref_seq(seq),
+        action_id: action_id.to_owned(),
+        request: Interaction::question(
+            paused_step_id(),
+            "Allow the external agent to run `cargo test`?".to_owned(),
+        ),
+        observations,
+    }
+}
+
+/// Extracts the [`ExternalAgentEvent`]s from a batch of external-agent
+/// notifications, asserting each is a `Notification::ExternalAgent`.
+fn external_events(notifications: &[Notification]) -> Vec<ExternalAgentEvent> {
+    notifications
+        .iter()
+        .map(|notification| match notification {
+            Notification::ExternalAgent(event) => event.clone(),
+            other => panic!("expected a Notification::ExternalAgent, got {other:?}"),
+        })
+        .collect()
 }
 
 fn interaction_resolution(id: RequirementId, answer: &str) -> RequirementResolution {
@@ -598,4 +664,70 @@ fn external_interaction_resume_targeting_the_wrong_requirement_fails() {
 
     assert!(outcome.is_quiescent());
     assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+}
+
+#[test]
+fn external_agent_emits_observation_notifications() {
+    // A Completed decision point replays its buffered observations, in order, as
+    // `Notification::ExternalAgent` events on the resuming step (design §5.5).
+    let mut direct = machine();
+    let opened = direct.step(StepInput::external(user_input("refactor the parser")));
+    let batch = observation_batch("done");
+    let completed = direct.step(StepInput::resume(external_resolution(
+        opened.requirements[0].id,
+        completed_with(3, batch.clone()),
+    )));
+
+    assert!(completed.is_quiescent());
+    assert!(completed.requirements.is_empty());
+    assert_eq!(direct.cursor().kind(), LoopCursorKind::Done);
+    // Exactly the buffered observations, preserving order and count.
+    assert_eq!(external_events(&completed.notifications), batch);
+
+    // The machine records `last_event_seq` in its retained session facts and uses
+    // it to align observations on resume: a replayed decision point reporting a
+    // sequence at or below the consumed one emits nothing, while a fresh sequence
+    // beyond it is replayed in full (design §5.5).
+    let mut looped = machine();
+    let opened = looped.step(StepInput::external(user_input("refactor the parser")));
+
+    // First pause consumes observations up to seq 2 and emits them.
+    let first_batch = observation_batch("first");
+    let first_pause = looped.step(StepInput::resume(external_resolution(
+        opened.requirements[0].id,
+        paused_with("act-1", 2, first_batch.clone()),
+    )));
+    assert_eq!(external_events(&first_pause.notifications), first_batch);
+
+    // Answer the interaction so the turn loops back to AwaitingSession.
+    let responded = looped.step(StepInput::resume(interaction_resolution(
+        first_pause.requirements[0].id,
+        "go ahead",
+    )));
+
+    // A replayed pause reporting the same `last_event_seq` (2) is a duplicate:
+    // its observations were already consumed, so nothing is re-emitted.
+    let replay_pause = looped.step(StepInput::resume(external_resolution(
+        responded.requirements[0].id,
+        paused_with("act-1", 2, observation_batch("first")),
+    )));
+    assert!(
+        replay_pause.notifications.is_empty(),
+        "observations at or below the consumed sequence must not be replayed"
+    );
+
+    // Answering again advances the session; a Completed result reporting a fresh
+    // sequence (4) beyond the consumed one replays its new observations in full.
+    let responded_again = looped.step(StepInput::resume(interaction_resolution(
+        replay_pause.requirements[0].id,
+        "go ahead",
+    )));
+    let final_batch = observation_batch("final");
+    let final_completed = looped.step(StepInput::resume(external_resolution(
+        responded_again.requirements[0].id,
+        completed_with(4, final_batch.clone()),
+    )));
+
+    assert_eq!(looped.cursor().kind(), LoopCursorKind::Done);
+    assert_eq!(external_events(&final_completed.notifications), final_batch);
 }
