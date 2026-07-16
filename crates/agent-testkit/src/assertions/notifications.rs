@@ -5,7 +5,7 @@
 //! and lets a test assert on family counts, tool start/finish presence and
 //! ordering, step-boundary counts, and step-boundary metadata.
 
-use agent_lib::agent::{Notification, StepId};
+use agent_lib::agent::{ExternalAgentEvent, Notification, StepId};
 use agent_lib::conversation::ToolCallId;
 use serde_json::Value;
 
@@ -58,6 +58,20 @@ impl<'a> NotificationAssertions<'a> {
     /// Asserts the number of tool-finished notifications.
     pub fn tool_finished_count(self, expected: usize) -> Self {
         self.family_count("tool finished", expected, self.tool_finished_calls().len())
+    }
+
+    /// Asserts the number of external-agent notifications.
+    ///
+    /// External-agent notifications carry the observe-only
+    /// [`ExternalAgentEvent`]s an external session buffered before a decision
+    /// point and replayed on resume (design §5.5); this counts them as a family,
+    /// mirroring [`llm_count`](Self::llm_count) and the tool families.
+    pub fn external_agent_count(self, expected: usize) -> Self {
+        self.family_count(
+            "external agent",
+            expected,
+            self.external_agent_events().len(),
+        )
     }
 
     /// Asserts a tool-started notification exists for `call_id`.
@@ -163,6 +177,21 @@ impl<'a> NotificationAssertions<'a> {
             .iter()
             .filter_map(|notification| match notification {
                 Notification::StepBoundary(boundary) => Some(boundary.step_id()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Returns every external-agent event in the stream, in stream order.
+    ///
+    /// These are the observe-only [`ExternalAgentEvent`]s replayed from an
+    /// external session's buffered `observations` (design §5.5), letting a test
+    /// assert on their payloads and ordering.
+    pub fn external_agent_events(self) -> Vec<&'a ExternalAgentEvent> {
+        self.notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                Notification::ExternalAgent(event) => Some(event),
                 _ => None,
             })
             .collect()
@@ -285,6 +314,64 @@ mod tests {
         );
         assert!(
             message.contains("tool_started("),
+            "message lists the actual stream: {message}"
+        );
+    }
+
+    #[test]
+    fn external_agent_family_is_counted_and_accessible_in_order() {
+        use agent_lib::agent::{ExternalAgentEvent, Notification};
+
+        // A stream interleaving an external-agent event with other families: the
+        // external-agent assertions must count and extract only its own family,
+        // preserving stream order.
+        let notifications = vec![
+            Notification::ExternalAgent(ExternalAgentEvent::SessionStarted {
+                session_id: Some("s-1".to_owned()),
+            }),
+            Notification::ExternalAgent(ExternalAgentEvent::TextDelta {
+                text: "hello".to_owned(),
+            }),
+            Notification::ExternalAgent(ExternalAgentEvent::SessionCompleted),
+        ];
+
+        let assertions = assert_notifications(&notifications).external_agent_count(3);
+        let events = assertions.external_agent_events();
+        assert_eq!(events.len(), 3, "every external-agent event is extracted");
+        assert!(
+            matches!(
+                events[0],
+                ExternalAgentEvent::SessionStarted { session_id }
+                    if session_id.as_deref() == Some("s-1")
+            ),
+            "accessor preserves stream order for the first event"
+        );
+        assert!(
+            matches!(events[2], ExternalAgentEvent::SessionCompleted),
+            "accessor preserves stream order for the last event"
+        );
+    }
+
+    #[test]
+    fn external_agent_count_mismatch_lists_stream() {
+        use agent_lib::agent::{ExternalAgentEvent, Notification};
+
+        let notifications = vec![Notification::ExternalAgent(
+            ExternalAgentEvent::SessionCompleted,
+        )];
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_notifications(&notifications).external_agent_count(2);
+        }))
+        .expect_err("a wrong external-agent count must panic");
+        let message = panic
+            .downcast_ref::<String>()
+            .expect("panic payload is a String");
+        assert!(
+            message.contains("expected 2 external agent notification(s), found 1"),
+            "message names the expectation: {message}"
+        );
+        assert!(
+            message.contains("external_agent("),
             "message lists the actual stream: {message}"
         );
     }

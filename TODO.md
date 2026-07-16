@@ -1276,7 +1276,7 @@ resume 后一次性把它们转成 `Notification::ExternalAgent` 吐出(经 `Ste
   可选归集 helper 暴露(machine 只自动记录 `output.artifacts`,保持 sans-io 单一职责)。Milestone 5 review
   属 M5-4。
 
-### [TODO] M5-4 Milestone 5 Review
+### [DONE] M5-4 Milestone 5 Review
 
 **前置依赖**:M5-1..M5-3。
 
@@ -1291,6 +1291,53 @@ resume 后一次性把它们转成 `Notification::ExternalAgent` 吐出(经 `Ste
 
 - 完整验证序列全绿,`cargo test --all --all-targets` 无回归。
 - Review 结论写入「完成记录」。
+
+**完成记录**:
+
+- **observation→notification 顺序与去重(§5.5)——通过。** `fold_session_result`
+  (`src/agent/external/machine.rs:307`)的三个决策点(`Completed`/`PausedForInteraction`/`Failed`)都在
+  **调用 `set_session` 之前**读取 `observe(incoming_seq, observations)`,故对齐游标读的是旧的已消费 seq。
+  `observe`(machine.rs:355):空 observations → 0 条;当本次 `incoming` 与已消费 `consumed` 均为 `Some`
+  且 `incoming <= consumed` 时判定已消费,发 0 条(去重);否则 `into_iter().map(Notification::ExternalAgent)`
+  **按序全发**(顺序保持);任一 seq 缺失(`None`)则无法对齐,按 as-is 全发。`Failed` 用
+  `session.as_ref().and_then(|s| s.last_event_seq)` 取游标,仅 `Some` 时 `set_session`。**结论:顺序保持、
+  去重语义正确,replay 同一决策点不双发。**
+- **artifact 记录不落敏感原文(§11/§12)——通过。** `complete_session`(machine.rs:487)在建好 assistant
+  response 后 `record_artifacts(output.artifacts)`(move,不 clone);state 仅存
+  `ExternalArtifactRef {kind, summary, path, reference}`,`reference` 为 opaque handle(如 `blob://…`),
+  从不内联 diff/log/blob 原文;`ExternalAgentStateRecord` 对空列表 `skip_serializing_if` 保持快照向后兼容。
+  仅 `Completed` 携带 `output`,故 artifacts 只在完成时记录,`Failed` 无 output 不记录。归集 helper
+  `ExternalArtifactRef::from_file_patch` / `collect_file_patch_artifacts`(`src/agent/external/mod.rs`)同样只产
+  引用、不含 diff 原文。**结论:记录的是 redacted ref,不落原文。**
+- **实时旁路不阻塞 continuation(sink.rs)——通过。** `ExternalEventSink::emit(&self, &ExternalAgentEvent)`
+  + `DiscardEventSink` no-op(`src/agent/external/sink.rs`);rustdoc 明确该旁路可丢弃、必须立即返回、不得
+  back-pressure、可整条跳过、事件为 untrusted,并**刻意不接进 sans-io 的 `step`**——唯一能阻塞 continuation
+  的是 `Requirement`,sink 属 handler 层的侧信道。§11 的双路径(`Notification::ExternalAgent` 可跳过 vs
+  `Requirement` 必须 resolve/abandon)与实现一致。**结论:旁路非阻塞、边界清晰。**
+- **`assertions/notifications.rs` 覆盖 `ExternalAgent` 断言——发现缺口并按 class-wide 原则闭合。**
+  复核发现 `NotificationAssertions` 对每个既有 family 都提供 `*_count` 断言与访问器
+  (`llm_count`/`step_boundary_count`/`step_boundary_steps`/`tool_started_count`+`tool_started_calls`/
+  `tool_finished_count`+`tool_finished_calls`),**唯独 `ExternalAgent` 只有 `describe()` 的诊断渲染、没有可断言的
+  count/accessor**(machine 层测试因此只能手写本地 `external_events` matcher)。为使「assertions 能覆盖
+  `ExternalAgent` 断言」成立,补齐同族对称 API:新增 `external_agent_count(expected)` 断言(复用
+  `family_count`,标签 `"external agent"`)与访问器 `external_agent_events(self) -> Vec<&ExternalAgentEvent>`
+  (stream order,`filter_map`);文件头导入 `ExternalAgentEvent`(经 `agent_lib::agent` re-export)。两者带
+  rustdoc,说明其为 §5.5 的 observe-only 事件。新增两个单测:
+  `external_agent_family_is_counted_and_accessible_in_order`(混合流中只计/取本族且保序)、
+  `external_agent_count_mismatch_lists_stream`(count 不匹配时 panic 且诊断含 `external agent … found 1` 与
+  `external_agent(` 流摘要)。
+- **穷尽 `match` 复核**:全库对 `Notification` 的唯一穷尽 `match` 仍是 testkit `describe()`
+  (notifications.rs),已含 `Notification::ExternalAgent(event) => "external_agent({event:?})"` 臂;其余均为
+  `find_map`/`filter_map`(带 `_ => None`)或 `matches!`,无遗漏分派臂。M5-1 的记录仍准确。
+- **验证(完整序列全绿)**:`cargo fmt --all -- --check` 无差异;`cargo clippy --all-targets -- -D warnings`
+  0 告警;`cargo test -p agent-testkit --lib notification` 4 passed(含 2 个新增);
+  `cargo test --all --all-targets` 全绿(lib 475、agent-testkit 138,共 34 个测试二进制 0 failed,
+  credential-gated 集成测试保持 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  0 告警;`git diff --check` 干净。
+- **Milestone 5 review 结论**:event 通道(`observations` → `Notification::ExternalAgent`,按 `last_event_seq`
+  exact-once 去重)与 artifact 通道(`output.artifacts` → `ExternalAgentState` 的 redacted ref 持久化 trace)
+  均与设计 §5.5/§11/§12 一致;阻塞式 `Requirement` 与非阻塞 `ExternalEventSink` 旁路边界清晰、互不污染;
+  testkit 现已对 `ExternalAgent` notification 提供与其他 family 对称的断言能力。**Milestone 5 签核通过。**
 
 ---
 

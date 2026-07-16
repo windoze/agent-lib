@@ -1,45 +1,42 @@
-# M5-3 — artifact ref 记录(patch / diff / test result)
+# M5-4 — Milestone 5 Review(Event sink 与 artifact)
 
-**状态:完成(全绿,已提交)。**
+**状态:完成(全绿,已提交)。** 本次执行 TODO.md 第一个未完成任务 = M5-4(review 任务)。
 
-## 目标(TODO.md M5-3)
-- 落实 `ExternalArtifactRef` 字段(已在 M2-1 定义:kind/summary/path/reference)。
-- machine 完成时把 `ExternalAgentOutput.artifacts` 记录到 state(=可持久化 trace),
-  只记引用与摘要,不落敏感原文(§12 redaction)。
-- 提供把 `FilePatch` event 归集为 artifact 的映射 helper。
+## 任务要求(TODO.md M5-4)
+- 核对 observation→notification 顺序与去重(§5.5);artifact 记录不落敏感原文(§11/§12);
+  实时旁路接口不阻塞 continuation。
+- 确认 `assertions/notifications.rs` 能覆盖新的 `ExternalAgent` notification 断言。
+- 验证:完整验证序列全绿,`cargo test --all --all-targets` 无回归;review 结论写入完成记录。
 
-## 关键事实(已核对)
-- DTO 已就绪:`ExternalArtifactKind {Patch,Diff,TestResult,File,Other}`、
-  `ExternalArtifactRef {kind,summary,path,reference}`、`ExternalAgentOutput.artifacts`(mod.rs)。
-- `ExternalAgentState`(state.rs)字段:spec/conversation/session/cursor/active_tools/cleanup_required。
-  序列化经 `ExternalAgentStateRecord`(deny_unknown_fields)。
-- machine `complete_session`(machine.rs:463)消费 `output`:仅用 summary/usage 建 response,artifacts 被丢弃。
-- Failed 无 output,故 artifacts 仅在 Completed 记录。
-- 无独立 trace 对象;state 是可持久化 trace,notification 流是实时 trace。
+## 复核结论(已核对源码)
+1. **observation→notification 顺序/去重(§5.5)——通过。**
+   - `fold_session_result`(machine.rs:307)三个决策点(Completed/PausedForInteraction/Failed)
+     都在 `set_session` 之前调用 `observe(incoming_seq, observations)`,故读取旧的已消费游标。
+   - `observe`(machine.rs:355):空→空;`incoming<=consumed`(两者都 Some)→判定已消费,发 0 条;
+     否则 `into_iter().map(Notification::ExternalAgent)` 按序全发。任一 seq 缺失→按 as-is 全发。
+   - Failed 用 `session.as_ref().and_then(last_event_seq)`,仅 Some 时 set_session。
+2. **artifact 记录不落原文(§11/§12)——通过。**
+   - `complete_session`(machine.rs:487)`record_artifacts(output.artifacts)`,move,仅存
+     `ExternalArtifactRef{kind,summary,path,reference}`,`reference` opaque(`blob://`)。仅 Completed 记录。
+   - `from_file_patch`/`collect_file_patch_artifacts` 仅产 ref,不含 diff 原文。
+3. **实时旁路不阻塞(sink.rs)——通过。**
+   - `ExternalEventSink::emit` + `DiscardEventSink` no-op;rustdoc 明确可丢弃/不阻塞/可跳过/untrusted,
+     刻意不接进 sans-io `step`——只有 `Requirement` 阻塞 continuation。
+4. **穷尽 match 复核**:全库唯一对 `Notification` 的穷尽 `match` 是 testkit `describe()`(notifications.rs:191),
+   已含 `ExternalAgent` 臂;其余为 `find_map`/`filter_map`。无遗漏。
+
+## 发现的缺口(需闭合,class-wide 一致性)
+`NotificationAssertions` 对每个既有 family 都有 `*_count` 断言 + 访问器,**唯独缺 `ExternalAgent`**:
+`describe()` 只做诊断渲染,没有可断言的 count/accessor。要让 review 结论「能覆盖 ExternalAgent 断言」
+为真,按 class-wide-fix 原则补齐同族断言。
 
 ## 方案
-1. state.rs:`ExternalAgentState` 加 `artifacts: Vec<ExternalArtifactRef>`。
-   - 访问器 `artifacts(&self) -> &[ExternalArtifactRef]`。
-   - `record_artifacts(&mut self, IntoIterator<Item=ExternalArtifactRef>)` 追加。
-   - Record 加字段 `#[serde(default, skip_serializing_if = "Vec::is_empty")]` 保持向后兼容。
-   - new() 初始化空 vec。
-2. mod.rs:
-   - `impl ExternalArtifactRef { pub fn from_file_patch(&ExternalAgentEvent) -> Option<Self> }`
-     (FilePatch → kind=Patch, path/summary/diff_ref→reference;非 FilePatch 返回 None)。
-   - 自由函数 `collect_file_patch_artifacts(&[ExternalAgentEvent]) -> Vec<ExternalArtifactRef>`,再导出。
-3. machine.rs `complete_session`:在建 response 后、settle 前
-   `self.state.record_artifacts(output.artifacts)`(move,只记引用与摘要)。
-   更新 rustdoc 说明记录 artifacts。
-4. 测试:
-   - `external_agent_records_artifacts`(machine/tests.rs):Completed 带 artifacts →
-     `direct.state().artifacts()` 记录正确 ref,且结构上不含原文;空 artifacts 时不记录。
-   - state.rs 单测:artifacts round-trip / 空时不出现在快照。
-   - mod.rs 单测:`from_file_patch` / `collect_file_patch_artifacts` 映射。
-5. 验证序列:fmt --check → `cargo test external_agent_records_artifacts` → clippy -D warnings →
-   全量 test → doc -D warnings → git diff --check。
-6. TODO.md M5-3 标 [DONE] + 完成记录;提交 `[M5-3] ...`,停止。
+1. `crates/agent-testkit/src/assertions/notifications.rs`:
+   - import `ExternalAgentEvent`;新增 `external_agent_count(expected)` + 访问器
+     `external_agent_events() -> Vec<&ExternalAgentEvent>`(stream order);加单测。
+2. 验证:fmt --check → clippy -D warnings → `cargo test -p agent-testkit notification` →
+   `cargo test --all --all-targets`(≤30min)→ doc -D warnings → `git diff --check`。
+3. TODO.md M5-4 标 `[DONE]` + 完成记录;提交 `[M5-4] ...`;停止。
 
 ## 约束
-- 不改既有 record 字段/顺序的 wire 兼容(新增字段可跳过)。
-- machine 保持 sans-io;不记录原文,只记 ref/summary。
-- 新公开 API 带 rustdoc。
+- 只补 testkit 断言对称缺口;不改 machine/state 语义。新公开 API 带 rustdoc。
