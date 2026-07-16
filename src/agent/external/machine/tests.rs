@@ -21,9 +21,9 @@ use crate::agent::{
     StepInput, ToolSetId,
     external::{
         ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalAgentSpec,
-        ExternalAgentState, ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
-        ExternalSessionPolicy, ExternalSessionRef, ExternalSessionResult, ExternalStreamPolicy,
-        WorktreeIsolation,
+        ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef, ExternalPermissionMode,
+        ExternalRuntimeKind, ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef,
+        ExternalSessionResult, ExternalStreamPolicy, WorktreeIsolation,
     },
     spec::{ToolSetRef, WorktreeRef},
 };
@@ -218,6 +218,39 @@ fn observation_batch(tag: &str) -> Vec<ExternalAgentEvent> {
             text: format!("delta-{tag}"),
         },
         ExternalAgentEvent::SessionCompleted,
+    ]
+}
+
+/// A `Completed` result whose output carries `artifacts`.
+fn completed_with_artifacts(artifacts: Vec<ExternalArtifactRef>) -> ExternalSessionResult {
+    ExternalSessionResult::Completed {
+        session: session_ref(),
+        output: ExternalAgentOutput {
+            summary: "refactor complete".to_owned(),
+            artifacts,
+            usage: None,
+            cost_micros: None,
+        },
+        observations: Vec::new(),
+    }
+}
+
+/// A representative set of redacted artifact references: a patch and a test
+/// result, each carrying only a summary plus opaque path/reference handles.
+fn sample_artifacts() -> Vec<ExternalArtifactRef> {
+    vec![
+        ExternalArtifactRef {
+            kind: ExternalArtifactKind::Patch,
+            summary: "tighten parser error recovery".to_owned(),
+            path: Some("src/parser.rs".to_owned()),
+            reference: Some("blob://diff-1".to_owned()),
+        },
+        ExternalArtifactRef {
+            kind: ExternalArtifactKind::TestResult,
+            summary: "cargo test: 12 passed".to_owned(),
+            path: None,
+            reference: Some("blob://test-log-1".to_owned()),
+        },
     ]
 }
 
@@ -730,4 +763,62 @@ fn external_agent_emits_observation_notifications() {
 
     assert_eq!(looped.cursor().kind(), LoopCursorKind::Done);
     assert_eq!(external_events(&final_completed.notifications), final_batch);
+}
+
+#[test]
+fn external_agent_records_artifacts() {
+    // A completed session folds `ExternalAgentOutput.artifacts` into the retained
+    // trace on `ExternalAgentState`, preserving order (design §11).
+    let mut direct = machine();
+    assert!(
+        direct.state().artifacts().is_empty(),
+        "a fresh machine records no artifacts"
+    );
+
+    let opened = direct.step(StepInput::external(user_input("refactor the parser")));
+    let artifacts = sample_artifacts();
+    let completed = direct.step(StepInput::resume(external_resolution(
+        opened.requirements[0].id,
+        completed_with_artifacts(artifacts.clone()),
+    )));
+
+    assert!(completed.is_quiescent());
+    assert_eq!(direct.cursor().kind(), LoopCursorKind::Done);
+    assert_eq!(direct.state().artifacts(), artifacts.as_slice());
+
+    // Only redacted references are recorded — a kind, an untrusted summary, and
+    // opaque path/reference handles — never inline artifact content (§12).
+    for artifact in direct.state().artifacts() {
+        if let Some(reference) = artifact.reference.as_deref() {
+            assert!(
+                reference.starts_with("blob://"),
+                "reference must be an opaque handle, not inline content: {reference}"
+            );
+        }
+    }
+
+    // The recorded references survive the state persistence boundary unchanged.
+    let encoded = serde_json::to_value(direct.state()).expect("serialize state");
+    let decoded: ExternalAgentState = serde_json::from_value(encoded).expect("deserialize state");
+    assert_eq!(decoded.artifacts(), artifacts.as_slice());
+}
+
+#[test]
+fn external_agent_records_no_artifacts_when_output_reports_none() {
+    // A completion with an empty artifact list leaves the recorded trace empty and
+    // keeps the artifacts field absent from the persisted state (backward-compatible
+    // snapshot shape).
+    let mut direct = machine();
+    let opened = direct.step(StepInput::external(user_input("refactor the parser")));
+    direct.step(StepInput::resume(external_resolution(
+        opened.requirements[0].id,
+        completed_with_artifacts(Vec::new()),
+    )));
+
+    assert!(direct.state().artifacts().is_empty());
+    let encoded = serde_json::to_value(direct.state()).expect("serialize state");
+    assert!(
+        encoded.get("artifacts").is_none(),
+        "an empty artifact list is skipped in the snapshot"
+    );
 }

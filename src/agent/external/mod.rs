@@ -360,6 +360,53 @@ pub struct ExternalArtifactRef {
     pub reference: Option<String>,
 }
 
+impl ExternalArtifactRef {
+    /// Derives a [`Patch`](ExternalArtifactKind::Patch) artifact reference from a
+    /// [`FilePatch`](ExternalAgentEvent::FilePatch) observation, or `None` for any
+    /// other event.
+    ///
+    /// A runtime reports each applied/proposed change as a `FilePatch`
+    /// observation; this maps one into the artifact-reference shape a completed
+    /// session records, carrying the affected `path`, the untrusted `summary`,
+    /// and the opaque `diff_ref` (if any) as the stored [`reference`](Self::reference).
+    /// Only these references are copied — never the full diff — so the mapping
+    /// stays redaction-safe (design §11, §12).
+    #[must_use]
+    pub fn from_file_patch(event: &ExternalAgentEvent) -> Option<Self> {
+        match event {
+            ExternalAgentEvent::FilePatch {
+                path,
+                summary,
+                diff_ref,
+            } => Some(Self {
+                kind: ExternalArtifactKind::Patch,
+                summary: summary.clone(),
+                path: Some(path.clone()),
+                reference: diff_ref.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Collects the [`FilePatch`](ExternalAgentEvent::FilePatch) observations in
+/// `events` into [`Patch`](ExternalArtifactKind::Patch) artifact references,
+/// preserving order.
+///
+/// This is a convenience for a handler that wants to fold the patch events it
+/// buffered before a decision point into
+/// [`ExternalAgentOutput::artifacts`](ExternalAgentOutput::artifacts); every
+/// non-`FilePatch` event is ignored. Only artifact references are produced —
+/// never the diffs themselves — keeping the result redaction-safe (design §11,
+/// §12). See [`ExternalArtifactRef::from_file_patch`] for the per-event mapping.
+#[must_use]
+pub fn collect_file_patch_artifacts(events: &[ExternalAgentEvent]) -> Vec<ExternalArtifactRef> {
+    events
+        .iter()
+        .filter_map(ExternalArtifactRef::from_file_patch)
+        .collect()
+}
+
 /// Terminal output of an external session that reached
 /// [`Completed`](ExternalSessionResult::Completed).
 ///
@@ -512,7 +559,7 @@ mod tests {
         ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalArtifactKind,
         ExternalArtifactRef, ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
         ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
-        ExternalStreamPolicy, WorktreeIsolation,
+        ExternalStreamPolicy, WorktreeIsolation, collect_file_patch_artifacts,
     };
     use crate::{
         agent::{AgentId, StepId, interaction::Interaction, spec::WorktreeRef},
@@ -674,5 +721,80 @@ mod tests {
         };
         let encoded = serde_json::to_value(&launch).expect("serialize error");
         assert!(encoded.get("launch").is_some());
+    }
+
+    #[test]
+    fn file_patch_event_maps_to_patch_artifact_ref() {
+        let event = ExternalAgentEvent::FilePatch {
+            path: "src/parser.rs".to_owned(),
+            summary: "tighten error recovery".to_owned(),
+            diff_ref: Some("blob://diff-1".to_owned()),
+        };
+        let artifact = ExternalArtifactRef::from_file_patch(&event).expect("FilePatch maps");
+        assert_eq!(
+            artifact,
+            ExternalArtifactRef {
+                kind: ExternalArtifactKind::Patch,
+                summary: "tighten error recovery".to_owned(),
+                path: Some("src/parser.rs".to_owned()),
+                reference: Some("blob://diff-1".to_owned()),
+            }
+        );
+
+        // A FilePatch without a stored diff still maps, leaving `reference` empty.
+        let no_ref = ExternalAgentEvent::FilePatch {
+            path: "README.md".to_owned(),
+            summary: "note".to_owned(),
+            diff_ref: None,
+        };
+        let artifact = ExternalArtifactRef::from_file_patch(&no_ref).expect("FilePatch maps");
+        assert_eq!(artifact.reference, None);
+        assert_eq!(artifact.path.as_deref(), Some("README.md"));
+
+        // Non-FilePatch events do not map.
+        assert!(
+            ExternalArtifactRef::from_file_patch(&ExternalAgentEvent::SessionCompleted).is_none()
+        );
+    }
+
+    #[test]
+    fn collect_file_patch_artifacts_keeps_only_patches_in_order() {
+        let events = vec![
+            ExternalAgentEvent::SessionStarted { session_id: None },
+            ExternalAgentEvent::FilePatch {
+                path: "a.rs".to_owned(),
+                summary: "first".to_owned(),
+                diff_ref: Some("blob://a".to_owned()),
+            },
+            ExternalAgentEvent::TextDelta {
+                text: "chatter".to_owned(),
+            },
+            ExternalAgentEvent::FilePatch {
+                path: "b.rs".to_owned(),
+                summary: "second".to_owned(),
+                diff_ref: None,
+            },
+            ExternalAgentEvent::SessionCompleted,
+        ];
+        let artifacts = collect_file_patch_artifacts(&events);
+        assert_eq!(
+            artifacts,
+            vec![
+                ExternalArtifactRef {
+                    kind: ExternalArtifactKind::Patch,
+                    summary: "first".to_owned(),
+                    path: Some("a.rs".to_owned()),
+                    reference: Some("blob://a".to_owned()),
+                },
+                ExternalArtifactRef {
+                    kind: ExternalArtifactKind::Patch,
+                    summary: "second".to_owned(),
+                    path: Some("b.rs".to_owned()),
+                    reference: None,
+                },
+            ]
+        );
+
+        assert!(collect_file_patch_artifacts(&[]).is_empty());
     }
 }

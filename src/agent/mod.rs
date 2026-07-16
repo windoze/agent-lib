@@ -51,7 +51,7 @@ pub use external::{
     ExternalArtifactRef, ExternalPermissionMode, ExternalRuntimeHandles, ExternalRuntimeKind,
     ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest,
     ExternalSessionResult, ExternalSessionShutdown, ExternalStreamPolicy, WorkerProfileRef,
-    WorktreeIsolation,
+    WorktreeIsolation, collect_file_patch_artifacts,
 };
 pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};
 pub use interaction::{

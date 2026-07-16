@@ -1214,7 +1214,7 @@ resume 后一次性把它们转成 `Notification::ExternalAgent` 吐出(经 `Ste
   cargo doc --no-deps --workspace` 0 告警;`git diff --check` 干净。
 - 说明:artifact ref 记录(`ExternalAgentOutput.artifacts` → state/trace)属 M5-3,本任务未触及。
 
-### [TODO] M5-3 artifact ref 记录(patch / diff / test result)
+### [DONE] M5-3 artifact ref 记录(patch / diff / test result)
 
 **前置依赖**:M5-2。
 
@@ -1236,6 +1236,45 @@ resume 后一次性把它们转成 `Notification::ExternalAgent` 吐出(经 `Ste
 - 新增测试 `external_agent_records_artifacts`:Completed 带 artifacts,断言 state/trace 记录了正确的
   artifact ref 且不含敏感原文。过滤名:`cargo test external_agent_records_artifacts`。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- `ExternalArtifactRef` 字段已在 M2-1 就绪(`kind: ExternalArtifactKind{Patch,Diff,TestResult,File,Other}`、
+  `summary`、`path`、`reference`),本任务复用并未重命名(设计里 `FilePath` 与既有 `File` 等义,保持 `File`
+  以免破坏已导出 API)。
+- `src/agent/external/state.rs`:`ExternalAgentState` 新增 `artifacts: Vec<ExternalArtifactRef>` 字段,
+  作为可持久化 trace(本库无独立 trace 对象,state 即持久化 trace,notification 流为实时 trace)。新增只读
+  访问器 `artifacts(&self) -> &[ExternalArtifactRef]` 与追加式 `record_artifacts<I: IntoIterator<Item=
+  ExternalArtifactRef>>(&mut self, I)`(均带 rustdoc,强调只存引用/摘要、不落原文,符合 §11/§12)。
+  `ExternalAgentStateRecord` 加同名字段,`#[serde(default, skip_serializing_if = "Vec::is_empty")]` 保持
+  空列表时快照 byte-for-byte 向后兼容;`new`/`from_record`/`Serialize` 同步初始化与透传。
+- `src/agent/external/machine.rs`:`complete_session` 在建好 assistant response 后、commit turn 前调用
+  `self.state.record_artifacts(output.artifacts)`(move,不 clone),把完成态输出的 artifacts 折进 state。
+  仅 `Completed` 携带 `output`,故 artifacts 只在完成时记录;`Failed` 无 output 不记录。更新模块头 `Completed`
+  条目与 `complete_session` rustdoc,说明记录的是 redacted ref(§11/§12)。
+- `src/agent/external/mod.rs`:新增 `impl ExternalArtifactRef { pub fn from_file_patch(&ExternalAgentEvent)
+  -> Option<Self> }`(`FilePatch{path,summary,diff_ref}` → `kind=Patch`、`path=Some(path)`、
+  `reference=diff_ref`;非 FilePatch 返回 `None`)与自由函数 `collect_file_patch_artifacts(&[
+  ExternalAgentEvent]) -> Vec<ExternalArtifactRef>`(按序过滤映射 FilePatch),经 `external::*` 与
+  `crate::agent::*` 再导出;两者 rustdoc 强调只产引用、不含 diff 原文。
+- 新增/覆盖测试:
+  - `src/agent/external/machine/tests.rs`:`external_agent_records_artifacts`(过滤名匹配)——Completed 带
+    patch+test-result 两条 artifacts → `state().artifacts()` 顺序/内容正确;断言 `reference` 均为 `blob://`
+    opaque handle(非内联原文);state serde round-trip 后 artifacts 不变。另加
+    `external_agent_records_no_artifacts_when_output_reports_none`——空列表不记录且快照省略 `artifacts` 键。
+    配套 helper `completed_with_artifacts` / `sample_artifacts`。
+  - `src/agent/external/mod.rs` tests:`file_patch_event_maps_to_patch_artifact_ref`(含无 diff_ref 与
+    非 FilePatch 分支)、`collect_file_patch_artifacts_keeps_only_patches_in_order`(顺序保留、空输入)。
+  - `src/agent/external/state.rs` tests:`recorded_artifacts_accumulate_and_round_trip_and_skip_when_empty`
+    ——多次 `record_artifacts` 累积保序、空列表快照省略、round-trip 相等。
+- 验证(默认完整序列全绿):`cargo fmt --all -- --check` 无差异;`cargo test --lib -- external_agent_records
+  file_patch collect_file_patch recorded_artifacts` 全 passed;`cargo clippy --all-targets -- -D warnings`
+  0 告警;`cargo test --all --all-targets` 全绿(合计 694 passed、0 failed,含 lib/testkit/集成,
+  credential-gated 保持 ignored);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 0 告警;
+  `git diff --check` 干净。
+- 说明:artifact 只记 ref/summary、不落原文,`from_file_patch`/`collect_file_patch_artifacts` 作为 handler
+  可选归集 helper 暴露(machine 只自动记录 `output.artifacts`,保持 sans-io 单一职责)。Milestone 5 review
+  属 M5-4。
 
 ### [TODO] M5-4 Milestone 5 Review
 

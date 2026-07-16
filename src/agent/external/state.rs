@@ -11,7 +11,7 @@
 use crate::{
     agent::{
         CursorRequirement,
-        external::{ExternalAgentSpec, ExternalSessionRef},
+        external::{ExternalAgentSpec, ExternalArtifactRef, ExternalSessionRef},
         spec::ToolSetRef,
     },
     conversation::{Conversation, ConversationError, ConversationSnapshot},
@@ -87,12 +87,12 @@ impl ExternalAgentCursor {
 /// The state owns one active [`Conversation`] and records only resumable facts:
 /// the static [`ExternalAgentSpec`], the [`ExternalSessionRef`] needed to realign
 /// with the runtime across restarts, the active tool declarations, the recovery
-/// [`ExternalAgentCursor`], and a pending-cleanup flag a never-resume abandon
-/// raises so the handle layer knows it still owes an orphaned session a
-/// force-close (design §6.4). Serialization crosses the Conversation persistence
-/// boundary via [`Conversation::snapshot`]; deserialization rebuilds the live
-/// Conversation via [`Conversation::restore`]. Runtime handles never appear in
-/// this shape.
+/// [`ExternalAgentCursor`], the [`ExternalArtifactRef`] list a completed session
+/// reported, and a pending-cleanup flag a never-resume abandon raises so the
+/// handle layer knows it still owes an orphaned session a force-close (design
+/// §6.4). Serialization crosses the Conversation persistence boundary via
+/// [`Conversation::snapshot`]; deserialization rebuilds the live Conversation via
+/// [`Conversation::restore`]. Runtime handles never appear in this shape.
 #[derive(Debug)]
 pub struct ExternalAgentState {
     spec: ExternalAgentSpec,
@@ -100,6 +100,7 @@ pub struct ExternalAgentState {
     session: Option<ExternalSessionRef>,
     cursor: ExternalAgentCursor,
     active_tools: ToolSetRef,
+    artifacts: Vec<ExternalArtifactRef>,
     cleanup_required: bool,
 }
 
@@ -118,6 +119,7 @@ impl ExternalAgentState {
             session: None,
             cursor: ExternalAgentCursor::Idle,
             active_tools,
+            artifacts: Vec::new(),
             cleanup_required: false,
         }
     }
@@ -178,6 +180,33 @@ impl ExternalAgentState {
         self.active_tools = active_tools;
     }
 
+    /// Returns the artifact references recorded from completed sessions, in the
+    /// order they were reported.
+    ///
+    /// Each entry is only a redacted [`ExternalArtifactRef`] — a kind, an
+    /// untrusted summary, and opaque path/reference handles — never the artifact
+    /// content itself (full diff, test log, file blob), keeping large or
+    /// sensitive payloads out of the persisted state (design §11, §12).
+    #[must_use]
+    pub fn artifacts(&self) -> &[ExternalArtifactRef] {
+        &self.artifacts
+    }
+
+    /// Appends artifact references a completed session reported, in order.
+    ///
+    /// The [`ExternalAgentMachine`](super::ExternalAgentMachine) calls this when a
+    /// session reaches [`Completed`](super::ExternalSessionResult::Completed) to
+    /// fold [`ExternalAgentOutput::artifacts`](super::ExternalAgentOutput::artifacts)
+    /// into the retained trace. Only the references are stored — never the
+    /// underlying content — so the persisted state stays redaction-safe (design
+    /// §12).
+    pub fn record_artifacts<I>(&mut self, artifacts: I)
+    where
+        I: IntoIterator<Item = ExternalArtifactRef>,
+    {
+        self.artifacts.extend(artifacts);
+    }
+
     /// Returns `true` when a never-resume abandon left an external session the
     /// handle layer still owes a force-close.
     ///
@@ -217,6 +246,7 @@ impl ExternalAgentState {
             session: record.session,
             cursor: record.cursor,
             active_tools: record.active_tools,
+            artifacts: record.artifacts,
             cleanup_required: record.cleanup_required,
         })
     }
@@ -234,6 +264,7 @@ impl Serialize for ExternalAgentState {
             session: self.session.clone(),
             cursor: self.cursor.clone(),
             active_tools: self.active_tools.clone(),
+            artifacts: self.artifacts.clone(),
             cleanup_required: self.cleanup_required,
         }
         .serialize(serializer)
@@ -260,6 +291,8 @@ struct ExternalAgentStateRecord {
     #[serde(default)]
     cursor: ExternalAgentCursor,
     active_tools: ToolSetRef,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    artifacts: Vec<ExternalArtifactRef>,
     #[serde(default, skip_serializing_if = "is_false")]
     cleanup_required: bool,
 }
@@ -278,9 +311,9 @@ mod tests {
         agent::{
             AgentId, AgentPath, AgentSlot, CursorRequirement, RequirementId, ToolSetId,
             external::{
-                ExternalAgentSpec, ExternalPermissionMode, ExternalRuntimeKind,
-                ExternalSessionPolicy, ExternalSessionRef, ExternalStreamPolicy, WorkerProfileRef,
-                WorktreeIsolation,
+                ExternalAgentSpec, ExternalArtifactKind, ExternalArtifactRef,
+                ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionPolicy,
+                ExternalSessionRef, ExternalStreamPolicy, WorkerProfileRef, WorktreeIsolation,
             },
             spec::{ToolSetRef, WorktreeRef},
         },
@@ -586,5 +619,46 @@ mod tests {
         let mut swept = decoded;
         swept.clear_cleanup_required();
         assert!(!swept.cleanup_required());
+    }
+
+    #[test]
+    fn recorded_artifacts_accumulate_and_round_trip_and_skip_when_empty() {
+        let mut state = ExternalAgentState::new(spec(), committed_conversation());
+        assert!(state.artifacts().is_empty());
+
+        // An empty artifact list is skipped in the snapshot, preserving the
+        // pre-M5-3 shape.
+        let clean = serde_json::to_value(&state).expect("serialize clean state");
+        assert!(
+            clean
+                .as_object()
+                .expect("object")
+                .get("artifacts")
+                .is_none(),
+            "an empty artifact list must be skipped"
+        );
+
+        let patch = ExternalArtifactRef {
+            kind: ExternalArtifactKind::Patch,
+            summary: "refactor".to_owned(),
+            path: Some("src/parser.rs".to_owned()),
+            reference: Some("blob://diff-1".to_owned()),
+        };
+        let test_result = ExternalArtifactRef {
+            kind: ExternalArtifactKind::TestResult,
+            summary: "12 passed".to_owned(),
+            path: None,
+            reference: Some("blob://test-1".to_owned()),
+        };
+
+        // Recording accumulates across calls, preserving order.
+        state.record_artifacts([patch.clone()]);
+        state.record_artifacts([test_result.clone()]);
+        assert_eq!(state.artifacts(), [patch.clone(), test_result.clone()]);
+
+        let encoded = serde_json::to_value(&state).expect("serialize state");
+        let decoded: ExternalAgentState =
+            serde_json::from_value(encoded).expect("deserialize state");
+        assert_eq!(decoded.artifacts(), [patch, test_result]);
     }
 }

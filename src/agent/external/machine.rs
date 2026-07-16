@@ -18,8 +18,12 @@
 //!   [`Start`](ExternalSessionInput::Start) when no session exists yet and
 //!   [`Continue`](ExternalSessionInput::Continue) to advance an established one.
 //! - `step(Resume(ExternalSession(Completed)))` records the resumable session
-//!   facts, folds the runtime's terminal output into committed history, and
-//!   settles the cursor on [`Done`](ExternalAgentCursor::Done).
+//!   facts, folds the runtime's terminal output into committed history, records
+//!   the reported [`ExternalArtifactRef`](super::ExternalArtifactRef) list into
+//!   the retained trace via
+//!   [`ExternalAgentState::record_artifacts`](ExternalAgentState::record_artifacts)
+//!   (references only, never inline content — design §11, §12), and settles the
+//!   cursor on [`Done`](ExternalAgentCursor::Done).
 //! - `step(Resume(ExternalSession(Failed)))` records any retained session facts
 //!   and settles the cursor on [`Error`](ExternalAgentCursor::Error).
 //! - `step(Resume(ExternalSession(PausedForInteraction)))` records the session
@@ -460,6 +464,13 @@ impl ExternalAgentMachine {
     }
 
     /// Records the terminal output, commits the turn, and settles on `Done`.
+    ///
+    /// The runtime's reported [`ExternalArtifactRef`](super::ExternalArtifactRef)
+    /// list is folded into the retained trace via
+    /// [`ExternalAgentState::record_artifacts`] before the turn commits. Only the
+    /// artifact references (kind, summary, opaque path/reference) are stored — the
+    /// underlying diff/log/blob is never inlined — keeping the persisted state
+    /// redaction-safe (design §11, §12).
     fn complete_session(
         &mut self,
         session: ExternalSessionRef,
@@ -473,6 +484,7 @@ impl ExternalAgentMachine {
         self.state.set_session(Some(session));
 
         let response = assistant_response(&output);
+        self.state.record_artifacts(output.artifacts);
         if let Err(error) = self
             .state
             .conversation_mut()
