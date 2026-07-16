@@ -52,9 +52,10 @@ use crate::{
         ToolWaitRequirements, approval::approval_response_for_decision,
     },
     conversation::{
-        CancelDisposition, CancelledToolResult, MessageId, ToolCallId, ToolCallMapping,
+        CancelDisposition, CancelledToolResult, ConversationMessage, MessageId, PendingTurn,
+        ToolCallId, ToolCallMapping,
     },
-    model::{content::ContentBlock, tool::ToolCall},
+    model::{content::ContentBlock, message::Role, tool::ToolCall},
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -78,6 +79,64 @@ impl InFlight {
         Self {
             assistant_message_id,
             steps_started: 1,
+            tools: None,
+        }
+    }
+
+    /// Reconstructs in-flight scratch from persisted turn facts, anchoring on a
+    /// frozen assistant message rather than the (non-serialized) live scratch.
+    ///
+    /// This is the [`InFlight`] half of
+    /// [`rebuild_scratch_from_state`](super::DefaultAgentMachine::rebuild_scratch_from_state)
+    /// (effect-refine doc §3.4). Under 落点 2 the scratch is intentionally not
+    /// serialized, so a machine parked mid-turn re-derives it from the durable
+    /// [`Conversation`](crate::conversation::Conversation) pending transaction.
+    /// Two pieces are recoverable from committed facts and rebuilt here:
+    ///
+    /// - `assistant_message_id`: the id of the most recently *frozen* assistant
+    ///   message. For an [`AwaitingTool`](crate::agent::LoopCursor::AwaitingTool)
+    ///   / [`AwaitingApproval`](crate::agent::LoopCursor::AwaitingApproval) park
+    ///   this is exactly the tool-use step that is in flight; for a *continuation*
+    ///   [`StreamingStep`](crate::agent::LoopCursor::StreamingStep) it is the
+    ///   previous step's assistant (an anchor, not the outstanding step's yet
+    ///   un-minted id — see the limitation below).
+    /// - `steps_started`: the count of frozen assistant messages plus one when a
+    ///   fresh assistant is still outstanding (`awaiting_unfrozen_assistant`),
+    ///   i.e. a `StreamingStep` whose LLM response has not been folded.
+    ///
+    /// # Limitations under 落点 2
+    ///
+    /// - The active [`ToolPhase`] (`running` / `awaiting_approval` detail) is
+    ///   *not* reconstructed (`tools: None`): mid-batch precise recovery is a
+    ///   driver/persistence concern deferred to M3+ (see the module docs and
+    ///   effect-refine doc §3.5). A rebuilt in-tool park is therefore a faithful
+    ///   *phase marker*, not a resumable tool batch.
+    /// - The pre-allocated `MessageId` a `StreamingStep` will assign to its
+    ///   outstanding (still un-frozen) assistant is host-supplied and not
+    ///   persisted, so it cannot be recovered. A first LLM step (only the user
+    ///   message frozen, no assistant to anchor on) therefore returns [`None`];
+    ///   the driver re-establishes that identity on restore.
+    pub(super) fn rebuild_from_pending(
+        pending: &PendingTurn,
+        awaiting_unfrozen_assistant: bool,
+    ) -> Option<Self> {
+        let frozen_assistant_ids: Vec<MessageId> = pending
+            .messages()
+            .iter()
+            .filter(|message| message.payload().role == Role::Assistant)
+            .map(ConversationMessage::id)
+            .collect();
+        let anchor = *frozen_assistant_ids.last()?;
+        let steps_started =
+            frozen_assistant_ids.len() as u32 + u32::from(awaiting_unfrozen_assistant);
+        Some(Self::restored(anchor, steps_started))
+    }
+
+    /// Builds restored in-flight scratch with no active tool phase.
+    fn restored(assistant_message_id: MessageId, steps_started: u32) -> Self {
+        Self {
+            assistant_message_id,
+            steps_started,
             tools: None,
         }
     }

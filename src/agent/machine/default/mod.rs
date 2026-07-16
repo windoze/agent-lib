@@ -381,8 +381,118 @@ impl DefaultAgentMachine {
         }
     }
 
+    /// Reconstructs the mid-turn [`TurnScratch`] from the durable
+    /// [`AgentState`] so it is aligned to the current [`LoopCursor`] phase.
+    ///
+    /// The scratch (`InFlight` / `PendingReconfig`) is intentionally *not*
+    /// serialized (落点 2): a machine parked mid-turn re-derives it from the
+    /// persistent [`Conversation`](crate::conversation::Conversation) pending
+    /// transaction and the reconfiguration queue rather than from a deserialized
+    /// scratch (effect-refine doc §3.4). This makes that re-derivation an
+    /// explicit, testable operation instead of the implicit "cursor and scratch
+    /// stay aligned" convention: after it runs, [`TurnScratch::matches_cursor`]
+    /// holds for every phase whose scratch is derivable from committed facts.
+    ///
+    /// Reconstruction is phase-directed:
+    ///
+    /// - [`StreamingStep`](LoopCursor::StreamingStep) /
+    ///   [`AwaitingTool`](LoopCursor::AwaitingTool) /
+    ///   [`AwaitingApproval`](LoopCursor::AwaitingApproval): rebuild an
+    ///   [`InFlight`] anchored on the pending turn's frozen assistant messages
+    ///   via [`InFlight::rebuild_from_pending`]. A `StreamingStep` awaits a fresh
+    ///   (still un-frozen) assistant, so `awaiting_unfrozen_assistant` is `true`
+    ///   there and `false` for the tool/approval parks whose step is already
+    ///   frozen.
+    /// - [`AwaitingReconfig`](LoopCursor::AwaitingReconfig): replan the deferred
+    ///   application from the persisted [`queued_reconfigs`](AgentState::queued_reconfigs)
+    ///   and rebuild the [`PendingReconfig`]. The cursor's committing `step_id`
+    ///   distinguishes a during-turn [`PendingReconfig::Commit`] (whose
+    ///   `records` are re-rendered from the application, so they need no
+    ///   persistence) from a start-of-turn `BeginTurn`.
+    /// - [`Idle`](LoopCursor::Idle) /
+    ///   [`CancelRecovery`](LoopCursor::CancelRecovery) /
+    ///   [`Done`](LoopCursor::Done) / [`Error`](LoopCursor::Error): no turn is in
+    ///   flight, so the scratch is [`TurnScratch::None`].
+    ///
+    /// # Limitations under 落点 2
+    ///
+    /// The active [`ToolPhase`](tools) detail is not reconstructed (`tools:
+    /// None`; see [`InFlight::rebuild_from_pending`]), so a rebuilt in-tool park
+    /// is a faithful phase marker rather than a resumable batch. Two parks
+    /// additionally depend on host-supplied inputs that are not persisted and so
+    /// are left as [`TurnScratch::None`] for the driver to re-establish: a
+    /// `StreamingStep` on its very first LLM step (no frozen assistant to anchor,
+    /// and the outstanding assistant's id is not yet minted) and a start-of-turn
+    /// reconfiguration whose queued [`AgentUserInput`] is not persisted (its
+    /// cursor carries no committing `step_id`). The fully round-tripping restore
+    /// is therefore the during-turn `AwaitingReconfig` boundary.
+    fn rebuild_scratch_from_state(&mut self) -> Result<(), StepError> {
+        self.scratch = match self.state.loop_cursor() {
+            LoopCursor::StreamingStep(_) => self.rebuild_in_flight_scratch(true),
+            LoopCursor::AwaitingTool(_) | LoopCursor::AwaitingApproval(_) => {
+                self.rebuild_in_flight_scratch(false)
+            }
+            LoopCursor::AwaitingReconfig(cursor) => {
+                let step_id = cursor.step_id();
+                self.rebuild_reconfig_scratch(step_id)?
+            }
+            LoopCursor::Idle
+            | LoopCursor::CancelRecovery(_)
+            | LoopCursor::Done(_)
+            | LoopCursor::Error(_) => TurnScratch::None,
+        };
+        Ok(())
+    }
+
+    /// Rebuilds [`TurnScratch::InTurn`] from the pending turn, or
+    /// [`TurnScratch::None`] when no frozen assistant anchors it (see
+    /// [`InFlight::rebuild_from_pending`] for the anchor and `tools: None`
+    /// limitations).
+    fn rebuild_in_flight_scratch(&self, awaiting_unfrozen_assistant: bool) -> TurnScratch {
+        match self.state.conversation().pending() {
+            Some(pending) => InFlight::rebuild_from_pending(pending, awaiting_unfrozen_assistant)
+                .map_or(TurnScratch::None, TurnScratch::InTurn),
+            None => TurnScratch::None,
+        }
+    }
+
+    /// Rebuilds a deferred [`PendingReconfig`] from the persisted reconfiguration
+    /// queue, or [`TurnScratch::None`] when the queue is empty or the park is a
+    /// non-reconstructable start-of-turn reconfiguration (see the
+    /// [`rebuild_scratch_from_state`](Self::rebuild_scratch_from_state) doc).
+    fn rebuild_reconfig_scratch(&self, step_id: Option<StepId>) -> Result<TurnScratch, StepError> {
+        let Some(application) = self.state.queued_reconfig_application()? else {
+            return Ok(TurnScratch::None);
+        };
+        // A during-turn commit records its committing step on the cursor; a
+        // start-of-turn `BeginTurn` does not, and its queued user input is not
+        // persisted, so only the during-turn `Commit` is reconstructable.
+        let Some(step_id) = step_id else {
+            return Ok(TurnScratch::None);
+        };
+        let records = reconfig_boundary_records(application.requests());
+        Ok(TurnScratch::Reconfig(PendingReconfig::Commit {
+            step_id,
+            application,
+            records,
+        }))
+    }
+
     /// Opens a fresh user turn and blocks on one `NeedLlm` requirement.
     fn begin_user_turn(&mut self, user: AgentUserInput) -> Result<StepOutcome, StepError> {
+        // Re-derive the mid-turn scratch from the persisted state at this turn
+        // boundary so it is aligned to the cursor phase before the next turn
+        // opens. This is the explicit stand-in for the former implicit
+        // assumption that the scratch was already `None` here (effect-refine doc
+        // §3.4): a machine reused across turns rests at `Idle` / `Done` / `Error`
+        // (all `TurnScratch::None`), and a machine handed a persisted state
+        // rebuilds whatever its cursor implies.
+        self.rebuild_scratch_from_state()?;
+        debug_assert!(
+            self.scratch.matches_cursor(self.state.loop_cursor()),
+            "begin_user_turn: turn scratch phase must match the loop cursor phase"
+        );
+
         // A completed or errored turn settles the cursor at a terminal rest state
         // (`Done` / `Error`). The same machine is reused across turns, so a new
         // user message supersedes that finished turn: reset the cursor to the
@@ -399,9 +509,11 @@ impl DefaultAgentMachine {
 
         // A never-resume abandon of a tool batch leaves a *coherent* pending turn
         // (its dangling tool_use closed by synthesized `Cancelled` results) with
-        // the cursor settled at `Idle`. A new user turn supersedes that
-        // interrupted turn, so discard the leftover transaction before
-        // `begin_turn` opens the next one (which rejects a second open pending).
+        // the cursor settled at `Idle`. This is the same consistency definition
+        // `rebuild_scratch_from_state` encodes: an `Idle` cursor carries
+        // `TurnScratch::None` (no in-flight assistant), so any leftover pending
+        // is a superseded transaction. Discard it before `begin_turn` opens the
+        // next one (which rejects a second open pending).
         if matches!(self.state.loop_cursor(), LoopCursor::Idle)
             && self.state.conversation().pending().is_some()
         {

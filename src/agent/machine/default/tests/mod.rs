@@ -475,4 +475,5 @@ fn abandon_without_outstanding_requirement_fails() {
 }
 
 mod reconfig;
+mod restore;
 mod tools;
