@@ -49,3 +49,41 @@
 - fmt/clippy 均通过;`src/` 无改动;`git diff --check` 干净。
 - TODO.md M1-1 标 [DONE] 并写完成记录（M1-2 heading 已确认完好)。
 - 下一步:提交 [M1-1],停止;下轮从 M1-2 继续。
+
+---
+
+# 当前任务：M1-2 记录 spike 结论（doc-only）
+
+## 定位
+- `TODO.md` 首个未完成任务 = **M1-2**（第 90 行 `[TODO]`）。M1-1 已 `[DONE]` 且已提交（HEAD=320dcb4）。
+- 纯文档任务：在 `docs/external-agent.md` §15 之后新增「附录 A：Phase 0 spike 结论」。
+
+## 做什么
+- 记录 spike 四类实测结论：启动方式 / 流 decoder 形态 / 取消行为 / 成本量级，及对后续 DTO/handler 设计影响。
+- ≥3 条对 Milestone 2（M2-1..M2-5）的具体、可操作影响。
+- 对与文档不一致处以「(spike 修正)」脚注标注（§3.1 fold 有损、§5.5 行解码不足），不删原文。
+
+## 依据
+- spike 源码 `examples/external_cli_spike.rs`（reader task + mpsc、tokio::select! 轮询 is_cancelled、start_kill+wait、fold 词数估算 usage、env SPIKE_PROMPT 透传 prompt）。
+- 相关章节：§3.1、§4.3、§5.5、§6.4、§14。
+
+## 验证门
+- Markdown 无断链；`git diff --check` 干净。
+- 仅改文档（无 src/ 变更），可复用上次全量测试绿；仍跑 fmt/clippy 无害快速校验（可选）。
+
+## 进度
+- (进行中) 已读 spike 源码与 §3.1/§5.5/§6.4/§13/§14/§15，开始写附录。
+
+## 进度更新（M1-2 完成）
+- `docs/external-agent.md` §15 后新增「附录 A：Phase 0 spike 结论」（A.1 启动/A.2 decoder/A.3 取消/A.4 成本 + A.5 对 M2 的 5 条可操作影响 + A.6 go/no-go=Go）。
+- §3.1、§5.5 各加「(spike 修正)」引用块，未删原文。
+- TODO.md M1-2 标 [DONE] 并写完成记录；M1-3 heading 完好。
+- 纯文档改动、`git diff --check` 干净、无断链；复用上次全量绿，跳过 cargo test。
+- 下一步：提交 [M1-2]，停止；下轮从 M1-3 继续。
+
+## 进度更新（M1-2 完成）
+- docs/external-agent.md §15 后新增「附录 A：Phase 0 spike 结论」（A.1 启动/A.2 decoder/A.3 取消/A.4 成本 + A.5 对 M2 的 5 条可操作影响 + A.6 go/no-go=Go）。
+- §3.1、§5.5 各加「(spike 修正)」引用块，未删原文。
+- TODO.md M1-2 标 [DONE] 并写完成记录；M1-3 heading 完好。
+- 纯文档改动、git diff --check 干净、无断链；复用上次全量绿，跳过 cargo test。
+- 下一步：提交 [M1-2]，停止；下轮从 M1-3 继续。

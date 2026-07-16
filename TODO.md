@@ -87,7 +87,7 @@ pub trait LlmHandler: Send + Sync {
   `cargo fmt --all -- --check` 无差异;`cargo clippy --all-targets -- -D warnings` 无告警;
   `git status` 显示 `src/` 无改动;`git diff --check` 干净。(本任务仅要求 fmt+clippy+run,未跑全量测试套件。)
 
-### [TODO] M1-2 记录 spike 结论
+### [DONE] M1-2 记录 spike 结论
 
 **前置依赖**:M1-1。
 
@@ -106,6 +106,27 @@ pub trait LlmHandler: Send + Sync {
 
 - `docs/external-agent.md` 新增附录,结论明确、可操作(至少列出 3 条对 Milestone 2 的具体影响)。
 - Markdown 渲染无断链;`git diff --check` 干净。
+
+**完成记录**:
+
+- 在 `docs/external-agent.md` §15 之后新增「附录 A:Phase 0 spike 结论」,依据 M1-1 的
+  `examples/external_cli_spike.rs` 实测,分四类记录结论:
+  - **A.1 启动方式**:`tokio::process::Command`(stdin=null / stdout=piped / stderr=null /
+    `kill_on_drop`)、prompt 经 env 透传只是权宜;结论——`ExternalSessionRequest::Start` 应把 prompt
+    当纯数据、不焊死投递通道。
+  - **A.2 流 decoder 形态**:reader task + 有界 `mpsc` + `tokio::select!` 竞速验证 §5.5 后台缓冲模型,
+    但逐行纯文本解码不足;结论——`ExternalAgentEvent` 必须是结构化枚举,decoder/进程归 runtime handle 长存。
+  - **A.3 取消行为**:10ms 轮询 `is_cancelled` → `start_kill()`+`wait()`,证实 §6.4 never-resume;
+    结论——清理走 handler/runtime handle 的 `Drop`,结果 DTO 需显式 shutdown disposition。
+  - **A.4 成本量级**:fold usage 为词数粗估、黑盒文本拿不到真实 token/成本;结论——`ExternalSessionResult`
+    需独立 usage/cost 字段(runtime 自报或标记未知)。
+- **对 Milestone 2 的具体影响**:附录 A.5 列出 5 条可操作项(覆盖 M2-1 DTO 字段、M2-2 三态 + observations、
+  M2-3 长存 runtime handle + Drop 清理、M2-4 scripted handler 禁真实进程/sleep、§14 未定问题回填),
+  超过"至少 3 条"要求;A.6 给出 Milestone 2 go/no-go(Go,且核心库不引入真实进程依赖)。
+- 对 spike 修正的两处假设以「(spike 修正,见附录 A)」引用块标注,未删原文:§3.1(fold 有损,
+  无 per-event usage / 无 permission 表达)、§5.5(逐行文本解码不足,event 须结构化、reader 归 runtime handle)。
+- 验证:纯文档改动(仅 `docs/external-agent.md`,`src/` 无变更),`git diff --check` 干净、无断链;
+  按 PROMPT「仅文档改动可复用上次全量绿结果」跳过全量 `cargo test`(自上次绿以来无编译产物变化)。
 
 ### [TODO] M1-3 Milestone 1 Review
 

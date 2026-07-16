@@ -80,6 +80,10 @@ interaction 或新的 orchestration runtime。
 允许一个低保真 adapter 把 Claude Code/Codex 流式输出 fold 成 `RequirementResult::Llm(Response)`,
 用于快速试验。但这只是兼容层,不是目标设计。
 
+> (spike 修正,见附录 A) Phase 0 实测证实 fold 可跑通,但**有损**:折叠后的 `Response`
+> 无法承载 per-event usage/成本、也无法表达 permission 请求这类决策点,进一步印证它只能作为
+> 一次性兼容层,不能沿用为目标 DTO。
+
 目标设计中:
 
 ```text
@@ -394,6 +398,12 @@ session 是**持续流式**的:一个 turn 内会吐大量 text/command/patch ev
 需要显式调和,否则 handler 要么阻塞住整条流,要么被迫在 effect 边界外偷偷调用 `InteractionHandler`。
 
 约定的模型是:**handler 在后台 task 上跑 session,把 event 缓冲,只在"下一个决策点"返回一次 result。**
+
+> (spike 修正,见附录 A) Phase 0 用「独立 reader task + `mpsc` + `tokio::select!`」原型验证了这条
+> 后台缓冲模型:`mpsc::Receiver::recv` 的 cancel-safe 特性让"投递增量"与"侦测取消"可以安全竞速。
+> 但 spike 的**逐行文本**解码不足以表达结构化 event(text/command/patch/permission),目标
+> `ExternalAgentEvent` 必须是从帧解码出的结构化枚举,且 reader task 应归 runtime handle 长期持有,
+> 而非每次兑现 `NeedExternalSession` 重开子进程。
 
 - `ExternalSessionHandler` 兑现 `NeedExternalSession` 时,不是同步跑到 session 结束,而是把 session
   推进到**下一个决策点**:`Completed`(本轮无更多输入需求)、`PausedForInteraction`(需要审批/澄清)、
@@ -736,3 +746,79 @@ External agent 的正确抽象层次是:
 
 这样 cheap model、premium coding agent、内部 agent、外部 CLI agent 可以在同一个程序里协作,同时保留
 effect-model 的核心价值:可暂停、可恢复、可测试、可审计、可按动态作用域组合 handler。
+
+## 附录 A:Phase 0 spike 结论
+
+> 来源:Milestone 1 / 任务 M1-1 的低保真 spike(`examples/external_cli_spike.rs`,可用
+> `cargo run --example external_cli_spike` 复现)。spike 用 `sh -c` stub 脚本占位外部 CLI,
+> 全程离线、无真实 Claude Code/Codex/OpenCode、无网络与 credentials,只用现有 `LlmHandler`
+> 边界观察一个进程外 runtime 如何插入。本附录把实测结论回灌到设计假设,指导 Milestone 2+ 的取舍;
+> 附录只追加、不修改上文既有结论。
+
+### A.1 启动方式
+
+- 实测:以 `tokio::process::Command` 拉起子进程,`stdin=null`、`stdout=piped`、`stderr=null`、
+  `kill_on_drop(true)`;请求 prompt 经 `SPIKE_PROMPT` env 透传给 stub。进程 spawn 是廉价、同步的,
+  失败以 `ClientError::Other` 表达。
+- 观察:env 透传 prompt 只是 spike 便宜行事——真实 CLI 各家投递入口不同(argv / stdin / 配置文件 /
+  `--prompt-file`),不该把"单一投递通道"焊进 DTO。prompt 应作为**数据**留在 request 里,由 handler
+  决定落到哪个通道。
+- 对设计的影响:`ExternalSessionRequest::Start` 需承载 prompt(及可选投递提示)作为纯数据;进程持有权、
+  `kill_on_drop`、spawn 失败到 `ExternalAgentError` 的映射归 `ExternalSessionHandler` / runtime handle。
+
+### A.2 流 decoder 形态
+
+- 实测:独立 reader task 用 `BufReader::lines()` 逐行读 stdout,经**有界 `mpsc`**(cap 16)把每行投递给
+  主循环;主循环 `tokio::select!` 让"收增量"与"轮询取消"竞速。`recv()` cancel-safe,不会丢半行。
+  Streaming 模式下每行打印 `[stream +N]`,EOF 后把累计文本 fold 成一个 `Response`。
+- 观察:"后台 task 缓冲 + 决策点返回一次 result"的形态(§5.5)成立且顺手。但**逐行纯文本**解码把
+  text/command/patch/permission 混为一谈,无法表达权限请求这类决策点;真实 CLI 多为 JSON 事件流
+  (可能多行成帧),不是裸文本行。此外 spike 每个场景**重开一个子进程**,没有跨兑现存活的 session。
+- 对设计的影响:`ExternalAgentEvent` 必须是从帧解码的**结构化枚举**;reader/decoder 与进程应由
+  runtime handle(§4.3)长期持有、跨多次 `NeedExternalSession` 兑现存活,`last_event_seq` 游标才有意义。
+
+### A.3 取消行为
+
+- 实测:主循环每 10ms 轮询 `RunContext::is_cancelled`,一旦置位即 `child.start_kill()` + `wait()`,
+  并返回 `ClientError::Other("run cancelled: killed external CLI after N streamed chunk(s)")`。
+  场景 3 用 1000 chunk × 50ms 的长跑 stub,在 ~150ms 处 `cancellation().cancel()`,子进程被稳定 kill。
+- 观察:§6.4 的 never-resume 语义被证实——取消后 machine 不会再被 step,进程只能由 handler 侧 kill,
+  没有机会再走一步 `Shutdown` effect。spike 用 `sleep` 轮询是权宜;真实 handler 应 `await` cancellation
+  future / token 而非忙轮询。折叠出的 `Response` 无法区分"正常 EOF"与"被 kill",disposition 丢失。
+- 对设计的影响:进程生命周期与清理必须落在 handler / runtime handle 的 `Drop` 路径(§6.4);结果 DTO
+  需显式携带 shutdown disposition(优雅关闭 / 强制 kill / 关闭失败),不能靠折叠文本推断。
+
+### A.4 成本量级
+
+- 实测:fold 时 usage 用**词数粗估**(`split_whitespace().count()` 作 output token,input=0),
+  仅为兼容 handler 契约的 shape,并非真实计量。spike 进程本身极廉价(stub 只做 `printf`+`sleep`)。
+- 观察:黑盒 stdout 文本拿不到真实 token / 成本;fold-to-`Response` 会丢掉 per-event usage。真实成本
+  只能来自 runtime 自己的账单/用量输出(若有),否则应显式标记为未知,而不是用文本反推。
+- 对设计的影响:`ExternalSessionResult` 需要独立的 usage/cost 字段,来源是 runtime 自报或标记未知;
+  调度器(§9)的 cheap→strong 决策不能建立在折叠文本的词数估算上。
+
+### A.5 对 Milestone 2 的具体影响(可操作项)
+
+1. **M2-1 DTO**:`ExternalSessionRequest::Start` 把 prompt 当纯数据承载,不焊死投递通道(A.1);
+   `ExternalAgentEvent` 设计为结构化枚举(text-delta / command / patch / permission-request / usage),
+   而非裸文本行(A.2);`ExternalSessionResult` 增加显式 shutdown disposition 与 usage/cost 字段(A.3、A.4)。
+2. **M2-2 `NeedExternalSession` / `RequirementResult::ExternalSession`**:result 的三态
+   (Completed / PausedForInteraction / Failed)必须能携带决策点前缓冲的 `observations: Vec<ExternalAgentEvent>`,
+   permission 请求走 `PausedForInteraction` 而不是混进文本流(A.2),对齐 §5.5。
+3. **M2-3 `ExternalSessionHandler` trait**:约定 handler 持有**长期存活**的 runtime handle(进程 + decoder task),
+   跨多次兑现存活;清理走 `Drop` / registry 而非再走一步 effect(A.2、A.3),满足 §6.4 的 never-resume 清理。
+4. **M2-4 `ScriptedExternalSessionHandler`**:用脚本化决策点转移 + 预置 observations 复现三态,
+   **默认路径禁用真实子进程 / `sleep` / 网络**(spike 已证明 stub 替身可行,且真实进程带来的不确定性
+   不该进默认测试条件),保证每个用例 <1 分钟。
+5. **§14 未定问题回填**:"black-box 完成定义"与"取消后副作用"两条获得实测支撑——完成须由结构化
+   `Completed` 事件而非文本 EOF 判定;取消后副作用不可回滚,disposition 必须入 trace(§6.4、§10),
+   供 M3-4 的 shutdown disposition 与 worktree 复用决策使用。
+
+### A.6 Milestone 2 go/no-go 结论
+
+- **Go**:effect 边界(`LlmHandler` → `RequirementResult`)足以承载一个进程外 runtime;后台缓冲 + 决策点
+  返回、reader-task/`mpsc` cancel-safe 竞速、`is_cancelled` 驱动 kill 三点均实测可行,可进入正式 DTO/handler。
+- **不需要**为核心库引入真实进程依赖:scripted 替身足以覆盖 Milestone 2 语义,真实 CLI 留到更后期的
+  cassette / 集成层。
+- **必须先决**:Milestone 2 的 DTO 一开始就要为"结构化 event、显式 disposition、显式 usage、
+  长期存活 runtime handle"留位(A.1–A.4),否则 Milestone 3 的 machine 会被迫重演 spike 的有损折叠。
