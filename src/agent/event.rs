@@ -15,7 +15,7 @@
 
 use crate::{
     agent::{
-        AgentStateError, ApprovalError, RunContextError, StepId, TraceNodeId,
+        AgentStateError, ApprovalError, ExternalAgentEvent, RunContextError, StepId, TraceNodeId,
         requirement::{AgentPath, RequirementKindTag},
         state::QueuedPivot,
         tool::ToolRuntimeError,
@@ -211,6 +211,14 @@ pub enum Notification {
     ToolCallStarted(ToolCallStarted),
     /// Tool execution has finished and produced a complete response.
     ToolCallFinished(ToolCallFinished),
+    /// A structured observation drained from an external agent session.
+    ///
+    /// A machine buffers [`ExternalAgentEvent`]s produced by an external runtime
+    /// and, after resume, replays them as observe-only notifications (design
+    /// §5.3/§5.5). Like the other notifications this is skippable: it exists so a
+    /// UI or drain can watch external progress and never carries a request or a
+    /// terminal state.
+    ExternalAgent(ExternalAgentEvent),
 }
 
 /// Payload emitted at an Agent step boundary.
@@ -491,7 +499,9 @@ mod tests {
         ToolCallFinished, ToolCallStarted,
     };
     use crate::{
-        agent::{BudgetDimension, BudgetError, PivotSource, StepId, TraceNodeId},
+        agent::{
+            BudgetDimension, BudgetError, ExternalAgentEvent, PivotSource, StepId, TraceNodeId,
+        },
         conversation::{
             Conversation, ConversationConfig, ConversationId, MessageId, ToolCallId, TurnId,
         },
@@ -697,6 +707,44 @@ mod tests {
             // record, the wire shape the driver forwards downstream.
             let encoded = serde_json::to_value(&notification).expect("serialize notification");
             assert!(encoded.get("type").is_some());
+        }
+    }
+
+    #[test]
+    fn notification_external_agent_round_trips_and_keeps_wire_tag() {
+        // `Notification::ExternalAgent` is the incremental external path added in
+        // M5-1: an external runtime observation replayed as a skippable
+        // notification. It must round-trip and encode as the `external_agent`
+        // tagged record without disturbing the existing variant tags.
+        let events = [
+            ExternalAgentEvent::SessionStarted {
+                session_id: Some("sess-1".to_owned()),
+            },
+            ExternalAgentEvent::TextDelta {
+                text: "partial output".to_owned(),
+            },
+            ExternalAgentEvent::PermissionRequested {
+                action_id: "write-file".to_owned(),
+                summary: "write ./out.txt".to_owned(),
+            },
+            ExternalAgentEvent::SessionCompleted,
+        ];
+
+        for event in events {
+            let notification = Notification::ExternalAgent(event.clone());
+
+            let encoded = serde_json::to_value(&notification).expect("serialize notification");
+            assert_eq!(encoded["type"], json!("external_agent"));
+            assert_eq!(
+                encoded["data"],
+                serde_json::to_value(&event).expect("serialize external event")
+            );
+
+            let decoded: Notification =
+                serde_json::from_value(encoded).expect("decode notification");
+            assert_eq!(decoded, notification);
+
+            assert_json_round_trip(notification);
         }
     }
 

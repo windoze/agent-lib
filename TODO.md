@@ -1117,7 +1117,7 @@ interaction,提供 `approve_all`/`deny_all`/`sequence`。设计文档 §13 Phase
 
 ## Milestone 5 — Event sink 与 artifact(Phase 4)
 
-### [TODO] M5-1 新增 `Notification::ExternalAgent` 变体
+### [DONE] M5-1 新增 `Notification::ExternalAgent` 变体
 
 **前置依赖**:M4-4。
 
@@ -1137,6 +1137,26 @@ ToolCallStarted(..), ToolCallFinished(..) }`。设计文档 §5.3 提议新增
 - 新增单测:`Notification::ExternalAgent` serde round-trip。过滤名:`cargo test --lib notification_external`。
 - `cargo test --all --all-targets` 确认无回归(尤其 `assertions/notifications.rs` 相关)。
 - 完整验证序列全绿。
+
+**完成记录**:
+
+- `src/agent/event.rs`:`Notification` 新增 `ExternalAgent(ExternalAgentEvent)` 变体(带 rustdoc,说明其
+  为 §5.3/§5.5 的可跳过 observe-only 通知),并在文件头 `use crate::agent::{..}` 导入 `ExternalAgentEvent`。
+  既有 4 变体的 serde tag(`llm`/`step_boundary`/`tool_call_started`/`tool_call_finished`)保持不变;新变体
+  在 `#[serde(tag="type", content="data", rename_all="snake_case")]` 下编码为
+  `{"type":"external_agent","data":<ExternalAgentEvent>}`。
+- 穷尽 `match` 更新:`crates/agent-testkit/src/assertions/notifications.rs` 的 `describe()` 补
+  `Notification::ExternalAgent(event) => "external_agent({event:?})"` 臂(仅此一处穷尽 match;其余为
+  `matches!`/`let-else`,无需改)。
+- 新增单测 `notification_external_agent_round_trips_and_keeps_wire_tag`(名含 `notification_external`):
+  对 `SessionStarted/TextDelta/PermissionRequested/SessionCompleted` 断言 `type=="external_agent"`、
+  `data` 等于 `ExternalAgentEvent` 直接序列化,并 round-trip 相等。
+- 验证(默认完整序列全绿):`cargo fmt --all -- --check` 无差异;`cargo test --lib notification_external`
+  1 passed;`cargo clippy --all-targets -- -D warnings` 0 告警;`cargo test --all --all-targets` 全绿
+  (lib 468、testkit 136,集成 0 failed);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  0 告警;`git diff --check` 干净。
+- 说明:observation→notification 的实际转换与去重属 M5-2;`machine.rs` 中 “conversion … lands in M5”
+  的注释仍准确,故不改动。
 
 ### [TODO] M5-2 observation 缓冲 → notification 转换与 event sink
 

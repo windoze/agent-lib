@@ -205,6 +205,9 @@ fn describe(notification: &Notification) -> String {
         Notification::ToolCallFinished(finished) => {
             format!("tool_finished(call={})", finished.call_id())
         }
+        Notification::ExternalAgent(event) => {
+            format!("external_agent({event:?})")
+        }
     }
 }
 
