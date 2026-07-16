@@ -1,53 +1,55 @@
-# M1-3 — 新增 external subagent DTO 与 `RespondSubagent` / `PausedForSubagent`
+# M1-4 Review — 协议层完整性与兼容性检查
 
-**当前执行 = TODO.md 第一个未完成任务 = M1-3**(M1-1、M1-2 已 `[DONE]`,均已 commit)。
+**当前执行 = TODO.md 第一个未完成任务 = M1-4**(M1-1/M1-2/M1-3 已 `[DONE]` 且已 commit)。
+这是 Milestone 1 的阶段 review 任务(真实任务,不可跳过)。
 
-## 目标
-在 external DTO 层落地 host subagent bridge 的 provider-neutral、serde-friendly 协议数据结构。
-machine 本轮**不**真正驱动 subagent(subagent parity 是 M3);machine 收到 `PausedForSubagent`
-即视为尚未接线的协议异常(observe 后 fail_with,分阶段设计非 workaround,M3 替换该 arm)。
+## 任务要求(TODO.md M1-4)
+1. 对照 docs/managed-external-agent.md §5,确认下列类型全部存在且有 rustdoc:
+   ExternalObservedEvent / ExternalToolBatchId / ExternalToolCall / ExternalToolResult /
+   ExternalSubagentRequestId / external subagent request+output DTO /
+   ExternalSessionInput::{RespondToolResults,RespondSubagent} /
+   ExternalSessionResult::{PausedForToolCalls,PausedForSubagent}。
+2. 检查 src/agent/external/mod.rs 的 pub use / 公开路径是否符合 crate 风格。
+3. 检查新增 DTO 是否保留 raw/extra escape hatch,且不把 runtime 私有 schema 泄露为稳定 typed API。
+4. 检查 docs/managed-external-agent.md 命名,如实现采用了不同命名则同步更新文档。
+5. 验证:external_dto_roundtrips / requirement /
+   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace / 完整验证序列 1-6。
+6. 完成记录列出 M1 public API diff 摘要。
 
-## 权威来源冲突说明
-- TODO.md M1-3(权威)采用嵌套 `ExternalSubagentRequest` 结构。
-- docs/managed-external-agent.md §5.2 采用把 `spec_ref/brief/result_schema` 平铺进 `PausedForSubagent`,
-  且 `RespondSubagent.output` 用 `SubagentOutput`。
-- 依 TODO 权威,采用嵌套 request + serde-friendly `ExternalSubagentOutput`(推荐方案二,避免改
-  `SubagentOutput` runtime 类型边界)。文档命名同步留给 M1-4 review(其任务明确要求)。
+## 核查结论(阅读源码后)
+- 全部 8 类类型均存在于 src/agent/external/mod.rs,均带完整 rustdoc(含 design §5.x 引用)。
+- src/agent/mod.rs re-export 完整、按字母序、风格一致(external::{...} 一块 + sink 一块)。
+- raw escape hatch:ExternalToolCall/ExternalToolResult/ExternalSubagentRequest/ExternalSubagentOutput
+  均有 raw: Option<Value>(#[serde(default, skip_serializing_if)]);to_tool_call 主动丢弃 raw,
+  不泄露到稳定 tool 路径;raw 类型是 serde_json::Value,不暴露 runtime 私有 typed schema。OK
 
-## 要新增 / 修改
-1. `src/agent/external/mod.rs`
-   - import `AgentSpecRef`、`SubagentOutput`(from `crate::agent`)。
-   - `ExternalSubagentRequestId(String)` newtype(`#[serde(transparent)]`,`new`/`as_str`)。
-   - `ExternalSubagentRequest { request_id, spec_ref, brief, result_schema: Option<Value>, raw: Option<Value> }`。
-   - `ExternalSubagentOutput { summary: String, raw: Option<Value> }` + `From<SubagentOutput>`(raw=None)。
-   - `ExternalSessionInput::RespondSubagent { request_id, output: ExternalSubagentOutput }`。
-   - `ExternalSessionResult::PausedForSubagent { session, request: ExternalSubagentRequest, observations }`。
-   - 测试:`external_subagent_dto_roundtrips`、snake_case 变体、`From<SubagentOutput>` 保真。
-2. `src/agent/mod.rs` — re-export `ExternalSubagentRequest`、`ExternalSubagentRequestId`、`ExternalSubagentOutput`。
-3. `src/agent/external/machine.rs` — `fold_session_result` 加 `PausedForSubagent` arm(observe + fail_with,M3 替换)。
-4. `crates/agent-testkit/src/assertions/external.rs` — `ExternalInputKind::RespondSubagent`、
-   `ExternalResultKind::PausedForSubagent` + input_kind/result_kind arm + rustdoc。
-5. `tests/agent_external_real_e2e.rs` — `session_prompt` 加 `RespondSubagent` arm 返回 Protocol 错误。
+## 需要动手的唯一工作:文档命名同步(M1-3 memory 显式把此项 defer 到 M1-4)
+实现相对 docs §5 的偏差:
+- §5.1 RespondSubagent.output: 文档 SubagentOutput -> 实现 ExternalSubagentOutput。
+- §5.2 PausedForSubagent: 文档平铺 request_id/spec_ref/brief/result_schema ->
+  实现嵌套 request: ExternalSubagentRequest;并更新 "推荐 spawn_agent tool call" 取舍说明为已定的
+  专门变体方案(spawn_agent tool bridge 留给 M3-3)。
+- §5.3 ExternalToolResult: 补 error: Option<String> 字段并对齐字段顺序;补
+  ExternalSubagentRequest / ExternalSubagentOutput 结构定义。
+- §21 M1 line: "决定 spawn_agent 走 tool bridge 还是专门 PausedForSubagent" -> 记录已选专门变体。
 
-## 不改
-- `RequirementKind::NeedSubagent` 的 serde shape、`SubagentOutput` 类型边界(不给它加 serde)。
-- machine cursor / state.rs(subagent 相位是 M3)。
+## 步骤
+- [ ] 编辑 docs/managed-external-agent.md §5.1 / §5.2 / §5.3 / §21 命名同步
+- [ ] cargo test -p agent-lib external_dto_roundtrips
+- [ ] cargo test -p agent-lib requirement
+- [ ] cargo fmt --all -- --check(仅 doc 改动,代码未变)
+- [ ] cargo clippy --all-targets -- -D warnings
+- [ ] RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+- [ ] cargo test --all --all-targets(仅 md 改动,复用上次绿;跑聚焦即可)
+- [ ] git diff --check
+- [ ] TODO.md 标 [DONE] + 完成记录(含 M1 public API diff 摘要)
+- [ ] commit,stop
 
-## 验证序列
-1. cargo fmt --all -- --check
-2. 聚焦:external_subagent_dto_roundtrips / external_dto_roundtrips /
-   accepts_matrix_pairs_each_kind_with_its_result_only
-3. cargo clippy --all-targets -- -D warnings
-4. cargo test --all --all-targets (<=30min)
-5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-6. git diff --check
+## 备注
+本任务只改文档(*.md)。代码未变 -> 完整 test suite 可复用 M1-3 的绿结果;仍跑聚焦
+external_dto_roundtrips + requirement + doc + clippy 以满足验证条件与确保 rustdoc intra-doc link 无破损。
 
-## 进度
-- [x] 读 TODO/PLAN/memory/源码,选定 M1-3,梳理全部 exhaustive match sites
-- [x] mod.rs DTO + helper + enum 变体 + From
-- [x] machine fold arm(observe + fail_with,M3 替换)
-- [x] testkit assertions kinds
-- [x] real e2e match arm
-- [x] mod.rs re-export
-- [x] 测试 + 验证序列 1-6 全绿(lib 562 passed;clippy 0;doc OK;修 1 处 intra-doc link)
-- [x] TODO.md 标 [DONE] + 完成记录;待 commit
+## 完成状态(2026-07-17)
+全部步骤完成:核查通过;docs §5.1/§5.2/§5.3/§21 命名已同步实现;
+external_dto_roundtrips(1)+requirement(40) 绿;clippy 0;rustdoc -D warnings 绿;
+全量 suite 复用 M1-3 绿(仅 md 改动);git diff --check clean。TODO.md 已标 [DONE] + 完成记录。待 commit。

@@ -196,7 +196,7 @@ pub enum ExternalSessionInput {
     },
     RespondSubagent {
         request_id: ExternalSubagentRequestId,
-        output: SubagentOutput,
+        output: ExternalSubagentOutput,
     },
     Shutdown,
 }
@@ -207,6 +207,9 @@ pub enum ExternalSessionInput {
 - `RespondToolResults` 把宿主工具执行结果回灌给 runtime。
 - `RespondSubagent` 只在 runtime adapter 需要显式回写子 agent 结果时使用。若 runtime 的 spawn 请求本身以
   tool bridge 表达,也可以统一走 `RespondToolResults`。
+- `output` 采用 serde-friendly 的 `ExternalSubagentOutput`(见 §5.3),而不是 runtime-only 的
+  `SubagentOutput`:宿主 subagent 结果需要跨 external session 边界持久化,而 `SubagentOutput` 不带 serde
+  derive。`From<SubagentOutput>` 提供从宿主结果到该 DTO 的转换。
 - `batch_id` / `request_id` 是 runtime adapter 生成或保留的 correlation handle,不要求 provider-neutral
   全局唯一,但必须在同一 session 内可关联。
 
@@ -245,10 +248,7 @@ pub enum ExternalSessionResult {
     },
     PausedForSubagent {
         session: ExternalSessionRef,
-        request_id: ExternalSubagentRequestId,
-        spec_ref: AgentSpecRef,
-        brief: Interaction,
-        result_schema: Option<Value>,
+        request: ExternalSubagentRequest,
         observations: Vec<ExternalObservedEvent>,
     },
     Failed {
@@ -259,6 +259,10 @@ pub enum ExternalSessionResult {
 }
 ```
 
+`PausedForSubagent` 携带的 subagent 请求已收敛为嵌套的 `ExternalSubagentRequest`(见 §5.3),
+把 `request_id` / `spec_ref` / `brief` / `result_schema` / `raw` 聚成一个可独立 round-trip 的 DTO,
+而不是把这些字段平铺进变体。
+
 如果想少加一个 `PausedForSubagent`,也可以让 `spawn_agent` 暴露为普通 external tool call,由
 `ExternalAgentMachine` 识别 `SpawnAgentRequest` 并转 `NeedSubagent`。两种设计的取舍:
 
@@ -267,7 +271,9 @@ pub enum ExternalSessionResult {
 | 专门 `PausedForSubagent` | 语义清晰,不混在 tool failure policy 里 | DTO 多一个变体 |
 | `spawn_agent` 作为 tool call | 复用 tool bridge,更接近 collab adapter | machine 需要在 tool phase 特判 scope-deepening |
 
-推荐首版:先用 `spawn_agent` tool call 统一桥接,除非 runtime 有原生 subagent event 无法表达成 tool call。
+**已定方案**:M1 采用专门的 `PausedForSubagent` 变体作为原生 subagent event 的规范路径(语义清晰、
+不与 tool failure policy 混在一起)。把 runtime 的 `spawn_agent` tool call 特判成子 agent 的 tool-bridge
+路径作为补充能力,留到 M3(见 §8.3),二者并存而非互斥。
 
 ### 5.3 external tool DTO
 
@@ -283,13 +289,27 @@ pub struct ExternalToolCall {
 
 pub struct ExternalToolResult {
     pub provider_call_id: String,
-    pub content: Vec<ContentBlock>,
     pub status: ToolStatus,
+    pub content: Vec<ContentBlock>,
+    pub error: Option<String>,
     pub raw: Option<Value>,
 }
 
 pub struct ExternalToolBatchId(String);
 pub struct ExternalSubagentRequestId(String);
+
+pub struct ExternalSubagentRequest {
+    pub request_id: ExternalSubagentRequestId,
+    pub spec_ref: AgentSpecRef,
+    pub brief: Interaction,
+    pub result_schema: Option<Value>,
+    pub raw: Option<Value>,
+}
+
+pub struct ExternalSubagentOutput {
+    pub summary: String,
+    pub raw: Option<Value>,
+}
 ```
 
 映射原则:
@@ -298,6 +318,11 @@ pub struct ExternalSubagentRequestId(String);
 - machine 仍通过 `ToolExecutionIds` 分配 framework `ToolCallId`。
 - `NeedTool` 使用现有 `ToolCall { id, name, input }`,其中 `id` 保留 provider call id。
 - `ToolResponse.tool_call_id` 必须回答 provider call id。
+- `ExternalToolResult.status` / `content` 直接镜像宿主 `ToolResponse`;`error` 只在工具**根本无法执行**
+  (`ToolRuntimeError`)时携带稳定诊断,区别于工具**已运行**并返回 `ToolStatus::Error` 内容的情况。构造走
+  `ExternalToolResult::from_tool_response` / `from_tool_runtime_error`。
+- `ExternalSubagentRequest` 是 `PausedForSubagent` 的嵌套请求 DTO;`ExternalSubagentOutput` 是
+  runtime-only `SubagentOutput` 的 serde-friendly 持久化对应物,`RespondSubagent.output` 使用它。
 - `raw` 只保留未建模字段,不参与稳定逻辑。
 
 ### 5.4 observed event sequence
@@ -1082,7 +1107,8 @@ cargo test --test agent_external_real_e2e -- --ignored --nocapture
 - 新增 `ExternalToolCall` / `ExternalToolResult` / batch id。
 - 扩展 `ExternalSessionInput::RespondToolResults`。
 - 扩展 `ExternalSessionResult::PausedForToolCalls`。
-- 决定 `spawn_agent` 走 tool bridge 还是专门 `PausedForSubagent`。
+- `spawn_agent`:已定采用专门 `PausedForSubagent` + 嵌套 `ExternalSubagentRequest` /
+  `ExternalSubagentOutput`;tool-bridge 特判留给 M3(§8.3)。
 - 更新 serde / requirement alignment / testkit fixtures。
 
 ### M2: `ExternalAgentMachine` tool parity

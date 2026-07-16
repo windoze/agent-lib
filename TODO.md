@@ -346,7 +346,7 @@
   ignored 为真实 e2e);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过(修正一处
   `RequirementResult` intra-doc link 为全限定路径);`git diff --check` clean。
 
-### [TODO] M1-4 Review：协议层完整性与兼容性检查
+### [DONE] M1-4 Review：协议层完整性与兼容性检查
 
 **上下文**:
 
@@ -376,6 +376,70 @@ serde、rustdoc、导出面和设计文档一致。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
 - 完整验证序列 1-6 全过。
 - 在本任务完成记录中列出 M1 public API diff 摘要。
+
+**完成记录**(2026-07-17):
+
+本任务是 M1 阶段 review,核查协议层完整性并同步文档命名。**无 `.rs` 改动**,仅改文档。
+
+*核查结论*(逐项对照 TODO.md 要求):
+
+- **类型存在性 + rustdoc**:8 类目标类型全部存在于 `src/agent/external/mod.rs` 且带完整 rustdoc
+  (均引用 design §5.x):`ExternalObservedEvent`、`ExternalToolBatchId`、`ExternalToolCall`、
+  `ExternalToolResult`、`ExternalSubagentRequestId`、`ExternalSubagentRequest` /
+  `ExternalSubagentOutput`(external subagent request/output DTO)、
+  `ExternalSessionInput::{RespondToolResults,RespondSubagent}`、
+  `ExternalSessionResult::{PausedForToolCalls,PausedForSubagent}`。
+- **公开路径风格**:`src/agent/external/mod.rs` 的 `pub use` 分块(dispatch/escalation/machine/…)与
+  `src/agent/mod.rs` 的 `pub use external::{…}`(字母序)一致,新符号全部 re-export,风格符合 crate 现有约定。
+- **raw/extra escape hatch**:`ExternalToolCall`/`ExternalToolResult`/`ExternalSubagentRequest`/
+  `ExternalSubagentOutput` 均带 `raw: Option<Value>`(`#[serde(default, skip_serializing_if]`);
+  `ExternalToolCall::to_tool_call` 主动丢弃 `raw` 不泄露到稳定 tool 路径;`raw` 是 `serde_json::Value`,
+  不把任何 runtime 私有 typed schema 暴露为稳定 public API。符合 §5.3 与通用约束。
+- **文档命名同步**(M1-3 显式 defer 到本 review):实现相对 docs §5 的偏差已全部同步:
+  - §5.1 `RespondSubagent.output`:`SubagentOutput` → `ExternalSubagentOutput`,并补说明为何用 serde DTO。
+  - §5.2 `PausedForSubagent`:平铺 `request_id/spec_ref/brief/result_schema` → 嵌套
+    `request: ExternalSubagentRequest`;取舍表下把「推荐首版 spawn_agent tool call」改为「已定采用专门
+    `PausedForSubagent` 变体,spawn_agent tool-bridge 特判留给 M3(§8.3)」。
+  - §5.3 `ExternalToolResult`:字段对齐实现顺序(`status` 先于 `content`)并补 `error: Option<String>`;
+    新增 `ExternalSubagentRequest` / `ExternalSubagentOutput` 结构定义与映射原则说明。
+  - §21 M1 milestone 行:「决定 spawn_agent 走 tool bridge 还是专门 PausedForSubagent」→ 记录已选专门变体。
+
+*M1 public API diff 摘要*(M1-1 + M1-2 + M1-3 相对 M1 前的净增,均在 `crate::agent` 与
+`crate::agent::external` 导出):
+
+- 新增类型:
+  - `ExternalObservedEvent { seq: u64, event: ExternalAgentEvent }`
+    + `new` / `unsequenced_for_tests`(M1-1)。
+  - `ExternalToolBatchId(String)`(`#[serde(transparent)]`)+ `new` / `as_str`(M1-2)。
+  - `ExternalToolCall { provider_call_id, name, input, raw }` + `to_tool_call`(M1-2)。
+  - `ExternalToolResult { provider_call_id, status, content, error, raw }`
+    + `from_tool_response` / `from_tool_runtime_error`(M1-2)。
+  - `ExternalSubagentRequestId(String)`(`#[serde(transparent)]`)+ `new` / `as_str`(M1-3)。
+  - `ExternalSubagentRequest { request_id, spec_ref, brief, result_schema, raw }`(M1-3)。
+  - `ExternalSubagentOutput { summary, raw }` + `impl From<SubagentOutput>`(M1-3)。
+- 新增 enum 变体:
+  - `ExternalSessionInput::RespondToolResults { batch_id, results }`(M1-2)。
+  - `ExternalSessionInput::RespondSubagent { request_id, output: ExternalSubagentOutput }`(M1-3)。
+  - `ExternalSessionResult::PausedForToolCalls { session, batch_id, calls, observations }`(M1-2)。
+  - `ExternalSessionResult::PausedForSubagent { session, request, observations }`(M1-3)。
+- 变更(breaking)字段形状:
+  - `ExternalSessionResult::{Completed,PausedForInteraction,Failed}.observations`:
+    `Vec<ExternalAgentEvent>` → `Vec<ExternalObservedEvent>`(M1-1)。
+- 新增自由函数:
+  - `collect_file_patch_artifacts_from_observed(&[ExternalObservedEvent]) -> Vec<ExternalArtifactRef>`
+    (M1-1;保留旧 `collect_file_patch_artifacts`)。
+
+*验证*:
+
+- `cargo fmt --all -- --check` FMT_OK。
+- 聚焦:`cargo test -p agent-lib --lib external_dto_roundtrips`(1 passed)、
+  `cargo test -p agent-lib --lib requirement`(40 passed)。
+- `cargo clippy --all-targets -- -D warnings` 0 warning。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过(含新增/改动 intra-doc link 无破损)。
+- `cargo test --all --all-targets`:**复用** M1-3(commit cf37a9c)的全绿结果 —— 自那次全量 run 起仅
+  `TODO.md` / `docs/*.md` / `memory/*.md` 变更,无任何 `.rs` 改动(`git status` 确认无 `.rs`),按文档-only
+  复用规则跳过重跑。
+- `git diff --check` clean。
 
 ---
 
