@@ -725,3 +725,52 @@ async fn restore_requires_a_client_or_provider() {
         "restore without a client or provider is a config error, got {error:?}"
     );
 }
+
+#[test]
+fn registered_subagents_appear_in_the_delegate_table() {
+    let reviewer = Agent::worker()
+        .model("reviewer-model")
+        .system("You review code.")
+        .build()
+        .expect("worker builds");
+    let researcher = Agent::worker()
+        .system("You research.")
+        .build()
+        .expect("worker builds");
+
+    let agent = AgentBuilder::default()
+        .client(ScriptedClient::new(vec![text_response("hi")]))
+        .model("test-model")
+        .subagent("reviewer", reviewer)
+        .subagent("researcher", researcher)
+        .build()
+        .expect("build agent");
+
+    let names: Vec<&str> = agent.subagents().iter().map(|s| s.name()).collect();
+    assert_eq!(names, ["reviewer", "researcher"]);
+    // The explicit-model worker keeps its model; the default worker inherits.
+    assert!(!agent.subagents()[0].inherits_model());
+    assert_eq!(
+        agent.subagents()[0].spec().model().model(),
+        "reviewer-model"
+    );
+    assert!(agent.subagents()[1].inherits_model());
+}
+
+#[test]
+fn into_parts_carries_registered_delegates() {
+    let reviewer = Agent::worker()
+        .system("You review code.")
+        .build()
+        .expect("worker builds");
+    let agent = AgentBuilder::default()
+        .client(ScriptedClient::new(vec![text_response("hi")]))
+        .model("test-model")
+        .subagent("reviewer", reviewer)
+        .build()
+        .expect("build agent");
+
+    let parts = agent.into_parts();
+    assert_eq!(parts.delegates.len(), 1);
+    assert_eq!(parts.delegates[0].name(), "reviewer");
+}

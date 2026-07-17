@@ -28,6 +28,7 @@ use crate::conversation::ConversationSnapshot;
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
 use crate::facade::chat::client_for_provider;
 use crate::facade::config::ProviderConfig;
+use crate::facade::delegate::LocalSubagent;
 use crate::facade::error::FacadeError;
 use crate::facade::ids::FacadeIds;
 use crate::facade::run::ArtifactRef;
@@ -174,6 +175,8 @@ pub struct AgentParts {
     pub approval: Arc<FacadeApproval>,
     /// The identity source the agent mints run/turn/message ids from.
     pub ids: FacadeIds,
+    /// The registered local subagent delegates (data-first recipes).
+    pub delegates: Vec<LocalSubagent>,
 }
 
 impl std::fmt::Debug for AgentParts {
@@ -352,6 +355,7 @@ impl AgentRestoreBuilder {
             extra_declarations: self.extra_declarations,
             approval,
             ids,
+            delegates: Vec::new(),
         })
     }
 }

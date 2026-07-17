@@ -53,6 +53,7 @@ use crate::conversation::{Conversation, ConversationConfig};
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
 use crate::facade::chat::client_for_provider;
 use crate::facade::config::{ModelConfig, ProviderConfig};
+use crate::facade::delegate::{AgentWorkerBuilder, LocalSubagent};
 use crate::facade::error::FacadeError;
 use crate::facade::ids::FacadeIds;
 use crate::facade::run::{IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary};
@@ -70,9 +71,9 @@ pub use snapshot::{
 pub use stream::AgentRunStream;
 
 /// Default per-turn LLM-step budget when a builder does not set one (§8.4).
-const DEFAULT_MAX_STEPS: u32 = 8;
+pub(crate) const DEFAULT_MAX_STEPS: u32 = 8;
 /// Default number of tool-call rounds allowed per turn when unset (§8.4).
-const DEFAULT_MAX_TOOL_ROUNDS: u32 = 4;
+pub(crate) const DEFAULT_MAX_TOOL_ROUNDS: u32 = 4;
 
 /// A stateful, tool-using agent backed by one live [`DefaultAgentMachine`].
 ///
@@ -116,6 +117,7 @@ pub struct Agent {
     extra_declarations: Vec<ToolDecl>,
     approval: Arc<FacadeApproval>,
     ids: FacadeIds,
+    delegates: Vec<LocalSubagent>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -138,6 +140,14 @@ impl std::fmt::Debug for Agent {
                     .map(|declaration| declaration.name.as_str())
                     .collect::<Vec<_>>(),
             )
+            .field(
+                "delegates",
+                &self
+                    .delegates
+                    .iter()
+                    .map(LocalSubagent::name)
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -147,6 +157,18 @@ impl Agent {
     #[must_use]
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
+    }
+
+    /// Starts a fluent [`AgentWorkerBuilder`] for a data-first local subagent.
+    ///
+    /// Unlike [`builder`](Agent::builder), a worker needs no client or provider:
+    /// it produces a [`LocalSubagent`] recipe whose live child runtime is
+    /// assembled only when a delegation is fulfilled, and which inherits the
+    /// supervisor's model by default (`docs/facade-api.md` §10.3, R4). Register
+    /// the result with [`AgentBuilder::subagent`].
+    #[must_use]
+    pub fn worker() -> AgentWorkerBuilder {
+        AgentWorkerBuilder::default()
     }
 
     /// Runs one agent turn and returns the minimal [`Reply`].
@@ -278,6 +300,17 @@ impl Agent {
         self.machine.state()
     }
 
+    /// Returns the local subagent delegates registered on this agent.
+    ///
+    /// Each entry is a data-first [`LocalSubagent`] recipe registered through
+    /// [`AgentBuilder::subagent`]; the live child runtime is assembled only when
+    /// a delegation is fulfilled (milestone M3-2). The base path exposes them for
+    /// inspection and future delegation routing.
+    #[must_use]
+    pub fn subagents(&self) -> &[LocalSubagent] {
+        &self.delegates
+    }
+
     /// Runs one agent turn as an incremental [`AgentRunStream`].
     ///
     /// The returned stream is the tool-using, approval-gated analog of
@@ -374,6 +407,7 @@ impl Agent {
             extra_declarations: self.extra_declarations,
             approval: self.approval,
             ids: self.ids,
+            delegates: self.delegates,
         }
     }
 }
@@ -401,6 +435,7 @@ pub struct AgentBuilder {
     tool_failure_policy: Option<ToolFailurePolicy>,
     worktree: Option<WorktreeRef>,
     ids: Option<FacadeIds>,
+    delegates: Vec<LocalSubagent>,
 }
 
 impl std::fmt::Debug for AgentBuilder {
@@ -423,6 +458,14 @@ impl std::fmt::Debug for AgentBuilder {
             .field("max_steps", &self.max_steps)
             .field("max_tool_rounds", &self.max_tool_rounds)
             .field("tool_failure_policy", &self.tool_failure_policy)
+            .field(
+                "delegates",
+                &self
+                    .delegates
+                    .iter()
+                    .map(LocalSubagent::name)
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -552,6 +595,20 @@ impl AgentBuilder {
         self
     }
 
+    /// Registers a local subagent delegate under `name`.
+    ///
+    /// The `worker` is a data-first [`LocalSubagent`] produced by
+    /// [`Agent::worker`]; this stamps `name` onto it and records it in the
+    /// agent's delegate table (`docs/facade-api.md` §10.1). The base path only
+    /// stores local delegates; the unified delegate abstraction of §12 is
+    /// reserved for later milestones. Registration order is preserved and
+    /// exposed through [`Agent::subagents`].
+    #[must_use]
+    pub fn subagent(mut self, name: impl Into<String>, worker: LocalSubagent) -> Self {
+        self.delegates.push(worker.with_name(name));
+        self
+    }
+
     /// Finalizes the builder into an [`Agent`], assembling the §8.3 machine stack.
     ///
     /// # Errors
@@ -634,6 +691,7 @@ impl AgentBuilder {
             extra_declarations: self.extra_declarations,
             approval,
             ids,
+            delegates: self.delegates,
         })
     }
 }
@@ -707,7 +765,7 @@ impl HandlerScope for FacadeAgentScope {
 /// so the tighter of the two limits binds: `min(max_steps, max_tool_rounds + 1)`,
 /// clamped to at least one step. Parallel tool execution is pinned to one, the
 /// core default the base machine does not otherwise consume.
-fn build_loop_policy(
+pub(crate) fn build_loop_policy(
     max_steps: u32,
     max_tool_rounds: u32,
     tool_failure_policy: ToolFailurePolicy,

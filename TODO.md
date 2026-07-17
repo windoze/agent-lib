@@ -778,7 +778,7 @@ facade::`（72 passed）；`cargo clippy --all-targets -- -D warnings` 及
 `.subagent(name, worker)`、model-routed delegation（默认每 subagent 一个工具 `ask_<name>`）、
 `DelegationTrace`。完全复用 `NeedSubagent` / `SubagentHandler` / `NestedMachine`。
 
-### [TODO] M3-1 `Agent::worker()` → `LocalSubagent` spec + `.subagent(..)` 注册
+### [DONE] M3-1 `Agent::worker()` → `LocalSubagent` spec + `.subagent(..)` 注册
 
 **上下文**：
 
@@ -802,6 +802,39 @@ facade::`（72 passed）；`cargo clippy --all-targets -- -D warnings` 及
   两模式都能构造；`.subagent(..)` 后 delegate 表含该 worker。
 - 聚焦：`cargo test -p agent-lib facade::delegate`（或 `facade::subagent`）。
 - 完整验证序列 1–6。
+
+**完成记录**：
+
+新建 `src/facade/delegate.rs`，落地 data-first 的 `AgentWorkerBuilder`（`Agent::worker()`）
+与 `LocalSubagent`，并在 `AgentBuilder` 上接入 `.subagent(name, worker)` 登记，全部离线单测通过。
+
+- **`Agent::worker()` → `LocalSubagent`（§10.3 data-first）**：`AgentWorkerBuilder`
+  产 `LocalSubagent{name, description, spec: AgentSpec, tools: ToolSetRef, approval:
+  ApprovalPolicy, inherit_model}`——只含数据，无 client/闭包/handler 字段；child
+  `AgentState`/machine/`RunContext` 留待 `NeedSubagent` 兑现（M3-2）。字段用私有 + 访问器，
+  与 `AgentSpec`/`ModelRef` 等既有数据类型的约定一致；`spec` 可经 serde 往返（测试断言）。
+- **model 继承/显式两模式（R4）**：默认继承（`inherit_model=true`），`spec.model` 记
+  占位模型 `<inherited>`，`inherits_model()` 报 `true`，真实 supervisor model 在兑现时替换；
+  `.model(..)` 显式 pin（清除继承）、`.inherit_model()` 显式继承（清除 pin），最后一次调用生效。
+- **`.subagent(name, LocalSubagent)` 登记**：`AgentBuilder` 增 `delegates: Vec<LocalSubagent>`，
+  `.subagent()` 用 `with_name` 打上注册名并按序追加；build 后随 `Agent` 携带，经
+  `Agent::subagents() -> &[LocalSubagent]` 暴露；`into_parts()`/`AgentParts.delegates` 一并携带。
+  统一 delegate 抽象（§12）与 name 冲突 build 期报错留待 M3-3；restore 的 delegate 快照留待 M3-3
+  （当前 restore 产空 delegate 表）。可执行 child tools 留待 M3-2（`LocalSubagent` 保持 data-only）。
+- **复用**：worker 复用 agent.rs 的 `build_loop_policy` + `DEFAULT_MAX_STEPS`/
+  `DEFAULT_MAX_TOOL_ROUNDS`（改 `pub(crate)`）；`mod.rs` 增 `pub mod delegate;` 并 re-export
+  `AgentWorkerBuilder`/`LocalSubagent`。
+
+**测试**：`src/facade/delegate.rs` 7 个单测（data-only 显式模型、默认继承、继承/显式切换 last-wins、
+tool_declarations 进 spec、approval 携带、确定性 id、`with_name`）+ `src/facade/agent/tests.rs`
+两个登记测试（`.subagent()` 后 delegate 表按序含 reviewer/researcher 且模型模式正确；`into_parts`
+携带 delegate）。
+
+**验证**：序列 1–6 全绿——`cargo fmt --all`；聚焦 `cargo test -p agent-lib --lib facade::delegate`
+（7 passed）+ `facade::`（81 passed）；`cargo clippy --all-targets -- -D warnings` 及
+`--features "external-claude-code external-codex external-opencode"` 均 clean；
+`cargo test --all --all-targets` 全绿（含 16 doctests）；
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` clean；`git diff --check` clean。
 
 ### [TODO] M3-2 model-routed delegation：subagent 暴露为工具 + `NeedSubagent` 兑现 + `DelegationTrace`
 

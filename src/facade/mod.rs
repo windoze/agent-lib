@@ -24,12 +24,14 @@
 //! foundations. Milestone 2 begins with the typed function tool surface
 //! ([`Tool`], [`ToolContext`], [`ToolResult`], [`IntoToolResult`]) in [`tool`],
 //! then the approval surface ([`Approval`], [`ApprovalPolicy`],
-//! [`ApprovalDecision`]) in [`approval`].
+//! [`ApprovalDecision`]) in [`approval`]. Milestone 3 adds the local subagent
+//! surface ([`Agent::worker`], [`LocalSubagent`]) in [`delegate`].
 
 pub mod agent;
 pub mod approval;
 pub mod chat;
 pub mod config;
+pub mod delegate;
 pub mod error;
 pub mod ids;
 pub mod run;
@@ -42,6 +44,7 @@ pub use agent::{
 pub use approval::{Approval, ApprovalDecision, ApprovalPolicy, FacadeApproval};
 pub use chat::{Chat, ChatBuilder, ChatSession, ChatSessionBuilder, RunStream};
 pub use config::{ModelConfig, ProviderConfig, ProviderConfigBuilder};
+pub use delegate::{AgentWorkerBuilder, LocalSubagent};
 pub use error::FacadeError;
 pub use ids::FacadeIds;
 pub use run::{
