@@ -1,44 +1,51 @@
-# M5-2 dispatcher-routed delegation — execution plan
+# M5-R Review: Dispatcher / Escalator correctness + doc consistency
 
-Task: `TODO.md` §Milestone 5 → **M5-2 dispatcher-routed delegation (primary → verify → escalate)**.
-Spec: `docs/facade-api.md` §13.3, §17.4, §6.3 (`RunEvent::Escalated`), §19.
+Task: `TODO.md` §Milestone 5 → **M5-R** (first incomplete task). Review + convergence only.
+Spec anchors: `docs/facade-api.md` §13.2–§13.3, §6.3 (`RunEvent::Escalated`/`EscalationTrace`),
+§18.5, §19 (no new scheduler runtime).
 
 ## Goal
-`Delegation::dispatcher().primary("cheap").verify_with("verifier").escalate_to("strong").max_attempts(2)`
-maps onto `agent::external::{Dispatcher, Escalator}` semantics (no new scheduler runtime, §19).
-Loop: primary runs → verifier checks product → on reject, escalate to strong, capped by
-`max_attempts`. Attempts + escalation path recorded into `DelegationTrace`s; emit `RunEvent::Escalated`.
+Certify M5-1 (rules-routed) + M5-2 (dispatcher-routed) match §13.2–§13.3:
+- rules-routed: model unaware (no delegate tools advertised).
+- dispatcher-routed maps onto existing `agent::external::{Dispatcher, Escalator}` (no new runtime, §19).
+- escalation path + `DelegationTrace` / `RunEvent::Escalated` complete.
+- dispatcher is never a first-version default.
+Fix small deviations; record gaps as follow-up tasks (per rules). Produce §13 promise vs
+M5-impl comparison table. Run full validation sequence 1–6 (+ external-features clippy).
 
-## Design decisions
-- New `DispatcherConfig { primary, verifier: Option, escalate_to: Option, max_attempts }` +
-  `DelegationMode::Dispatcher`. Builder mirrors rules-routed switch behavior.
-- Dispatcher mode exposes **no** delegate tool to the model (like Rules): declarations/route/
-  external_tool_names empty. Facade drives delegates directly via the existing
-  `DelegationToolHandler::fulfill_rules_routed` path (reuses subagent/external drive, §9.2 gate).
-- Escalation **decision** uses the real `agent::external::Escalator` + `WorkerRoster`: primary
-  registered `CostTier::Cheap` with `EscalationRules{escalate_to: strong}`, strong `Premium`
-  terminal. `assess()` on `WorkerReport::failed(current, ReviewRejected)` returns `Reassign(strong)`
-  → read `choice.worker().id()` back to delegate name. Escalator `.with_budget_headroom(0)`.
-- Verifier verdict contract (documented): verifier requests escalation when its reply contains the
-  case-insensitive token `ESCALATE`, or its delegation fails. Otherwise passes. A primary/worker
-  delegation that itself fails also triggers escalation.
-- Final reply text = last worker summary (not verifier). Supervisor usage = 0; child usage on
-  subagent/external slices. Not folded into supervisor Conversation.
+## Review findings (code read)
+- `delegate.rs`: `DelegationMode::{Rules,Dispatcher}` → `declarations()`/`route()`/
+  `external_tool_names()` all return empty ⇒ model never sees delegates. ✓ (§13.2/§13.3)
+- `route_task`: first-match-wins, case-insensitive substring. ✓
+- Build-time validation: `first_unknown_rule_delegate` / `first_unknown_dispatcher_delegate` +
+  empty-primary check ⇒ `FacadeError::Config`. ✓
+- `agent.rs drive_dispatcher_routed`: primary→verify→escalate loop capped by `max_attempts`;
+  escalation *decision* via real `Escalator::assess` over a `WorkerRoster`
+  (primary=Cheap+EscalationRules→strong; strong=Premium terminal), `with_budget_headroom(0)`.
+  Emits `RunEvent::Escalated(EscalationTrace{from,to})`; per-attempt worker/verifier →
+  `DelegationTrace`. No supervisor LLM; usage=0; not folded into Conversation. ✓ (§19)
+- Uses `Escalator` (escalation engine) but not `Dispatcher` (initial budget-aware router):
+  faithful, since the primary is an explicitly-named fixed worker (no ambiguous routing to
+  dispatch). Documented in M5-2 record. → note in comparison table, no code change.
+- prelude / facade §3: §3's list has no `RoutingRule`/`DispatcherConfig`/`EscalationTrace`;
+  current prelude already matches §3 (has `Delegation`, `RunEvent`, `RunOutput`, `ManagedExternalAgent`).
+  ⇒ no prelude change needed (unlike M4-R which had a pending prelude add).
 
-## Steps / Status
-1. [config] delegate.rs config+builder+accessors+validation, RulesRoutedTarget Clone, drive_one helper — done
-2. [drive] agent.rs drive_dispatcher_routed + run_dispatcher_routed + run_full branch + retention + build validation — done
-3. [stream] stream.rs start_dispatcher_routed — done
-4. [tests] offline unit + drive + stream tests (10 cases) — done
-5. [validate] fmt/clippy(+external)/focused/full/doc/diff — done, all green
+## Decision
+No source deviation found requiring a fix. Pure review: run full validation, write completion
+record + comparison table in TODO.md, mark M5-R `[DONE]`, commit, stop.
 
-## Class-wide bug fixed during M5-2
-- `FacadeSubagentSpawner::child_ids` (delegate.rs) and `FacadeExternalSpawner::child_ids`
-  (external.rs) used a fixed `subagent:{name}` / `external:{name}` trace node id. Driving the same
-  delegate twice in one run (dispatcher re-runs the verifier per attempt) triggered
-  `duplicate trace node id`. Fixed by folding the freshly-minted `run_id` into the trace node id,
-  guaranteeing uniqueness across repeated drives for BOTH subagent and external delegates.
+## Validation (sequence 1–6 + external clippy)
+1. cargo fmt --all -- --check
+2. cargo clippy --all-targets -- -D warnings
+3. cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
+4. cargo test -p agent-lib facade::delegate  (focused)
+5. cargo test --all --all-targets  (full)
+6. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace ; git diff --check
 
-## Result
-M5-2 complete and marked `[DONE]` in TODO.md. Full validation sequence 1–6 green. Stopping (do
-not start M5-R).
+## Status: DONE
+
+All validation green (fmt, clippy default + 4 external features, focused 46 delegate tests,
+full `cargo test --all --all-targets`, doc, git diff --check). No source deviation found;
+review-only. M5-R marked [DONE] in TODO.md with §13 comparison table. PLAN.md unchanged
+(no phase-level change). Committing and stopping (do not start M6-1).

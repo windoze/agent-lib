@@ -1434,7 +1434,7 @@ M4（managed external agent 构造/分级/兑现/审批/restore）承诺项**全
   （含 10 个 dispatcher 用例）全绿 ✓；`cargo test --all --all-targets` 全绿（50 组 test result: ok，0 failed）✓；
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✓；`git diff --check` 干净 ✓。
 
-### [TODO] M5-R Review：Dispatcher / Escalator 正确性与文档一致性检查
+### [DONE] M5-R Review：Dispatcher / Escalator 正确性与文档一致性检查
 
 **上下文**：M5-1..M5-2 落地 rules/dispatcher 路由。仅审查+收敛。
 
@@ -1449,6 +1449,75 @@ M4（managed external agent 构造/分级/兑现/审批/restore）承诺项**全
 
 - 完整验证序列 1–6 全绿。
 - 对照表：M5 已实现 vs §13 承诺项，缺口记为后续任务。
+
+**完成记录**（2026-07-18）：
+
+审查 + 收敛任务，逐条核对 M5-1（rules-routed）与 M5-2（dispatcher-routed）与
+`docs/facade-api.md` §13.2–§13.3/§6.3/§18.5/§19。**未发现需修正的规范偏离，无源码改动**——
+prelude 与 §3 清单已一致（§3 列 `Delegation`/`RunEvent`/`RunOutput`/`ManagedExternalAgent`，
+均已在 `src/prelude.rs`；`RoutingRule`/`DispatcherConfig`/`EscalationTrace` 不在 §3 prelude
+清单内，经 `pub mod delegate` / `facade::EscalationTrace` 可达，无需增补）。
+
+- **§13.2 Rules-routed（模型可无感）** — ✅ `DelegationMode::Rules` 使
+  `declarations()`/`route()`/`external_tool_names()`（`src/facade/delegate.rs:942/972/1017`）**全部返回空**，
+  即不向 supervisor LLM 暴露任何 delegate 工具；`Agent::run_full`（`agent.rs:259`）与 stream `start`
+  （`agent/stream.rs:96`）在进 supervisor 前用 `route_task()` 拦截并直驱 delegate。`route_task`
+  （`delegate.rs:769`）大小写不敏感子串、首条命中规则胜出（注册顺序＝优先级），未命中回落普通 supervisor
+  drive（同样无 delegate 工具）。build 期 `first_unknown_rule_delegate` 拒未注册 delegate（`FacadeError::Config`）。
+- **§13.3 Dispatcher-routed（映射现有 `Dispatcher`/`Escalator`，未另造调度，§19）** — ✅
+  `DelegationMode::Dispatcher` 同 Rules 对模型零暴露；整轮走 `run_dispatcher_routed`→`drive_dispatcher_routed`
+  （`agent.rs:569/1564`）的 primary→verify→escalate 闭环，受 `max_attempts` 钳制。升级**决策**委托给真实
+  `agent::external::Escalator::assess`（`agent.rs:1747/1768`），roster 用真实
+  `WorkerRoster`/`WorkerProfile`/`CostTier`/`EscalationRules`/`EscalationTrigger`/`WorkerReport`
+  （primary=`Cheap`+规则→strong；strong=`Premium` 终态；`with_budget_headroom(0)` 纯上行）——**未新造调度
+  runtime**，符合 §19。每次 worker/verifier 复用 `DelegationToolHandler::fulfill_rules_routed`，
+  recorder/usage/artifacts/§9.2 审批门与 model-routed 完全一致；不经 supervisor LLM（usage=0、不折叠进
+  `Conversation`）。
+- **升级路径 + `DelegationTrace`/`RunEvent::Escalated` 完整** — ✅ 每次尝试的 worker/verifier 进
+  `DelegationTrace`（`RunOutput.delegations` + `Delegation{Started,Artifact,Finished,Failed}` 事件，
+  经 `DispatcherAccumulator::record`，`agent.rs:1528`），每次升级产
+  `RunEvent::Escalated(EscalationTrace{from,to})`（`agent.rs:1611`；§6.3 line 325 定义的专用变体）。
+  verifier 判定协议（§13.3 未定线协议，facade 约定并写 rustdoc）：回复含大小写不敏感 `ESCALATE`
+  或自身 delegation 失败＝判不过。run_full 与 stream 两路事件序列一致（`agent/stream.rs:272`
+  `start_dispatcher_routed` 回放同序事件 + 末尾 `Done`）。
+- **Dispatcher 非默认** — ✅ `Delegation::default()`＝`model_routed()`（`delegate.rs:650`）；
+  dispatcher 仅经显式 `Delegation::dispatcher()` 进入，rustdoc 明标「advanced, opt-in — never a default」。
+
+**对照表 — §13（及相邻 §6.3/§19）承诺项 vs M5 实现**：
+
+| §    | 承诺项 | 状态 | 归属 |
+|------|--------|------|------|
+| 13.1 | model-routed（每 delegate 一个 `ask_<name>` 工具，默认档） | ✅ 已实现 | M3-2 |
+| 13.2 | rules-routed：`rules().when_task_contains(kw, delegate)` 按规则路由 | ✅ 已实现 | M5-1 |
+| 13.2 | rules-routed 模型可无感（不向 LLM 暴露 delegate 工具） | ✅ 已实现 | M5-1 |
+| 13.2 | 未命中规则的明确行为（回落普通 supervisor drive） | ✅ 已实现 | M5-1 |
+| 13.2 | build 期拒未注册 delegate | ✅ 已实现 | M5-1 |
+| 13.3 | dispatcher-routed：`dispatcher().primary().verify_with().escalate_to().max_attempts()` | ✅ 已实现 | M5-2 |
+| 13.3 | 映射到现有 `agent::external::Escalator`（升级决策），未另造调度（§19） | ✅ 已实现 | M5-2 |
+| 13.3 | primary→verifier→escalate 闭环，受 `max_attempts` 钳制 | ✅ 已实现 | M5-2 |
+| 13.3 | 升级路径产 `RunEvent::Escalated(EscalationTrace)`（§6.3） | ✅ 已实现 | M5-2 |
+| 13.3 | 每次尝试进 `DelegationTrace`（`RunOutput.delegations` + 事件） | ✅ 已实现 | M5-2 |
+| 13.3 | dispatcher-routed 非第一版默认（默认＝model-routed） | ✅ 已实现 | M5-2 |
+| 13.3 | 映射到 `agent::external::Dispatcher`（初始预算感知路由器） | ➖ 无需（primary 为显式固定 worker，无歧义路由可 dispatch；仅 `Escalator` 已足够，§19 复用地基不假装） | M5-2 |
+| 12   | 统一 `Delegate`/`DelegateSpec` 抽象 | ⏳ 首版可不公开（随 external 增量） | 后续 |
+| 14   | 按 delegate 拓扑自动启用 collab（mailbox/blackboard/plan/artifact） | ⏳ 未实现（已排期） | M6-1 |
+| 14   | external runtime collab 能力桥接本库 primitives | ⏳ 未实现（已排期） | M6-2 |
+
+M5（rules-routed + dispatcher-routed）承诺项**全部实现**。唯一 ➖ 项（映射 `Dispatcher` 初始路由器）
+属**设计选择而非缺口**：dispatcher-routed 的 primary 是显式命名的固定 worker，不存在需要 `Dispatcher`
+的「模糊中段 + 预算降级」初始路由；升级决策由真实 `Escalator::assess` 承担，忠实复用地基、未另造 runtime
+（§19），M5-2 完成记录已载此取向。其余 ⏳ 缺口（§12 统一抽象、§14 collab）由 §13/§14 自身排期为后续
+milestone（M6）承接，**无需新增前置任务**（不阻塞、非 M5 承诺范围）。**全套测试绿、无新观察到的失败测试**
+（Test Failure Policy 满足）。
+
+**验证**（序列 1–6 全绿 + external features clippy 全绿；本任务仅文档改动，但为 review 验收门仍跑全序列）：
+
+- `cargo fmt --all -- --check` ✓；
+- `cargo clippy --all-targets -- -D warnings` ✓ +
+  `--features "external-claude-code external-codex external-opencode external-acp"` ✓；
+- 聚焦 `cargo test -p agent-lib facade::delegate` ✓（46 passed，含 M5-1/M5-2 的 rules/dispatcher 用例）；
+- `cargo test --all --all-targets` ✓（全部 test binary 0 failed）；
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✓；`git diff --check` ✓。
 
 ---
 
