@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "kind": {
+      "custom": "acp"
+    },
+    "version": "acp-wire-1-fixture",
+    "probe": "agent-client-protocol 1.2.0 (offline decoder fixture)",
+    "session_id": "sess-019f6e33-c533-7680-9bb7-7d3b5a45e780"
+  },
+  "redaction": {
+    "applied": true,
+    "placeholder": "<redacted>",
+    "notes": "synthetic ACP session/update stream; no real prompt or credential content"
+  },
+  "turns": [
+    {
+      "expect_input": "start",
+      "input_frames": [
+        {
+          "stream": "stdout",
+          "payload": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\"}}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"I'll refactor the parser.\"}}}}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"plan\",\"entries\":[{\"content\":\"outline the parser\",\"priority\":\"high\",\"status\":\"in_progress\"},{\"content\":\"add tests\",\"priority\":\"medium\",\"status\":\"pending\"}]}}}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"call-search\",\"title\":\"search the workspace docs\",\"kind\":\"search\",\"status\":\"pending\"}}}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"call-search\",\"status\":\"completed\"}}}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\"}}"
+        }
+      ],
+      "expected_events": [
+        {
+          "seq": 0,
+          "event": {
+            "session_started": {
+              "session_id": "sess-019f6e33-c533-7680-9bb7-7d3b5a45e780"
+            }
+          }
+        },
+        {
+          "seq": 1,
+          "event": {
+            "text_delta": {
+              "text": "I'll refactor the parser."
+            }
+          }
+        },
+        {
+          "seq": 2,
+          "event": {
+            "task_updated": {
+              "task_id": "0",
+              "status": "in_progress"
+            }
+          }
+        },
+        {
+          "seq": 3,
+          "event": {
+            "task_updated": {
+              "task_id": "1",
+              "status": "pending"
+            }
+          }
+        },
+        {
+          "seq": 4,
+          "event": {
+            "tool_started": {
+              "name": "search the workspace docs"
+            }
+          }
+        },
+        {
+          "seq": 5,
+          "event": {
+            "tool_finished": {
+              "name": "search the workspace docs",
+              "status": "ok"
+            }
+          }
+        },
+        {
+          "seq": 6,
+          "event": "session_completed"
+        }
+      ],
+      "decision": {
+        "kind": "completed",
+        "output": {
+          "summary": "I'll refactor the parser.",
+          "artifacts": []
+        }
+      }
+    },
+    {
+      "expect_input": "continue",
+      "input_frames": [
+        {
+          "stream": "stdout",
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Applying the patch to src/lib.rs.\"}}}}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"call-edit\",\"title\":\"edit src/lib.rs\",\"kind\":\"edit\",\"status\":\"pending\"}}}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"toolCall\":{\"toolCallId\":\"call-edit\",\"title\":\"write src/lib.rs\"},\"options\":[]}}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"call-edit\",\"status\":\"completed\",\"content\":[{\"type\":\"diff\",\"path\":\"/repo/src/lib.rs\",\"newText\":\"pub fn added() {}\\n\"}]}}}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"jsonrpc\":\"2.0\",\"id\":11,\"result\":{\"stopReason\":\"end_turn\"}}"
+        }
+      ],
+      "expected_events": [
+        {
+          "seq": 7,
+          "event": {
+            "text_delta": {
+              "text": "Applying the patch to src/lib.rs."
+            }
+          }
+        },
+        {
+          "seq": 8,
+          "event": {
+            "tool_started": {
+              "name": "edit src/lib.rs"
+            }
+          }
+        },
+        {
+          "seq": 9,
+          "event": {
+            "permission_requested": {
+              "action_id": "10",
+              "summary": "write src/lib.rs"
+            }
+          }
+        },
+        {
+          "seq": 10,
+          "event": {
+            "file_patch": {
+              "path": "/repo/src/lib.rs",
+              "summary": "edit /repo/src/lib.rs"
+            }
+          }
+        },
+        {
+          "seq": 11,
+          "event": {
+            "tool_finished": {
+              "name": "edit src/lib.rs",
+              "status": "ok"
+            }
+          }
+        },
+        {
+          "seq": 12,
+          "event": "session_completed"
+        }
+      ],
+      "decision": {
+        "kind": "completed",
+        "output": {
+          "summary": "Applying the patch to src/lib.rs.",
+          "artifacts": []
+        }
+      }
+    }
+  ]
+}

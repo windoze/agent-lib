@@ -3353,7 +3353,7 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
   packages"（未拉入）；`--features external-acp` 下 `agent-client-protocol v1.2.0 └── agent-lib` 出现。
   `cargo build`（无 feature）不含 ACP crate；`cargo build --features external-acp` 通过。
 
-### [TODO] M10-2 用官方 crate 建立 ACP client 连接与 `session/update` 观测解码
+### [DONE] M10-2 用官方 crate 建立 ACP client 连接与 `session/update` 观测解码
 
 **上下文**:
 
@@ -3397,6 +3397,60 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
   - `cargo test -p agent-lib --features external-acp acp_session_update_maps_to_observations`
   - `cargo test -p agent-lib --features external-acp acp_cassette`
 - 完整验证序列 1-6 全过(默认 + `--features external-acp` 两种配置)。
+
+**完成记录**：
+
+- **新增两个 feature-gated 模块** `src/agent/external/acp/{decoder.rs,connection.rs}`，在
+  `acp/mod.rs` 以 `mod decoder; mod connection;` 挂载并 re-export 中立类型
+  `AcpStreamDecoder` / `AcpDecision` / `PendingClientRequest` / `AcpLauncher` /
+  `SpawnedAcpAgent` / `TokioProcessLauncher`；`src/agent/external/mod.rs` 的
+  `#[cfg(feature = "external-acp")]` re-export 块同步补齐,故
+  `agent_lib::agent::external::{AcpStreamDecoder, …}` 路径可用。
+- **公共 API 不泄漏 crate raw 类型(M10-2/M10-4 硬约束)**:decoder 唯一 **public** 解码入口是
+  `push_jsonrpc_line(&str) -> Result<Option<AcpDecision>, ExternalAgentError>`;吃 schema-typed 值的
+  `on_session_update(&SessionUpdate)` / `finish_turn(StopReason)` / `session_started` 均为 `pub(crate)`,
+  仅供 connection 层调用。`AcpDecision`(`Completed{output}` / `Failed{error}`)与 `PendingClientRequest`
+  (`Permission` / `ReadFile` / `WriteFile` / `Terminal`)全为中立类型,不含任何 `agent-client-protocol*`
+  类型。fixture 也只存 raw JSON-RPC 帧串 + 中立 `ExternalObservedEvent`/`AcpDecision`。
+- **`AcpStreamDecoder`(§10.3 已有词汇表,不新增变体)**:一个 decoder 跨整个 session,`seq` 跨 turn 单调分配
+  (design §5.5 replay dedup)。映射:`agent_message_chunk` → `TextDelta`(并累积为 turn summary);
+  `tool_call`(`execute` 类)→ `CommandStarted`、其余 → `ToolStarted`,按 `toolCallId` 关联到
+  `tool_call_update` 终态 → `CommandFinished` / `ToolFinished`;`diff` content → `FilePatch`;
+  `plan` → 每 entry 一条 `TaskUpdated`(`task_id` = 下标);`session/new` result 的 `sessionId` →
+  `SessionStarted`;`session/prompt` result 的 `stopReason`(EndTurn/MaxTokens/… 全部)→ `SessionCompleted`
+  + `AcpDecision::Completed`;JSON-RPC `error` → `AcpDecision::Failed{Runtime}`。`session/request_permission`
+  额外 emit 中立 `PermissionRequested` 观测并缓存 `PendingClientRequest::Permission`;`fs/*` / `terminal/*`
+  仅缓存(M10-2 不应答,留 M10-3 用 `take_client_requests()` 服务)。`PromptResponse.usage` 属未启用的
+  unstable feature,故 output 的 `usage`/`cost_micros`/`artifacts` 保持空,与 M10-1 capability 基线一致。
+- **容忍/错误纪律**:空行、缺 method/result/error 的 JSON-RPC 对象、未建模的 `session/update` 种类(thought /
+  user echo / 其它)均容忍(无观测);非 JSON、非对象、`session/update` params 无法解成 schema 类型 → 归类
+  `ExternalAgentError::Protocol`。所有诊断为固定字符串,永不夹带 prompt / 文件内容 / 凭据。
+- **connection 层**:可注入的 `AcpLauncher` trait(`async fn launch(&AcpConfig) -> SpawnedAcpAgent`);
+  `SpawnedAcpAgent` 行帧 JSON-RPC 传输——`write_line` 写一行并 flush,`read_line` 每读带
+  `config.timeout()` 超时(超时/断开 → `ExternalAgentError::SessionLost`,EOF → `Ok(None)`),内部把流装箱
+  为 `Box<dyn AsyncRead/AsyncWrite + Send + Unpin>` 以便测试注入内存流。生产 `TokioProcessLauncher` 用
+  `tokio::process`:`env_clear` 后灌入 `resolved_env`、`current_dir(working_dir)`、stdin/stdout piped、
+  stderr 丢弃(防凭据泄漏)、`kill_on_drop(true)`,并保留 `Child` 句柄让 drop 时回收——与三个 CLI adapter
+  的 IO 纪律一致。live `initialize`/`session/new`/`session/prompt` 驱动与 permission bridge 留 M10-3。
+- **测试(全绿)**:decoder 6 个 inline 单测(`acp_session_update_maps_to_observations`——text/plan/
+  非命令 tool_call/命令 tool_call/diff 全覆盖并断言单调 `seq` 与 `Completed` summary、
+  `acp_session_update_tolerates_unmodeled_kinds`、`acp_push_jsonrpc_line_decodes_notification_and_result`、
+  `acp_push_jsonrpc_line_caches_client_requests`、`acp_push_jsonrpc_line_classifies_error_response`、
+  `acp_push_jsonrpc_line_tolerates_and_rejects`);connection 3 个 `#[tokio::test]`
+  (`fake_launcher_transport_feeds_decoder`、`read_line_times_out_into_session_lost`——50ms 超时快速返回、
+  `read_line_reports_eof`)。新增离线 cassette `tests/agent_acp_cassette.rs` + fixture
+  `tests/fixtures/external/acp/full_session.json`(+ README):两 turn(Start text-only+plan+tool_call →
+  completion;Continue text+edit tool_call+`session/request_permission`+diff → completion),4 个测试
+  (`acp_cassette_regenerate_fixture` env-gated 重生、`acp_cassette_matches_in_code_builder`、
+  `acp_cassette_is_secret_free` 脱敏扫描、`acp_cassette_decodes_full_session` 单 decoder 重放断言观测流/
+  逐 turn 决策/缓存的 permission 请求);重生走 `AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1`,常规跑不覆写。
+- **验证序列 1-6 全过**(默认 + `--features external-acp` 两配置):`cargo fmt --all` 通过;
+  `cargo clippy --all-targets -- -D warnings`(默认)与 `--features external-acp` 均无告警;
+  `cargo test --all --all-targets`(默认)全绿、`--features external-acp` 全绿(lib 含新增 9 个 acp 单测,
+  集成新增 4 个 acp cassette 测试,均 <1s);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  默认与 `--features external-acp` 均通过。
+- **feature 隔离**:decoder/connection/cassette 全部 `#[cfg(feature = "external-acp")]` 或
+  `#![cfg(feature = "external-acp")]` 门控;默认构建既不编译新代码也不拉入 ACP crate,默认全量测试与改动前一致。
 
 ### [TODO] M10-3 实现 ACP live session adapter、permission bridge 与 ignored real e2e
 

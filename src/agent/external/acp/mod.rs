@@ -18,8 +18,13 @@
 //!   the neutral [`AcpNegotiatedCapabilities`] projection of an `initialize`
 //!   handshake into an
 //!   [`ExternalRuntimeCapabilities`](crate::agent::external::ExternalRuntimeCapabilities).
-//! - **M10-2 (later):** the official-crate client connection and the
-//!   `session/update` → observation decoder.
+//! - **M10-2 (this task):** the client [`connection`] layer ([`AcpLauncher`] /
+//!   [`SpawnedAcpAgent`] / [`TokioProcessLauncher`]) and the private
+//!   [`session/update` decoder`](decoder) — [`AcpStreamDecoder`] — that
+//!   normalizes agent→client messages into sequenced
+//!   [`ExternalObservedEvent`](crate::agent::external::ExternalObservedEvent)
+//!   observations and per-turn [`AcpDecision`]s while caching the client requests
+//!   ([`PendingClientRequest`]) M10-3 must service.
 //! - **M10-3 (later):** the live `AcpAdapter` / session that first truly drives
 //!   the host-pausable permission bridge.
 //!
@@ -31,8 +36,12 @@
 //! projection is built from the handshake by the connection layer in later tasks.
 
 mod config;
+mod connection;
+mod decoder;
 
 pub use config::AcpConfig;
+pub use connection::{AcpLauncher, SpawnedAcpAgent, TokioProcessLauncher};
+pub use decoder::{AcpDecision, AcpStreamDecoder, PendingClientRequest};
 
 use crate::agent::external::{ExternalRuntimeCapabilities, ExternalRuntimeKind};
 
