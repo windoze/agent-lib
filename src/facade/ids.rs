@@ -135,6 +135,18 @@ impl FacadeIds {
         MessageId::new(self.next_uuid())
     }
 
+    /// Mints the next framework tool-call identity.
+    ///
+    /// Used by the facade to key a rules-routed delegation into its shared
+    /// delegation recorder when no model-issued tool call supplies one
+    /// (`docs/facade-api.md` §13.2). Named to avoid clashing with the
+    /// `ToolExecutionIds::tool_call_id` trait method, which derives a call id
+    /// from an existing model-issued [`ToolCall`].
+    #[must_use]
+    pub fn fresh_tool_call_id(&self) -> ToolCallId {
+        ToolCallId::new(self.next_uuid())
+    }
+
     /// Mints the next Agent step identity.
     #[must_use]
     pub fn step_id(&self) -> StepId {

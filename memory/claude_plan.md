@@ -1,40 +1,44 @@
-# M4-R Review：Managed external agent 正确性与文档一致性检查
+# M5-1 rules-routed delegation — DONE
 
-Task: TODO.md M4-R (first incomplete). Review-only + reconcile task over M4-1..M4-3.
-Verify facade external delegate matches docs/facade-api.md §11 / §9.2 / §15.2–§15.3 /
-§6.2 / §19; fix small deviations; produce comparison table; record gaps.
+## Task
+First incomplete task in TODO.md: **M5-1 rules-routed delegation** (docs/facade-api.md §13.2).
+Extend `Delegation` with `rules()` + `when_task_contains(keywords, delegate)`; the facade
+routes a whole task to a matching delegate (local or external) WITHOUT exposing any delegate
+as a model tool. rustdoc + offline tests + full validation sequence.
 
-## Findings
-- CONCRETE FIX: prelude was missing `ManagedExternalAgent` (M4-1 deferred it here,
-  "prelude 补录留 M4-R"). §3 prelude list names only `ManagedExternalAgent` (NOT
-  ExternalRunMode/RestoreExternal), so add exactly that one. -> src/prelude.rs.
-- Background review (explore agent) + manual read confirmed NO other code deviation:
-  * mapping NeedSubagent->ExternalAgentMachine->ExternalSessionHandler->adapter reused (§19).
-  * capability grades honest (wrap ExternalRuntimeCapabilities + ACP negotiation, fail-fast).
-  * snapshot data-only (no handle/secret/client/closure); default RestoreExternal=MarkInterrupted.
-  * external start gated by resolve_external_start; headless-no-policy denies (not hang).
-  * RunOutput expresses delegation+artifacts+events (§6.2).
-- Reconciliation: `ask_worktree_write` is ADVISORY (rustdoc says so), satisfied via §9.2's
-  "或显式 opt-in" branch (managed child runs in isolated throwaway worktree explicitly
-  configured via .worktree()). M4-3 record's "升级为强制执行" phrasing was imprecise for
-  worktree-write specifically; only external-agent START is hard-gated (ask_external_agents).
-  Behavior is spec-compliant -> no code change; clarified in M4-R record.
-- Future/deferred (foundation-gated, R8/R9; spec §11.3 marks host_tools "后续能力",
-  resume depends on ACP loadSession): live host-tool injection (ManagedWithTools runtime)
-  and live attach/resume (Attachable runtime) + resume approval gate are NOT M4 deliverables;
-  facade honestly fail-fasts, does not pretend. Recorded in comparison table; no new task
-  (not committed scope, not blocking) — same handling as M3-R for §11/§12/§13 gaps.
+## Design decisions
+- New internal `DelegationMode::Rules { rules: Vec<RoutingRule> }`.
+- Matching: case-insensitive substring `contains`; ANY keyword hits; FIRST rule (registration
+  order) wins = priority. No match → falls through to normal supervisor drive.
+- Rules-routed bypasses the supervisor LLM entirely: supervisor usage = 0, and the routed turn
+  is NOT folded into the supervisor `Conversation` (keeps DefaultAgentMachine sans-io
+  encapsulation intact). The delegation is reported fully via RunOutput + trace + events.
+- Reuse: `fulfill_rules_routed` synthesizes an `ask_<name>(task)` ToolCall keyed by a fresh
+  framework call id, then dispatches to the existing `drive_delegation` /
+  `drive_external_delegation`, so recorder/usage/artifacts/§9.2 approval gate are identical.
+- External approval-denial → `Err(FacadeError::ApprovalDenied)`; a failed (non-denied)
+  delegation → Ok(RunOutput) with a Failed trace + DelegationFailed event.
+- Build-time validation: a rule naming an unregistered delegate → `FacadeError::Config`.
 
-## Validation (seq 1-6 + ext clippy) — ALL GREEN
-1. cargo fmt --all -- --check ✓
-2. cargo test -p agent-lib --lib facade:: ✓ (108 passed)
-3. cargo clippy --all-targets -- -D warnings ✓
-   + --features "external-claude-code external-codex external-opencode external-acp" ✓
-4. cargo test --all --all-targets ✓ (50 binaries, 0 failures)
+## Edits
+- ids.rs: `fresh_tool_call_id()` (renamed to avoid clash with the `ToolExecutionIds::tool_call_id`
+  trait method).
+- delegate.rs: RoutingRule, DelegationMode::Rules, builders (rules/when_task_contains/route_task/
+  is_rules_routed/first_unknown_rule_delegate), empty declarations/route/external_tool_names for
+  Rules, RulesRoutedTarget, fulfill_rules_routed, synthetic_delegation_call. +4 unit tests, +6
+  drive/stream tests.
+- agent.rs: run_full rules branch, build_delegation_handler, resolve_rules_target,
+  run_rules_routed, free fns drive_rules_routed / build_rules_routed_output / rules_routed_summary
+  / user_message_text; build-time validation in AgentBuilder::build.
+- agent/stream.rs: start() rules branch → start_rules_routed (drives delegate, replays events into
+  sink, yields Done).
+
+## Validation — ALL GREEN
+1. cargo fmt --all ✓
+2. cargo clippy --all-targets -- -D warnings ✓ (and with the three external features ✓)
+3. cargo test -p agent-lib facade::delegate ✓ (35 passed)
+4. cargo test --all --all-targets ✓ (50 test-result groups, no failures)
 5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace ✓
 6. git diff --check ✓
 
-## Status
-- [x] prelude fix + rustdoc
-- [x] full validation
-- [x] TODO.md M4-R [DONE] + comparison table + commit
+## Status: COMPLETE — TODO.md M5-1 marked [DONE]. Committing, then STOP.

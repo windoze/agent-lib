@@ -1328,7 +1328,7 @@ M4（managed external agent 构造/分级/兑现/审批/restore）承诺项**全
 目标：`docs/facade-api.md` §13.2–§13.3、§18.5。rules-routed 与 dispatcher-routed delegation，对应
 `agent::external::Dispatcher` / `Escalator`：cheap→verify→strong 升级闭环，升级路径进 `DelegationTrace`。
 
-### [TODO] M5-1 rules-routed delegation
+### [DONE] M5-1 rules-routed delegation
 
 **上下文**：
 
@@ -1349,6 +1349,34 @@ M4（managed external agent 构造/分级/兑现/审批/restore）承诺项**全
   规则优先级/多命中处理确定。
 - 聚焦：`cargo test -p agent-lib facade::delegate`（含 rules 用例）。
 - 完整验证序列 1–6。
+
+**完成记录**：
+
+- `src/facade/delegate.rs`：新增 `RoutingRule`（keywords + delegate，大小写不敏感子串匹配、任一关键词命中）
+  与 `DelegationMode::Rules`；`Delegation` 新增 `rules()`、`when_task_contains(keywords, delegate)`（链式，
+  非 rules 模式调用会切换为 rules）、`is_rules_routed()`、`route_task()`（首条命中规则胜出＝注册顺序即优先级）、
+  `first_unknown_rule_delegate()`（build 期校验）。`declarations()`/`route()`/`external_tool_names()` 对 Rules
+  模式返回空——即不向模型暴露任何 delegate 工具。新增 `RulesRoutedTarget`（Local/External，持有 owned clone）与
+  `DelegationToolHandler::fulfill_rules_routed()`：合成 `ask_<name>(task)` 调用后复用既有
+  `drive_delegation`/`drive_external_delegation`，因此 recorder、usage 归集、artifacts、§9.2 外部审批门完全一致。
+- `src/facade/ids.rs`：新增 `fresh_tool_call_id()`（避免与 `ToolExecutionIds::tool_call_id` trait 方法冲突），
+  为无模型工具调用的 rules 路由铸造 recorder key。
+- `src/facade/agent.rs`：`run_full` 增加 rules 分支（命中即 `run_rules_routed`，未命中回落到普通 supervisor
+  drive）；新增 `build_delegation_handler`/`resolve_rules_target`/`run_rules_routed` 与自由函数
+  `drive_rules_routed`/`build_rules_routed_output`/`rules_routed_summary`/`user_message_text`。设计：rules 路由
+  不经过 supervisor LLM，supervisor usage 为 0，且**不**把该轮折叠进 supervisor `Conversation`（保持 sans-io
+  封装），delegation 完全经由 `RunOutput`+trace/events 报告；external delegate 的可续会话事实保留供 snapshot。
+  `AgentBuilder::build` 增加 build 期校验：规则引用未注册 delegate → `FacadeError::Config`。
+- `src/facade/agent/stream.rs`：`start()` 增加 rules 分支 `start_rules_routed`，future 驱动 delegate 后把
+  `DelegationStarted`/`DelegationArtifact`/`DelegationFinished|Failed` 事件回放进 sink，末尾产 `Done`。
+- 测试：`src/facade/delegate.rs` 新增 4 个单元测试（route_task 优先级/大小写/未命中、Rules 模式零工具声明、
+  链式切换、未知 delegate 检测）+ 6 个离线 drive/stream 测试（本地 subagent、external delegate、未命中回落
+  supervisor、首条规则胜出、build 拒绝未知 delegate、stream 事件序列）。
+- 验证：`cargo fmt --all` ✓；`cargo clippy --all-targets -- -D warnings` ✓（含
+  `--features external-claude-code external-codex external-opencode` ✓）；`cargo test -p agent-lib facade::delegate`
+  35 passed ✓；`cargo test --all --all-targets` 全绿（50 个 test-result 组无失败）✓；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✓；`git diff --check` 无问题 ✓。
+
 
 ### [TODO] M5-2 dispatcher-routed delegation（primary → verify → escalate）
 

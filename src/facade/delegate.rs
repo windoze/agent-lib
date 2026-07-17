@@ -467,9 +467,9 @@ pub(crate) fn delegation_declaration(name: &str, description: &str) -> ToolDecl 
 }
 
 /// The delegation routing strategy for an agent's registered subagents
-/// (`docs/facade-api.md` §10.2, §13.1).
+/// (`docs/facade-api.md` §10.2, §13.1, §13.2).
 ///
-/// Two shapes are supported at this milestone:
+/// Three shapes are supported:
 ///
 /// - [`model_routed`](Self::model_routed) (the default): every registered
 ///   subagent is advertised to the supervising model as its own
@@ -479,6 +479,12 @@ pub(crate) fn delegation_declaration(name: &str, description: &str) -> ToolDecl 
 ///   unified `<name>(agent, task)` tool that routes to the requested delegate by
 ///   its `agent` argument. This suits a dynamic delegate roster or an outer
 ///   policy that wants to own routing.
+/// - [`rules`](Self::rules): the facade (not the model) routes each *task* to a
+///   delegate by matching keywords in the task text
+///   ([`when_task_contains`](Self::when_task_contains)). No delegate is exposed
+///   to the model as a tool, so the model need not know the delegates exist —
+///   the fit when a product must not let the model start an expensive worker on
+///   its own (§13.2).
 ///
 /// ```
 /// use agent_lib::facade::Delegation;
@@ -488,10 +494,50 @@ pub(crate) fn delegation_declaration(name: &str, description: &str) -> ToolDecl 
 ///
 /// // Advanced: a single unified delegation tool.
 /// let unified = Delegation::single_tool("delegate");
+///
+/// // Rules-routed: the facade routes by keywords, the model stays unaware.
+/// let ruled = Delegation::rules()
+///     .when_task_contains(["fix", "test", "compile"], "coder")
+///     .when_task_contains(["review", "audit"], "reviewer");
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delegation {
     mode: DelegationMode,
+}
+
+/// One rules-routed routing rule: any of `keywords` present in a task routes it
+/// to the delegate registered under `delegate` (`docs/facade-api.md` §13.2).
+///
+/// Matching is case-insensitive substring containment on the task text, and the
+/// first rule (in registration order) whose keywords hit wins, so rule order is
+/// the routing priority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingRule {
+    /// The keywords that, if any appears in the task text, select this rule.
+    keywords: Vec<String>,
+    /// The registration name of the delegate this rule routes to.
+    delegate: String,
+}
+
+impl RoutingRule {
+    /// Returns the delegate name this rule routes to.
+    #[must_use]
+    pub fn delegate(&self) -> &str {
+        &self.delegate
+    }
+
+    /// Returns the keywords that select this rule.
+    #[must_use]
+    pub fn keywords(&self) -> &[String] {
+        &self.keywords
+    }
+
+    /// Reports whether `haystack` (already lowercased) contains any keyword.
+    fn matches(&self, haystack: &str) -> bool {
+        self.keywords
+            .iter()
+            .any(|keyword| haystack.contains(&keyword.to_lowercase()))
+    }
 }
 
 /// The internal routing mode carried by a [`Delegation`].
@@ -505,6 +551,12 @@ enum DelegationMode {
     SingleTool {
         /// The advertised name of the unified delegation tool.
         tool_name: String,
+    },
+    /// Facade-owned routing: the task is matched against `rules` and routed to a
+    /// delegate without exposing any delegate to the model (§13.2).
+    Rules {
+        /// The ordered routing rules; the first whose keywords hit wins.
+        rules: Vec<RoutingRule>,
     },
 }
 
@@ -566,6 +618,102 @@ impl Delegation {
         }
     }
 
+    /// Rules-routed delegation: the facade routes each task to a delegate by
+    /// matching keywords, without exposing any delegate to the model (§13.2).
+    ///
+    /// Start from an empty rule set and add rules with
+    /// [`when_task_contains`](Self::when_task_contains). Because no delegate is
+    /// advertised as a tool, the supervising model need not know the delegates
+    /// exist; a task that matches no rule is answered by the supervisor itself.
+    ///
+    /// ```
+    /// use agent_lib::facade::Delegation;
+    ///
+    /// let routing = Delegation::rules()
+    ///     .when_task_contains(["fix", "test", "compile"], "coder")
+    ///     .when_task_contains(["review", "audit"], "reviewer");
+    /// ```
+    #[must_use]
+    pub fn rules() -> Self {
+        Self {
+            mode: DelegationMode::Rules { rules: Vec::new() },
+        }
+    }
+
+    /// Appends a rules-routed rule: if the task text contains **any** of
+    /// `keywords`, route the whole task to the delegate registered under
+    /// `delegate` (§13.2).
+    ///
+    /// Matching is case-insensitive substring containment, and rules are tried
+    /// in the order they were added — the first rule whose keywords hit wins, so
+    /// registration order is the routing priority. This method is meant to chain
+    /// after [`rules`](Self::rules); calling it on a non-rules [`Delegation`]
+    /// switches the mode to rules-routed, starting from this single rule.
+    #[must_use]
+    pub fn when_task_contains<I, S>(mut self, keywords: I, delegate: impl Into<String>) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let rule = RoutingRule {
+            keywords: keywords.into_iter().map(Into::into).collect(),
+            delegate: delegate.into(),
+        };
+        match &mut self.mode {
+            DelegationMode::Rules { rules } => rules.push(rule),
+            _ => self.mode = DelegationMode::Rules { rules: vec![rule] },
+        }
+        self
+    }
+
+    /// Reports whether this delegation routes by facade rules rather than by the
+    /// model (§13.2).
+    #[must_use]
+    pub(crate) fn is_rules_routed(&self) -> bool {
+        matches!(self.mode, DelegationMode::Rules { .. })
+    }
+
+    /// Resolves the rules-routed delegate name for `task`, if any rule matches.
+    ///
+    /// Returns the delegate name of the first rule (in registration order) whose
+    /// keywords appear in `task`, or `None` when no rule matches or this
+    /// delegation is not rules-routed (§13.2).
+    #[must_use]
+    pub(crate) fn route_task(&self, task: &str) -> Option<&str> {
+        let DelegationMode::Rules { rules } = &self.mode else {
+            return None;
+        };
+        let haystack = task.to_lowercase();
+        rules
+            .iter()
+            .find(|rule| rule.matches(&haystack))
+            .map(|rule| rule.delegate.as_str())
+    }
+
+    /// Returns the first rule delegate name that is not registered among
+    /// `subagents` or `external`, for build-time validation (§13.2).
+    ///
+    /// A rules-routed delegation that names a delegate no agent registered can
+    /// never route correctly, so [`AgentBuilder::build`](crate::facade::AgentBuilder::build)
+    /// rejects it up front rather than failing silently at run time.
+    #[must_use]
+    pub(crate) fn first_unknown_rule_delegate(
+        &self,
+        subagents: &[LocalSubagent],
+        external: &[ManagedExternalDelegate],
+    ) -> Option<String> {
+        let DelegationMode::Rules { rules } = &self.mode else {
+            return None;
+        };
+        rules
+            .iter()
+            .find(|rule| {
+                !subagents.iter().any(|s| s.name() == rule.delegate)
+                    && !external.iter().any(|e| e.name() == rule.delegate)
+            })
+            .map(|rule| rule.delegate.clone())
+    }
+
     /// Synthesizes the tool declarations this delegation advertises for
     /// `subagents` and `external` delegates, appended to the supervisor's
     /// advertised tool set at build time (§10.1, §13.1).
@@ -593,6 +741,9 @@ impl Delegation {
                     tool_name, subagents, external,
                 )]
             }
+            // Rules-routed delegation never advertises a delegate to the model:
+            // the facade routes the task itself, so no tool is synthesized (§13.2).
+            DelegationMode::Rules { .. } => Vec::new(),
         }
     }
 
@@ -627,6 +778,14 @@ impl Delegation {
                     .map(|delegate| (delegate.name().to_owned(), delegate.clone()))
                     .collect(),
             },
+            // Rules-routed delegation exposes no delegation tool to the machine,
+            // so the run-scoped handler recognizes nothing and forwards every
+            // call to the base registry; the facade drives the routed delegate
+            // directly instead (§13.2).
+            DelegationMode::Rules { .. } => DelegationRoute::PerSubagent {
+                local: HashMap::new(),
+                external: HashMap::new(),
+            },
         }
     }
 
@@ -645,6 +804,9 @@ impl Delegation {
                 .map(|delegate| delegation_tool_name(delegate.name()))
                 .collect(),
             DelegationMode::SingleTool { .. } => Vec::new(),
+            // Rules-routed delegation never advertises an external start tool to
+            // the machine (the facade drives it directly), so nothing to exempt.
+            DelegationMode::Rules { .. } => Vec::new(),
         }
     }
 }
@@ -1335,6 +1497,61 @@ impl DelegationToolHandler {
                     session,
                 },
             );
+    }
+
+    /// Drives one rules-routed delegation to `target` and records its trace,
+    /// usage, and any artifacts under `call_id` (`docs/facade-api.md` §13.2).
+    ///
+    /// Rules-routed delegation is initiated by the facade, not the model, so
+    /// there is no model-issued tool call to fulfill. This synthesizes the
+    /// `ask_<name>(task)` call the delegate drive expects and reuses the exact
+    /// same fulfillment path a model-routed delegation would — a local subagent
+    /// through [`drive_delegation`](Self::drive_delegation), a managed external
+    /// agent through [`drive_external_delegation`](Self::drive_external_delegation)
+    /// (including its §9.2 approval gate) — so the recorder entry, usage
+    /// attribution, and artifact capture are identical.
+    pub(crate) async fn fulfill_rules_routed(
+        &self,
+        call_id: ToolCallId,
+        target: &RulesRoutedTarget,
+        task: String,
+        ctx: &RunContext,
+    ) -> RequirementResult {
+        match target {
+            RulesRoutedTarget::Local(subagent) => {
+                let call = synthetic_delegation_call(&call_id, subagent.name(), &task);
+                self.drive_delegation(call_id, &call, subagent, task, ctx)
+                    .await
+            }
+            RulesRoutedTarget::External(delegate) => {
+                let call = synthetic_delegation_call(&call_id, delegate.name(), &task);
+                self.drive_external_delegation(call_id, &call, delegate, task, ctx)
+                    .await
+            }
+        }
+    }
+}
+
+/// The delegate a rules-routed delegation resolves a task to (§13.2).
+///
+/// Resolved by the facade from a [`Delegation::route_task`] match against the
+/// agent's registered delegates. It owns the delegate recipe (both variants are
+/// cheap, data-only clones) so the drive holds no borrow of the agent across an
+/// `await`.
+pub(crate) enum RulesRoutedTarget {
+    /// The task routes to a local subagent.
+    Local(LocalSubagent),
+    /// The task routes to a managed external agent.
+    External(ManagedExternalDelegate),
+}
+
+/// Synthesizes the `ask_<name>(task)` tool call a rules-routed delegation drive
+/// consumes, keyed by the framework `call_id` so its recorder entry matches.
+fn synthetic_delegation_call(call_id: &ToolCallId, delegate_name: &str, task: &str) -> ToolCall {
+    ToolCall {
+        id: call_id.to_string(),
+        name: delegation_tool_name(delegate_name),
+        input: json!({ "task": task }),
     }
 }
 
@@ -2718,5 +2935,336 @@ mod model_routed_tests {
             matches!(error, crate::facade::FacadeError::InvalidState(_)),
             "an unattachable AttachOrFail restore fails explicitly, got {error:?}"
         );
+    }
+
+    // ---- rules-routed delegation (`docs/facade-api.md` §13.2) ----
+
+    #[test]
+    fn rules_route_task_first_match_wins_and_is_case_insensitive() {
+        let routing = Delegation::rules()
+            .when_task_contains(["review", "audit"], "reviewer")
+            .when_task_contains(["fix", "compile"], "coder");
+        assert!(routing.is_rules_routed());
+
+        // The first rule whose keyword hits wins, even when a later rule would
+        // also match — registration order is the routing priority.
+        assert_eq!(
+            routing.route_task("Please REVIEW and fix the diff"),
+            Some("reviewer")
+        );
+        // Matching is case-insensitive substring containment.
+        assert_eq!(routing.route_task("time to COMPILE it"), Some("coder"));
+        // No keyword present routes nowhere (the supervisor answers instead).
+        assert_eq!(routing.route_task("write documentation"), None);
+    }
+
+    #[test]
+    fn rules_mode_advertises_no_delegate_tools() {
+        let routing = Delegation::rules().when_task_contains(["fix"], "coder");
+        assert!(
+            routing.declarations(&[], &[]).is_empty(),
+            "rules-routed delegation exposes no delegate to the model"
+        );
+        assert!(routing.external_tool_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn when_task_contains_switches_a_non_rules_delegation_to_rules() {
+        // Chaining onto the default model-routed delegation flips it to rules
+        // mode, starting from the single appended rule.
+        let routing = Delegation::model_routed().when_task_contains(["fix"], "coder");
+        assert!(routing.is_rules_routed());
+        assert_eq!(routing.route_task("fix it"), Some("coder"));
+    }
+
+    #[test]
+    fn unknown_rule_delegate_is_detected_for_build_validation() {
+        let routing = Delegation::rules().when_task_contains(["x"], "ghost");
+        assert_eq!(
+            routing.first_unknown_rule_delegate(&[], &[]).as_deref(),
+            Some("ghost")
+        );
+    }
+
+    #[tokio::test]
+    async fn rules_routed_task_routes_to_matching_local_subagent() {
+        // No SUPERVISOR route is scripted: a rules-routed turn must not take an
+        // LLM step, so the supervisor client is never asked to `chat`.
+        let client = RoutingClient::new(vec![route(
+            "REVIEWER",
+            vec![text_response("LGTM: no issues found")],
+        )]);
+
+        let reviewer = Agent::worker()
+            .description("Strict code reviewer.")
+            .system("You are the REVIEWER.")
+            .build()
+            .expect("worker builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .subagent("reviewer", reviewer)
+            .delegation(Delegation::rules().when_task_contains(["review", "audit"], "reviewer"))
+            .build()
+            .expect("agent builds");
+
+        // The model is never told a delegate exists: no delegation tool is
+        // advertised on the supervisor spec.
+        let advertised: Vec<&str> = agent
+            .state()
+            .spec()
+            .initial_tools()
+            .tools()
+            .iter()
+            .map(|decl| decl.name.as_str())
+            .collect();
+        assert!(
+            !advertised.iter().any(|name| name.starts_with("ask_")),
+            "rules-routed delegation advertises no delegate tool, got {advertised:?}"
+        );
+
+        let output = agent.run_full("Please review the diff.").await.unwrap();
+
+        // With no supervisor step the delegate's summary is the whole reply.
+        assert_eq!(output.reply.text(), "LGTM: no issues found");
+        // The supervisor took no LLM step, so its usage slice is zero.
+        assert_eq!(output.usage.supervisor.input, 0);
+        assert_eq!(output.usage.supervisor.output, 0);
+
+        // Exactly one delegation trace, attributed to the reviewer, completed.
+        assert_eq!(output.delegations.len(), 1);
+        let trace = &output.delegations[0];
+        assert_eq!(trace.delegate, "reviewer");
+        assert_eq!(trace.status, DelegationStatus::Completed);
+
+        // Child usage is attributed to the subagent slice, not the supervisor.
+        assert_eq!(output.usage.subagents.input, 11);
+        assert_eq!(output.usage.subagents.output, 7);
+
+        // The routed exchange is not folded into the supervisor conversation.
+        assert!(
+            agent.conversation().turns().is_empty(),
+            "a rules-routed turn does not commit to the supervisor conversation"
+        );
+
+        // Bracketing events: Started then Finished, no ordinary tool events.
+        let started = output
+            .events
+            .iter()
+            .position(|event| matches!(event, RunEvent::DelegationStarted(_)))
+            .expect("a DelegationStarted event");
+        let finished = output
+            .events
+            .iter()
+            .position(|event| matches!(event, RunEvent::DelegationFinished(_)))
+            .expect("a DelegationFinished event");
+        assert!(started < finished, "DelegationStarted precedes Finished");
+        assert!(
+            !output
+                .events
+                .iter()
+                .any(|event| matches!(event, RunEvent::ToolStarted(_))),
+            "no ordinary tool events for a rules-routed delegation"
+        );
+    }
+
+    #[tokio::test]
+    async fn rules_routed_task_routes_to_external_delegate() {
+        // The supervisor client is never asked to chat; only the external
+        // delegate's scripted session runs.
+        let client = RoutingClient::new(vec![route("SUPERVISOR", vec![text_response("unused")])]);
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .external_agent("coder", completed_coder())
+            .delegation(Delegation::rules().when_task_contains(["refactor", "fix"], "coder"))
+            .build()
+            .expect("agent builds");
+
+        let output = agent.run_full("Please refactor the parser.").await.unwrap();
+
+        // The external summary is the whole reply.
+        assert_eq!(output.reply.text(), "refactor complete");
+
+        // One external delegation trace, completed, with runtime usage on the
+        // external slice.
+        assert_eq!(output.delegations.len(), 1);
+        let trace = &output.delegations[0];
+        assert_eq!(trace.delegate, "coder");
+        assert_eq!(trace.status, DelegationStatus::Completed);
+        assert_eq!(output.usage.external.input, 4);
+        assert_eq!(output.usage.external.output, 2);
+        assert_eq!(output.usage.subagents.input, 0);
+
+        // The reported artifact surfaces on the run output.
+        assert_eq!(output.artifacts.len(), 1);
+        assert_eq!(output.artifacts[0].path, "src/parser.rs");
+
+        // The external delegate's resumable session facts are retained for a
+        // later snapshot (§15.2).
+        let snapshot = agent.snapshot().expect("snapshot at a committed point");
+        let json = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        assert!(
+            json.contains("resume-1"),
+            "the retained external session token is persisted in the snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn rules_routed_no_match_runs_the_supervisor_normally() {
+        // A task matching no rule falls through to the ordinary supervisor drive.
+        let client = RoutingClient::new(vec![route(
+            "SUPERVISOR",
+            vec![text_response("I answered it myself.")],
+        )]);
+
+        let reviewer = Agent::worker()
+            .description("Strict code reviewer.")
+            .system("You are the REVIEWER.")
+            .build()
+            .expect("worker builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .subagent("reviewer", reviewer)
+            .delegation(Delegation::rules().when_task_contains(["review", "audit"], "reviewer"))
+            .build()
+            .expect("agent builds");
+
+        let output = agent.run_full("Write the documentation.").await.unwrap();
+
+        // The supervisor answered directly; no delegation happened.
+        assert_eq!(output.reply.text(), "I answered it myself.");
+        assert!(
+            output.delegations.is_empty(),
+            "a non-matching task is not delegated"
+        );
+        assert_eq!(output.usage.supervisor.input, 11);
+        // The supervisor turn is committed to the conversation as usual.
+        assert!(!agent.conversation().turns().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rules_routed_first_matching_rule_wins_across_delegates() {
+        // Both rules would match "review and refactor"; the first (reviewer) wins.
+        let client = RoutingClient::new(vec![
+            route("REVIEWER", vec![text_response("reviewer handled it")]),
+            route("CODER", vec![text_response("coder handled it")]),
+        ]);
+
+        let reviewer = Agent::worker()
+            .description("Strict reviewer.")
+            .system("You are the REVIEWER.")
+            .build()
+            .expect("worker builds");
+        let coder = Agent::worker()
+            .description("Focused coder.")
+            .system("You are the CODER.")
+            .build()
+            .expect("worker builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .subagent("reviewer", reviewer)
+            .subagent("coder", coder)
+            .delegation(
+                Delegation::rules()
+                    .when_task_contains(["review"], "reviewer")
+                    .when_task_contains(["review", "refactor"], "coder"),
+            )
+            .build()
+            .expect("agent builds");
+
+        let output = agent
+            .run_full("Please review and refactor the module.")
+            .await
+            .unwrap();
+        assert_eq!(output.reply.text(), "reviewer handled it");
+        assert_eq!(output.delegations.len(), 1);
+        assert_eq!(output.delegations[0].delegate, "reviewer");
+    }
+
+    #[test]
+    fn rules_routed_unknown_delegate_is_rejected_at_build() {
+        let client = RoutingClient::new(vec![route("SUPERVISOR", vec![text_response("x")])]);
+        let error = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .delegation(Delegation::rules().when_task_contains(["fix"], "ghost"))
+            .build()
+            .expect_err("a rule naming an unregistered delegate is rejected");
+        assert!(
+            matches!(error, crate::facade::FacadeError::Config(_)),
+            "an unknown rule delegate is a build-time Config error, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rules_routed_stream_yields_delegation_events_then_done() {
+        let client = RoutingClient::new(vec![route(
+            "REVIEWER",
+            vec![text_response("streamed review done")],
+        )]);
+
+        let reviewer = Agent::worker()
+            .description("Strict code reviewer.")
+            .system("You are the REVIEWER.")
+            .build()
+            .expect("worker builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .subagent("reviewer", reviewer)
+            .delegation(Delegation::rules().when_task_contains(["review"], "reviewer"))
+            .build()
+            .expect("agent builds");
+
+        let mut stream = agent
+            .stream("Please review the diff.")
+            .await
+            .expect("stream starts");
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("stream item is ok"));
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RunEvent::DelegationStarted(_))),
+            "the stream surfaces a DelegationStarted event"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RunEvent::DelegationFinished(_))),
+            "the stream surfaces a DelegationFinished event"
+        );
+        let done = events
+            .iter()
+            .find_map(|event| match event {
+                RunEvent::Done(output) => Some(output),
+                _ => None,
+            })
+            .expect("the stream ends with a Done event");
+        assert_eq!(done.reply.text(), "streamed review done");
+        assert_eq!(done.delegations.len(), 1);
+        assert_eq!(done.delegations[0].delegate, "reviewer");
     }
 }

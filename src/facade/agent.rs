@@ -44,9 +44,9 @@ use std::sync::Arc;
 use crate::agent::{
     AgentError, AgentInput, AgentSpec, AgentState, BudgetLimits, DefaultAgentMachine, HandlerScope,
     InteractionHandler, LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor, LoopPolicy,
-    ModelRef, Notification, RequirementIds, RunContext, ToolApprovalPolicy, ToolExecutionIds,
-    ToolFailurePolicy, ToolHandler, ToolRegistry, ToolRegistryHandler, ToolSetRef, WorktreeRef,
-    drain,
+    ModelRef, Notification, RequirementIds, RequirementResult, RunContext, RunId,
+    ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy, ToolHandler, ToolRegistry,
+    ToolRegistryHandler, ToolSetRef, WorktreeRef, drain,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig};
@@ -55,7 +55,7 @@ use crate::facade::chat::client_for_provider;
 use crate::facade::config::{ModelConfig, ProviderConfig};
 use crate::facade::delegate::{
     AgentWorkerBuilder, Delegation, DelegationRecorder, DelegationRoute, DelegationToolHandler,
-    LocalSubagent, new_delegation_recorder,
+    LocalSubagent, RecordedDelegation, RulesRoutedTarget, new_delegation_recorder,
 };
 use crate::facade::error::FacadeError;
 use crate::facade::external::{
@@ -71,6 +71,7 @@ use crate::facade::tool::{
     ensure_unique_tool_names,
 };
 use crate::model::content::ContentBlock;
+use crate::model::message::Message;
 use crate::model::tool::Tool as ToolDecl;
 
 mod snapshot;
@@ -245,6 +246,22 @@ impl Agent {
         &mut self,
         input: impl IntoUserMessage,
     ) -> Result<RunOutput, FacadeError> {
+        let message = input.into_user_message();
+
+        // Rules-routed delegation routes the whole task to a delegate the model
+        // never sees; a task that matches no rule falls through to the ordinary
+        // supervisor drive (which advertises no delegate tools) (§13.2).
+        if self.delegation.is_rules_routed() {
+            let routed = self
+                .delegation
+                .route_task(&user_message_text(&message))
+                .map(str::to_owned);
+            if let Some(delegate_name) = routed {
+                let task = user_message_text(&message);
+                return self.run_rules_routed(delegate_name, task).await;
+            }
+        }
+
         let run_id = self.ids.run_id();
         let ctx = RunContext::new_root(
             run_id,
@@ -287,7 +304,7 @@ impl Agent {
         let agent_input = AgentInput::user_message(
             self.ids.turn_id(),
             self.ids.message_id(),
-            input.into_user_message(),
+            message,
             self.ids.message_id(),
             self.ids.step_id(),
         )?;
@@ -392,6 +409,108 @@ impl Agent {
     /// spec when a delegation is fulfilled (R4).
     fn supervisor_model(&self) -> ModelRef {
         self.machine.state().spec().model().clone()
+    }
+
+    /// Builds the per-run [`DelegationToolHandler`] used to drive a rules-routed
+    /// delegation, wired with a fresh `recorder` and the run's identity, tools,
+    /// client, model, and approval policy (§13.2).
+    pub(crate) fn build_delegation_handler(
+        &self,
+        run_id: RunId,
+        ctx: &RunContext,
+        recorder: DelegationRecorder,
+    ) -> Result<DelegationToolHandler, FacadeError> {
+        let context = ToolContextParts {
+            run_id,
+            agent_id: self.machine.state().spec().id(),
+            worktree: self.machine.state().spec().worktree().clone(),
+            cancel: ctx.cancellation().clone(),
+            trace: ctx.trace().clone(),
+        };
+        let registry = FacadeToolRegistry::new(
+            self.tools.clone(),
+            self.custom_registry.clone(),
+            self.extra_declarations.clone(),
+            context,
+        )?;
+        let registry: Arc<dyn ToolRegistry> = Arc::new(registry);
+        Ok(DelegationToolHandler::new(
+            ToolRegistryHandler::new(registry),
+            self.delegation_route(),
+            self.client.clone(),
+            self.supervisor_model(),
+            self.ids.clone(),
+            recorder,
+            self.approval.clone(),
+        ))
+    }
+
+    /// Resolves a rules-routed delegate name to an owned drive target (§13.2).
+    ///
+    /// The delegate name is validated at build time, so an unregistered name
+    /// here is a defensive [`FacadeError::InvalidState`].
+    pub(crate) fn resolve_rules_target(
+        &self,
+        name: &str,
+    ) -> Result<RulesRoutedTarget, FacadeError> {
+        if let Some(subagent) = self.delegates.iter().find(|d| d.name() == name) {
+            Ok(RulesRoutedTarget::Local(subagent.clone()))
+        } else if let Some(delegate) = self.external_agents.iter().find(|d| d.name() == name) {
+            Ok(RulesRoutedTarget::External(delegate.clone()))
+        } else {
+            Err(FacadeError::InvalidState(format!(
+                "rules-routed delegate `{name}` is not registered"
+            )))
+        }
+    }
+
+    /// Routes one task to a rules-matched delegate, driving it to completion and
+    /// assembling the terminal [`RunOutput`] (§13.2).
+    ///
+    /// The delegate is driven through the same delegation machinery a
+    /// model-routed call uses, so its trace, usage, artifacts, and events match
+    /// field for field. Unlike a model-routed turn there is no supervisor LLM
+    /// step, so the supervisor's own usage is zero and the routed exchange is
+    /// **not** folded into the supervisor [`Conversation`]; the delegation is
+    /// reported entirely through the returned [`RunOutput`]. A managed external
+    /// delegate that the approval policy denies fails the run with
+    /// [`FacadeError::ApprovalDenied`] (§9.2), and its resumable session facts are
+    /// retained for a later [`snapshot`](Agent::snapshot) (§15.2).
+    async fn run_rules_routed(
+        &mut self,
+        delegate_name: String,
+        task: String,
+    ) -> Result<RunOutput, FacadeError> {
+        let run_id = self.ids.run_id();
+        let ctx = RunContext::new_root(
+            run_id,
+            BudgetLimits::unbounded(),
+            self.ids.trace_root("agent-run"),
+        );
+        let recorder = new_delegation_recorder();
+        let handler = self.build_delegation_handler(run_id, &ctx, recorder.clone())?;
+        let target = self.resolve_rules_target(&delegate_name)?;
+
+        let drive = drive_rules_routed(&handler, &recorder, &self.ids, &target, task, &ctx).await?;
+
+        // Retain the external delegate's data-only session facts so a later
+        // snapshot can persist them (§15.2), mirroring `run_full`.
+        if drive.record.is_external {
+            let status = match drive.record.trace.status {
+                DelegationStatus::Completed => ExternalDelegateStatus::Completed,
+                DelegationStatus::Failed => ExternalDelegateStatus::Failed,
+            };
+            self.last_external_sessions.insert(
+                drive.record.trace.delegate.clone(),
+                RetainedExternalSession {
+                    status,
+                    session: drive.record.session.clone(),
+                    artifacts: drive.record.artifacts.clone(),
+                },
+            );
+        }
+
+        Ok(drive.output)
     }
 
     /// Runs one agent turn as an incremental [`AgentRunStream`].
@@ -755,7 +874,11 @@ impl AgentBuilder {
     /// Defaults to [`Delegation::model_routed`] (one `ask_<name>` tool per
     /// subagent, `docs/facade-api.md` §13.1). Pass
     /// [`Delegation::single_tool`] to collapse every delegate behind one unified
-    /// `<name>(agent, task)` tool that routes by its `agent` argument (§10.2).
+    /// `<name>(agent, task)` tool that routes by its `agent` argument (§10.2), or
+    /// [`Delegation::rules`] to let the facade route a whole task to a delegate by
+    /// keyword — exposing no delegate to the model at all (§13.2). A rules-routed
+    /// delegation whose rules name a delegate no agent registered is rejected by
+    /// [`build`](Self::build).
     #[must_use]
     pub fn delegation(mut self, delegation: Delegation) -> Self {
         self.delegation = Some(delegation);
@@ -816,6 +939,18 @@ impl AgentBuilder {
         // `ask_<name>` tool per delegate (model-routed, §10.1) or a single
         // unified `<name>(agent, task)` tool (§10.2).
         let delegation = self.delegation.unwrap_or_default();
+
+        // Rules-routed delegation names its delegates by string; a name no agent
+        // registered can never route, so reject it up front rather than failing
+        // silently at run time (§13.2).
+        if let Some(unknown) =
+            delegation.first_unknown_rule_delegate(&self.delegates, &self.external_agents)
+        {
+            return Err(FacadeError::Config(format!(
+                "rules-routed delegation references unregistered delegate `{unknown}`"
+            )));
+        }
+
         let mut declarations: Vec<ToolDecl> = self.tools.iter().map(Tool::declaration).collect();
         declarations.extend(self.extra_declarations.iter().cloned());
         if let Some(custom) = &self.custom_registry {
@@ -1106,6 +1241,127 @@ pub(crate) fn collect_traces(
         external_approval_denied,
         external_sessions,
     }
+}
+
+/// The outcome of one rules-routed delegation drive (`docs/facade-api.md` §13.2).
+///
+/// Shared by [`Agent::run_full`] and the streaming path: the [`RunOutput`] is the
+/// terminal result to return (or yield as `Done`), while the
+/// [`RecordedDelegation`] lets the caller retain an external delegate's session
+/// facts (§15.2).
+pub(crate) struct RulesRoutedDrive {
+    /// The terminal run output assembled from the drive.
+    pub output: RunOutput,
+    /// The recorded delegation (trace, artifacts, session, denial flag).
+    pub record: RecordedDelegation,
+}
+
+/// Drives one rules-routed delegation and assembles its terminal output.
+///
+/// The delegate is driven through the shared [`DelegationToolHandler`] using a
+/// framework call id minted from `ids`, then its recorded trace, usage, and
+/// artifacts are projected into a single-delegation [`RunOutput`]. A managed
+/// external delegate the approval policy denied fails with
+/// [`FacadeError::ApprovalDenied`] (§9.2).
+pub(crate) async fn drive_rules_routed(
+    handler: &DelegationToolHandler,
+    recorder: &DelegationRecorder,
+    ids: &FacadeIds,
+    target: &RulesRoutedTarget,
+    task: String,
+    ctx: &RunContext,
+) -> Result<RulesRoutedDrive, FacadeError> {
+    let call_id = ids.fresh_tool_call_id();
+    let key = call_id.to_string();
+    let result = handler
+        .fulfill_rules_routed(call_id, target, task, ctx)
+        .await;
+
+    let record = recorder
+        .lock()
+        .expect("delegation recorder poisoned")
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| {
+            FacadeError::InvalidState("rules-routed delegation was not recorded".to_owned())
+        })?;
+
+    // A denied external delegate surfaces as a run-level error, matching the
+    // model-routed path (§9.2).
+    if record.approval_denied {
+        return Err(FacadeError::ApprovalDenied);
+    }
+
+    let summary = rules_routed_summary(&result);
+    let output = build_rules_routed_output(&record, summary);
+    Ok(RulesRoutedDrive { output, record })
+}
+
+/// Projects a single recorded rules-routed delegation into a [`RunOutput`].
+///
+/// The supervisor took no LLM step, so its usage is zero and the delegate's
+/// usage is attributed to the subagent or external slice; the delegation trace,
+/// artifacts, and bracketing events mirror a model-routed delegation exactly.
+fn build_rules_routed_output(record: &RecordedDelegation, summary: String) -> RunOutput {
+    let mut events = vec![RunEvent::DelegationStarted(record.trace.clone())];
+    let mut usage = UsageSummary::from_supervisor(crate::model::usage::Usage::default());
+    if record.is_external {
+        usage.add_external(record.trace.usage.clone());
+    } else {
+        usage.add_subagent(record.trace.usage.clone());
+    }
+    match record.trace.status {
+        DelegationStatus::Completed => {
+            for artifact in &record.artifacts {
+                events.push(RunEvent::DelegationArtifact(artifact.clone()));
+            }
+            events.push(RunEvent::DelegationFinished(record.trace.clone()));
+        }
+        DelegationStatus::Failed => {
+            events.push(RunEvent::DelegationFailed(record.trace.clone()));
+        }
+    }
+    RunOutput {
+        reply: Reply::from_parts(summary, Some(crate::model::usage::Usage::default()), None),
+        response: None,
+        usage,
+        tool_calls: Vec::new(),
+        delegations: vec![record.trace.clone()],
+        artifacts: record.artifacts.clone(),
+        events,
+    }
+}
+
+/// Extracts the delegate's summary text (or, on failure, its classified error
+/// message) from a fulfilled rules-routed delegation.
+fn rules_routed_summary(result: &RequirementResult) -> String {
+    match result {
+        RequirementResult::Tool(Ok(response)) => response
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        RequirementResult::Tool(Err(error)) => error.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Concatenates the text of every [`ContentBlock::Text`] block in a user
+/// message, so a rules-routed delegation can match keywords against it (§13.2).
+pub(crate) fn user_message_text(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Extracts the final assistant text, aggregated usage, and last stop reason of

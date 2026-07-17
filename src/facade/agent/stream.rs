@@ -58,7 +58,10 @@ use crate::model::tool::ToolCall;
 use crate::stream::accumulator::{Accumulator, AccumulatorError};
 use crate::stream::{Delta, StreamEvent};
 
-use super::{Agent, classify_error, collect_traces, final_turn_summary};
+use super::{
+    Agent, classify_error, collect_traces, drive_rules_routed, final_turn_summary,
+    user_message_text,
+};
 
 /// A shared sink the tapping handlers push live [`RunEvent`]s into while the
 /// drive future runs, drained in order by [`AgentRunStream::poll_next`].
@@ -86,6 +89,17 @@ pub(super) fn start(
     agent: &mut Agent,
     message: Message,
 ) -> Result<AgentRunStream<'_>, FacadeError> {
+    // Rules-routed delegation short-circuits the supervisor loop: if the task
+    // text matches a routing rule, the whole turn is handed to the matched
+    // delegate and no LLM step is taken (`docs/facade-api.md` §13.2). A
+    // non-matching task falls through to the normal machine drive below.
+    if agent.delegation.is_rules_routed() {
+        let task = user_message_text(&message);
+        if let Some(delegate_name) = agent.delegation.route_task(&task).map(str::to_owned) {
+            return start_rules_routed(agent, delegate_name, task);
+        }
+    }
+
     let run_id = agent.ids.run_id();
     let ctx = RunContext::new_root(
         run_id,
@@ -187,7 +201,51 @@ pub(super) fn start(
     })
 }
 
-/// An incremental stream of [`RunEvent`]s produced by [`Agent::stream`].
+/// Opens a streamed *rules-routed* turn: the whole task is handed to
+/// `delegate_name` with no supervisor LLM step (`docs/facade-api.md` §13.2).
+///
+/// The delegate is driven eagerly-in-future via [`drive_rules_routed`]; its
+/// bracketing [`RunEvent`]s (`DelegationStarted`, per-artifact
+/// `DelegationArtifact`, then `DelegationFinished` or `DelegationFailed`) are
+/// replayed into the shared sink so a caller streaming the turn observes the
+/// same events as a model-routed delegation, then the terminal [`RunOutput`] is
+/// yielded as `Done`.
+///
+/// As on the normal streaming path, an external delegate's session facts are not
+/// retained here (the drive owns its inputs and does not touch `agent`); a
+/// snapshot is taken between runs via [`Agent::run_full`](super::Agent::run_full).
+fn start_rules_routed(
+    agent: &mut Agent,
+    delegate_name: String,
+    task: String,
+) -> Result<AgentRunStream<'_>, FacadeError> {
+    let run_id = agent.ids.run_id();
+    let ctx = RunContext::new_root(
+        run_id,
+        BudgetLimits::unbounded(),
+        agent.ids.trace_root("agent-run"),
+    );
+    let recorder = new_delegation_recorder();
+    let handler = agent.build_delegation_handler(run_id, &ctx, recorder.clone())?;
+    let target = agent.resolve_rules_target(&delegate_name)?;
+    let ids = agent.ids.clone();
+    let sink: EventSink = Arc::new(Mutex::new(VecDeque::new()));
+    let sink_for_future = sink.clone();
+    let future = Box::pin(async move {
+        let drive = drive_rules_routed(&handler, &recorder, &ids, &target, task, &ctx).await?;
+        for event in &drive.output.events {
+            emit(&sink_for_future, event.clone());
+        }
+        Ok(drive.output)
+    });
+
+    Ok(AgentRunStream {
+        future,
+        sink,
+        output: None,
+        state: DriveState::Driving,
+    })
+}
 ///
 /// `AgentRunStream` implements [`futures::Stream`] with
 /// `Item = Result<RunEvent, FacadeError>` and also offers an inherent
