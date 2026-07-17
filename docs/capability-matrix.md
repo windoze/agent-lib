@@ -135,6 +135,18 @@ approval（`untrusted`/`on-request`/`never`）+ sandbox（`read-only`/`workspace
 `declined`)。live session adapter 与真机 e2e 待 M7-3,故下表 Codex 行仍保持保守 `false`;待该 e2e 在具备
 Codex 登录的机器上跑绿后再逐项翻真。
 
+里程碑 8-1 起,feature-gated 的 OpenCode adapter 同样提供了一个 **capability probe**（`external-opencode`
+下的 [`agent::external::opencode_probe`](../src/agent/external/opencode/probe.rs)）:它以**当前本机
+`opencode` CLI 实测 `--version` / `--help` / `run --help` 为准**,把缺失/损坏的 binary 分类为 `Launch`、
+把 `opencode run` 无 `--format json` 结构化事件流的 CLI 分类为 `UnsupportedCapability{Streaming}`,并从两份
+help 广告出的开关**保守探测**能力位(streaming←`run --format`+`json`,permission_bridge←`run --auto`,
+resume←`run --continue`/`--session` 或顶层 `session`,host_tools←顶层 `mcp`,usage/artifacts←结构化流,
+host_subagents 保守 `false`)。配套的 [`OpenCodeConfig`](../src/agent/external/opencode/config.rs) 把
+`ExternalPermissionMode` 保守映射到 `run` 唯一的权限旁路开关 `--auto`(**仅 `BypassPermissions` 发
+`--auto`**,其余模式不加以免越权放宽),更细的 read-only/accept-edits 交给 `--agent` 预设 agent。与
+Claude/Codex 一样,该探测反映「CLI 自称支持什么」,仍**不是** e2e 实测;decoder 待 M8-2、live adapter 与真机
+e2e 待 M8-3,故下表 OpenCode 行仍保持保守 `false`。
+
 ### 受管能力清单（`ExternalCapability`，共 8 项）
 
 | `ExternalCapability` | serde 标签 | 覆盖的决策点 / 旁路 | 保守默认 |

@@ -2286,7 +2286,7 @@ Codex adapter 要和 Claude Code adapter 保持相同 adapter trait 和 capabili
 目标:实现 feature-gated OpenCode adapter,按实际 CLI/API 能力接入 streaming、permission、tool bridge,并用
 capability model 明确降级。
 
-### [TODO] M8-1 增加 OpenCode capability probe 与启动配置
+### [DONE] M8-1 增加 OpenCode capability probe 与启动配置
 
 **上下文**:
 
@@ -2310,6 +2310,37 @@ capability model 明确降级。
 - `cargo test -p agent-lib opencode_probe`
 - 默认测试未启 feature 通过。
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- 新增 `external-opencode` feature(`Cargo.toml`,off by default,仅复用 tokio process,无新重依赖)。
+- 新增 `src/agent/external/opencode/`:
+  - `config.rs` → `OpenCodeConfig`(binary/env[Debug 脱敏]/working_dir/permission_mode/model/`--agent`/timeout;
+    serde round-trip;`auto_approve()` 仅 `BypassPermissions`=true;`base_run_args()` = `run --format json`
+    [+`--auto`][+`--model`][+`--agent`])。
+  - `probe.rs` → `OpenCodeProbeOutput` / `OpenCodeProbeExec`(trait)/ `SystemOpenCodeExec`(tokio::process,
+    kill_on_drop,timeout,施加 working_dir/env)/ `probe` / `probe_with_exec` / `detect_capabilities`。
+  - `mod.rs` 挂载 + `pub use`。
+- 真实 CLI 对齐(据官方 opencode.ai/docs/cli,非硬编码假设):非交互入口 = `opencode run`;结构化流 =
+  `run --format json`(**不是** `--json`);resume = `run --continue`/`--session` 或顶层 `session`;host tools =
+  顶层 `mcp`;权限旁路 = `run --auto`。
+- probe 契约(不假装):`--version` io 错误/非零 → `Launch`;`--help`+`run --help` 皆空 → `Launch`;`run` 无
+  `--format json` → `UnsupportedCapability{Streaming}`;其余能力从两份 help **保守探测**,默认 `false`,
+  host_subagents 恒 `false`(spawn bridge 待 M8-3)。权限映射保守:仅 `BypassPermissions` 发 `--auto`,避免越权。
+- `external/mod.rs`:feature-gated `mod opencode` + re-export
+  `OpenCodeConfig` / `OpenCodeProbeExec` / `OpenCodeProbeOutput` / `SystemOpenCodeExec` /
+  `opencode_probe` / `opencode_probe_with_exec`。
+- 文档:`docs/managed-external-agent.md` §14 增补 M8-1 实现状态;`docs/capability-matrix.md` 增补 OpenCode
+  probe 段(保守、仍非 e2e);`tests/fixtures/external/opencode/README.md` 说明 probe/config 已落地、cassette 待
+  M8-2。
+- 范围 = 仅 config + probe(对齐 M6-1/M7-1);decoder 留 M8-2,live adapter/e2e 留 M8-3。
+- 验证序列 1-6 全过:
+  1. `cargo fmt --all -- --check` 通过。
+  2. `cargo test -p agent-lib --features external-opencode --lib opencode` = 13 passed;未启 feature = 0 test。
+  3. `cargo clippy --all-targets -- -D warnings`(feature off)与 `--features external-opencode` 均 0 warning。
+  4. `cargo test --all --all-targets`(feature off)= 43 个 result 块全 ok,0 failed。
+  5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --features external-opencode` 通过。
+  6. `git diff --check` 干净。
 
 ### [TODO] M8-2 实现 OpenCode stream decoder cassette 测试
 

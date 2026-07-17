@@ -1116,6 +1116,19 @@ Codex 的 full tool injection 取决于当前 CLI/exec-server/MCP 能力:
 
 OpenCode 需要先做 capability probe,因为部署形态可能更多。
 
+> **实现状态(M8-1,已落地)**:feature `external-opencode` 下新增了受管 OpenCode adapter 的
+> **启动配置**([`OpenCodeConfig`](../src/agent/external/opencode/config.rs))与 **capability probe**
+> ([`agent::external::opencode_probe`](../src/agent/external/opencode/probe.rs))。probe 以**当前本机
+> `opencode` CLI 实测** `--version` / `--help` / `run --help` 为准,不硬编码假设:缺失/损坏的 binary →
+> `Launch`;`opencode run` 无 `--format json` 结构化事件流 → `UnsupportedCapability{Streaming}`;其余能力
+> 位从两份 help **保守探测**(默认 `false`,仅当 help 明确广告才开):streaming←`run --format` 且 `json`、
+> permission_bridge←`run --auto`、resume←`run --continue`/`--session` 或顶层 `session`、host_tools←顶层
+> `mcp`、usage/artifacts←结构化流、graceful_shutdown←恒 `true`、host_subagents←恒 `false`(spawn bridge 待
+> M8-3 验证;选预设 `--agent` ≠ host 铸造 subagent)。`OpenCodeConfig` 把 `ExternalPermissionMode` 保守映射
+> 到 `run` 的唯一权限旁路开关 `--auto`:**仅 `BypassPermissions` 发 `--auto`**,其余模式不加(交给
+> permission bridge 或默认拒绝),避免用全量自动批准越权放宽宿主权限边界;更细的 read-only/accept-edits 由
+> `--agent` 预设 agent 表达。stream decoder 待 M8-2,live session adapter 与真机 e2e 待 M8-3。
+
 ### 14.1 probe 项
 
 - CLI 命令名和版本。

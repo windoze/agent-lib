@@ -73,6 +73,8 @@ mod config;
 mod dispatch;
 mod escalation;
 mod machine;
+#[cfg(feature = "external-opencode")]
+mod opencode;
 mod profile;
 mod registry;
 mod runtime;
@@ -105,6 +107,11 @@ pub use escalation::{
     WorkerReport,
 };
 pub use machine::ExternalAgentMachine;
+#[cfg(feature = "external-opencode")]
+pub use opencode::{
+    OpenCodeConfig, OpenCodeProbeExec, OpenCodeProbeOutput, SystemOpenCodeExec,
+    probe as opencode_probe, probe_with_exec as opencode_probe_with_exec,
+};
 pub use profile::{
     Capability, CostTier, EscalationRules, EscalationTrigger, WorkerProfile, WorkerProfileRef,
     WorkerProfileRegistry,

@@ -20,6 +20,12 @@ external-claude-code = []
 # in; the probe reuses tokio's process support, so enabling it adds no new heavy
 # dependency.
 external-codex = []
+# Enables the managed OpenCode runtime adapter (launch config + capability probe;
+# the stream decoder and live session follow in later milestones). Off by
+# default so the core crate pulls in no CLI-adapter machinery unless a host opts
+# in; the probe reuses tokio's process support, so enabling it adds no new heavy
+# dependency.
+external-opencode = []
 
 [dependencies]
 async-trait = "0.1"
