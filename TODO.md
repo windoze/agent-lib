@@ -2859,14 +2859,305 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
 
 ---
 
+## Milestone 10 — ACP(Agent Client Protocol)managed adapter
+
+目标:新增一个 **ACP client 形态**的 managed adapter,用官方 crate `agent-client-protocol` /
+`agent-client-protocol-schema` 实现,而**不手写** JSON-RPC 分帧与协议类型(Zed 侧测试更充分、兼容性更好)。
+
+关键事实(调研结论,2026-07):
+
+- **ACP 是单一标准协议,不是各家变体**。它由 Zed 发起、现托管在中立组织
+  `github.com/agentclientprotocol`,传输为 **JSON-RPC 2.0 over stdio**,当前 wire 版本 = 1,设计目标类似
+  LSP:一套 client 实现对接所有 ACP agent。
+- **一套 client 通吃**:Gemini CLI(原生)、OpenCode(原生)、Claude(经
+  `@zed-industries/claude-agent-acp` adapter 进程)、Codex(经 Zed adapter 进程)。因此**不做「每家一个
+  adapter」**,只做一个 `AcpAdapter`,启动命令(binary + args)由 `AcpConfig` 区分,wire 层完全复用。
+
+- **本机实测的 ACP agent 与配置/凭据要求(重要,直接影响 `AcpConfig` 与 e2e 设计)**。三个 bridge 都是 npm
+  包 `@agentclientprotocol/*` 的 Node 脚本,**均自动读取各自 CLI 的缺省配置文件与登录态**,`agent-lib`
+  不传 key:
+  - `claude-agent-acp`(本机 `@agentclientprotocol/claude-agent-acp@0.59.0`):内嵌
+    `@anthropic-ai/claude-agent-sdk`,由 SDK 自动读取 **Claude Code 的 `~/.claude` 配置/登录态**
+    (bundle 引用 `.claude` / `pathToClaudeCodeExecutable`)。**不用**官方 Anthropic API/key。
+  - `codex-acp`(本机 `@agentclientprotocol/codex-acp@1.1.4`):是**外挂 wrapper**,启动时 **spawn 真实
+    `codex` 进程**(`CODEX_PATH ?? "codex"` → `codex app-server`),因而完全继承 **Codex 的 `~/.codex`
+    配置与 `auth.json` 登录态**。**不用**官方 OpenAI API/key。
+  - `opencode acp`(本机 opencode 1.17.15):就是 opencode 本体的子命令(同进程,无外部 adapter),读
+    **OpenCode 自身的 `~/.config/opencode/opencode.json` 等缺省配置**。
+  - 共同含义:三者都从**各自 CLI 的配置文件 + 登录态**取凭据,而非 `agent-lib` 传入的 provider 凭据(与
+    M6-M8 一致,凭据边界在被包装的 CLI 侧)。`agent-lib` 不承载 API key。
+  - **配置能力要求(重点,非「必须继承」而是「能继承 + 能注入/替换」)**:`AcpConfig` 必须让 adapter 做到两点——
+    1. **默认继承**宿主既有环境(默认把父进程 env 传给子进程,`working_dir` 归 worktree),使一台按缺省配置
+       登录好的机器开箱即用;
+    2. **能注入/替换配置**:允许显式指定/覆盖各 CLI 的配置来源,而非只能用缺省路径。**这是本地测试的硬需求**
+       ——本机跑的这三个 agent 都**不是用缺省配置**,没有覆盖能力就无法测。
+  - 各 CLI 实测支持的覆盖入口(供 `AcpConfig` 设计参考,以本机版本实测为准):
+    - Codex(`codex-acp` → `codex app-server`):`CODEX_HOME` 指向替代配置目录(`~/.codex` 的替身,含
+      `config.toml` / `auth.json`);`CODEX_CONFIG`、`CODEX_PATH`(指定 codex 二进制)也被 `codex-acp` 识别;
+      底层 codex 支持 `-c key=value` 覆盖单项。
+    - Claude(`claude-agent-acp` → Claude Agent SDK):经 SDK/`claude` 的 `--settings <file-or-json>` 等注入
+      额外 settings;登录态默认取 `~/.claude`。
+    - OpenCode(`opencode acp`):`OPENCODE_CONFIG`(指向配置文件)、`OPENCODE_CONFIG_DIR`、
+      `OPENCODE_CONFIG_CONTENT`(内联配置)、`XDG_CONFIG_HOME` 等 env,以及 `--cwd`。
+  - 因此 `AcpConfig` 的 `env` override / args 是**一等能力**(不是仅供边角覆盖):既能不设、走继承,也能注入上述
+    任一 env / flag 指向测试专用配置目录或文件。约束依旧:`Debug` 脱敏、**绝不**承载 API key(凭据仍由目标
+    CLI 的配置/登录态提供)。
+- **能力仍需协商**:wire 一致但 feature parity 不保证。`initialize` 阶段协商 capabilities
+  (`loadSession` / fs / terminal 等可选),映射到已有的 `ExternalRuntimeCapabilities` 8 项,复用
+  `with_probed_capabilities` 的逐位取交模型。
+- **角色**:本 adapter 扮演 ACP **client**(host = client),ACP agent 子进程扮演 **agent**。方向:
+  - client→agent(我们发):`initialize` / `authenticate` / `session/new` / `session/load`(gated) /
+    `session/prompt` / `session/set_mode` / `session/cancel`(notification)。
+  - agent→client(我们收/应答):`session/update`(notification,流式进度) / `session/request_permission` /
+    `fs/read_text_file` / `fs/write_text_file` / `terminal/*`。
+- **首个点亮 host-pausable 决策臂的 adapter**:三个 CLI adapter(M6/M7/M8)因自主运行,
+  `permission_bridge` 恒为 `false`。ACP 的 `session/request_permission` 是 agent→client 的 **request**,
+  天然映射到 machine 早已实现的 `PausedForInteraction` → `NeedInteraction` → `RespondInteraction` 路径,使
+  `permission_bridge` 第一次为 `true`。`fs/*` / `terminal/*` 是 client 侧**环境服务**(adapter 直接对
+  worktree 兑现并汇报为 observation),不等同于 `NeedTool` 意义上的 host tool;`host_tools`(经 client MCP)
+  为后续能力,首版保守 `false`。
+
+通用约束(在 Milestone 1 通用约束之上追加):
+
+- ACP 相关代码全部 gate 在**非默认** feature `external-acp` 之后;默认 `cargo test --all --all-targets`
+  不编译 ACP adapter、不拉入 `agent-client-protocol*` 依赖、不依赖任何 ACP agent binary/登录态。
+- 官方 crate 只在 adapter 层使用;其 raw 协议类型**不得**成为 `agent-lib` 稳定 public API(与三个 CLI
+  adapter 的 "不导出 raw frame 类型" 纪律一致)。ACP wire 版本作为一个探测/协商项记录,漂移由 crate 升级 +
+  cassette 兜底。
+- 复用现有 `ExternalRuntimeKind::Custom(String)` 承载 ACP(如 `Custom("acp")` 或带 agent 标签),**不新增**
+  enum 变体(除非 review 明确需要一等公民);machine / driver / `ExternalAgentState` **不改**。
+
+### [TODO] M10-1 增加 `external-acp` feature、ACP 依赖与 `AcpConfig` / capability 协商
+
+**上下文**:
+
+- `Cargo.toml` 现有 `external-claude-code` / `external-codex` / `external-opencode` 三个非默认 feature,均
+  为空 feature(`= []`),因为 CLI adapter 只复用 tokio 的 process 支持,无新依赖。ACP 不同:它要引入官方
+  crate `agent-client-protocol`(runtime)+ `agent-client-protocol-schema`(协议类型)。
+- 三个 CLI adapter 的 `*/config.rs` 是纯数据 serde DTO(binary/env/working_dir/permission_mode/timeout,
+  手写 `Debug` 脱敏 env),`*/probe.rs` 通过可注入 exec 探测 capabilities。ACP 的 capability 来源不同:它来自
+  `initialize` 握手返回的 agent capabilities,而非 `--help` 文本。
+- capability model 见 `src/agent/external/capability.rs`(`ExternalRuntimeCapabilities` 8 项 +
+  `ExternalCapability` + `unsupported(...)`);intersect 模型见任一 `*/adapter.rs` 的
+  `with_probed_capabilities` / `intersect_capabilities`。
+
+**做什么**:
+
+- `Cargo.toml`:
+  - 新增非默认 feature `external-acp`,并把 `agent-client-protocol` / `agent-client-protocol-schema` 作为
+    **optional** dependency,只在该 feature 下启用(`external-acp = ["dep:agent-client-protocol",
+    "dep:agent-client-protocol-schema"]`)。
+  - 在 feature 注释里写明:默认关闭,开启才拉入 ACP 依赖;确认所选 crate 版本对应的 ACP wire 版本并在注释/常量
+    中记录(以本机可拉取的最新稳定版实测为准,不硬编码假设)。
+- 新增 feature-gated 模块 `src/agent/external/acp/{mod.rs,config.rs}`,在 `src/agent/external/mod.rs` 以
+  `#[cfg(feature = "external-acp")]` 挂载并 re-export `AcpConfig`(以及后续任务的类型)。
+- `AcpConfig`(纯数据 serde DTO,可持久化):
+  - `binary` + `args`(承载不同 ACP agent 的启动行;以本机实测为准:`claude-agent-acp`(无参数)、
+    `codex-acp`(无参数)、`opencode acp`(即 `binary=opencode`、`args=["acp"]`);首版只需能表达任意
+    `program + args`)。
+  - **配置继承 + 注入(一等能力)**:adapter spawn 子进程时**默认继承宿主完整 env**(让缺省配置/登录态开箱
+    即用),同时 `AcpConfig` 必须能**注入/替换**各 CLI 的配置来源(本地测试硬需求,因为本机三个 agent 都不用
+    缺省配置)。为此 `AcpConfig` 至少提供:
+    - `env` override(`BTreeMap`,手写 `Debug` 只印 key + `<redacted>`,与三个 CLI config 一致):在继承基础上
+      **追加/覆盖**指定 env,用于指向测试专用配置——实测入口:Codex 用 `CODEX_HOME`(替代 `~/.codex`)/
+      `CODEX_CONFIG` / `CODEX_PATH`,OpenCode 用 `OPENCODE_CONFIG` / `OPENCODE_CONFIG_DIR` /
+      `OPENCODE_CONFIG_CONTENT` / `XDG_CONFIG_HOME`,Claude 经 `claude --settings <file-or-json>`(走 `args`)。
+    - 一个显式开关表达「是否继承父进程 env」(默认继承);清空继承时须让调用方能补齐 `HOME` 等,否则 bridge
+      找不到配置即失败。
+    - **约束不变**:`env` **绝不**承载 API key;凭据始终由目标 CLI 的配置/登录态提供。
+  - `working_dir`(worktree)。
+  - `ExternalPermissionMode`(不像 CLI 靠启动 flag,而是决定收到 `session/request_permission` 后的**默认
+    应答策略**:`Plan` 拒绝 mutating、`BypassPermissions` 自动 allow 等;首版只需把 mode 存下并在 doc 说明
+    语义,真正应答逻辑在 M10-3)。
+  - `timeout`。
+- 便捷预设构造器(基于本机实测的启动行,不硬编码 key):
+  - `AcpConfig::claude_agent_acp()` → `binary="claude-agent-acp"`;doc 注明依赖本机 **Claude Code** 配置/登录态。
+  - `AcpConfig::codex_acp()` → `binary="codex-acp"`;doc 注明依赖本机 **Codex** 配置/登录态。
+  - `AcpConfig::opencode_acp()` → `binary="opencode"`、`args=["acp"]`(OpenCode 自带 ACP)。
+  - 通用 `AcpConfig::new(binary, args)` 兜底任意 ACP agent。
+- capability 协商:提供一个把 ACP `initialize` 返回的 agent capabilities → `ExternalRuntimeCapabilities`
+  的映射函数(纯函数,输入用 schema crate 的 capability 类型或其中立投影,不做 IO;真正的握手 IO 在 M10-3)。
+  保守基线 `none()`,只把协商确认的位打开:`loadSession` → `resume`,fs/terminal 广告 →(记录但不直接等于
+  `host_tools`,见里程碑说明),始终 `permission_bridge=true`(ACP 定义了 request_permission)、
+  `streaming=true`(session/update)、`graceful_shutdown=true`。`host_tools`/`host_subagents` 首版 `false`。
+
+**验证条件**:
+
+- `AcpConfig` serde round-trip;`Debug` / `Display` 不泄漏 env secret(断言注入的假 secret 不出现)。
+- 预设构造器单测:`claude_agent_acp()` / `codex_acp()` / `opencode_acp()` 产出预期 `binary`/`args`
+  (`opencode_acp` 的 `args` 含 `"acp"`);断言默认 `AcpConfig` 不含任何 API-key 字段(config 无 key 概念,
+  只有 `env` override),证明凭据边界在被包装的 CLI 侧。
+- 配置继承/注入能力单测(不 spawn 真实进程,断言 adapter 构造的 spawn env/args):默认继承父进程 env;
+  设置 `env` override 后,该键出现在子进程 env(如 `CODEX_HOME=/tmp/test-codex` / `OPENCODE_CONFIG_DIR=...`);
+  「不继承」开关下父进程 env 不透传。证明本地测试可指向非缺省配置目录。
+- capability 映射纯函数单测:给定「支持 loadSession + fs」的握手投影 → `resume=true`、`permission_bridge=true`、
+  `streaming=true`、`host_tools=false`;给定空/最小握手 → 只有协议保证位为 true,其余 false。
+- 默认构建不受影响:`cargo build`(无 feature)不拉入 ACP crate;`cargo build --features external-acp` 通过。
+- 聚焦测试:
+  - `cargo test -p agent-lib --features external-acp acp_config_roundtrip`
+  - `cargo test -p agent-lib --features external-acp acp_capabilities_from_initialize`
+- 完整验证序列 1-6 全过(其中 clippy/test/doc 需分别在默认与 `--features external-acp` 两种配置下跑通)。
+
+### [TODO] M10-2 用官方 crate 建立 ACP client 连接与 `session/update` 观测解码
+
+**上下文**:
+
+- 与三个 CLI adapter 手写 `*/decoder.rs`(逐行 `serde_json::Value` 防御式导航)不同,ACP 用官方 crate 的
+  JSON-RPC runtime 收发消息;本任务只把 crate 的回调/事件**归一化**成中立的
+  `ExternalObservedEvent`(见 `src/agent/external/mod.rs` 的 event 词汇表:`SessionStarted` / `TextDelta` /
+  `CommandStarted` / `CommandFinished` / `FilePatch` / `PermissionRequested` / `ToolStarted` /
+  `ToolFinished` / `TaskUpdated` / `SessionCompleted`),不导出 crate 的 raw 类型。
+- `session/update` 是 agent→client 的 notification,携带 message chunk / tool_call / tool_call_update /
+  plan / diff 等;这是流式进度来源,对应 `ExternalObservedEvent` 观测流。
+- `session/prompt` 是一问一答:发送后 agent 通过一串 `session/update` 汇报,最终 `session/prompt` response 带
+  `stopReason` 表示本 turn 结束。
+
+**做什么**:
+
+- 在 `src/agent/external/acp/` 新增 client 连接层(feature-gated),封装官方 crate 的 stdio client:
+  - 用 crate 提供的 client/connection API 启动并 attach 到 ACP agent 子进程(spawn 走可注入的 launcher
+    trait,便于离线单测;生产用 `tokio::process`,stdin/stdout piped、stderr 丢弃防泄漏、`kill_on_drop`、每读
+    超时——与三个 CLI adapter 的 IO 纪律一致)。
+  - 实现 crate 的 client 回调 trait,把 `session/update` 归一化成 `ExternalObservedEvent`,跨 turn 单调
+    分配 `seq`;把 `session/request_permission` / `fs/*` / `terminal/*` 的到达**暂存**为待 M10-3 处理的
+    决策/服务(本任务只需能识别与缓存,不必完整应答)。
+- `session/update` → 观测映射(用 §10.3 已有词汇表,不新增变体):
+  - assistant message chunk → `TextDelta`。
+  - tool_call 开始 / update / 完成 → `ToolStarted` / `ToolFinished`(bash 类可用 `CommandStarted` /
+    `CommandFinished`,如 crate 暴露足够信息)。
+  - diff / 文件变更 → `FilePatch`。
+  - plan / todo 更新 → `TaskUpdated`。
+  - session 建立 → `SessionStarted`(带 ACP session id);turn 结束(prompt response stopReason)→
+    `SessionCompleted`。
+- 容忍/错误纪律(与 CLI decoder 一致):crate 报的协议错误 / 未建模的 update 种类 → 容忍(无观测)或
+  归类到 `ExternalAgentError::Protocol`;所有诊断为固定字符串,永不夹带 prompt / 文件内容 / 凭据。
+
+**验证条件**:
+
+- 观测归一化单测:构造若干 `session/update`(text / tool_call / diff / plan)投影,断言产出的
+  `ExternalObservedEvent` 序列与单调 `seq`;未知 update 种类被容忍。
+- 一个离线 cassette(`tests/fixtures/external/acp/`,`assert_no_secrets` 脱敏)覆盖:单 turn text-only、
+  含 tool_call、含 diff、以 stopReason 收尾 → `SessionCompleted`。
+- 聚焦测试:
+  - `cargo test -p agent-lib --features external-acp acp_session_update_maps_to_observations`
+  - `cargo test -p agent-lib --features external-acp acp_cassette`
+- 完整验证序列 1-6 全过(默认 + `--features external-acp` 两种配置)。
+
+### [TODO] M10-3 实现 ACP live session adapter、permission bridge 与 ignored real e2e
+
+**上下文**:
+
+- milestone-5 抽象见 `src/agent/external/adapter.rs`(`ExternalRuntimeAdapter` /
+  `ExternalRuntimeSession` / `RuntimeDecisionPoint`)与 `registry.rs`;三个 CLI adapter 的 `*/adapter.rs`
+  是照抄模板。ACP 与它们的进程模型不同:ACP 是**单条长驻**双向连接(更接近 Claude Code 的 stream-json 时序,
+  而非 Codex/OpenCode 的每-turn 一次性进程)。
+- 本任务是 ACP 首次真正驱动 machine 的 host-pausable 臂:`session/request_permission`(agent→client
+  request)→ `RuntimeDecisionPoint::PausedForInteraction` → machine 发 `NeedInteraction` → host 应答 →
+  `ExternalSessionInput::RespondInteraction` → adapter 把应答回写成 ACP permission response。
+
+**做什么**:
+
+- `AcpAdapter`(该模块**唯一 pub 类型**,impl `ExternalRuntimeAdapter`):
+  - `new(config)` 报告本 adapter 实现的能力;`with_probed_capabilities(config, &probed)` 与实现能力**逐位
+    取交**(复用 M10-1 的协商映射 + 现有 intersect 模式)。
+  - `start`:spawn agent 子进程 → `initialize` 握手(据返回填 `session/new`)→ `session/new` 拿 ACP session
+    id(作为 registry key / resume token)→ 发首个 `session/prompt`;读 `session/update` 直到落定一个
+    `RuntimeDecisionPoint`。
+  - `resume`:仅当协商到 `loadSession` 能力时用 `session/load` 复活,否则 `ResumeUnavailable`。
+- `AcpSession`(私有,impl `ExternalRuntimeSession`):单条长驻连接 + 跨全程单调 `seq` 的观测解码(M10-2)。
+  `advance(input)`:
+  - `Start`/`Continue` → 发 `session/prompt`,读 update 直到 decision。
+  - `RespondInteraction`(权限应答)→ 把 host 的 `InteractionResponse` 回写成 ACP
+    `session/request_permission` response(allow/deny),继续读 update 直到下一个 decision。权限暂停对应的
+    `Interaction` 的 `step_id`/`actor` **绑定宿主** `RunContext.run_id`/请求 `agent_id`,**绝不**取自 runtime
+    输出。
+  - decision 落定:turn 结束(stopReason)→ `Completed`(带 usage/artifacts,若 crate 暴露);
+    收到 `session/request_permission` → `PausedForInteraction`;连接中途断 → `SessionLost`;协议违例 →
+    `Protocol`。
+  - `fs/read_text_file` / `fs/write_text_file` / `terminal/*`:作为 **client 环境服务**由 adapter 直接对
+    `working_dir`/worktree 兑现(受 `ExternalPermissionMode` 约束:如 `Plan` 拒绝写),并汇报为 observation;
+    **不**折成 `NeedTool`(首版 `host_tools=false`)。写操作必要时先经 `PausedForInteraction` 审批(由
+    permission mode / approval policy 决定)。
+  - `shutdown`:发 `session/cancel` + 关连接,超时 forced kill,归类 `ExternalSessionShutdown`。
+- 能力(诚实):`streaming`/`permission_bridge`/`graceful_shutdown` = true;`resume` 取决于 `loadSession`
+  协商;`artifacts`/`usage` 取决于 crate 是否暴露;`host_tools`/`host_subagents` = false。对声明了 `tools`
+  的 `start`/`resume` 请求,以 `UnsupportedCapability{HostTools}` 明确拒绝(与三个 CLI adapter 一致);
+  follow-up 的 `RespondToolResults`→`{HostTools}`、`RespondSubagent`→`{HostSubagents}` 明确拒绝。
+- IO 经私有 launcher/connection trait 注入:生产用真实 crate + `tokio::process`;单测注入 fake transport
+  回放固定 ACP 消息序列并捕获我们发出的请求,**离线**跑通 initialize/prompt/permission/fs/cancel/shutdown 全
+  状态机,无需任何 ACP agent binary、无网络。
+- 真机 e2e:新增 `#[ignore]` 用例 `tests/external_acp.rs`,通过 `ACP_AGENT_BIN`(+ 可选 `ACP_AGENT_ARGS`)
+  或 PATH 发现一个 ACP agent。以本机实测的三个 agent 为准:
+  - `claude-agent-acp`(依赖本机 **Claude Code** 配置/登录态,非官方 key);
+  - `codex-acp`(依赖本机 **Codex** 配置/登录态,非官方 key);
+  - `opencode acp`(OpenCode 自带 ACP)。
+  测试**不**从 env 读 API key,而是依赖各 CLI 的配置/登录态;缺失 binary/登录即带清晰非-secret 信息
+  **跳过**(退出为绿)。**因本机三个 agent 都不用缺省配置**,e2e 必须能经 `AcpConfig` 指向实际配置——
+  提供覆盖入口(如 `ACP_CODEX_HOME` / `ACP_OPENCODE_CONFIG` / `ACP_CLAUDE_SETTINGS` 之类测试 env,映射到
+  §M10-1 的 `AcpConfig.env`/`args`);未设时走继承(缺省配置)。然后在临时 git worktree 里驱动
+  probe→start→advance(自动 approve 权限暂停)→completion→graceful shutdown,断言观测流为多步
+  (SessionStarted + ≥1 文本 + SessionCompleted),并断言 worktree 隔离(产物落在 worktree 内、不泄漏到启动
+  checkout)。
+  运行命令与实跑过的 agent 写进完成记录。
+
+**验证条件**:
+
+- adapter fake-transport 单测覆盖:start→completion、start→request_permission→RespondInteraction(allow/
+  deny)→completion、fs 写经审批后兑现、连接断→SessionLost、协议违例→Protocol、shutdown 分类、声明 tools →
+  `UnsupportedCapability{HostTools}`。
+- 断言 permission 暂停产生的 `Interaction` 的 step_id/actor 来自宿主而非 runtime 输出。
+- 一个经真实 `ExternalAgentMachine::drain` + registry-backed handler 的离线 drain 测试:
+  Start → PausedForInteraction → NeedInteraction → RespondInteraction → Completed(证明 ACP 首次真正驱动
+  host-pausable 臂,且无需改 machine/driver)。
+- 聚焦测试:
+  - `cargo test -p agent-lib --features external-acp acp_adapter`
+  - `cargo test --features external-acp --test external_acp -- --ignored`(仅在具备 ACP agent 时实跑,
+    否则清晰跳过)
+- 完整验证序列 1-6 全过(默认 + `--features external-acp`)。
+
+### [TODO] M10-4 Review:ACP adapter 正确性与协议一致性检查
+
+**上下文**:
+
+M10 结束后,`agent-lib` 应能以一个 ACP client 对接任意 ACP agent,并首次真正驱动 permission bridge。
+阶段 review 确认它没有把 crate raw 类型泄漏为稳定 API、没有改 machine/driver、能力诚实、脱敏到位。
+
+**做什么**:
+
+- 核对 `src/agent/external/acp/`:
+  - 官方 crate 的协议类型未出现在 `agent-lib` 稳定 public API(只有 `AcpAdapter` / `AcpConfig` 等中立类型
+    对外);观测只用现有 `ExternalAgentEvent` 词汇表。
+  - `ExternalAgentMachine` / `drive.rs` / `ExternalAgentState` 无任何 ACP 特判改动。
+  - `permission_bridge=true` 的路径确实经 `PausedForInteraction`→`NeedInteraction`→`RespondInteraction`,
+    interaction 的 step_id/actor 绑定宿主;权限应答经 `Interaction::accepts_response` 校验后才回写 ACP
+    (与 M3-2 一致)。
+  - capability 诚实:未协商到的位不假装 true;声明 tools 被明确拒绝而非静默忽略。
+  - secret 脱敏:config `Debug`、错误诊断、cassette fixture 均无 env secret / prompt / 文件内容 / 凭据。
+- 核对 feature 隔离:默认构建不含 ACP 依赖(`cargo tree` 或 `cargo build` 确认);ACP 代码全在
+  `#[cfg(feature = "external-acp")]` 之后。
+- 更新 `docs/managed-external-agent.md`(新增 ACP adapter 章节,仿 §12-14 的实现状态记法)与
+  `docs/capability-matrix.md`(记录 ACP 实测/协商能力,不声称未验证支持)。
+
+**验证条件**:
+
+- 默认完整验证序列 1-6 全过;`--features external-acp` 下 clippy/test/doc 全过。
+- `cargo build`(无 feature)不拉入 `agent-client-protocol*`(在完成记录中给出 `cargo tree` 证据)。
+- 完成记录中给出:ACP adapter 相对三个 CLI adapter 的能力差异摘要(尤其 `permission_bridge`)、
+  ACP wire 版本、剩余 runtime-dependent 限制(host_tools 经 client MCP 等后续项)。
+
+---
+
 ## 交接任务
 
 ### [TODO] H-1 归档当前计划并为 facade API 生成新的 PLAN/TODO
 
 **上下文**:
 
-- 当前 `PLAN.md` 和本 `TODO.md` 记录的是 Managed External Agent 工作线。下一轮工作要切换到
-  [`docs/facade-api.md`](docs/facade-api.md) 对应的 facade API 落地。
+- 当前 `PLAN.md` 和本 `TODO.md` 记录的是 Managed External Agent 工作线(含 M1-M9 的核心/CLI adapter 与
+  M10 的 ACP adapter)。下一轮工作要切换到 [`docs/facade-api.md`](docs/facade-api.md) 对应的 facade API 落地。
+- facade API 与本工作线有承接关系:facade 的 external delegate / `ManagedExternalAgent` /
+  `ExternalRunMode` 能力分级(见 `docs/facade-api.md` §11)应能表达 M10 落地的 ACP 后端与 permission bridge
+  档位;编写新计划时须把这一依赖显式承接过来。
 - 执行本任务时,必须先保留当前计划/任务单的历史版本,再重写仓库根目录的 `PLAN.md` 和 `TODO.md`。
 - 新 `TODO.md` 要给后续 coding agent 直接执行,不能只写高层目标。
 

@@ -35,7 +35,8 @@
 以下锚点是本计划的精确接入面：
 
 - `src/agent/external/mod.rs`
-  - `ExternalRuntimeKind::{ClaudeCode,Codex,OpenCode,Custom}` 已有。
+  - `ExternalRuntimeKind::{ClaudeCode,Codex,OpenCode,Custom}` 已有;ACP adapter(M10)复用
+    `Custom(String)` 承载,不新增变体。
   - `ExternalSessionInput` 现有 `Start` / `Continue` / `RespondInteraction` / `Shutdown`。
   - `ExternalSessionRequest` 已携带 `agent_id`、`runtime`、`worktree`、`session`、`input`、`tools`、
     `policy`。
@@ -116,6 +117,42 @@ tool、host interaction、host subagent reify 成现有 requirement，由外层 
 | M7 | Codex managed adapter | feature-gated adapter 模块 | parser cassette + ignored real e2e |
 | M8 | OpenCode managed adapter | feature-gated adapter 模块 | parser cassette + ignored real e2e |
 | M9 | worktree/budget/reconfig/docs/real mixed e2e hardening | `external/*`、`docs/*`、`tests/*` | offline + ignored real |
+| M10 | ACP(Agent Client Protocol)managed adapter | `external/acp/*`(feature `external-acp`) | offline cassette/fake-transport + ignored real e2e |
+
+## M10:ACP managed adapter(与 M6-M8 的关系)
+
+M6-M8 为 Claude Code / Codex / OpenCode 各写了一套**私有 wire 解码**的 adapter,因为这三家 CLI 的
+JSON/JSONL 输出互不兼容、且都是「自主运行、只读观测」的半托管形态(`permission_bridge` / `host_tools`
+恒为 `false`)。M10 走一条根本不同的路:
+
+- **ACP 是单一标准协议**(JSON-RPC 2.0 over stdio,wire v1,类 LSP),一套 client 实现即可对接所有 ACP
+  agent(Gemini/OpenCode 原生;Claude/Codex 经 Zed 的 adapter 进程)。因此 M10 **只做一个 `AcpAdapter`**,
+  不做「每家一个」,启动命令由 `AcpConfig` 区分,wire 层复用。
+- **用官方 crate**(`agent-client-protocol` + `agent-client-protocol-schema`)而非手写 JSON-RPC:提高兼容性
+  与正确性(Zed 侧测试充分),协议类型只在 adapter 层用、不外泄为稳定 API。
+- **凭据边界在被包装的 CLI 侧,不在本库**(本机实测):三个 bridge 都从各自 CLI 的配置/登录态取凭据——
+  `claude-agent-acp`(内嵌 Claude Agent SDK)读 `~/.claude`、`codex-acp`(spawn `codex app-server`)读
+  `~/.codex`(含 `auth.json`)、`opencode acp`(opencode 子命令)读 `~/.config/opencode`,均**不用**官方
+  API/key。`AcpConfig` 因此不承载 API key。
+- **配置能力:能继承 + 能注入/替换**(非「必须继承」)。adapter 默认继承宿主完整 env(缺省配置开箱即用),
+  同时 `AcpConfig` 必须能显式**注入/替换**配置来源——这是本地测试的硬需求,因为本机三个 agent 都不用缺省
+  配置。实测覆盖入口:Codex 用 `CODEX_HOME`/`CODEX_CONFIG`/`CODEX_PATH`(+底层 `codex -c key=value`),
+  OpenCode 用 `OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR`/`OPENCODE_CONFIG_CONTENT`/`XDG_CONFIG_HOME`,Claude 用
+  `claude --settings <file-or-json>`。e2e 通过这些入口指向测试专用配置,未设则走继承——与 M6-M8 的凭据边界
+  处理一致。
+- **feature gate `external-acp`**:官方 crate 作为 optional dependency,默认关闭;默认构建/测试不拉入 ACP
+  依赖、不依赖任何 ACP agent binary。
+- **首次点亮 host-pausable 臂**:ACP 的 `session/request_permission`(agent→client request)天然映射到
+  machine 早已实现的 `PausedForInteraction`→`NeedInteraction`→`RespondInteraction`,使 `permission_bridge`
+  第一次为 `true`。`fs/*` / `terminal/*` 作为 client 侧环境服务由 adapter 直接对 worktree 兑现并汇报为
+  observation,不折成 `NeedTool`;`host_tools`(经 client MCP)留作后续能力,首版保守 `false`。
+- **不改 machine/driver/state**:复用 milestone-5 抽象与 `ExternalRuntimeKind::Custom(String)`,与 M6-M8
+  同构地挂进 `ExternalRuntimeAdapter` / `ExternalRuntimeSession` / `ExternalSessionRegistry`。
+
+M10 完成后,facade API(见 [`docs/facade-api.md`](docs/facade-api.md) §11 Managed External Agent 集成、
+§11.3 能力分级)可把 ACP agent 作为一个 `ExternalRunMode::Managed`(乃至 permission bridge 打开的更高档)
+external delegate 暴露:facade 的 `ExternalRunMode` / `ExternalAgentCapabilities` 分级应能表达「ACP =
+标准协议、permission bridge 可用」这一层,承接关系记入 H-1 之后的 facade 计划。
 
 ## 验证策略
 
@@ -147,3 +184,9 @@ tool、host interaction、host subagent reify 成现有 requirement，由外层 
   `ExternalObservedEvent.seq` 作为唯一 replay 进度。
 - **恢复 mid-turn scratch**：`ExternalAgentMachine::new` 当前无法重建 awaiting state 的 driver-facing
   streaming cursor。缓解：把外部 tool/subagent pending facts 放入 serializable cursor，并补 restore 测试。
+- **ACP 官方 crate / wire 版本漂移**：`agent-client-protocol*` 仍在演进,crate API 与 ACP wire 版本各自独立
+  升级。缓解:crate 只在 adapter 层用、raw 类型不外泄为稳定 API;capability 经 `initialize` 协商而非硬编码;
+  cassette + fake-transport 覆盖归一化路径;wire 版本作为探测项记录。
+- **ACP agent 能力不对称**:wire 一致但 feature parity 不保证(`loadSession`/fs/terminal 均可选)。缓解:
+  复用 `ExternalRuntimeCapabilities` + `with_probed_capabilities` 逐位取交,未协商到的位不假装支持,
+  不支持的请求 fail fast(`UnsupportedCapability`)。

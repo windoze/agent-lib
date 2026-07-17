@@ -634,8 +634,15 @@ Agent facade
   -> NeedSubagent 或 NeedExternalSession
   -> ExternalAgentMachine
   -> ExternalSessionHandler
-  -> runtime adapter(Codex / Claude Code / OpenCode / Custom)
+  -> runtime adapter(Codex / Claude Code / OpenCode / ACP / Custom)
 ```
+
+runtime adapter 已落地的有:三个私有 wire 的 CLI adapter(Claude Code / Codex / OpenCode,均自主运行、
+无 permission bridge)与一个 **ACP adapter**(feature `external-acp`,基于官方 `agent-client-protocol`
+crate,以一个标准 ACP client 对接任意 ACP agent——Gemini/OpenCode 原生、Claude/Codex 经 Zed adapter
+进程)。ACP adapter 是首个支持 permission bridge 的 runtime(`session/request_permission` 映射到
+`NeedInteraction`),facade 的 `ManagedExternalAgent` 构造器因此应能表达「ACP 后端 + permission bridge
+可用」这一档(见 §11.3)。
 
 如果 external agent 作为 child agent 挂载,推荐仍通过 `NeedSubagent` 进入 `ExternalAgentMachine`。
 `ExternalAgentMachine` 内部再发 `NeedExternalSession` 推进真实 runtime。这样它与 local subagent
@@ -653,6 +660,20 @@ Managed external agent 的能力取决于 runtime:
 | 可 attach/resume 长生命周期 session | `ExternalRunMode::Attachable` |
 
 构建时应检查 `ExternalAgentCapabilities`,不支持的能力要 fail fast 或明确降级。
+
+runtime 到能力档的现状(与 `ExternalRuntimeCapabilities` 8 项对齐):
+
+- 三个 CLI adapter(Claude Code / Codex / OpenCode)自主运行,`permission_bridge` / `host_tools` 为
+  `false`,对应 `ExternalRunMode::Managed` 但**无**权限桥;它们经 `session/update` 式观测提供流式事件与
+  artifact。
+- **ACP adapter** 是首个 `permission_bridge=true` 的 runtime(`session/request_permission`),属带权限桥的
+  `Managed`;`resume` 取决于 ACP `loadSession` 协商能力;`host_tools`(经 client MCP)为后续能力。因为 ACP
+  是标准协议,facade 侧「选哪个 external runtime」与「它能做什么」两件事解耦:runtime 选择决定启动命令,
+  能力档由 `initialize` 协商结果填充。
+
+facade 的 `ManagedExternalAgent` 构造器应提供对应入口(如 `ManagedExternalAgent::acp(binary, args)` 或
+`::claude_agent_acp()` / `::gemini_acp()` 之类便捷预设),并把协商到的能力如实反映到 `ExternalRunMode` /
+`ExternalAgentCapabilities`,不假装未验证的档位。
 
 ## 12. 统一 Delegate 抽象
 
