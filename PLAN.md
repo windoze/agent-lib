@@ -1,192 +1,147 @@
-# 实施计划：Managed External Agent
+# 实施计划：Facade API（batteries-included 装配层）
 
-> 本计划以 [`docs/managed-external-agent.md`](docs/managed-external-agent.md) 为设计输入。
-> 上一轮根目录计划「Effect 层清理(三刀重构)」已归档到
-> [`docs/archive/2026-07-17-effect-refine/`](docs/archive/2026-07-17-effect-refine/)。
-> 逐任务实现清单见 [`TODO.md`](TODO.md)。
+> 本计划以 [`docs/facade-api.md`](docs/facade-api.md) 为唯一设计输入，并引用
+> [`docs/conversation-core.md`](docs/conversation-core.md)（Conversation 不变量与 snapshot/restore）、
+> [`docs/agent-layer.md`](docs/agent-layer.md)（Agent sans-io 分层：machine / handler / driver）、
+> [`docs/agent-effect-model.md`](docs/agent-effect-model.md)（Requirement / HandlerScope / Pop）、
+> [`docs/external-agent.md`](docs/external-agent.md) 与
+> [`docs/managed-external-agent.md`](docs/managed-external-agent.md)（受管 external agent）。
+>
+> 上一轮根目录计划「Managed External Agent」（Milestone 1–10：核心协议扩展、三家 CLI adapter、
+> ACP adapter、worktree/budget/reconfig/docs 收尾）已完成并归档到
+> [`docs/archive/2026-07-17-managed-external-agent/`](docs/archive/2026-07-17-managed-external-agent/)。
+> 更早的 Client / Conversation / Agent Layer / Effect Migration / Testability / Complex-tests /
+> Effect-refine / External-agent 记录在 `docs/archive/2026-07-*` 下。逐任务实现清单见
+> [`TODO.md`](TODO.md)。
+>
+> 标注约定：`docs/facade-api.md` 中的类型/方法名是**建议的** facade 形状，未必已在代码中存在；本计划把它们
+> 落成实际 API，命名以文档为准、以现有底层类型为锚。
 
 ## 目标
 
-把现有 `ExternalAgentMachine` 从“黑盒 external session effect”推进到“受管 external agent”：
+在已有 Client / Conversation / Agent 三层之上，新增一层 batteries-included 的 **facade** API
+（`agent_lib::facade` + `agent_lib::prelude`），让常见的聊天、工具 agent、subagent、managed external
+agent 场景**不必手写** `Conversation` pending 事务、`AgentMachine`、`RequirementIds`/`ToolExecutionIds`、
+`HandlerScope` 与 driver wiring（见 `docs/facade-api.md` §0–§2）。具体：
 
-- 外部 runtime(Claude Code / Codex / OpenCode) 的流式文本、命令、patch、权限请求、tool call、
-  subagent 请求、artifact、usage 等都通过 agent effect 模型归一化。
-- `ExternalAgentMachine` 仍保持 sans-io：它只 reify `Requirement`，不启动进程、不读写 runtime stream、
-  不执行工具、不询问用户。
-- 真实 IO 由 `ExternalSessionHandler` / runtime adapter / session registry 兑现；driver 继续用
-  `drain`、`HandlerScope`、`Pop`、`RunContext` 处理 nested scope、cancel、budget、trace。
-- 对内部 agent 已有能力尽量 parity：流式输出、tool 注入、approval/user interaction、subagent、
-  artifact、usage/cost、worktree isolation、cancel cleanup、reconfig。
+- **渐进式使用**：从 one-shot `Chat::ask`，到 stateful `ChatSession::send`，再到 `Agent` 工具调用、
+  local subagent、managed external agent，逐层增加概念，不要求用户一开始理解完整 effect 模型。
+- **保留强不变量**：facade 内部仍用 `Conversation` 推进 turn、`DefaultAgentMachine` reify effect、
+  `HandlerScope`/`drain`/`Pop` 兑现 requirement；**不**绕过底层重写一套轻量状态机（§2.1、§19）。
+- **默认可用**：默认生成稳定 identity（内建 `RequirementIds`/`ToolExecutionIds` id source）、默认创建
+  session、默认处理 pending 失败、默认接好 tool registry、默认给 headless/attended 审批一个明确行为。
+- **可恢复**：`ChatSession` / `Agent` / delegating session 支持 snapshot/restore，snapshot 只存 data-only
+  facts，不存凭据、闭包、进程句柄、client handle（§15、§19）。
+- **可观测 + 逃生舱清楚**：简单路径只拿 `Reply.text()`；产品/调试路径拿完整 `RunOutput`（response、
+  tool trace、delegation trace、artifact、usage、raw events），并能退回底层模块（§6、§19）。
 
 ## 非目标
 
-- 不把 Claude Code、Codex、OpenCode 的私有 JSON/JSONL schema 变成 `agent-lib` 的稳定 public API。
-  这些 schema 只存在于 runtime adapter 的 parser/cassette 层。
-- 不要求三个 runtime 首版能力完全一致。能力差异通过 capability model 显式暴露，不能静默假装支持。
-- 不让真实 CLI/API 测试进入默认测试路径。默认 `cargo test --all --all-targets` 必须离线、稳定、
-  不依赖凭据、网络、本地登录态或未纳管进程。
-- 不新增新的 effect family。external runtime 的 tool/subagent/interaction 决策点应映射到现有
-  `NeedTool`、`NeedSubagent`、`NeedInteraction`，再通过 `NeedExternalSession` 回灌给 runtime。
-- 不把 worktree/process 权限当成 runtime 自带安全边界。宿主的 permission policy 与 worktree isolation
-  仍是最终约束。
+（严格照搬 `docs/facade-api.md` §2.2、§19）
 
-## 当前实现锚点
+- 不隐藏 provider 能力差异：provider-specific extras 仍显式绑定 `ProviderId`（`model::extras`）。
+- 不把所有能力塞进一个 `EasyClient`；Chat / stateful conversation / tool agent / delegating agent 语义
+  不同，API 上区分。
+- 不让 `Reply` 只等于 `String`；主路径返回结构化 `Reply` / `RunOutput`，`ask_text` 只是便捷。
+- 不把 API key、base URL token、运行期闭包、live process handle 写进 snapshot。
+- 不让 managed external agent 伪装成普通函数工具；它有 session/artifact/worktree/权限/cancel/attach 语义，
+  一等建模为 external delegate。
+- **不新增 effect family**：subagent/external 的 tool/interaction/subagent 决策点仍映射到现有
+  `NeedTool`/`NeedInteraction`/`NeedSubagent`，external 经 `NeedExternalSession` 回灌 runtime。
 
-以下锚点是本计划的精确接入面：
+## 现有代码锚点（facade 的精确接入面）
 
-- `src/agent/external/mod.rs`
-  - `ExternalRuntimeKind::{ClaudeCode,Codex,OpenCode,Custom}` 已有;ACP adapter(M10)复用
-    `Custom(String)` 承载,不新增变体。
-  - `ExternalSessionInput` 现有 `Start` / `Continue` / `RespondInteraction` / `Shutdown`。
-  - `ExternalSessionRequest` 已携带 `agent_id`、`runtime`、`worktree`、`session`、`input`、`tools`、
-    `policy`。
-  - `ExternalAgentEvent` 已覆盖 session、text delta、command、file patch、permission、tool、
-    message、task、completed，但事件本身还没有 `seq`。
-  - `ExternalSessionResult` 现有 `Completed` / `PausedForInteraction` / `Failed`，`observations`
-    仍是 `Vec<ExternalAgentEvent>`。
-  - `ExternalAgentError` 已有 `Launch`、`SessionLost`、`Protocol`、`LimitExceeded`、
-    `ResumeUnavailable`、`ShutdownFailed`、`Runtime`。
-- `src/agent/external/machine.rs`
-  - `ExternalAgentMachine` 已支持 user message -> `NeedExternalSession(Start/Continue)`。
-  - 已支持 `PausedForInteraction` -> `NeedInteraction` -> `RespondInteraction`。
-  - 已支持 `Completed` commit Conversation、`Failed` error cursor、artifact 记录、cancel cleanup flag。
-  - 当前 cursor 只有 `AwaitingSession` / `AwaitingInteraction`，还没有 tool/subagent 相位。
-  - `observe` 当前依赖 `ExternalSessionRef.last_event_seq` 做粗粒度 dedup。
-- `src/agent/external/state.rs`
-  - `ExternalAgentCursor` 是可序列化恢复 cursor。
-  - `ExternalAgentState` 持有唯一 `Conversation`、`session`、`active_tools`、`artifacts`、
-    `cleanup_required`。
-- `src/agent/drive.rs`
-  - `ExternalSessionHandler` 已是一个 effect handler。
-  - `drain` 会并发 fulfill 本 scope 可处理的非 subagent requirement；`NeedSubagent` 走串行
-    `resolve_requirement` 并带 `outer` pop target。
-- `src/agent/effect_manifest.rs`
-  - `ExternalSession` 已在 effect manifest 中；本计划不需要改 manifest 增 effect。
-- `src/agent/tool.rs`
-  - `ToolExecutionIds` 提供 `ToolCallId`、tool result message id、assistant continuation id、step id。
-  - external tool 注入应复用 `ToolExecutionIds::tool_call_id` 分配 framework call id。
-- `src/agent/interaction.rs` / `src/agent/permission.rs`
-  - `InteractionKind::Permission`、`PermissionRequest`、`PermissionResponse` 已能承载 runtime 权限请求。
-- `src/agent/drive/subagent.rs`
-  - `DrivingSubagentHandler` 已定义 nested drain 机制；external runtime spawn 请求应走 `NeedSubagent`。
-- `src/agent/external/runtime.rs` / `src/agent/external/shutdown.rs` / `src/agent/external/sink.rs`
-  - 已有 runtime handle holder、shutdown disposition、live event sink 占位。
-
-## 目标架构
-
-```text
-ExternalAgentMachine (sans-io)
-  UserMessage
-    -> NeedExternalSession(Start/Continue)
-    -> ExternalSessionResult decision point
-
-Decision points:
-  Completed
-    -> commit Conversation -> Done
-
-  PausedForInteraction
-    -> NeedInteraction
-    -> NeedExternalSession(RespondInteraction)
-
-  PausedForToolCalls
-    -> NeedTool batch
-    -> NeedExternalSession(RespondToolResults)
-
-  PausedForSubagent
-    -> NeedSubagent
-    -> NeedExternalSession(RespondSubagent)
-
-  Failed
-    -> cancel pending -> Error
-```
-
-`ExternalSessionHandler` 的生产实现只负责把 runtime adapter 的下一决策点包装成
-`RequirementResult::ExternalSession(Box<ExternalSessionResult>)`。machine 收到决策点后，继续把 host
-tool、host interaction、host subagent reify 成现有 requirement，由外层 scope 决定本层处理还是 pop。
+- **模块**：`src/lib.rs` 现有 `pub mod adapter/agent/client/conversation/model/stream`；新增
+  `pub mod facade;` 与 `pub mod prelude;`。facade 子模块建议：`config`、`chat`、`run`（Reply/RunOutput/
+  RunEvent/RunStream）、`tool`、`agent`、`delegate`、`error`、`ids`（内建 id source）。
+- **client**：`client::{EndpointConfig, AuthScheme, ChatRequest, Response, LlmClient}`；
+  `model::extras::{ProviderId, ProviderExtras}`。`ProviderConfig` 是 `EndpointConfig` + `ProviderId`
+  的易用包装。
+- **conversation**：`Conversation::{new, begin_turn, start_assistant_response, finish_assistant,
+  commit_pending, effective_view, snapshot}`、`ConversationSnapshot`、`ConversationConfig`、ids
+  （`ConversationId/TurnId/MessageId/ToolCallId`）、`AssistantFinish`。
+- **agent**：`AgentSpec/AgentState/DefaultAgentMachine/LlmStepMode`、`RequirementIds`+`ToolExecutionIds`
+  （id source）、`ModelRef/LoopPolicy/ToolFailurePolicy/ToolSetRef/WorktreeRef`、
+  `RunContext::new_root`+`BudgetLimits`、`drive::{drain, HandlerScope, ReferenceScope}`
+  （`ReferenceScope::new(client, registry).with_interaction(..)`）、
+  `ToolRegistry/ToolExecutor/ToolApprovalPolicy/ApprovalRequirement/Interaction/InteractionHandler/
+  InteractionKind`、`NestedMachine/SubagentHandler`、`collab`（plan/blackboard/mailbox）。
+- **external**：`agent::external::{ExternalRuntimeKind, ExternalRuntimeCapabilities,
+  ExternalAgentMachine, ExternalSessionHandler, ExternalSessionRegistry, runtime adapters}`；ACP 侧
+  `AcpAdapter`（feature `external-acp`）。这些是 `ManagedExternalAgent` / `ExternalRunMode` 的地基。
+- **驱动样板**：`examples/agent_chat.rs` 展示 id source（`RequirementIds`+`ToolExecutionIds`）、
+  `AgentSpec`→`AgentState`→`DefaultAgentMachine`、自建 `HandlerScope`、`drain`、`RunContext` 的完整
+  wiring——facade 要把这段样板收进内部。`examples/tool_round_trip.rs` / `examples/managed_*.rs` 同为参考。
 
 ## 里程碑
 
-| 里程碑 | 主题 | 主要文件 | 默认测试形态 |
+承接 `docs/facade-api.md` §18「建议落地顺序」，逐层增加概念、每层可独立验证。
+
+| 里程碑 | 主题 | 主要产出 | 默认测试形态 |
 |---|---|---|---|
-| M1 | external session 协议扩展与 sequenced observations | `src/agent/external/mod.rs` | serde/unit |
-| M2 | `ExternalAgentMachine` tool parity | `src/agent/external/machine.rs`、`state.rs` | machine unit |
-| M3 | subagent / interaction parity | `machine.rs`、`interaction.rs`、`permission.rs` | machine + drive unit |
-| M4 | streaming live sink、capability model、session policy | `external/sink.rs`、`external/profile.rs`、新 capability 模块 | unit |
-| M5 | runtime adapter abstraction 与 scripted/cassette handler | `external/runtime.rs`、新 adapter/registry 模块 | offline scripted/cassette |
-| M6 | Claude Code managed adapter | feature-gated adapter 模块 | parser cassette + ignored real e2e |
-| M7 | Codex managed adapter | feature-gated adapter 模块 | parser cassette + ignored real e2e |
-| M8 | OpenCode managed adapter | feature-gated adapter 模块 | parser cassette + ignored real e2e |
-| M9 | worktree/budget/reconfig/docs/real mixed e2e hardening | `external/*`、`docs/*`、`tests/*` | offline + ignored real |
-| M10 | ACP(Agent Client Protocol)managed adapter | `external/acp/*`(feature `external-acp`) | offline cassette/fake-transport + ignored real e2e |
+| M1 | Chat facade | `facade`/`prelude` 模块、`ProviderConfig`/`ModelConfig`、`Reply`/`RunOutput`/`RunEvent`/`FacadeError`、`Chat`/`ChatSession`（ask/send/stream/snapshot/restore） | 单元（内建 fake `LlmClient`，离线） |
+| M2 | 基础 Agent facade | typed function `Tool`、`Approval` 三档、内建 id source、`Agent`（`run`/`run_full`/`stream`/`snapshot`）、loop policy | 单元（fake client + 脚本工具，离线） |
+| M3 | Local subagent | `Agent::worker()`、`.subagent(..)`、model-routed delegation（每 delegate 一个工具）、`DelegationTrace` | 单元（父子 machine 离线 drain） |
+| M4 | Managed external agent | `.external_agent(..)`、`ManagedExternalAgent`（含 `::acp` 预设）、`ExternalRunMode`/`ExternalAgentCapabilities` 分级、approval defaults、artifact trace、restore policy | 单元（scripted/registry-backed external，离线） |
+| M5 | Dispatcher / Escalator | rules-routed + dispatcher-routed delegation（primary→verify→escalate）、升级路径入 `DelegationTrace` | 单元（离线 delegate 拓扑） |
+| M6 | Collaboration convenience | 按 delegate 拓扑自动启用 mailbox/blackboard/plan/artifact store，`Collaboration` 显式配置，桥接 external collab 能力 | 单元（离线拓扑） |
 
-## M10:ACP managed adapter(与 M6-M8 的关系)
+每个 milestone 末尾有一个独立 `M<n>-R` review 任务，检查正确性、完整性、文档一致性。
 
-M6-M8 为 Claude Code / Codex / OpenCode 各写了一套**私有 wire 解码**的 adapter,因为这三家 CLI 的
-JSON/JSONL 输出互不兼容、且都是「自主运行、只读观测」的半托管形态(`permission_bridge` / `host_tools`
-恒为 `false`)。M10 走一条根本不同的路:
+## 关键设计约束（照搬 §19，落地时必须守）
 
-- **ACP 是单一标准协议**(JSON-RPC 2.0 over stdio,wire v1,类 LSP),一套 client 实现即可对接所有 ACP
-  agent(Gemini/OpenCode 原生;Claude/Codex 经 Zed 的 adapter 进程)。因此 M10 **只做一个 `AcpAdapter`**,
-  不做「每家一个」,启动命令由 `AcpConfig` 区分,wire 层复用。
-- **用官方 crate**(`agent-client-protocol` + `agent-client-protocol-schema`)而非手写 JSON-RPC:提高兼容性
-  与正确性(Zed 侧测试充分),协议类型只在 adapter 层用、不外泄为稳定 API。
-- **凭据边界在被包装的 CLI 侧,不在本库**(本机实测):三个 bridge 都从各自 CLI 的配置/登录态取凭据——
-  `claude-agent-acp`(内嵌 Claude Agent SDK)读 `~/.claude`、`codex-acp`(spawn `codex app-server`)读
-  `~/.codex`(含 `auth.json`)、`opencode acp`(opencode 子命令)读 `~/.config/opencode`,均**不用**官方
-  API/key。`AcpConfig` 因此不承载 API key。
-- **配置能力:能继承 + 能注入/替换**(非「必须继承」)。adapter 默认继承宿主完整 env(缺省配置开箱即用),
-  同时 `AcpConfig` 必须能显式**注入/替换**配置来源——这是本地测试的硬需求,因为本机三个 agent 都不用缺省
-  配置。实测覆盖入口:Codex 用 `CODEX_HOME`/`CODEX_CONFIG`/`CODEX_PATH`(+底层 `codex -c key=value`),
-  OpenCode 用 `OPENCODE_CONFIG`/`OPENCODE_CONFIG_DIR`/`OPENCODE_CONFIG_CONTENT`/`XDG_CONFIG_HOME`,Claude 用
-  `claude --settings <file-or-json>`。e2e 通过这些入口指向测试专用配置,未设则走继承——与 M6-M8 的凭据边界
-  处理一致。
-- **feature gate `external-acp`**:官方 crate 作为 optional dependency,默认关闭;默认构建/测试不拉入 ACP
-  依赖、不依赖任何 ACP agent binary。
-- **首次点亮 host-pausable 臂**:ACP 的 `session/request_permission`(agent→client request)天然映射到
-  machine 早已实现的 `PausedForInteraction`→`NeedInteraction`→`RespondInteraction`,使 `permission_bridge`
-  第一次为 `true`。`fs/*` / `terminal/*` 作为 client 侧环境服务由 adapter 直接对 worktree 兑现并汇报为
-  observation,不折成 `NeedTool`;`host_tools`(经 client MCP)留作后续能力,首版保守 `false`。
-- **不改 machine/driver/state**:复用 milestone-5 抽象与 `ExternalRuntimeKind::Custom(String)`,与 M6-M8
-  同构地挂进 `ExternalRuntimeAdapter` / `ExternalRuntimeSession` / `ExternalSessionRegistry`。
-
-M10 完成后,facade API(见 [`docs/facade-api.md`](docs/facade-api.md) §11 Managed External Agent 集成、
-§11.3 能力分级)可把 ACP agent 作为一个 `ExternalRunMode::Managed`(乃至 permission bridge 打开的更高档)
-external delegate 暴露:facade 的 `ExternalRunMode` / `ExternalAgentCapabilities` 分级应能表达「ACP =
-标准协议、permission bridge 可用」这一层,承接关系记入 H-1 之后的 facade 计划。
+- Facade 是装配层，不是第二套 runtime；`ChatSession`/`Agent` 内部必须用 `Conversation`，不直接拼 message Vec。
+- `Agent` 必须内部用 `AgentMachine` + effect handler，不绕过 `Requirement`。
+- 简单 API 默认 cancel failed pending（回到上一个 committed 一致点）；高级 API 可保留 pending 供检查
+  （`PendingFailurePolicy::{Cancel, KeepForInspection}`）。
+- Snapshot 不保存 secret / 闭包 / client / live process handle。
+- Local subagent 默认作为 local delegate；managed external agent 默认作为 external delegate，且更保守
+  （启动/resume/写工作区需审批或显式 opt-in）。
+- Model-routed delegation 默认每 delegate 一个工具（`ask_<name>`）；统一 `delegate` 工具是高级选项。
+- `RunOutput` 必须能同时表达 LLM response、tool trace、delegation trace、artifact、raw events。
+- 所有 provider-specific 行为继续经 provider extras / capability model 显式表达。
 
 ## 验证策略
 
-默认完整验证序列：
+默认完整验证序列（cheap → expensive，任务另有放宽时以任务为准）：
 
 1. `cargo fmt --all -- --check`
-2. 聚焦测试：任务中给出精确过滤名
+2. 聚焦测试：任务中给出精确过滤名（如 `cargo test -p agent-lib facade::chat`）
 3. `cargo clippy --all-targets -- -D warnings`
-4. `cargo test --all --all-targets`
+4. `cargo test --all --all-targets`（完整套件，超时 ≤ 30 分钟）
 5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
 6. `git diff --check`
 
-真实 runtime/API 测试必须满足：
+补充约束：
 
-- `#[ignore]`，默认测试不运行。
-- 明确检测所需环境变量和 CLI 可用性，缺失时跳过或给出不含 secret 的错误。
-- 不输出 key、auth header、完整 prompt transcript、未脱敏 tool input。
-- 使用独立 worktree 或临时目录，结束后清理或标记残留 side effect。
+- 触碰 external adapter 的任务，额外跑一遍
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`。
+- facade 单元测试必须**离线**：用内建/伪造 `LlmClient` 与脚本化 handler，不依赖网络、凭据、CLI 或本地登录态；
+  每个测试须在 1 分钟内完成，卡住即为 bug。
+- 真实 provider / 真实 CLI 的端到端验证一律 `#[ignore]`，缺环境时干净跳过（绿），不输出 secret。
+- 新增公开 API 必须带 rustdoc（`#![warn(missing_docs)]` 已开）；宏/泛型生成项的 rustdoc 需可编译。
 
-## 风险
+## 风险与待确认（含 `docs/facade-api.md` §20 未定问题）
 
-- **runtime 协议漂移**：Claude Code / Codex / OpenCode JSON/JSONL schema 会变。缓解：adapter parser 私有化、
-  cassette 覆盖、capability probe、不把 raw schema 暴露为稳定 API。
-- **tool bridge 能力不对称**：三个 runtime 未必都支持 host tool 注入。缓解：capability model 明确
-  `UnsupportedCapability`，dispatcher 避免派错 worker。
-- **cancel 后副作用残留**：forced kill 不能回滚已执行命令。缓解：session registry 记录
-  `ExternalSessionShutdown`，worktree isolation 标记 dirty。
-- **stream 事件重复**：live sink 和 buffered observations 双路径可能重复。缓解：
-  `ExternalObservedEvent.seq` 作为唯一 replay 进度。
-- **恢复 mid-turn scratch**：`ExternalAgentMachine::new` 当前无法重建 awaiting state 的 driver-facing
-  streaming cursor。缓解：把外部 tool/subagent pending facts 放入 serializable cursor，并补 restore 测试。
-- **ACP 官方 crate / wire 版本漂移**：`agent-client-protocol*` 仍在演进,crate API 与 ACP wire 版本各自独立
-  升级。缓解:crate 只在 adapter 层用、raw 类型不外泄为稳定 API;capability 经 `initialize` 协商而非硬编码;
-  cassette + fake-transport 覆盖归一化路径;wire 版本作为探测项记录。
-- **ACP agent 能力不对称**:wire 一致但 feature parity 不保证(`loadSession`/fs/terminal 均可选)。缓解:
-  复用 `ExternalRuntimeCapabilities` + `with_probed_capabilities` 逐位取交,未协商到的位不假装支持,
-  不支持的请求 fail fast(`UnsupportedCapability`)。
+facade-api.md §20 列了 7 个未定问题；落地时按下述取向推进，遇到硬约束再在 `TODO.md` 追加前置任务：
+
+- **R1 typed tool 与 `schemars`（§20.3，实证缺口）**：`schemars` **当前不是** `agent-lib` 的依赖
+  （已核对 `Cargo.toml`）。`Tool::function` 需要 `Args -> JSON schema`。取向：优先把 schema 派生放在
+  **可选 feature 或 companion 支持**，避免给核心 crate 强加 `schemars`；若 M2 证明无 feature 无法保证
+  易用性，则在 `TODO.md` 追加「引入 schema 依赖」前置任务，明确 feature 边界后再实现 typed tool。
+- **R2 Chat::send 语义（§20.1）**：为避免 stateful/stateless 含混，采用文档倾向——只提供 `Chat::ask`
+  （one-shot）+ `ChatSession::send`（多轮），不提供易混的 `Chat::send`。
+- **R3 `Agent` vs `AgentSession` 命名（§20.2）**：第一版以 `Agent` 承载运行态（`run` 取 `&mut self`），
+  builder 产 `Agent`；文档仍按三层讲。若后续需要区分 spec/session，再拆。
+- **R4 subagent 是否继承 supervisor provider/model（§20.4）**：`Agent::worker()` 同时支持
+  `.model(..)`（显式）与 `.inherit_model()`（继承），默认继承，保持易用。
+- **R5 DelegationTrace task brief redaction（§20.5）**：`DelegationTrace` 若进 snapshot/日志，需 redact
+  策略；M3/M4 落地时 task brief 默认不写入持久 snapshot，敏感字段提供 redact 钩子。
+- **R6 External restore 默认 `MarkInterrupted`（§20.6）**：coding agent 默认 `MarkInterrupted`（安全）；
+  只读 external agent 允许显式 `AttachOrFail`。
+- **R7 `RunEvent` 可序列化（§20.7）**：`RunEvent` 的归一化变体尽量可序列化；`RawStream`/`RawNotification`
+  逃生舱可能含不易序列化 source，标注为「非序列化承诺」变体，序列化能力不作为稳定契约。
+- **R8 底层能力对齐**：facade 只承诺 `docs/facade-api.md` 有依据、且底层已落地的能力；文档里尚无底层支撑的
+  形状（如 `DelegateBackend` trait、部分 collab 自动拓扑）先不公开，作为后续 milestone 或待确认项，不假装支持。
+- **R9 external 能力档真实性**：`ExternalRunMode`/`ExternalAgentCapabilities` 必须如实反映
+  `ExternalRuntimeCapabilities`（8 项）与 ACP `initialize` 协商结果，未验证的档位不假装可用（承接 M10）。
