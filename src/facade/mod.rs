@@ -48,8 +48,9 @@ pub use delegate::{AgentWorkerBuilder, LocalSubagent};
 pub use error::FacadeError;
 pub use ids::FacadeIds;
 pub use run::{
-    ApprovalRequest, ArtifactRef, DelegationMessage, DelegationProgress, DelegationTrace,
-    EscalationTrace, IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary,
+    ApprovalRequest, ArtifactRef, DelegationMessage, DelegationProgress, DelegationStatus,
+    DelegationTrace, EscalationTrace, IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace,
+    UsageSummary,
 };
 pub use tool::{
     FacadeToolRegistry, IntoToolResult, Tool, ToolContext, ToolContextParts, ToolResult,

@@ -836,7 +836,7 @@ tool_declarations 进 spec、approval 携带、确定性 id、`with_name`）+ `s
 `cargo test --all --all-targets` 全绿（含 16 doctests）；
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` clean；`git diff --check` clean。
 
-### [TODO] M3-2 model-routed delegation：subagent 暴露为工具 + `NeedSubagent` 兑现 + `DelegationTrace`
+### [DONE] M3-2 model-routed delegation：subagent 暴露为工具 + `NeedSubagent` 兑现 + `DelegationTrace`
 
 **上下文**：
 
@@ -862,6 +862,52 @@ tool_declarations 进 spec、approval 携带、确定性 id、`with_name`）+ `s
   子 agent 的需审批工具仍触发审批（§9.2）。
 - 聚焦：`cargo test -p agent-lib facade::delegate`（含 model-routed 用例）。
 - 完整验证序列 1–6。
+
+**完成记录**：
+
+在 `src/facade/delegate.rs` 落地 model-routed delegation 的兑现路径，并在 `agent.rs`/
+`agent/stream.rs`/`run.rs`/`mod.rs` 上接线，全部离线单测通过。
+
+- **subagent 暴露为工具（§10.1）**：`delegation_tool_name(name)="ask_<name>"` +
+  `delegation_declaration(name, description)`（输入 schema 含必填 `task: string`，空描述给出
+  terse 生成描述）。`AgentBuilder::build` 为每个已登记 subagent 追加一条 `ask_<name>` 声明到
+  supervisor 的 `AgentSpec` tool set——因为发给模型的工具集取自 machine state 的
+  `current_tool_set()`，声明必须在 build 期入 spec，run-scoped `FacadeToolRegistry` 不含它。
+  name 冲突 build 期报错按 spec 留待 M3-3。
+- **`NeedSubagent` 兑现（复用 `SubagentHandler`）**：`DefaultAgentMachine` 只发 `NeedTool`，
+  故在 `NeedTool` 边界用 `DelegationToolHandler`（`ToolHandler`）拦截 `ask_<name>`：`is_delegation`
+  命中即 `drive_delegation`，内部构 per-call `FacadeSubagentSpawner`（`SubagentSpawner`）+ 参考
+  `DrivingSubagentHandler`（`DEFAULT_MAX_DELEGATION_DEPTH=8`）串行 drain child `NestedMachine`，
+  非 delegation 名转发底层 `ToolRegistryHandler`。这正是「NeedSubagent→SubagentHandler→child
+  drain」的忠实路径，只是在模型真正路由的工具边界做关联。
+- **child 建模与回灌**：`spawn` 用 `LocalSubagent.spec` 重建 child `AgentSpec`/`AgentState`/machine；
+  R4 继承时以 supervisor 具体 model 替换占位模型，否则用 worker 显式 model。`RecordingChildMachine`
+  包裹具体 `DefaultAgentMachine`，在 `cursor()==Done` 时经 `final_turn_summary` 抓 `(text, usage)`
+  存入共享 slot；`summarize` 读 slot 作 child 摘要，`delegation_response` 把摘要回灌为
+  supervisor 的 `ToolResponse`（child 失败则折成 `ToolRuntimeError::ExecutionFailed`）。
+- **DelegationTrace + 事件（§10.2/§18.3）**：新增 `DelegationStatus{Completed,Failed}` 并扩展
+  `DelegationTrace{delegate, status, usage}`（`#[non_exhaustive]`）。`collect_traces` 依 recorder 的
+  call_id 把通知分流为 delegation vs 普通 tool：delegation 进 `RunOutput.delegations` 且 usage 经
+  `UsageSummary::add_subagent` 归入 `subagents` 切片，沿途产
+  `RunEvent::DelegationStarted/Finished/Failed`（stream 路径的 `TapToolHandler` 同样分流）。
+- **审批（§9.2）**：child scope 用 `LocalSubagent.approval()` 建 `FacadeApproval`，同时充当 child
+  machine 的 `ToolApprovalPolicy` 与 scope 的 `InteractionHandler`，故子 agent 的需审批工具仍会暂停。
+
+**测试**：`src/facade/delegate.rs` 新增 `delegation_declaration_advertises_ask_tool_with_task_input`
+单测 + `model_routed_tests` 模块两例（离线 `RoutingClient` 按 `request.system` 标记分流 supervisor/child）：
+（1）`model_routed_delegation_drives_child_and_folds_result`——supervisor 调 `ask_reviewer`→child 被
+drive、摘要回灌为工具结果并推进到 supervisor 终局；`delegations` 恰一条（delegate=reviewer、
+status=Completed、usage.input=11）；`usage.subagents` 折入 child usage；`tool_calls` 空；事件
+`DelegationStarted`→`DelegationFinished` 有序且无普通 tool 事件。（2）
+`child_approval_gated_tool_still_triggers_approval`——child 的 `shell` 工具经 ask/deny 审批仍被咨询
+（`AtomicBool` 置位）。
+
+**验证**：序列 1–6 全绿——`cargo fmt --all`；聚焦 `cargo test -p agent-lib --lib facade::delegate`
+（10 passed）+ `facade::`（84 passed）；`cargo clippy --all-targets -- -D warnings` 及
+`--features "external-claude-code external-codex external-opencode"` 均 clean；
+`cargo test --all --all-targets` 全绿；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+clean（修正了因新 import 使 `AgentState`/`RunContext` 内链可解析而产生的 redundant-target 告警）；
+`git diff --check` clean。
 
 ### [TODO] M3-3 `Delegation` 配置（model-routed 选项）+ 多 delegate + pending delegation snapshot
 

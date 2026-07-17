@@ -47,15 +47,18 @@ use crate::agent::{
 use crate::client::{ChatRequest, ClientError, LlmClient, Response};
 use crate::conversation::ToolCallId;
 use crate::facade::approval::FacadeApproval;
+use crate::facade::delegate::{DelegationRecorder, DelegationToolHandler, new_delegation_recorder};
 use crate::facade::error::FacadeError;
-use crate::facade::run::{ApprovalRequest, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary};
+use crate::facade::run::{
+    ApprovalRequest, DelegationStatus, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary,
+};
 use crate::facade::tool::{FacadeToolRegistry, ToolContextParts};
 use crate::model::message::Message;
 use crate::model::tool::ToolCall;
 use crate::stream::accumulator::{Accumulator, AccumulatorError};
 use crate::stream::{Delta, StreamEvent};
 
-use super::{Agent, classify_error, collect_tool_traces, final_turn_summary};
+use super::{Agent, classify_error, collect_traces, final_turn_summary};
 
 /// A shared sink the tapping handlers push live [`RunEvent`]s into while the
 /// drive future runs, drained in order by [`AgentRunStream::poll_next`].
@@ -115,6 +118,7 @@ pub(super) fn start(
         agent.ids.step_id(),
     )?;
 
+    let recorder = new_delegation_recorder();
     let sink: EventSink = Arc::new(Mutex::new(VecDeque::new()));
     let scope = FacadeStreamScope {
         llm: StreamingTapHandler {
@@ -122,7 +126,15 @@ pub(super) fn start(
             sink: sink.clone(),
         },
         tool: TapToolHandler {
-            inner: ToolRegistryHandler::new(registry),
+            inner: DelegationToolHandler::new(
+                ToolRegistryHandler::new(registry),
+                agent.delegate_table(),
+                agent.client.clone(),
+                agent.supervisor_model(),
+                agent.ids.clone(),
+                recorder.clone(),
+            ),
+            recorder: recorder.clone(),
             sink: sink.clone(),
         },
         interaction: TapInteractionHandler {
@@ -134,18 +146,20 @@ pub(super) fn start(
     let machine = &mut agent.machine;
     let future = Box::pin(async move {
         let done = drain(machine, agent_input, &scope, None, &ctx).await?;
-        let (tool_calls, events) = collect_tool_traces(done.notifications());
+        let collected = collect_traces(done.notifications(), &recorder);
         match done.cursor() {
             LoopCursor::Done(_) => {
                 let (text, usage, stop_reason) = final_turn_summary(machine.state().conversation());
+                let mut usage_summary = UsageSummary::from_supervisor(usage.clone());
+                usage_summary.add_subagent(collected.subagent_usage);
                 Ok(RunOutput {
-                    reply: Reply::from_parts(text, Some(usage.clone()), stop_reason),
+                    reply: Reply::from_parts(text, Some(usage), stop_reason),
                     response: None,
-                    usage: UsageSummary::from_supervisor(usage),
-                    tool_calls,
-                    delegations: Vec::new(),
+                    usage: usage_summary,
+                    tool_calls: collected.tool_calls,
+                    delegations: collected.delegations,
                     artifacts: Vec::new(),
-                    events,
+                    events: collected.events,
                 })
             }
             LoopCursor::Error(error) => Err(classify_error(error.message())),
@@ -333,11 +347,18 @@ impl LlmHandler for StreamingTapHandler {
     }
 }
 
-/// Fulfills a `NeedTool` by delegating to the reference
-/// [`ToolRegistryHandler`], bracketing it with live
-/// [`RunEvent::ToolStarted`] / [`RunEvent::ToolFinished`] events.
+/// Fulfills a `NeedTool` by delegating to the run-scoped
+/// [`DelegationToolHandler`], bracketing an ordinary tool call with live
+/// [`RunEvent::ToolStarted`] / [`RunEvent::ToolFinished`] and a delegation call
+/// with [`RunEvent::DelegationStarted`] / [`RunEvent::DelegationFinished`] (or
+/// [`RunEvent::DelegationFailed`]).
+///
+/// A delegation drives its child synchronously inside `fulfill`, so both live
+/// delegation events are emitted once the child settles, carrying the trace the
+/// handler recorded (its final status and child usage).
 struct TapToolHandler {
-    inner: ToolRegistryHandler,
+    inner: DelegationToolHandler,
+    recorder: DelegationRecorder,
     sink: EventSink,
 }
 
@@ -349,6 +370,28 @@ impl ToolHandler for TapToolHandler {
         call: &ToolCall,
         ctx: &RunContext,
     ) -> RequirementResult {
+        if self.inner.is_delegation(&call.name) {
+            let result = self.inner.fulfill(call_id, call, ctx).await;
+            if let Some(trace) = self
+                .recorder
+                .lock()
+                .expect("delegation recorder poisoned")
+                .get(&call_id.to_string())
+                .cloned()
+            {
+                emit(&self.sink, RunEvent::DelegationStarted(trace.clone()));
+                match trace.status {
+                    DelegationStatus::Completed => {
+                        emit(&self.sink, RunEvent::DelegationFinished(trace));
+                    }
+                    DelegationStatus::Failed => {
+                        emit(&self.sink, RunEvent::DelegationFailed(trace));
+                    }
+                }
+            }
+            return result;
+        }
+
         let trace = ToolTrace {
             name: call.name.clone(),
             call_id: call_id.to_string(),

@@ -44,7 +44,7 @@ use std::sync::Arc;
 use crate::agent::{
     AgentError, AgentInput, AgentSpec, AgentState, BudgetLimits, DefaultAgentMachine, HandlerScope,
     InteractionHandler, LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor, LoopPolicy,
-    Notification, RequirementIds, RunContext, ToolApprovalPolicy, ToolExecutionIds,
+    ModelRef, Notification, RequirementIds, RunContext, ToolApprovalPolicy, ToolExecutionIds,
     ToolFailurePolicy, ToolHandler, ToolRegistry, ToolRegistryHandler, ToolSetRef, WorktreeRef,
     drain,
 };
@@ -53,10 +53,16 @@ use crate::conversation::{Conversation, ConversationConfig};
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
 use crate::facade::chat::client_for_provider;
 use crate::facade::config::{ModelConfig, ProviderConfig};
-use crate::facade::delegate::{AgentWorkerBuilder, LocalSubagent};
+use crate::facade::delegate::{
+    AgentWorkerBuilder, DelegationRecorder, DelegationToolHandler, LocalSubagent,
+    delegation_declaration, delegation_tool_name, new_delegation_recorder,
+};
 use crate::facade::error::FacadeError;
 use crate::facade::ids::FacadeIds;
-use crate::facade::run::{IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary};
+use crate::facade::run::{
+    DelegationStatus, DelegationTrace, IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace,
+    UsageSummary,
+};
 use crate::facade::tool::{FacadeToolRegistry, Tool, ToolContextParts, ensure_unique_tool_names};
 use crate::model::content::ContentBlock;
 use crate::model::tool::Tool as ToolDecl;
@@ -242,9 +248,17 @@ impl Agent {
         )?;
         let registry: Arc<dyn ToolRegistry> = Arc::new(registry);
 
+        let recorder = new_delegation_recorder();
         let scope = FacadeAgentScope {
             llm: LlmClientHandler::new(self.client.clone()),
-            tool: ToolRegistryHandler::new(registry),
+            tool: DelegationToolHandler::new(
+                ToolRegistryHandler::new(registry),
+                self.delegate_table(),
+                self.client.clone(),
+                self.supervisor_model(),
+                self.ids.clone(),
+                recorder.clone(),
+            ),
             interaction: self.approval.clone(),
         };
 
@@ -257,20 +271,22 @@ impl Agent {
         )?;
 
         let done = drain(&mut self.machine, agent_input, &scope, None, &ctx).await?;
-        let (tool_calls, events) = collect_tool_traces(done.notifications());
+        let collected = collect_traces(done.notifications(), &recorder);
 
         match done.cursor() {
             LoopCursor::Done(_) => {
                 let (text, usage, stop_reason) =
                     final_turn_summary(self.machine.state().conversation());
+                let mut usage_summary = UsageSummary::from_supervisor(usage.clone());
+                usage_summary.add_subagent(collected.subagent_usage);
                 Ok(RunOutput {
-                    reply: Reply::from_parts(text, Some(usage.clone()), stop_reason),
+                    reply: Reply::from_parts(text, Some(usage), stop_reason),
                     response: None,
-                    usage: UsageSummary::from_supervisor(usage),
-                    tool_calls,
-                    delegations: Vec::new(),
+                    usage: usage_summary,
+                    tool_calls: collected.tool_calls,
+                    delegations: collected.delegations,
                     artifacts: Vec::new(),
-                    events,
+                    events: collected.events,
                 })
             }
             LoopCursor::Error(error) => Err(classify_error(error.message())),
@@ -309,6 +325,27 @@ impl Agent {
     #[must_use]
     pub fn subagents(&self) -> &[LocalSubagent] {
         &self.delegates
+    }
+
+    /// Builds the per-run delegation lookup keyed by each delegate's synthesized
+    /// `ask_<name>` tool name (§10.1).
+    ///
+    /// Shared behind an [`Arc`] so the run-scoped [`DelegationToolHandler`] and
+    /// the streaming tap can consult the same table without re-cloning the
+    /// delegate recipes on every tool call.
+    fn delegate_table(&self) -> Arc<HashMap<String, LocalSubagent>> {
+        Arc::new(
+            self.delegates
+                .iter()
+                .map(|delegate| (delegation_tool_name(delegate.name()), delegate.clone()))
+                .collect(),
+        )
+    }
+
+    /// Returns the supervisor's own model, substituted into any inheriting child
+    /// spec when a delegation is fulfilled (R4).
+    fn supervisor_model(&self) -> ModelRef {
+        self.machine.state().spec().model().clone()
     }
 
     /// Runs one agent turn as an incremental [`AgentRunStream`].
@@ -656,11 +693,19 @@ impl AgentBuilder {
         );
 
         // The advertised tool set must mirror what the run-scoped
-        // FacadeToolRegistry reports, so build it from the same three sources.
+        // FacadeToolRegistry reports, so build it from the same three sources,
+        // then append one synthesized delegation tool per registered subagent so
+        // the supervising model can route work to a child (§10.1).
         let mut declarations: Vec<ToolDecl> = self.tools.iter().map(Tool::declaration).collect();
         declarations.extend(self.extra_declarations.iter().cloned());
         if let Some(custom) = &self.custom_registry {
             declarations.extend(custom.declarations());
+        }
+        for delegate in &self.delegates {
+            declarations.push(delegation_declaration(
+                delegate.name(),
+                delegate.description(),
+            ));
         }
 
         let spec = AgentSpec::new(
@@ -719,7 +764,7 @@ fn build_facade_approval(policy: ApprovalPolicy, tools: &[Tool]) -> Arc<FacadeAp
 ///
 /// Both [`AgentBuilder::build`] and the restore path share this so a rebuilt
 /// machine is wired identically to a freshly built one.
-fn assemble_machine(
+pub(crate) fn assemble_machine(
     state: AgentState,
     ids: &FacadeIds,
     approval: Arc<FacadeApproval>,
@@ -740,7 +785,7 @@ fn assemble_machine(
 /// (no reconfiguration, subagents, or host permissions on the base agent path).
 struct FacadeAgentScope {
     llm: LlmClientHandler,
-    tool: ToolRegistryHandler,
+    tool: DelegationToolHandler,
     interaction: Arc<FacadeApproval>,
 }
 
@@ -792,15 +837,40 @@ fn classify_error(message: &str) -> FacadeError {
     }
 }
 
-/// Projects the drained tool notifications into per-call traces and UI events.
+/// The per-run traces and UI events projected from a drained turn.
+pub(crate) struct CollectedTraces {
+    /// Traces for ordinary (non-delegation) tool calls.
+    pub tool_calls: Vec<ToolTrace>,
+    /// Traces for delegation calls, recorded by the delegation handler.
+    pub delegations: Vec<DelegationTrace>,
+    /// Aggregate token usage reported by every driven child.
+    pub subagent_usage: crate::model::usage::Usage,
+    /// The ordered normalized events for the run.
+    pub events: Vec<RunEvent>,
+}
+
+/// Projects the drained tool notifications into per-call traces and UI events,
+/// splitting delegation calls out from ordinary tool calls.
 ///
 /// A [`Notification::ToolCallStarted`] carries the tool name and framework call
-/// id, so it seeds both a [`ToolTrace`] in `tool_calls` and a
+/// id. When that call id was recorded as a delegation by the
+/// [`DelegationToolHandler`], it seeds a [`DelegationTrace`] in `delegations`
+/// (its child usage folded into `subagent_usage`) and a
+/// [`RunEvent::DelegationStarted`]; otherwise it seeds a [`ToolTrace`] and a
 /// [`RunEvent::ToolStarted`]. A [`Notification::ToolCallFinished`] carries only
-/// the call id, so its name is recovered from the started map to emit the
-/// matching [`RunEvent::ToolFinished`].
-fn collect_tool_traces(notifications: &[Notification]) -> (Vec<ToolTrace>, Vec<RunEvent>) {
+/// the call id, so its role is recovered from the same recorder / started map to
+/// emit the matching finished (or failed) event.
+pub(crate) fn collect_traces(
+    notifications: &[Notification],
+    recorder: &DelegationRecorder,
+) -> CollectedTraces {
+    let recorded = recorder
+        .lock()
+        .expect("delegation recorder poisoned")
+        .clone();
     let mut tool_calls = Vec::new();
+    let mut delegations = Vec::new();
+    let mut subagent_usage = crate::model::usage::Usage::default();
     let mut events = Vec::new();
     let mut names: HashMap<String, String> = HashMap::new();
 
@@ -808,27 +878,49 @@ fn collect_tool_traces(notifications: &[Notification]) -> (Vec<ToolTrace>, Vec<R
         match notification {
             Notification::ToolCallStarted(started) => {
                 let call_id = started.call_id().to_string();
-                let name = started.call().name.clone();
-                names.insert(call_id.clone(), name.clone());
-                let trace = ToolTrace { name, call_id };
-                tool_calls.push(trace.clone());
-                events.push(RunEvent::ToolStarted(trace));
+                if let Some(trace) = recorded.get(&call_id) {
+                    delegations.push(trace.clone());
+                    subagent_usage.merge(trace.usage.clone());
+                    events.push(RunEvent::DelegationStarted(trace.clone()));
+                } else {
+                    let name = started.call().name.clone();
+                    names.insert(call_id.clone(), name.clone());
+                    let trace = ToolTrace { name, call_id };
+                    tool_calls.push(trace.clone());
+                    events.push(RunEvent::ToolStarted(trace));
+                }
             }
             Notification::ToolCallFinished(finished) => {
                 let call_id = finished.call_id().to_string();
-                let name = names.get(&call_id).cloned().unwrap_or_default();
-                events.push(RunEvent::ToolFinished(ToolTrace { name, call_id }));
+                if let Some(trace) = recorded.get(&call_id) {
+                    match trace.status {
+                        DelegationStatus::Completed => {
+                            events.push(RunEvent::DelegationFinished(trace.clone()));
+                        }
+                        DelegationStatus::Failed => {
+                            events.push(RunEvent::DelegationFailed(trace.clone()));
+                        }
+                    }
+                } else {
+                    let name = names.get(&call_id).cloned().unwrap_or_default();
+                    events.push(RunEvent::ToolFinished(ToolTrace { name, call_id }));
+                }
             }
             _ => {}
         }
     }
 
-    (tool_calls, events)
+    CollectedTraces {
+        tool_calls,
+        delegations,
+        subagent_usage,
+        events,
+    }
 }
 
 /// Extracts the final assistant text, aggregated usage, and last stop reason of
 /// the most recently committed turn.
-fn final_turn_summary(
+pub(crate) fn final_turn_summary(
     conversation: &Conversation,
 ) -> (
     String,

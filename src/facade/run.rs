@@ -285,15 +285,33 @@ pub struct ApprovalRequest {
     pub tool_name: String,
 }
 
-/// Placeholder trace describing one delegation to a subagent or external agent.
+/// The terminal outcome of a single delegation (`docs/facade-api.md` §10.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationStatus {
+    /// The delegate ran to completion and its summary was folded back.
+    Completed,
+    /// The delegate failed; the error was folded back to the supervising model.
+    Failed,
+}
+
+/// A trace describing one delegation to a local subagent (`docs/facade-api.md`
+/// §10.2).
 ///
-/// Populated by the subagent/external milestones (Milestone 3/4). The field set
-/// is minimal and may grow (the type is `#[non_exhaustive]`).
+/// Produced by the model-routed delegation path (Milestone 3): when the
+/// supervising model calls an `ask_<name>` delegation tool, the child machine is
+/// driven to completion and one of these is recorded into
+/// [`RunOutput::delegations`]. The field set is minimal and may grow (the type
+/// is `#[non_exhaustive]`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct DelegationTrace {
     /// Name of the delegate that handled the task.
     pub delegate: String,
+    /// Whether the delegation completed or failed.
+    pub status: DelegationStatus,
+    /// Token usage reported by the child machine for the delegated turn.
+    pub usage: Usage,
 }
 
 /// Placeholder for a progress update reported by a running delegation.
