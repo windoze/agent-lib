@@ -1,55 +1,45 @@
-# M1-2 Reply / RunOutput / UsageSummary / RunEvent / IntoUserMessage
+# M1-3 `Chat` / `ChatBuilder` + `ask` / `ask_full`（one-shot，无 tool-use）
 
-**当前任务 = TODO.md 首个未完成 = M1-2**（`### [TODO] M1-2`）。M1-1 已 `[DONE]`。
-唯一设计输入：`docs/facade-api.md` §5.2、§6。装配层，不新增 effect family。
+**当前任务 = TODO.md 首个未完成 = M1-3**（`### [TODO] M1-3`）。M1-1、M1-2 已 `[DONE]`。
+唯一设计输入：`docs/facade-api.md` §5.1–§5.3。装配层，不新增 effect family，直接驱动 `Conversation`。
 
-## 目标（TODO.md M1-2「做什么」）
+## 目标
+新增 `src/facade/chat.rs`：
+- `Chat`（可共享配置 + `Arc<dyn LlmClient>`，`Clone`）。
+- `ChatBuilder`（`.provider(ProviderConfig).model(str).system(str).max_tokens(u32).temperature(f32).client(Arc<dyn LlmClient>).build()`）。
+  - client 解析：显式 `.client` 优先；否则按 `ProviderId` 造 adapter（Anthropic→`AnthropicAdapter`，OpenAiResp→`OpenAiRespAdapter`）；都无→`FacadeError::Config`。
+  - 缺 model → `FacadeError::Config`。
+- `Chat::ask(input) -> Result<Reply, FacadeError>`、`ask_full(input) -> Result<RunOutput, FacadeError>`。
+  - one-shot：每次新建临时 `Conversation`（`ConversationConfig::new(system)`）。
+  - §5.3 驱动：`begin_turn` → effective_view+pending_context 构 `ChatRequest`（`ModelConfig::apply_to_request`，stream=false，无 tools）→ `client.chat` → `start_assistant_response` → `finish_assistant`。
+    - `AssistantFinish::ReadyToCommit` → `commit_pending(TurnMeta::default())`（response usage 由 pending 自动 merge）。
+    - `RequiresToolCallMappings` → `FacadeError::UnexpectedToolUse`。
+  - 任意失败（含 tool-use / client error）→ 兜底 `cancel_pending(DiscardTurn)` 回到一致点。
+- `session()` 入口延后到 M1-4（TODO 允许）。
+- 全部公开项带 rustdoc + 一个 no_run doctest。
+- mod.rs 重导 `Chat, ChatBuilder`；prelude.rs 补 `Chat`。
 
-1. 新建 `src/facade/run.rs`：
-   - `Reply { text: String, usage: Option<Usage>, stop_reason: Option<StopReason> }`
-     + `text()/usage()/stop_reason()`；`text()` 聚合 `Response` 的 Text blocks。
-     （spec 写 `TokenUsage` 但代码无此类型；TODO 注「确认实际类型名」→ 用 `model::usage::Usage`。）
-   - `RunOutput { reply, response: Option<Response>, usage: UsageSummary, tool_calls: Vec<ToolTrace>,
-     delegations: Vec<DelegationTrace>, artifacts: Vec<ArtifactRef>, events: Vec<RunEvent> }`。
-   - `UsageSummary { supervisor, subagents, external: Usage }` + `from_supervisor/total/add_*`（M1 只填 supervisor）。
-   - `RunEvent`（枚举，全变体现在就定死避免后续破坏）：TextDelta/ToolStarted/ToolFinished/
-     ApprovalRequested/DelegationStarted/DelegationProgress/DelegationMessage/DelegationArtifact/
-     DelegationFinished/DelegationFailed/Escalated/Done(RunOutput)/RawStream(StreamEvent)/RawNotification(Notification)。
-     M1 只有 TextDelta/Done/RawStream/RawNotification 有实义，其余占位。
-2. 最小占位类型（放 run.rs）：`ToolTrace/ApprovalRequest/DelegationTrace/DelegationProgress/
-   DelegationMessage/ArtifactRef/EscalationTrace`，`#[non_exhaustive]`，rustdoc 注明后续 milestone 填充。
-   M1 里 RunOutput 对应 Vec 默认空。
-3. `IntoUserMessage` trait + 4 impl：`&str`/`String`/`Message`/`Vec<ContentBlock>` → user `Message`。
-4. R7：RunEvent 归一化变体尽量可序列化；Raw* 标注非序列化承诺 → RunEvent 不 derive Serde；
-   叶子数据类型（Reply/UsageSummary/traces）可 derive Serialize+Deserialize。
-5. 全部公开项带 rustdoc。
-6. mod.rs 重导 Reply/RunOutput/UsageSummary/RunEvent/IntoUserMessage + trace 占位类型；
-   prelude 补 Reply/RunOutput/RunEvent（§3 列表）。
+## 关键锚点（已核实）
+- `Conversation::{new, begin_turn, effective_view, pending_context, start_assistant_response, finish_assistant, commit_pending, cancel_pending}`。
+- `AssistantFinish::{ReadyToCommit, RequiresToolCallMappings}`；`CancelDisposition::DiscardTurn`。
+- commit 时 response usage 已由 pending 累加并 `merge_pending` 进 meta → 传 `TurnMeta::default()`。
+- request：`effective.into_parts()` + `pending_context().into_messages()`；`ModelConfig::apply_to_request` 覆盖 model/max_tokens/temperature/provider_extras。
 
-## 已核实代码锚点
+## 测试（离线，fake `LlmClient` 返回固定 Response）
+- `ask` 返回文本正确；`ask_full` 的 response/usage 正确。
+- tool-use Response → `UnexpectedToolUse`。
+- 连续两次 `ask` 互不保留历史（fake client 记录收到的 messages 长度均为 1）。
 
-- `client::Response { message: Message, usage: Usage, stop_reason: Normalized<StopReason>, extra }`（src/client/response.rs，`crate::client::Response`）。
-- `model::usage::Usage`（derive Serialize + 自定义 Deserialize；有 `merge`、`total_computed`；Clone/Debug/Default/PartialEq/Eq）。
-- `model::normalized::{Normalized<T>{value,raw}, StopReason}`（StopReason: Copy/Eq/Serialize/Deserialize）。
-- `model::message::{Message{role,content}, Role}`；`model::content::ContentBlock::Text{text,extra}`（enum tag=type）。
-- `stream::StreamEvent`（`crate::stream::StreamEvent`，Serialize/Deserialize/Clone/Debug/PartialEq/Eq）。
-- `agent::Notification`（`crate::agent::Notification`，同上派生）。
-- 无 `TokenUsage` 类型 → 用 `Usage`（TODO 已授权确认实际类型名）。
+## 验证
+1. `cargo fmt --all -- --check`
+2. `cargo test -p agent-lib --lib facade::chat`
+3. `cargo clippy --all-targets -- -D warnings`
+4. `cargo test --all --all-targets`
+5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+6. `git diff --check`
 
-## 验证（TODO.md M1-2）
-
-- 单测：Reply::text() 多 text block 聚合正确、非文本 content 不丢（保留在 RunOutput.response）；
-  IntoUserMessage 四种输入产等价 Message；UsageSummary 聚合求和正确。
-- 聚焦：`cargo test -p agent-lib facade::run`。
-- 完整序列 1(fmt --check)、3(clippy -D warnings)、4(cargo test --all --all-targets)、
-  5(RUSTDOCFLAGS=-D warnings doc)、6(git diff --check)。步骤 2 用聚焦名。
-
-## 执行步骤
-
-1. [x] 读 TODO M1-2 + 锚点类型 + facade-api §3/§5.2/§6 + PLAN R7。
-2. [x] 写 src/facade/run.rs（类型 + `From` 构造器 + IntoUserMessage + 占位类型 + rustdoc）+ run/tests.rs。
-3. [x] mod.rs / prelude.rs 补重导。
-4. [x] fmt ✅ / clippy -D warnings ✅（Done 改 Box<RunOutput> 消 large_enum_variant）/ 聚焦 5 passed ✅ /
-       cargo test --all --all-targets 50 组 ok ✅ / doc ✅ / git diff --check ✅。
-5. [x] TODO.md 标 M1-2 [DONE] + 完成记录（含 TokenUsage→Usage、Box 两处 spec 取舍留给 M1-R）。
-6. [~] commit `[M1-2] ...`，停（进行中）。
+## 完成状态：DONE
+- 落地 `src/facade/chat.rs` + `chat/tests.rs`（6 离线测试全绿）。
+- mod.rs 重导 `Chat, ChatBuilder`；prelude 补 `Chat`。
+- 全序列绿：fmt ✅ / clippy ✅ / full suite 50 组 947 passed 0 failed ✅ / doc ✅ / diff --check ✅。
+- `session()` 延后到 M1-4。TODO.md 已标 `[DONE] M1-3` 并补完成记录。

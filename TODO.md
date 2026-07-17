@@ -189,7 +189,7 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   `cargo clippy --all-targets -- -D warnings` ✅；`cargo test --all --all-targets` 全绿（50 组 test result: ok，
   0 failed）✅；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✅；`git diff --check` 干净 ✅。
 
-### [TODO] M1-3 `Chat` / `ChatBuilder` + `ask` / `ask_full`（one-shot，无 tool-use）
+### [DONE] M1-3 `Chat` / `ChatBuilder` + `ask` / `ask_full`（one-shot，无 tool-use）
 
 **上下文**：
 
@@ -219,6 +219,39 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   互不保留历史。
 - 聚焦：`cargo test -p agent-lib facade::chat`。
 - 完整验证序列 1–6（含 `cargo test --all --all-targets`，因为新增可编译代码与测试）。
+
+**完成记录**：
+
+- 新建 `src/facade/chat.rs`：
+  - `Chat`（`Clone`；持 `Arc<dyn LlmClient>` + `ModelConfig` + `Option<system>` + `FacadeIds`；手写脱敏
+    `Debug` 把 client 打成 `<dyn LlmClient>`，不泄漏内部）。方法 `builder()/ask/ask_full` 及只读
+    `client()/model()/system()`。
+  - `ChatBuilder`（`Clone, Default`）：`.provider(ProviderConfig)`、`.client(Arc<dyn LlmClient>)`（离线测试直
+    接注入，优先于 provider）、`.model(impl Into<String>)`（必填，缺则 `FacadeError::Config`）、`.system(..)`、
+    `.max_tokens(u32)`、`.temperature(f32)`、`.ids(FacadeIds)`（确定性测试用）、`.build()`。client 解析：显式
+    client 优先；否则按 `ProviderId` 造 adapter（`Anthropic`→`AnthropicAdapter`、`OpenAiResp`→`OpenAiRespAdapter`）；
+    两者皆无 → `FacadeError::Config`。
+  - `ask_full` 每次新建临时 `Conversation`（`ConversationConfig::new(system)`），按 `docs/facade-api.md` §5.3
+    驱动：`begin_turn` → `effective_view().into_parts()` + `pending_context().into_messages()` 构 `ChatRequest`
+    （`ModelConfig::apply_to_request` 覆盖 model/max_tokens/temperature/provider_extras；`stream=false`；`tools`
+    恒空——Chat 不执行工具）→ `LlmClient::chat` → `start_assistant_response` → `finish_assistant`。
+    `AssistantFinish::ReadyToCommit` → `commit_pending(TurnMeta::default())`（response usage 已由 pending 自动
+    `merge_pending` 进 meta，避免重复计数）；`RequiresToolCallMappings`（即 tool-use）→ `FacadeError::UnexpectedToolUse`。
+    共享私有 `drive_turn` 在 `begin_turn` 之后的任意错误路径都兜底 `cancel_pending(CancelDisposition::DiscardTurn)`
+    回到上一提交一致点（供 M1-4 `ChatSession` 复用）。`ask` = `ask_full().reply`。
+  - `Chat::session()` 入口按 TODO 授权延后到 M1-4（避免引入尚未落地的 `ChatSessionBuilder`）。
+- `src/facade/mod.rs` 重导 `chat::{Chat, ChatBuilder}` 并更新模块 rustdoc；`src/prelude.rs` 补 `Chat`
+  （对齐 §5.1 示例）。
+- 单元测试（`src/facade/chat/tests.rs`，6 个，全离线，`FakeClient` 返回固定 `Response` 且记录收到的 request）：
+  `ask` 文本+stop_reason 聚合、请求只含当轮 user 消息；`ask_full` 保留 `response` 且 supervisor usage 正确、
+  request 带 system/model、无 tools、非流式；tool-use `Response` → `UnexpectedToolUse`；连续两次 `ask` 请求消息数
+  均为 `[1, 1]`（一次性会话不保留历史）；builder 缺 model / 缺 client+provider → `Config`。
+- **spec 取舍**：`.model(..)` 取字符串（对齐 §5.1 `.model("gpt-5.5")`），内部据 `.max_tokens`/`.temperature`
+  组装 `ModelConfig`；tool-use 判定采用 Conversation 权威信号 `AssistantFinish::RequiresToolCallMappings`
+  而非手扫 content（等价，且避免 dead code）。
+- 验证：`cargo fmt --all -- --check` ✅；`cargo test -p agent-lib --lib facade::chat` 6 passed ✅；
+  `cargo clippy --all-targets -- -D warnings` ✅；`cargo test --all --all-targets` 全绿（50 组 test result: ok，
+  947 passed，0 failed）✅；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✅；`git diff --check` 干净 ✅。
 
 ### [TODO] M1-4 `ChatSession` + `send` / `send_full` + `conversation()` + snapshot/restore
 

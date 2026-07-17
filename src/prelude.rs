@@ -6,8 +6,8 @@
 //! adapter internals); code needing those should import them explicitly from
 //! their owning module (see `docs/facade-api.md` §3).
 //!
-//! Milestone 1 exposes the configuration wrappers and the shared result/event
-//! types. Subsequent milestones extend this prelude with `Chat`, `ChatSession`,
-//! and the Agent-facade types as they land.
+//! Milestone 1 exposes the configuration wrappers, the shared result/event
+//! types, and the one-shot `Chat` entry point. Subsequent milestones extend
+//! this prelude with `ChatSession` and the Agent-facade types as they land.
 
-pub use crate::facade::{ModelConfig, ProviderConfig, Reply, RunEvent, RunOutput};
+pub use crate::facade::{Chat, ModelConfig, ProviderConfig, Reply, RunEvent, RunOutput};
