@@ -1,35 +1,43 @@
-# M3-4 Review：interaction/subagent parity 正确性检查
+# M4-1 将 `ExternalEventSink` 升级为 sequenced live sink
 
-**当前执行 = TODO.md 第一个未完成任务 = M3-4**（M1-*、M2-*、M3-1/2/3 已 `[DONE]`）。
-这是 **review 任务**（不可跳过、不可拆分）。
+**当前执行 = TODO.md 第一个未完成任务 = M4-1**（M1-*、M2-*、M3-* 已 `[DONE]`）。
 
-## 做什么（来自 TODO.md M3-4）
-1. 手工检查 `src/agent/external/machine.rs`:resume 各相位 id/family 校验；NeedSubagent 只 reify；
-   spawn_agent 特判不落入普通 ToolRegistry；interaction 经 accepts_response 校验后回灌。
-2. 检查 `drain` 无 external 特判（有则解释 + trace 测试）。
-3. 更新 `docs/managed-external-agent.md` 中 M2/M3 状态或命名差异。
+## 任务分析（来自 TODO.md M4-1 + docs §10.1）
+- `src/agent/external/sink.rs` 的 `ExternalEventSink::emit(&ExternalAgentEvent)` 是占位。
+- 设计 §10.1（docs/managed-external-agent.md 673-674）与 §6 表（line 342）要求 live sink 按 `seq` emit
+  `ExternalObservedEvent`，与 buffered observations 双通道，seq 是唯一 replay 进度。
+- sink 只是 UI tail，不改 control flow；无生产调用方（仅 trait + DiscardEventSink + 再导出）。
 
-## 验证条件
-- `cargo test -p agent-lib external_agent` / `cargo test -p agent-lib drive`
-- 完整验证序列 1-6 全过。
-- 完成记录中给出 M3 能力 parity 摘要。
+## 方案决策
+- 直接把 `ExternalEventSink::emit` 签名改成接收 `&ExternalObservedEvent`（sequenced）。
+  - 无生产调用方，改签名安全且最干净（对齐 §10.1 `sink.emit(observed_event)`）。
+  - 不新增并行 trait，避免双 trait 维护成本。
 
-## 发现记录（review findings）
-- machine.rs 四点核对全部满足：
-  1. resume 各相位 id+family 校验齐全（session/interaction/tool-batch-route+dup+kind/subagent）。
-  2. NeedSubagent 只 reify（pause_for_subagent / spawn_agent 分支只 emit Requirement），child 由
-     driver DrivingSubagentHandler 驱动。
-  3. spawn_agent 经 SpawnAgentRequest::matches 桥成 NeedSubagent（畸形→runtime-visible error），
-     绝不发 NeedTool；machine 本身无 ToolRegistry。
-  4. resume_interaction 先 interaction.accepts_response 校验再 RespondInteraction，失败进 error cursor，
-     不转发非法答案。
-- drive.rs drain/fulfill_batch/resolve_requirement 全泛型按 RequirementKindTag 路由，无 External 特判，
-  external emit 的 NeedTool/NeedSubagent/NeedInteraction 与 DefaultAgentMachine 同形，无需新增 trace 测试。
-- 文档同步 docs/managed-external-agent.md：§1 现状表 2 行、§3 parity 表 4 行、§21 编号说明 +
-  M2 命名差异（无 AwaitingToolApproval / ToolApprovalPolicy / ToolFailurePolicy）+ M3 落地状态标注。
-- 焦点测试：external_agent 132 passed、drive 27 passed；fmt/clippy(-D warnings)/doc(-D warnings)/
-  git diff --check 全过；full suite 复用 M3-3 绿快照（本任务仅 .md 改动，无 .rs 变更）。
+## 做什么
+1. `sink.rs`:
+   - `use super::ExternalObservedEvent;`
+   - `trait ExternalEventSink::emit(&self, event: &ExternalObservedEvent)`。
+   - `DiscardEventSink` impl 改签名。
+   - rustdoc 明确三点：sink 不得阻塞；允许丢事件；exact-once 只由
+     `ExternalSessionResult.observations` + machine replay 保证。
+   - doctest 示例改用 `ExternalObservedEvent`。
+2. 测试:
+   - 更新 `discard_sink_accepts_and_drops_events` 用 sequenced events。
+   - 新增 `collecting_sink_records_sequenced_events_for_tests`：test-only collecting sink
+     （`Mutex<Vec<ExternalObservedEvent>>`），证明 sink 收事件不影响独立 buffered observations，
+     且按 seq 记录。
 
-## 状态：已完成（M3-4 [DONE]）
-- 纯 review sign-off + 文档同步，无 .rs 改动。
-- TODO.md 已标 [DONE] 并补完成记录（含 M3 parity 摘要表）。下一任务 = M4-1，本轮不启动。
+## 验证条件（TODO.md）
+- `discard_sink_accepts_and_drops_events` 更新并通过。
+- 新增 `collecting_sink_records_sequenced_events_for_tests`。
+- `cargo test -p agent-lib external::sink`。
+- 完整验证序列 1-6：fmt / 焦点测试 / clippy -D warnings / 全量 test / doc -D warnings / git diff --check。
+
+## 影响面
+- 仅 `sink.rs` 有 `.rs` 改动；无生产调用方需改。
+- 需同步 docs（M3 状态表 line 1137、§1 现状表 line 61/113）标注 M4-1 落地。
+
+## 状态：已完成（M4-1 [DONE]）
+- 仅 `src/agent/external/sink.rs` 有 .rs 改动 + docs 同步 + TODO.md/memory。
+- 完整验证序列 1-6 全过（focused external::sink 2 passed；full suite 38 组 0 failed）。
+- 下一任务 = M4-2，本轮不启动。

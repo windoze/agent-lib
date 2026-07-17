@@ -1145,7 +1145,7 @@ family/id 不符,停 turn);无 tool/subagent 结果写入 `Conversation`(runtime
 
 目标:把流式旁路和 runtime 能力差异做成可测试、可降级的公共接口。
 
-### [TODO] M4-1 将 `ExternalEventSink` 升级为 sequenced live sink
+### [DONE] M4-1 将 `ExternalEventSink` 升级为 sequenced live sink
 
 **上下文**:
 
@@ -1172,7 +1172,39 @@ family/id 不符,停 turn);无 tool/subagent 结果写入 `Conversation`(runtime
 - `cargo test -p agent-lib external::sink`
 - 完整验证序列 1-6 全过。
 
-### [TODO] M4-2 新增 `ExternalRuntimeCapabilities` 与 unsupported capability 错误
+**完成记录**:
+
+*方案*:`ExternalEventSink` 无生产调用方(仅 trait + `DiscardEventSink` + `agent::external` /
+`crate::agent` 再导出),直接把 `emit` 签名从 `&ExternalAgentEvent` 升级为 `&ExternalObservedEvent`,
+与设计 §10.1 数据流(`adapter decode ExternalObservedEvent(seq,event) -> if Streaming: sink.emit(...)`)
+及 §6「live sink 可以按 seq emit」对齐。不新增并行 trait,避免双 trait 维护成本。live sink 与 buffered
+`observations` 共享同一 `seq` 线,host 可据此对齐/去重两条通道。
+
+*改动*(`src/agent/external/sink.rs`,唯一 `.rs` 改动):
+
+- `trait ExternalEventSink::emit(&self, event: &ExternalObservedEvent)` + `DiscardEventSink` 同步改签名。
+- rustdoc 明确三点:sink 不得阻塞 continuation(须立即返回、只丢事件不背压);允许自由丢事件(无投递
+  保证);exact-once 仅由 `ExternalSessionResult::observations` + machine `seq` 去重保证,sink 只是有损
+  live 镜像,绝非其替代。doctest 示例改用 `ExternalObservedEvent::new(0, …)`。
+- `discard_sink_accepts_and_drops_events` 更新为喂 sequenced observations(含 trait object 路径)。
+- 新增 test-only `CollectingSink`(`Mutex<Vec<ExternalObservedEvent>>`)+
+  `collecting_sink_records_sequenced_events_for_tests`:模拟 handler 双通道循环(既 buffer 又 emit),
+  断言 sink 按 `seq`(0/1/2)完整记录,且独立的 buffered observations 不被旁路扰动(仍等于全量流)。
+
+*文档同步*(`docs/managed-external-agent.md`):§1 现状表「structured streaming live sink」标注
+sink 已 sequenced(policy/runtime 接线待实现);§3 parity 流式文本行改为「seq 已落地(M1)、
+`ExternalEventSink` 已 sequenced(M4-1)、runtime 接线待实现」;§10.1 数据流图 `sink.emit(&observed_event)`;
+§21 M3 条目拆为「sequenced sink 已落地(M4-1)」+「`ExternalStreamPolicy::Streaming` 策略/接线待实现」。
+
+*验证*(完整序列 1-6 全过):
+
+- `cargo fmt --all -- --check` clean。
+- 聚焦:`cargo test -p agent-lib external::sink`(2 passed:`discard_sink_accepts_and_drops_events`、
+  `collecting_sink_records_sequenced_events_for_tests`)。
+- `cargo clippy --all-targets -- -D warnings` 0 warning。
+- `cargo test --all --all-targets`:38 组测试二进制全 ok、0 failed。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过(含 sink doctest)。
+- `git diff --check` clean。
 
 **上下文**:
 
