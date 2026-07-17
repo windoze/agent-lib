@@ -423,6 +423,69 @@ impl CassetteFrame {
             extra: BTreeMap::new(),
         }
     }
+
+    /// A [`Stdout`](CassetteStream::Stdout) frame whose payload is `value`
+    /// serialized with **every object's keys sorted recursively**.
+    ///
+    /// Building a payload string from a [`serde_json::Value`] with
+    /// `value.to_string()` preserves the underlying map's iteration order, which
+    /// is not stable across builds: a default build backs
+    /// `serde_json::Value` objects with a sorted `BTreeMap`, but a build that
+    /// unifies `serde_json/preserve_order` (for example once `agent-lib`'s
+    /// `external-acp` adapter is enabled, whose schema crate pulls that feature
+    /// in) backs them with an insertion-order `IndexMap`. A committed cassette
+    /// fixture that froze `to_string()` output would then drift purely on
+    /// feature unification, even with identical logical content. Canonicalizing
+    /// keys makes the payload byte-identical under either build, so a frozen
+    /// fixture stays stable — build the JSON-carrying frames of a committed
+    /// cassette with this constructor rather than a raw `to_string()`.
+    #[must_use]
+    pub fn stdout_json(value: &Value) -> Self {
+        Self::stdout(canonical_json_string(value))
+    }
+
+    /// A [`Stderr`](CassetteStream::Stderr) frame whose payload is `value`
+    /// serialized with object keys sorted recursively; the stderr counterpart of
+    /// [`stdout_json`](Self::stdout_json), carrying the same
+    /// `serde_json/preserve_order` determinism guarantee.
+    #[must_use]
+    pub fn stderr_json(value: &Value) -> Self {
+        Self::stderr(canonical_json_string(value))
+    }
+}
+
+/// Serializes `value` to a compact JSON string with **every object's keys sorted
+/// recursively**, so the result is identical whether or not the build unifies
+/// `serde_json/preserve_order`.
+///
+/// Under a default build `serde_json::Value` objects are already sorted
+/// (`BTreeMap`), so this is a no-op; under `preserve_order` (insertion-order
+/// `IndexMap`) it re-sorts them. Either way the string matches a fixture frozen
+/// from a sorted build.
+#[must_use]
+pub fn canonical_json_string(value: &Value) -> String {
+    sort_json_keys(value).to_string()
+}
+
+/// Recursively rebuilds `value` with every object's entries reinserted in
+/// key-sorted order.
+///
+/// Reinserting in sorted order fixes the serialized key order under
+/// `preserve_order` (insertion-order `IndexMap`) and is a harmless no-op under a
+/// sorted `BTreeMap` build.
+fn sort_json_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map
+                .iter()
+                .map(|(key, child)| (key.clone(), sort_json_keys(child)))
+                .collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(entries.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sort_json_keys).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Which output stream a [`CassetteFrame`] was captured from.
@@ -970,6 +1033,7 @@ mod tests {
     use agent_lib::agent::external::{
         ExternalAgentEvent, ExternalAgentOutput, ExternalObservedEvent, ExternalRuntimeKind,
     };
+    use serde_json::{Map, Value, json};
 
     fn sample_cassette() -> ExternalRuntimeCassette {
         ExternalRuntimeCassette::new(
@@ -1052,6 +1116,35 @@ mod tests {
     fn cassette_default_frame_stream_is_stdout() {
         let frame: CassetteFrame = serde_json::from_str(r#"{ "payload": "line" }"#).expect("frame");
         assert_eq!(frame.stream, CassetteStream::Stdout);
+    }
+
+    #[test]
+    fn stdout_json_sorts_object_keys_recursively() {
+        // Build an object whose keys are inserted in reverse-sorted order. Under
+        // a `preserve_order` (all-features) build this insertion order survives
+        // `to_string()`; `stdout_json` must still emit fully sorted keys so a
+        // frozen fixture never drifts on feature unification.
+        let mut nested = Map::new();
+        nested.insert("z".to_owned(), json!(1));
+        nested.insert("a".to_owned(), json!(2));
+        let mut outer = Map::new();
+        outer.insert("type".to_owned(), json!("system"));
+        outer.insert("nested".to_owned(), Value::Object(nested));
+        outer.insert("cwd".to_owned(), json!("/repo"));
+        let value = Value::Object(outer);
+
+        let frame = CassetteFrame::stdout_json(&value);
+        assert_eq!(frame.stream, CassetteStream::Stdout);
+        assert_eq!(
+            frame.payload,
+            r#"{"cwd":"/repo","nested":{"a":2,"z":1},"type":"system"}"#,
+        );
+        // The stderr counterpart canonicalizes identically.
+        assert_eq!(
+            CassetteFrame::stderr_json(&value).payload,
+            frame.payload,
+            "stderr_json must canonicalize the same way as stdout_json",
+        );
     }
 
     #[test]

@@ -1,56 +1,41 @@
-# M6-2 — Bridge external runtime collab events to library collab primitives
+# M6-3 — Fix external cassette key-order drift under serde_json/preserve_order
 
-Task: `TODO.md` → first incomplete = **M6-2**.
-Spec: `docs/facade-api.md` §14 末段 — external runtime `spawn_agent`/`send_message`/
-`plan_update`/`blackboard_post` 应桥接到本库 `agent::collab` primitives，不依赖 runtime 私有协议。
+Task: TODO.md → first incomplete = **M6-3** (before M6-R).
 
-## Analysis
-- External observations surface as `Notification::ExternalAgent(ExternalAgentEvent)` in each
-  child machine `StepOutcome` (exactly-once, seq-deduped).
-- Collab events map:
-  - `send_message`  → `ExternalAgentEvent::MessageSent { to, summary }` → Mailbox.send
-  - `plan_update`   → `ExternalAgentEvent::TaskUpdated { task_id, status }` → Plan reflect
-  - `blackboard_post` → NEW `ExternalAgentEvent::BlackboardPosted { channel, summary }` → Blackboard.post
-  - `spawn_agent`   → already bridged (NeedSubagent tool, M3-3) — not reflected here.
-- Facade provisions live shared primitives in `CollabState` (M6-1). Need a bridge that routes
-  external observations into the enabled ones. Provider-neutral: bridge takes agent-layer
-  `ExternalAgentEvent` (no runtime private types); stays `pub(crate)` (not in public facade API).
+## Root cause (reproduced)
+- All-features build (`external-acp`) unifies `serde_json/preserve_order` → `Value` objects
+  become insertion-order `IndexMap` instead of sorted `BTreeMap`.
+- External cassette test helpers `fn frame(v) { CassetteFrame::stdout(v.to_string()) }` freeze
+  the payload STRING into the committed fixture. Under preserve_order the string reorders keys
+  (insertion order) and drifts from the frozen (sorted) fixture.
+- Confirmed via `claude_code_cassette_matches_in_code_builder`: fixture sorted vs builder insertion.
+- Default + single-feature builds: `Value` is BTreeMap → always sorted → green.
 
-## Steps
-1. `src/agent/external/mod.rs`: add `BlackboardPosted { channel, summary }` variant to
-   `ExternalAgentEvent` (symmetric w/ MessageSent/TaskUpdated; model-complete, decoder-unused —
-   same precedent as MessageSent). Rustdoc. No exhaustive match breaks (only `_`-guarded match).
-2. `src/facade/collab.rs`: add `pub(crate) struct CollabBridge` { mailbox/blackboard/plan Option<Arc> }
-   + `from_state(&CollabState)`, `is_active()`, `absorb_notifications(from, &[Notification])`,
-   `absorb_event(from, &ExternalAgentEvent)`. Plan reflection helper (add_task→claim→update,
-   best-effort) + lenient status label parser (todo/pending, in_progress, completed/done, blocked,
-   cancelled). Tests.
-3. `src/facade/external.rs`: thread `CollabBridge` into `drive_external` → `FacadeExternalSpawner`
-   → `RecordingExternalMachine`; absorb `outcome.notifications` in `step` (from = delegate name).
-4. `src/facade/delegate.rs`: `DelegationToolHandler` gains `collab: CollabBridge`; pass into
-   `drive_external`.
-5. `src/facade/agent.rs`: `Agent::collab_bridge()` builds from `self.collab`; pass at both
-   `DelegationToolHandler::new` sites (run_full + build_delegation_handler).
-6. Rustdoc updates (collab.rs module: M6-2 landed). TODO.md [DONE] + record.
+## Fix (deterministic, class-wide)
+1. agent-testkit `external/cassette.rs`:
+   - Add recursive `sort_json_keys(&Value) -> Value` (object keys sorted; arrays/scalars recursed).
+   - Add `CassetteFrame::stdout_json(&Value)` / `stderr_json(&Value)` constructors that serialize
+     the canonicalized value. Payload string is then identical under BTreeMap or IndexMap.
+   - Unit test: build a Value with keys in reverse order via serde_json::Map, assert stdout_json
+     payload is fully sorted (meaningful under the preserve_order/all-features build).
+2. Update the 4 fixture-building test helpers to `CassetteFrame::stdout_json(&value)`:
+   - tests/agent_claude_code_cassette.rs
+   - tests/agent_codex_cassette.rs
+   - tests/agent_opencode_cassette.rs
+   - tests/agent_acp_cassette.rs (its `update_frame` wraps `frame`, so covered)
+   `agent_external_cassette.rs` already uses byte-literals (deterministic) — no change.
+3. Do NOT regenerate fixtures in insertion order (would reverse-break default builds). Canonical
+   output equals the existing sorted fixtures → no fixture rewrite needed.
 
-## Validation (1-6 + external clippy)
-1 fmt; 2 clippy --all-targets -D warnings; 3 clippy --features external-*; 4
-cargo test -p agent-lib facade::collab; 5 cargo test --all --all-targets (<30min); 6 doc.
-
-## Discovered pre-existing failure (scheduled as M6-3)
-- Ran `cargo test --features "external-claude-code external-codex external-opencode external-acp"`:
-  948 passed / 1 failed. The 1 failure `claude_code_cassette_matches_in_code_builder` reproduces on a
-  CLEAN tree (git stash) with the same feature set → PRE-EXISTING, not introduced by M6-2, and not on
-  the collab-bridge path.
-- Root cause: `external-acp` pulls `agent-client-protocol(-schema)` which enable
-  `serde_json/preserve_order`; Cargo feature-unification flips `serde_json::Value` object maps from
-  `BTreeMap` (sorted) to `IndexMap` (insertion), so the claude_code cassette `frame()` payloads
-  (`json!(..).to_string()`) reorder keys and drift from the frozen fixture (sorted).
-- Default-feature suite green (1070/0); single-feature cassette green. Per Test Failure Policy,
-  scheduled a dedicated fix task **M6-3** BEFORE M6-R rather than folding unrelated test-infra
-  serialization work into M6-2.
+## Validation (1–6 + external clippy)
+1 `cargo fmt --all`
+2 `cargo clippy --all-targets -- -D warnings`
+3 `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
+4 `cargo test --features "external-claude-code external-codex external-opencode external-acp"` (all green)
+5 `cargo test --features external-claude-code --test agent_claude_code_cassette` (green)
+6 `cargo test --all --all-targets` (green, <30min); `RUSTDOCFLAGS=-D warnings cargo doc --no-deps --workspace`
 
 ## Status: DONE
-- Implementation + wiring + tests complete and green (see TODO.md 完成记录（M6-2）).
-- M6-2 marked [DONE]; M6-3 (cassette preserve_order drift) inserted before M6-R.
-- PLAN.md unchanged (no phase-level change).
+- Harness-level canonicalization (stdout_json/stderr_json + sort_json_keys) landed; 4 frame() helpers switched; ACP fixture re-frozen to canonical sorted order.
+- All validation 1-6 + external clippy green (all-features 1094/0, default 1071/0).
+- M6-3 marked [DONE]; PLAN.md unchanged (no phase-level change).

@@ -57,8 +57,14 @@ fn full_session_path() -> PathBuf {
 }
 
 /// Wraps a JSON value as a verbatim stdout JSON-RPC frame line.
+///
+/// Serializes with object keys sorted recursively so the frozen fixture payload
+/// is byte-identical whether or not the build unifies `serde_json/preserve_order`
+/// (which flips `serde_json::Value` object maps from sorted `BTreeMap` to
+/// insertion-order `IndexMap`; `external-acp` enables it directly). `update_frame`
+/// and every other builder inherit the same determinism through this helper.
 fn frame(value: Value) -> CassetteFrame {
-    CassetteFrame::stdout(value.to_string())
+    CassetteFrame::stdout_json(&value)
 }
 
 /// A `session/update` notification carrying `update` for [`SESSION_ID`].

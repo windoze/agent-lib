@@ -19,27 +19,27 @@
       "input_frames": [
         {
           "stream": "stdout",
-          "payload": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\"}}"
+          "payload": "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\"}}"
         },
         {
           "stream": "stdout",
-          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"I'll refactor the parser.\"}}}}"
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"content\":{\"text\":\"I'll refactor the parser.\",\"type\":\"text\"},\"sessionUpdate\":\"agent_message_chunk\"}}}"
         },
         {
           "stream": "stdout",
-          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"plan\",\"entries\":[{\"content\":\"outline the parser\",\"priority\":\"high\",\"status\":\"in_progress\"},{\"content\":\"add tests\",\"priority\":\"medium\",\"status\":\"pending\"}]}}}"
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"entries\":[{\"content\":\"outline the parser\",\"priority\":\"high\",\"status\":\"in_progress\"},{\"content\":\"add tests\",\"priority\":\"medium\",\"status\":\"pending\"}],\"sessionUpdate\":\"plan\"}}}"
         },
         {
           "stream": "stdout",
-          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"call-search\",\"title\":\"search the workspace docs\",\"kind\":\"search\",\"status\":\"pending\"}}}"
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"kind\":\"search\",\"sessionUpdate\":\"tool_call\",\"status\":\"pending\",\"title\":\"search the workspace docs\",\"toolCallId\":\"call-search\"}}}"
         },
         {
           "stream": "stdout",
-          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"call-search\",\"status\":\"completed\"}}}"
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"tool_call_update\",\"status\":\"completed\",\"toolCallId\":\"call-search\"}}}"
         },
         {
           "stream": "stdout",
-          "payload": "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\"}}"
+          "payload": "{\"id\":2,\"jsonrpc\":\"2.0\",\"result\":{\"stopReason\":\"end_turn\"}}"
         }
       ],
       "expected_events": [
@@ -112,23 +112,23 @@
       "input_frames": [
         {
           "stream": "stdout",
-          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Applying the patch to src/lib.rs.\"}}}}"
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"content\":{\"text\":\"Applying the patch to src/lib.rs.\",\"type\":\"text\"},\"sessionUpdate\":\"agent_message_chunk\"}}}"
         },
         {
           "stream": "stdout",
-          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"call-edit\",\"title\":\"edit src/lib.rs\",\"kind\":\"edit\",\"status\":\"pending\"}}}"
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"kind\":\"edit\",\"sessionUpdate\":\"tool_call\",\"status\":\"pending\",\"title\":\"edit src/lib.rs\",\"toolCallId\":\"call-edit\"}}}"
         },
         {
           "stream": "stdout",
-          "payload": "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"toolCall\":{\"toolCallId\":\"call-edit\",\"title\":\"write src/lib.rs\"},\"options\":[]}}"
+          "payload": "{\"id\":10,\"jsonrpc\":\"2.0\",\"method\":\"session/request_permission\",\"params\":{\"options\":[],\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"toolCall\":{\"title\":\"write src/lib.rs\",\"toolCallId\":\"call-edit\"}}}"
         },
         {
           "stream": "stdout",
-          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"call-edit\",\"status\":\"completed\",\"content\":[{\"type\":\"diff\",\"path\":\"/repo/src/lib.rs\",\"newText\":\"pub fn added() {}\\n\"}]}}}"
+          "payload": "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sess-019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"update\":{\"content\":[{\"newText\":\"pub fn added() {}\\n\",\"path\":\"/repo/src/lib.rs\",\"type\":\"diff\"}],\"sessionUpdate\":\"tool_call_update\",\"status\":\"completed\",\"toolCallId\":\"call-edit\"}}}"
         },
         {
           "stream": "stdout",
-          "payload": "{\"jsonrpc\":\"2.0\",\"id\":11,\"result\":{\"stopReason\":\"end_turn\"}}"
+          "payload": "{\"id\":11,\"jsonrpc\":\"2.0\",\"result\":{\"stopReason\":\"end_turn\"}}"
         }
       ],
       "expected_events": [
