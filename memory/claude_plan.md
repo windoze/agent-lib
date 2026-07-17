@@ -1,65 +1,39 @@
-# M3-3 Plan — `Delegation` config + multi-delegate + delegate/pending snapshot
+# M3-R Plan — Review: Local subagent correctness + doc consistency
 
-Task: **M3-3** in `TODO.md` (first incomplete). Docs: `docs/facade-api.md`
-§10.2, §13.1, §15.2; `PLAN.md` R5 (task brief not persisted).
+Task: **M3-R** in `TODO.md` (first incomplete). Review-only + convergence.
+Milestone 3 (M3-1..M3-3) landed local subagent delegation.
 
-## Deliverables
-1. `Delegation` config type (`src/facade/delegate.rs`):
-   - `model_routed()` (default; one `ask_<name>` tool per delegate) with
-     `.expose_subagents_as_tools()` / `.expose_as_tools()` (idempotent refiners).
-   - `single_tool(name)` (unified `<name>(agent, task)` tool that routes by the
-     `agent` argument).
-   - `AgentBuilder::delegation(..)` wiring; stored on `Agent`.
-2. Multiple subagents: each exposes an independent tool (model-routed) or the
-   unified tool routes by `agent` (single-tool). **Name collisions rejected at
-   build time** (`FacadeError::DuplicateTool`).
-3. Extend `AgentSnapshot`:
-   - `delegates: Vec<DelegateSnapshot>` — data-only spec (name, description,
-     spec, tools, inherit_model); approval omitted (runtime handle).
-   - `pending_delegations: Vec<DelegationSnapshot>` — in-progress child
-     `ConversationSnapshot` + delegate name (capturable + restorable; the
-     synchronous one-shot drive leaves none at a committed point, so it is empty
-     in normal capture, documented).
-   - persist the `Delegation` mode so restore re-routes correctly.
-   - `restore()` rebuilds delegates (and can rebuild child machine from a pending
-     snapshot). Task brief is never added to the persistent snapshot (R5).
-4. rustdoc complete; update §15.2 doc to match the extended snapshot.
+## Scope (from TODO.md)
+- Verify consistency with `docs/facade-api.md` §10, §13.1:
+  - `Agent::worker()` produces data-first spec.
+  - child built at `NeedSubagent` fulfillment (reuses `SubagentHandler`/
+    `NestedMachine`, no new mechanism, §19).
+  - model-routed default: one tool per delegate.
+  - `DelegationTrace` / `RunEvent::Delegation*` complete.
+  - snapshot/restore covers delegate fields and contains no secrets.
+- `prelude` exposes `Delegation` (if public).
+- Fix small-scope deviations; new features → prerequisite tasks per rules.
 
-## Key facts
-- `DefaultAgentMachine` only emits `NeedTool`; delegation intercepted at the
-  `NeedTool` boundary by `DelegationToolHandler`. Refactor its `delegates` map to
-  a `DelegationRoute` enum knowing the mode.
-- Delegation tool declarations are baked into the supervisor `AgentSpec` tool set
-  at build time (LLM tools come from machine state), so build appends per mode.
-- `AgentSpec`/`ToolSetRef`/`ConversationSnapshot` are Serialize; `AgentSpec` is
-  not `Eq` (f32 temperature) → `DelegateSnapshot` is PartialEq only.
-- `LocalSubagent` is not Serialize (approval handler); snapshot uses its public
-  accessors + a `pub(crate)` `from_parts` constructor for rebuild.
+## Validation
+- Full validation sequence 1–6 all green:
+  1. `cargo fmt --all`
+  2. `cargo clippy --all-targets -- -D warnings`
+  3. clippy with external features
+  4. `cargo test --all --all-targets`
+  5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  6. `git diff --check`
+- Comparison table: M3 implemented vs §10 promised items; gaps → follow-up tasks.
 
 ## Steps
-1. delegate.rs: `Delegation`/`DelegationMode` (serde), `expose_*`,
-   `delegation_single_tool_declaration`, `DelegationRoute` + builder,
-   `LocalSubagent::from_parts`. Refactor `DelegationToolHandler` to route.
-2. tool.rs: `ensure_unique_declaration_names(&[ToolDecl])`.
-3. agent.rs: `AgentBuilder.delegation` field + `.delegation(..)`; build appends
-   per mode + collision check; `Agent.delegation` field + accessor;
-   `delegation_route()` replaces `delegate_table()`; pass to handler in run_full;
-   `into_parts`/snapshot pass delegates+delegation.
-4. agent/snapshot.rs: populate `DelegateSnapshot`/`DelegationSnapshot`; persist
-   `delegation`; `capture(state, delegates, delegation)`; restore rebuilds
-   delegates + delegation; optional `.subagent(..)` override on restore builder.
-5. agent/stream.rs: use `delegation_route()`.
-6. mod.rs/prelude: export `Delegation`.
-7. Tests (delegate.rs offline): two subagents each callable; single_tool routes
-   by arg; duplicate-name build error; snapshot carries delegates + no brief;
-   restore re-delegates; DelegationSnapshot round-trip rebuilds child.
-8. Validate seq 1-6, mark [DONE], commit, STOP.
+1. Read docs §10/§13.1/§15.2/§18.3/§19 + delegate.rs + agent snapshot/stream +
+   prelude/mod exports. Build the §10 promise→impl matrix.
+2. Note any small deviations; fix in-scope only. Record real gaps as follow-ups.
+3. Run validation seq 1–6.
+4. Mark [DONE] in TODO.md + completion record (incl. comparison table). Commit. STOP.
 
 ## Status
-- [x] Implement (all files wired; library + tests compile clean)
-- [x] Tests + validation seq 1-6 (fmt; clippy default + external features clean;
-      `cargo test -p agent-lib --lib facade::delegate` 16 passed incl. 6 new;
-      `cargo test --all --all-targets` all green, lib 753 passed;
-      `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` clean;
-      `git diff --check` clean)
-- [x] Mark [DONE] in TODO.md + completion record; commit next, then STOP
+- [x] Review + matrix — M3-1..M3-3 忠实实现 §10/§13.1/§15.2/§19；无需修正的规范偏离；
+      prelude 已导出 Delegation。缺口（§11/§12/§13.2/§13.3）均已在 M4/M5 排期。
+- [x] Validation seq 1–6 全绿（fmt no-op; clippy default+external clean; test --all green;
+      doc clean; diff --check clean）。无源码改动。
+- [x] Mark [DONE] + 完成记录（含对照表）写入 TODO.md；提交，STOP。
