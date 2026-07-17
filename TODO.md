@@ -1226,7 +1226,7 @@ approval defaults（比 local 更保守）+ artifact trace + external restore po
   ✓；`cargo test --all --all-targets` ✓（0 失败）；
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✓；`git diff --check` ✓。
 
-### [TODO] M4-R Review：Managed external agent 正确性与文档一致性检查
+### [DONE] M4-R Review：Managed external agent 正确性与文档一致性检查
 
 **上下文**：M4-1..M4-3 落地 external delegate。仅审查+收敛。
 
@@ -1244,6 +1244,82 @@ approval defaults（比 local 更保守）+ artifact trace + external restore po
 
 - 完整验证序列 1–6 全绿，+ external features clippy 全绿。
 - 对照表：M4 已实现 vs §11 承诺项，缺口记为后续任务。
+
+**完成记录**（2026-07-18）：
+
+审查 + 收敛任务，逐条核对 M4-1..M4-3 与 `docs/facade-api.md` §11/§9.2/§15.2–§15.3/§6.2/§19。
+唯一源码改动是 **prelude 增补 `ManagedExternalAgent`**（M4-1 明确「prelude 补录留 M4-R」）：§3 prelude
+清单仅列 `ManagedExternalAgent`（**不**含 `ExternalRunMode`/`RestoreExternal`），故只补此一项，忠于 §3
+（`src/prelude.rs`，含 rustdoc 更新）。其余逐条核对**未发现需修正的规范偏离**。
+
+- **§11.1 External delegate** — ✅ `AgentBuilder::external_agent(name, ManagedExternalAgent)` 登记
+  external delegate，默认经 model-routed 暴露为 `ask_<name>`（`src/facade/agent.rs`、`delegate.rs`）；
+  managed external agent 不压扁成普通函数工具（保留 session/artifact/worktree/权限/cancel 语义）。
+- **§11.2 内部映射（复用地基，§19）** — ✅ 兑现路径 `NeedTool` 拦 `ask_<name>` →
+  `FacadeExternalSpawner` 构 `ExternalAgentMachine`（`RecordingExternalMachine` 包装）→ 注入的 scoped
+  `ExternalSessionHandler` 兑现 `NeedExternalSession` → runtime adapter；与 local subagent 共享
+  scope 派生/cancel/budget/trace/pop（复用 `DrivingSubagentHandler`，未另造 runtime）。
+  （`src/facade/external.rs` `drive_external`、`RecordingExternalMachine`。）
+- **§11.3 能力分级（R9 真实性）** — ✅ `ExternalRunMode{BlackBox,Managed,ManagedWithTools,Attachable}`
+  + `required_capabilities()` 映射；`ExternalAgentCapabilities` wrap `ExternalRuntimeCapabilities`
+  （8 项），基线取各 adapter `implemented_capabilities()`，ACP 经 `capabilities_from_initialize`
+  精化；`build()` 对超档 mode **fail fast**（`FacadeError::UnsupportedExternalMode{runtime,mode,missing}`）；
+  rustdoc 标注为「探针/协商前保守基线，运行时精化，不硬编码未验证档」——不假装未验证档。
+- **§9.2 external 默认更保守** — ✅ external delegate **启动**经 `FacadeApproval::resolve_external_start`
+  在 drive 门控（override>per-tool>ask_external_agents?ask-deferred:default）；headless 无 handler →
+  deny（`ApprovalDenied`），不静默等待。model-routed 的 `ask_<name>` 工具在机器审批门豁免，drive 为唯一
+  审批权威（不双重提示）。**收敛说明**：`ask_worktree_write` 为 **advisory**（rustdoc 明载「Recorded for
+  host inspection…advisory for the managed path」），因 managed child 恒在**一次性隔离 worktree**（用户经
+  `.worktree()` 显式配置）运行、写入不触碰父 checkout，恰好满足 §9.2「写工作区 需要审批**或显式 opt-in**」的
+  opt-in 分支，故非硬门——属规范内正确取值。M4-3 完成记录「`ask_worktree_write` 升级为强制执行」措辞对
+  worktree-write 一项不精确（真正硬门的是 external-agent **启动**，经 `ask_external_agents`），此处校正，
+  **不改源码**（行为已符合规范）。
+- **§15.2 AgentSnapshot（data-only，无 secret）** — ✅ `external_delegates: Vec<ExternalDelegateSnapshot>`
+  仅存 external_session_id/runtime kind/worktree ref/last status/task brief/artifact refs/transcript
+  refs；**不**存进程句柄/API key/client/闭包（restore 时 `session_handler` 显式置 `None`，`Debug` 不透明）。
+- **§15.3 External restore policy** — ✅ `RestoreExternal{AttachOrFail,MarkInterrupted,RestartFromBrief}`，
+  `#[default]=MarkInterrupted`（`AgentRestoreBuilder` 派生 Default）；`AttachOrFail` 在无重登记 handler 或无
+  可 resume session 时 → `FacadeError::InvalidState`（不静默 attach）。
+- **§6.2/§19 RunOutput** — ✅ `RunOutput{reply,response:Option,usage,tool_calls,delegations,artifacts,
+  events}` 与 §6.2 一致；external delegation 无 1:1 LLM `Response` 时仍产 `reply`/`delegations`/`artifacts`/
+  events；`UsageSummary` 聚合 supervisor+subagent+external。`RunEvent::Delegation{Started,Artifact,
+  Finished,Failed}` 两路（run_full/stream）一致。
+
+**对照表 — §11（及相邻 §9.2/§15/§6.2/§19）承诺项 vs M4 实现**：
+
+| §    | 承诺项 | 状态 | 归属 |
+|------|--------|------|------|
+| 11.1 | managed external agent 作为 external delegate（非普通函数工具） | ✅ 已实现 | M4-2 |
+| 11.2 | 映射到地基 `NeedSubagent`→`ExternalAgentMachine`→`ExternalSessionHandler`→adapter（未另造，§19） | ✅ 已实现 | M4-2 |
+| 11.3 | `ExternalRunMode` 四档 + `ExternalAgentCapabilities` 分级 | ✅ 已实现 | M4-1 |
+| 11.3 | 构建时能力校验，超档 fail fast | ✅ 已实现 | M4-1 |
+| 11.3 | 能力档如实反映 `ExternalRuntimeCapabilities`+ACP 协商，不假装未验证档（R9） | ✅ 已实现 | M4-1 |
+| 9.2  | external 启动需审批；headless 无 policy → deny（不静默） | ✅ 已实现 | M4-3 |
+| 9.2  | external 写工作区 需审批**或显式 opt-in**（worktree 隔离+`.worktree()` 显式配置满足 opt-in 分支；flag advisory） | ✅ 已实现（opt-in 分支） | M4-1/M4-3 |
+| 15.2 | `AgentSnapshot` external 字段 data-only、无 secret/handle/client/闭包 | ✅ 已实现 | M4-3 |
+| 15.3 | `RestoreExternal` 三档，默认 `MarkInterrupted` | ✅ 已实现 | M4-3 |
+| 6.2/19 | `RunOutput` 同表 external delegation+artifact+events；`UsageSummary` 聚合 external | ✅ 已实现 | M4-2 |
+| 3    | `prelude` 增补 `ManagedExternalAgent` | ✅ 已实现（本任务） | M4-R |
+| 11.3 | `ManagedWithTools` 的 host-tool **运行期注入** | ⏳ 后续能力（`host_tools` 底层未落地，R8/R9；facade fail-fast 不假装） | 后续 |
+| 11.3 | `Attachable` 的 **live attach/resume**（消费 retained session）+ resume/attach 审批门 | ⏳ 后续能力（`resume` 取决 ACP `loadSession` 协商，底层未落地，R8/R9；`AttachOrFail` 现仅保留 session facts） | 后续 |
+| 12   | 统一 `Delegate`/`DelegateSpec` 抽象 | ⏳ 首版可不公开（随 external 增量） | 后续 |
+| 13.2 | rules-routed delegation | ⏳ 未实现（已排期） | M5-1 |
+| 13.3 | dispatcher-routed delegation | ⏳ 未实现（已排期） | M5-2 |
+
+M4（managed external agent 构造/分级/兑现/审批/restore）承诺项**全部实现**。两个 ⏳「后续能力」缺口
+（`ManagedWithTools` host-tool 注入、`Attachable` live resume + resume 审批门）由 `docs/facade-api.md`
+§11.3 自身标注为「后续能力」/「取决于 ACP `loadSession` 协商」，且 `PLAN.md` R8/R9 明确 facade 只承诺底层
+已落地的能力、未落地档位 fail-fast 不假装——现实现即如此（无 workaround、无假装档）。故属**规范自身延后的
+底层门控能力**而非 M4 未兑现承诺，记入本对照表跟踪、**无需新增前置任务**（不阻塞、非 M4 承诺范围；与 M3-R
+处理 §11/§12/§13 缺口方式一致）。待底层 host_tools / loadSession-resume 落地后再由对应 facade 任务承接。
+
+**验证**（序列 1–6 全绿 + external features clippy 全绿）：
+
+- `cargo fmt --all -- --check` ✓；聚焦 `cargo test -p agent-lib --lib facade::` ✓（108 passed）；
+- `cargo clippy --all-targets -- -D warnings` ✓ + `--features "external-claude-code external-codex
+  external-opencode external-acp"` ✓；
+- `cargo test --all --all-targets` ✓（50 个测试二进制，0 失败）；
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✓；`git diff --check` ✓。
 
 ---
 

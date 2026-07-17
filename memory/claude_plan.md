@@ -1,54 +1,40 @@
-# M4-3 external approval defaults + restore policy + AgentSnapshot external fields
+# M4-R Review：Managed external agent 正确性与文档一致性检查
 
-Task: TODO.md M4-3 (first incomplete). Wire external delegate approval defaults,
-add `RestoreExternal` + `Agent::restore().restore_external(..)` (default
-`MarkInterrupted`), and extend `AgentSnapshot` with data-only external delegate
-fields. Offline only (scripted handlers). No real CLI.
+Task: TODO.md M4-R (first incomplete). Review-only + reconcile task over M4-1..M4-3.
+Verify facade external delegate matches docs/facade-api.md §11 / §9.2 / §15.2–§15.3 /
+§6.2 / §19; fix small deviations; produce comparison table; record gaps.
 
-## Design decisions
-- **Approval**: external delegate start is gated in the delegation DRIVE
-  (`drive_external_delegation`) via `FacadeApproval::resolve_external_start`,
-  honoring override > per-tool > (ask_external_agents ? ask-deferred : default).
-  Model-routed external `ask_<name>` tools are EXEMPTED from the machine
-  approval gate so the drive is the single authority (no double-prompt). On
-  denial: record a Failed delegation with `approval_denied=true`, fold a denied
-  tool result; `run_full`/`stream` surface `FacadeError::ApprovalDenied`.
-- **Retention**: `Agent.last_external_sessions: HashMap<name, RetainedExternalSession>`
-  updated after `run_full` drain from the recorder (status/session ref/artifacts).
-  Stream path does not retain (future holds &mut machine); documented boundary.
-- **Snapshot**: `AgentSnapshot.external_delegates: Vec<ExternalDelegateSnapshot>`
-  (data-only: name/runtime/mode/worktree/model/args/permission_mode + last-known
-  status/session ref/artifacts). No handle/secret/api key/closure. No raw brief (R5).
-- **Restore**: `AgentRestoreBuilder.external_agent(name, mea)` + `.restore_external(policy)`.
-  Default `MarkInterrupted` -> restored delegate status=Interrupted. `AttachOrFail`
-  requires re-registered handler+resumable session else `FacadeError`. `RestartFromBrief`
-  clears session (status=Pending).
+## Findings
+- CONCRETE FIX: prelude was missing `ManagedExternalAgent` (M4-1 deferred it here,
+  "prelude 补录留 M4-R"). §3 prelude list names only `ManagedExternalAgent` (NOT
+  ExternalRunMode/RestoreExternal), so add exactly that one. -> src/prelude.rs.
+- Background review (explore agent) + manual read confirmed NO other code deviation:
+  * mapping NeedSubagent->ExternalAgentMachine->ExternalSessionHandler->adapter reused (§19).
+  * capability grades honest (wrap ExternalRuntimeCapabilities + ACP negotiation, fail-fast).
+  * snapshot data-only (no handle/secret/client/closure); default RestoreExternal=MarkInterrupted.
+  * external start gated by resolve_external_start; headless-no-policy denies (not hang).
+  * RunOutput expresses delegation+artifacts+events (§6.2).
+- Reconciliation: `ask_worktree_write` is ADVISORY (rustdoc says so), satisfied via §9.2's
+  "或显式 opt-in" branch (managed child runs in isolated throwaway worktree explicitly
+  configured via .worktree()). M4-3 record's "升级为强制执行" phrasing was imprecise for
+  worktree-write specifically; only external-agent START is hard-gated (ask_external_agents).
+  Behavior is spec-compliant -> no code change; clarified in M4-R record.
+- Future/deferred (foundation-gated, R8/R9; spec §11.3 marks host_tools "后续能力",
+  resume depends on ACP loadSession): live host-tool injection (ManagedWithTools runtime)
+  and live attach/resume (Attachable runtime) + resume approval gate are NOT M4 deliverables;
+  facade honestly fail-fasts, does not pretend. Recorded in comparison table; no new task
+  (not committed scope, not blocking) — same handling as M3-R for §11/§12/§13 gaps.
 
-## Deliverables / steps
-1. external.rs: RestoreExternal, ExternalDelegateStatus, RetainedExternalSession,
-   extend ExternalDriveOutcome+RecordingExternalMachine with session ref.
-2. approval.rs: external_tools set + exempt in approval_requirement +
-   resolve_external_start; update ask_external_agents/ask_worktree_write rustdoc.
-3. delegate.rs: RecordedDelegation{approval_denied, session, runtime, status};
-   DelegationToolHandler gains approval; gate in drive_external_delegation.
-4. agent.rs: Agent.last_external_sessions; build_facade_approval(external names);
-   thread approval into DelegationToolHandler (run_full+stream); CollectedTraces
-   external_approval_denied + session retention; run_full ApprovalDenied + retain;
-   Delegation external tool-name helper.
-5. snapshot.rs: AgentSnapshot.external_delegates + ExternalDelegateSnapshot;
-   capture; AgentRestoreBuilder external_agent/restore_external + apply policy.
-6. mod.rs + prelude: export RestoreExternal, ExternalDelegateSnapshot, ExternalDelegateStatus.
-7. Tests (offline) in external.rs/delegate.rs/agent tests + doctest.
-8. Docs: facade-api.md notes; M2-2 approval rustdoc "enforced".
-9. Validation seq 1-6 (+ 4 ext features clippy). Mark [DONE] + commit.
+## Validation (seq 1-6 + ext clippy) — ALL GREEN
+1. cargo fmt --all -- --check ✓
+2. cargo test -p agent-lib --lib facade:: ✓ (108 passed)
+3. cargo clippy --all-targets -- -D warnings ✓
+   + --features "external-claude-code external-codex external-opencode external-acp" ✓
+4. cargo test --all --all-targets ✓ (50 binaries, 0 failures)
+5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace ✓
+6. git diff --check ✓
 
 ## Status
-- [x] step 1 external.rs (RestoreExternal, ExternalDelegateStatus, RetainedExternalSession, ExternalDriveOutcome.session + capture, from_restored_parts)
-- [x] step 2 approval.rs (external_tools exempt + resolve_external_start + rustdoc)
-- [x] step 3 delegate.rs (RecordedDelegation.approval_denied/session; DelegationToolHandler.approval + gate; external_tool_names helper)
-- [x] step 4 agent.rs (last_external_sessions; build_facade_approval(external names); thread approval run_full+stream; CollectedTraces flag+sessions; run_full ApprovalDenied + retain)
-- [x] step 5 snapshot.rs (AgentSnapshot.external_delegates + ExternalDelegateSnapshot + capture; restore external_agent/restore_external + policy + reconstruct recipes)
-- [x] step 6 mod.rs exports (RestoreExternal, ExternalDelegateSnapshot, ExternalDelegateStatus)
-- [x] step 7 tests (6 offline external approval/restore/snapshot tests pass) + RestoreExternal doctest
-- [x] step 8 docs (facade-api.md §9.2/§15.2–§15.3 already describe behavior; only rustdoc needed — no spec edit)
-- [x] step 9 validation (fmt ✓, clippy default ✓ + ext features clippy ✓, full test suite ✓, rustdoc -D warnings ✓, git diff --check ✓) + TODO.md M4-3 [DONE] + completion record + commit
+- [x] prelude fix + rustdoc
+- [x] full validation
+- [x] TODO.md M4-R [DONE] + comparison table + commit

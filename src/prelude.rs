@@ -10,11 +10,13 @@
 //! types, and the one-shot `Chat` plus stateful `ChatSession` (including its
 //! incremental `RunStream`) entry points. Milestone 2 adds the base Agent
 //! facade — the tool-using [`Agent`], the typed [`Tool`] surface with its
-//! [`ToolContext`], and the [`Approval`] / [`ApprovalPolicy`] tiers. Subsequent
-//! milestones extend this prelude with the remaining delegation and
-//! managed-external-agent types as they land.
+//! [`ToolContext`], and the [`Approval`] / [`ApprovalPolicy`] tiers. Milestone 3
+//! adds the [`Delegation`] routing type, and Milestone 4 adds the
+//! [`ManagedExternalAgent`] entry point for managed external-agent delegates.
+//! Subsequent milestones extend this prelude with the remaining delegation
+//! types as they land.
 
 pub use crate::facade::{
-    Agent, Approval, ApprovalPolicy, Chat, ChatSession, Delegation, ModelConfig, ProviderConfig,
-    Reply, RunEvent, RunOutput, RunStream, Tool, ToolContext,
+    Agent, Approval, ApprovalPolicy, Chat, ChatSession, Delegation, ManagedExternalAgent,
+    ModelConfig, ProviderConfig, Reply, RunEvent, RunOutput, RunStream, Tool, ToolContext,
 };
