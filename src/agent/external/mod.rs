@@ -63,18 +63,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod adapter;
 mod capability;
 mod config;
 mod dispatch;
 mod escalation;
 mod machine;
 mod profile;
+mod registry;
 mod runtime;
 mod shutdown;
 mod sink;
 mod spec;
 mod state;
 
+pub use adapter::{ExternalRuntimeAdapter, ExternalRuntimeSession, RuntimeDecisionPoint};
 pub use capability::{ExternalCapability, ExternalRuntimeCapabilities};
 pub use config::{ExternalAgentMachineConfig, ExternalToolFailurePolicy};
 pub use dispatch::{
@@ -91,6 +94,7 @@ pub use profile::{
     Capability, CostTier, EscalationRules, EscalationTrigger, WorkerProfile, WorkerProfileRef,
     WorkerProfileRegistry,
 };
+pub use registry::{ExternalSessionRegistry, LiveSessionHandle};
 pub use runtime::ExternalRuntimeHandles;
 pub use shutdown::ExternalSessionShutdown;
 pub use sink::{DiscardEventSink, ExternalEventSink};

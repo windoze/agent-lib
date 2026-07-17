@@ -1,38 +1,54 @@
-# M4-4 Review：stream/capability/policy 完整性检查
+# M5-1 定义 ExternalRuntimeAdapter / ExternalRuntimeSession / ExternalSessionRegistry
 
-**当前执行 = TODO.md 第一个未完成任务 = M4-4**（M1..M3、M4-1、M4-2、M4-3 已 `[DONE]`）。
+**当前执行 = TODO.md 第一个未完成任务 = M5-1**（M1..M4 全部 `[DONE]`）。
 
-## 任务性质
-纯 sign-off review。逐条核对 M4-1..M4-3 落地的 stream(live sink)/capability model/session policy
-源码 + 测试，唯一代码外产物是 `docs/capability-matrix.md` 增补 managed external capability 章节。
-不引入 spec 偏差、不加 workaround。
+## 目标
+在 `src/agent/external` 下建立 runtime adapter 抽象层与 session registry skeleton，
+为 M5-2（scripted adapter + handler 组装）与真实 adapter（M6-8）预留边界。不接真实 CLI。
 
-## Review 检查清单（TODO.md M4-4 body）
-1. 所有 runtime-dependent 功能都有 capability 表达（streaming/resume/permission bridge/host tools/
-   host subagents/artifacts/usage/graceful shutdown）→ `ExternalCapability`(8 变体, ALL[8]) +
-   `ExternalRuntimeCapabilities`(8 bool 字段) 一一对应。✓
-2. `ExternalSessionPolicy`(runtime-facing: permission_mode/isolation/max_turns/stream_events) 与
-   machine config(`ExternalAgentMachineConfig`: tool_failure/required_capabilities/max_decision_loops)
-   职责边界清晰；后者是 plain-data serde DTO，不进 serializable `ExternalAgentState`。✓
-3. live sink 不是 blocking effect：`ExternalEventSink::emit(&self, &ExternalObservedEvent) -> ()`，
-   machine 从不持有 sink；只有 Requirement 能阻塞 continuation。✓
-4. 更新 `docs/capability-matrix.md`：新增「Managed External Runtime 能力模型」章节，列 8 个
-   capability + 保守默认(全 unsupported) + fallback 策略；明确不声称任何未验证 runtime 支持。
+## 设计
+新增两个子模块（模块化，避免 runtime.rs 膨胀）：
+- `src/agent/external/adapter.rs`
+  - `RuntimeDecisionPoint`：adapter 内部四个非失败决策点
+    (Completed / PausedForInteraction / PausedForToolCalls / PausedForSubagent)，
+    字段与 `ExternalSessionResult` 非 Failed 变体一一对应。
+    - `session()` / `observations()` 访问器。
+    - `into_session_result()` 映射到 DTO。
+    - `impl From<Result<RuntimeDecisionPoint, ExternalAgentError>> for ExternalSessionResult`
+      （Err -> Failed，并从 error 中提取 session）。
+  - `ExternalRuntimeSession`（trait, object-safe, Send）：单个 live session。
+    - `session_ref() -> ExternalSessionRef`
+    - `async advance(&mut, input, ctx) -> Result<RuntimeDecisionPoint, ExternalAgentError>`
+    - `async shutdown(&mut) -> ExternalSessionShutdown`
+  - `ExternalRuntimeAdapter`（trait, object-safe, Send+Sync）：工厂 + 能力。
+    - `kind()`, `capabilities()`
+    - `async start(request, ctx, sink?) -> Result<Box<dyn Session>, Error>`
+    - `async resume(session_ref, request, ctx, sink?) -> Result<Box<dyn Session>, Error>`
+      默认实现返回 `ResumeUnavailable`，支持 resume 的 adapter override。
+- `src/agent/external/registry.rs`
+  - `LiveSessionKey { agent_id, session_id }`（session_id None -> 不可 key）。
+  - `LiveSessionHandle = Arc<tokio::sync::Mutex<Box<dyn ExternalRuntimeSession>>>`。
+  - `ExternalSessionRegistry { adapter: Arc<dyn Adapter>, live: std::sync::Mutex<HashMap<..>> }`
+    - `get_or_start(request, ctx, sink)`：None -> start+register；Some(ref) -> 命中 reattach，
+      否则 capabilities.resume ? adapter.resume+register : `ResumeUnavailable`。
+    - `get(agent_id, session_ref)`：纯查找。
+    - `cleanup(agent_id, session_ref) -> ExternalSessionShutdown`：移除 + shutdown。
+    - `cleanup_agent(agent_id) -> Vec<ExternalSessionShutdown>`：cancel sweep（按 session_id 排序确定性）。
+    - `capabilities()/kind()/live_len()` passthrough。
+  - live handle 绝不进入 `ExternalAgentState`（registry 独立持有）。
 
-## 能力 fallback 策略（完成记录用）
-- baseline = `ExternalRuntimeKind::conservative_capabilities()` → 全部 false（不假设支持）。
-- 未声明 required 的 capability 缺失：保留原通用错误（如 tool id unavailable），兼容 pre-M4-3。
-- 声明 required 的 capability 缺失：`UnsupportedCapability{runtime,capability,detail}` 分类错误，
-  scheduler 可据此避免再次 dispatch。
-- tool 失败：`ReturnErrorToRuntime`(默认，runtime 自主决策) / `StopRun`(停 turn)。
-- decision loop 超 `max_decision_loops`：`LimitExceeded`。
-- stream：`ExternalStreamPolicy::{Buffered(默认)/Streaming/Disabled}`；sink 可自由丢弃事件，
-  exact-once 由 `observations`+seq dedup 保证，sink 只是 lossy live mirror。
+## 关键约束验证
+- trait object safe：async_trait 装箱 future + 非泛型方法 -> dyn-safe（doc 说明）。
+- registry unit 覆盖：start 后 get/resume（同一 Arc）、cleanup 移除 handle、unknown -> ResumeUnavailable。
+- 测试函数名前缀 `external_runtime_registry_*` 以匹配 `cargo test -p agent-lib external_runtime_registry`。
+- adapter 错误统一 `ExternalAgentError`。
 
-## 验证条件（TODO.md）+ 完整序列 1-6
-- `cargo test -p agent-lib external_capabilities`
-- `cargo test -p agent-lib external::sink`
-- 1 fmt / 2 焦点测试 / 3 clippy -D warnings / 4 全量 test（仅 doc 改动→可复用上次 green）/
-  5 doc -D warnings / 6 git diff --check。
+## 验证序列（TODO.md 1-6）
+1. `cargo fmt --all -- --check`
+2. `cargo test -p agent-lib external_runtime_registry`
+3. `cargo clippy --all-targets -- -D warnings`
+4. `cargo test --all --all-targets`（有代码改动，需跑）
+5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+6. `git diff --check`
 
-## 状态：已完成（M4-4 [DONE]）
+## 状态：已完成（M5-1 [DONE]）
