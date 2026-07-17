@@ -109,7 +109,7 @@ pub use escalation::{
 pub use machine::ExternalAgentMachine;
 #[cfg(feature = "external-opencode")]
 pub use opencode::{
-    OpenCodeConfig, OpenCodeDecision, OpenCodeDecodeContext, OpenCodeProbeExec,
+    OpenCodeAdapter, OpenCodeConfig, OpenCodeDecision, OpenCodeDecodeContext, OpenCodeProbeExec,
     OpenCodeProbeOutput, OpenCodeStreamDecoder, SystemOpenCodeExec, probe as opencode_probe,
     probe_with_exec as opencode_probe_with_exec,
 };

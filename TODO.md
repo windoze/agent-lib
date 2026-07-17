@@ -2514,7 +2514,7 @@ capability model 明确降级。
   5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features external-opencode` 通过。
   6. `git diff --check` 干净。
 
-### [TODO] M8-3 实现 OpenCode session adapter 与 ignored real e2e
+### [DONE] M8-3 实现 OpenCode session adapter 与 ignored real e2e
 
 **上下文**:
 
@@ -2537,6 +2537,60 @@ capability model 明确降级。
 - ignored 测试命令文档化。
 - 若本机环境具备 OpenCode,运行 ignored e2e 并记录结果；否则记录 skip 原因。
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- 新增 `src/agent/external/opencode/adapter.rs`:把 M8-1 启动配方与 M8-2 私有 decoder 接进 milestone-5 的
+  `ExternalRuntimeAdapter` / `ExternalRuntimeSession` 抽象,新增**唯一 pub 类型** `OpenCodeAdapter`(镜像
+  `CodexAdapter` 结构):`new(config)` 报告实现能力,`with_probed_capabilities(config, &probed)` 与本机 probe
+  逐位取交;`start` 用 `opencode run … <prompt>`、`resume` 用 `opencode run … --session <id> <message>`,启动失败
+  分别归类 `Launch` / `ResumeUnavailable`。
+- **每 turn 一个一次性进程**(同 Codex):prompt 是 `run` 的位置参数,进程一 turn 落定即退出,续跑是全新
+  `opencode run --session <id> <message>` 进程。为此给 `OpenCodeConfig` 新增 `base_resume_args(session_id)`(=
+  复用 `base_run_args()` 的 `run --format json [--auto][--model][--agent]` 再追加 `--session <id>`,对齐官方 CLI
+  `opencode run` 接受 `-s/--session`/`-c/--continue`,已核对 opencode.ai/docs/cli,非臆测)+ config 单测。
+- **无 init 帧差异**:OpenCode session id 随每帧 `sessionID` 到达(与 Codex 的 `thread.started` 前导帧不同),故
+  私有 `OpenCodeSession` 在 `begin` 里读到 decoder 惰性捕获首个 `sessionID`(并发唯一 `SessionStarted`)为止,把
+  前导观测缓存给第一次 `advance` 续读;整段 session 共用一个跨全程单调 `seq` 的 `OpenCodeStreamDecoder`。生产进程
+  stdin=null、stderr 丢弃、stdout 逐行喂 decoder、kill_on_drop、每读超时。
+- 能力(诚实按 M8-2 结论):`run --format json` 自主运行,流里无 host-pausable tool-call/approval 帧,turn 只
+  `Completed`/`Failed`。`implemented_capabilities()` 报 `streaming`/`resume`/`artifacts`/`usage`/
+  `graceful_shutdown`=true,`host_tools`/`host_subagents`/`permission_bridge`=false;声明 `tools` 的 start/resume 以
+  `UnsupportedCapability{HostTools}` 拒绝,follow-up 的 `RespondToolResults`/`RespondSubagent`/
+  `RespondInteraction` 均明确拒绝而非静默忽略。
+- IO 经私有 `OpenCodeLauncher` / `OpenCodeTurnStream` trait 注入:生产 `SystemOpenCodeLauncher`(tokio::process),
+  单测注入 `FakeLauncher` 回放固定 JSON 帧并逐 turn 捕获 `OpenCodeTurnSpec`,**离线**跑通 begin/advance(fresh +
+  resume)/shutdown 全状态机(含「resume 进程从不复报 sessionID 仍完成」的边界)。
+- **worktree 隔离修复(本任务中发现并修掉的真实缺陷,非 workaround)**:首版把 working dir 只经进程
+  `current_dir` 应用,但真机 e2e 复现出 `READY.txt` 落进**启动它的 checkout(repo 根)**而非临时 worktree。
+  实证根因:OpenCode 从 `--dir`/继承的 `$PWD` 解析项目与落盘目录,**而非仅** OS 级 cwd;`tokio::process` 的
+  `current_dir()` 只 `chdir` 却不更新继承来的 `PWD`(仍指向 cargo/repo 根),于是文件泄漏到 checkout。实验证明
+  `--dir` authoritative(压过 cwd 与 `$PWD`)。故给 `base_run_args()` 增补:配置 `working_dir` 时显式追加
+  `--dir <path>`(`base_resume_args()` 一并继承),launcher 保留 `current_dir` 作 belt-and-suspenders。新增
+  config 单测(`--dir` 存在/位置、resume 继承)与 turn-spec 单测(fresh+resume 均带 `--dir`),并订正 config
+  模块/`base_run_args`/`base_resume_args` doc 里「working dir 走进程 cwd 而非 --dir」的过期措辞。
+- 接线:`opencode/mod.rs` `mod adapter;` + `pub use adapter::OpenCodeAdapter;`;`external/mod.rs` feature-gated
+  re-export 追加 `OpenCodeAdapter`。
+- 真机 e2e:新增 `tests/external_opencode.rs`(`#[ignore]`,镜像 `external_codex.rs`),经 `OPENCODE_BIN`/PATH
+  发现 `opencode`(可选 `OPENCODE_MODEL`/`OPENCODE_AGENT`),缺 binary/登录即带清晰信息**跳过**(退出为绿);否则在
+  临时 git worktree 以 `BypassPermissions`(映射 `--auto`)驱动 probe→start→advance→completion→graceful shutdown,
+  断言观测流为多步,**并断言 worktree 隔离**:`READY.txt` 落在 worktree 内、且**绝不**泄漏进启动它的 checkout(cwd)。
+  命令文档化于 doc/README。
+- **本机 opencode 1.17.15 实跑通过**:ignored e2e = 1 passed(6 个观测事件、1 条文本、`READY.txt` 生成于 worktree
+  内且无泄漏、graceful shutdown,约 20s),非 skip。
+- 文档:`docs/managed-external-agent.md` §14 增补 M8-3 实现状态块(含 worktree 隔离/`--dir` 说明);
+  `docs/capability-matrix.md` 增补「OpenCode live adapter 实报能力(M8-3)」表 + 真机 e2e 状态(含隔离断言),
+  并修订 M8-1 段的过期措辞;`tests/fixtures/external/opencode/README.md` 从「live adapter 与 e2e 待 M8-3」更新为
+  已落地并说明 e2e 运行命令。
+- 验证序列 1-6 全过:
+  1. `cargo fmt --all -- --check` 通过。
+  2. `cargo clippy --all-targets -- -D warnings`(feature off)与 `--features external-opencode` 均 0 warning。
+  3. `cargo test -p agent-lib --features external-opencode --lib opencode` = 32 passed;
+     `cargo test --features external-opencode --test agent_opencode_cassette` = 7 passed;
+     `cargo test --features external-opencode --test external_opencode -- --ignored` = 1 passed(真机实跑,含隔离断言)。
+  4. `cargo test --all --all-targets`(feature off)全部 result 块 ok,0 failed。
+  5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features external-opencode` 通过。
+  6. `git diff --check` 干净。
 
 ### [TODO] M8-4 Review：OpenCode adapter 正确性检查
 

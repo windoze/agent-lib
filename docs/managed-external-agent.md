@@ -1184,6 +1184,44 @@ OpenCode 需要先做 capability probe,因为部署形态可能更多。
 > cassette([`tests/agent_opencode_cassette.rs`](../tests/agent_opencode_cassette.rs) +
 > `tests/fixtures/external/opencode/full_session.json`)冻结,覆盖 text/command/patch/permission/tool/
 > subtask/completion/error 及容忍/畸形帧分类;live session adapter 与真机 e2e 仍待 M8-3。
+>
+> **实现状态(M8-3,已落地)**:`external-opencode` 下把 M8-1 启动配方与 M8-2 私有 decoder 接进
+> milestone-5 的 `ExternalRuntimeAdapter` / `ExternalRuntimeSession` 抽象(§11),新增 **live session +
+> runtime adapter** [`OpenCodeAdapter`](../src/agent/external/opencode/adapter.rs)(该模块**唯一 pub
+> 类型**):`new(config)` 报告本 adapter 实现的全部能力,`with_probed_capabilities(config, &probed)` 把实现
+> 能力与 probe 实测能力**逐位取交**;`start` 用 `opencode run … <prompt>` 启动全新 session,`resume` 用
+> `opencode run … --session <id> <message>` 续跑既有 session,启动失败分别归类 `Launch` / `ResumeUnavailable`。
+> - **每 turn 一个一次性进程**(同 Codex):`opencode run` 的 prompt 是 CLI **位置参数**,进程在一个 turn 落定
+>   后退出;续跑是全新的 `opencode run --session <id> <message>` 进程。故为 `base_run_args()` 新增配套的
+>   `OpenCodeConfig::base_resume_args(session_id)`(= 复用 `run --format json [--auto][--model][--agent]` 再追加
+>   `--session <id>`,对齐官方 CLI:`run` 接受 `-s/--session` / `-c/--continue`),由 adapter 追加 `<message>`。
+> - **无 init 帧**:与 Codex 的 `thread.started` 前导帧不同,OpenCode 的 session id 随**每帧** `sessionID` 到达,
+>   故 `OpenCodeSession`(私有)在 `begin` 里读到 decoder 惰性捕获首个 `sessionID`(并发出唯一
+>   `SessionStarted` 观测)为止,把这些前导观测缓存给第一次 `advance` 续读;此后每个 `Continue` follow-up 在
+>   `advance` spawn 一个新的 `run --session` 进程,整段 session 共用一个跨全程单调 `seq` 的 decoder。生产进程
+>   **stdin=null**(否则 `run` 阻塞在从 stdin 读消息)、**stderr 丢弃**(防原始文本泄漏)、stdout piped 逐行喂
+>   decoder,`kill_on_drop`、每读超时。
+> - 能力(诚实按 M8-2 结论):`run --format json` **自主运行**,流里没有 host 可暂停的 tool-call/approval 帧,
+>   一个 turn 只会 `Completed`/`Failed`。故 `implemented_capabilities()` 报 `host_tools=false` /
+>   `host_subagents=false` / **`permission_bridge=false`**,`streaming`/`resume`/`artifacts`/`usage`/
+>   `graceful_shutdown` 为 true;声明 `tools` 的 `start`/`resume` 以 `UnsupportedCapability{HostTools}` 拒绝,
+>   follow-up 的 `RespondToolResults`→`{HostTools}`、`RespondSubagent`→`{HostSubagents}`、
+>   `RespondInteraction`→`{PermissionBridge}` 均**明确拒绝而非静默忽略**。
+> - IO 经私有 `OpenCodeLauncher` / `OpenCodeTurnStream` trait 注入:生产用 `SystemOpenCodeLauncher`
+>   (`tokio::process`),单测注入 `FakeLauncher` 回放固定 JSON 帧并**逐 turn 捕获 `OpenCodeTurnSpec`**,**离线**
+>   跑通 begin/advance(fresh + resume)/shutdown 全状态机,无需真实 binary、无网络。
+> - **worktree 隔离**:配置了 `working_dir` 时,`base_run_args()`/`base_resume_args()` 以显式
+>   `--dir <path>` 传入。OpenCode 从 `--dir`/继承的 `$PWD` 解析其项目与文件落盘位置,**而非仅**子进程的
+>   OS 级 cwd——`tokio::process` 的 `current_dir()` 只 `chdir` 却不更新继承来的 `PWD`(仍指向启动进程的
+>   目录),故若只设 cwd,OpenCode 会把文件写进**启动它的那个 checkout**(实测复现)。因此 working dir 必须
+>   走 `--dir`(authoritative,压过 cwd 与 `$PWD`);launcher 另把它设为进程 `current_dir` 作 belt-and-suspenders。
+> - 真机 e2e:[`tests/external_opencode.rs`](../tests/external_opencode.rs) 有一个 `#[ignore]` 用例,通过
+>   `OPENCODE_BIN` 或 PATH 发现 `opencode`(可选 `OPENCODE_MODEL`/`OPENCODE_AGENT`),缺失 binary/登录即带清晰
+>   信息**跳过**(退出为绿),否则在临时 git worktree 里以 `BypassPermissions`(映射 `--auto`,让自主 CLI 能落盘
+>   且无需 host 审批)驱动 probe→start→advance→completion→graceful shutdown,断言观测流确为多步,并**断言
+>   worktree 隔离**:`READY.txt` 落在 worktree 内、且**绝不**泄漏进启动它的 checkout(cwd)。**本机
+>   opencode 1.17.15 实跑通过**(6 个观测事件、1 条文本、`READY.txt` 生成于 worktree 内、无泄漏、优雅关闭,
+>   约 20s)。运行:`cargo test --features external-opencode --test external_opencode -- --ignored --nocapture`。
 
 ### 14.1 probe 项
 

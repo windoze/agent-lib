@@ -16,8 +16,12 @@
 //! event stream is selected with `--format json` (OpenCode's raw JSON event
 //! format; note it is *not* a bare `--json` flag), the model with
 //! `-m/--model provider/model`, a preset agent with `--agent`, and the working
-//! directory with the spawned process's current directory (equivalent to
-//! `--dir`). Runtime permission gating on `run` is expressed only by the single
+//! directory with an explicit `--dir <path>`. OpenCode resolves its project /
+//! file operations from `--dir` (falling back to the inherited `$PWD`), *not*
+//! from the child's OS-level current directory alone, so the working directory
+//! must be passed as `--dir` for worktree isolation; the launcher also applies
+//! it as the spawned process's cwd as a belt-and-suspenders measure. Runtime
+//! permission gating on `run` is expressed only by the single
 //! `--auto` flag ("auto-approve permissions that are not explicitly denied");
 //! finer-grained read-only / accept-edits behaviour lives in OpenCode's
 //! agent/permission configuration selected via `--agent`, not in dedicated `run`
@@ -246,13 +250,20 @@ impl OpenCodeConfig {
     /// [`BypassPermissions`](ExternalPermissionMode::BypassPermissions), and
     /// finally the optional `--model` / `--agent` selectors. The adapter's live
     /// session (M8-3) appends the per-turn prompt (and, for a resume, a
-    /// `--continue` / `--session <id>` shape); the working directory is applied to
-    /// the spawned process rather than passed as `--dir`. The probe does not use
-    /// these arguments — it inspects `--version` / `--help` / `run --help`
-    /// instead.
+    /// `--session <id>` shape); when a [`working_dir`](Self::working_dir) is set
+    /// it is passed as an explicit `--dir <path>`, because OpenCode resolves its
+    /// file operations from `--dir`/`$PWD` and *not* from the child's OS-level
+    /// cwd alone — omitting it lets OpenCode write into the launching checkout's
+    /// directory (the inherited `$PWD`) instead of the intended worktree. The
+    /// probe does not use these arguments — it inspects `--version` / `--help` /
+    /// `run --help` instead.
     #[must_use]
     pub fn base_run_args(&self) -> Vec<String> {
         let mut args = vec!["run".to_owned(), "--format".to_owned(), "json".to_owned()];
+        if let Some(dir) = &self.working_dir {
+            args.push("--dir".to_owned());
+            args.push(dir.to_string_lossy().into_owned());
+        }
         if self.auto_approve() {
             args.push("--auto".to_owned());
         }
@@ -264,6 +275,28 @@ impl OpenCodeConfig {
             args.push("--agent".to_owned());
             args.push(agent.clone());
         }
+        args
+    }
+
+    /// Builds the base managed-mode CLI arguments for *resuming* a live
+    /// `opencode run` session by its runtime-assigned id.
+    ///
+    /// OpenCode has no separate resume subcommand: a follow-up turn is a fresh
+    /// `opencode run` process that continues an existing session with the
+    /// `-s/--session <ID>` flag (verified against the CLI reference:
+    /// `opencode run` accepts `--continue`/`--session` alongside `--format`,
+    /// `--auto`, `--model`, and `--agent`). This therefore reuses the whole
+    /// [`base_run_args`](Self::base_run_args) launch shape — `run --format json`
+    /// plus the conditional `--auto` / `--model` / `--agent` selectors — and
+    /// appends `--session <session_id>`. The adapter's live session (M8-3)
+    /// appends the per-turn follow-up message as the trailing positional
+    /// argument; the working directory rides along as the explicit `--dir <path>`
+    /// emitted by the inherited [`base_run_args`](Self::base_run_args) shape.
+    #[must_use]
+    pub fn base_resume_args(&self, session_id: &str) -> Vec<String> {
+        let mut args = self.base_run_args();
+        args.push("--session".to_owned());
+        args.push(session_id.to_owned());
         args
     }
 }
@@ -356,6 +389,71 @@ mod tests {
         assert!(!prompt.iter().any(|arg| arg == "--auto"));
         assert!(!prompt.iter().any(|arg| arg == "--model"));
         assert!(!prompt.iter().any(|arg| arg == "--agent"));
+        // With no working directory there is no `--dir`.
+        assert!(!prompt.iter().any(|arg| arg == "--dir"));
+    }
+
+    #[test]
+    fn opencode_config_base_run_args_pass_working_dir_as_dir() {
+        // The working directory must be passed explicitly as `--dir <path>`:
+        // OpenCode resolves file operations from `--dir`/`$PWD`, not the child's
+        // OS-level cwd alone, so relying on the spawned process's current
+        // directory leaks writes into the launching checkout (design §14).
+        let config = OpenCodeConfig::new().with_working_dir("/tmp/scratch-worktree");
+        let args = config.base_run_args();
+        let dir_pos = args
+            .iter()
+            .position(|a| a == "--dir")
+            .expect("--dir is present when a working_dir is configured");
+        assert_eq!(
+            args.get(dir_pos + 1).map(String::as_str),
+            Some("/tmp/scratch-worktree")
+        );
+        // `run --format json` still leads before `--dir`.
+        assert_eq!(&args[..3], &["run", "--format", "json"]);
+
+        // Resume inherits the same `--dir` from the shared run shape.
+        let resume = config.base_resume_args("ses_dir");
+        assert!(
+            resume
+                .windows(2)
+                .any(|w| w == ["--dir", "/tmp/scratch-worktree"])
+        );
+    }
+
+    #[test]
+    fn opencode_config_base_resume_args_continue_a_session() {
+        // Resume reuses the full run launch shape and appends `--session <id>`.
+        let config = OpenCodeConfig::new()
+            .with_permission_mode(ExternalPermissionMode::BypassPermissions)
+            .with_model("anthropic/claude-sonnet-4")
+            .with_agent("build");
+        let resume = config.base_resume_args("ses_abc123");
+        assert_eq!(
+            resume,
+            vec![
+                "run",
+                "--format",
+                "json",
+                "--auto",
+                "--model",
+                "anthropic/claude-sonnet-4",
+                "--agent",
+                "build",
+                "--session",
+                "ses_abc123",
+            ]
+        );
+        // Resume shares the `run --format json` prefix with a fresh launch.
+        assert!(resume.starts_with(config.base_run_args().as_slice()));
+
+        // A permissive default resume is just the JSON run shape plus `--session`.
+        let bare = OpenCodeConfig::new().base_resume_args("ses_xyz");
+        assert_eq!(
+            bare,
+            vec!["run", "--format", "json", "--session", "ses_xyz"]
+        );
+        assert!(!bare.iter().any(|arg| arg == "--auto"));
     }
 
     #[test]

@@ -177,8 +177,8 @@ resume←`run --continue`/`--session` 或顶层 `session`,host_tools←顶层 `m
 host_subagents 保守 `false`)。配套的 [`OpenCodeConfig`](../src/agent/external/opencode/config.rs) 把
 `ExternalPermissionMode` 保守映射到 `run` 唯一的权限旁路开关 `--auto`(**仅 `BypassPermissions` 发
 `--auto`**,其余模式不加以免越权放宽),更细的 read-only/accept-edits 交给 `--agent` 预设 agent。与
-Claude/Codex 一样,该探测反映「CLI 自称支持什么」,仍**不是** e2e 实测;decoder 待 M8-2、live adapter 与真机
-e2e 待 M8-3,故下表 OpenCode 行仍保持保守 `false`。
+Claude/Codex 一样,该探测反映「CLI 自称支持什么」,仍**不是** e2e 实测(真机实报见下方 M8-3 表);末尾
+「各 runtime 当前声明」的保守基线 `none()` 表不随之翻真。
 
 里程碑 8-2 起,`external-opencode` 下新增了 adapter 私有的 `opencode run --format json` **stream decoder**
 ([`OpenCodeStreamDecoder`](../src/agent/external/opencode/decoder.rs)):它把 CLI 逐行输出的
@@ -192,6 +192,36 @@ per-turn `OpenCodeDecision`。与 `codex exec --json` 一样,`run --format json`
 schema 不外泄为稳定 API,回归由离线 cassette([`tests/agent_opencode_cassette.rs`](../tests/agent_opencode_cassette.rs) +
 `tests/fixtures/external/opencode/full_session.json`)冻结,覆盖 text/command/patch/permission/
 tool/subtask/completion/error;live adapter 与真机 e2e 仍待 M8-3。
+
+里程碑 8-3 起,`external-opencode` 把 M8-1 配方与 M8-2 decoder 接成 feature-gated 的 **live session adapter**
+([`OpenCodeAdapter`](../src/agent/external/opencode/adapter.rs)):它 `start`/`resume`/`advance`/`shutdown`
+真实 `opencode run` 进程。与 Codex 同构——`run` 的 prompt 是 CLI 位置参数、进程一 turn 落定即退出,续跑是全新
+`opencode run --session <id> <message>` 进程(新增配套 `OpenCodeConfig::base_resume_args()` = 复用
+`base_run_args()` 追加 `--session <id>`)。与 Codex 的差异:OpenCode **无 init 帧**,session id 随每帧
+`sessionID` 到达,故 `begin` 读到 decoder 惰性捕获首个 `sessionID`(并发 `SessionStarted`)为止。其状态机由注入的
+`OpenCodeLauncher`/`OpenCodeTurnStream` trait 离线跑通(fresh+resume+shutdown),生产 `SystemOpenCodeLauncher`
+用 `tokio::process`(stdin=null、stderr 丢弃、每读超时、kill_on_drop)。
+
+**OpenCode live adapter 实报能力（M8-3,feature `external-opencode`）**——下表列的是
+`OpenCodeAdapter::new()` **实报**的能力(与末尾「各 runtime 当前声明」的保守基线 `none()` 不同);
+`with_probed_capabilities` 会把这些实报位与本机 probe 逐位 AND,故某项能力只有 adapter 实现且 probe 也广告时
+才最终为 `true`;host bridge 三项无论 probe 如何都恒 `false`。
+
+| 受管能力 | `OpenCodeAdapter::new()` 实报 | 验证来源 |
+|---|---|---|
+| streaming | `true` | 真机 e2e(观测流 SessionStarted + ≥1 TextDelta + SessionCompleted,≥3 事件,镜像到 live sink)+ 离线单测 |
+| resume | `true` | 离线单测(`run --session <id>` fresh+follow-up 顺序、defer 首 turn、pre-seed session id);真机 e2e 单 turn 未跑 resume |
+| artifacts | `true` | 离线 decoder cassette(`edit`/`write`→`FilePatch`);真机 e2e prompt 在 `--dir` worktree 内生成 `READY.txt`(并断言不泄漏进启动 checkout) |
+| usage | `true` | 离线 decoder cassette(`step_finish.tokens/cost` 跨步累加→`ExternalAgentOutput.usage`)+ 单测断言 `output.usage.is_some()` |
+| graceful_shutdown | `true` | 真机 e2e(`registry.cleanup` 断言 `Graceful`)+ 离线单测(close 分类 Graceful/ForcedKill) |
+| permission_bridge | `false`(恒) | `run --format json` 自主运行、按 `--auto` 解审批,流里无 host-answerable pause;`RespondInteraction`→`UnsupportedCapability{PermissionBridge}` |
+| host_tools | `false`(恒) | run 自主执行工具,无 host-pausable tool-call 帧;声明 `tools` 的 start/resume 与 `RespondToolResults` 均以 `UnsupportedCapability{HostTools}` 拒绝 |
+| host_subagents | `false`(恒) | 无 host-桥接的 spawn 帧;`RespondSubagent`→`UnsupportedCapability{HostSubagents}` |
+
+真机 e2e 状态:**本机 opencode 1.17.15 实跑通过**([`tests/external_opencode.rs`](../tests/external_opencode.rs),
+以 `BypassPermissions`/`--auto` 驱动 probe→start→advance→completion→graceful shutdown,在 `--dir` 临时
+worktree 内生成 `READY.txt` 并断言其**不泄漏**进启动它的 checkout(worktree 隔离,详见 §14),
+6 个观测事件、约 20s);缺 binary/登录时该 `#[ignore]` 测试自跳过(退出为绿)。
 
 ### 受管能力清单（`ExternalCapability`，共 8 项）
 

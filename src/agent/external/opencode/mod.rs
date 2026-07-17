@@ -24,9 +24,14 @@
 //!   `run --format json` runs autonomously — its permission prompts are resolved
 //!   against the `--auto` launch flag rather than bridged back to the host — so a
 //!   turn only ever completes or fails.
-//! - **M8-3 (later):** the live
+//! - **M8-3 (this task):** the live
 //!   [`ExternalRuntimeSession`](crate::agent::external::ExternalRuntimeSession)
-//!   process management that wraps the decoder into start/resume/advance.
+//!   process management ([`OpenCodeAdapter`]) that wraps the decoder into
+//!   start/resume/advance. `opencode run` is one-shot per turn (the prompt is a
+//!   CLI positional argument, not a stdin frame), so a follow-up turn is a fresh
+//!   `opencode run --session <id> <message>` process; the adapter reports
+//!   host-tool, host-subagent, and permission bridging as unsupported because the
+//!   stream never pauses for the host (M8-2).
 //!
 //! The [`OpenCodeConfig`] captures the CLI's `run`-subcommand layout: the
 //! structured stream is selected with `--format json`, the model with
@@ -37,10 +42,12 @@
 //! private wire schema as stable public API (design 非目标): the probe reads only
 //! `--version` / `--help` / `run --help`.
 
+mod adapter;
 mod config;
 mod decoder;
 mod probe;
 
+pub use adapter::OpenCodeAdapter;
 pub use config::OpenCodeConfig;
 pub use decoder::{OpenCodeDecision, OpenCodeDecodeContext, OpenCodeStreamDecoder};
 pub use probe::{

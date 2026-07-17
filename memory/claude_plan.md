@@ -1,63 +1,54 @@
-# M8-2 实现 OpenCode stream decoder cassette 测试
+# M8-3 实现 OpenCode session adapter 与 ignored real e2e
 
-**当前任务 = TODO.md 第一个未完成任务 = M8-2**（TODO.md 行 2452 `### [TODO] M8-2`）。
-M8-1 已 `[DONE]`（config+probe），M8-2 = 私有 `opencode run --format json` decoder + cassette。
+**当前任务 = TODO.md 第一个未完成任务 = M8-3**（TODO.md 行 2517 `### [TODO] M8-3`）。
+M8-1（config+probe）、M8-2（decoder+cassette）已 `[DONE]`。M8-3 = live session adapter + ignored real e2e。
 
-## 真实 OpenCode wire 格式（已核对 sst/opencode 源码，非硬编码假设）
-`opencode run --format json` 逐行输出信封：
-`{ "type": <emit-type>, "timestamp": <ms>, "sessionID": <id>, ...data }`
-（源：packages/opencode/src/cli/cmd/run.ts `emit()`；part schema：packages/sdk/js/src/gen/types.gen.ts）
+## 结论：OpenCode 与 Codex adapter 几乎同构（都自主运行、一进程/一 turn）
+`opencode run --format json` 与 `codex exec --json` 一样自主：无 host-pausable pause 臂，
+turn 只 Completed / Failed。因此 `OpenCodeAdapter` 镜像 `CodexAdapter` 结构：
+- `OpenCodeTurnSpec { Fresh{prompt} | Resume{session_id,message} }` → args = base_run_args()[+`--session <id>`] + positional message
+- `OpenCodeLauncher` / `OpenCodeTurnStream` traits（离线可测）+ `SystemOpenCodeLauncher` / `OpenCodeProcessTurn`
+- `OpenCodeSession<L>` impl `ExternalRuntimeSession`：begin 读到 session_id 捕获（OpenCode 无 init 帧，
+  sessionID 随首帧到达，decoder.ensure_session 惰性捕获），first_turn_pending，advance loop，shutdown
+- `OpenCodeAdapter` impl `ExternalRuntimeAdapter`：kind/capabilities/start/resume
+  - capabilities：streaming/resume/artifacts/usage/graceful=on；permission_bridge/host_tools/host_subagents=off
+  - reject declared host tools；turn_message 拒 RespondToolResults/Subagent/Interaction
 
-emit 类型仅 6 种（run.ts loop 只对这些调用 emit）：
-- `text` → `{ part: TextPart }`（仅 part.time.end 时）→ TextDelta(part.text)
-- `reasoning` → `{ part: ReasoningPart }`（仅 thinking，默认关）→ 容忍
-- `tool_use` → `{ part: ToolPart }`（仅 state.status ∈ {completed,error}）
-  - ToolPart = { type:"tool", callID, tool:<name>, state }
-  - tool id "bash"（input.command, metadata.exit, metadata.output/output, title=command）
-  - "edit"/"write"/"apply_patch"（title=filePath 或 input.filePath, metadata.diff）
-  - "task"（子代理：input.description/prompt/subagent_type）
-  - 其他（grep/read/glob/webfetch...）
-  - state error 且是权限拒绝 → opencode 稳定错误串 "The user rejected permission to use..."/
-    "prevents you from using this specific tool call" → 信息型 PermissionRequested（run 模式自动裁决，
-    不回灌 host，等价 Codex declined 处理）
-- `step_start` → `{ part: StepStartPart }` → 容忍（边界）
-- `step_finish` → `{ part: StepFinishPart }`：{ reason, cost, tokens:{input,output,reasoning,cache:{read,write}} }
-  - reason=="tool-calls" → 继续（无决策）；其余（"stop"/"length"...）→ 终结 Completed
-  - usage 跨 turn 内所有 step_finish 累加为 turn 总量
-- `error` → `{ error: ApiError }`（session.error，{name, data?:{message}}）→ Failed(Runtime)
-
-SessionStarted：无独立 init 帧，从首个带 sessionID 的帧惰性发一次。
-权限：run --format json **不**输出 permission.asked（--auto 自动批准/否则自动拒绝），
-故 decoder 自主（Completed/Failed only，同 Codex），无 host-pausable 决策。
-
-## 决策类型 OpenCodeDecision = { Completed{output}, Failed{error} }（同 Codex，无 Paused 臂）
+## 真实 OpenCode CLI（已核对 opencode.ai/docs/cli，非臆测）
+`opencode run [message..]` 位置参数 = prompt；`-s/--session <ID>` resume；`-c/--continue`；
+`--format json` raw JSON events；`--auto` 权限旁路；`-m/--model`；`--agent`。
+→ 需给 `OpenCodeConfig` 加 `base_resume_args(session_id)` = base_run_args() + `--session <id>`。
 
 ## 交付物
-1. src/agent/external/opencode/decoder.rs：OpenCodeDecodeContext / OpenCodeDecision / OpenCodeStreamDecoder
-   （push_line/take_observations/session_id；防御式 serde_json::Value 解析；私有 schema 不外泄）
-2. opencode/mod.rs：mod decoder + pub use
-3. external/mod.rs：feature-gated 追加 decoder 三型 re-export
-4. tests/agent_opencode_cassette.rs：#![cfg(feature="external-opencode")] cassette 套件
-   （regenerate/matches/secret-free/decode-full/tolerance/malformed/error 各 test）
-5. tests/fixtures/external/opencode/full_session.json：AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1 生成
-   覆盖 text/command/patch/permission/tool/subtask/completion/error
-6. 更新 fixtures README、docs/managed-external-agent.md §14、docs/capability-matrix.md
-7. TODO.md M8-2 → [DONE] + 完成记录
+1. config.rs：新增 `base_resume_args(session_id)` + 测试
+2. adapter.rs：OpenCodeAdapter + OpenCodeSession + launcher/stream traits + 内联 fake-launcher 单测
+3. mod.rs：`mod adapter; pub use adapter::OpenCodeAdapter;`
+4. external/mod.rs：feature-gated 追加 `OpenCodeAdapter` re-export
+5. tests/external_opencode.rs：#[ignore] real-CLI e2e（镜像 external_codex.rs，缺 binary/auth 时 green skip）
+6. 更新 docs/managed-external-agent.md §14、docs/capability-matrix.md、fixtures README
+7. TODO.md M8-3 → [DONE] + 完成记录
 
 ## 验证序列
 1. cargo fmt --all -- --check
-2. cargo test -p agent-lib --features external-opencode opencode（lib）
-3. AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1 生成 fixture，再 cargo test --features external-opencode --test agent_opencode_cassette
-4. cargo clippy --all-targets -- -D warnings（off）+ --features external-opencode
-5. cargo test --all --all-targets（off，<=30min）
-6. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features external-opencode
-7. git diff --check
+2. cargo clippy --all-targets -- -D warnings（off）+ --features external-opencode
+3. cargo test -p agent-lib --features external-opencode --lib opencode
+4. cargo test --features external-opencode --test agent_opencode_cassette
+5. cargo test --features external-opencode --test external_opencode -- --ignored（无 opencode 则 green skip）
+6. cargo test --all --all-targets（off，<=30min）
+7. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features external-opencode
+8. git diff --check
 
 ## 进度
-- [x] 读 TODO/PLAN/源码/真实 opencode schema
-- [x] 写 decoder.rs
-- [x] 挂 mod + re-export
-- [x] 写 cassette test + 生成 fixture
-- [x] 更新 docs（managed-external-agent.md §14、capability-matrix.md、fixtures README）
-- [x] 跑验证序列 1-6 全过（fmt / clippy off+on / lib opencode 13 + cassette 7 / full suite / doc / diff --check）
-- [x] TODO.md M8-2 DONE + 完成记录 → commit
+- [x] 调研（Codex adapter / OpenCode decoder+config+probe / 真实 CLI）
+- [x] config.base_resume_args + 测试
+- [x] adapter.rs
+- [x] mod + re-export
+- [x] tests/external_opencode.rs（本机 opencode 1.17.15 实跑通过）
+- [x] docs
+- [x] 验证序列 1-8 全过
+- [x] **worktree 隔离缺陷修复**：e2e 复现出 READY.txt 泄漏到 repo 根。实证根因——OpenCode 从
+      `--dir`/`$PWD` 解析落盘目录,而 tokio `current_dir()` 只 chdir 不更新继承的 `PWD`(仍指向 repo 根)。
+      修法:`base_run_args()` 配置 working_dir 时显式追加 `--dir <path>`(authoritative);launcher 保留
+      `current_dir` 作 belt-and-suspenders;新增 config/turn-spec 单测;e2e 增加隔离断言(READY.txt 落在
+      worktree 内、不泄漏进 cwd)。真机重跑:6 事件、无泄漏、约 20s。
+- [x] TODO.md DONE + commit
