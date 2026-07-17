@@ -1,43 +1,39 @@
-# M4-1 将 `ExternalEventSink` 升级为 sequenced live sink
+# M4-2 新增 `ExternalRuntimeCapabilities` 与 unsupported capability 错误
 
-**当前执行 = TODO.md 第一个未完成任务 = M4-1**（M1-*、M2-*、M3-* 已 `[DONE]`）。
+**当前执行 = TODO.md 第一个未完成任务 = M4-2**（M1..M3、M4-1 已 `[DONE]`）。
 
-## 任务分析（来自 TODO.md M4-1 + docs §10.1）
-- `src/agent/external/sink.rs` 的 `ExternalEventSink::emit(&ExternalAgentEvent)` 是占位。
-- 设计 §10.1（docs/managed-external-agent.md 673-674）与 §6 表（line 342）要求 live sink 按 `seq` emit
-  `ExternalObservedEvent`，与 buffered observations 双通道，seq 是唯一 replay 进度。
-- sink 只是 UI tail，不改 control flow；无生产调用方（仅 trait + DiscardEventSink + 再导出）。
+## 结构修复（前置，必须先做）
+- 上一 commit `69a0060 [M4-1]` 在插入 M4-1 完成记录时**误删**了
+  `### [TODO] M4-2 新增 \`ExternalRuntimeCapabilities\` 与 unsupported capability 错误` 标题，
+  导致 M4-2 的 body（上下文/做什么/验证条件，TODO.md 约 1209-1254）变成 M4-1 的孤儿续写。
+- 属于「任务条目本身损坏，必须结构性修复」——恢复 M4-2 标题（放回其 body 之前），不新增/拆分任务。
 
-## 方案决策
-- 直接把 `ExternalEventSink::emit` 签名改成接收 `&ExternalObservedEvent`（sequenced）。
-  - 无生产调用方，改签名安全且最干净（对齐 §10.1 `sink.emit(observed_event)`）。
-  - 不新增并行 trait，避免双 trait 维护成本。
+## 任务分析（TODO.md M4-2 body + docs §15）
+- 现状 `ExternalAgentError` 无 `UnsupportedCapability`；无 session-level capability model。
+- TODO body（权威）定义 8 能力：streaming/resume/permission_bridge/host_tools/host_subagents/
+  artifacts/usage/graceful_shutdown —— 与 M4-4 review 清单逐项一致。
+- docs §15 是更细的「拟新增」草图（13 字段 + capability:String）。以 TODO body 为准（enum capability，
+  8 能力集），与 M4-4 acceptance 对齐；PLAN 非目标要求「能力差异显式暴露、不静默假装支持」→ 保守默认全 false。
 
-## 做什么
-1. `sink.rs`:
-   - `use super::ExternalObservedEvent;`
-   - `trait ExternalEventSink::emit(&self, event: &ExternalObservedEvent)`。
-   - `DiscardEventSink` impl 改签名。
-   - rustdoc 明确三点：sink 不得阻塞；允许丢事件；exact-once 只由
-     `ExternalSessionResult.observations` + machine replay 保证。
-   - doctest 示例改用 `ExternalObservedEvent`。
-2. 测试:
-   - 更新 `discard_sink_accepts_and_drops_events` 用 sequenced events。
-   - 新增 `collecting_sink_records_sequenced_events_for_tests`：test-only collecting sink
-     （`Mutex<Vec<ExternalObservedEvent>>`），证明 sink 收事件不影响独立 buffered observations，
-     且按 seq 记录。
+## 方案
+1. 新增 `src/agent/external/capability.rs`：
+   - `ExternalCapability` enum（8 变体，snake_case serde，Copy/Hash，`as_str`/`Display`，`ALL` 常量）。
+   - `ExternalRuntimeCapabilities`（runtime + 8 bool，serde）：`none(runtime)` 保守全 false；
+     `supports(cap)`；`require(cap, detail) -> Result<(), ExternalAgentError>` 产 classified error。
+   - `impl ExternalRuntimeKind { conservative_capabilities() }` 保守 helper。
+2. `mod.rs`：`mod capability;` + `pub use capability::{ExternalCapability, ExternalRuntimeCapabilities};`；
+   `ExternalAgentError` 新增 `UnsupportedCapability { runtime, capability: ExternalCapability, detail }`
+   （`#[error("{runtime:?} runtime does not support {capability}: {detail}")]`，不含 prompt/tool input 字段）。
+3. `src/agent/mod.rs`：re-export 新类型。
+4. 测试：
+   - `capability.rs`: `external_capabilities_roundtrip`（serde round-trip + none/supports/ALL）。
+   - `mod.rs`: `external_error_roundtrips`（全 error 变体 round-trip + UnsupportedCapability Display 不泄漏 prompt/tool input）。
 
 ## 验证条件（TODO.md）
-- `discard_sink_accepts_and_drops_events` 更新并通过。
-- 新增 `collecting_sink_records_sequenced_events_for_tests`。
-- `cargo test -p agent-lib external::sink`。
+- capability/error DTO serde round-trip。
+- `UnsupportedCapability` Display 不含 raw prompt/tool input。
+- `cargo test -p agent-lib external_capabilities_roundtrip`
+- `cargo test -p agent-lib external_error_roundtrips`
 - 完整验证序列 1-6：fmt / 焦点测试 / clippy -D warnings / 全量 test / doc -D warnings / git diff --check。
 
-## 影响面
-- 仅 `sink.rs` 有 `.rs` 改动；无生产调用方需改。
-- 需同步 docs（M3 状态表 line 1137、§1 现状表 line 61/113）标注 M4-1 落地。
-
-## 状态：已完成（M4-1 [DONE]）
-- 仅 `src/agent/external/sink.rs` 有 .rs 改动 + docs 同步 + TODO.md/memory。
-- 完整验证序列 1-6 全过（focused external::sink 2 passed；full suite 38 组 0 failed）。
-- 下一任务 = M4-2，本轮不启动。
+## 状态：进行中

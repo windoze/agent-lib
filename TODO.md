@@ -1206,6 +1206,8 @@ sink 已 sequenced(policy/runtime 接线待实现);§3 parity 流式文本行改
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过(含 sink doctest)。
 - `git diff --check` clean。
 
+### [TODO] M4-2 新增 `ExternalRuntimeCapabilities` 与 unsupported capability 错误
+
 **上下文**:
 
 - `docs/managed-external-agent.md` §15 要求 capability model。
