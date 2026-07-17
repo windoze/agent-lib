@@ -106,6 +106,21 @@ pub enum TraceNodeKind {
         /// The recorded disposition of the session close.
         disposition: ExternalSessionShutdown,
     },
+    /// Usage/cost charged against the run budget for an external session step.
+    ///
+    /// The existence of this node records that the amounts were *sourced from
+    /// the external runtime's own report* (a CLI/SDK usage frame or transcript
+    /// metadata), never estimated by this crate (design §17). A `None` field
+    /// means the runtime reported nothing for that dimension, so it was recorded
+    /// as unknown and left unbudgeted rather than guessed.
+    ExternalUsage {
+        /// Token count charged, when the runtime reported usage.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_charged: Option<u64>,
+        /// Cost in micro-units charged, when the runtime reported cost.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_micros_charged: Option<u64>,
+    },
 }
 
 /// Serializable trace record for reconstructing a run tree.
@@ -325,6 +340,36 @@ impl TraceHandle {
         )
     }
 
+    /// Records usage/cost charged for an external session step under the current
+    /// parent.
+    ///
+    /// The node's presence marks the amounts as *external-runtime-reported*: they
+    /// come from the runtime's own usage frame or transcript metadata, never an
+    /// estimate this crate synthesized (design §17). Pass `None` for a dimension
+    /// the runtime did not report so it is recorded as unknown rather than
+    /// guessed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TraceError`] when the node id is duplicate or the current
+    /// parent is not present.
+    pub fn record_external_usage(
+        &self,
+        id: TraceNodeId,
+        tokens_charged: Option<u64>,
+        cost_micros_charged: Option<u64>,
+    ) -> Result<TraceRecord, TraceError> {
+        let label = external_usage_label(tokens_charged, cost_micros_charged);
+        self.record_node(
+            id,
+            TraceNodeKind::ExternalUsage {
+                tokens_charged,
+                cost_micros_charged,
+            },
+            Some(label),
+        )
+    }
+
     fn record_node(
         &self,
         id: TraceNodeId,
@@ -344,6 +389,20 @@ impl TraceHandle {
         let record = TraceRecord::new(id, Some(self.parent.clone()), kind, label);
         records.push(record.clone());
         Ok(record)
+    }
+}
+
+/// Renders a stable, secret-free label for an [`ExternalUsage`] trace node.
+///
+/// [`ExternalUsage`]: TraceNodeKind::ExternalUsage
+fn external_usage_label(tokens: Option<u64>, cost_micros: Option<u64>) -> String {
+    match (tokens, cost_micros) {
+        (None, None) => "external-runtime-reported: unknown".to_owned(),
+        (tokens, cost_micros) => {
+            let tokens = tokens.map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+            let cost = cost_micros.map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+            format!("external-runtime-reported: tokens={tokens} cost_micros={cost}")
+        }
     }
 }
 

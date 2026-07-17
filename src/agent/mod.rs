@@ -62,12 +62,14 @@ pub use external::{
     ExternalSessionRequest, ExternalSessionResult, ExternalSessionShutdown, ExternalStreamPolicy,
     ExternalSubagentOutput, ExternalSubagentRequest, ExternalSubagentRequestId,
     ExternalToolBatchId, ExternalToolCall, ExternalToolFailurePolicy, ExternalToolResult,
-    HumanGate, ImpactScope, RuleRouter, ScriptedTaskEvaluator, ScriptedVerifier, TaskDescriptor,
-    TaskEvaluator, Uncertainty, Verifier, Worker, WorkerChoice, WorkerProfile, WorkerProfileRef,
-    WorkerProfileRegistry, WorkerReport, WorkerRoster, WorktreeIsolation,
-    collect_file_patch_artifacts, collect_file_patch_artifacts_from_observed,
+    ExternalUsageCharge, ExternalUsageChargingHandler, HumanGate, ImpactScope, RuleRouter,
+    ScriptedTaskEvaluator, ScriptedVerifier, TaskDescriptor, TaskEvaluator, Uncertainty, Verifier,
+    Worker, WorkerChoice, WorkerProfile, WorkerProfileRef, WorkerProfileRegistry, WorkerReport,
+    WorkerRoster, WorktreeIsolation, collect_file_patch_artifacts,
+    collect_file_patch_artifacts_from_observed,
 };
 pub use external::{DiscardEventSink, ExternalEventSink};
+pub use external::{ExternalSessionSweeper, NoSweep, budget_exhausted};
 pub use external::{
     GitWorktreeManager, PreparedWorktree, SystemGit, WorktreeCleanupOutcome, WorktreeError,
     WorktreeGitExec, WorktreeManager,

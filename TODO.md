@@ -2735,7 +2735,7 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
   external-opencode"` 亦 0 warning）;`cargo test --all --all-targets` 全 ok（46 个 test result: ok、exit 0、
   0 failed）;`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净;`git diff --check` 干净。
 
-### [TODO] M9-2 接入 usage/cost budget charging
+### [DONE] M9-2 接入 usage/cost budget charging
 
 **上下文**:
 
@@ -2761,6 +2761,41 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
   - budget exceeded 停止 session 并 cleanup。
 - `cargo test -p agent-lib external_budget`
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- **新增 `src/agent/external/budget.rs`**（不 feature-gated,default 构建即编译；沿用外部模块 unboxed
+  `ExternalAgentError` 契约,故模块级 `#![allow(clippy::result_large_err)]` 并附说明）:
+  - `ExternalUsageCharge`（`Copy`）:`from_output(&ExternalAgentOutput)` 只读取 runtime **上报**的 token/cost,
+    token 取 `Usage.total`,缺失时回退 `total_computed()`(仍是上报列求和,**绝不词数估算**);`tokens()`/
+    `cost_micros()`/`is_unknown()`;`charge(&RunContext)` 仅对已上报维度 charge,`BudgetError`→
+    `ExternalAgentError::LimitExceeded`(经 `limit_exceeded(RunContextError)` 统一映射)。
+  - `budget_exhausted(&RunContext) -> Option<BudgetDimension>`:advance 前预检,某 count 维度 `used>=limit`
+    即返回该维度(steps>tokens>cost 稳定顺序),unbounded 永不触发;wall-clock 因需 caller elapsed 不在此检查。
+  - `ExternalSessionSweeper`(async trait)`sweep(agent_id,&session)->ExternalSessionShutdown`,impl for
+    `ExternalSessionRegistry`(委托 `cleanup`)+ blanket `Arc<S>` + `NoSweep`(默认,宿主自管 teardown,返回
+    `Graceful`)。
+  - `ExternalUsageChargingHandler<H, S=NoSweep>`(`new`/`with_sweeper`/`inner`)impl `ExternalSessionHandler`:
+    ① 预检 `budget_exhausted` → 已耗尽则(有 live session 才)`sweep`+`record_external_shutdown`,返回
+    `Failed{LimitExceeded}` **不调 inner**;② 调 inner;非 external family / `Paused*` **原样透传不 charge**;
+    ③ `Completed` → charge,成功后 `record_external_usage`(source=external runtime reported)原样返回;
+    charge 超限 → `sweep`(停 session+cleanup)+记 usage+shutdown,改写为 `Failed{session:Some, LimitExceeded}`
+    **保留 session facts** 供 machine 审计。trace id 由 per-handler `AtomicU64` + `run_id` 生成(遵循 crate
+    「nondeterminism 由 caller 掌控」,无 clock/RNG)。
+- **trace 记录来源**:`context/trace.rs` 新增 `TraceNodeKind::ExternalUsage { tokens_charged, cost_micros_charged }`
+  (节点存在即代表来源为 external-runtime-reported;`None`=runtime 未报告=unknown,不估算)+
+  `TraceHandle::record_external_usage`;`agent-testkit` trace assertion `describe_kind` 补该 arm。
+- **导出**:`external/mod.rs` + `agent/mod.rs` re-export `ExternalUsageCharge/ExternalUsageChargingHandler/
+  ExternalSessionSweeper/NoSweep/budget_exhausted`。
+- **测试**:`budget/tests.rs` 17 个 `external_budget_*`(全离线、每测 <1s):reported usage+cost charged、
+  computed total 回退、missing=unknown 不 charge、partial 只 charge 上报维度、charge 超限→LimitExceeded 且不部分
+  记账、`budget_exhausted` 各维度/unbounded/有余额、handler completion charge、trace 记 usage(含 unknown)、
+  预检失败不调 inner + sweep session、无 live session 不 sweep、completion 超限停 session+cleanup(ForcedKill 记入
+  trace)、Paused 透传不 charge、within-budget 结果不变、registry 实现 sweeper 编译期断言。
+- **验证(全过)**:`cargo fmt --all -- --check` 干净;`cargo test -p agent-lib external_budget` 17 passed;
+  `cargo clippy --all-targets -- -D warnings` 0 warning(另跑 `--features "external-claude-code external-codex
+  external-opencode"` 亦 0 warning);`cargo test --all --all-targets` 全 ok(46 个 test result: ok、0 failed);
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净;`git diff --check` 干净。
 
 ### [TODO] M9-3 支持 turn-boundary external reconfig
 

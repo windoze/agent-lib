@@ -276,6 +276,12 @@ fn describe_kind(kind: TraceNodeKind) -> String {
         TraceNodeKind::ExternalShutdown { disposition } => {
             format!("external_shutdown({})", disposition.label())
         }
+        TraceNodeKind::ExternalUsage {
+            tokens_charged,
+            cost_micros_charged,
+        } => format!(
+            "external_usage(tokens={tokens_charged:?}, cost_micros={cost_micros_charged:?})"
+        ),
     }
 }
 

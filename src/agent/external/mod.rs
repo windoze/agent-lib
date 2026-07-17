@@ -64,6 +64,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod adapter;
+mod budget;
 mod capability;
 #[cfg(feature = "external-claude-code")]
 mod claude_code;
@@ -85,6 +86,10 @@ mod state;
 mod worktree;
 
 pub use adapter::{ExternalRuntimeAdapter, ExternalRuntimeSession, RuntimeDecisionPoint};
+pub use budget::{
+    ExternalSessionSweeper, ExternalUsageCharge, ExternalUsageChargingHandler, NoSweep,
+    budget_exhausted,
+};
 pub use capability::{ExternalCapability, ExternalRuntimeCapabilities};
 #[cfg(feature = "external-claude-code")]
 pub use claude_code::{
