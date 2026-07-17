@@ -1156,7 +1156,7 @@ approval defaults（比 local 更保守）+ artifact trace + external restore po
   ✓（0 失败）；`cargo test -p agent-lib --lib --features "external-claude-code external-codex external-opencode"`
   ✓（855 passed）。聚焦 `cargo test -p agent-lib --lib facade::` ✓（102 passed）。
 
-### [TODO] M4-3 external approval defaults + restore policy + `AgentSnapshot` external 字段
+### [DONE] M4-3 external approval defaults + restore policy + `AgentSnapshot` external 字段
 
 **上下文**：
 
@@ -1185,6 +1185,46 @@ approval defaults（比 local 更保守）+ artifact trace + external restore po
   后该 delegate 标记 interrupted；`AttachOrFail` 在无法 attach 时 → 明确错误。
 - 聚焦：`cargo test -p agent-lib facade::external`（含 approval/restore 用例）。
 - 完整验证序列 1–6（+ external features clippy 同 M4-1）。
+
+**完成记录**：
+
+- **审批默认接入（drive-gate）**：`FacadeApproval` 新增 `external_tools: BTreeSet<String>` +
+  `with_external_tools(..)`，并新增 `resolve_external_start(tool_name) -> bool`（同步决策：显式
+  per-tool/override tier 优先；否则 `ask_external_agents` 时走 `decide_ask_deferred`（无
+  handler/headless → deny），再否则用默认 tier）。external delegate 的启动在
+  `drive_external_delegation` 处经 `resolve_external_start` 门控；拒绝时记 `Failed` delegation
+  （`approval_denied=true`）并回灌被拒工具结果，`collect_traces` 置 `external_approval_denied`，
+  `run_full`/streaming 两路返回 `FacadeError::ApprovalDenied`。model-routed 的 `ask_<name>` 工具在机器
+  审批门中豁免（`external_tools` → `AutoApprove`），使 drive 成为唯一审批权威（不双重提示）。
+  `ask_external_agents`/`ask_worktree_write` 由 M2-2「仅记录」升级为「强制执行」（rustdoc 同步更新）。
+- **`RestoreExternal` 策略**：`src/facade/external.rs` 新增 `RestoreExternal::{AttachOrFail,
+  MarkInterrupted(默认), RestartFromBrief}`（snake_case serde + `Display`）、`ExternalDelegateStatus`
+  （Pending/Completed/Failed/Interrupted）、`RetainedExternalSession`（pub(crate)）。
+  `Agent::restore().restore_external(..)` + `.external_agent(name, manager)` 覆盖；`build` 从
+  `snapshot.external_delegates` 重建 external delegates（`ExternalDelegateSnapshot::to_delegate()`
+  data-only recipe，经 `ManagedExternalAgent::from_restored_parts` 不注入 handler/不重校验 mode），再按名
+  应用 override——与 local subagent restore 对称。`last_external_sessions` 依策略重建：
+  MarkInterrupted→Interrupted+保留 session/artifacts；RestartFromBrief→Pending+清空；AttachOrFail 在无
+  重新登记且可 attach 的 delegate（`session_handler().is_some()` 且 `snap.session.is_some()`）时 →
+  `FacadeError::InvalidState`。
+- **`AgentSnapshot` external 字段（data-only）**：新增 `external_delegates: Vec<ExternalDelegateSnapshot>`，
+  字段仅含 external_session_id/runtime kind/worktree ref/last status/task brief/artifact refs/
+  transcript refs——无进程句柄/API key/client/闭包。`capture(..)` 合并 `external_agents`（recipe）与
+  `last_external_sessions`（status/session/artifacts）；`ExternalDriveOutcome` 新增
+  `session: Option<ExternalSessionRef>` 并在 `RecordingExternalMachine::step` 捕获，`run_full` 于回合后
+  刷新 `Agent.last_external_sessions`（streaming 路因 `&mut machine` 借用无法保留，已注明——快照在回合之间取）。
+- **导出**：`RestoreExternal`/`ExternalDelegateStatus`/`ExternalDelegateSnapshot` 经 `src/facade/mod.rs`
+  与 `src/facade/agent.rs` re-export。
+- **离线单测**（`src/facade/delegate.rs` `model_routed_tests`，用 in-crate `FixedExternalSessionHandler`/
+  `completed_external_handler`，不碰真实 CLI）：`auto_deny` → `ApprovalDenied`；`ask_external_agents` 无
+  handler（headless）→ `ApprovalDenied`；`ask` handler 批准 → 跑到 Completed；driven 后 `snapshot()`
+  external delegate 为 data-only 且含 session facts（断言无 handle/secret）；`restore_external(
+  MarkInterrupted)` 后 delegate 标 interrupted；`AttachOrFail` 不可 attach 时 → 明确错误。另加
+  `src/facade/external.rs` `RestoreExternal` doctest。
+- **验证**：`cargo fmt --all` ✓；`cargo clippy --all-targets -- -D warnings` ✓；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
+  ✓；`cargo test --all --all-targets` ✓（0 失败）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✓；`git diff --check` ✓。
 
 ### [TODO] M4-R Review：Managed external agent 正确性与文档一致性检查
 

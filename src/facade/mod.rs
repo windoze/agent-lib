@@ -43,7 +43,8 @@ pub mod tool;
 
 pub use agent::{
     Agent, AgentBuilder, AgentParts, AgentRestoreBuilder, AgentRunStream, AgentSnapshot,
-    AgentStateSnapshot, BlackboardSnapshot, DelegateSnapshot, DelegationSnapshot, MailboxSnapshot,
+    AgentStateSnapshot, BlackboardSnapshot, DelegateSnapshot, DelegationSnapshot,
+    ExternalDelegateSnapshot, MailboxSnapshot,
 };
 pub use approval::{Approval, ApprovalDecision, ApprovalPolicy, FacadeApproval};
 pub use chat::{Chat, ChatBuilder, ChatSession, ChatSessionBuilder, RunStream};
@@ -51,8 +52,8 @@ pub use config::{ModelConfig, ProviderConfig, ProviderConfigBuilder};
 pub use delegate::{AgentWorkerBuilder, Delegation, LocalSubagent};
 pub use error::FacadeError;
 pub use external::{
-    ExternalAgentCapabilities, ExternalRunMode, ManagedExternalAgent, ManagedExternalAgentBuilder,
-    ManagedExternalDelegate,
+    ExternalAgentCapabilities, ExternalDelegateStatus, ExternalRunMode, ManagedExternalAgent,
+    ManagedExternalAgentBuilder, ManagedExternalDelegate, RestoreExternal,
 };
 pub use ids::FacadeIds;
 pub use run::{

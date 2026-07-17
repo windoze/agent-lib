@@ -54,6 +54,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::agent::external::ExternalSessionRef;
 use crate::agent::{
     AgentError, AgentInput, AgentMachine, AgentSpec, AgentSpecRef, AgentState, CancellationToken,
     DefaultAgentMachine, DrivingSubagentHandler, HandlerScope, Interaction, InteractionHandler,
@@ -628,6 +629,24 @@ impl Delegation {
             },
         }
     }
+
+    /// Returns the model-routed start-tool names for `external` delegates that
+    /// the drive layer gates (`ask_<name>`), so the machine tool gate can exempt
+    /// them and avoid double-prompting the same start (§9.2).
+    ///
+    /// Single-tool delegation shares one tool name across every delegate, so it
+    /// cannot be safely exempted at the machine layer; it yields no exemptions
+    /// here and its unified tool passes through the ordinary machine gate.
+    #[must_use]
+    pub(crate) fn external_tool_names(&self, external: &[ManagedExternalDelegate]) -> Vec<String> {
+        match &self.mode {
+            DelegationMode::PerSubagentTool => external
+                .iter()
+                .map(|delegate| delegation_tool_name(delegate.name()))
+                .collect(),
+            DelegationMode::SingleTool { .. } => Vec::new(),
+        }
+    }
 }
 
 /// Synthesizes the unified single-tool delegation declaration (§10.2).
@@ -710,6 +729,15 @@ pub(crate) struct RecordedDelegation {
     pub artifacts: Vec<ArtifactRef>,
     /// Whether this delegation routed to a managed external agent.
     pub is_external: bool,
+    /// Whether this external delegation was denied before it started by the
+    /// approval policy (§9.2). Always `false` for a local subagent. The Agent
+    /// facade folds this into a run-level
+    /// [`FacadeError::ApprovalDenied`](crate::facade::FacadeError::ApprovalDenied).
+    pub approval_denied: bool,
+    /// The resumable session facts an external delegate's last drive reported, if
+    /// any; retained data-only for a later snapshot (§15.2). Always `None` for a
+    /// local subagent.
+    pub session: Option<ExternalSessionRef>,
 }
 
 /// A per-run map from a delegation call's framework id to its recorded trace.
@@ -1061,12 +1089,18 @@ pub(crate) struct DelegationToolHandler {
     supervisor_model: ModelRef,
     ids: FacadeIds,
     recorder: DelegationRecorder,
+    approval: Arc<FacadeApproval>,
     max_depth: u32,
 }
 
 impl DelegationToolHandler {
     /// Wraps `base`, routing calls the `route` recognizes through the subagent
     /// path and recording each delegation's trace into `recorder`.
+    ///
+    /// `approval` is the run's [`FacadeApproval`]; a managed external delegate is
+    /// gated through its
+    /// [`resolve_external_start`](FacadeApproval::resolve_external_start) before
+    /// it is driven (§9.2).
     pub(crate) fn new(
         base: ToolRegistryHandler,
         route: DelegationRoute,
@@ -1074,6 +1108,7 @@ impl DelegationToolHandler {
         supervisor_model: ModelRef,
         ids: FacadeIds,
         recorder: DelegationRecorder,
+        approval: Arc<FacadeApproval>,
     ) -> Self {
         Self {
             base,
@@ -1082,6 +1117,7 @@ impl DelegationToolHandler {
             supervisor_model,
             ids,
             recorder,
+            approval,
             max_depth: DEFAULT_MAX_DELEGATION_DEPTH,
         }
     }
@@ -1175,6 +1211,8 @@ impl DelegationToolHandler {
                     },
                     artifacts: Vec::new(),
                     is_external: false,
+                    approval_denied: false,
+                    session: None,
                 },
             );
     }
@@ -1199,6 +1237,26 @@ impl DelegationToolHandler {
         task: String,
         ctx: &RunContext,
     ) -> RequirementResult {
+        // Gate the external start at the drive layer (§9.2). The machine tool
+        // gate exempts the delegate's start tool, so this is the sole authority.
+        if !self.approval.resolve_external_start(&call.name) {
+            self.record_external(
+                &call_id,
+                delegate.name(),
+                DelegationStatus::Failed,
+                Usage::default(),
+                Vec::new(),
+                None,
+                true,
+            );
+            return RequirementResult::Tool(Err(ToolRuntimeError::ExecutionFailed {
+                tool_name: call.name.clone(),
+                message: format!(
+                    "managed external agent `{}` denied by approval policy",
+                    delegate.name()
+                ),
+            }));
+        }
         match drive_external(delegate.name(), delegate.agent(), &self.ids, task, ctx).await {
             Ok(outcome) => {
                 let status = if outcome.completed && !outcome.cleanup_required {
@@ -1213,6 +1271,8 @@ impl DelegationToolHandler {
                     status,
                     outcome.usage,
                     outcome.artifacts,
+                    outcome.session,
+                    false,
                 );
                 match status {
                     DelegationStatus::Completed => {
@@ -1234,6 +1294,8 @@ impl DelegationToolHandler {
                     DelegationStatus::Failed,
                     Usage::default(),
                     Vec::new(),
+                    None,
+                    false,
                 );
                 RequirementResult::Tool(Err(ToolRuntimeError::ExecutionFailed {
                     tool_name: call.name.clone(),
@@ -1243,8 +1305,9 @@ impl DelegationToolHandler {
         }
     }
 
-    /// Records one external delegation trace (with any reported artifacts) under
-    /// its framework call id.
+    /// Records one external delegation trace (with any reported artifacts and
+    /// resumable session) under its framework call id.
+    #[allow(clippy::too_many_arguments)]
     fn record_external(
         &self,
         call_id: &ToolCallId,
@@ -1252,6 +1315,8 @@ impl DelegationToolHandler {
         status: DelegationStatus,
         usage: Usage,
         artifacts: Vec<ArtifactRef>,
+        session: Option<ExternalSessionRef>,
+        approval_denied: bool,
     ) {
         self.recorder
             .lock()
@@ -1266,6 +1331,8 @@ impl DelegationToolHandler {
                     },
                     artifacts,
                     is_external: true,
+                    approval_denied,
+                    session,
                 },
             );
     }
@@ -2412,5 +2479,244 @@ mod model_routed_tests {
             .restore_conversation()
             .expect("rebuild child conversation");
         assert_eq!(rebuilt.turns().len(), turns_before);
+    }
+
+    /// Builds a supervisor client that delegates once to `ask_coder` then closes
+    /// with a final message, for the external approval/restore tests.
+    fn external_supervisor_client() -> Arc<RoutingClient> {
+        RoutingClient::new(vec![route(
+            "SUPERVISOR",
+            vec![
+                tool_call_response("del-1", "ask_coder", json!({ "task": "refactor" })),
+                text_response("Final: done."),
+            ],
+        )])
+    }
+
+    /// Builds a `coder` external agent whose scripted session completes.
+    fn completed_coder() -> crate::facade::ManagedExternalAgent {
+        crate::facade::ManagedExternalAgent::claude_code()
+            .session_handler(Arc::new(completed_external_handler(
+                "refactor complete",
+                "src/parser.rs",
+                Usage {
+                    input: 4,
+                    output: 2,
+                    ..Usage::default()
+                },
+            )))
+            .build()
+            .expect("managed external agent builds")
+    }
+
+    #[tokio::test]
+    async fn external_delegation_denied_by_auto_deny_surfaces_approval_denied() {
+        let mut agent = AgentBuilder::default()
+            .client(external_supervisor_client())
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(ApprovalPolicy::default().tool("ask_coder", Approval::auto_deny()))
+            .external_agent("coder", completed_coder())
+            .build()
+            .expect("agent builds");
+
+        let error = agent
+            .run_full("Please refactor.")
+            .await
+            .expect_err("an auto-denied external delegate fails the run");
+        assert!(
+            matches!(error, crate::facade::FacadeError::ApprovalDenied),
+            "auto_deny on the external start tool surfaces ApprovalDenied, got {error:?}"
+        );
+
+        // The denied external agent never drove a session, so no summary was
+        // folded back as a tool result.
+        assert!(
+            !tool_result_texts(&agent)
+                .iter()
+                .any(|text| text == "refactor complete"),
+            "a denied external delegate is not driven"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_delegation_denied_headless_when_ask_external_agents_has_no_handler() {
+        // `ask_external_agents` with an auto-allow default and no `ask` handler is
+        // a headless run: the external start is denied rather than left blocking.
+        let mut agent = AgentBuilder::default()
+            .client(external_supervisor_client())
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(ApprovalPolicy::from(Approval::auto_allow()).ask_external_agents())
+            .external_agent("coder", completed_coder())
+            .build()
+            .expect("agent builds");
+
+        let error = agent
+            .run_full("Please refactor.")
+            .await
+            .expect_err("a headless ask_external_agents run denies the external start");
+        assert!(
+            matches!(error, crate::facade::FacadeError::ApprovalDenied),
+            "headless ask_external_agents surfaces ApprovalDenied, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_delegation_approved_by_ask_handler_runs_to_completion() {
+        let approved = Arc::new(AtomicBool::new(false));
+        let approved_probe = approved.clone();
+        let policy = ApprovalPolicy::default().tool(
+            "ask_coder",
+            Approval::ask(move |request| {
+                if request.tool_name == "ask_coder" {
+                    approved_probe.store(true, Ordering::SeqCst);
+                    ApprovalDecision::Approve
+                } else {
+                    ApprovalDecision::Deny
+                }
+            }),
+        );
+
+        let mut agent = AgentBuilder::default()
+            .client(external_supervisor_client())
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(policy)
+            .external_agent("coder", completed_coder())
+            .build()
+            .expect("agent builds");
+
+        let output = agent.run_full("Please refactor.").await.unwrap();
+
+        assert!(
+            approved.load(Ordering::SeqCst),
+            "the external start consulted the ask handler"
+        );
+        assert_eq!(output.delegations.len(), 1);
+        assert_eq!(output.delegations[0].delegate, "coder");
+        assert_eq!(output.delegations[0].status, DelegationStatus::Completed);
+        assert!(
+            tool_result_texts(&agent)
+                .iter()
+                .any(|text| text == "refactor complete"),
+            "an approved external delegate is driven and folds its summary back"
+        );
+    }
+
+    #[tokio::test]
+    async fn driven_external_snapshot_is_data_only_with_session_facts() {
+        use crate::agent::external::ExternalRuntimeKind;
+        use crate::facade::ExternalDelegateStatus;
+
+        let mut agent = AgentBuilder::default()
+            .client(external_supervisor_client())
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .external_agent("coder", completed_coder())
+            .build()
+            .expect("agent builds");
+
+        agent.run_full("Please refactor.").await.unwrap();
+
+        let snapshot = agent.snapshot().expect("snapshot at a committed point");
+        assert_eq!(snapshot.external_delegates.len(), 1);
+        let delegate = &snapshot.external_delegates[0];
+        assert_eq!(delegate.name, "coder");
+        assert_eq!(delegate.runtime, ExternalRuntimeKind::ClaudeCode);
+        assert_eq!(delegate.status, ExternalDelegateStatus::Completed);
+
+        // The resumable session facts are captured as data (session id + resume
+        // token), and the reported artifact surfaces on the snapshot.
+        let session = delegate.session.as_ref().expect("a captured session ref");
+        assert_eq!(session.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(session.resume_token.as_deref(), Some("resume-1"));
+        assert_eq!(delegate.artifacts.len(), 1);
+        assert_eq!(delegate.artifacts[0].path, "src/parser.rs");
+
+        // The snapshot serializes to data only — no runtime handle or closure
+        // leaks into the persisted form — and round-trips exactly.
+        let json = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        assert!(
+            !json.contains("session_handler") && !json.contains("handler"),
+            "no runtime session handler leaks into the snapshot"
+        );
+        let restored: crate::facade::AgentSnapshot =
+            serde_json::from_str(&json).expect("deserialize snapshot");
+        assert_eq!(restored, snapshot);
+    }
+
+    #[tokio::test]
+    async fn restore_external_mark_interrupted_marks_the_delegate_interrupted() {
+        use crate::facade::ExternalDelegateStatus;
+
+        let mut agent = AgentBuilder::default()
+            .client(external_supervisor_client())
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .external_agent("coder", completed_coder())
+            .build()
+            .expect("agent builds");
+        agent.run_full("Please refactor.").await.unwrap();
+        let snapshot = agent.snapshot().expect("snapshot at a committed point");
+
+        // The default restore policy marks the delegate interrupted without
+        // touching any external runtime.
+        let restored = Agent::restore()
+            .snapshot(snapshot)
+            .client(external_supervisor_client())
+            .build()
+            .expect("restore rebuilds the agent");
+
+        // The restored agent re-advertises the external delegate, and a
+        // re-snapshot reports its reconciled interrupted status with the recorded
+        // session preserved.
+        assert_eq!(restored.external_agents().len(), 1);
+        assert_eq!(restored.external_agents()[0].name(), "coder");
+        let resnapshot = restored.snapshot().expect("re-snapshot the restored agent");
+        assert_eq!(resnapshot.external_delegates.len(), 1);
+        assert_eq!(
+            resnapshot.external_delegates[0].status,
+            ExternalDelegateStatus::Interrupted
+        );
+        assert_eq!(
+            resnapshot.external_delegates[0]
+                .session
+                .as_ref()
+                .and_then(|session| session.session_id.as_deref()),
+            Some("sess-1"),
+            "MarkInterrupted preserves the recorded session facts"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_external_attach_or_fail_errors_when_unattachable() {
+        use crate::facade::RestoreExternal;
+
+        let mut agent = AgentBuilder::default()
+            .client(external_supervisor_client())
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .external_agent("coder", completed_coder())
+            .build()
+            .expect("agent builds");
+        agent.run_full("Please refactor.").await.unwrap();
+        let snapshot = agent.snapshot().expect("snapshot at a committed point");
+
+        // AttachOrFail with no re-registered runtime (hence no session handler to
+        // attach with) is an explicit, non-silent failure.
+        let error = Agent::restore()
+            .snapshot(snapshot)
+            .client(external_supervisor_client())
+            .restore_external(RestoreExternal::AttachOrFail)
+            .build()
+            .expect_err("attach_or_fail without a re-registered runtime fails");
+        assert!(
+            matches!(error, crate::facade::FacadeError::InvalidState(_)),
+            "an unattachable AttachOrFail restore fails explicitly, got {error:?}"
+        );
     }
 }

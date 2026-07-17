@@ -228,7 +228,11 @@ impl ApprovalPolicy {
 
     /// Requires approval before a managed external agent runs (§9.2).
     ///
-    /// Recorded now; enforced when the managed-external stack lands (Milestone 4).
+    /// When set, a managed external delegate is gated before it starts: the
+    /// Agent facade defers to the policy default `ask` handler (denying headless)
+    /// unless a tool-level override or per-tool entry for that delegate's tool
+    /// name applies. A denial surfaces as
+    /// [`FacadeError::ApprovalDenied`](crate::facade::FacadeError::ApprovalDenied).
     #[must_use]
     pub fn ask_external_agents(mut self) -> Self {
         self.ask_external_agents = true;
@@ -237,7 +241,9 @@ impl ApprovalPolicy {
 
     /// Requires approval before an agent writes its worktree (§9.2).
     ///
-    /// Recorded now; enforced when the managed-external stack lands (Milestone 4).
+    /// Recorded for host inspection; managed external delegates already run in an
+    /// isolated throwaway worktree (`docs/managed-external-agent.md` §16), so this
+    /// flag is advisory for the managed path.
     #[must_use]
     pub fn ask_worktree_write(mut self) -> Self {
         self.ask_worktree_write = true;
@@ -321,6 +327,7 @@ pub struct FacadeApproval {
     tool_overrides: BTreeMap<String, Approval>,
     ask_external_agents: bool,
     ask_worktree_write: bool,
+    external_tools: std::collections::BTreeSet<String>,
     pending: Mutex<HashMap<ToolCallId, PendingDecision>>,
 }
 
@@ -334,8 +341,28 @@ impl FacadeApproval {
             tool_overrides: BTreeMap::new(),
             ask_external_agents: policy.ask_external_agents,
             ask_worktree_write: policy.ask_worktree_write,
+            external_tools: std::collections::BTreeSet::new(),
             pending: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Registers the model-routed tool names that start a managed external
+    /// delegate (`ask_<name>`), exempting them from the machine-level approval
+    /// gate (§9.2).
+    ///
+    /// The Agent facade drives external-delegate approval at the **drive** layer
+    /// through [`resolve_external_start`](Self::resolve_external_start), so the
+    /// machine gate must not double-prompt on the same call. Names registered
+    /// here therefore always report [`ApprovalRequirement::AutoApprove`] from the
+    /// machine's perspective; the sole authority is the drive gate.
+    #[must_use]
+    pub fn with_external_tools<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.external_tools = names.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Registers a tool-level [`Approval`] override.
@@ -366,6 +393,67 @@ impl FacadeApproval {
             .get(tool_name)
             .or_else(|| self.per_tool.get(tool_name))
             .unwrap_or(&self.default)
+    }
+
+    /// Decides synchronously whether a managed external delegate may start,
+    /// applying the §9.2 default-permission table.
+    ///
+    /// External-delegate start is gated at the drive layer (not the machine tool
+    /// gate) so a single call resolves to exactly one decision. The effective
+    /// tier is chosen as:
+    ///
+    /// 1. an explicit tool-level override or agent per-tool entry for
+    ///    `tool_name`, otherwise
+    /// 2. an *ask-deferred* tier when [`ask_external_agents`] is set (defer to
+    ///    the policy default handler, denying headless), otherwise
+    /// 3. the policy default tier.
+    ///
+    /// Any [`ask`](Approval::ask) handler is invoked synchronously here. Returns
+    /// `true` when the delegate may start and `false` when it is denied; a denial
+    /// surfaces as
+    /// [`FacadeError::ApprovalDenied`](crate::facade::FacadeError::ApprovalDenied).
+    ///
+    /// [`ask_external_agents`]: ApprovalPolicy::ask_external_agents
+    #[must_use]
+    pub fn resolve_external_start(&self, tool_name: &str) -> bool {
+        let explicit = self
+            .tool_overrides
+            .get(tool_name)
+            .or_else(|| self.per_tool.get(tool_name));
+        match explicit {
+            Some(approval) => self.decide_tier(tool_name, &approval.kind),
+            None if self.ask_external_agents => self.decide_ask_deferred(tool_name),
+            None => self.decide_tier(tool_name, &self.default.kind),
+        }
+    }
+
+    /// Resolves one approval tier to an allow/deny decision for an external start.
+    fn decide_tier(&self, tool_name: &str, kind: &ApprovalKind) -> bool {
+        match kind {
+            ApprovalKind::AutoAllow => true,
+            ApprovalKind::AutoDeny => false,
+            ApprovalKind::Ask(Some(handler)) => {
+                let request = ApprovalRequest {
+                    tool_name: tool_name.to_owned(),
+                };
+                handler(&request) == ApprovalDecision::Approve
+            }
+            ApprovalKind::Ask(None) => self.decide_ask_deferred(tool_name),
+        }
+    }
+
+    /// Resolves an ask-deferred tier by deferring to the policy default handler,
+    /// denying when the run is headless (no default handler).
+    fn decide_ask_deferred(&self, tool_name: &str) -> bool {
+        match &self.default.kind {
+            ApprovalKind::Ask(Some(handler)) => {
+                let request = ApprovalRequest {
+                    tool_name: tool_name.to_owned(),
+                };
+                handler(&request) == ApprovalDecision::Approve
+            }
+            _ => false,
+        }
     }
 
     /// Records the pending decision for one require-approval call.
@@ -431,12 +519,19 @@ impl fmt::Debug for FacadeApproval {
             .field("tool_overrides", &self.tool_overrides)
             .field("ask_external_agents", &self.ask_external_agents)
             .field("ask_worktree_write", &self.ask_worktree_write)
+            .field("external_tools", &self.external_tools)
             .finish_non_exhaustive()
     }
 }
 
 impl ToolApprovalPolicy for FacadeApproval {
     fn approval_requirement(&self, call_id: ToolCallId, call: &ToolCall) -> ApprovalRequirement {
+        // External-delegate start tools are gated at the drive layer
+        // (`resolve_external_start`); exempt them from the machine gate so the
+        // same start is never double-prompted (§9.2).
+        if self.external_tools.contains(&call.name) {
+            return ApprovalRequirement::AutoApprove;
+        }
         if matches!(self.resolve(&call.name).kind, ApprovalKind::AutoAllow) {
             return ApprovalRequirement::AutoApprove;
         }

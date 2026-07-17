@@ -133,6 +133,7 @@ pub(super) fn start(
                 agent.supervisor_model(),
                 agent.ids.clone(),
                 recorder.clone(),
+                agent.approval.clone(),
             ),
             recorder: recorder.clone(),
             sink: sink.clone(),
@@ -147,6 +148,13 @@ pub(super) fn start(
     let future = Box::pin(async move {
         let done = drain(machine, agent_input, &scope, None, &ctx).await?;
         let collected = collect_traces(done.notifications(), &recorder);
+        // A denied external delegate surfaces as a run-level error, matching
+        // `run_full` (§9.2). Retention of external session facts is not possible
+        // on the streaming path (the future holds `&mut machine` for the stream's
+        // lifetime), so a snapshot is taken between runs via `run_full`.
+        if collected.external_approval_denied {
+            return Err(FacadeError::ApprovalDenied);
+        }
         match done.cursor() {
             LoopCursor::Done(_) => {
                 let (text, usage, stop_reason) = final_turn_summary(machine.state().conversation());

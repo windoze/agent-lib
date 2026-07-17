@@ -64,7 +64,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::agent::external::{
     ExternalAgentMachine, ExternalAgentSpec, ExternalAgentState, ExternalArtifactRef,
-    ExternalSessionPolicy, ExternalStreamPolicy, WorktreeIsolation,
+    ExternalSessionPolicy, ExternalSessionRef, ExternalStreamPolicy, WorktreeIsolation,
 };
 use crate::agent::{
     AgentError, AgentId, AgentInput, AgentMachine, AgentSpecRef, DrivingSubagentHandler,
@@ -445,6 +445,41 @@ impl ManagedExternalAgent {
     pub(crate) fn session_handler(&self) -> Option<&Arc<dyn ExternalSessionHandler>> {
         self.session_handler.as_ref()
     }
+
+    /// Reconstructs a data-only recipe from restored [`AgentSnapshot`] parts.
+    ///
+    /// A snapshot restores an external delegate's data (runtime, mode, worktree,
+    /// model, args, permission mode) but never its runtime session handler,
+    /// binary override, or credentials (§15.2). This rebuilds the data-only
+    /// recipe without a session handler (re-supplied on restore through
+    /// [`AgentRestoreBuilder::external_agent`](crate::facade::AgentRestoreBuilder::external_agent))
+    /// and without re-validating the run mode: the spec was already validated
+    /// when the agent was first built, and the true capabilities are re-probed
+    /// only when the delegate is actually driven (§11.3). The capability baseline
+    /// stored here is the runtime's conservative declared set.
+    #[must_use]
+    pub(crate) fn from_restored_parts(
+        runtime: ExternalRuntimeKind,
+        mode: ExternalRunMode,
+        worktree: Option<WorktreeRef>,
+        model: Option<String>,
+        args: Vec<String>,
+        permission_mode: ExternalPermissionMode,
+    ) -> Self {
+        let capabilities =
+            ExternalAgentCapabilities::from_runtime_capabilities(declared_capabilities(&runtime));
+        Self {
+            runtime,
+            mode,
+            capabilities,
+            worktree,
+            binary: None,
+            model,
+            args,
+            permission_mode,
+            session_handler: None,
+        }
+    }
 }
 
 /// Builder for a [`ManagedExternalAgent`], reached through a preset constructor.
@@ -758,6 +793,127 @@ impl ManagedExternalDelegate {
     }
 }
 
+/// The policy for reconciling a managed external delegate's previously-live
+/// session when an [`Agent`](crate::facade::Agent) is restored from an
+/// [`AgentSnapshot`](crate::facade::AgentSnapshot) (`docs/facade-api.md` §15.3,
+/// `PLAN.md` R6).
+///
+/// An [`AgentSnapshot`](crate::facade::AgentSnapshot) captures only *data* about
+/// a managed external delegate's last-known session (its runtime kind, worktree,
+/// session id, last status, artifact and transcript refs) — never the live
+/// process, SDK client, or credentials (§15.2). When such a snapshot is
+/// restored, the previously-live external runtime is gone, so the caller must
+/// declare how to reconcile it:
+///
+/// - [`MarkInterrupted`](Self::MarkInterrupted) (the default) records the
+///   delegate as interrupted and does **not** touch the external runtime, so the
+///   caller can inspect [`RunOutput`](crate::facade::RunOutput) or the snapshot
+///   and decide to continue, cancel, manually repair, or restart. This is the
+///   safe default because a coding agent may already have changed the worktree,
+///   so a blind restart is risky (R6).
+/// - [`AttachOrFail`](Self::AttachOrFail) re-attaches to the recorded session and
+///   fails fast if it cannot (no re-registered runtime handler, no resumable
+///   session, or a runtime that does not support resume). Reserved for read-only
+///   / resumable external agents where re-attaching is safe (R6).
+/// - [`RestartFromBrief`](Self::RestartFromBrief) discards the recorded session
+///   and lets the next run start the delegate afresh from its task brief.
+///
+/// ```
+/// use agent_lib::facade::RestoreExternal;
+///
+/// // The safe default leaves the external runtime untouched.
+/// assert_eq!(RestoreExternal::default(), RestoreExternal::MarkInterrupted);
+/// assert_eq!(RestoreExternal::AttachOrFail.as_str(), "attach_or_fail");
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreExternal {
+    /// Re-attach to the recorded session; fail fast if it cannot be attached.
+    AttachOrFail,
+    /// Mark the delegate interrupted without touching the external runtime
+    /// (the safe default).
+    #[default]
+    MarkInterrupted,
+    /// Discard the recorded session and start the delegate afresh next run.
+    RestartFromBrief,
+}
+
+impl RestoreExternal {
+    /// Returns the stable snake_case label of this policy.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AttachOrFail => "attach_or_fail",
+            Self::MarkInterrupted => "mark_interrupted",
+            Self::RestartFromBrief => "restart_from_brief",
+        }
+    }
+}
+
+impl std::fmt::Display for RestoreExternal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The last-known lifecycle status of a managed external delegate's session, as
+/// captured in an [`AgentSnapshot`](crate::facade::AgentSnapshot) (data-only,
+/// §15.2).
+///
+/// This is a coarse, serializable status a host can inspect after a restore to
+/// decide how to proceed; it carries no runtime handle or credential.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalDelegateStatus {
+    /// No session has been driven for this delegate yet.
+    #[default]
+    Pending,
+    /// The last driven session completed cleanly.
+    Completed,
+    /// The last driven session failed or was cancel-abandoned.
+    Failed,
+    /// The session was marked interrupted by an
+    /// [`AgentSnapshot`](crate::facade::AgentSnapshot) restore under
+    /// [`RestoreExternal::MarkInterrupted`].
+    Interrupted,
+}
+
+impl ExternalDelegateStatus {
+    /// Returns the stable snake_case label of this status.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+impl std::fmt::Display for ExternalDelegateStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The retained last-known session facts for one managed external delegate.
+///
+/// The [`Agent`](crate::facade::Agent) updates this after a `run_full` drive so a
+/// later [`snapshot`](crate::facade::Agent::snapshot) can persist the delegate's
+/// data-only session state (status, resumable [`ExternalSessionRef`], and any
+/// reported [`ArtifactRef`]s). It never holds a process handle, SDK client, or
+/// credential.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RetainedExternalSession {
+    /// The delegate's last-known coarse status.
+    pub status: ExternalDelegateStatus,
+    /// The resumable session facts reported by the last drive, if any.
+    pub session: Option<ExternalSessionRef>,
+    /// Artifacts reported by the last completed drive, in order.
+    pub artifacts: Vec<ArtifactRef>,
+}
+
 /// The facts captured from a driven external delegation.
 ///
 /// A [`RecordingExternalMachine`] snapshots these off the
@@ -776,6 +932,10 @@ pub(crate) struct ExternalDriveOutcome {
     /// Whether the abandoned session left a live runtime for the handle layer to
     /// sweep (the cancel cleanup marker, design §6.4).
     pub cleanup_required: bool,
+    /// The resumable session facts the runtime reported, if any. Captured so a
+    /// later [`Agent`](crate::facade::Agent) snapshot can persist the delegate's
+    /// data-only session id / transcript / resume token (§15.2).
+    pub session: Option<ExternalSessionRef>,
 }
 
 /// A shared, single-slot capture of an [`ExternalDriveOutcome`].
@@ -809,6 +969,7 @@ impl AgentMachine for RecordingExternalMachine {
             artifacts,
             completed,
             cleanup_required: state.cleanup_required(),
+            session: state.session().cloned(),
         });
         outcome
     }

@@ -58,7 +58,9 @@ use crate::facade::delegate::{
     LocalSubagent, new_delegation_recorder,
 };
 use crate::facade::error::FacadeError;
-use crate::facade::external::{ManagedExternalAgent, ManagedExternalDelegate};
+use crate::facade::external::{
+    ExternalDelegateStatus, ManagedExternalAgent, ManagedExternalDelegate, RetainedExternalSession,
+};
 use crate::facade::ids::FacadeIds;
 use crate::facade::run::{
     ArtifactRef, DelegationStatus, DelegationTrace, IntoUserMessage, Reply, RunEvent, RunOutput,
@@ -76,7 +78,7 @@ mod stream;
 
 pub use snapshot::{
     AgentParts, AgentRestoreBuilder, AgentSnapshot, AgentStateSnapshot, BlackboardSnapshot,
-    DelegateSnapshot, DelegationSnapshot, MailboxSnapshot,
+    DelegateSnapshot, DelegationSnapshot, ExternalDelegateSnapshot, MailboxSnapshot,
 };
 pub use stream::AgentRunStream;
 
@@ -130,6 +132,10 @@ pub struct Agent {
     delegates: Vec<LocalSubagent>,
     external_agents: Vec<ManagedExternalDelegate>,
     delegation: Delegation,
+    /// The last-known data-only session facts for each managed external delegate,
+    /// keyed by delegate name, refreshed after every `run_full` drive so a later
+    /// [`snapshot`](Agent::snapshot) can persist them (§15.2).
+    last_external_sessions: HashMap<String, RetainedExternalSession>,
 }
 
 impl std::fmt::Debug for Agent {
@@ -273,6 +279,7 @@ impl Agent {
                 self.supervisor_model(),
                 self.ids.clone(),
                 recorder.clone(),
+                self.approval.clone(),
             ),
             interaction: self.approval.clone(),
         };
@@ -287,6 +294,16 @@ impl Agent {
 
         let done = drain(&mut self.machine, agent_input, &scope, None, &ctx).await?;
         let collected = collect_traces(done.notifications(), &recorder);
+
+        // Refresh the retained per-delegate external session facts so a later
+        // snapshot can persist them (§15.2), then surface an external-delegate
+        // denial as a run-level error (§9.2).
+        for (name, session) in collected.external_sessions {
+            self.last_external_sessions.insert(name, session);
+        }
+        if collected.external_approval_denied {
+            return Err(FacadeError::ApprovalDenied);
+        }
 
         match done.cursor() {
             LoopCursor::Done(_) => {
@@ -436,7 +453,13 @@ impl Agent {
     /// [`run`](Agent::run) commits before returning, so the agent rests at a
     /// snapshot-able point.
     pub fn snapshot(&self) -> Result<AgentSnapshot, FacadeError> {
-        AgentSnapshot::capture(self.machine.state(), &self.delegates, &self.delegation)
+        AgentSnapshot::capture(
+            self.machine.state(),
+            &self.delegates,
+            &self.external_agents,
+            &self.last_external_sessions,
+            &self.delegation,
+        )
     }
 
     /// Starts a fluent [`AgentRestoreBuilder`] that rebuilds an [`Agent`] from an
@@ -821,8 +844,15 @@ impl AgentBuilder {
 
         // One FacadeApproval bridges both runtime roles: it is the machine's pure
         // ToolApprovalPolicy and the scope's InteractionHandler, sharing one
-        // pending-decision map through a single Arc.
-        let approval = build_facade_approval(self.approval.unwrap_or_default(), &self.tools);
+        // pending-decision map through a single Arc. The model-routed external
+        // start tools are registered so the machine gate exempts them and the
+        // drive layer is the sole approval authority for external delegates.
+        let external_tool_names = delegation.external_tool_names(&self.external_agents);
+        let approval = build_facade_approval(
+            self.approval.unwrap_or_default(),
+            &self.tools,
+            external_tool_names,
+        );
 
         let machine = assemble_machine(state, &ids, approval.clone());
 
@@ -837,20 +867,28 @@ impl AgentBuilder {
             delegates: self.delegates,
             external_agents: self.external_agents,
             delegation,
+            last_external_sessions: HashMap::new(),
         })
     }
 }
 
-/// Builds the shared [`FacadeApproval`] bridge from an agent-level policy and the
-/// per-tool overrides carried on each typed [`Tool`].
+/// Builds the shared [`FacadeApproval`] bridge from an agent-level policy, the
+/// per-tool overrides carried on each typed [`Tool`], and the model-routed
+/// external start-tool names to exempt from the machine gate.
 ///
 /// A tool-level [`Approval`](crate::facade::Approval) override wins over the
 /// agent-level entry for the same name (`docs/facade-api.md` §9.1). The returned
 /// value is shared behind one [`Arc`] so the machine (as
 /// [`ToolApprovalPolicy`]) and the drive scope (as [`InteractionHandler`])
-/// observe the same pending-decision map.
-fn build_facade_approval(policy: ApprovalPolicy, tools: &[Tool]) -> Arc<FacadeApproval> {
-    let mut approval = FacadeApproval::new(policy);
+/// observe the same pending-decision map. `external_tools` names the model-routed
+/// `ask_<name>` delegate start tools; they are gated at the drive layer, so the
+/// machine gate exempts them to avoid double-prompting (§9.2).
+fn build_facade_approval(
+    policy: ApprovalPolicy,
+    tools: &[Tool],
+    external_tools: Vec<String>,
+) -> Arc<FacadeApproval> {
+    let mut approval = FacadeApproval::new(policy).with_external_tools(external_tools);
     for tool in tools {
         if let Some(tool_approval) = tool.approval_override() {
             approval = approval.with_tool_override(tool.name(), tool_approval.clone());
@@ -952,6 +990,13 @@ pub(crate) struct CollectedTraces {
     pub artifacts: Vec<ArtifactRef>,
     /// The ordered normalized events for the run.
     pub events: Vec<RunEvent>,
+    /// Whether any managed external delegate was denied before it started by the
+    /// approval policy (§9.2). The Agent facade folds this into a run-level
+    /// [`FacadeError::ApprovalDenied`].
+    pub external_approval_denied: bool,
+    /// The last-known data-only session facts for each managed external delegate
+    /// driven this run, keyed by delegate name, for snapshot retention (§15.2).
+    pub external_sessions: HashMap<String, RetainedExternalSession>,
 }
 
 /// Projects the drained tool notifications into per-call traces and UI events,
@@ -983,6 +1028,29 @@ pub(crate) fn collect_traces(
     let mut artifacts = Vec::new();
     let mut events = Vec::new();
     let mut names: HashMap<String, String> = HashMap::new();
+    let mut external_approval_denied = false;
+    let mut external_sessions: HashMap<String, RetainedExternalSession> = HashMap::new();
+
+    for record in recorded.values() {
+        if !record.is_external {
+            continue;
+        }
+        if record.approval_denied {
+            external_approval_denied = true;
+        }
+        let status = match record.trace.status {
+            DelegationStatus::Completed => ExternalDelegateStatus::Completed,
+            DelegationStatus::Failed => ExternalDelegateStatus::Failed,
+        };
+        external_sessions.insert(
+            record.trace.delegate.clone(),
+            RetainedExternalSession {
+                status,
+                session: record.session.clone(),
+                artifacts: record.artifacts.clone(),
+            },
+        );
+    }
 
     for notification in notifications {
         match notification {
@@ -1035,6 +1103,8 @@ pub(crate) fn collect_traces(
         external_usage,
         artifacts,
         events,
+        external_approval_denied,
+        external_sessions,
     }
 }
 

@@ -21,11 +21,13 @@
 //! base agent path produces empty slices there so the struct shape is stable
 //! now.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{AgentSpec, AgentState, PlanSnapshot, ToolRegistry, ToolSetRef};
+use crate::agent::external::{ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionRef};
+use crate::agent::{AgentSpec, AgentState, PlanSnapshot, ToolRegistry, ToolSetRef, WorktreeRef};
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationSnapshot};
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
@@ -33,6 +35,10 @@ use crate::facade::chat::client_for_provider;
 use crate::facade::config::ProviderConfig;
 use crate::facade::delegate::{Delegation, LocalSubagent};
 use crate::facade::error::FacadeError;
+use crate::facade::external::{
+    ExternalDelegateStatus, ExternalRunMode, ManagedExternalAgent, ManagedExternalDelegate,
+    RestoreExternal, RetainedExternalSession,
+};
 use crate::facade::ids::FacadeIds;
 use crate::facade::run::ArtifactRef;
 use crate::facade::tool::{Tool, ensure_unique_tool_names};
@@ -44,9 +50,11 @@ use super::{Agent, assemble_machine, build_facade_approval};
 ///
 /// Beyond the [`supervisor`](Self::supervisor) conversation and the
 /// [`agent_state`](Self::agent_state), the snapshot carries the registered local
-/// subagent [`delegates`](Self::delegates) (data-only recipes) and the
+/// subagent [`delegates`](Self::delegates) (data-only recipes), the registered
+/// managed [`external_delegates`](Self::external_delegates) (data-only recipes
+/// plus their last-known session facts), and the
 /// [`delegation`](Self::delegation) routing mode, so a restored agent
-/// re-advertises and re-routes to the same subagents (`docs/facade-api.md`
+/// re-advertises and re-routes to the same delegates (`docs/facade-api.md`
 /// §15.2). The [`pending_delegations`](Self::pending_delegations) slice captures
 /// any in-progress child conversation; the synchronous one-shot delegation drive
 /// never rests with a child in flight at a committed snapshot point, so it is
@@ -70,6 +78,10 @@ pub struct AgentSnapshot {
     /// The registered local subagent delegates, as data-only recipes (their
     /// runtime approval handlers are omitted, §15.2).
     pub delegates: Vec<DelegateSnapshot>,
+    /// The registered managed external delegates, as data-only recipes plus
+    /// their last-known session facts (their runtime session handlers and
+    /// credentials are omitted, §15.2).
+    pub external_delegates: Vec<ExternalDelegateSnapshot>,
     /// The delegation routing mode, so a restored agent re-routes delegation
     /// calls exactly as it did before the snapshot.
     pub delegation: Delegation,
@@ -88,20 +100,25 @@ pub struct AgentSnapshot {
 }
 
 impl AgentSnapshot {
-    /// Captures a data-only snapshot of `state`, its registered `delegates`, and
+    /// Captures a data-only snapshot of `state`, its registered `delegates`,
+    /// `external` delegates (folding in their retained `external_sessions`), and
     /// the `delegation` routing mode.
     ///
     /// The supervisor conversation is snapshotted first so an in-flight
     /// (uncommitted) turn surfaces as a clean [`FacadeError::Conversation`]
-    /// before the whole state is serialized. Each delegate is captured as a
+    /// before the whole state is serialized. Each local delegate is captured as a
     /// data-only [`DelegateSnapshot`] (its approval handler, a runtime handle, is
-    /// deliberately dropped). `pending_delegations` is empty: a delegation is
-    /// driven to completion within one supervisor turn, so no child is in flight
-    /// at the committed point a snapshot requires. No task brief is written to
-    /// the snapshot (`PLAN.md` R5).
+    /// deliberately dropped); each external delegate is captured as a data-only
+    /// [`ExternalDelegateSnapshot`] (its session handler, credentials, and any
+    /// process handle are dropped, §15.2). `pending_delegations` is empty: a
+    /// delegation is driven to completion within one supervisor turn, so no child
+    /// is in flight at the committed point a snapshot requires. No task brief is
+    /// written to the snapshot (`PLAN.md` R5).
     pub(super) fn capture(
         state: &AgentState,
         delegates: &[LocalSubagent],
+        external: &[ManagedExternalDelegate],
+        external_sessions: &HashMap<String, RetainedExternalSession>,
         delegation: &Delegation,
     ) -> Result<Self, FacadeError> {
         let supervisor = state.conversation().snapshot()?;
@@ -110,6 +127,15 @@ impl AgentSnapshot {
             supervisor,
             agent_state,
             delegates: delegates.iter().map(DelegateSnapshot::capture).collect(),
+            external_delegates: external
+                .iter()
+                .map(|delegate| {
+                    ExternalDelegateSnapshot::capture(
+                        delegate,
+                        external_sessions.get(delegate.name()),
+                    )
+                })
+                .collect(),
             delegation: delegation.clone(),
             pending_delegations: Vec::new(),
             mailbox: None,
@@ -194,6 +220,91 @@ impl DelegateSnapshot {
             approval,
             self.inherit_model,
         )
+    }
+}
+
+/// A data-only snapshot of one registered managed external delegate.
+///
+/// It captures the delegate's stable recipe data — its registration `name`, the
+/// backing `runtime` kind, validated run `mode`, optional `worktree`, pinned
+/// `model`, launch `args`, and `permission_mode` — plus the delegate's last-known
+/// data-only session facts: a coarse [`status`](Self::status), any resumable
+/// [`session`](Self::session) reference, and the [`artifacts`](Self::artifacts)
+/// its last drive reported. It never carries the runtime session handler, the SDK
+/// client, a process handle, credentials, or the raw task brief (`PLAN.md` R5,
+/// §15.2). It is `PartialEq` but not `Eq` only for symmetry with the rest of the
+/// snapshot tree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalDelegateSnapshot {
+    /// The delegate's registration name (the `ask_<name>` stem).
+    pub name: String,
+    /// The backing external runtime kind.
+    pub runtime: ExternalRuntimeKind,
+    /// The validated run mode.
+    pub mode: ExternalRunMode,
+    /// The worktree the runtime was confined to, if one was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeRef>,
+    /// The pinned model, if one was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The extra launch arguments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// The permission mode applied to gated actions.
+    pub permission_mode: ExternalPermissionMode,
+    /// The delegate's last-known coarse session status.
+    pub status: ExternalDelegateStatus,
+    /// The resumable session facts the delegate's last drive reported, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ExternalSessionRef>,
+    /// Artifacts the delegate's last completed drive reported, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactRef>,
+}
+
+impl ExternalDelegateSnapshot {
+    /// Captures a data-only snapshot of `delegate`, folding in its last-known
+    /// `session` facts (session handler and credentials dropped, §15.2).
+    #[must_use]
+    pub(super) fn capture(
+        delegate: &ManagedExternalDelegate,
+        session: Option<&RetainedExternalSession>,
+    ) -> Self {
+        let agent = delegate.agent();
+        Self {
+            name: delegate.name().to_owned(),
+            runtime: agent.runtime().clone(),
+            mode: agent.mode(),
+            worktree: agent.worktree().cloned(),
+            model: agent.model().map(ToOwned::to_owned),
+            args: agent.args().to_vec(),
+            permission_mode: agent.permission_mode(),
+            status: session.map(|retained| retained.status).unwrap_or_default(),
+            session: session.and_then(|retained| retained.session.clone()),
+            artifacts: session
+                .map(|retained| retained.artifacts.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Rebuilds a data-first [`ManagedExternalDelegate`] recipe from the snapshot,
+    /// without the runtime session handler a snapshot cannot carry (§15.2).
+    ///
+    /// The rebuilt delegate re-advertises and re-routes exactly like the original
+    /// but cannot be driven until a runtime session handler is re-supplied through
+    /// [`AgentRestoreBuilder::external_agent`](super::AgentRestoreBuilder::external_agent).
+    #[must_use]
+    pub(super) fn to_delegate(&self) -> ManagedExternalDelegate {
+        let agent = ManagedExternalAgent::from_restored_parts(
+            self.runtime.clone(),
+            self.mode,
+            self.worktree.clone(),
+            self.model.clone(),
+            self.args.clone(),
+            self.permission_mode,
+        );
+        ManagedExternalDelegate::new(self.name.clone(), agent)
     }
 }
 
@@ -330,6 +441,8 @@ pub struct AgentRestoreBuilder {
     approval: Option<ApprovalPolicy>,
     ids: Option<FacadeIds>,
     subagent_overrides: Vec<LocalSubagent>,
+    external_overrides: Vec<ManagedExternalDelegate>,
+    restore_external: RestoreExternal,
 }
 
 impl std::fmt::Debug for AgentRestoreBuilder {
@@ -354,6 +467,15 @@ impl std::fmt::Debug for AgentRestoreBuilder {
                     .map(LocalSubagent::name)
                     .collect::<Vec<_>>(),
             )
+            .field(
+                "external_overrides",
+                &self
+                    .external_overrides
+                    .iter()
+                    .map(ManagedExternalDelegate::name)
+                    .collect::<Vec<_>>(),
+            )
+            .field("restore_external", &self.restore_external)
             .finish_non_exhaustive()
     }
 }
@@ -445,6 +567,37 @@ impl AgentRestoreBuilder {
         self
     }
 
+    /// Re-registers a managed external delegate, re-supplying the runtime
+    /// attachment (session handler, credentials) a snapshot deliberately omits.
+    ///
+    /// A snapshot restores each external delegate's data-only recipe and its
+    /// last-known session facts, but never its runtime session handler (§15.2).
+    /// Pass a freshly built [`ManagedExternalAgent`] here — with a
+    /// [`session_handler`](crate::facade::ManagedExternalAgentBuilder::session_handler)
+    /// when the delegate must be driven or attached — to re-supply that runtime
+    /// attachment. The `name` is stamped onto `agent` exactly as
+    /// [`AgentBuilder::external_agent`](super::AgentBuilder::external_agent) does.
+    /// Re-registration is **required** for
+    /// [`RestoreExternal::AttachOrFail`](crate::facade::RestoreExternal::AttachOrFail).
+    #[must_use]
+    pub fn external_agent(mut self, name: impl Into<String>, agent: ManagedExternalAgent) -> Self {
+        self.external_overrides
+            .push(ManagedExternalDelegate::new(name, agent));
+        self
+    }
+
+    /// Sets the policy that reconciles each managed external delegate's recorded
+    /// session on restore (`docs/facade-api.md` §15.3).
+    ///
+    /// Defaults to [`RestoreExternal::MarkInterrupted`], which marks each restored
+    /// delegate interrupted without touching any external runtime — the safe
+    /// default, since a coding agent may already have changed a worktree.
+    #[must_use]
+    pub const fn restore_external(mut self, policy: RestoreExternal) -> Self {
+        self.restore_external = policy;
+        self
+    }
+
     /// Finalizes the builder, rebuilding the [`Agent`] from the snapshot.
     ///
     /// # Errors
@@ -487,7 +640,70 @@ impl AgentRestoreBuilder {
             .ids
             .unwrap_or_else(|| FacadeIds::continuing_after(state.conversation()));
 
-        let approval = build_facade_approval(self.approval.unwrap_or_default(), &self.tools);
+        // Rebuild the registered external delegates from their data-only
+        // snapshots (a snapshot cannot carry the runtime session handler, §15.2),
+        // then apply the caller's re-registrations (which re-supply that handler),
+        // replacing the persisted recipe of the same name in place — symmetric to
+        // the local-subagent restore above.
+        let mut external_agents: Vec<ManagedExternalDelegate> = snapshot
+            .external_delegates
+            .iter()
+            .map(ExternalDelegateSnapshot::to_delegate)
+            .collect();
+        for override_delegate in self.external_overrides {
+            match external_agents
+                .iter_mut()
+                .find(|existing| existing.name() == override_delegate.name())
+            {
+                Some(existing) => *existing = override_delegate,
+                None => external_agents.push(override_delegate),
+            }
+        }
+
+        // Reconcile each snapshotted delegate's recorded session under the chosen
+        // `restore_external` policy (§15.3).
+        let mut last_external_sessions: HashMap<String, RetainedExternalSession> = HashMap::new();
+        for snap in &snapshot.external_delegates {
+            let retained = match self.restore_external {
+                RestoreExternal::MarkInterrupted => RetainedExternalSession {
+                    status: ExternalDelegateStatus::Interrupted,
+                    session: snap.session.clone(),
+                    artifacts: snap.artifacts.clone(),
+                },
+                RestoreExternal::RestartFromBrief => RetainedExternalSession {
+                    status: ExternalDelegateStatus::Pending,
+                    session: None,
+                    artifacts: Vec::new(),
+                },
+                RestoreExternal::AttachOrFail => {
+                    let attachable = external_agents
+                        .iter()
+                        .find(|delegate| delegate.name() == snap.name)
+                        .is_some_and(|delegate| delegate.agent().session_handler().is_some());
+                    if !attachable || snap.session.is_none() {
+                        return Err(FacadeError::InvalidState(format!(
+                            "restore_external(attach_or_fail): external delegate `{}` cannot be \
+                             attached; re-register it with `.external_agent(name, ..)` carrying a \
+                             session handler and ensure the snapshot has a resumable session",
+                            snap.name
+                        )));
+                    }
+                    RetainedExternalSession {
+                        status: snap.status,
+                        session: snap.session.clone(),
+                        artifacts: snap.artifacts.clone(),
+                    }
+                }
+            };
+            last_external_sessions.insert(snap.name.clone(), retained);
+        }
+
+        let external_tool_names = snapshot.delegation.external_tool_names(&external_agents);
+        let approval = build_facade_approval(
+            self.approval.unwrap_or_default(),
+            &self.tools,
+            external_tool_names,
+        );
         let machine = assemble_machine(state, &ids, approval.clone());
 
         // Rebuild the registered delegates from their data-only snapshots,
@@ -520,11 +736,14 @@ impl AgentRestoreBuilder {
             ids,
             delegates,
             // External delegates are a runtime attachment (their session handler
-            // is never serialized); the snapshot carries none, so a restored
-            // agent starts with an empty external-delegate table until the caller
-            // re-registers one. Persisted external snapshot/restore is M4-3.
-            external_agents: Vec::new(),
+            // is never serialized). The snapshot carries only data-only recipes
+            // plus last-known session facts; the caller re-supplies each runtime
+            // through `.external_agent(name, ..)`, and the recorded sessions are
+            // reconciled into `last_external_sessions` under the `restore_external`
+            // policy above (§15.2, §15.3).
+            external_agents,
             delegation: snapshot.delegation,
+            last_external_sessions,
         })
     }
 }
