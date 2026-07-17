@@ -100,6 +100,28 @@ pub enum FacadeError {
         name: String,
     },
 
+    /// A managed external agent requested a run mode its runtime cannot fulfill.
+    ///
+    /// Raised at build time by
+    /// [`ManagedExternalAgentBuilder::build`](crate::facade::ManagedExternalAgentBuilder::build)
+    /// when the requested [`ExternalRunMode`](crate::facade::ExternalRunMode)
+    /// needs a managed capability the target runtime does not advertise (see
+    /// `docs/facade-api.md` §11.3). Rather than silently pretending a runtime
+    /// supports host-tool injection or resume, construction fails fast so a host
+    /// can pick a supported mode or a different runtime.
+    #[error(
+        "external runtime `{runtime}` does not support run mode `{mode}` \
+         (missing capabilities: {missing})"
+    )]
+    UnsupportedExternalMode {
+        /// Stable label of the runtime that could not fulfill the mode.
+        runtime: String,
+        /// Stable label of the requested run mode.
+        mode: &'static str,
+        /// Comma-separated capabilities the runtime is missing for the mode.
+        missing: String,
+    },
+
     /// The facade was driven into a state its API cannot service.
     #[error("facade invalid state: {0}")]
     InvalidState(String),

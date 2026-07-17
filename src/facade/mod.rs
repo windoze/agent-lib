@@ -26,7 +26,9 @@
 //! then the approval surface ([`Approval`], [`ApprovalPolicy`],
 //! [`ApprovalDecision`]) in [`approval`]. Milestone 3 adds the local subagent
 //! surface ([`Agent::worker`], [`LocalSubagent`], [`Delegation`]) in
-//! [`delegate`].
+//! [`delegate`]. Milestone 4 begins the managed-external-agent surface
+//! ([`ManagedExternalAgent`], [`ExternalRunMode`], [`ExternalAgentCapabilities`])
+//! in [`external`].
 
 pub mod agent;
 pub mod approval;
@@ -34,6 +36,7 @@ pub mod chat;
 pub mod config;
 pub mod delegate;
 pub mod error;
+pub mod external;
 pub mod ids;
 pub mod run;
 pub mod tool;
@@ -47,6 +50,9 @@ pub use chat::{Chat, ChatBuilder, ChatSession, ChatSessionBuilder, RunStream};
 pub use config::{ModelConfig, ProviderConfig, ProviderConfigBuilder};
 pub use delegate::{AgentWorkerBuilder, Delegation, LocalSubagent};
 pub use error::FacadeError;
+pub use external::{
+    ExternalAgentCapabilities, ExternalRunMode, ManagedExternalAgent, ManagedExternalAgentBuilder,
+};
 pub use ids::FacadeIds;
 pub use run::{
     ApprovalRequest, ArtifactRef, DelegationMessage, DelegationProgress, DelegationStatus,
