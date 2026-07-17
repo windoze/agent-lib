@@ -9,8 +9,13 @@
   把一次会话建模成可校验、可分支、可投影 / 压缩、可快照恢复的历史。
 - **Agent 层** —— 在 Conversation 之上提供 sans-io 的状态机（`AgentMachine`），把每个副作用
   reify 成可寻址的 `Requirement`，由 driver 兑现后折回同一个 Conversation。
+- **Facade 层** —— 在上述三层之上的 batteries-included 装配层（`agent_lib::facade` +
+  `agent_lib::prelude`），让常见的聊天、工具 agent、subagent、managed external agent、
+  dispatcher 场景不必手写 `Conversation` pending 事务、`AgentMachine`、`HandlerScope` 与
+  driver wiring。它内部仍复用 `Conversation` + `DefaultAgentMachine` + `Requirement`，
+  不绕过底层不变量（`docs/facade-api.md` §2.1、§19）。
 
-保留 provider 原始值与尚未建模的字段，是贯穿三层的一个设计原则：上层逻辑永远不需要绑定
+保留 provider 原始值与尚未建模的字段，是贯穿各层的一个设计原则：上层逻辑永远不需要绑定
 特定厂商的 wire 细节。
 
 ## 模块概览
@@ -23,6 +28,8 @@
 | `adapter` | Anthropic Messages 与 OpenAI Responses 的 HTTP / SSE 适配器。 |
 | `conversation` | 强类型 identity、`Conversation`、`PendingTurn` 事务、`Boundary`、fork、projection / compaction、snapshot / restore。 |
 | `agent` | data-only 的 Agent 配置与状态、sans-io `AgentMachine`、`Requirement` 副作用模型和参考 driver;`agent::collab` 提供 plan / blackboard / mailbox 协作原语与桥接工具 adapter;`agent::external` 提供外部 coding-agent 会话、混合调度器(`Dispatcher`)与 cheap→strong 升级 / verifier(`Escalator`)。 |
+| `facade` | batteries-included 装配层：`Chat` / `ChatSession`、工具 `Agent`（typed `Tool` + 三档 `Approval`）、local subagent 与 managed external agent delegation、`Dispatcher` / `Escalator` 路由、按拓扑自动启用的 `Collaboration` 协作底座，以及统一的 `Reply` / `RunOutput` / `RunEvent` / snapshot-restore。 |
+| `prelude` | `use agent_lib::prelude::*;` 重导最常用的 facade 入口类型（`Chat` / `ChatSession` / `Agent` / `Tool` / `Approval` / `Delegation` / `ManagedExternalAgent` / `ProviderConfig` / `ModelConfig` / `Reply` / `RunOutput` 等）。 |
 
 ## 安装
 
@@ -32,6 +39,73 @@
 [dependencies]
 agent-lib = { path = "../agent-lib" }
 ```
+
+## 快速开始：Facade 层（batteries-included）
+
+大多数应用应从 `agent_lib::facade` 入手：它把下面三层的装配（identity、pending 事务、
+`AgentMachine`、`HandlerScope`、driver）都封装好，按「渐进式使用」逐层加概念——从 one-shot
+`Chat`，到有状态多轮 `ChatSession`，再到会调用工具的 `Agent`、local subagent、managed
+external agent 与 dispatcher（`docs/facade-api.md` §2、§18）。所有入口内部仍复用
+`Conversation` + `DefaultAgentMachine`，不绕过底层不变量。
+
+一次性问答（无工具）：
+
+```rust
+use agent_lib::facade::{Chat, ProviderConfig};
+use std::error::Error;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let chat = Chat::builder()
+        .provider(ProviderConfig::openai_from_env()?)
+        .model("gpt-5.5")
+        .system("Answer concisely.")
+        .build()?;
+
+    let reply = chat.ask("What is a provider-neutral client?").await?;
+    println!("{}", reply.text());
+    Ok(())
+}
+```
+
+会调用工具的 `Agent`（typed function tool + 审批档位）：
+
+```rust
+use agent_lib::facade::tool::{Tool, ToolContext};
+use agent_lib::facade::{Agent, Approval, ProviderConfig};
+use serde_json::json;
+use std::error::Error;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let mut agent = Agent::builder()
+        .provider(ProviderConfig::openai_from_env()?)
+        .model("gpt-5.5")
+        .system("You are a concise weather assistant.")
+        .tool(Tool::function_with_schema(
+            "get_weather",
+            "Look up the current weather for a city.",
+            json!({ "type": "object", "properties": { "city": { "type": "string" } } }),
+            |_ctx: ToolContext, args: serde_json::Value| async move {
+                let city = args.get("city").and_then(|v| v.as_str()).unwrap_or("?");
+                Ok::<_, std::convert::Infallible>(format!("{city}: sunny, 26C"))
+            },
+        ))
+        .approval(Approval::auto_allow())
+        .build()?;
+
+    let reply = agent.run("What is the weather in Shanghai?").await?;
+    println!("{}", reply.text());
+    Ok(())
+}
+```
+
+需要观测细节时改用 `run_full` / `ask_full`，返回的 `RunOutput` 同时携带归一化 `response`、
+`usage`、`tool_calls`、`delegations`、`artifacts` 与 raw `events`。有状态的 `ChatSession` /
+`Agent` 支持 `snapshot` / `restore`——快照只保存 data-only 事实，**不**包含凭据、闭包、
+client 或 live process handle（§2.1、§15）。想脱离 facade 时可退回下面各层的原始类型。
+
+需要更细粒度控制的场景，可以直接使用下面的 Client / Conversation / Agent 层。
 
 ## 快速开始：Client 层
 
@@ -404,5 +478,6 @@ cargo test --test agent_complex_cancel     # cancel never-resume、approval vs c
 - [`docs/conversation-core.md`](docs/conversation-core.md) —— Conversation 层设计。
 - [`docs/agent-layer.md`](docs/agent-layer.md)、[`docs/agent-effect-model.md`](docs/agent-effect-model.md)
   —— Agent 层 sans-io + effect-handler 模型。
+- [`docs/facade-api.md`](docs/facade-api.md) —— Facade（batteries-included 装配层）设计。
 - [`docs/managed-external-agent.md`](docs/managed-external-agent.md) —— 受管外部 agent 设计与能力 parity。
 - [`docs/capability-matrix.md`](docs/capability-matrix.md) —— provider 能力差异与实测范围。

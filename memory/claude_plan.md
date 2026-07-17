@@ -1,41 +1,52 @@
-# M6-3 — Fix external cassette key-order drift under serde_json/preserve_order
+# M6-R — Review: Collaboration convenience + overall facade acceptance
 
-Task: TODO.md → first incomplete = **M6-3** (before M6-R).
+Task: TODO.md → first incomplete = **M6-R** (capstone review for facade M1–M6).
+Review task (`*R`): do NOT decompose unless the entry itself is structurally wrong.
 
-## Root cause (reproduced)
-- All-features build (`external-acp`) unifies `serde_json/preserve_order` → `Value` objects
-  become insertion-order `IndexMap` instead of sorted `BTreeMap`.
-- External cassette test helpers `fn frame(v) { CassetteFrame::stdout(v.to_string()) }` freeze
-  the payload STRING into the committed fixture. Under preserve_order the string reorders keys
-  (insertion order) and drifts from the frozen (sorted) fixture.
-- Confirmed via `claude_code_cassette_matches_in_code_builder`: fixture sorted vs builder insertion.
-- Default + single-feature builds: `Value` is BTreeMap → always sorted → green.
+## What to verify
+1. §14 consistency: topology auto-enable correct; external collab bridged to lib
+   primitives (no runtime-private protocol leak into public facade API, §14/§19);
+   only promise landed capabilities (R8 honesty — no silent "pretend support").
+2. Overall acceptance vs §2/§18/§19:
+   - progressive usage (Chat → ChatSession → Agent → subagent → external)
+   - strong invariants preserved (internal Conversation + DefaultAgentMachine +
+     Requirement/HandlerScope/drain/Pop; no bypass state machine)
+   - default-usable, recoverable (snapshot has NO secret), observable (RunOutput
+     full dimensions), escape hatches clear
+   - prelude vs §3 list consistency
+   - README / docs: is a facade getting-started example needed?
+3. Summarize milestone leftover gaps → follow-up tasks in TODO.md (if any).
+   Confirm NO unscheduled failing tests (Test Failure Policy).
 
-## Fix (deterministic, class-wide)
-1. agent-testkit `external/cassette.rs`:
-   - Add recursive `sort_json_keys(&Value) -> Value` (object keys sorted; arrays/scalars recursed).
-   - Add `CassetteFrame::stdout_json(&Value)` / `stderr_json(&Value)` constructors that serialize
-     the canonicalized value. Payload string is then identical under BTreeMap or IndexMap.
-   - Unit test: build a Value with keys in reverse order via serde_json::Map, assert stdout_json
-     payload is fully sorted (meaningful under the preserve_order/all-features build).
-2. Update the 4 fixture-building test helpers to `CassetteFrame::stdout_json(&value)`:
-   - tests/agent_claude_code_cassette.rs
-   - tests/agent_codex_cassette.rs
-   - tests/agent_opencode_cassette.rs
-   - tests/agent_acp_cassette.rs (its `update_frame` wraps `frame`, so covered)
-   `agent_external_cassette.rs` already uses byte-literals (deterministic) — no change.
-3. Do NOT regenerate fixtures in insertion order (would reverse-break default builds). Canonical
-   output equals the existing sorted fixtures → no fixture rewrite needed.
+## Acceptance deliverable
+- Comparison table: facade implemented vs docs/facade-api.md §2–§17 promises;
+  uncovered items explicitly recorded as follow-up tasks or confirmed non-goals.
 
-## Validation (1–6 + external clippy)
-1 `cargo fmt --all`
-2 `cargo clippy --all-targets -- -D warnings`
-3 `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
-4 `cargo test --features "external-claude-code external-codex external-opencode external-acp"` (all green)
-5 `cargo test --features external-claude-code --test agent_claude_code_cassette` (green)
-6 `cargo test --all --all-targets` (green, <30min); `RUSTDOCFLAGS=-D warnings cargo doc --no-deps --workspace`
+## Validation (full sequence 1–6 + all-external clippy)
+1 cargo fmt --all -- --check
+2 focused: cargo test -p agent-lib facade::collab
+3 cargo clippy --all-targets -- -D warnings
+   + clippy --features "external-claude-code external-codex external-opencode external-acp"
+4 cargo test --all --all-targets (<=30min)
+5 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+6 git diff --check
 
-## Status: DONE
-- Harness-level canonicalization (stdout_json/stderr_json + sort_json_keys) landed; 4 frame() helpers switched; ACP fixture re-frozen to canonical sorted order.
-- All validation 1-6 + external clippy green (all-features 1094/0, default 1071/0).
-- M6-3 marked [DONE]; PLAN.md unchanged (no phase-level change).
+## Status: IN PROGRESS
+- Reading docs §2/§3/§14/§18/§19 + facade sources; running validation.
+
+---
+
+## M6-R Status: DONE
+- §14 collab convenience verified faithful (derive_default table + CollabBridge
+  provider-neutral, no runtime-private types in public API, R8 honesty).
+- §2–§17 acceptance comparison table recorded in TODO.md M6-R completion record;
+  all facade promises (M1–M6) landed, no uncovered §2–§17 item needs a follow-up.
+- prelude vs §3: only diff is `AgentSession` (resolved open-question §20 #2 →
+  unified stateful `Agent`); not a gap.
+- README gap FIXED (doc-only): added Facade layer to intro list + module table,
+  new "快速开始：Facade 层" getting-started (Chat + tool Agent, from verified
+  doctests), and docs/facade-api.md reference link.
+- Validation ALL GREEN: fmt-check; facade::collab 17; clippy default + all-external;
+  default suite 1071/0 (10 ignored e2e); rustdoc -D warnings; git diff --check;
+  all-external suite 1094/0 (18 ignored e2e). No unscheduled failing tests.
+- endtag NOT applied: Milestone 7 still has open tasks.
