@@ -2309,7 +2309,7 @@ e2e。注意 Codex CLI 参数顺序必须按当前 CLI 要求验证。
   `cargo test --all --all-targets`(未启 feature)44 个 test binary 全 ok、0 failed;
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features external-codex` 干净。
 
-### [TODO] M7-4 Review：Codex adapter 正确性检查
+### [DONE] M7-4 Review：Codex adapter 正确性检查
 
 **上下文**:
 
@@ -2328,6 +2328,63 @@ Codex adapter 要和 Claude Code adapter 保持相同 adapter trait 和 capabili
 - `cargo test --features external-codex -p agent-lib codex_cassette`
 - `git diff --check`
 - 完成记录中列出 Codex 支持/不支持能力和真实 e2e 状态。
+
+**完成记录**:
+
+- **性质**:纯 review + 文档更新任务。逐项核对 M7-1/2/3 落地的 Codex adapter 源码,确认与 Claude Code
+  adapter 共享同一 `ExternalRuntimeAdapter`/`ExternalRuntimeSession` trait 与 `ExternalCapability` 语义、
+  无 workaround、无 spec 偏离,**未发现需修复的缺陷**,故不改任何代码,仅更新 `docs/capability-matrix.md`。
+- **CLI 参数顺序(已核对源码 + tests)**:`config.rs`
+  - `base_exec_args()` = `-a <approval> exec --json -s <sandbox> --skip-git-repo-check [--model M][--profile P]`
+    —— 全局 `-a` 严格在 `exec` 子命令之前(Codex CLI footgun),测试
+    `codex_config_base_exec_args_put_global_flag_before_subcommand` 断言 `approval_pos < exec_pos` 且完整序列。
+  - `base_resume_args(id)` = `-a <approval> -s <sandbox> [--model M][--profile P] exec resume --json
+    --skip-git-repo-check <id>` —— `resume` 子命令不接受 `-s/-p`,故上提到顶层,测试
+    `codex_config_base_resume_args_hoist_sandbox_and_selectors_before_exec` 断言 `sandbox_pos/profile_pos <
+    exec_pos`、id 为末位、含/不含 model/profile 两版。
+  - `CodexTurnSpec::args()` 追加 prompt(fresh)/message(resume,在 id 之后),测试
+    `codex_turn_spec_appends_prompt_and_message_to_base_args`。
+- **sandbox/approval mode(文档 + tests)**:`ExternalPermissionMode` → approval(`untrusted`/`on-request`/
+  `never`) + sandbox(`read-only`/`workspace-write`/`danger-full-access`)映射在 `approval_policy_arg` /
+  `sandbox_mode_arg` 的 rustdoc 逐模式说明,测试 `codex_config_approval_and_sandbox_map_every_mode` 覆盖全 4
+  模式。e2e 用 `AcceptEdits`(`on-request`+`workspace-write`)让自主 CLI 落盘且无需 host 审批。
+- **feature gate / 依赖**:`external-codex` off by default(`Cargo.toml`),`codex/mod.rs` 与 `external/mod.rs`
+  的 re-export 全 `#[cfg(feature = "external-codex")]`;复用 `tokio`(process)、`async-trait`、`serde_json`,
+  **无新增依赖**。默认构建不接入任何 Codex 机制。
+- **no-secret logging**:`CodexConfig` 手写 `Debug` 把 `env` 值渲染为 `<redacted>`(仅露 key),测试
+  `codex_config_debug_redacts_env_secrets` 断言原始 `sk-...` 不出现;生产 `SystemCodexLauncher` 把
+  `stderr = Stdio::null()`(防原始 runtime 文本泄漏)、`stdin = null`;decoder 每条诊断为固定字符串,不折入
+  prompt/命令行/工具输出/凭据;cassette `codex_cassette_is_secret_free` 扫描无 secret。
+- **cleanup**:`CodexProcessTurn::close()` 在 grace 窗口 `wait()`(一次性 turn 进程正常已自退),超时
+  `start_kill()`→`ForcedKill`、wait 出错→`Failed`;`kill_on_drop(true)` 兜底;`CodexSession::shutdown()` 关当前
+  turn 进程、turn 间无进程时返回 `Graceful`;`spawn_follow_up_turn` 先 close 旧(已退)进程再 spawn 新 resume。
+  测试 `codex_adapter_shutdown_classifies_the_close`;真机 e2e 断言 `registry.cleanup(...) == Graceful`。
+- **trace**:`advance` 每轮尊重 `ctx.is_cancelled()`(取消→`SessionLost`)。与 Claude Code 用
+  `ctx.run_id()` 建 `StepId` 关联 trace 不同,Codex 自主运行、按 runtime 分配的 `thread_id` resume,observations
+  不需宿主 run/step id 关联——这是**刻意且诚实的差异**(start/resume 的 `ctx` 未用即以 `_ctx` 命名),decode
+  context 只按 config/worktree 的 cwd 给 `command_execution` 补目录,绝不取自 model 输出。
+- **Codex 支持/不支持能力(诚实反映 M7-2,非 workaround)**:
+  - **支持(`new()` 实报 `true`)**:`streaming`、`resume`、`artifacts`、`usage`、`graceful_shutdown`。
+  - **不支持(恒 `false`)**:`permission_bridge`、`host_tools`、`host_subagents`——`codex exec --json` 自主
+    运行、按预置策略解审批、自己执行工具,流里无 host-pausable 帧。声明 `tools` 的 `start`/`resume` 以
+    `UnsupportedCapability{HostTools}` 拒绝;follow-up 的 `RespondToolResults`→`{HostTools}`、
+    `RespondSubagent`→`{HostSubagents}`、`RespondInteraction`→`{PermissionBridge}` 均拒绝而非静默忽略。
+  - `with_probed_capabilities` 把上述实报位与本机 probe 逐位 AND(host bridge 三项无论 probe 恒 `false`)。
+- **真实 e2e 状态**:`tests/external_codex.rs`(`#[ignore]`,`CODEX_BIN`/PATH 发现,缺 binary/登录自跳过退绿),
+  **本机 codex-cli 0.144.1 实跑通过**(M7-3 记录):`AcceptEdits`/`workspace-write` 驱动
+  probe→start→advance→completion→graceful shutdown,生成 `READY.txt`,5 个观测事件(2 文本)、优雅关闭、约 51s。
+  e2e 覆盖 streaming(sink 多事件)+ graceful_shutdown(断言 `Graceful`);resume 由离线单测覆盖(真机 e2e 为单
+  turn,未跑 resume);artifacts/usage 由离线 cassette + 单测覆盖。
+- **文档**:`docs/capability-matrix.md` 在 Codex 叙述后新增「**Codex live adapter 实报能力**(M7-4 review 定案)」
+  表——逐项列 `CodexAdapter::new()` 实报值 + 验证来源(e2e / 离线单测 / cassette),并显式区分「adapter 实报」
+  与末尾「各 runtime 当前声明」的默认构建保守基线 `none()`;附真机 e2e 状态段。保守基线表本身不改(它忠实表示
+  默认构建 `none()`)。
+- **验证(完整序列全过)**:`cargo fmt --all -- --check` 干净;`cargo clippy --all-targets -- -D warnings`
+  与 `--features external-codex` 均 0 warning;`cargo test --features external-codex -p agent-lib --lib codex`
+  30 passed;`cargo test --features external-codex -p agent-lib --test agent_codex_cassette` 7 passed;
+  `cargo test --all --all-targets`(未启 feature)全 ok、exit 0、0 failed;
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features external-codex` 干净;`git diff --check` 干净。
+  (代码自 M7-3 绿跑后未变,本任务仅改 `docs/*.md`;仍重跑上述以完成 review 签核。)
 
 ---
 

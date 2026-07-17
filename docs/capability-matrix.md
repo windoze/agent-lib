@@ -148,6 +148,26 @@ approval（`untrusted`/`on-request`/`never`）+ sandbox（`read-only`/`workspace
 `streaming`/`resume`/`artifacts`/`usage`/`graceful_shutdown` 由 `new()` 报告为 `true`、或经
 `with_probed_capabilities` 与本机 probe 逐位取交。下表是保守基线(`none()`),不代表 adapter 的实报能力。
 
+**Codex live adapter 实报能力（M7-4 review 定案，feature `external-codex`）**——下表列的是
+`CodexAdapter::new()` **实报**的能力(与末尾「各 runtime 当前声明」的默认构建保守基线 `none()`
+不同),并标注每项的验证来源。`with_probed_capabilities` 会把这些实报位与本机 probe 逐位 AND,
+故某项能力只有在 adapter 实现且 probe 也广告时才最终为 `true`;host bridge 三项无论 probe 如何都恒 `false`。
+
+| 受管能力 | `CodexAdapter::new()` 实报 | 验证来源 |
+|---|---|---|
+| streaming | `true` | 真机 e2e(观测流 SessionStarted + ≥1 TextDelta + SessionCompleted,≥3 事件,镜像到 live sink)+ 离线单测 |
+| resume | `true` | 离线单测(`exec resume <thread_id>` fresh+follow-up 顺序、defer 首 turn、记录 thread id);真机 e2e 单 turn 未跑 resume |
+| artifacts | `true` | 离线 decoder cassette(`file_change`→`FilePatch`);真机 e2e prompt 生成 `READY.txt` |
+| usage | `true` | 离线 decoder cassette(`turn.completed.usage`→`ExternalAgentOutput.usage`)+ 单测断言 `output.usage.is_some()` |
+| graceful_shutdown | `true` | 真机 e2e(`registry.cleanup` 断言 `Graceful`)+ 离线单测(close 分类 Graceful/ForcedKill) |
+| permission_bridge | `false`(恒) | `codex exec --json` 自主运行、按预设策略解审批,流里无 host-answerable pause;`RespondInteraction`→`UnsupportedCapability{PermissionBridge}` |
+| host_tools | `false`(恒) | exec 自主执行工具,无 host-pausable tool-call 帧;声明 `tools` 的 start/resume 与 `RespondToolResults` 均以 `UnsupportedCapability{HostTools}` 拒绝 |
+| host_subagents | `false`(恒) | 无 host-桥接的 spawn 帧;`RespondSubagent`→`UnsupportedCapability{HostSubagents}` |
+
+真机 e2e 状态:**本机 codex-cli 0.144.1 实跑通过**(`tests/external_codex.rs`,以
+`AcceptEdits`/`workspace-write` 驱动 probe→start→advance→completion→graceful shutdown,生成
+`READY.txt`,5 个观测事件、约 51s);缺 binary/登录时该 `#[ignore]` 测试自跳过(退出为绿)。
+
 里程碑 8-1 起,feature-gated 的 OpenCode adapter 同样提供了一个 **capability probe**（`external-opencode`
 下的 [`agent::external::opencode_probe`](../src/agent/external/opencode/probe.rs)）:它以**当前本机
 `opencode` CLI 实测 `--version` / `--help` / `run --help` 为准**,把缺失/损坏的 binary 分类为 `Launch`、
