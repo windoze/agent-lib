@@ -75,6 +75,7 @@ mod codex;
 mod config;
 mod dispatch;
 mod escalation;
+mod handler;
 mod machine;
 #[cfg(feature = "external-opencode")]
 mod opencode;
@@ -121,6 +122,7 @@ pub use escalation::{
     EscalationError, EscalationOutcome, Escalator, HumanGate, ScriptedVerifier, Verifier,
     WorkerReport,
 };
+pub use handler::RegistryExternalSessionHandler;
 pub use machine::{ExternalAgentMachine, ExternalReconfigOutcome, ExternalReconfigTiming};
 #[cfg(feature = "external-opencode")]
 pub use opencode::{

@@ -56,7 +56,8 @@ pub use delegate::{AgentWorkerBuilder, Delegation, LocalSubagent};
 pub use error::FacadeError;
 pub use external::{
     ExternalAgentCapabilities, ExternalDelegateStatus, ExternalRunMode, ManagedExternalAgent,
-    ManagedExternalAgentBuilder, ManagedExternalDelegate, RestoreExternal,
+    ManagedExternalAgentBuilder, ManagedExternalDelegate, RegistryExternalSessionHandler,
+    RestoreExternal, default_external_session_handler,
 };
 pub use ids::FacadeIds;
 pub use run::{

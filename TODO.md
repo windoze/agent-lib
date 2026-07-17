@@ -1965,7 +1965,7 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
   5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 绿。
   6. `git diff --check` 干净。
 
-### [TODO] M7-4 生产级 registry-backed `ExternalSessionHandler`（feature-gated）
+### [DONE] M7-4 生产级 registry-backed `ExternalSessionHandler`（feature-gated）
 
 **上下文**：
 
@@ -1992,6 +1992,51 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
 - 聚焦：`cargo test -p agent-lib --features external-claude-code facade::external`（视实现调整过滤名）。
 - 完整验证序列 1–6，**并额外跑**
   `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`。
+
+**完成记录**：
+
+- Part A（runtime 无关，不带 feature gate）：新增 `src/agent/external/handler.rs` 的
+  `RegistryExternalSessionHandler` —— 官方 registry-backed handler，仅持有
+  `Arc<ExternalSessionRegistry>` + 可选 `Arc<dyn ExternalEventSink>`，不持机器状态。`fulfill` 每次
+  `registry.get_or_start(request, ctx, sink)` 解析 live handle → `handle.advance(&input, ctx)` 推进一个
+  decision point → 用 `From<Result<RuntimeDecisionPoint, ExternalAgentError>> for ExternalSessionResult`
+  的 `.into()` 折叠结果，使 launch 失败与 advance 失败都落到 `ExternalSessionResult::Failed`（family 对齐，
+  绝不串到别的 requirement family）。构造：`new(registry)` / `with_sink(registry, sink)`；`registry()`
+  accessor 让宿主用 `cleanup_agent`/`cleanup` 强制关闭（机器不发 shutdown effect，cleanup 由宿主驱动）。
+- Part B（feature-gated 便捷构造）：`src/facade/external.rs` 新增
+  `pub async fn default_external_session_handler(agent: &ManagedExternalAgent)
+  -> Result<Arc<RegistryExternalSessionHandler>, FacadeError>`。按 `agent.runtime()` 探测 live CLI 并 wire
+  匹配 adapter 到 registry：CLI 三家走 `probe(&config)` → `with_probed_capabilities`（缺二进制/未登录时
+  probe fail-fast，非 secret 错误经 `FacadeError::ExternalAgent { name, message }` 上抛，不静默降级）；ACP 走
+  `AcpAdapter::new(config)`（无 probe，live initialize 协商）。返回**具体类型** `Arc<RegistryExternalSessionHandler>`
+  以保留 `.registry()`，在 `.session_handler(..)` 处经 unsized coercion 收敛为 `Arc<dyn ExternalSessionHandler>`。
+  未编入对应 feature 的 runtime → `runtime_feature_disabled` 显式 fail-fast（消息点名要开的 feature），
+  无默认可用 arm 时（默认构建）catch-all 保证仍返回 feature-disabled 错误。
+- 无 feature 构建洁净：`Duration` / `DEFAULT_EXTERNAL_IO_TIMEOUT`(120s) / `external_probe_error` /
+  `agent_working_dir` 均按 `any(external-*)` cfg-gate；`ExternalAgentError` 不在模块作用域 import，签名与
+  rustdoc 链接一律走全路径 `crate::agent::external::ExternalAgentError`，保证 `RUSTDOCFLAGS="-D warnings"` 下
+  链接可解析、无未用告警。
+- 导出：`src/agent/external/mod.rs` 加 `mod handler;` + `pub use handler::RegistryExternalSessionHandler;`；
+  `src/facade/mod.rs` 的 `pub use external::{..}` 增加 `default_external_session_handler` 与
+  `RegistryExternalSessionHandler`。
+- 测试（全离线、in-crate doubles，遵守 src 内不依赖 agent-testkit 约定）：
+  - `src/agent/external/handler/tests.rs`（2 用例，绿）：`advances_through_pause_resume_then_force_closes`
+    用 scripted `ScriptAdapter`/`ScriptSession` + `CollectingSink` 驱动 start→advance→pause/resume→
+    宿主 `cleanup_agent` 强制关闭，断言观测流与 live_len 归零；`launch_failure_folds_to_failed_result`
+    断言 launch 错误折叠为 `Failed`（不串 family）。
+  - `src/facade/external.rs`（2 新用例，绿）：`default_handler_fails_fast_when_runtime_feature_disabled`
+    （`cfg(not(external-codex))`，codex agent → 点名 `external-codex` 的 fail-fast 错误）；
+    `default_handler_fails_fast_when_cli_binary_is_missing`（`cfg(external-claude-code)`，绝对不存在路径
+    的二进制使 probe 立即 spawn 失败，离线快返回，非空非 secret 消息）。
+- 验证：
+  1. `cargo fmt --all` 绿。
+  2. `cargo clippy --all-targets -- -D warnings` 绿。
+  3. `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings` 绿。
+  4. 聚焦：`cargo test --lib external::handler`（2 passed）、`cargo test --features external-claude-code --lib facade::external`（11 passed，含新用例）。
+  5. `cargo test --all --all-targets` 全绿（exit 0）。
+  6. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（默认与四 feature 均绿；修正了 `handler.rs`
+     两处指向私有模块的 `](self)` 链接）。
+  7. `git diff --check` 干净。
 
 ### [TODO] M7-5 facade 透出 AI 决策注入口（不实现 AI 逻辑）
 

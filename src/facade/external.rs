@@ -61,10 +61,19 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode",
+    feature = "external-acp"
+))]
+use std::time::Duration;
 
+pub use crate::agent::external::RegistryExternalSessionHandler;
 use crate::agent::external::{
     ExternalAgentMachine, ExternalAgentSpec, ExternalAgentState, ExternalArtifactRef,
-    ExternalSessionPolicy, ExternalSessionRef, ExternalStreamPolicy, WorktreeIsolation,
+    ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRegistry, ExternalStreamPolicy,
+    WorktreeIsolation,
 };
 use crate::agent::{
     AgentError, AgentId, AgentInput, AgentMachine, AgentSpecRef, DrivingSubagentHandler,
@@ -88,7 +97,8 @@ use serde_json::Map;
 
 #[cfg(feature = "external-acp")]
 use crate::agent::external::{
-    AcpConfig, AcpNegotiatedCapabilities, acp_runtime_kind, capabilities_from_initialize,
+    ACP_RUNTIME_LABEL, AcpConfig, AcpNegotiatedCapabilities, acp_runtime_kind,
+    capabilities_from_initialize,
 };
 
 /// The grade of managed behavior a caller asks a runtime to provide (§11.3).
@@ -744,7 +754,243 @@ fn declared_capabilities(runtime: &ExternalRuntimeKind) -> ExternalRuntimeCapabi
     capabilities
 }
 
-/// A named managed external delegate registered on an [`Agent`](crate::facade::Agent).
+/// The IO and probe timeout the default session handler applies to a managed
+/// runtime.
+///
+/// This bounds both the capability probe and every live-session read the
+/// handler drives. It is generous (two minutes) because a managed coding-agent
+/// turn can legitimately think for a while before it reaches its next decision
+/// point; a host that needs a different bound builds the adapter and
+/// [`RegistryExternalSessionHandler`] directly instead of using this default.
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode",
+    feature = "external-acp"
+))]
+const DEFAULT_EXTERNAL_IO_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Builds the official registry-backed [`ExternalSessionHandler`] for a
+/// [`ManagedExternalAgent`], probing the live runtime and wiring the matching
+/// adapter behind an [`ExternalSessionRegistry`].
+///
+/// This is the "last mile" a host would otherwise hand-assemble: it selects the
+/// live runtime adapter for [`agent.runtime()`](ManagedExternalAgent::runtime),
+/// builds its launch config from the managed spec (worktree, binary, model, and
+/// permission mode), runs the runtime's capability probe (for the CLI runtimes)
+/// so the reported capabilities are the verified intersection rather than the
+/// declared baseline (§11.3), and wraps the probed adapter in a fresh registry.
+/// The returned handler is ready to inject with
+/// [`ManagedExternalAgentBuilder::session_handler`]. Because it returns the
+/// concrete [`RegistryExternalSessionHandler`] (which coerces to
+/// `Arc<dyn ExternalSessionHandler>` at the injection point), a host keeps the
+/// [`registry`](RegistryExternalSessionHandler::registry) accessor to
+/// force-close the session with
+/// [`cleanup_agent`](ExternalSessionRegistry::cleanup_agent) once a drive is
+/// done.
+///
+/// Each runtime arm is gated on its `external-*` feature. The ACP arm builds the
+/// single shared ACP adapter and lets the live `initialize` handshake negotiate
+/// capabilities per session, so no offline probe runs for it.
+///
+/// # Errors
+///
+/// Returns [`FacadeError::ExternalAgent`] with a stable, non-secret message when:
+///
+/// - the runtime's adapter feature is not compiled in (fail-fast rather than
+///   silently doing nothing), or
+/// - the capability probe fails because the CLI binary is missing, is not
+///   usable, or does not advertise a required capability. The classified
+///   [`ExternalAgentError`](crate::agent::external::ExternalAgentError) is
+///   surfaced verbatim (it carries no credentials), so a host can treat a
+///   missing binary / unauthenticated CLI as a conservative skip instead of a
+///   crash, exactly as the managed examples do — never a silent capability
+///   downgrade.
+pub async fn default_external_session_handler(
+    agent: &ManagedExternalAgent,
+) -> Result<Arc<RegistryExternalSessionHandler>, FacadeError> {
+    let registry = build_default_registry(agent).await?;
+    Ok(Arc::new(RegistryExternalSessionHandler::new(Arc::new(
+        registry,
+    ))))
+}
+
+/// Selects the live adapter for `agent`'s runtime and wraps it in a registry.
+///
+/// Every named arm is feature-gated; a runtime whose feature is off falls
+/// through to the catch-all, which fails fast with an explicit "enable the
+/// feature" message rather than degrading silently.
+async fn build_default_registry(
+    agent: &ManagedExternalAgent,
+) -> Result<ExternalSessionRegistry, FacadeError> {
+    match agent.runtime() {
+        #[cfg(feature = "external-claude-code")]
+        ExternalRuntimeKind::ClaudeCode => build_claude_code_registry(agent).await,
+        #[cfg(feature = "external-codex")]
+        ExternalRuntimeKind::Codex => build_codex_registry(agent).await,
+        #[cfg(feature = "external-opencode")]
+        ExternalRuntimeKind::OpenCode => build_opencode_registry(agent).await,
+        #[cfg(feature = "external-acp")]
+        ExternalRuntimeKind::Custom(label) if label == ACP_RUNTIME_LABEL => {
+            build_acp_registry(agent)
+        }
+        other => Err(runtime_feature_disabled(other)),
+    }
+}
+
+/// Builds the fail-fast error for a runtime whose adapter feature is not
+/// compiled into this build.
+fn runtime_feature_disabled(runtime: &ExternalRuntimeKind) -> FacadeError {
+    let label = runtime_label(runtime);
+    FacadeError::ExternalAgent {
+        name: label.clone(),
+        message: format!(
+            "no managed runtime adapter is compiled in for `{label}`; rebuild with the matching \
+             `external-*` feature (external-claude-code / external-codex / external-opencode / \
+             external-acp) to build its default session handler"
+        ),
+    }
+}
+
+/// Lifts a probe/launch failure into a non-secret [`FacadeError`].
+///
+/// The classified [`ExternalAgentError`](crate::agent::external::ExternalAgentError)
+/// carries no credentials, so it is surfaced verbatim; a host reads it to decide
+/// whether to skip (missing binary, unauthenticated CLI) or fail.
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
+fn external_probe_error(
+    runtime: &ExternalRuntimeKind,
+    error: &crate::agent::external::ExternalAgentError,
+) -> FacadeError {
+    FacadeError::ExternalAgent {
+        name: runtime_label(runtime),
+        message: format!("could not build the default session handler: {error}"),
+    }
+}
+
+/// Resolves the worktree working directory from the managed spec, if one was set.
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode",
+    feature = "external-acp"
+))]
+fn agent_working_dir(agent: &ManagedExternalAgent) -> Option<PathBuf> {
+    agent
+        .worktree()
+        .map(|worktree| worktree.path().to_path_buf())
+}
+
+/// Probes the local Claude Code CLI and wraps it in a registry.
+#[cfg(feature = "external-claude-code")]
+async fn build_claude_code_registry(
+    agent: &ManagedExternalAgent,
+) -> Result<ExternalSessionRegistry, FacadeError> {
+    use crate::agent::external::{ClaudeCodeAdapter, ClaudeCodeConfig, probe};
+
+    let mut config = ClaudeCodeConfig::new()
+        .with_permission_mode(agent.permission_mode())
+        .with_timeout(DEFAULT_EXTERNAL_IO_TIMEOUT);
+    if let Some(working_dir) = agent_working_dir(agent) {
+        config = config.with_working_dir(working_dir);
+    }
+    if let Some(binary) = agent.binary() {
+        config = config.with_binary(binary);
+    }
+    if let Some(model) = agent.model() {
+        config = config.with_model(model);
+    }
+    let probed = probe(&config)
+        .await
+        .map_err(|error| external_probe_error(agent.runtime(), &error))?;
+    let adapter = ClaudeCodeAdapter::with_probed_capabilities(config, &probed);
+    Ok(ExternalSessionRegistry::new(Arc::new(adapter)))
+}
+
+/// Probes the local Codex CLI and wraps it in a registry.
+#[cfg(feature = "external-codex")]
+async fn build_codex_registry(
+    agent: &ManagedExternalAgent,
+) -> Result<ExternalSessionRegistry, FacadeError> {
+    use crate::agent::external::{CodexAdapter, CodexConfig, codex_probe};
+
+    let mut config = CodexConfig::new()
+        .with_permission_mode(agent.permission_mode())
+        .with_timeout(DEFAULT_EXTERNAL_IO_TIMEOUT);
+    if let Some(working_dir) = agent_working_dir(agent) {
+        config = config.with_working_dir(working_dir);
+    }
+    if let Some(binary) = agent.binary() {
+        config = config.with_binary(binary);
+    }
+    if let Some(model) = agent.model() {
+        config = config.with_model(model);
+    }
+    let probed = codex_probe(&config)
+        .await
+        .map_err(|error| external_probe_error(agent.runtime(), &error))?;
+    let adapter = CodexAdapter::with_probed_capabilities(config, &probed);
+    Ok(ExternalSessionRegistry::new(Arc::new(adapter)))
+}
+
+/// Probes the local OpenCode CLI and wraps it in a registry.
+#[cfg(feature = "external-opencode")]
+async fn build_opencode_registry(
+    agent: &ManagedExternalAgent,
+) -> Result<ExternalSessionRegistry, FacadeError> {
+    use crate::agent::external::{OpenCodeAdapter, OpenCodeConfig, opencode_probe};
+
+    let mut config = OpenCodeConfig::new()
+        .with_permission_mode(agent.permission_mode())
+        .with_timeout(DEFAULT_EXTERNAL_IO_TIMEOUT);
+    if let Some(working_dir) = agent_working_dir(agent) {
+        config = config.with_working_dir(working_dir);
+    }
+    if let Some(binary) = agent.binary() {
+        config = config.with_binary(binary);
+    }
+    if let Some(model) = agent.model() {
+        config = config.with_model(model);
+    }
+    let probed = opencode_probe(&config)
+        .await
+        .map_err(|error| external_probe_error(agent.runtime(), &error))?;
+    let adapter = OpenCodeAdapter::with_probed_capabilities(config, &probed);
+    Ok(ExternalSessionRegistry::new(Arc::new(adapter)))
+}
+
+/// Rebuilds the ACP launch config from the managed spec and wraps the shared ACP
+/// adapter in a registry.
+///
+/// ACP negotiates capabilities through the live `initialize` handshake rather
+/// than an offline probe, so this arm is synchronous: the adapter reports its
+/// implemented features and each session refines them on connect.
+#[cfg(feature = "external-acp")]
+fn build_acp_registry(
+    agent: &ManagedExternalAgent,
+) -> Result<ExternalSessionRegistry, FacadeError> {
+    use crate::agent::external::AcpAdapter;
+
+    let binary = agent.binary().ok_or_else(|| FacadeError::ExternalAgent {
+        name: runtime_label(agent.runtime()),
+        message: "the ACP managed agent has no launch binary; build it with \
+                  ManagedExternalAgent::acp(..) or an ACP preset"
+            .to_owned(),
+    })?;
+    let mut config = AcpConfig::new(binary, agent.args().iter().cloned())
+        .with_permission_mode(agent.permission_mode())
+        .with_timeout(DEFAULT_EXTERNAL_IO_TIMEOUT);
+    if let Some(working_dir) = agent_working_dir(agent) {
+        config = config.with_working_dir(working_dir);
+    }
+    let adapter = AcpAdapter::new(config);
+    Ok(ExternalSessionRegistry::new(Arc::new(adapter)))
+}
+
 ///
 /// This pairs the registration `name` (which mints the `ask_<name>` delegation
 /// tool, §13.1) with the data-first [`ManagedExternalAgent`] recipe that is
@@ -1504,5 +1750,57 @@ mod tests {
             Some("gemini".into())
         );
         assert_eq!(agent.args(), ["--experimental-acp"]);
+    }
+
+    // A runtime whose adapter feature is not compiled into this build fails fast
+    // with an explicit "enable the feature" message rather than degrading
+    // silently. Codex is used because this arm only runs when its feature is off.
+    #[cfg(not(feature = "external-codex"))]
+    #[tokio::test]
+    async fn default_handler_fails_fast_when_runtime_feature_disabled() {
+        use super::default_external_session_handler;
+
+        let codex = ManagedExternalAgent::codex().build().expect("build codex");
+        let error = default_external_session_handler(&codex)
+            .await
+            .expect_err("a runtime with no compiled adapter must fail fast");
+        match error {
+            FacadeError::ExternalAgent { name, message } => {
+                assert_eq!(name, "codex");
+                assert!(
+                    message.contains("external-codex"),
+                    "the message must name the feature to enable, got: {message}"
+                );
+            }
+            other => panic!("expected a fail-fast ExternalAgent error, got {other:?}"),
+        }
+    }
+
+    // When the adapter feature *is* compiled in, a missing/broken CLI binary makes
+    // the capability probe fail fast with a non-secret error rather than silently
+    // building a degraded handler. An absolute non-existent path guarantees the
+    // probe's spawn fails offline without touching PATH.
+    #[cfg(feature = "external-claude-code")]
+    #[tokio::test]
+    async fn default_handler_fails_fast_when_cli_binary_is_missing() {
+        use super::default_external_session_handler;
+
+        let claude = ManagedExternalAgent::claude_code()
+            .binary("/nonexistent-agent-lib/claude-probe-target")
+            .build()
+            .expect("build claude");
+        let error = default_external_session_handler(&claude)
+            .await
+            .expect_err("a missing CLI binary must make the probe fail fast");
+        match error {
+            FacadeError::ExternalAgent { name, message } => {
+                assert_eq!(name, "claude_code");
+                assert!(
+                    !message.is_empty(),
+                    "the fail-fast error must carry a non-empty, non-secret message"
+                );
+            }
+            other => panic!("expected a fail-fast ExternalAgent error, got {other:?}"),
+        }
     }
 }
