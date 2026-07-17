@@ -2858,7 +2858,7 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
   feature-gated lib 753 passed、真实 e2e `#[ignore]` 自跳过;
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净;`git diff --check` 干净。
 
-### [TODO] M9-4 增加真实 DeepSeek 父协调器 + Claude Code/Codex 子 agent ignored e2e
+### [DONE] M9-4 增加真实 DeepSeek 父协调器 + Claude Code/Codex 子 agent ignored e2e
 
 **上下文**:
 
@@ -2894,6 +2894,47 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
   - 至少一次 external observation 被 replay。
   - final conversation committed。
 - 完整验证序列 1-6 全过；真实 e2e 可单独记录,不纳入默认完整验证。
+
+**完成记录**:
+
+- **新增文件 `tests/agent_external_managed_real_e2e.rs`**（顶部
+  `#![cfg(all(feature = "external-claude-code", feature = "external-codex"))]`，features 关时整文件
+  cfg 掉 = 空 crate，默认 `cargo test --all --all-targets` 从不引用 CLI-adapter 机制）。与既有
+  `tests/agent_external_real_e2e.rs`（手搓 `claude`/`codex exec` shell）本质不同：本文件走 **managed** 全链路
+  ——真实 `ClaudeCodeAdapter`/`CodexAdapter`（M6/M7）经 `ExternalSessionRegistry` + registry-backed
+  `ExternalSessionHandler` 驱动，做结构化 stream-json 解码、sequenced observations、managed permission
+  bridge（子 scope `.interaction(ScriptedInteractionHandler::approve_all())` 就地批准 permission pause）。
+- **测试结构（3 个 `#[ignore]`）**:
+  - `deepseek_coordinator_drives_managed_claude_code_and_codex_subagents`（headline M9-4）:DeepSeek 父协调器
+    LLM 先 plan 两个 brief → 通过 `NeedSubagent` 先派生 Claude Code child 再派生 Codex child（均为 managed
+    `ExternalAgentMachine`）→ 父协调器把两 child report 合成一条 final status。硬断言:coordinator `Done`;
+    spawned == `[ClaudeCode, Codex]`;两 runtime 各完成一次 session;至少一次 external observation 被 replay;
+    DeepSeek 调用 ≥2;final text 含 `MANAGED_MULTI_AGENT_OK`。
+  - `managed_claude_code_child_commits_turn` / `managed_codex_child_commits_turn`:各自单独驱动一个 managed
+    child `ExternalAgentMachine`（start → 结构化流 → completed），断言 `committed_turns(1)` + `pending_none`
+    + 至少一次 observation replay，提供确定性的「subagent 完成 / observation replayed / conversation committed」
+    证据并演练 managed permission bridge。
+- **启动前守卫（缺失即 skip，不泄密）**:`E2eEnv` 从 `.envrc`/env 读 `DEEPSEEK_API_KEY`（缺 → 非密 skip 提示）
+  与可选 `DEEPSEEK_BASE_URL/DEEPSEEK_MODEL`;`command_available()` 检 `claude`/`codex`（可用 `CLAUDE_CODE_BIN`
+  /`CODEX_BIN` 覆盖）;`build_managed_handler()` 先 `probe`/`codex_probe`，probe 失败 → 非密 skip（视为 auth/runtime
+  信号而非测试失败）。`DeepSeekCallLog` 只计数不存 prompt;secret 从不 `eprintln!`。
+- **隔离 & cleanup**:每个 child 在 OS temp 下自建 `git init` 一次性 worktree（`make_worktree`，adapter CWD 取
+  `config.working_dir()`）;测试结束 `registry.cleanup_agent(agent_id)` 强制关 live session + `cleanup_worktree`
+  删临时目录（panic 前先 cleanup），两 adapter `kill_on_drop(true)` 兜底。
+- **文档化运行命令**（文件模块 doc）:feature flags、required env、`cargo test --features
+  "external-claude-code external-codex" --test agent_external_managed_real_e2e -- --ignored --nocapture`、worktree
+  隔离、secret redaction、unsupported-capability fallback（probe 失败即 skip）全部写清。
+- **本机限制**:无 DeepSeek key / 无 `claude`/`codex` CLI，真实 e2e 无法执行 → 三测均 `#[ignore]` 且默认套件
+  确认为 `0 passed; 3 ignored`（features 开时）/ `0 tests`（features 关时=空 crate）。真实调用需在具备
+  DeepSeek+Claude Code+Codex 的环境按上述命令单独运行并记录（M9-6 总验收再核对）。
+- **验证序列（全过，本任务无 src 改动，仅新增 feature-gated ignored 测试 + 文档/计划 md）**:
+  `cargo fmt --all -- --check` 干净;
+  `cargo clippy --all-targets --features "external-claude-code external-codex" -- -D warnings` 0 warning;
+  `cargo test --features "external-claude-code external-codex" --test agent_external_managed_real_e2e -- --list`
+  = 3 tests，默认运行 `0 passed; 3 ignored`;
+  `cargo clippy --all-targets -- -D warnings`（默认）0 warning;
+  `cargo test --all --all-targets`（默认）47 个 test 二进制全 `ok`、0 failed（新测 cfg 掉=空 crate，真实 e2e 不跑）;
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净;`git diff --check` 干净。
 
 ### [TODO] M9-5 更新 docs/examples/capability matrix
 
