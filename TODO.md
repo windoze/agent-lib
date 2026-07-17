@@ -1836,7 +1836,7 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
      doctests 亦绿（含新 `interaction_handler` 示例）。
   6. `git diff --check` 干净。
 
-### [TODO] M7-2 `RunEvent` 可序列化投影（`WireRunEvent`）
+### [DONE] M7-2 `RunEvent` 可序列化投影（`WireRunEvent`）
 
 **上下文**：
 
@@ -1860,6 +1860,43 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
   投影为 opaque 标记且可序列化、不 panic。
 - 聚焦：`cargo test -p agent-lib facade::run`（或投影所在模块）。
 - 完整验证序列 1–6。
+
+**完成记录**：
+
+- 实现（`src/facade/run.rs`，纯归一化投影，**未改** `RunEvent` 本身的 derive，R7 决定不变）：
+  - 新增 `WireRunEvent`（`Serialize + Deserialize`，adjacently-tagged
+    `#[serde(tag = "type", content = "data", rename_all = "snake_case")]`，与
+    `agent::Notification` 的线格式一致）+ `RunEvent::to_wire(&self) -> WireRunEvent`。
+  - 归一化变体（`TextDelta`/`ToolStarted`/`ToolFinished`/`ApprovalRequested`/`Delegation*`
+    五连/`Escalated`/`Done`）**如实转发**各自本已 serde 友好的 payload，无损。
+  - `Done(Box<RunOutput>)` → `Done(Box<WireRunOutput>)`：因 `RunOutput` 内含
+    `events: Vec<RunEvent>`（不可 serde）而本身不派生 serde，故新增镜像结构
+    `WireRunOutput`（`reply`/`response: Option<Response>`/`usage`/`tool_calls`/`delegations`/
+    `artifacts` 逐字转发，`events` 递归投影为 `Vec<WireRunEvent>`）+ `RunOutput::to_wire`。
+    Done payload 与原 `RunEvent::Done` 一样 `Box` 化以规避 `clippy::large_enum_variant`。
+  - `RawStream`/`RawNotification` **降级**为 opaque 标记变体
+    `WireRunEvent::Raw(RawEventKind::{Stream,Notification})`——只记录哪种逃生舱触发，
+    **不承载**底层 `StreamEvent`/`Notification` 载荷，故不把逃生舱序列化提升为稳定契约。
+  - rustdoc 写清：哪些变体无损、`Raw` 为何 opaque、`Done` 内嵌 events 遵循同一（Raw 有损）规则；
+    模块 doc 与 `src/facade/mod.rs` re-export（`RawEventKind`/`WireRunEvent`/`WireRunOutput`）+ doc 均更新。
+- 测试（`src/facade/run/tests.rs`，全离线，4 新用例）：
+  - `normalized_run_events_project_losslessly_and_round_trip`：11 个归一化变体
+    `to_wire()` 后与预期相等，且 `serde_json` round-trip 保真。
+  - `done_projects_run_output_and_nested_events_round_trip`：`Done` 投影出
+    `WireRunOutput`，内嵌 `TextDelta` 无损、内嵌 `RawNotification` 降级为
+    `Raw(Notification)` 标记，整体 round-trip 保真。
+  - `raw_escape_hatches_project_to_opaque_markers`：两条逃生舱各投影为可区分的 opaque
+    标记，可序列化、round-trip、不 panic。
+  - `wire_event_uses_adjacently_tagged_snake_case_shape`：断言线格式为
+    `{"type":..,"data":..}` 的 snake_case 形状。
+- 验证（未触碰 external adapter，故不需全 external features clippy）：
+  1. `cargo fmt --all -- --check` 绿。
+  2. 聚焦 `cargo test -p agent-lib --lib facade::run`：9 passed（含 4 新用例）。
+  3. `cargo clippy --all-targets -- -D warnings` 绿（`Done` payload 装箱以过
+     `large_enum_variant`）。
+  4. `cargo test --all --all-targets`：全绿，无失败（lib 821 + 集成/文档测试）。
+  5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 绿。
+  6. `git diff --check` 干净。
 
 ### [TODO] M7-3 富化 `ApprovalRequest`
 

@@ -12,9 +12,10 @@
 //!   lower-layer error `source` ([`error`]).
 //! - [`FacadeIds`] — a built-in monotonic identity source, since the library
 //!   core never mints ids itself ([`ids`]).
-//! - [`Reply`], [`RunOutput`], [`UsageSummary`], [`RunEvent`], and
-//!   [`IntoUserMessage`] — the shared result, usage, event, and input types
-//!   returned and accepted by every run entry point ([`run`]).
+//! - [`Reply`], [`RunOutput`], [`UsageSummary`], [`RunEvent`], its serializable
+//!   projection [`WireRunEvent`], and [`IntoUserMessage`] — the shared result,
+//!   usage, event, and input types returned and accepted by every run entry
+//!   point ([`run`]).
 //! - [`Chat`] and [`ChatBuilder`] — the stateless one-shot Chat facade, plus
 //!   [`ChatSession`] / [`ChatSessionBuilder`] for stateful multi-turn chat with
 //!   snapshot/restore and an incremental [`RunStream`] ([`chat`]).
@@ -60,8 +61,8 @@ pub use external::{
 pub use ids::FacadeIds;
 pub use run::{
     ApprovalRequest, ArtifactRef, DelegationMessage, DelegationProgress, DelegationStatus,
-    DelegationTrace, EscalationTrace, IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace,
-    UsageSummary,
+    DelegationTrace, EscalationTrace, IntoUserMessage, RawEventKind, Reply, RunEvent, RunOutput,
+    ToolTrace, UsageSummary, WireRunEvent, WireRunOutput,
 };
 pub use tool::{
     FacadeToolRegistry, IntoToolResult, Tool, ToolContext, ToolContextParts, ToolResult,

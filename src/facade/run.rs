@@ -9,6 +9,9 @@
 //! - [`UsageSummary`] — token usage aggregated across the supervisor, local
 //!   subagents, and external runtimes.
 //! - [`RunEvent`] — a UI/CLI-friendly streaming event, with raw escape hatches.
+//! - [`WireRunEvent`] — the official serializable projection of [`RunEvent`]
+//!   (via [`RunEvent::to_wire`]) for cross-process hosts; normalized variants
+//!   are lossless, the raw escape hatches collapse to opaque markers.
 //! - [`IntoUserMessage`] — the input conversion used by every `ask`/`send`
 //!   entry point.
 //!
@@ -158,6 +161,54 @@ impl From<Response> for RunOutput {
     }
 }
 
+impl RunOutput {
+    /// Projects this run output into its serializable [`WireRunOutput`] form.
+    ///
+    /// Every field except `events` is forwarded verbatim (all of them —
+    /// [`Reply`], the underlying [`Response`], [`UsageSummary`], and the trace
+    /// vectors — are already serializable). The `events` are projected element
+    /// by element through [`RunEvent::to_wire`], so any nested
+    /// [`RunEvent::RawStream`]/[`RunEvent::RawNotification`] degrades to an
+    /// opaque [`WireRunEvent::Raw`] marker exactly as at the top level.
+    #[must_use]
+    pub fn to_wire(&self) -> WireRunOutput {
+        WireRunOutput {
+            reply: self.reply.clone(),
+            response: self.response.clone(),
+            usage: self.usage.clone(),
+            tool_calls: self.tool_calls.clone(),
+            delegations: self.delegations.clone(),
+            artifacts: self.artifacts.clone(),
+            events: self.events.iter().map(RunEvent::to_wire).collect(),
+        }
+    }
+}
+
+/// A serializable projection of [`RunOutput`] (see [`RunOutput::to_wire`]).
+///
+/// [`RunOutput`] intentionally does not derive `serde` because it embeds
+/// `events: Vec<RunEvent>`, and [`RunEvent`] carries non-serializable escape
+/// hatches (see [`WireRunEvent`]). This mirror type holds the same fields but
+/// stores the events as already-projected [`WireRunEvent`]s, so the whole
+/// structure round-trips through `serde` (modulo the lossy `Raw` markers).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireRunOutput {
+    /// The minimal successful result.
+    pub reply: Reply,
+    /// The complete underlying LLM response, when the run produced one.
+    pub response: Option<Response>,
+    /// Token usage aggregated across supervisor, subagents, and external runtimes.
+    pub usage: UsageSummary,
+    /// Traces for tools invoked during the run.
+    pub tool_calls: Vec<ToolTrace>,
+    /// Traces for delegations performed during the run.
+    pub delegations: Vec<DelegationTrace>,
+    /// Artifacts produced by delegates during the run.
+    pub artifacts: Vec<ArtifactRef>,
+    /// The ordered projected events observed during the run.
+    pub events: Vec<WireRunEvent>,
+}
+
 /// Token usage aggregated across every participant in a run.
 ///
 /// The facade separates usage reported by the supervisor model, by local
@@ -259,6 +310,121 @@ pub enum RunEvent {
     RawStream(StreamEvent),
     /// Escape hatch: a raw agent-layer notification.
     RawNotification(Notification),
+}
+
+impl RunEvent {
+    /// Projects this event into its official serializable [`WireRunEvent`] form.
+    ///
+    /// This is the single, explicit, one-way bridge for cross-process hosts that
+    /// need to ship run events over a wire. It exists precisely because
+    /// [`RunEvent`] does not (and will not) derive `serde`: the projection is
+    /// *lossy by design*. Every normalized variant forwards its already
+    /// serializable payload verbatim, but the two escape hatches
+    /// ([`RunEvent::RawStream`]/[`RunEvent::RawNotification`]) collapse to an
+    /// opaque [`WireRunEvent::Raw`] marker that records only which escape hatch
+    /// fired — their underlying `StreamEvent`/`Notification` payload is *not*
+    /// carried, keeping R7 intact (their serialization is not a stable
+    /// contract).
+    #[must_use]
+    pub fn to_wire(&self) -> WireRunEvent {
+        match self {
+            RunEvent::TextDelta(text) => WireRunEvent::TextDelta(text.clone()),
+            RunEvent::ToolStarted(trace) => WireRunEvent::ToolStarted(trace.clone()),
+            RunEvent::ToolFinished(trace) => WireRunEvent::ToolFinished(trace.clone()),
+            RunEvent::ApprovalRequested(req) => WireRunEvent::ApprovalRequested(req.clone()),
+            RunEvent::DelegationStarted(trace) => WireRunEvent::DelegationStarted(trace.clone()),
+            RunEvent::DelegationProgress(progress) => {
+                WireRunEvent::DelegationProgress(progress.clone())
+            }
+            RunEvent::DelegationMessage(message) => {
+                WireRunEvent::DelegationMessage(message.clone())
+            }
+            RunEvent::DelegationArtifact(artifact) => {
+                WireRunEvent::DelegationArtifact(artifact.clone())
+            }
+            RunEvent::DelegationFinished(trace) => WireRunEvent::DelegationFinished(trace.clone()),
+            RunEvent::DelegationFailed(trace) => WireRunEvent::DelegationFailed(trace.clone()),
+            RunEvent::Escalated(trace) => WireRunEvent::Escalated(trace.clone()),
+            RunEvent::Done(output) => WireRunEvent::Done(Box::new(output.to_wire())),
+            RunEvent::RawStream(_) => WireRunEvent::Raw(RawEventKind::Stream),
+            RunEvent::RawNotification(_) => WireRunEvent::Raw(RawEventKind::Notification),
+        }
+    }
+}
+
+/// Identifies which [`RunEvent`] escape hatch a [`WireRunEvent::Raw`] marker
+/// stands in for.
+///
+/// The projection deliberately drops the escape hatch payload (see
+/// [`RunEvent::to_wire`]); this enum preserves only the *kind* of raw event so a
+/// consumer can tell a raw client stream event from a raw agent notification
+/// without gaining a stable-serialization contract over their contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RawEventKind {
+    /// Stands in for [`RunEvent::RawStream`] (a raw client-layer stream event).
+    Stream,
+    /// Stands in for [`RunEvent::RawNotification`] (a raw agent-layer notification).
+    Notification,
+}
+
+/// The official serializable projection of [`RunEvent`] (see
+/// [`RunEvent::to_wire`]).
+///
+/// [`RunEvent`] intentionally does not derive `serde` (see `PLAN.md` R7),
+/// because its [`RunEvent::RawStream`]/[`RunEvent::RawNotification`] escape
+/// hatches carry values whose serialization is not a stable contract. Rather
+/// than forcing every cross-process host to re-derive its own wire enum, this
+/// type is the single canonical bridge:
+///
+/// - **Normalized variants are lossless**: `TextDelta`, `ToolStarted`,
+///   `ToolFinished`, `ApprovalRequested`, the `Delegation*` family, `Escalated`,
+///   and `Done` forward their already-serializable payloads verbatim (via
+///   [`WireRunOutput`] for `Done`), so `to_wire()` followed by a `serde_json`
+///   round-trip reproduces the same value.
+/// - **`Raw` is opaque and lossy**: both escape hatches collapse to
+///   [`WireRunEvent::Raw`], which records only a [`RawEventKind`] and carries no
+///   payload. This is what keeps R7 intact — the projection never promotes the
+///   escape hatch serialization to a stable contract.
+///
+/// The variants are adjacently tagged (`{"type": ..., "data": ...}`,
+/// `snake_case`), matching [`Notification`]'s wire shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum WireRunEvent {
+    /// An incremental chunk of assistant text.
+    TextDelta(String),
+    /// A tool invocation has started.
+    ToolStarted(ToolTrace),
+    /// A tool invocation has finished.
+    ToolFinished(ToolTrace),
+    /// The run is waiting on an approval decision.
+    ApprovalRequested(ApprovalRequest),
+    /// A delegation has started.
+    DelegationStarted(DelegationTrace),
+    /// A delegation reported progress.
+    DelegationProgress(DelegationProgress),
+    /// A delegation emitted a message.
+    DelegationMessage(DelegationMessage),
+    /// A delegation produced an artifact.
+    DelegationArtifact(ArtifactRef),
+    /// A delegation finished successfully.
+    DelegationFinished(DelegationTrace),
+    /// A delegation failed.
+    DelegationFailed(DelegationTrace),
+    /// A delegation was escalated to a stronger delegate.
+    Escalated(EscalationTrace),
+    /// The run finished; carries the projected [`WireRunOutput`].
+    ///
+    /// The payload is boxed for the same reason as [`RunEvent::Done`]: it keeps
+    /// this large terminal variant from inflating the size of every
+    /// `WireRunEvent`.
+    Done(Box<WireRunOutput>),
+    /// Opaque stand-in for a [`RunEvent`] escape hatch.
+    ///
+    /// Carries only which escape hatch fired (see [`RawEventKind`]); the
+    /// underlying `StreamEvent`/`Notification` payload is intentionally dropped.
+    Raw(RawEventKind),
 }
 
 /// Placeholder trace for a single tool invocation.
