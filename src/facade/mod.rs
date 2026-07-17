@@ -26,6 +26,7 @@
 //! then the approval surface ([`Approval`], [`ApprovalPolicy`],
 //! [`ApprovalDecision`]) in [`approval`].
 
+pub mod agent;
 pub mod approval;
 pub mod chat;
 pub mod config;
@@ -34,6 +35,7 @@ pub mod ids;
 pub mod run;
 pub mod tool;
 
+pub use agent::{Agent, AgentBuilder};
 pub use approval::{Approval, ApprovalDecision, ApprovalPolicy, FacadeApproval};
 pub use chat::{Chat, ChatBuilder, ChatSession, ChatSessionBuilder, RunStream};
 pub use config::{ModelConfig, ProviderConfig, ProviderConfigBuilder};

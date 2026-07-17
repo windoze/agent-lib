@@ -1,74 +1,79 @@
-# M2-2 `Approval` three-tier + `ApprovalPolicy` -> `ToolApprovalPolicy`/`InteractionHandler`
+# M2-3 `Agent` / `AgentBuilder` + `run` / `run_full` (assemble machine + drive)
 
-## Task (TODO.md M2-2)
-Build `src/facade/approval.rs`: three-tier `Approval` (auto_allow/auto_deny/ask) +
-`ApprovalPolicy` builder. Bridge into adapters implementing `agent::ToolApprovalPolicy`
-(produces `ApprovalRequirement` per tool name/policy) and `agent::InteractionHandler`
-(auto_allow/auto_deny produce `ApprovalResponse` directly; `ask` calls the user handler;
-non-Approval `InteractionKind` -> reasonable default or deny). headless (ask but no handler)
--> deny (surfaces as `FacadeError::ApprovalDenied`), never hangs. Add tool-level override
-`Tool::function(..).approval(..)` with priority over agent-level. Full rustdoc.
+## Task (TODO.md M2-3)
+Build `src/facade/agent.rs`: `Agent` + `AgentBuilder`. builder collects
+provider/model/system/tools/approval/loop-policy; `build()` assembles the §8.3 chain
+(AgentBuilder -> AgentSpec -> AgentState(Conversation::new) -> DefaultAgentMachine ->
+RequirementIds+ToolExecutionIds -> HandlerScope(llm+tool+interaction) -> RunContext ->
+drain). `run`/`run_full`: per turn `AgentInput::user_message` + `drain`; final assistant
+text -> Reply; RunOutput fills response/usage/tool_calls (ToolTrace from notifications);
+`LoopCursor::Error` -> FacadeError (LoopLimitExceeded / Agent(..)). Loop policy defaults
+max_steps=8, max_tool_rounds=4, tool_failure_policy=ReturnErrorToModel + overrides.
+pending failure -> cancel (machine's fail path already discards pending). rustdoc + doctest.
 
-## Anchors (verified)
-- `agent::{ToolApprovalPolicy, ApprovalRequirement, ApprovalResponse, ApprovalDecision,
-  Interaction, InteractionHandler, InteractionKind, InteractionResponse, PermissionResponse,
-  RequirementResult, RunContext}`. Reference: `ApprovalInteractionHandler`, example
-  `RequireApproval`/`StdinApproval` in examples/agent_chat.rs.
-- `ToolApprovalPolicy::approval_requirement(&self, ToolCallId, &ToolCall) -> ApprovalRequirement`
-  (requires `fmt::Debug`). `InteractionHandler::fulfill(&self, &Interaction, &RunContext)
-  -> RequirementResult` (`#[async_trait]`). `InteractionKind::Approval { call_id, requirement }`
-  carries NO tool name -> correlate via shared pending map keyed by `ToolCallId`.
-- Machine always calls the policy BEFORE the interaction handler for the same call_id
-  (tool-use -> approval_requirement -> RequireApproval -> NeedInteraction -> fulfill). So the
-  policy populates the pending map and the interaction handler consumes it.
-- `facade::run::ApprovalRequest { tool_name }` (non_exhaustive; constructible in-crate).
+## Key findings (verified against code)
+- `LoopPolicy` fields = { max_steps, max_parallel_tools, tool_failure_policy } — there is
+  NO `max_tool_rounds` in the core. Faithful mapping: underlying `LoopPolicy.max_steps =
+  min(facade.max_steps, facade.max_tool_rounds + 1)` (a successful run needs tool_rounds+1
+  LLM steps). max_parallel_tools = 1 (core default; facade doesn't expose it; core machine
+  doesn't consume it anyway).
+- Step-limit reached => machine `fail_with_notifications` => `LoopCursor::Error(msg)` with
+  msg = "agent loop step limit {N} reached before a final assistant response". `drain`
+  returns `Ok(TurnDone{cursor: Error})` for machine errors, `Err(AgentError)` only for
+  driver/handler failures. Classify Error cursor: msg.contains("loop step limit") =>
+  LoopLimitExceeded, else Agent(AgentError::Other(msg)). A facade test drives the limit and
+  asserts LoopLimitExceeded, locking the contract.
+- Approval Deny does NOT abort: machine synthesizes a denial tool response, emits
+  ToolCallFinished, continues loop (tool closure never called). So auto_deny test asserts
+  tool-not-executed + final text; no ApprovalDenied abort (M2-3 error mapping only lists
+  LoopLimitExceeded / Agent).
+- Usage: committed turn's `meta().usage()` IS the aggregate (pending turn accumulates each
+  response's usage; merged at commit even with TurnMeta::default()). stop_reason from
+  `meta().responses().last()`. Reply built from (final assistant text, turn usage, last
+  stop_reason). RunOutput.response = None (drain consumes raw Response; synthesizing one
+  would be misleading). tool_calls/events from TurnDone notifications
+  (ToolCallStarted/Finished).
+- ReferenceScope::with_interaction only accepts ApprovalInteractionHandler (fixed decision),
+  so build a custom `HandlerScope` (like examples/agent_chat.rs ChatScope) carrying
+  LlmClientHandler + ToolRegistryHandler(FacadeToolRegistry) + Arc<FacadeApproval> as the
+  interaction handler. Same Arc<FacadeApproval> is the machine approval policy (via
+  with_approval_policy) AND the scope interaction handler (shared pending map).
+- FacadeToolRegistry needs per-run ToolContextParts (run_id/agent_id/worktree/cancel/trace)
+  from RunContext; so registry + scope are rebuilt per run. Machine (state+approval+loop) is
+  built once and persists across run() calls (multi-turn history).
+- ToolContextParts: run_id=ctx.run_id(), agent_id=spec.id(), worktree=spec.worktree().clone(),
+  cancel=ctx.cancellation().clone(), trace=ctx.trace().clone().
 
-## Design (`src/facade/approval.rs`)
-1. `pub use crate::agent::ApprovalDecision;`
-2. `Approval` (Clone, manual Debug): enum kind AutoAllow / AutoDeny / Ask(Arc<AskFn>).
-   `AskFn = dyn Fn(&ApprovalRequest) -> ApprovalDecision + Send + Sync`. ctors
-   `auto_allow()/auto_deny()/ask(handler)`.
-3. `ApprovalPolicy` (Clone, manual Debug): { default: Approval, per_tool: BTreeMap<String,
-   Approval>, ask_external_agents: bool, ask_worktree_write: bool }. `Default` -> default =
-   auto_allow (typed tools are user code, trusted). Builder: `new(Approval)`, `allow_tool`,
-   `ask_tool` (Ask with no handler -> falls back to default handler else headless deny),
-   `deny_tool`, `tool(name, Approval)`, `ask_external_agents`, `ask_worktree_write`. Getters
-   for the two flags. `impl From<Approval> for ApprovalPolicy` (so AgentBuilder `.approval(..)`
-   accepts both `Approval` and `ApprovalPolicy` via `Into`).
-4. `FacadeApproval` implements BOTH `ToolApprovalPolicy` and `InteractionHandler`, shared via
-   `Arc`. Holds resolved config (default + per_tool + tool_overrides + flags) and
-   `Mutex<HashMap<ToolCallId, PendingDecision>>`. Ctor `new(ApprovalPolicy)` +
-   `with_tool_override(name, Approval)` (tool-level, highest priority; M2-3 feeds Tool.approval).
-   - resolve(name) = tool_overrides > per_tool > default.
-   - `approval_requirement`: AutoAllow -> AutoApprove; else RequireApproval{reason} and store
-     PendingDecision (Deny{msg} for auto_deny / headless-ask, Ask{request,handler} otherwise).
-   - `fulfill`: Approval -> pop PendingDecision, produce ApprovalResponse (deny/ask handler);
-     Question -> empty answer; Choice -> index 0; Permission -> deny (safe default, M4 refines).
-   - Manual Debug (closures not Debug).
-5. `Tool` (tool.rs): add `approval: Option<Approval>`, `.approval(self, Approval) -> Self`,
-   `approval_override(&self) -> Option<&Approval>`. Update Debug to include has_approval.
-6. `FacadeError`: add unit variants `ApprovalDenied`, `PermissionDenied` (spec §16). Add a
-   helper to classify a denied approval decision (used by M2-3 run path).
-7. Exports in facade/mod.rs + module rustdoc note.
+## Edits
+1. `error.rs`: add `Agent(#[from] AgentError)` and `LoopLimitExceeded` variants (§16).
+2. `run.rs`: add `pub(crate) fn Reply::from_parts(text, usage, stop_reason)`.
+3. `tool.rs`: extract `pub(crate) fn ensure_unique_tool_names(tools, extra, custom)` used by
+   both `FacadeToolRegistry::new` and `Agent::build` (build-time conflict check).
+4. `agent.rs` (new): Agent + AgentBuilder + custom HandlerScope + drive + classifier.
+5. `mod.rs`: `pub mod agent;` + export `Agent`, `AgentBuilder`. (prelude deferred to M2-R.)
 
-## Tests (offline, in src/facade/approval.rs)
-- auto_allow -> AutoApprove requirement.
-- auto_deny -> RequireApproval + fulfill yields Deny response.
-- ask -> RequireApproval + fulfill calls handler, returns its decision (approve & deny cases).
-- tool-level override beats agent per_tool (with_tool_override wins).
-- ask_tool with no handler and default auto_allow -> headless deny (fulfill returns Deny, no hang).
-- ask_tool with default = ask(handler) -> uses default handler.
-- non-Approval kinds: Question -> empty answer; Choice -> 0; Permission -> deny.
-- ApprovalPolicy::from(Approval) sets default; flags stored/readable.
+## Tests (offline, in agent.rs) — scripted sequenced FakeClient
+- run: tool-use then final text -> returns final text; tool closure ran once.
+- run_full: tool_calls records the call; events contain ToolStarted/Finished.
+- auto_deny: tool closure NOT called; final text still returned.
+- max_tool_rounds=1 with always-tool-use client -> LoopLimitExceeded.
+- (extra) build fails on duplicate tool name; run advertises tool declarations.
 
 ## Validation
-1. cargo fmt --all
-2. cargo clippy --all-targets -- -D warnings  (+ --features facade-schema for the CLI-free set touched)
-3. cargo test -p agent-lib facade::approval  (focused) then cargo test --all --all-targets (<=30 min)
-4. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-5. git diff --check
+fmt --all -- --check; clippy --all-targets -D warnings (+ --features facade-schema);
+cargo test -p agent-lib facade::agent (focused); cargo test --all --all-targets;
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace; git diff --check.
 
 ## Status: DONE
-- All validation green: fmt; clippy default + facade-schema (0 warnings); facade::approval 8 tests;
-  full suite (agent-lib lib 720); doc default + facade-schema; doctests 14/15; git diff --check clean.
-- TODO.md M2-2 marked [DONE] with completion record. No PLAN.md phase change; no new prerequisite tasks.
+
+- Implemented `src/facade/agent.rs` (`Agent` + `AgentBuilder` + `FacadeAgentScope` + `run`/`run_full`
+  + helpers `build_loop_policy`/`classify_error`/`collect_tool_traces`/`final_turn_summary`).
+- Added `src/facade/agent/tests.rs` — 7 offline tests, all green.
+- Wired `pub mod agent; pub use agent::{Agent, AgentBuilder};` into `src/facade/mod.rs`.
+- Support edits: `error.rs` (`Agent(#[from] AgentError)` + `LoopLimitExceeded`), `run.rs`
+  (`Reply::from_parts`), `tool.rs` (`ensure_unique_tool_names`), `chat.rs` (`client_for_provider` → `pub(crate)`).
+- Validation all green: fmt; clippy default + `facade-schema` (0 warnings); focused `facade::agent` 7/7;
+  `cargo test --all --all-targets` 983 passed / 0 failed; rustdoc `-D warnings` default + `facade-schema`;
+  doctests 12/12; `git diff --check` clean.
+- M2-3 marked `[DONE]` in `TODO.md` with completion record. Prelude additions + stream/snapshot/restore/into_parts
+  deferred to M2-4 / M2-R per plan.

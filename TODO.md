@@ -563,7 +563,7 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   `--features facade-schema` 均通过；`cargo test --doc -p agent-lib` 默认 14 / `--features facade-schema` 15
   全绿 ✅｜`git diff --check` 干净 ✅。
 
-### [TODO] M2-3 `Agent` / `AgentBuilder` + `run` / `run_full`（装配 machine + drive）
+### [DONE] M2-3 `Agent` / `AgentBuilder` + `run` / `run_full`（装配 machine + drive）
 
 **上下文**：
 
@@ -596,6 +596,37 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   行为符合策略；`max_tool_rounds` 超限 → `LoopLimitExceeded`。
 - 聚焦：`cargo test -p agent-lib facade::agent`。
 - 完整验证序列 1–6。
+
+**完成记录**：
+
+- 新增 `src/facade/agent.rs`：`Agent` + `AgentBuilder`。`build()` 一次性装配 §8.3 全链路
+  —— typed tools + escape-hatch 声明 → `ToolSetRef`；`AgentSpec`（worktree/system/model/loop policy）
+  → `AgentState(Conversation::new)` → `DefaultAgentMachine::new(state, NonStreaming, FacadeIds)`
+  `.with_tool_execution_ids(FacadeIds)` `.with_approval_policy(FacadeApproval)`。machine 建一次、跨 `run`
+  持有（多轮历史累积）；每轮重建 run-scoped `FacadeToolRegistry` + 自建 `FacadeAgentScope: HandlerScope`
+  （llm + tool + 共享 `Arc<FacadeApproval>` 作 interaction），`AgentInput::user_message` + `drain` 驱动。
+- `run_full`：`LoopCursor::Done` → 从已提交 turn 取最终 assistant 文本 / 聚合 usage / stop_reason 组
+  `Reply::from_parts`（`response=None`，因 drive 折叠 `Response`）；从本轮 `ToolCallStarted/Finished`
+  notifications 收集 `ToolTrace` 填 `tool_calls` 与 `RunEvent::ToolStarted/ToolFinished`。`run` = `run_full().reply`。
+- loop policy 映射（§8.4）：`effective_max_steps = min(max_steps, max_tool_rounds+1).max(1)`，
+  `max_parallel_tools=1`；默认 `max_steps=8 / max_tool_rounds=4 / ToolFailurePolicy::ReturnErrorToModel`。
+  step 限额耗尽（机器发 `"agent loop step limit N reached ..."`）→ `FacadeError::LoopLimitExceeded`，
+  其余错误 cursor → `FacadeError::Agent(AgentError::Other(..))`。
+- 支撑改动：`error.rs` 增 `FacadeError::{Agent(#[from] AgentError), LoopLimitExceeded}`；`run.rs` 增
+  `pub(crate) Reply::from_parts`；`tool.rs` 抽出 `pub(crate) ensure_unique_tool_names` 供 build 期查重复用；
+  `chat.rs` 的 `client_for_provider` 提升为 `pub(crate)`；`mod.rs` 导出 `pub mod agent; pub use agent::{Agent, AgentBuilder};`。
+- 测试 `src/facade/agent/tests.rs`（全离线，脚本化 `ScriptedClient` + 计数 typed tool，各 < 1s）：
+  `run` 完成一次 tool round-trip 返回最终文本且工具恰执行一次；`run_full` 记录 `tool_calls` + 事件 +
+  聚合 usage；`auto_deny` 时工具不执行且返回最终文本；always-tool-use（每轮唯一 provider id）+
+  `max_tool_rounds=1` → `LoopLimitExceeded`；多轮 `run` 历史累积；缺 model / 重名工具 build 报错。
+  （修复的一处真实行为：脚本客户端若跨轮复用同一 provider call id，会先触发 Conversation 重复 id
+  报错而非 loop limit —— 真实模型每轮 id 唯一，故 fixture 改为逐轮生成唯一 id，未绕过任何底层路径。）
+- 验证：`cargo fmt --all` ✅｜`cargo clippy --all-targets -- -D warnings` 默认 + `--features facade-schema`
+  均 0 警告 ✅｜`cargo test -p agent-lib facade::agent` 7 全绿 ✅｜`cargo test --all --all-targets`
+  全绿（983 passed / 0 failed）✅｜`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 默认 +
+  `--features facade-schema` 均通过；`cargo test --doc -p agent-lib` 12 全绿 ✅｜`git diff --check` 干净 ✅。
+- 说明：`prelude` 增补 `Agent/Tool/Approval/...` 与 `stream`/`snapshot`/`restore`/`into_parts` 按计划留待
+  M2-4 / M2-R；本任务仅从 `facade` 根导出 `Agent`/`AgentBuilder`。
 
 ### [TODO] M2-4 `Agent::stream` + `snapshot`/`restore` + `into_parts`
 

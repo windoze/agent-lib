@@ -7,6 +7,7 @@
 
 use thiserror::Error;
 
+use crate::agent::AgentError;
 use crate::client::ClientError;
 use crate::conversation::ConversationError;
 
@@ -40,6 +41,25 @@ pub enum FacadeError {
     /// A Conversation operation was rejected.
     #[error("conversation error: {0}")]
     Conversation(#[from] ConversationError),
+
+    /// An Agent-layer drive failed while running the loop.
+    ///
+    /// Wraps an [`AgentError`] surfaced either directly from the driver
+    /// ([`crate::agent::drain`]) or reconstructed from a terminal
+    /// [`crate::agent::LoopCursor::Error`] the machine came to rest on (see
+    /// `docs/facade-api.md` §16). The underlying
+    /// [`std::error::Error::source`] chain is preserved.
+    #[error("agent error: {0}")]
+    Agent(#[from] AgentError),
+
+    /// The Agent loop hit its step / tool-round limit before the model produced
+    /// a final assistant response.
+    ///
+    /// The facade bounds a run by `max_steps` and `max_tool_rounds` (see
+    /// `docs/facade-api.md` §8.4); when a model keeps requesting tools past that
+    /// budget the run fails fast with this variant rather than looping forever.
+    #[error("agent loop step or tool-round limit exceeded")]
+    LoopLimitExceeded,
 
     /// The model returned a tool-use block where none is allowed.
     ///

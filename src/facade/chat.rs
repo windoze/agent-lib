@@ -357,7 +357,7 @@ impl ChatBuilder {
 }
 
 /// Builds a concrete adapter client for a [`ProviderConfig`]'s wire protocol.
-fn client_for_provider(provider: ProviderConfig) -> Arc<dyn LlmClient> {
+pub(crate) fn client_for_provider(provider: ProviderConfig) -> Arc<dyn LlmClient> {
     use crate::model::extras::ProviderId;
 
     let (endpoint, provider_id) = provider.into_parts();

@@ -537,26 +537,7 @@ impl FacadeToolRegistry {
         extra: Vec<ToolDecl>,
         context: ToolContextParts,
     ) -> Result<Self, FacadeError> {
-        let mut seen = std::collections::BTreeSet::new();
-        let mut check = |name: &str| -> Result<(), FacadeError> {
-            if !seen.insert(name.to_owned()) {
-                return Err(FacadeError::DuplicateTool {
-                    name: name.to_owned(),
-                });
-            }
-            Ok(())
-        };
-        for tool in &tools {
-            check(tool.name())?;
-        }
-        for declaration in &extra {
-            check(&declaration.name)?;
-        }
-        if let Some(custom) = &custom {
-            for declaration in custom.declarations() {
-                check(&declaration.name)?;
-            }
-        }
+        ensure_unique_tool_names(&tools, &extra, custom.as_ref())?;
 
         Ok(Self {
             tools,
@@ -565,6 +546,44 @@ impl FacadeToolRegistry {
             context,
         })
     }
+}
+
+/// Validates that no tool name is declared more than once across the typed
+/// tools, the escape-hatch declarations, and the custom registry.
+///
+/// Shared by [`FacadeToolRegistry::new`] and the Agent facade's build step so a
+/// name conflict is reported once, up front, regardless of which assembly path
+/// discovers it.
+///
+/// # Errors
+///
+/// Returns [`FacadeError::DuplicateTool`] on the first repeated name.
+pub(crate) fn ensure_unique_tool_names(
+    tools: &[Tool],
+    extra: &[ToolDecl],
+    custom: Option<&Arc<dyn ToolRegistry>>,
+) -> Result<(), FacadeError> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut check = |name: &str| -> Result<(), FacadeError> {
+        if !seen.insert(name.to_owned()) {
+            return Err(FacadeError::DuplicateTool {
+                name: name.to_owned(),
+            });
+        }
+        Ok(())
+    };
+    for tool in tools {
+        check(tool.name())?;
+    }
+    for declaration in extra {
+        check(&declaration.name)?;
+    }
+    if let Some(custom) = custom {
+        for declaration in custom.declarations() {
+            check(&declaration.name)?;
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Debug for FacadeToolRegistry {

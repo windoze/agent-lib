@@ -48,6 +48,25 @@ pub struct Reply {
 }
 
 impl Reply {
+    /// Builds a reply from already-aggregated parts.
+    ///
+    /// Used by the Agent facade, whose sans-io drive folds each LLM response
+    /// into the [`Conversation`](crate::conversation::Conversation) and does not
+    /// hand back a raw [`Response`]. The `text` is the final assistant text, the
+    /// `usage` is aggregated across every step of the run, and `stop_reason` is
+    /// the normalized stop reason of the final response, when known.
+    pub(crate) fn from_parts(
+        text: String,
+        usage: Option<Usage>,
+        stop_reason: Option<StopReason>,
+    ) -> Self {
+        Self {
+            text,
+            usage,
+            stop_reason,
+        }
+    }
+
     /// Returns the aggregated assistant text.
     #[must_use]
     pub fn text(&self) -> &str {
