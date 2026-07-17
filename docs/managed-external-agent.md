@@ -121,7 +121,7 @@ scope wiring 决定 attended / headless 行为。
 | budget | handler/driver charge tokens/cost | runtime usage/cost event charge | 拟新增 |
 | trace | requirement + tool + subagent nodes | external events + shutdown + artifacts | 部分已有 |
 | artifact | tool/model output | patch/diff/test/file artifact refs | 部分已有 |
-| worktree isolation | `WorktreeRef` | shared / per-agent / ephemeral worktree manager | 拟新增 |
+| worktree isolation | `WorktreeRef` | shared / per-agent / ephemeral worktree manager | 已落地(M9-1):`WorktreeManager`/`GitWorktreeManager`(prepare/cleanup + residual 标记),见 §16 |
 | reconfig | queued tool set swap | boundary-level tool bridge reconfigure | 拟新增 |
 | snapshot/restore | `AgentState` + Conversation snapshot | `ExternalAgentState` + `ExternalSessionRef` resume | state 已有,handler 待实现 |
 
@@ -1296,25 +1296,54 @@ ExternalAgentError::UnsupportedCapability {
 
 ## 16. worktree isolation
 
-`WorktreeIsolation` 当前只是 data。managed runtime 必须真正执行:
+`WorktreeIsolation` 曾经只是 data。M9-1 起 `WorktreeManager` 真正执行隔离,默认实现
+`GitWorktreeManager`(handler/scheduler 侧 hook,object-safe,可作 `Arc<dyn WorktreeManager>`):
 
-| isolation | 行为 |
-|---|---|
-| `Shared` | 直接在指定 worktree 运行 |
-| `PerAgentWorktree` | 每个 agent 固定一个独立 worktree |
-| `EphemeralGitWorktree` | 每次 session 创建临时 git worktree,结束后清理 |
+| isolation | prepare 行为 | cleanup 行为 |
+|---|---|---|
+| `Shared` | 直接返回传入 worktree,不做任何 IO | 从不删除;dirty close 仍标 residual |
+| `PerAgentWorktree` | `<root>/agent-<agent_id>` 固定 linked git worktree,已存在则幂等复用 | 持久保留(跨 session 复用),从不删除;dirty close 标 residual |
+| `EphemeralGitWorktree` | `<root>/ephemeral/<agent_id>-<n>` 每 session 新建 linked git worktree | graceful → `git worktree remove --force` 删除;forced/failed → **保留** 并标 residual |
 
-拟新增 `WorktreeManager`:
+`root` 默认 `std::env::temp_dir()/agent-lib-worktrees`,置于 base checkout 之外避免 git worktree
+嵌套;`with_root` 可覆盖。ephemeral 路径用 per-manager 单调计数器(非随机/时钟),遵循本 crate
+“nondeterminism 由 caller 掌控” 约束,并对已存在(retained)目录做 existence 跳过。
+
+`WorktreeManager`:
 
 ```rust
-pub trait WorktreeManager {
-    fn prepare(&self, agent_id: AgentId, isolation: WorktreeIsolation) -> Result<PreparedWorktree, AgentError>;
-    fn collect_artifacts(&self, worktree: &PreparedWorktree) -> Vec<ExternalArtifactRef>;
-    fn cleanup(&self, worktree: PreparedWorktree, shutdown: ExternalSessionShutdown) -> Result<(), AgentError>;
+#[async_trait]
+pub trait WorktreeManager: Send + Sync {
+    async fn prepare(
+        &self,
+        agent_id: AgentId,
+        base: &WorktreeRef,
+        isolation: WorktreeIsolation,
+    ) -> Result<PreparedWorktree, WorktreeError>;
+
+    async fn cleanup(
+        &self,
+        prepared: PreparedWorktree,
+        disposition: ExternalSessionShutdown,
+    ) -> Result<WorktreeCleanupOutcome, WorktreeError>;
 }
 ```
 
-forced kill / shutdown failed 后,worktree 应标记为 residual side effects,不能自动复用。
+git 操作走 `WorktreeGitExec` hook(生产实现 `SystemGit` shell out `git worktree add --detach` /
+`git worktree remove --force`),因此 placement/teardown 策略在无真实仓库下即可单测。
+
+### residual side-effect 策略(design §6.4/§16)
+
+`cleanup` 消费 session registry 报告的 `ExternalSessionShutdown` disposition:
+
+- `Graceful` → 无 residual;ephemeral 被删除,worktree 视为 clean 可复用。
+- `ForcedKill` / `Failed` → `leaves_residual_side_effects()` 为真;**任何** isolation 都标
+  `WorktreeCleanupOutcome::residual_side_effects()=true`,ephemeral 也**保留**供排查,
+  `safe_to_reuse()` 返回 false。forced kill / failed 绝不误标 clean。
+
+registry 的 `cleanup` / `cleanup_agent` 返回 `ExternalSessionShutdown`;scheduler 把该 disposition
+既喂给 `TraceHandle::record_external_shutdown`(审计),又喂给 `WorktreeManager::cleanup`
+(决定删除/保留/标记),二者用同一 disposition 保持一致。
 
 ## 17. budget / usage / cost
 

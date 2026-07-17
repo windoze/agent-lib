@@ -2673,7 +2673,7 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
 
 目标:把 managed external agent 接入调度、worktree、budget、docs 和真实多 agent e2e。
 
-### [TODO] M9-1 实现 worktree isolation 管理与 cleanup 标记
+### [DONE] M9-1 实现 worktree isolation 管理与 cleanup 标记
 
 **上下文**:
 
@@ -2696,6 +2696,44 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
 - forced kill/failed cleanup 不会误标 clean。
 - `cargo test -p agent-lib external_worktree`
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- **新增 `src/agent/external/worktree.rs`**（不 feature-gated,default 构建即编译）:
+  - `WorktreeManager`（async, object-safe trait）:`prepare(agent_id, base, isolation) -> PreparedWorktree` /
+    `cleanup(prepared, ExternalSessionShutdown) -> WorktreeCleanupOutcome`,可作 `Arc<dyn WorktreeManager>`。
+  - `PreparedWorktree`（agent_id/isolation/worktree/ephemeral + accessors）与
+    `WorktreeCleanupOutcome`（isolation/worktree/`removed()`/`residual_side_effects()`/`safe_to_reuse()`）。
+  - `WorktreeError::{Prepare,Cleanup}`（thiserror,带 isolation+path+stable detail,无 secret）。
+  - `WorktreeGitExec`（hook）+ 生产实现 `SystemGit`:`git -C <repo> worktree add --detach <path> HEAD` /
+    `worktree remove --force <path>`（tokio::process）。策略与 IO 分离,使 placement/teardown 可离线单测。
+  - `GitWorktreeManager<G=SystemGit>`:root 默认 `temp_dir()/agent-lib-worktrees`（`with_root` 可覆盖）,
+    置于 base checkout 之外避免 git worktree 嵌套。ephemeral 唯一名用 **per-manager 单调计数器**（`AtomicU64`,
+    非随机/时钟,遵循本 crate「nondeterminism 由 caller 掌控」约束,`uuid` 未启用 `v4`),并对已存在
+    (retained) 目录做 existence 跳过。
+- **三策略 prepare/cleanup（design §6.4/§16）**:
+  - `Shared` → 原 base,无 IO;cleanup 从不删除,dirty close 仍标 residual。
+  - `PerAgentWorktree` → `<root>/agent-<agent_id>` 固定 linked worktree,存在则幂等复用;cleanup 持久保留、
+    从不删除,dirty close 标 residual。
+  - `EphemeralGitWorktree` → `<root>/ephemeral/<agent_id>-<n>` 每 session 新建;graceful → `git worktree remove`
+    删除且 `removed=true residual=false`;`ForcedKill`/`Failed` → **保留**、`removed=false residual=true`
+    （`safe_to_reuse()=false`）。**forced kill / failed 绝不误标 clean**。
+- **residual 语义与 registry 协调**:cleanup 消费的 disposition 即 `ExternalSessionRegistry::cleanup`/
+  `cleanup_agent` 返回、`TraceHandle::record_external_shutdown` 记录的同一 `ExternalSessionShutdown`;
+  `residual_side_effects()` 恒等于 `disposition.leaves_residual_side_effects()`,scheduler 用同一 disposition
+  既审计又决定删除/保留。§16 文档写明该协调关系。
+- **导出**:`external/mod.rs` + `agent/mod.rs` re-export `GitWorktreeManager/PreparedWorktree/SystemGit/
+  WorktreeCleanupOutcome/WorktreeError/WorktreeGitExec/WorktreeManager`。
+- **文档**:`docs/managed-external-agent.md` §16 重写为已实现 + prepare/cleanup 策略表 + residual 策略段;
+  status table「worktree isolation」行改为「已落地(M9-1)」。
+- **测试**:`worktree.rs` inline 12 个单测（`external_worktree_*` 前缀以匹配 filter）覆盖三策略 prepare、
+  per-agent 幂等复用与跨 agent 路径隔离、ephemeral 唯一性、graceful 删除、forced_kill/failed 保留且标 residual、
+  shared/per-agent residual、git add/remove 失败冒泡 `WorktreeError`、以及三 disposition→outcome 协调。
+  ScriptedGit 双桩 + 计数器 ScratchRoot,全离线、每测 <1s。
+- **验证(全过)**:`cargo fmt --all -- --check` 干净;`cargo test -p agent-lib external_worktree` 12 passed;
+  `cargo clippy --all-targets -- -D warnings` 0 warning（另跑 `--features "external-claude-code external-codex
+  external-opencode"` 亦 0 warning）;`cargo test --all --all-targets` 全 ok（46 个 test result: ok、exit 0、
+  0 failed）;`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净;`git diff --check` 干净。
 
 ### [TODO] M9-2 接入 usage/cost budget charging
 

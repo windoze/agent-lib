@@ -82,6 +82,7 @@ mod shutdown;
 mod sink;
 mod spec;
 mod state;
+mod worktree;
 
 pub use adapter::{ExternalRuntimeAdapter, ExternalRuntimeSession, RuntimeDecisionPoint};
 pub use capability::{ExternalCapability, ExternalRuntimeCapabilities};
@@ -123,6 +124,10 @@ pub use shutdown::ExternalSessionShutdown;
 pub use sink::{DiscardEventSink, ExternalEventSink};
 pub use spec::ExternalAgentSpec;
 pub use state::{ExternalAgentCursor, ExternalAgentState};
+pub use worktree::{
+    GitWorktreeManager, PreparedWorktree, SystemGit, WorktreeCleanupOutcome, WorktreeError,
+    WorktreeGitExec, WorktreeManager,
+};
 
 /// Which external coding-agent runtime backs a session.
 ///

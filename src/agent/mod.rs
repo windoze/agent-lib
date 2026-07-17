@@ -68,6 +68,10 @@ pub use external::{
     collect_file_patch_artifacts, collect_file_patch_artifacts_from_observed,
 };
 pub use external::{DiscardEventSink, ExternalEventSink};
+pub use external::{
+    GitWorktreeManager, PreparedWorktree, SystemGit, WorktreeCleanupOutcome, WorktreeError,
+    WorktreeGitExec, WorktreeManager,
+};
 pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};
 pub use interaction::{
     Interaction, InteractionError, InteractionKind, InteractionKindTag, InteractionResponse,

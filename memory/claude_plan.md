@@ -1,55 +1,66 @@
-# M8-4 Review：OpenCode adapter 正确性检查
+# M9-1 实现 worktree isolation 管理与 cleanup 标记
 
-**当前任务 = TODO.md 第一个未完成任务 = M8-4**（TODO.md `### [TODO] M8-4`，line 2595）。
-M8-1/M8-2/M8-3 已 `[DONE]`。M8-4 = review：对比三个 runtime adapter 一致性 + 更新 capability-matrix OpenCode 行。
+**当前任务 = TODO.md 第一个未完成任务 = M9-1**（`### [TODO] M9-1`, line 2676）。
+M1..M8 全部 `[DONE]`。M9-1 是 M9（Managed External Agent hardening）第一子任务。
 
-## Review 结论（已逐项核对源码）
+## 任务要求（TODO.md 2676-2698）
+1. 新增 `WorktreeManager` trait / adapter hook：
+   - `prepare(worktree ref, isolation) -> prepared worktree`
+   - `cleanup(prepared, shutdown disposition)`
+   - 标记 residual side effects
+2. session registry cleanup 时记录 `ExternalSessionShutdown`（已返回 disposition，补文档+测试证明协调）。
+3. ephemeral worktree graceful 后删除；forced/failed 保留或标记；策略写文档。
+4. 验证：unit tests 覆盖 shared/per-agent/ephemeral 三策略；forced/failed 不误标 clean；
+   `cargo test -p agent-lib external_worktree`；完整验证序列 1-6。
 
-### 1. trait 实现一致 ✓
-- 三者都 impl `ExternalRuntimeAdapter`(kind/capabilities/start/resume) + `ExternalRuntimeSession`
-  (session_ref/advance/shutdown)。
-- **Codex 与 OpenCode 同构**（自主、一进程/一 turn）：begin/read_line/drain_and_emit/
-  spawn_follow_up_turn/finish(仅 Completed/Failed)/advance(cancel→SessionLost)/shutdown
-  (close stream 或 Graceful) 结构逐行一致；OpenCodeLauncher/OpenCodeTurnStream 镜像
-  CodexLauncher/CodexTurnStream。
-- **Claude Code 差异是设计意图**：常驻 stdio 进程（非一进程/一 turn），finish 多出
-  PausedForToolCalls/PausedForInteraction 臂（permission bridge），write_input 替代
-  spawn_follow_up_turn，shutdown 直接关 io。
+## 现状核对（已读源码）
+- `WorktreeIsolation::{Shared,PerAgentWorktree,EphemeralGitWorktree}` @ external/mod.rs:198。
+- `ExternalSessionShutdown{Graceful,ForcedKill,Failed}` + `leaves_residual_side_effects()` @ shutdown.rs。
+- `ExternalAgentState::{cleanup_required,mark/clear_cleanup_required}` @ state.rs。
+- registry `cleanup/cleanup_agent` 返回 `ExternalSessionShutdown` @ registry.rs:255/279。
+- `TraceHandle::record_external_shutdown` 已存在 @ context/trace.rs:316。
+- `WorktreeRef` @ agent/spec.rs:95。`AgentId: Display`。
+- 设计意图 docs/managed-external-agent.md §16（拟新增 `WorktreeManager`），status table line 124「拟新增」。
 
-### 2. capability fallback 一致 ✓
-- 三者：new()→implemented_capabilities()；with_probed_capabilities()→intersect_capabilities()
-  （逐位 AND，helper 三份逐行一致）。
-- 三者：reject_unsupported_tools(host_tools 门禁)+turn_message 拒绝式
-  (PermissionBridge/HostTools/HostSubagents→UnsupportedCapability，Shutdown→Protocol)。
-- 能力位：Claude={streaming,resume,permission_bridge,artifacts,usage,graceful=true;
-  host_tools,host_subagents=false}；Codex & OpenCode={streaming,resume,artifacts,usage,graceful=true;
-  permission_bridge,host_tools,host_subagents=false}。唯一差异 = permission_bridge，已文档化。
+## 设计
+新文件 `src/agent/external/worktree.rs`：
+- `PreparedWorktree`（Clone/Debug/PartialEq/Eq）：agent_id, isolation, worktree(WorktreeRef), ephemeral。accessors。
+- `WorktreeCleanupOutcome`：isolation, worktree, removed:bool, residual_side_effects:bool；`safe_to_reuse()=!residual`。
+- `WorktreeError`（thiserror Clone/PartialEq/Eq）：Prepare{isolation,path,detail} / Cleanup{...}。
+- `WorktreeGitExec`（async trait）：`add_worktree(repo,worktree)` / `remove_worktree(repo,worktree)` -> `Result<(),String>`。
+- `SystemGit` impl：`git -C <repo> worktree add --detach <path> HEAD` / `worktree remove --force <path>`（tokio::process）。
+- `WorktreeManager`（async trait, object-safe）：`prepare(agent_id,base,isolation)` / `cleanup(prepared,disposition)`。
+- `GitWorktreeManager<G=SystemGit>`：
+  - root = temp_dir()/"agent-lib-worktrees"，`with_root` 可覆盖（测试用）。
+  - prepare：Shared→原 base 无 IO；PerAgent→root/agent-<id> 幂等复用否则 git add；Ephemeral→root/ephemeral/<uuid> 总是 add。
+  - cleanup：Shared/PerAgent→removed=false，residual=disposition.leaves_residual_side_effects()；
+    Ephemeral graceful→git remove removed=true residual=false；forced/failed→保留 removed=false residual=true。
+- tests（inline，fn 名 `external_worktree_*` 匹配 filter）：三策略、幂等、graceful remove、forced/failed 不误标 clean、
+  shared/per-agent residual、git 失败冒泡、disposition 协调。
 
-### 3. parser cassette 覆盖层级一致 ✓
-- 三份 agent_<rt>_cassette.rs 各 7 个并行层：regenerate_fixture / matches_in_code_builder /
-  is_secret_free / decodes_full_session / tolerates_unknown_and_blank_frames /
-  rejects_malformed_frames / decodes_*_as_failed。各有 committed fixture。
-- inline adapter 单测同构；OpenCode 多 resume_survives_a_session_that_never_re_reports_its_id（无 init 帧特性）。
-
-### 4. cleanup/trace 一致 ✓
-- 三者 advance 均先 ctx.is_cancelled()→SessionLost；shutdown→ExternalSessionShutdown。
-- adapter 层不自发 tracing（trace 经 RunContext trace node 透传）。
-- session_ref 均暴露 session_id + resume_token(=session id) + last_event_seq 高水位去重。
-
-## 交付物
-1. docs/capability-matrix.md：OpenCode 小节标注 M8-4 review 定案 + 新增三 adapter 统一接入路径对照表。
-2. TODO.md M8-4 → [DONE] + 完成记录（OpenCode 支持/不支持能力 + 真实 e2e 状态）。
+导出：external/mod.rs `pub use worktree::{...}`；agent/mod.rs re-export。
+文档：docs/managed-external-agent.md §16 更新为已实现 + 策略表；status table line 124「已实现」。
 
 ## 验证序列
-1. cargo fmt --all -- --check
-2. cargo clippy --all-targets --features external-opencode -- -D warnings
-3. cargo test --features external-opencode -p agent-lib opencode_cassette
-4. cargo test --features external-opencode -p agent-lib --lib opencode
+1. cargo fmt --all
+2. cargo clippy --all-targets -- -D warnings
+3. cargo test -p agent-lib external_worktree
+4. cargo test -p agent-lib external
 5. git diff --check
-6. 全量 cargo test --all --all-targets：M8-4 仅改 docs，无编译产物变化，复用 M8-3 绿结果。
+6. 全量 cargo test --all --all-targets（<=30min）
 
 ## 进度
-- [x] 调研 + 逐项一致性核对（trait/fallback/cassette/cleanup）
-- [x] 更新 capability-matrix.md OpenCode 行 + 统一对照表
-- [x] 目标验证（fmt/clippy/opencode 测试 + 全量 cargo test --all --all-targets exit 0）
-- [x] TODO.md DONE + commit
+- [ ] 写 worktree.rs
+- [ ] 导出 + 文档
+- [ ] fmt/clippy/test
+- [ ] TODO.md DONE + commit
+
+## 完成状态（M9-1 DONE）
+- [x] worktree.rs（types + WorktreeManager trait + GitWorktreeManager + SystemGit + WorktreeGitExec + 12 单测）
+- [x] 导出（external/mod.rs + agent/mod.rs）+ 文档（managed-external-agent.md §16 + status table）
+- [x] 计数器替代 uuid v4（crate 未启用 v4 feature；遵循 no-random 约束）
+- [x] fmt/clippy(default+3 features)/doc(workspace)/git diff 全干净
+- [x] cargo test -p agent-lib external_worktree → 12 passed
+- [x] cargo test --all --all-targets → 46 ok, 0 failed, exit 0
+- [x] TODO.md M9-1 → [DONE] + 完成记录
+- [ ] commit（进行中）
