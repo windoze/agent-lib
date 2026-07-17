@@ -103,7 +103,10 @@ resume、host 工具注入、subagent 桥接等。这套模型的唯一代码来
 [`agent::external::probe`](../src/agent/external/claude_code/probe.rs)）：它调用 `claude --version`
 / `--help`，把缺失/损坏的 binary 分类为 `Launch`、把不支持 `stream-json` 的 CLI 分类为
 `UnsupportedCapability{Streaming}`，并从 `--help` 广告出的开关**保守探测**能力位。该探测反映的是
-「CLI 自称支持什么」，仍**不是** e2e 实测；下表 Claude Code 行要等 M6-3/M6-4 真实会话跑通后才逐项翻真。
+「CLI 自称支持什么」,仍**不是** e2e 实测。里程碑 6-2 又补上了 feature-gated 的私有 `stream-json`
+**decoder**（[`ClaudeStreamDecoder`](../src/agent/external/claude_code/decoder.rs)）,它离线地把 CLI
+帧解成中立观测/决策并有 committed cassette 回归,但仍未跑真实会话;下表 Claude Code 行要等
+M6-3/M6-4 真实会话跑通后才逐项翻真。
 
 ### 受管能力清单（`ExternalCapability`，共 8 项）
 

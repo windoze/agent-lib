@@ -1892,7 +1892,7 @@ process 管理,不需要改 machine/driver。
   --workspace`（含 `--features external-claude-code`）干净；`git diff --check` 干净。
 - Claude Code 真实 e2e 未在本任务范围（属 M6-3）；本机未运行真实 CLI。
 
-### [TODO] M6-2 实现 Claude Code stream decoder cassette 测试
+### [DONE] M6-2 实现 Claude Code stream decoder cassette 测试
 
 **上下文**:
 
@@ -1917,6 +1917,57 @@ process 管理,不需要改 machine/driver。
 - parser 不需要真实 Claude Code。
 - `cargo test -p agent-lib claude_code_cassette`
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- 新增 feature-gated 私有 decoder `src/agent/external/claude_code/decoder.rs`：有状态、跨 turn
+  单调 `seq` 的逐帧 `stream-json` 解码器。全程走 `serde_json::Value` 防御式导航,**不导出任何 raw
+  frame 类型**,Claude 私有 wire schema 不进 `agent-lib` 稳定 API（design §12.2）。在
+  `src/agent/external/claude_code/mod.rs` 挂载并经 `src/agent/external/mod.rs` 的
+  `#[cfg(feature = "external-claude-code")]` re-export `ClaudeDecision`、`ClaudeDecodeContext`、
+  `ClaudeStreamDecoder`。
+- 公开 API：`ClaudeDecodeContext::new(step_id, actor)`（宿主身份,权限 `Interaction` 只绑宿主
+  `step_id`/`actor`,绝不取自模型输出）、`ClaudeStreamDecoder::new(ctx)`、
+  `push_line(&str) -> Result<Option<ClaudeDecision>, ExternalAgentError>`、
+  `take_observations() -> Vec<ExternalObservedEvent>`、`session_id()`。turn 落定时返回中立
+  `ClaudeDecision`（`Completed` / `PausedForToolCalls` / `PausedForInteraction` / `Failed`）。
+- frame 映射：`system/init`→`SessionStarted`（捕获 session_id + cwd）；assistant `text`→`TextDelta`；
+  `tool_use` `Bash`→`CommandStarted`,`Edit`/`Write`/`MultiEdit`/`NotebookEdit`/`Update`→`FilePatch`
+  （summary=`"{name} {path}"`）,其它内建→`ToolStarted`,`mcp__*` 宿主桥接工具→折成
+  `PausedForToolCalls` 批次（batch_id = assistant message `id`）；user `tool_result` 关联到已追踪的
+  Bash→`CommandFinished`（is_error→exit_code 0/1）,否则→`ToolFinished`；`control_request`
+  `can_use_tool`→`PermissionRequested` 观测 + `PausedForInteraction`；`result` `success`→
+  `SessionCompleted` + `Completed`（cost_micros=round(total_cost_usd*1e6),usage 取自 result.usage）,
+  error 子类型→`Failed`（`error_max_turns`→`LimitExceeded`,其余→`Runtime{code,message}`）。
+- 容忍策略（稳定）：空行 / `stream_event` 部分帧 / 未知 `type` / 未知 content block / 未关联的
+  `tool_result` → 容忍（`Ok(None)`,无观测）；非法 JSON / 非对象帧 / 缺字符串 `type` / 已知帧缺必需
+  内层对象（assistant/user 无 `message`、control_request 无 `request_id`/`request`）→
+  `ExternalAgentError::Protocol`。所有诊断均为固定字符串,永不夹带 prompt/tool input/凭据。
+- 因跨 turn 观测由状态机按 `ExternalSessionRef::last_event_seq` 去重,单个 decoder 实例贯穿整个 session,
+  `seq` 跨 turn 单调不重置；`take_observations()` 只 drain 待发观测而不重置 `next_seq`;决策产出时清空
+  `active_tools`。
+- 依赖环规避：`agent-testkit` 依赖 `agent-lib`,`agent-lib` dev-dep `agent-testkit`;若在 `src/` 内联
+  用 `agent_testkit` 会得到两个 agent-lib 实例导致类型不一致。故 decoder 设为 feature-gated `pub`,
+  全部测试放到 feature-gated 集成测试 `tests/agent_claude_code_cassette.rs`（agent-lib 只链一次）。
+- committed cassette `tests/fixtures/external/claude_code/full_session.json`：三 turn（turn1 = text/
+  command/patch/宿主 tool → `PausedForToolCalls`;turn2 = text/permission → `PausedForInteraction`;
+  turn3 = text/completion → `Completed`,含 usage/cost）。由 in-code builder 经
+  `AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1` 再生成;`assert_no_secrets` 保证无凭据。
+- 测试（集成 7 个,均离线、无需真实 Claude Code）：regenerate guard、cassette 与 in-code builder 逐帧/
+  逐决策一致、secret-free 扫描、full-session 全程回放断言观测流与每 turn 决策、容忍未知/空行帧、
+  malformed→`Protocol`、error-result→`Failed`。`ExternalAgentError` 是模块 canonical 未装箱错误,
+  decoder 同步小-`Ok` helper 触发的 `clippy::result_large_err` 以模块级 `#![allow]` + 说明注释显式接受,
+  与 `adapter.rs`/`registry.rs`/`probe.rs` 的错误签名保持一致。
+- 文档：`docs/managed-external-agent.md` §12.2 增补「实现状态（M6-2,已落地）」；
+  `docs/capability-matrix.md` 保守基线段落说明离线 decoder 已存在但仍非 e2e;
+  `tests/fixtures/external/claude_code/README.md` 从预留占位改为描述已落地的合成 decoder fixture。
+- 验证：`cargo fmt --all -- --check` 干净；`cargo clippy --all-targets -- -D warnings` 与
+  `--features external-claude-code` 均 0 warning；`cargo test --all --all-targets`（未启 feature）
+  全 ok、0 failed；`cargo test --features external-claude-code --test agent_claude_code_cassette`
+  7 passed；`cargo test -p agent-lib --test agent_claude_code_cassette`（未启 feature）0 test；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --features external-claude-code` 干净；
+  `git diff --check` 干净。
+- Claude Code 真实 e2e 未在本任务范围（属 M6-3）;本机未运行真实 CLI,仅回放合成 cassette。
 
 ### [TODO] M6-3 实现 Claude Code session adapter 与 ignored real e2e
 

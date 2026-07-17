@@ -83,8 +83,8 @@ pub use adapter::{ExternalRuntimeAdapter, ExternalRuntimeSession, RuntimeDecisio
 pub use capability::{ExternalCapability, ExternalRuntimeCapabilities};
 #[cfg(feature = "external-claude-code")]
 pub use claude_code::{
-    ClaudeCodeConfig, ClaudeCodeProbeExec, ProbeOutput, SystemClaudeCodeExec, probe,
-    probe_with_exec,
+    ClaudeCodeConfig, ClaudeCodeProbeExec, ClaudeDecision, ClaudeDecodeContext,
+    ClaudeStreamDecoder, ProbeOutput, SystemClaudeCodeExec, probe, probe_with_exec,
 };
 pub use config::{ExternalAgentMachineConfig, ExternalToolFailurePolicy};
 pub use dispatch::{

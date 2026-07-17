@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "kind": "claude_code",
+    "version": "1.0.0-cc-fixture",
+    "probe": "claude 1.0.0 (offline decoder fixture)",
+    "session_id": "claude-sess-42"
+  },
+  "redaction": {
+    "applied": true,
+    "placeholder": "<redacted>",
+    "notes": "synthetic Claude Code stream-json; no real prompt or credential content"
+  },
+  "turns": [
+    {
+      "expect_input": "start",
+      "input_frames": [
+        {
+          "stream": "stdout",
+          "payload": "{\"cwd\":\"/repo/agent-lib\",\"model\":\"claude-sonnet\",\"session_id\":\"claude-sess-42\",\"subtype\":\"init\",\"tools\":[\"Bash\",\"Edit\"],\"type\":\"system\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"message\":{\"content\":[{\"text\":\"I'll refactor the parser.\",\"type\":\"text\"}],\"id\":\"msg_1\",\"role\":\"assistant\"},\"type\":\"assistant\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"message\":{\"content\":[{\"id\":\"toolu_bash1\",\"input\":{\"command\":\"cargo fmt\"},\"name\":\"Bash\",\"type\":\"tool_use\"}],\"id\":\"msg_2\",\"role\":\"assistant\"},\"type\":\"assistant\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"message\":{\"content\":[{\"content\":\"formatted 3 files\",\"is_error\":false,\"tool_use_id\":\"toolu_bash1\",\"type\":\"tool_result\"}],\"role\":\"user\"},\"type\":\"user\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"message\":{\"content\":[{\"id\":\"toolu_edit1\",\"input\":{\"file_path\":\"src/parser.rs\",\"new_string\":\"for\",\"old_string\":\"loop\"},\"name\":\"Edit\",\"type\":\"tool_use\"}],\"id\":\"msg_3\",\"role\":\"assistant\"},\"type\":\"assistant\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"message\":{\"content\":[{\"content\":\"applied\",\"is_error\":false,\"tool_use_id\":\"toolu_edit1\",\"type\":\"tool_result\"}],\"role\":\"user\"},\"type\":\"user\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"message\":{\"content\":[{\"id\":\"toolu_host1\",\"input\":{\"suite\":\"parser\"},\"name\":\"mcp__host__run_tests\",\"type\":\"tool_use\"}],\"id\":\"msg_4\",\"role\":\"assistant\"},\"type\":\"assistant\"}"
+        }
+      ],
+      "expected_events": [
+        {
+          "seq": 0,
+          "event": {
+            "session_started": {
+              "session_id": "claude-sess-42"
+            }
+          }
+        },
+        {
+          "seq": 1,
+          "event": {
+            "text_delta": {
+              "text": "I'll refactor the parser."
+            }
+          }
+        },
+        {
+          "seq": 2,
+          "event": {
+            "command_started": {
+              "command": "cargo fmt",
+              "cwd": "/repo/agent-lib"
+            }
+          }
+        },
+        {
+          "seq": 3,
+          "event": {
+            "command_finished": {
+              "exit_code": 0,
+              "stdout_tail": "formatted 3 files",
+              "stderr_tail": ""
+            }
+          }
+        },
+        {
+          "seq": 4,
+          "event": {
+            "file_patch": {
+              "path": "src/parser.rs",
+              "summary": "Edit src/parser.rs"
+            }
+          }
+        },
+        {
+          "seq": 5,
+          "event": {
+            "tool_finished": {
+              "name": "Edit",
+              "status": "ok"
+            }
+          }
+        }
+      ],
+      "decision": {
+        "kind": "paused_for_tool_calls",
+        "batch_id": "msg_4",
+        "calls": [
+          {
+            "provider_call_id": "toolu_host1",
+            "name": "mcp__host__run_tests",
+            "input": {
+              "suite": "parser"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "expect_input": "respond_tool_results",
+      "input_frames": [
+        {
+          "stream": "stdout",
+          "payload": "{\"message\":{\"content\":[{\"text\":\"Tests pass. I need to commit.\",\"type\":\"text\"}],\"id\":\"msg_5\",\"role\":\"assistant\"},\"type\":\"assistant\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"request\":{\"input\":{\"command\":\"git commit -am refactor\"},\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\"},\"request_id\":\"perm-1\",\"type\":\"control_request\"}"
+        }
+      ],
+      "expected_events": [
+        {
+          "seq": 6,
+          "event": {
+            "text_delta": {
+              "text": "Tests pass. I need to commit."
+            }
+          }
+        },
+        {
+          "seq": 7,
+          "event": {
+            "permission_requested": {
+              "action_id": "perm-1",
+              "summary": "run `git commit -am refactor`"
+            }
+          }
+        }
+      ],
+      "decision": {
+        "kind": "paused_for_interaction",
+        "action_id": "perm-1",
+        "request": {
+          "step_id": "11111111-1111-4111-8111-111111111111",
+          "kind": {
+            "permission": {
+              "request": {
+                "action_id": "perm-1",
+                "actor": "22222222-2222-4222-8222-222222222222",
+                "category": "shell",
+                "summary": "run `git commit -am refactor`",
+                "subject": {
+                  "command": "git commit -am refactor"
+                },
+                "risk": "medium"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "expect_input": "respond_interaction",
+      "input_frames": [
+        {
+          "stream": "stdout",
+          "payload": "{\"message\":{\"content\":[{\"text\":\"Done.\",\"type\":\"text\"}],\"id\":\"msg_6\",\"role\":\"assistant\"},\"type\":\"assistant\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"duration_ms\":4200,\"is_error\":false,\"num_turns\":3,\"result\":\"Refactored the parser and committed.\",\"session_id\":\"claude-sess-42\",\"subtype\":\"success\",\"total_cost_usd\":0.0123,\"type\":\"result\",\"usage\":{\"cache_creation_input_tokens\":50,\"cache_read_input_tokens\":100,\"input_tokens\":1200,\"output_tokens\":340}}"
+        }
+      ],
+      "expected_events": [
+        {
+          "seq": 8,
+          "event": {
+            "text_delta": {
+              "text": "Done."
+            }
+          }
+        },
+        {
+          "seq": 9,
+          "event": "session_completed"
+        }
+      ],
+      "decision": {
+        "kind": "completed",
+        "output": {
+          "summary": "Refactored the parser and committed.",
+          "artifacts": [],
+          "usage": {
+            "input": 1200,
+            "output": 340,
+            "cache_read": 100,
+            "cache_write": 50,
+            "reasoning": 0
+          },
+          "cost_micros": 12300
+        }
+      }
+    }
+  ]
+}

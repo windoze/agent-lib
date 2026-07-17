@@ -925,6 +925,28 @@ decoder 必须:
 - 保留必要 raw refs 到 debug/cassette。
 - 不把 raw private schema 暴露为 stable event。
 
+#### 实现状态（M6-2,已落地）
+
+`external-claude-code` feature 下已落地**私有 `stream-json` decoder**（尚无 live session,见 M6-3）:
+
+- `ClaudeStreamDecoder`（`src/agent/external/claude_code/decoder.rs`）:有状态、跨 turn 单调 `seq` 的
+  逐帧解码器。全程走 `serde_json::Value` 防御式导航,**不导出任何 raw frame 类型**,Claude 私有 wire
+  schema 不进 `agent-lib` 稳定 API。`push_line` 产出中立的 `ExternalObservedEvent` 观测流,turn 落定时
+  返回一个中立 `ClaudeDecision`(`Completed` / `PausedForToolCalls` / `PausedForInteraction` / `Failed`)。
+- frame 映射:`system/init`→`SessionStarted`;assistant `text`→`TextDelta`;`tool_use` `Bash`→
+  `CommandStarted`,edit/write→`FilePatch`,其它内建→`ToolStarted`,`mcp__*` 宿主桥接工具→折成
+  `PausedForToolCalls` 批次;user `tool_result`→`CommandFinished`/`ToolFinished`;`control_request`
+  `can_use_tool`→`PermissionRequested` 观测 + `PausedForInteraction`(权限 `Interaction` 绑定宿主
+  `step_id`/`actor`,绝不取自模型输出);`result` `success`→`SessionCompleted` + `Completed`(带 usage/cost),
+  error 子类型→`Failed`(`error_max_turns`→`LimitExceeded`,其余→`Runtime`)。
+- 容忍策略(稳定):空行 / `stream_event` 部分帧 / 未知 `type` / 未知 content block / 未关联的 `tool_result`
+  → 容忍(无观测、无错);非法 JSON / 非对象 / 缺字符串 `type` / 已知帧缺必需内层对象 → `ExternalAgentError::Protocol`。
+  所有诊断均为固定字符串,永不夹带 prompt/tool input/凭据。
+- 回归:committed cassette `tests/fixtures/external/claude_code/full_session.json`(三 turn,覆盖 text /
+  command / patch / 宿主 tool / permission / completion)经 `tests/agent_claude_code_cassette.rs` 用同一
+  decoder 回放全程,断言观测流与每 turn 决策;另有内联 raw-frame 单测覆盖容忍 / `Protocol` / error-result 分类。
+  `assert_no_secrets` 保证 fixture 无凭据。离线,无需真实 Claude Code。
+
 ### 12.3 tool 注入
 
 Claude Code 可优先通过 MCP/custom tools 注入宿主工具:

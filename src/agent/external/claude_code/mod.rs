@@ -14,16 +14,24 @@
 //!   returning a conservatively-detected
 //!   [`ExternalRuntimeCapabilities`](crate::agent::external::ExternalRuntimeCapabilities)
 //!   otherwise.
-//! - **M6-2 / M6-3 (later):** the private `stream-json` decoder and the live
+//! - **M6-2 (this task):** the private [`stream-json` decoder`](decoder) turning
+//!   raw CLI frames into sequenced
+//!   [`ExternalObservedEvent`](crate::agent::external::ExternalObservedEvent)
+//!   observations and per-turn [`ClaudeDecision`]s.
+//! - **M6-3 (later):** the live
 //!   [`ExternalRuntimeSession`](crate::agent::external::ExternalRuntimeSession)
-//!   process management.
+//!   process management that wraps the decoder into start/resume/advance.
 //!
 //! Nothing here parses or re-exports Claude Code's private wire schema as stable
 //! public API (design 非目标): the probe reads only `--version` / `--help`, and
-//! the decoder that lands later stays behind the adapter boundary.
+//! the decoder navigates the raw frames through [`serde_json::Value`] without
+//! ever exposing a raw frame type — its outputs are the provider-neutral
+//! observation and decision DTOs.
 
 mod config;
+mod decoder;
 mod probe;
 
 pub use config::ClaudeCodeConfig;
+pub use decoder::{ClaudeDecision, ClaudeDecodeContext, ClaudeStreamDecoder};
 pub use probe::{ClaudeCodeProbeExec, ProbeOutput, SystemClaudeCodeExec, probe, probe_with_exec};
