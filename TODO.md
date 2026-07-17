@@ -2038,7 +2038,7 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
      两处指向私有模块的 `](self)` 链接）。
   7. `git diff --check` 干净。
 
-### [TODO] M7-5 facade 透出 AI 决策注入口（不实现 AI 逻辑）
+### [DONE] M7-5 facade 透出 AI 决策注入口（不实现 AI 逻辑）
 
 **上下文**：
 
@@ -2063,6 +2063,49 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
   permission decider 使某 `Permission` 请求被 approve（对照未注入时 deny）。
 - 聚焦：`cargo test -p agent-lib facade::delegate facade::approval`（注入用例）。
 - 完整验证序列 1–6（+ 若触碰 external adapter 则加全 external features clippy）。
+
+**完成记录（M7-5）**：
+
+- 仅开注入口、零 AI 逻辑，两个接缝默认值与 M5/M4 逐字节一致：
+  - **Dispatcher 路由/升级接缝（`src/facade/delegate.rs`）**：`Delegation` 新增 `#[serde(skip)]`
+    的运行时字段 `dispatcher_hooks: DispatcherHooks`（`evaluator: Option<Arc<dyn TaskEvaluator+Send+Sync>>`
+    + `verifier: Option<Arc<dyn Verifier+Send+Sync>>`；类型别名 `SharedTaskEvaluator`/`SharedVerifier`）。
+    `DispatcherHooks` 手写 `Debug`（仅打 `has_evaluator`/`has_verifier`）、`PartialEq`（恒 `true`）、`Eq`，
+    使 `Delegation` 保留 `Clone/Debug/PartialEq/Eq/Serialize/Deserialize` 且**配置身份忽略运行时钩子**——
+    与 §15.2「snapshot 不存闭包/handler」一致，快照会丢弃钩子并回落内置默认。新增 builder
+    `dispatcher_evaluator(..)`/`dispatcher_verifier(..)`（均先 `dispatcher_config_mut()` 切到 dispatcher 模式再挂钩）
+    与 `pub(crate)` 访问器 `dispatcher_evaluator_hook()`/`dispatcher_verifier_hook()`；构造器经新私有
+    `from_mode(..)` 统一初始化钩子。
+  - **Dispatcher 引擎（`src/facade/agent.rs`）**：`drive_dispatcher_routed` 增 `evaluator`/`verifier` 两个
+    `Option` 形参。注入的 `Verifier` 既回填 `Escalator`（替换写死的 `ScriptedVerifier::passing()`），又作为
+    额外裁决源经 `injected_verifier_rejects(..)` 合流——判定 = `worker_failed || run_verifier(delegate ESCALATE token)
+    || 注入 verifier 拒绝`，任一为真即升级；注入的 `TaskEvaluator` 经 `injected_escalation_target(..)` 从 dispatcher
+    roster（primary + escalate_to）选升级目标，`None`/选中自身/未注册 delegate 均视为「不升级」。两者均缺省时逐字节
+    还原 M5。辅以 `dispatcher_task_descriptor()` 抽取共享 `TaskDescriptor`，`dispatcher_escalation_target` 泛型化为
+    `<V: Verifier>`。`run_dispatcher_routed`（agent.rs）与 `start_dispatcher_routed`（`src/facade/agent/stream.rs`）
+    两处调用点从 `delegation` 取钩子并透传。
+  - **权限裁决接缝（`src/facade/approval.rs`）**：`ApprovalPolicy` 新增 `on_permission<F>(F)` builder（`F: Fn(&PermissionRequest)
+    -> PermissionResponse + Send + Sync + 'static`），存 `permission_decider: Option<Arc<..>>`；`FacadeApproval::new`
+    复制该钩子，`fulfill` 的 `InteractionKind::Permission` 分支：有 decider → 调用之并以 `request.action_id()`
+    重新盖章 `PermissionResponse::new(action_id, decided.decision().clone())`（相关性恒成立），无 decider → 保持
+    「默认 deny」。文档注明：当经 `AgentBuilder::interaction_handler`（M7-1）注入整体 handler 时，后者是唯一权威，
+    decider 仅在无整体 handler 时生效。
+  - **`src/agent/external/escalation.rs`**：补 `impl<V: Verifier + ?Sized> Verifier for Arc<V>` 使
+    `Arc<dyn Verifier+Send+Sync>` 可作 `Escalator` 的 `V`。
+- rustdoc 逐条写清「默认值 + 注入点」，并指明这是 AI-based routing / AI-based verification / AI-based permission 的
+  正式接缝（§19）；沿用 M7-1..M7-4 约定，仅以 rustdoc 承载文档，`docs/facade-api.md` §19 的一致性核对留给 M7-R。
+- 测试（全离线，均 < 1s）：
+  - `src/facade/delegate.rs`（3 新用例，绿）：`dispatcher_injected_verifier_forces_escalation`（无 verifier delegate
+    时注入恒拒 `Verifier` → 干净 primary 仍升级到 strong）；`dispatcher_injected_evaluator_declines_escalation`
+    （失败 primary 默认会升级，注入 `ScriptedTaskEvaluator::new(|_,_| None)` → 抑制升级）；
+    `dispatcher_injection_hooks_stored_and_serde_drops_them`（builder 存钩子、配置相等忽略钩子、serde round-trip 丢钩子）。
+  - `src/facade/approval.rs`（2 新用例，绿）：`permission_decider_answers_permission_asks`（按 `risk()` approve 低危 /
+    deny 高危，并断言 action_id 重新盖章）、`permission_without_decider_denies_by_default`（默认 deny 对照）。
+- 验证序列全绿：1) `cargo fmt --all`；2) 聚焦 `cargo test -p agent-lib facade::delegate facade::approval`
+  （50 + 13 passed）；3) `cargo clippy --all-targets -- -D warnings`；
+  4) `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  5) `cargo test --all --all-targets`（exit 0，全绿）；6) `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  （修正 4 处指向已 import 类型的冗余 intra-doc 链接目标后洁净）+ `cargo test --doc -p agent-lib` 绿；7) `git diff --check` 干净。
 
 ### [TODO] M7-R Review：宿主嵌入接入面正确性与文档一致性检查
 

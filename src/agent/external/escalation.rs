@@ -198,6 +198,14 @@ impl Verifier for ScriptedVerifier {
     }
 }
 
+/// Forwards through a shared [`Verifier`], so an `Arc<dyn Verifier>` (for example
+/// a host-injected verification policy) can itself be an [`Escalator`]'s `V`.
+impl<V: Verifier + ?Sized> Verifier for std::sync::Arc<V> {
+    fn verify(&self, task: &TaskDescriptor, report: &WorkerReport) -> Option<EscalationTrigger> {
+        (**self).verify(task, report)
+    }
+}
+
 /// Identity used to build a human-gate [`Interaction`] when escalation reaches a
 /// person (design §9 "或 human" / "停机问用户").
 ///

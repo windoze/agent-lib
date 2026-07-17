@@ -41,7 +41,8 @@ use async_trait::async_trait;
 
 use crate::agent::{
     ApprovalRequirement, ApprovalResponse, Interaction, InteractionHandler, InteractionKind,
-    InteractionResponse, PermissionResponse, RequirementResult, RunContext, ToolApprovalPolicy,
+    InteractionResponse, PermissionRequest, PermissionResponse, RequirementResult, RunContext,
+    ToolApprovalPolicy,
 };
 use crate::conversation::ToolCallId;
 use crate::facade::run::ApprovalRequest;
@@ -232,6 +233,18 @@ impl fmt::Debug for Approval {
     }
 }
 
+/// A host-injected decider for an [`InteractionKind::Permission`] ask.
+///
+/// This is the formal seam for **AI-based permission** (`docs/facade-api.md`
+/// §19): the facade never decides a privileged action itself, it only forwards
+/// the [`PermissionRequest`] to the injected decider, which returns the
+/// [`PermissionResponse`]. Installed through
+/// [`ApprovalPolicy::on_permission`]; when absent the facade denies every
+/// permission ask by default (§9.2). Because it is a runtime handler it is
+/// shared behind an [`Arc`] and, like an `ask` approval handler, is dropped on
+/// snapshot.
+type PermissionDecider = Arc<dyn Fn(&PermissionRequest) -> PermissionResponse + Send + Sync>;
+
 /// Agent-level approval configuration (`docs/facade-api.md` §9.1–§9.2).
 ///
 /// A policy pairs a whole-agent [`default`](ApprovalPolicy::new) tier with
@@ -256,6 +269,7 @@ pub struct ApprovalPolicy {
     per_tool: BTreeMap<String, Approval>,
     ask_external_agents: bool,
     ask_worktree_write: bool,
+    permission_decider: Option<PermissionDecider>,
 }
 
 impl Default for ApprovalPolicy {
@@ -334,6 +348,48 @@ impl ApprovalPolicy {
         self
     }
 
+    /// Injects a decider for [`Permission`](crate::agent::InteractionKind::Permission)
+    /// asks — the AI-based permission seam of `docs/facade-api.md` §19.
+    ///
+    /// A managed external runtime (Milestone 4) can pause on a
+    /// [`PermissionRequest`] for a privileged action (a shell command, a file
+    /// write, spawning a child, …). By default the facade **denies** every such
+    /// ask (§9.2); installing a decider lets the host answer them — returning a
+    /// [`PermissionResponse`] built with [`approve`](PermissionResponse::approve),
+    /// [`deny`](PermissionResponse::deny), or [`cancel`](PermissionResponse::cancel).
+    /// The facade re-stamps the response with the request's `action_id`, so a
+    /// decider may build its response from any convenient id. The facade itself
+    /// implements no decision logic; it only forwards the request.
+    ///
+    /// The decider only applies when no whole-agent interaction handler is
+    /// injected through
+    /// [`AgentBuilder::interaction_handler`](crate::facade::AgentBuilder::interaction_handler),
+    /// which — when present — is the sole authority for every paused interaction.
+    ///
+    /// ```
+    /// use agent_lib::agent::PermissionResponse;
+    /// use agent_lib::facade::{Approval, ApprovalPolicy};
+    ///
+    /// // Approve read-only permission asks, deny everything riskier.
+    /// let policy = ApprovalPolicy::new(Approval::auto_allow()).on_permission(|request| {
+    ///     use agent_lib::agent::PermissionRisk;
+    ///     if request.risk() <= PermissionRisk::Low {
+    ///         PermissionResponse::approve(request.action_id().to_owned())
+    ///     } else {
+    ///         PermissionResponse::deny(request.action_id().to_owned(), None)
+    ///     }
+    /// });
+    /// # let _ = policy;
+    /// ```
+    #[must_use]
+    pub fn on_permission<F>(mut self, decider: F) -> Self
+    where
+        F: Fn(&PermissionRequest) -> PermissionResponse + Send + Sync + 'static,
+    {
+        self.permission_decider = Some(Arc::new(decider));
+        self
+    }
+
     /// Returns whether managed external agents require approval.
     #[must_use]
     pub const fn requires_ask_external_agents(&self) -> bool {
@@ -354,6 +410,7 @@ impl From<Approval> for ApprovalPolicy {
             per_tool: BTreeMap::new(),
             ask_external_agents: false,
             ask_worktree_write: false,
+            permission_decider: None,
         }
     }
 }
@@ -366,6 +423,7 @@ impl fmt::Debug for ApprovalPolicy {
             .field("per_tool", &self.per_tool)
             .field("ask_external_agents", &self.ask_external_agents)
             .field("ask_worktree_write", &self.ask_worktree_write)
+            .field("has_permission_decider", &self.permission_decider.is_some())
             .finish()
     }
 }
@@ -420,6 +478,7 @@ pub struct FacadeApproval {
     ask_external_agents: bool,
     ask_worktree_write: bool,
     external_tools: std::collections::BTreeSet<String>,
+    permission_decider: Option<PermissionDecider>,
     pending: Mutex<HashMap<ToolCallId, PendingDecision>>,
 }
 
@@ -434,6 +493,7 @@ impl FacadeApproval {
             ask_external_agents: policy.ask_external_agents,
             ask_worktree_write: policy.ask_worktree_write,
             external_tools: std::collections::BTreeSet::new(),
+            permission_decider: policy.permission_decider,
             pending: Mutex::new(HashMap::new()),
         }
     }
@@ -684,13 +744,27 @@ impl InteractionHandler for FacadeApproval {
             // so the result still type-aligns with the requirement.
             InteractionKind::Question { .. } => InteractionResponse::answer(String::new()),
             InteractionKind::Choice { .. } => InteractionResponse::Choice(0),
-            // Permission asks come from external runtimes (Milestone 4); deny by
-            // default until a policy opts in (§9.2).
+            // Permission asks come from external runtimes (Milestone 4). A
+            // host-injected decider answers them (the AI-based permission seam,
+            // §19); absent one the facade denies by default until a policy opts
+            // in (§9.2). The response is re-stamped with the request's
+            // `action_id` so correlation always holds regardless of the id the
+            // decider built its response with.
             InteractionKind::Permission { request } => {
-                InteractionResponse::Permission(PermissionResponse::deny(
-                    request.action_id().to_owned(),
-                    Some("permission denied by default facade policy".to_owned()),
-                ))
+                let response = match &self.permission_decider {
+                    Some(decider) => {
+                        let decided = decider(request);
+                        PermissionResponse::new(
+                            request.action_id().to_owned(),
+                            decided.decision().clone(),
+                        )
+                    }
+                    None => PermissionResponse::deny(
+                        request.action_id().to_owned(),
+                        Some("permission denied by default facade policy".to_owned()),
+                    ),
+                };
+                InteractionResponse::Permission(response)
             }
         };
         RequirementResult::Interaction(response)
@@ -872,6 +946,93 @@ mod tests {
         assert!(matches!(
             bridge.fulfill(&permission, &ctx).await,
             RequirementResult::Interaction(InteractionResponse::Permission(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn permission_decider_answers_permission_asks() {
+        use crate::agent::{PermissionDecision, PermissionResponse};
+
+        // A host-injected decider (the AI-based permission seam, §19) answers a
+        // Permission ask instead of the default deny: here it approves low-risk
+        // actions and denies the rest, keyed off the request's risk.
+        let bridge = FacadeApproval::new(ApprovalPolicy::default().on_permission(|request| {
+            if request.risk() <= PermissionRisk::Low {
+                PermissionResponse::approve(request.action_id().to_owned())
+            } else {
+                PermissionResponse::deny(request.action_id().to_owned(), None)
+            }
+        }));
+        let ctx = run_ctx();
+
+        let low = PermissionRequest::new(
+            "allow-me".to_owned(),
+            AgentId::new(uuid(2)),
+            PermissionCategory::Shell,
+            "ls".to_owned(),
+            json!({ "command": "ls" }),
+            PermissionRisk::Low,
+            None,
+        );
+        let RequirementResult::Interaction(InteractionResponse::Permission(response)) = bridge
+            .fulfill(&Interaction::permission(step_id(), low), &ctx)
+            .await
+        else {
+            panic!("expected a permission interaction response");
+        };
+        // The response is re-stamped with the request's action_id for correlation.
+        assert_eq!(response.action_id(), "allow-me");
+        assert_eq!(response.decision(), &PermissionDecision::Approve);
+
+        let high = PermissionRequest::new(
+            "deny-me".to_owned(),
+            AgentId::new(uuid(2)),
+            PermissionCategory::Shell,
+            "rm -rf /".to_owned(),
+            json!({ "command": "rm -rf /" }),
+            PermissionRisk::High,
+            None,
+        );
+        let RequirementResult::Interaction(InteractionResponse::Permission(response)) = bridge
+            .fulfill(&Interaction::permission(step_id(), high), &ctx)
+            .await
+        else {
+            panic!("expected a permission interaction response");
+        };
+        assert_eq!(response.action_id(), "deny-me");
+        assert!(matches!(
+            response.decision(),
+            PermissionDecision::Deny { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn permission_without_decider_denies_by_default() {
+        use crate::agent::PermissionDecision;
+
+        // Absent an injected decider, the facade keeps the default-deny behavior
+        // for external Permission asks (§9.2), byte-for-byte with Milestone 4.
+        let bridge = FacadeApproval::new(ApprovalPolicy::default());
+        let ctx = run_ctx();
+        let request = PermissionRequest::new(
+            "action-1".to_owned(),
+            AgentId::new(uuid(2)),
+            PermissionCategory::Shell,
+            "rm -rf".to_owned(),
+            json!({ "command": "rm -rf" }),
+            PermissionRisk::High,
+            None,
+        );
+        let RequirementResult::Interaction(InteractionResponse::Permission(response)) = bridge
+            .fulfill(&Interaction::permission(step_id(), request), &ctx)
+            .await
+        else {
+            panic!("expected a permission interaction response");
+        };
+        assert_eq!(response.action_id(), "action-1");
+        assert!(matches!(
+            response.decision(),
+            PermissionDecision::Deny { .. }
         ));
     }
 

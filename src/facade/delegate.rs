@@ -60,8 +60,9 @@ use crate::agent::{
     DefaultAgentMachine, DrivingSubagentHandler, HandlerScope, Interaction, InteractionHandler,
     LlmClientHandler, LlmHandler, LoopCursor, LoopPolicy, ModelRef, RequirementResult, RunContext,
     RunId, ScopePop, SpawnedChild, StepInput, StepOutcome, SubagentHandler, SubagentOutput,
-    SubagentSpawner, ToolFailurePolicy, ToolHandler, ToolRegistry, ToolRegistryHandler,
-    ToolRuntimeError, ToolSetRef, TraceHandle, TraceNodeId, TurnDone, WorktreeRef,
+    SubagentSpawner, TaskEvaluator, ToolFailurePolicy, ToolHandler, ToolRegistry,
+    ToolRegistryHandler, ToolRuntimeError, ToolSetRef, TraceHandle, TraceNodeId, TurnDone,
+    Verifier, WorktreeRef,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig, ToolCallId};
@@ -504,7 +505,62 @@ pub(crate) fn delegation_declaration(name: &str, description: &str) -> ToolDecl 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delegation {
     mode: DelegationMode,
+    /// Optional host-injected decision hooks for a dispatcher-routed delegation
+    /// (the AI-routing / AI-verification seam of `docs/facade-api.md` §19).
+    ///
+    /// These are runtime handlers, not serializable configuration, so — like the
+    /// approval `ask` handlers and external session handlers — they are dropped
+    /// on [`snapshot`](crate::facade::Agent::snapshot) (§15.2) and default to
+    /// absent, in which case the dispatcher behaves exactly as Milestone 5.
+    #[serde(skip)]
+    dispatcher_hooks: DispatcherHooks,
 }
+
+/// A boxed [`TaskEvaluator`] a host injects to route a dispatcher escalation.
+pub(crate) type SharedTaskEvaluator = Arc<dyn TaskEvaluator + Send + Sync>;
+
+/// A boxed [`Verifier`] a host injects to judge a dispatcher worker's output.
+pub(crate) type SharedVerifier = Arc<dyn Verifier + Send + Sync>;
+
+/// Host-injected decision hooks for a dispatcher-routed delegation.
+///
+/// Both hooks are optional and default to absent; when absent the facade
+/// dispatcher uses its built-in Milestone 5 defaults (a clean worker run is
+/// accepted, and escalation is resolved by `agent::external::Escalator` against
+/// the configured roster). They are the formal seam for AI-based routing
+/// ([`TaskEvaluator`]) and AI-based verification ([`Verifier`]); the facade never
+/// implements the AI itself (`docs/facade-api.md` §19).
+#[derive(Clone, Default)]
+pub(crate) struct DispatcherHooks {
+    /// Chooses the escalation target after a worker is rejected; `None` uses the
+    /// built-in [`Escalator`](crate::agent::Escalator) roster logic.
+    evaluator: Option<SharedTaskEvaluator>,
+    /// Judges whether a worker's output is rejected (and escalation warranted);
+    /// `None` uses the built-in verdict (worker failure plus the verifier
+    /// delegate's `ESCALATE` token, if any).
+    verifier: Option<SharedVerifier>,
+}
+
+impl std::fmt::Debug for DispatcherHooks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DispatcherHooks")
+            .field("has_evaluator", &self.evaluator.is_some())
+            .field("has_verifier", &self.verifier.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for DispatcherHooks {
+    /// Two delegations are equal when their serializable routing *configuration*
+    /// matches; the injected runtime hooks — like any other runtime handler — do
+    /// not participate in configuration identity, so they always compare equal.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DispatcherHooks {}
 
 /// One rules-routed routing rule: any of `keywords` present in a task routes it
 /// to the delegate registered under `delegate` (`docs/facade-api.md` §13.2).
@@ -657,13 +713,19 @@ impl Default for Delegation {
 }
 
 impl Delegation {
+    /// Builds a delegation in `mode` with no injected dispatcher hooks.
+    fn from_mode(mode: DelegationMode) -> Self {
+        Self {
+            mode,
+            dispatcher_hooks: DispatcherHooks::default(),
+        }
+    }
+
     /// Model-routed delegation: expose each subagent as its own `ask_<name>`
     /// tool (the default, §13.1).
     #[must_use]
     pub fn model_routed() -> Self {
-        Self {
-            mode: DelegationMode::PerSubagentTool,
-        }
+        Self::from_mode(DelegationMode::PerSubagentTool)
     }
 
     /// A no-op refinement making the model-routed intent explicit (§13.1).
@@ -699,11 +761,9 @@ impl Delegation {
     /// (§10.2).
     #[must_use]
     pub fn single_tool(tool_name: impl Into<String>) -> Self {
-        Self {
-            mode: DelegationMode::SingleTool {
-                tool_name: tool_name.into(),
-            },
-        }
+        Self::from_mode(DelegationMode::SingleTool {
+            tool_name: tool_name.into(),
+        })
     }
 
     /// Rules-routed delegation: the facade routes each task to a delegate by
@@ -723,9 +783,7 @@ impl Delegation {
     /// ```
     #[must_use]
     pub fn rules() -> Self {
-        Self {
-            mode: DelegationMode::Rules { rules: Vec::new() },
-        }
+        Self::from_mode(DelegationMode::Rules { rules: Vec::new() })
     }
 
     /// Appends a rules-routed rule: if the task text contains **any** of
@@ -823,11 +881,9 @@ impl Delegation {
     /// ```
     #[must_use]
     pub fn dispatcher() -> Self {
-        Self {
-            mode: DelegationMode::Dispatcher {
-                config: DispatcherConfig::empty(),
-            },
-        }
+        Self::from_mode(DelegationMode::Dispatcher {
+            config: DispatcherConfig::empty(),
+        })
     }
 
     /// Returns a mutable reference to the dispatcher config, switching the
@@ -880,6 +936,70 @@ impl Delegation {
     pub fn max_attempts(mut self, max_attempts: u32) -> Self {
         self.dispatcher_config_mut().max_attempts = max_attempts.max(1);
         self
+    }
+
+    /// Injects a custom [`TaskEvaluator`] that
+    /// chooses which worker a rejected task escalates to, switching to
+    /// dispatcher-routed mode if needed.
+    ///
+    /// This is the formal seam for **AI-based routing** (`docs/facade-api.md`
+    /// §19): the facade itself implements no model logic, it only forwards the
+    /// decision to the injected evaluator. On each escalation the evaluator is
+    /// consulted with the task descriptor and the worker roster (primary plus the
+    /// configured escalation target); it returns the
+    /// [`WorkerProfileRef`](crate::agent::WorkerProfileRef) to run next, or `None`
+    /// to decline (which stops the loop). A returned worker that names an
+    /// unregistered delegate — or the worker that just ran — is treated as a
+    /// decline. When **no** evaluator is injected the escalation target is
+    /// resolved by the built-in
+    /// [`Escalator`](crate::agent::Escalator), exactly as Milestone 5.
+    ///
+    /// The evaluator is a runtime handler, so it is dropped when the agent is
+    /// snapshotted (§15.2); a restored agent falls back to the built-in default.
+    #[must_use]
+    pub fn dispatcher_evaluator(mut self, evaluator: SharedTaskEvaluator) -> Self {
+        let _ = self.dispatcher_config_mut();
+        self.dispatcher_hooks.evaluator = Some(evaluator);
+        self
+    }
+
+    /// Injects a custom [`Verifier`] that judges whether a
+    /// worker's output is rejected (and an escalation warranted), switching to
+    /// dispatcher-routed mode if needed.
+    ///
+    /// This is the formal seam for **AI-based verification** (`docs/facade-api.md`
+    /// §19), replacing the built-in inert `ScriptedVerifier::passing()` the
+    /// facade wires by default. After each worker run the verifier is consulted
+    /// with the task descriptor and a
+    /// [`WorkerReport`](crate::agent::WorkerReport) for the worker; a
+    /// [`Some`] verdict rejects the output and forces an escalation. It composes
+    /// with (does not replace) the verifier delegate configured through
+    /// [`verify_with`](Self::verify_with) and a worker's own failure: the output
+    /// is rejected if **any** of them rejects. When **no** verifier is injected
+    /// the verdict is exactly Milestone 5 (worker failure plus the delegate's
+    /// `ESCALATE` token, if a verifier delegate is configured).
+    ///
+    /// The verifier is a runtime handler, so it is dropped when the agent is
+    /// snapshotted (§15.2); a restored agent falls back to the built-in default.
+    #[must_use]
+    pub fn dispatcher_verifier(mut self, verifier: SharedVerifier) -> Self {
+        let _ = self.dispatcher_config_mut();
+        self.dispatcher_hooks.verifier = Some(verifier);
+        self
+    }
+
+    /// Returns the injected escalation [`TaskEvaluator`],
+    /// if any (§19).
+    #[must_use]
+    pub(crate) fn dispatcher_evaluator_hook(&self) -> Option<&SharedTaskEvaluator> {
+        self.dispatcher_hooks.evaluator.as_ref()
+    }
+
+    /// Returns the injected verification [`Verifier`], if
+    /// any (§19).
+    #[must_use]
+    pub(crate) fn dispatcher_verifier_hook(&self) -> Option<&SharedVerifier> {
+        self.dispatcher_hooks.verifier.as_ref()
     }
 
     /// Reports whether this delegation routes through the facade dispatcher
@@ -4032,5 +4152,157 @@ mod model_routed_tests {
             escalation_edge(done),
             Some(("cheap".to_owned(), "strong".to_owned()))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // AI-decision injection seams (milestone M7-5, docs/facade-api.md §19)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dispatcher_injected_verifier_forces_escalation() {
+        use crate::agent::{EscalationTrigger, ScriptedVerifier, Verifier};
+
+        // No verifier delegate is configured, so by default a clean primary run
+        // is accepted and never escalates. Injecting a Verifier that always
+        // rejects (the AI-verification seam, §19) overrides that default verdict
+        // and forces exactly one escalation to the strong worker.
+        let client = RoutingClient::new(vec![
+            route("CHEAP", vec![text_response("cheap attempt at the task")]),
+            route("STRONG", vec![text_response("strong result delivered")]),
+        ]);
+
+        let verifier: Arc<dyn Verifier + Send + Sync> = Arc::new(ScriptedVerifier::rejecting(
+            EscalationTrigger::ReviewRejected,
+        ));
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .subagent("cheap", dispatch_worker("You are the CHEAP worker."))
+            .subagent("strong", dispatch_worker("You are the STRONG worker."))
+            .delegation(
+                Delegation::dispatcher()
+                    .primary("cheap")
+                    .escalate_to("strong")
+                    .max_attempts(2)
+                    .dispatcher_verifier(verifier),
+            )
+            .build()
+            .expect("agent builds");
+
+        let output = agent.run_full("Please solve the problem.").await.unwrap();
+
+        // The injected verifier rejected the clean primary, so the loop escalated
+        // to the strong worker and returned its output.
+        assert_eq!(output.reply.text(), "strong result delivered");
+        assert_eq!(
+            escalation_edge(&output),
+            Some(("cheap".to_owned(), "strong".to_owned()))
+        );
+        let names: Vec<&str> = output
+            .delegations
+            .iter()
+            .map(|trace| trace.delegate.as_str())
+            .collect();
+        assert_eq!(names, ["cheap", "strong"]);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_injected_evaluator_declines_escalation() {
+        use crate::agent::{ScriptedTaskEvaluator, TaskEvaluator};
+        use crate::facade::ManagedExternalAgent;
+
+        // The primary is a managed external agent with no session handler, so it
+        // fails its delegation — which by default escalates to the configured
+        // strong worker (cf. `dispatcher_escalates_when_primary_fails...`).
+        // Injecting a TaskEvaluator that declines (returns `None`, the AI-routing
+        // seam, §19) suppresses that escalation entirely.
+        let client = RoutingClient::new(vec![route(
+            "STRONG",
+            vec![text_response("UNUSED strong output")],
+        )]);
+
+        let cheap = ManagedExternalAgent::claude_code()
+            .build()
+            .expect("managed external agent builds");
+
+        let evaluator: Arc<dyn TaskEvaluator + Send + Sync> =
+            Arc::new(ScriptedTaskEvaluator::new(|_, _| None));
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .external_agent("cheap", cheap)
+            .subagent("strong", dispatch_worker("You are the STRONG worker."))
+            .delegation(
+                Delegation::dispatcher()
+                    .primary("cheap")
+                    .escalate_to("strong")
+                    .max_attempts(2)
+                    .dispatcher_evaluator(evaluator),
+            )
+            .build()
+            .expect("agent builds");
+
+        let output = agent
+            .run_full("Please implement the feature.")
+            .await
+            .unwrap();
+
+        assert!(
+            escalation_edge(&output).is_none(),
+            "the injected evaluator declined, so no escalation occurred"
+        );
+        assert_eq!(output.delegations.len(), 1);
+        assert_eq!(output.delegations[0].delegate, "cheap");
+        assert_eq!(output.delegations[0].status, DelegationStatus::Failed);
+    }
+
+    #[test]
+    fn dispatcher_injection_hooks_stored_and_serde_drops_them() {
+        use crate::agent::{
+            EscalationTrigger, ScriptedTaskEvaluator, ScriptedVerifier, TaskEvaluator, Verifier,
+            WorkerProfileRef,
+        };
+
+        let evaluator: Arc<dyn TaskEvaluator + Send + Sync> = Arc::new(
+            ScriptedTaskEvaluator::always(WorkerProfileRef::new("strong")),
+        );
+        let verifier: Arc<dyn Verifier + Send + Sync> = Arc::new(ScriptedVerifier::rejecting(
+            EscalationTrigger::ReviewRejected,
+        ));
+
+        // The builder switches to dispatcher mode and stores both runtime hooks.
+        let with_hooks = Delegation::dispatcher()
+            .primary("cheap")
+            .escalate_to("strong")
+            .dispatcher_evaluator(evaluator)
+            .dispatcher_verifier(verifier);
+        assert!(with_hooks.is_dispatcher_routed());
+        assert!(with_hooks.dispatcher_evaluator_hook().is_some());
+        assert!(with_hooks.dispatcher_verifier_hook().is_some());
+
+        // The same config without hooks: neither hook is present, but the two are
+        // config-equal because the injected handlers are runtime-only identity.
+        let without_hooks = Delegation::dispatcher()
+            .primary("cheap")
+            .escalate_to("strong");
+        assert!(without_hooks.dispatcher_evaluator_hook().is_none());
+        assert!(without_hooks.dispatcher_verifier_hook().is_none());
+        assert_eq!(
+            with_hooks, without_hooks,
+            "injected runtime hooks do not change config identity"
+        );
+
+        // Snapshotting (a serde round-trip) drops the runtime hooks (§15.2), so a
+        // restored delegation falls back to the built-in defaults.
+        let json = serde_json::to_string(&with_hooks).expect("serializes");
+        let restored: Delegation = serde_json::from_str(&json).expect("deserializes");
+        assert!(restored.dispatcher_evaluator_hook().is_none());
+        assert!(restored.dispatcher_verifier_hook().is_none());
     }
 }

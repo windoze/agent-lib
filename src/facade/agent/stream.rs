@@ -292,13 +292,16 @@ fn start_dispatcher_routed(
     let recorder = new_delegation_recorder();
     let handler = agent.build_delegation_handler(run_id, &ctx, recorder.clone())?;
     let targets = agent.resolve_dispatcher_targets(&config)?;
+    let evaluator = agent.delegation.dispatcher_evaluator_hook().cloned();
+    let verifier = agent.delegation.dispatcher_verifier_hook().cloned();
     let ids = agent.ids.clone();
     let sink: EventSink = Arc::new(Mutex::new(VecDeque::new()));
     let sink_for_future = sink.clone();
     let future = Box::pin(async move {
-        let drive =
-            drive_dispatcher_routed(&handler, &recorder, &ids, &config, &targets, task, &ctx)
-                .await?;
+        let drive = drive_dispatcher_routed(
+            &handler, &recorder, &ids, &config, &targets, task, &ctx, evaluator, verifier,
+        )
+        .await?;
         for event in &drive.output.events {
             emit(&sink_for_future, event.clone());
         }

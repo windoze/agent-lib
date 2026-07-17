@@ -48,9 +48,9 @@ use crate::agent::{
     Escalator, HandlerScope, HumanGate, ImpactScope, InteractionHandler, LlmClientHandler,
     LlmHandler, LlmStepMode, LoopCursor, LoopPolicy, Mailbox, ModelRef, Notification,
     PermissionRisk, Plan, RequirementIds, RequirementResult, RunContext, RunId, ScriptedVerifier,
-    TaskDescriptor, ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy, ToolHandler,
-    ToolRegistry, ToolRegistryHandler, ToolSetRef, Uncertainty, WorkerProfile, WorkerProfileRef,
-    WorkerReport, WorkerRoster, WorktreeRef, drain,
+    TaskDescriptor, TaskEvaluator, ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy,
+    ToolHandler, ToolRegistry, ToolRegistryHandler, ToolSetRef, Uncertainty, Verifier,
+    WorkerProfile, WorkerProfileRef, WorkerReport, WorkerRoster, WorktreeRef, drain,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig};
@@ -61,7 +61,7 @@ use crate::facade::config::{ModelConfig, ProviderConfig};
 use crate::facade::delegate::{
     AgentWorkerBuilder, DISPATCHER_ESCALATE_MARKER, Delegation, DelegationRecorder,
     DelegationRoute, DelegationToolHandler, DispatcherConfig, LocalSubagent, RecordedDelegation,
-    RulesRoutedTarget, new_delegation_recorder,
+    RulesRoutedTarget, SharedTaskEvaluator, SharedVerifier, new_delegation_recorder,
 };
 use crate::facade::error::FacadeError;
 use crate::facade::external::{
@@ -670,9 +670,11 @@ impl Agent {
         let recorder = new_delegation_recorder();
         let handler = self.build_delegation_handler(run_id, &ctx, recorder.clone())?;
         let targets = self.resolve_dispatcher_targets(&config)?;
+        let evaluator = self.delegation.dispatcher_evaluator_hook().cloned();
+        let verifier = self.delegation.dispatcher_verifier_hook().cloned();
 
         let drive = drive_dispatcher_routed(
-            &handler, &recorder, &self.ids, &config, &targets, task, &ctx,
+            &handler, &recorder, &self.ids, &config, &targets, task, &ctx, evaluator, verifier,
         )
         .await?;
 
@@ -1742,6 +1744,14 @@ impl DispatcherAccumulator {
 /// `config.max_attempts`. The escalation *decision* is delegated to
 /// `agent::external::Escalator` (§19). A managed external delegate the approval
 /// policy denies fails with [`FacadeError::ApprovalDenied`] (§9.2).
+///
+/// `evaluator` and `verifier` are the optional host-injected AI-routing /
+/// AI-verification seams (§19). When `verifier` is present it both backs the
+/// [`Escalator`] and is consulted after each worker run as an additional verdict
+/// source (rejecting composes with worker failure and the verifier delegate's
+/// token). When `evaluator` is present it chooses the escalation target instead
+/// of the built-in roster logic. Both absent reproduces Milestone 5 exactly.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_dispatcher_routed(
     handler: &DelegationToolHandler,
     recorder: &DelegationRecorder,
@@ -1750,8 +1760,15 @@ pub(crate) async fn drive_dispatcher_routed(
     targets: &HashMap<String, RulesRoutedTarget>,
     task: String,
     ctx: &RunContext,
+    evaluator: Option<SharedTaskEvaluator>,
+    verifier: Option<SharedVerifier>,
 ) -> Result<DispatcherDrive, FacadeError> {
-    let escalator = Escalator::new(ScriptedVerifier::passing()).with_budget_headroom(0);
+    // An injected Verifier replaces the built-in inert ScriptedVerifier::passing()
+    // seam inside the Escalator (§19); absent one the engine behaves as M5.
+    let escalation_verifier: SharedVerifier = verifier
+        .clone()
+        .unwrap_or_else(|| Arc::new(ScriptedVerifier::passing()));
+    let escalator = Escalator::new(escalation_verifier).with_budget_headroom(0);
     let roster = build_dispatcher_roster(config, ids);
 
     let mut acc = DispatcherAccumulator::default();
@@ -1769,24 +1786,30 @@ pub(crate) async fn drive_dispatcher_routed(
         final_summary = summary.clone();
         let worker_failed = record.trace.status == DelegationStatus::Failed;
 
-        // A clean worker run (that a verifier, if any, accepts) ends the loop.
+        // A clean worker run that the verifier delegate (if any) and any injected
+        // verifier both accept ends the loop.
         let rejected = worker_failed
             || run_verifier(
                 handler, recorder, ids, config, targets, &task, &summary, ctx, &mut acc,
             )
-            .await?;
+            .await?
+            || injected_verifier_rejects(verifier.as_ref(), &current, worker_failed);
         if !rejected {
             break;
         }
 
         // Rejected: escalate to the stronger worker while attempts remain and the
-        // escalation engine offers a target.
+        // routing decision offers a target.
         if attempt >= config.max_attempts() {
             break;
         }
-        let Some(next) =
-            dispatcher_escalation_target(&escalator, roster.as_ref(), &current, ctx, ids)?
-        else {
+        let next = match evaluator.as_ref() {
+            Some(evaluator) => {
+                injected_escalation_target(evaluator.as_ref(), roster.as_ref(), targets, &current)
+            }
+            None => dispatcher_escalation_target(&escalator, roster.as_ref(), &current, ctx, ids)?,
+        };
+        let Some(next) = next else {
             break;
         };
         acc.events.push(RunEvent::Escalated(EscalationTrace {
@@ -1919,14 +1942,75 @@ fn build_dispatcher_roster(config: &DispatcherConfig, ids: &FacadeIds) -> Option
     Some(roster)
 }
 
+/// Builds the provider-neutral [`TaskDescriptor`] the facade uses when it asks
+/// the escalation engine or an injected hook to weigh a dispatcher task.
+fn dispatcher_task_descriptor() -> TaskDescriptor {
+    TaskDescriptor::new(
+        dispatcher_capability(),
+        ImpactScope::SingleFile,
+        PermissionRisk::Low,
+        Uncertainty::Clear,
+    )
+}
+
+/// Asks an injected [`Verifier`] whether the worker `current` just produced an
+/// output that should be rejected (§19), returning `false` when no verifier is
+/// injected so the Milestone 5 verdict is preserved.
+///
+/// The verifier is consulted directly (not gated on
+/// [`TaskDescriptor::warrants_verification`]) because the host injected it
+/// deliberately. A `worker_failed` run is reported as a failing
+/// [`WorkerReport`] so a verifier can key off the failure; otherwise a clean
+/// report is passed and the verdict is entirely the verifier's.
+fn injected_verifier_rejects(
+    verifier: Option<&SharedVerifier>,
+    current: &str,
+    worker_failed: bool,
+) -> bool {
+    let Some(verifier) = verifier else {
+        return false;
+    };
+    let descriptor = dispatcher_task_descriptor();
+    let worker = WorkerProfileRef::new(current);
+    let report = if worker_failed {
+        WorkerReport::failed(worker, EscalationTrigger::ReviewRejected)
+    } else {
+        WorkerReport::succeeded(worker)
+    };
+    verifier.verify(&descriptor, &report).is_some()
+}
+
+/// Asks an injected [`TaskEvaluator`] which worker a rejected task escalates to
+/// (§19), returning the target delegate name or `None` to decline.
+///
+/// The evaluator picks from the dispatcher roster (primary plus the configured
+/// escalation target). A `None` roster (no escalation configured), an evaluator
+/// that declines, or one that names the `current` worker or a delegate that is
+/// not registered all mean "do not escalate".
+fn injected_escalation_target(
+    evaluator: &(dyn TaskEvaluator + Send + Sync),
+    roster: Option<&WorkerRoster>,
+    targets: &HashMap<String, RulesRoutedTarget>,
+    current: &str,
+) -> Option<String> {
+    let roster = roster?;
+    let descriptor = dispatcher_task_descriptor();
+    let choice = evaluator.evaluate(&descriptor, roster)?;
+    let name = choice.id();
+    if name == current || !targets.contains_key(name) {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
 /// Asks `agent::external::Escalator` which stronger worker to escalate to after
 /// `current` was rejected, returning the target delegate name or `None`.
 ///
 /// A `None` roster (no escalation configured), an escalation the engine declines
 /// (`Accept` / `Human` / `Exhausted`), or a `current` worker the roster does not
 /// know all mean "do not escalate".
-fn dispatcher_escalation_target(
-    escalator: &Escalator<ScriptedVerifier>,
+fn dispatcher_escalation_target<V: Verifier>(
+    escalator: &Escalator<V>,
     roster: Option<&WorkerRoster>,
     current: &str,
     ctx: &RunContext,
@@ -1939,12 +2023,7 @@ fn dispatcher_escalation_target(
         WorkerProfileRef::new(current),
         EscalationTrigger::ReviewRejected,
     );
-    let descriptor = TaskDescriptor::new(
-        dispatcher_capability(),
-        ImpactScope::SingleFile,
-        PermissionRisk::Low,
-        Uncertainty::Clear,
-    );
+    let descriptor = dispatcher_task_descriptor();
     let gate = HumanGate::new(ids.step_id(), ids.agent_id());
     match escalator.assess(&descriptor, &report, roster, ctx, &gate) {
         Ok(EscalationOutcome::Reassign(choice)) => Ok(Some(choice.worker().id().to_owned())),
