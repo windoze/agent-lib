@@ -145,6 +145,7 @@ use crate::{
             ExternalSubagentRequestId, ExternalToolBatchId, ExternalToolCall,
             ExternalToolFailurePolicy, ExternalToolResult,
         },
+        spec::ToolSetRef,
     },
     client::Response,
     conversation::{CancelDisposition, MessageId, ToolCallId, TurnMeta},
@@ -275,6 +276,45 @@ struct PendingBridgeCall {
     kind: ExternalBridgeCallKind,
 }
 
+/// When a host-requested external reconfiguration takes effect.
+///
+/// A managed external runtime is driven one whole session step at a time, so the
+/// tool set carried by a `NeedExternalSession` request is fixed for the duration
+/// of that step. This selector chooses how a reconfiguration interacts with a
+/// step that may still be in flight (design §19):
+///
+/// - [`NextBoundary`](Self::NextBoundary) is the safe default: applied
+///   immediately when the machine rests at a turn boundary, and otherwise queued
+///   and folded in when the next turn opens, never touching the live session.
+/// - [`Hot`](Self::Hot) asks for a live, mid-turn swap of the running session's
+///   tool set. The first-version machine only reconfigures at boundaries, so an
+///   in-flight hot request is rejected with
+///   [`UnsupportedCapability`](ExternalAgentError::UnsupportedCapability)
+///   ([`Reconfigure`](ExternalCapability::Reconfigure)) and leaves the live
+///   session untouched. At a turn boundary it behaves exactly like
+///   [`NextBoundary`](Self::NextBoundary).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExternalReconfigTiming {
+    /// Apply at the next turn boundary (immediately if already at a boundary).
+    #[default]
+    NextBoundary,
+    /// Apply immediately to the live in-flight session (requires runtime hot
+    /// reconfiguration support, which the first-version machine does not offer).
+    Hot,
+}
+
+/// Outcome of a host-requested external reconfiguration
+/// ([`ExternalAgentMachine::reconfigure`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalReconfigOutcome {
+    /// The requested tool set is now the active set; the next
+    /// `NeedExternalSession(Start/Continue)` request carries it.
+    Applied,
+    /// The machine was mid-turn, so the change was queued and will be folded in
+    /// when the next turn opens. The live in-flight session is left unchanged.
+    Queued,
+}
+
 /// Sans-io machine that drives one external coding-agent session step at a time.
 ///
 /// See the [external-agent module docs](crate::agent::external) for the
@@ -387,8 +427,78 @@ impl ExternalAgentMachine {
         self.state
     }
 
+    /// Requests a turn-boundary reconfiguration of the active tool set.
+    ///
+    /// This is a host-facing entry (not part of the sans-io
+    /// [`step`](AgentMachine::step)), the external-agent counterpart of
+    /// [`DefaultAgentMachine::reconfigure`](crate::agent::DefaultAgentMachine).
+    /// Because a managed runtime advances one whole session step at a time, the
+    /// tool set carried by an outstanding `NeedExternalSession` request cannot be
+    /// changed underneath it; the reconfiguration policy therefore keys on
+    /// whether a turn is in flight (design §19):
+    ///
+    /// - **At a turn boundary** (no turn in flight — the cursor rests
+    ///   [`Idle`](ExternalAgentCursor::Idle) / [`Done`](ExternalAgentCursor::Done)
+    ///   / [`Error`](ExternalAgentCursor::Error)) the new set becomes active
+    ///   immediately and any stale queued reconfiguration is dropped. The next
+    ///   [`Start`](ExternalSessionInput::Start) /
+    ///   [`Continue`](ExternalSessionInput::Continue) request carries it. Returns
+    ///   [`Applied`](ExternalReconfigOutcome::Applied) regardless of `timing`.
+    /// - **Mid-turn with [`NextBoundary`](ExternalReconfigTiming::NextBoundary)**
+    ///   the requested set is queued in the serializable state and folded into
+    ///   the active set when the next turn opens; the live session is untouched.
+    ///   Returns [`Queued`](ExternalReconfigOutcome::Queued).
+    /// - **Mid-turn with [`Hot`](ExternalReconfigTiming::Hot)** the caller asked
+    ///   to swap the *live* session's tools, which the first-version machine does
+    ///   not support. Nothing is changed — the live session, the active set, and
+    ///   any previously queued reconfiguration all stay exactly as they were —
+    ///   and the request fails loudly (see Errors) so the change never silently
+    ///   alters an in-flight session.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`ExternalAgentError::UnsupportedCapability`](ExternalAgentError::UnsupportedCapability)
+    /// naming [`ExternalCapability::Reconfigure`] when a mid-turn
+    /// [`Hot`](ExternalReconfigTiming::Hot) reconfiguration is requested, since a
+    /// live session's tool set cannot be hot-swapped by this machine.
+    #[allow(clippy::result_large_err)]
+    pub fn reconfigure(
+        &mut self,
+        active_tools: ToolSetRef,
+        timing: ExternalReconfigTiming,
+    ) -> Result<ExternalReconfigOutcome, ExternalAgentError> {
+        // `in_flight` is `Some` only between opening a turn and settling it, so
+        // its absence is exactly the "at a turn boundary" condition.
+        if self.in_flight.is_none() {
+            self.state.clear_pending_reconfig();
+            self.state.set_active_tools(active_tools);
+            return Ok(ExternalReconfigOutcome::Applied);
+        }
+
+        match timing {
+            ExternalReconfigTiming::NextBoundary => {
+                self.state.set_pending_reconfig(active_tools);
+                Ok(ExternalReconfigOutcome::Queued)
+            }
+            ExternalReconfigTiming::Hot => Err(ExternalAgentError::UnsupportedCapability {
+                runtime: self.state.spec().runtime().clone(),
+                capability: ExternalCapability::Reconfigure,
+                detail: "external machine reconfigures the active tool set only at a turn \
+                         boundary; a live session's tool set cannot be hot-swapped mid-turn"
+                    .to_owned(),
+            }),
+        }
+    }
+
     /// Opens a fresh Conversation turn and blocks on one `NeedExternalSession`.
     fn begin_user_turn(&mut self, user: AgentUserInput) -> StepOutcome {
+        // Fold a reconfiguration queued while a previous turn was in flight into
+        // the active tool set before building this turn's request, so the fresh
+        // `Start`/`Continue` carries the new tools (design §19).
+        if let Some(tools) = self.state.take_pending_reconfig() {
+            self.state.set_active_tools(tools);
+        }
         if let Err(error) = self.state.conversation_mut().begin_turn(
             user.turn_id(),
             user.message_id(),

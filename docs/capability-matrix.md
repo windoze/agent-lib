@@ -163,6 +163,7 @@ approval（`untrusted`/`on-request`/`never`）+ sandbox（`read-only`/`workspace
 | permission_bridge | `false`(恒) | `codex exec --json` 自主运行、按预设策略解审批,流里无 host-answerable pause;`RespondInteraction`→`UnsupportedCapability{PermissionBridge}` |
 | host_tools | `false`(恒) | exec 自主执行工具,无 host-pausable tool-call 帧;声明 `tools` 的 start/resume 与 `RespondToolResults` 均以 `UnsupportedCapability{HostTools}` 拒绝 |
 | host_subagents | `false`(恒) | 无 host-桥接的 spawn 帧;`RespondSubagent`→`UnsupportedCapability{HostSubagents}` |
+| reconfigure | `false`(恒) | live 会话 mid-turn 热替换未实现;机器仅做 turn-boundary reconfig(`ExternalReconfigTiming::Hot` 在 in-flight 时→`UnsupportedCapability{Reconfigure}`),boundary 级换集不需要此能力 |
 
 真机 e2e 状态:**本机 codex-cli 0.144.1 实跑通过**(`tests/external_codex.rs`,以
 `AcceptEdits`/`workspace-write` 驱动 probe→start→advance→completion→graceful shutdown,生成
@@ -217,6 +218,7 @@ tool/subtask/completion/error;live adapter 与真机 e2e 仍待 M8-3。
 | permission_bridge | `false`(恒) | `run --format json` 自主运行、按 `--auto` 解审批,流里无 host-answerable pause;`RespondInteraction`→`UnsupportedCapability{PermissionBridge}` |
 | host_tools | `false`(恒) | run 自主执行工具,无 host-pausable tool-call 帧;声明 `tools` 的 start/resume 与 `RespondToolResults` 均以 `UnsupportedCapability{HostTools}` 拒绝 |
 | host_subagents | `false`(恒) | 无 host-桥接的 spawn 帧;`RespondSubagent`→`UnsupportedCapability{HostSubagents}` |
+| reconfigure | `false`(恒) | live 会话 mid-turn 热替换未实现;机器仅做 turn-boundary reconfig(`ExternalReconfigTiming::Hot` 在 in-flight 时→`UnsupportedCapability{Reconfigure}`),boundary 级换集不需要此能力 |
 
 真机 e2e 状态:**本机 opencode 1.17.15 实跑通过**([`tests/external_opencode.rs`](../tests/external_opencode.rs),
 以 `BypassPermissions`/`--auto` 驱动 probe→start→advance→completion→graceful shutdown,在 `--dir` 临时
@@ -251,7 +253,7 @@ M8-4 review 逐项核对了源码，确认四个维度一致，唯一差异是 C
 支持能力=`streaming`/`resume`/`artifacts`/`usage`/`graceful_shutdown`；不支持=`permission_bridge`/
 `host_tools`/`host_subagents`（恒 `false`）。真机 e2e：本机 opencode 1.17.15 实跑通过。
 
-### 受管能力清单（`ExternalCapability`，共 8 项）
+### 受管能力清单（`ExternalCapability`，共 9 项）
 
 | `ExternalCapability` | serde 标签 | 覆盖的决策点 / 旁路 | 保守默认 |
 |---|---|---|---|
@@ -263,8 +265,9 @@ M8-4 review 逐项核对了源码，确认四个维度一致，唯一差异是 C
 | `Artifacts` | `artifacts` | 把产出的 artifact（patch/文件）回报给 host | `false` |
 | `Usage` | `usage` | 回报 token/cost usage 供 budget charging | `false` |
 | `GracefulShutdown` | `graceful_shutdown` | 无残留副作用地干净关闭会话 | `false` |
+| `Reconfigure` | `reconfigure` | 对 *live* 会话 mid-turn 热替换工具集（live tool-bridge swap）；boundary 级 reconfig 不需要此能力 | `false` |
 
-`ExternalCapability::ALL` 固定按上表顺序穷举全部 8 项，供能力矩阵与 round-trip 断言使用；
+`ExternalCapability::ALL` 固定按上表顺序穷举全部 9 项，供能力矩阵与 round-trip 断言使用；
 新增能力只需扩展该数组即被自动覆盖。`ExternalRuntimeCapabilities` 为每一项持有同名 `bool`
 字段，`supports(cap)` 逐项映射，`none(runtime)` 为全 `false` 的保守起点。
 
@@ -280,6 +283,7 @@ M8-4 review 逐项核对了源码，确认四个维度一致，唯一差异是 C
 | artifacts | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） |
 | usage | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） |
 | graceful_shutdown | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） |
+| reconfigure | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） |
 
 「未验证」= 保守基线返回 `false`，尚无探测/adapter 覆盖；这是待填表，接入真实 runtime
 adapter（里程碑 5-8）后才逐项翻真并注明验证来源。**不要把此表当成任一 runtime 的服务等级

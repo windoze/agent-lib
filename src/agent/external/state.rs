@@ -220,6 +220,7 @@ pub struct ExternalAgentState {
     artifacts: Vec<ExternalArtifactRef>,
     cleanup_required: bool,
     decision_loops: u32,
+    pending_reconfig: Option<ToolSetRef>,
 }
 
 impl ExternalAgentState {
@@ -240,6 +241,7 @@ impl ExternalAgentState {
             artifacts: Vec::new(),
             cleanup_required: false,
             decision_loops: 0,
+            pending_reconfig: None,
         }
     }
 
@@ -297,6 +299,45 @@ impl ExternalAgentState {
     /// Replaces the active tool declarations.
     pub fn set_active_tools(&mut self, active_tools: ToolSetRef) {
         self.active_tools = active_tools;
+    }
+
+    /// Returns the tool set queued for a turn-boundary reconfiguration, if any.
+    ///
+    /// A host reconfiguration requested while a turn is in flight cannot change
+    /// the live session's tool set (design §19); the requested set is parked here
+    /// and folded into [`active_tools`](Self::active_tools) when the next turn
+    /// opens, so the following `NeedExternalSession` request carries it. Parking
+    /// it in the serializable state (rather than machine scratch) lets a queued
+    /// reconfiguration survive snapshot/restore across a mid-turn pause.
+    #[must_use]
+    pub const fn pending_reconfig(&self) -> Option<&ToolSetRef> {
+        self.pending_reconfig.as_ref()
+    }
+
+    /// Queues `active_tools` for application at the next turn boundary.
+    ///
+    /// Any previously queued reconfiguration is overwritten, so the most recent
+    /// host request wins.
+    pub fn set_pending_reconfig(&mut self, active_tools: ToolSetRef) {
+        self.pending_reconfig = Some(active_tools);
+    }
+
+    /// Takes the tool set queued for a turn-boundary reconfiguration, leaving the
+    /// queue empty.
+    ///
+    /// The machine calls this as it opens the next turn so the queued set becomes
+    /// the [`active_tools`](Self::active_tools) carried by the fresh request.
+    pub fn take_pending_reconfig(&mut self) -> Option<ToolSetRef> {
+        self.pending_reconfig.take()
+    }
+
+    /// Discards any queued turn-boundary reconfiguration without applying it.
+    ///
+    /// Used when a fresh reconfiguration is applied directly at a turn boundary,
+    /// so a stale queued set from an earlier in-flight request cannot later
+    /// clobber the just-applied one.
+    pub fn clear_pending_reconfig(&mut self) {
+        self.pending_reconfig = None;
     }
 
     /// Returns the artifact references recorded from completed sessions, in the
@@ -393,6 +434,7 @@ impl ExternalAgentState {
             artifacts: record.artifacts,
             cleanup_required: record.cleanup_required,
             decision_loops: record.decision_loops,
+            pending_reconfig: record.pending_reconfig,
         })
     }
 }
@@ -412,6 +454,7 @@ impl Serialize for ExternalAgentState {
             artifacts: self.artifacts.clone(),
             cleanup_required: self.cleanup_required,
             decision_loops: self.decision_loops,
+            pending_reconfig: self.pending_reconfig.clone(),
         }
         .serialize(serializer)
     }
@@ -443,6 +486,8 @@ struct ExternalAgentStateRecord {
     cleanup_required: bool,
     #[serde(default, skip_serializing_if = "is_zero")]
     decision_loops: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_reconfig: Option<ToolSetRef>,
 }
 
 /// Serde predicate: skips the pending-cleanup flag when it is not set, keeping

@@ -956,6 +956,7 @@ fn permissive_capabilities(runtime: ExternalRuntimeKind) -> ExternalRuntimeCapab
         artifacts: true,
         usage: true,
         graceful_shutdown: true,
+        reconfigure: true,
     }
 }
 

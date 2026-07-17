@@ -122,7 +122,7 @@ scope wiring 决定 attended / headless 行为。
 | trace | requirement + tool + subagent nodes | external events + shutdown + artifacts | 部分已有 |
 | artifact | tool/model output | patch/diff/test/file artifact refs | 部分已有 |
 | worktree isolation | `WorktreeRef` | shared / per-agent / ephemeral worktree manager | 已落地(M9-1):`WorktreeManager`/`GitWorktreeManager`(prepare/cleanup + residual 标记),见 §16 |
-| reconfig | queued tool set swap | boundary-level tool bridge reconfigure | 拟新增 |
+| reconfig | queued tool set swap | boundary-level tool bridge reconfigure | 已落地(M9-3):`ExternalAgentMachine::reconfigure` + `ExternalReconfigTiming`/`ExternalReconfigOutcome`(boundary 应用/排队;in-flight `Hot`→`UnsupportedCapability{Reconfigure}`),见 §19 |
 | snapshot/restore | `AgentState` + Conversation snapshot | `ExternalAgentState` + `ExternalSessionRef` resume | state 已有,handler 待实现 |
 
 ## 4. 架构总览
@@ -1407,15 +1407,25 @@ runtime patch frame
 
 内部 machine 有 turn-boundary reconfig。external 支持分两级:
 
-1. **boundary toolset reconfig**
-   - 下一次 `NeedExternalSession(Start/Continue)` 使用新 tools。
-   - 如果 runtime session 已启动但不能动态改 tools,handler 可重启/新建 session。
+1. **boundary toolset reconfig(已落地 M9-3)**
+   - host-facing 入口 [`ExternalAgentMachine::reconfigure(active_tools, timing)`](../src/agent/external/machine.rs),
+     不属于 sans-io `step`,对应内部 `DefaultAgentMachine::reconfigure`。
+   - 边界判据 = 无 in-flight turn(cursor 停在 `Idle`/`Done`/`Error`)。边界上任意 `timing` 都**立即**替换
+     `ExternalAgentState.active_tools`(并丢弃任何已排队的旧 reconfig),返回 `ExternalReconfigOutcome::Applied`。
+   - turn 进行中且 `timing = NextBoundary`:把新 tool set **排队**进可序列化的
+     `ExternalAgentState.pending_reconfig`(随 snapshot/restore 持久),live session 不受影响,返回 `Queued`;
+     下一次 `begin_user_turn` 打开新 turn 时折入 `active_tools`。
+   - 效果:下一次 `NeedExternalSession(Start/Continue)` 的 `request.tools` 使用新集(`build_request` 直接读
+     `active_tools`)。如果 runtime session 已启动但不能动态改 tools,由 handler 在下一 boundary 重启/新建 session。
 
-2. **live tool bridge reconfig**
+2. **live tool bridge reconfig(hot swap)**
    - runtime 支持 MCP/tool refresh 时,handler 发 runtime-specific reconfigure。
-   - 不支持时返回 `UnsupportedCapability`。
+   - 首版 machine 只做 boundary reconfig:turn 进行中调用 `timing = Hot` 会以
+     `UnsupportedCapability{ capability: Reconfigure }` 拒绝,并**不改动任何状态**(active_tools / 排队 / cursor 全不变),
+     从而绝不悄悄改变 live session。`ExternalCapability::Reconfigure` /
+     `ExternalRuntimeCapabilities.reconfigure` 显式建模该能力,当前所有 runtime adapter 均声明 `false`。
 
-首版建议只做 boundary reconfig,并要求 runtime capability 明确。
+首版只做 boundary reconfig,并要求 runtime capability(`Reconfigure`)明确。
 
 ## 20. 测试策略
 

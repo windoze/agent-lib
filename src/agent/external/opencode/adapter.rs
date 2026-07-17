@@ -819,6 +819,7 @@ fn implemented_capabilities() -> ExternalRuntimeCapabilities {
         artifacts: true,
         usage: true,
         graceful_shutdown: true,
+        reconfigure: false,
     }
 }
 
@@ -837,6 +838,7 @@ fn intersect_capabilities(
         artifacts: left.artifacts && right.artifacts,
         usage: left.usage && right.usage,
         graceful_shutdown: left.graceful_shutdown && right.graceful_shutdown,
+        reconfigure: left.reconfigure && right.reconfigure,
     }
 }
 

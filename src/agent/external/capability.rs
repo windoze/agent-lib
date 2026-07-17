@@ -47,6 +47,11 @@ pub enum ExternalCapability {
     Usage,
     /// Shutting the session down cleanly without residual side effects.
     GracefulShutdown,
+    /// Reconfiguring the active tool set of a *live* session mid-turn, without
+    /// waiting for the next turn boundary (a "hot"/live tool-bridge swap). The
+    /// machine's default boundary-level reconfiguration never needs this; it
+    /// gates only the mid-session live swap described in design §19.
+    Reconfigure,
 }
 
 impl ExternalCapability {
@@ -55,7 +60,7 @@ impl ExternalCapability {
     /// Building a capability matrix or asserting round-trips over the full set
     /// should use this rather than hand-listing variants, so a newly added
     /// capability is covered automatically once this array is extended.
-    pub const ALL: [ExternalCapability; 8] = [
+    pub const ALL: [ExternalCapability; 9] = [
         ExternalCapability::Streaming,
         ExternalCapability::Resume,
         ExternalCapability::PermissionBridge,
@@ -64,6 +69,7 @@ impl ExternalCapability {
         ExternalCapability::Artifacts,
         ExternalCapability::Usage,
         ExternalCapability::GracefulShutdown,
+        ExternalCapability::Reconfigure,
     ];
 
     /// Returns the stable, human-readable label for this capability.
@@ -81,6 +87,7 @@ impl ExternalCapability {
             ExternalCapability::Artifacts => "artifacts",
             ExternalCapability::Usage => "usage",
             ExternalCapability::GracefulShutdown => "graceful_shutdown",
+            ExternalCapability::Reconfigure => "reconfigure",
         }
     }
 }
@@ -119,6 +126,10 @@ pub struct ExternalRuntimeCapabilities {
     pub usage: bool,
     /// Shuts the session down cleanly without residual side effects.
     pub graceful_shutdown: bool,
+    /// Reconfigures a live session's tool set mid-turn ("hot"/live tool-bridge
+    /// swap). Boundary-level reconfiguration does not need this; it gates only
+    /// the mid-session live swap described in design §19.
+    pub reconfigure: bool,
 }
 
 impl ExternalRuntimeCapabilities {
@@ -140,6 +151,7 @@ impl ExternalRuntimeCapabilities {
             artifacts: false,
             usage: false,
             graceful_shutdown: false,
+            reconfigure: false,
         }
     }
 
@@ -155,6 +167,7 @@ impl ExternalRuntimeCapabilities {
             ExternalCapability::Artifacts => self.artifacts,
             ExternalCapability::Usage => self.usage,
             ExternalCapability::GracefulShutdown => self.graceful_shutdown,
+            ExternalCapability::Reconfigure => self.reconfigure,
         }
     }
 
@@ -230,6 +243,7 @@ mod tests {
             artifacts: true,
             usage: true,
             graceful_shutdown: true,
+            reconfigure: true,
         };
         for capability in ExternalCapability::ALL {
             assert!(

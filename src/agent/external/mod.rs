@@ -112,7 +112,7 @@ pub use escalation::{
     EscalationError, EscalationOutcome, Escalator, HumanGate, ScriptedVerifier, Verifier,
     WorkerReport,
 };
-pub use machine::ExternalAgentMachine;
+pub use machine::{ExternalAgentMachine, ExternalReconfigOutcome, ExternalReconfigTiming};
 #[cfg(feature = "external-opencode")]
 pub use opencode::{
     OpenCodeAdapter, OpenCodeConfig, OpenCodeDecision, OpenCodeDecodeContext, OpenCodeProbeExec,

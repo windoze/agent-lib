@@ -2797,7 +2797,7 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
   external-opencode"` 亦 0 warning);`cargo test --all --all-targets` 全 ok(46 个 test result: ok、0 failed);
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净;`git diff --check` 干净。
 
-### [TODO] M9-3 支持 turn-boundary external reconfig
+### [DONE] M9-3 支持 turn-boundary external reconfig
 
 **上下文**:
 
@@ -2820,6 +2820,43 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
   - in-flight unsupported hot reconfig 不会悄悄改变 live session。
 - `cargo test -p agent-lib external_reconfig`
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- **能力模型（`external/capability.rs`）**:新增 `ExternalCapability::Reconfigure`(serde `reconfigure`,
+  `ALL` 8→9,`as_str`)与 `ExternalRuntimeCapabilities.reconfigure: bool`(`none()`=false、`supports()` 映射),
+  显式建模「live 会话 mid-turn 热替换(live tool-bridge swap)」能力,遵循「能力从不默认支持」约束。
+  三个 runtime adapter(`codex/claude_code/opencode`)`implemented_capabilities()` 声明 `reconfigure: false`、
+  `intersect_capabilities()` 逐位 AND;probe/registry 从 `none()` 派生故自动继承 false;testkit 两个
+  `permissive_capabilities` 保持「除 resume 外全开」故置 `reconfigure: true`。
+- **持久化状态（`external/state.rs`）**:`ExternalAgentState` 新增可序列化 `pending_reconfig: Option<ToolSetRef>`
+  (record `#[serde(default, skip_serializing_if="Option::is_none")]`,保持既有 snapshot 字节兼容)+
+  accessors `pending_reconfig()/set_pending_reconfig()/take_pending_reconfig()/clear_pending_reconfig()`;
+  队列入序列化状态(而非 machine scratch)使 mid-turn 排队的 reconfig 随 snapshot/restore 持久。
+- **host-facing 入口（`external/machine.rs`）**:新增 `ExternalReconfigTiming{ NextBoundary(default), Hot }` 与
+  `ExternalReconfigOutcome{ Applied, Queued }`,以及 `ExternalAgentMachine::reconfigure(active_tools, timing)
+  -> Result<ExternalReconfigOutcome, ExternalAgentError>`(非 sans-io `step`,对应内部 `DefaultAgentMachine::reconfigure`;
+  `#[allow(clippy::result_large_err)]` 沿用外部 unboxed 错误契约)。策略(边界判据 = `in_flight.is_none()`):
+  ① 边界(Idle/Done/Error)任意 timing → clear pending + `set_active_tools` 立即生效 → `Applied`;
+  ② in-flight + `NextBoundary` → `set_pending_reconfig` 排队、**不动 live session** → `Queued`;
+  ③ in-flight + `Hot` → `UnsupportedCapability{ capability: Reconfigure }`,**不改动任何状态**
+  (active_tools/pending/cursor 全不变),绝不悄悄改 live session。`begin_user_turn()` 顶部
+  `take_pending_reconfig()` 折入 `active_tools`,故下一次 `NeedExternalSession(Start/Continue)` 的
+  `request.tools`(由 `build_request` 直接读 `active_tools`)携带新集。
+- **导出**:`external/mod.rs` + `agent/mod.rs` re-export `ExternalReconfigOutcome/ExternalReconfigTiming`。
+- **文档**:`docs/managed-external-agent.md` §3 parity「reconfig」行改为「已落地(M9-3)」、§19 重写为两级
+  reconfig 的已实现语义;`docs/capability-matrix.md` 能力清单 8→9、新增 `Reconfigure` 行与两 adapter 实报表
+  `reconfigure=false(恒)` 行、保守声明表 reconfigure 行。
+- **测试**:`machine/tests.rs` 6 个 `external_reconfig_*`(全离线、每测 <1s):边界(fresh Idle)→Applied 且
+  Start request.tools=新集;边界(完成 turn 后 Done)→Applied 且 Continue 带新集;in-flight NextBoundary→Queued
+  且 active_tools/live 不变、完成后下一 turn 带新集;in-flight Hot→`UnsupportedCapability{Reconfigure}` 且
+  active_tools/pending/cursor 全不变、下一 turn 仍旧集;Hot@boundary→Applied;queued 经 snapshot/restore 后
+  下一 turn 仍带新集(断言 JSON 持久 `pending_reconfig`)。
+- **验证(全过)**:`cargo fmt --all -- --check` 干净;`cargo test -p agent-lib external_reconfig` 6 passed;
+  `cargo clippy --all-targets -- -D warnings` 0 warning(另跑 `--features "external-claude-code external-codex
+  external-opencode"` 亦 0 warning);`cargo test --all --all-targets` 全 ok(919 passed、0 failed);
+  feature-gated lib 753 passed、真实 e2e `#[ignore]` 自跳过;
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净;`git diff --check` 干净。
 
 ### [TODO] M9-4 增加真实 DeepSeek 父协调器 + Claude Code/Codex 子 agent ignored e2e
 
