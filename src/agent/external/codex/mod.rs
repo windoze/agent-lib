@@ -15,10 +15,10 @@
 //!   returning a conservatively-detected
 //!   [`ExternalRuntimeCapabilities`](crate::agent::external::ExternalRuntimeCapabilities)
 //!   otherwise.
-//! - **M7-2 (later):** a private JSONL stream decoder turning raw CLI frames into
-//!   sequenced
+//! - **M7-2 (this task):** the private [`codex exec --json` decoder`](decoder)
+//!   turning raw CLI frames into sequenced
 //!   [`ExternalObservedEvent`](crate::agent::external::ExternalObservedEvent)
-//!   observations and per-turn decisions.
+//!   observations and per-turn [`CodexDecision`]s.
 //! - **M7-3 (later):** the live
 //!   [`ExternalRuntimeSession`](crate::agent::external::ExternalRuntimeSession)
 //!   process management that wraps the decoder into start/resume/advance.
@@ -30,7 +30,9 @@
 //! (design 非目标): the probe reads only `--version` / `--help` / `exec --help`.
 
 mod config;
+mod decoder;
 mod probe;
 
 pub use config::CodexConfig;
+pub use decoder::{CodexDecision, CodexDecodeContext, CodexStreamDecoder};
 pub use probe::{CodexProbeExec, CodexProbeOutput, SystemCodexExec, probe, probe_with_exec};

@@ -1071,6 +1071,36 @@ fallback:
 - 无 JSONL 或不稳定时,plain stdout 只映射 `TextDelta` + final `Completed`。
 - fallback 必须标记 `structured_stream = false`。
 
+#### 实现状态（M7-2,已落地）
+
+- 新增 feature-gated 私有 decoder `src/agent/external/codex/decoder.rs`:有状态、跨 turn 单调 `seq` 的
+  逐帧 `codex exec --json` 解码器。全程走 `serde_json::Value` 防御式导航,**不导出任何 raw frame 类型**,
+  Codex 私有 wire schema 不进 `agent-lib` 稳定 API。经 `src/agent/external/mod.rs` 的
+  `#[cfg(feature = "external-codex")]` re-export `CodexDecision`、`CodexDecodeContext`、`CodexStreamDecoder`。
+- **以当前本机 Codex CLI(v0.144.1)实测 `codex exec --json` 输出为准**:该流是 `ThreadEvent` JSONL——
+  `thread.started` / `turn.started` / `turn.completed` / `turn.failed`、`item.started` / `item.updated` /
+  `item.completed`(包 `{id,type,...}` typed item)、以及顶层瞬时 `error` 通知。上表原先假设的
+  `approval request → PausedForInteraction` **在 exec `--json` 流里不存在**:codex exec 自主运行,自己执行工具
+  (含 MCP tool call 并回报 result),审批按启动时预设的 sandbox/approval 策略内部解决。故本 decoder 每 turn
+  只落定 `CodexDecision::Completed`(`turn.completed`)或 `Failed`(`turn.failed`),**没有** host-pausable 的
+  tool-call / interaction 决策。
+- frame 映射:`thread.started`→`SessionStarted`(捕获 thread_id);`item.completed` `agent_message`→`TextDelta`
+  (并作为本 turn summary);`item.started` `command_execution`→`CommandStarted`(cwd 取自 host `CodexDecodeContext`,
+  流里不含 cwd);`item.completed` `command_execution` completed/failed→`CommandFinished`,`declined`(被审批策略拒绝)
+  →信息性 `PermissionRequested`(无可应答项,runtime 已裁决);`item.completed` `file_change`→逐 change `FilePatch`
+  (`summary="{kind} {path}"`);`item.started`/`item.completed` `mcp_tool_call`→`ToolStarted`/`ToolFinished`
+  (`name="{server}/{tool}"`);`turn.completed`→`SessionCompleted` + `Completed`(usage 映射
+  input/output/cached/cache_write/reasoning,cost=None);`turn.failed`→`Failed{Runtime}`。
+- 容忍策略(稳定):空行 / `turn.started` / 顶层 `error` / `item.updated` / 未知顶层 type / 未知或缺失
+  item `type`(`reasoning`/`web_search`/`todo_list`/`collab_tool_call`/error item…)→容忍(`Ok(None)`,无观测);
+  非法 JSON / 非对象帧 / 缺字符串 `type` / `thread.started` 缺 `thread_id` / `item.*` 缺 `item` 对象或 item 非对象
+  →`ExternalAgentError::Protocol`。所有诊断均为固定字符串,永不夹带 prompt/命令/输出/凭据。
+- committed cassette `tests/fixtures/external/codex/full_session.json`:两 turn(turn1 = text/command/patch/
+  MCP tool/declined 命令 → `Completed`,含 usage;turn2 = text/顶层 error/`turn.failed` → `Failed`)。由 in-code
+  builder 经 `AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1` 再生成;`assert_no_secrets` 保证无凭据。测试放
+  feature-gated 集成测试 `tests/agent_codex_cassette.rs`(7 个,离线、无需真实 Codex)。
+- Codex 真实 e2e 与 live session adapter 未在本任务范围(属 M7-3);本机仅回放合成 cassette。
+
 ### 13.3 tool bridge
 
 Codex 的 full tool injection 取决于当前 CLI/exec-server/MCP 能力:

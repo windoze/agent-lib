@@ -90,7 +90,8 @@ pub use claude_code::{
 };
 #[cfg(feature = "external-codex")]
 pub use codex::{
-    CodexConfig, CodexProbeExec, CodexProbeOutput, SystemCodexExec, probe as codex_probe,
+    CodexConfig, CodexDecision, CodexDecodeContext, CodexProbeExec, CodexProbeOutput,
+    CodexStreamDecoder, SystemCodexExec, probe as codex_probe,
     probe_with_exec as codex_probe_with_exec,
 };
 pub use config::{ExternalAgentMachineConfig, ExternalToolFailurePolicy};

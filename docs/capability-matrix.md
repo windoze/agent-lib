@@ -124,7 +124,16 @@ adapter **不 bridge 宿主工具**(不跑 MCP server),故即便实测,`host_too
 [`CodexConfig`](../src/agent/external/codex/config.rs) 把 `ExternalPermissionMode` 映射到当前 CLI 词汇的
 approval（`untrusted`/`on-request`/`never`）+ sandbox（`read-only`/`workspace-write`/
 `danger-full-access`),并保证顶层全局 flag 排在 `exec` 子命令之前。与 Claude 一样,该探测反映「CLI 自称
-支持什么」,仍**不是** e2e 实测;decoder/live session 待 M7-2/M7-3,故下表 Codex 行仍保持保守 `false`。
+支持什么」,仍**不是** e2e 实测。
+
+里程碑 7-2 起,Codex adapter 也落地了离线的私有 **decoder**
+（[`CodexStreamDecoder`](../src/agent/external/codex/decoder.rs)）:它以**当前本机 Codex CLI(v0.144.1)
+实测 `codex exec --json` 输出为准**(该流是 `ThreadEvent` JSONL),离线地把 CLI 帧解成中立观测
+/决策并有 committed cassette(`tests/fixtures/external/codex/full_session.json`)回归。要点:codex exec 自主
+运行,自己执行工具(含 MCP)、按预设策略内部解决审批,故 decoder 每 turn 只落定 `Completed`/`Failed`,exec
+`--json` 流里**没有** host-pausable 的 tool-call / permission 帧(被拒动作表现为 `command_execution`
+`declined`)。live session adapter 与真机 e2e 待 M7-3,故下表 Codex 行仍保持保守 `false`;待该 e2e 在具备
+Codex 登录的机器上跑绿后再逐项翻真。
 
 ### 受管能力清单（`ExternalCapability`，共 8 项）
 

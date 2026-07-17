@@ -2148,7 +2148,7 @@ e2e。注意 Codex CLI 参数顺序必须按当前 CLI 要求验证。
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --features external-codex` 干净;
   `git diff --check` 干净。
 
-### [TODO] M7-2 实现 Codex stream decoder cassette 测试
+### [DONE] M7-2 实现 Codex stream decoder cassette 测试
 
 **上下文**:
 
@@ -2173,6 +2173,63 @@ e2e。注意 Codex CLI 参数顺序必须按当前 CLI 要求验证。
 - cassette 覆盖 text、permission、tool、patch、completion、error。
 - 无真实 Codex 依赖。
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- 新增 feature-gated 私有 decoder `src/agent/external/codex/decoder.rs`(范围同 M6-2:只做 decoder +
+  cassette,live adapter/e2e 留给 M7-3):有状态、跨 turn 单调 `seq` 的逐帧 `codex exec --json` 解码器。全程走
+  `serde_json::Value` 防御式导航,**不导出任何 raw frame 类型**,Codex 私有 wire schema 不进 `agent-lib` 稳定
+  API(design §12,非目标 §3)。经 `src/agent/external/mod.rs` 的 `#[cfg(feature = "external-codex")]`
+  re-export `CodexDecision`、`CodexDecodeContext`、`CodexStreamDecoder`。
+- **以当前本机 Codex CLI(v0.144.1)实测 `codex exec --json` 输出为准**(TODO 要求「以当前 CLI 为准」):经本机
+  实跑确认该流是 `ThreadEvent` JSONL——`thread.started` / `turn.started` / `turn.completed` / `turn.failed`、
+  `item.started` / `item.updated` / `item.completed`(包 `{id,type,...}` typed item)、以及顶层瞬时 `error`
+  通知;并对照上游 `codex-rs/exec/src/exec_events.rs` + `event_processor_with_jsonl_output.rs` 校验字段。关键
+  事实:codex exec `--json` **自主运行**,自己执行工具(含 MCP tool call 并回报 result),审批按启动时预设的
+  sandbox/approval 策略内部解决,exec 流里**没有** host-pausable 的 tool-call / approval 帧。故本 decoder 的
+  `CodexDecision` 只有 `Completed`(`turn.completed`)/ `Failed`(`turn.failed`)两个决策,**没有**
+  PausedForToolCalls / PausedForInteraction——这是 Codex 与 Claude 的真实能力差异,不是 workaround,已被 M7-1
+  的 capability 探测与本任务文档如实反映。
+- 公开 API:`CodexDecodeContext::new().with_cwd(cwd)`(命令 cwd 由 host 配置的 worktree 提供,流里不含 cwd;
+  不加 step_id/actor,因 decoder 不铸造 Interaction)、`CodexStreamDecoder::new(ctx)`、
+  `push_line(&str) -> Result<Option<CodexDecision>, ExternalAgentError>`、
+  `take_observations() -> Vec<ExternalObservedEvent>`、`session_id()`。turn 落定时清空本 turn 的
+  `last_message`;`seq` 跨 turn 单调不重置。
+- frame 映射:`thread.started`→`SessionStarted`(捕获 thread_id);`item.completed` `agent_message`→`TextDelta`
+  (并作为本 turn summary);`item.started` `command_execution`→`CommandStarted`(cwd 取自 context);
+  `item.completed` `command_execution` completed/failed→`CommandFinished`,`declined`(审批策略拒绝)→信息性
+  `PermissionRequested`(无可应答项,runtime 已裁决;这是 exec 流里唯一的 permission 信号);`item.completed`
+  `file_change`→逐 change `FilePatch`(`summary="{kind} {path}"`);`item.started`/`item.completed`
+  `mcp_tool_call`→`ToolStarted`/`ToolFinished`(`name="{server}/{tool}"`);`turn.completed`→`SessionCompleted`
+  + `Completed`(usage 映射 input/output/cached/cache_write/reasoning,cost=None);`turn.failed`→
+  `Failed{Runtime}`。
+- 容忍策略(稳定):空行 / `turn.started` / 顶层 `error` / `item.updated` / 未知顶层 type / 未知或缺失 item
+  `type`(`reasoning`/`web_search`/`todo_list`/`collab_tool_call`/error item…)→容忍(`Ok(None)`,无观测);
+  非法 JSON / 非对象帧 / 缺字符串 `type` / `thread.started` 缺 `thread_id` / `item.*` 缺 `item` 对象或 item 非
+  对象→`ExternalAgentError::Protocol`。所有诊断均为固定字符串,永不夹带 prompt/命令/输出/凭据。永不 panic。
+- 依赖环规避同 M6-2:decoder 设为 feature-gated `pub`,测试放 feature-gated 集成测试
+  `tests/agent_codex_cassette.rs`(避免 `agent-testkit`↔`agent-lib` 依赖环导致的双 crate 实例)。decoder 同步
+  小-`Ok` helper 触发的 `clippy::result_large_err` 以模块级 `#![allow]` + 说明注释显式接受,与
+  `adapter.rs`/`registry.rs`/`probe.rs` 错误签名保持一致。
+- committed cassette `tests/fixtures/external/codex/full_session.json`:两 turn(turn1 = `Start` → text/
+  command/patch/MCP tool/declined 命令 → `Completed`,含 usage;turn2 = `Continue`(resume)→ text/顶层 error/
+  `turn.failed` → `Failed`)。覆盖 text、permission、tool、patch、completion、error。由 in-code builder 经
+  `AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1` 再生成;`assert_no_secrets` 保证无凭据。
+- 测试(集成 7 个,均离线、无需真实 Codex、无网络):regenerate guard、cassette 与 in-code builder 逐字节一致、
+  secret-free 扫描、full-session 全程回放断言观测流与每 turn 决策、容忍未知/空行/顶层 error/item.updated 帧、
+  malformed→`Protocol`、`turn.failed`→`Failed`。
+- 文档:`docs/managed-external-agent.md` §13.2 增补「实现状态(M7-2,已落地)」并订正 §13.2 表格(exec `--json` 流
+  无 host-pausable approval → PausedForInteraction);`docs/capability-matrix.md` 增补 M7-2 离线 decoder 已落地
+  段落(仍非 e2e,Codex 行维持保守 `false`,待 M7-3 真机 e2e 再翻真);
+  `tests/fixtures/external/codex/README.md` 从预留占位改为描述已落地的合成 decoder fixture。
+- 验证(完整序列 1-6):`cargo fmt --all -- --check` 干净;`cargo test -p agent-lib --features external-codex
+  --test agent_codex_cassette` 7 passed,`cargo test -p agent-lib --test agent_codex_cassette`(未启 feature)
+  0 test;`cargo clippy --all-targets -- -D warnings` 与 `--features external-codex` 均 0 warning;
+  `cargo test --all --all-targets`(未启 feature)43 个 test binary 全 ok、0 failed;
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --features external-codex` 干净;
+  `git diff --check` 干净。
+- Codex 真实 e2e 与 live session adapter 未在本任务范围(属 M7-3);本机仅回放合成 cassette,未运行真实 Codex
+  会话(需登录/网络)。
 
 ### [TODO] M7-3 实现 Codex session adapter 与 ignored real e2e
 

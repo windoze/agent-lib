@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "kind": "codex",
+    "version": "0.144.1-codex-fixture",
+    "probe": "codex-cli 0.144.1 (offline decoder fixture)",
+    "session_id": "019f6e33-c533-7680-9bb7-7d3b5a45e780"
+  },
+  "redaction": {
+    "applied": true,
+    "placeholder": "<redacted>",
+    "notes": "synthetic codex exec --json; no real prompt or credential content"
+  },
+  "turns": [
+    {
+      "expect_input": "start",
+      "input_frames": [
+        {
+          "stream": "stdout",
+          "payload": "{\"thread_id\":\"019f6e33-c533-7680-9bb7-7d3b5a45e780\",\"type\":\"thread.started\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"type\":\"turn.started\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"item\":{\"id\":\"item_0\",\"text\":\"I'll refactor the parser.\",\"type\":\"agent_message\"},\"type\":\"item.completed\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"item\":{\"aggregated_output\":\"\",\"command\":\"cargo fmt\",\"exit_code\":null,\"id\":\"item_1\",\"status\":\"in_progress\",\"type\":\"command_execution\"},\"type\":\"item.started\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"item\":{\"aggregated_output\":\"formatted 3 files\",\"command\":\"cargo fmt\",\"exit_code\":0,\"id\":\"item_1\",\"status\":\"completed\",\"type\":\"command_execution\"},\"type\":\"item.completed\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"item\":{\"changes\":[{\"kind\":\"update\",\"path\":\"src/parser.rs\"}],\"id\":\"item_2\",\"status\":\"completed\",\"type\":\"file_change\"},\"type\":\"item.completed\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"item\":{\"arguments\":{\"query\":\"parser\"},\"error\":null,\"id\":\"item_3\",\"result\":null,\"server\":\"docs\",\"status\":\"in_progress\",\"tool\":\"search\",\"type\":\"mcp_tool_call\"},\"type\":\"item.started\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"item\":{\"arguments\":{\"query\":\"parser\"},\"error\":null,\"id\":\"item_3\",\"result\":{\"content\":[]},\"server\":\"docs\",\"status\":\"completed\",\"tool\":\"search\",\"type\":\"mcp_tool_call\"},\"type\":\"item.completed\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"item\":{\"aggregated_output\":\"\",\"command\":\"git commit -am refactor\",\"exit_code\":null,\"id\":\"item_4\",\"status\":\"declined\",\"type\":\"command_execution\"},\"type\":\"item.completed\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"type\":\"turn.completed\",\"usage\":{\"cache_write_input_tokens\":50,\"cached_input_tokens\":100,\"input_tokens\":1200,\"output_tokens\":340,\"reasoning_output_tokens\":20}}"
+        }
+      ],
+      "expected_events": [
+        {
+          "seq": 0,
+          "event": {
+            "session_started": {
+              "session_id": "019f6e33-c533-7680-9bb7-7d3b5a45e780"
+            }
+          }
+        },
+        {
+          "seq": 1,
+          "event": {
+            "text_delta": {
+              "text": "I'll refactor the parser."
+            }
+          }
+        },
+        {
+          "seq": 2,
+          "event": {
+            "command_started": {
+              "command": "cargo fmt",
+              "cwd": "/repo/agent-lib"
+            }
+          }
+        },
+        {
+          "seq": 3,
+          "event": {
+            "command_finished": {
+              "exit_code": 0,
+              "stdout_tail": "formatted 3 files",
+              "stderr_tail": ""
+            }
+          }
+        },
+        {
+          "seq": 4,
+          "event": {
+            "file_patch": {
+              "path": "src/parser.rs",
+              "summary": "update src/parser.rs"
+            }
+          }
+        },
+        {
+          "seq": 5,
+          "event": {
+            "tool_started": {
+              "name": "docs/search"
+            }
+          }
+        },
+        {
+          "seq": 6,
+          "event": {
+            "tool_finished": {
+              "name": "docs/search",
+              "status": "ok"
+            }
+          }
+        },
+        {
+          "seq": 7,
+          "event": {
+            "permission_requested": {
+              "action_id": "item_4",
+              "summary": "run `git commit -am refactor` (declined by approval policy)"
+            }
+          }
+        },
+        {
+          "seq": 8,
+          "event": "session_completed"
+        }
+      ],
+      "decision": {
+        "kind": "completed",
+        "output": {
+          "summary": "I'll refactor the parser.",
+          "artifacts": [],
+          "usage": {
+            "input": 1200,
+            "output": 340,
+            "cache_read": 100,
+            "cache_write": 50,
+            "reasoning": 20
+          }
+        }
+      }
+    },
+    {
+      "expect_input": "continue",
+      "input_frames": [
+        {
+          "stream": "stdout",
+          "payload": "{\"type\":\"turn.started\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"item\":{\"id\":\"item_5\",\"text\":\"I cannot reach the sandbox.\",\"type\":\"agent_message\"},\"type\":\"item.completed\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"message\":\"stream disconnected, retrying\",\"type\":\"error\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"error\":{\"message\":\"turn aborted: sandbox denied network access\"},\"type\":\"turn.failed\"}"
+        }
+      ],
+      "expected_events": [
+        {
+          "seq": 9,
+          "event": {
+            "text_delta": {
+              "text": "I cannot reach the sandbox."
+            }
+          }
+        }
+      ],
+      "decision": {
+        "kind": "failed",
+        "error": {
+          "runtime": {
+            "message": "turn aborted: sandbox denied network access"
+          }
+        }
+      }
+    }
+  ]
+}
