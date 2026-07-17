@@ -363,7 +363,7 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   passed，doctest 12 passed，其余各 suite 0 failed）✅；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
   ✅；`git diff --check` 干净 ✅。
 
-### [TODO] M1-R Review：Chat facade 正确性与文档一致性检查
+### [DONE] M1-R Review：Chat facade 正确性与文档一致性检查
 
 **上下文**：M1-1..M1-5 落地了 Chat facade。此任务只做审查与必要的收敛修正，不引入新功能。
 
@@ -382,6 +382,44 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
 
 - 完整验证序列 1–6 全绿。
 - 复述式检查：列出 M1 已实现 vs `docs/facade-api.md` §5–§6 承诺项的对照，缺口（若有）记为后续任务。
+
+**完成记录**：
+
+- 通读 `src/facade/{mod,config,ids,error,run,chat,chat/stream}.rs` 与 `src/prelude.rs`，逐项核对
+  `docs/facade-api.md` §3–§6/§16，结论：形状与语义一致，**无 spec 偏离、无缺口**。
+- 语义核对（全部满足）：
+  - §5.1 `Chat::ask`/`ask_full` 每次新建 throwaway `Conversation`（`ask_full` 内 `Conversation::new`），
+    **one-shot 不保历史**；`ChatSession` 复用单一 `Conversation`，**多轮保历史**（测试
+    `consecutive_asks_do_not_retain_history` 请求消息数 `[1,1]` vs `session_accumulates_history` `[1,3]`）。
+  - tool-use 一律 `FacadeError::UnexpectedToolUse`：非流式 `drive_pending` 与流式 `finish_inner` 都在
+    `finish_assistant` 返回 `RequiresToolCallMappings` 时报该错（`tool_use_response_is_rejected` /
+    `session_rejects_tool_use` / `stream_rejects_tool_use_and_rolls_back`）。
+  - pending 失败默认 cancel：`drive_turn` 出错走 `cancel_pending(DiscardTurn)`，`stream` 出错走
+    `RunStream::rollback`（`DiscardTurn`），回到最近 committed 一致点，`Chat`/`ChatSession` 仍可用。
+  - snapshot 不含 secret/client：`ChatSession::snapshot` 只产 `ConversationSnapshot`（数据）；
+    `snapshot_is_data_only_and_round_trips` 断言序列化文本不含 `client`/`api_key`/`LlmClient`。
+- `prelude`（`src/prelude.rs`）只重导已存在类型
+  `Chat/ChatSession/ModelConfig/ProviderConfig/Reply/RunEvent/RunOutput/RunStream`；集成测试
+  `tests/smoke.rs::prelude_and_direct_paths_agree` 已保证 prelude 与直接路径一致。rustdoc 完整、doctest 可编译
+  （`RUSTDOCFLAGS="-D warnings" cargo doc` 绿）。
+- §16 `FacadeError`：已加变体 `Config`/`Client`/`Conversation`/`UnexpectedToolUse`/`InvalidState` 命名与 §16 一致；
+  `#[non_exhaustive]`，其余变体留待后续里程碑（M2+）补，符合任务「允许尚未全加」。
+- **有意取舍差异（均已在代码 rustdoc 注明，非偏离）**：
+  - `FacadeError::Config(String)` vs §16 `Config(ConfigError)`：本 crate 无 `ConfigError` 类型，暂用 `String`
+    承载配置文案（变体名一致、payload 简化）。
+  - `RunEvent::Done(Box<RunOutput>)` vs §6.3 未装箱：避免大终态变体膨胀每个 `RunEvent`（`run.rs` 已注）。
+  - `Reply.usage: Option<Usage>` vs §6.1 `TokenUsage`：本 crate 具体类型为 `model::usage::Usage`（`run.rs` 已注）。
+  - `RunEvent` 不派生 serde（`PLAN.md` R7）：`RawStream`/`RawNotification` 逃生舱不作序列化承诺。
+- **§5–§6 承诺项 vs M1 实现对照（无缺口，无需新增后续任务）**：
+  - §5.2 `Chat`：`builder`/`ask`/`ask_full`/`session` ✅；`ChatSession`：`send`/`send_full`/`stream`/
+    `conversation`/`snapshot`/`restore` ✅。
+  - §5.2 `IntoUserMessage`：`&str`/`String`/`Message`/`Vec<ContentBlock>` ✅。
+  - §5.4 streaming：内部 `Accumulator` 折叠 `Response`、末尾 `Done` 提交、转发 `TextDelta`+`RawStream` ✅。
+  - §6.1 `Reply`（`text`/`usage`/`stop_reason`）✅；§6.2 `RunOutput`（7 字段齐全）✅；§6.3 `RunEvent`（全变体定义）✅。
+- 小范围文档一致性修正：`docs/facade-api.md` §3 prelude 目标示例补入 `RunStream`（doc-only，不改编译产物）。
+- 验证：`cargo fmt --all -- --check` ✅；`cargo clippy --all-targets -- -D warnings` ✅（未触碰 external adapter）；
+  `cargo test -p agent-lib --lib facade::` 39 passed ✅；`cargo test --all --all-targets` 全绿 ✅；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✅；`git diff --check` 干净 ✅。
 
 ---
 

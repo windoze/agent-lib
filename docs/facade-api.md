@@ -105,8 +105,8 @@ agent_lib::prelude
 ```rust
 pub use agent_lib::facade::{
     Agent, AgentSession, Approval, ApprovalPolicy, Chat, ChatSession, Delegation,
-    ManagedExternalAgent, ModelConfig, ProviderConfig, Reply, RunEvent, RunOutput, Tool,
-    ToolContext,
+    ManagedExternalAgent, ModelConfig, ProviderConfig, Reply, RunEvent, RunOutput, RunStream,
+    Tool, ToolContext,
 };
 ```
 
