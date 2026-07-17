@@ -844,6 +844,7 @@ pub struct AgentSnapshot {
     pub supervisor: ConversationSnapshot,
     pub agent_state: AgentStateSnapshot,
     pub delegates: Vec<DelegateSnapshot>,
+    pub delegation: Delegation,
     pub pending_delegations: Vec<DelegationSnapshot>,
     pub mailbox: Option<MailboxSnapshot>,
     pub blackboard: Option<BlackboardSnapshot>,
@@ -851,6 +852,13 @@ pub struct AgentSnapshot {
     pub artifacts: Vec<ArtifactRef>,
 }
 ```
+
+`delegates` 保存每个已注册 local subagent 的 data-only recipe（`name`/`description`/`spec`/`tools`/
+`inherit_model`，不含 approval handler 这类运行期句柄），`delegation` 保存路由模式，restore 时据此
+重新广告并路由到相同 subagent。`pending_delegations` 保存进行中 child 的 `ConversationSnapshot`；
+同步 one-shot delegation 在单个 supervisor turn 内跑完 child，snapshot 仅在 committed 一致点可取，
+故常规 capture 下为空（能力已就绪，供未来可中断 delegation）。task brief 默认不写入持久 snapshot
+（R5）。
 
 Local subagent:
 

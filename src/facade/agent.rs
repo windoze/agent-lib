@@ -54,8 +54,8 @@ use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
 use crate::facade::chat::client_for_provider;
 use crate::facade::config::{ModelConfig, ProviderConfig};
 use crate::facade::delegate::{
-    AgentWorkerBuilder, DelegationRecorder, DelegationToolHandler, LocalSubagent,
-    delegation_declaration, delegation_tool_name, new_delegation_recorder,
+    AgentWorkerBuilder, Delegation, DelegationRecorder, DelegationRoute, DelegationToolHandler,
+    LocalSubagent, new_delegation_recorder,
 };
 use crate::facade::error::FacadeError;
 use crate::facade::ids::FacadeIds;
@@ -63,7 +63,10 @@ use crate::facade::run::{
     DelegationStatus, DelegationTrace, IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace,
     UsageSummary,
 };
-use crate::facade::tool::{FacadeToolRegistry, Tool, ToolContextParts, ensure_unique_tool_names};
+use crate::facade::tool::{
+    FacadeToolRegistry, Tool, ToolContextParts, ensure_unique_declaration_names,
+    ensure_unique_tool_names,
+};
 use crate::model::content::ContentBlock;
 use crate::model::tool::Tool as ToolDecl;
 
@@ -124,6 +127,7 @@ pub struct Agent {
     approval: Arc<FacadeApproval>,
     ids: FacadeIds,
     delegates: Vec<LocalSubagent>,
+    delegation: Delegation,
 }
 
 impl std::fmt::Debug for Agent {
@@ -154,6 +158,7 @@ impl std::fmt::Debug for Agent {
                     .map(LocalSubagent::name)
                     .collect::<Vec<_>>(),
             )
+            .field("delegation", &self.delegation)
             .finish_non_exhaustive()
     }
 }
@@ -253,7 +258,7 @@ impl Agent {
             llm: LlmClientHandler::new(self.client.clone()),
             tool: DelegationToolHandler::new(
                 ToolRegistryHandler::new(registry),
-                self.delegate_table(),
+                self.delegation_route(),
                 self.client.clone(),
                 self.supervisor_model(),
                 self.ids.clone(),
@@ -327,19 +332,20 @@ impl Agent {
         &self.delegates
     }
 
-    /// Builds the per-run delegation lookup keyed by each delegate's synthesized
-    /// `ask_<name>` tool name (§10.1).
+    /// Returns the delegation routing strategy configured on this agent.
     ///
-    /// Shared behind an [`Arc`] so the run-scoped [`DelegationToolHandler`] and
-    /// the streaming tap can consult the same table without re-cloning the
-    /// delegate recipes on every tool call.
-    fn delegate_table(&self) -> Arc<HashMap<String, LocalSubagent>> {
-        Arc::new(
-            self.delegates
-                .iter()
-                .map(|delegate| (delegation_tool_name(delegate.name()), delegate.clone()))
-                .collect(),
-        )
+    /// Defaults to [`Delegation::model_routed`] (one `ask_<name>` tool per
+    /// subagent) unless overridden through [`AgentBuilder::delegation`].
+    #[must_use]
+    pub const fn delegation(&self) -> &Delegation {
+        &self.delegation
+    }
+
+    /// Builds the per-run [`DelegationRoute`] the run-scoped
+    /// [`DelegationToolHandler`] (and the streaming tap) consult to recognize and
+    /// dispatch delegation calls (§10.1, §10.2).
+    fn delegation_route(&self) -> DelegationRoute {
+        self.delegation.route(&self.delegates)
     }
 
     /// Returns the supervisor's own model, substituted into any inheriting child
@@ -407,7 +413,7 @@ impl Agent {
     /// [`run`](Agent::run) commits before returning, so the agent rests at a
     /// snapshot-able point.
     pub fn snapshot(&self) -> Result<AgentSnapshot, FacadeError> {
-        AgentSnapshot::capture(self.machine.state())
+        AgentSnapshot::capture(self.machine.state(), &self.delegates, &self.delegation)
     }
 
     /// Starts a fluent [`AgentRestoreBuilder`] that rebuilds an [`Agent`] from an
@@ -445,6 +451,7 @@ impl Agent {
             approval: self.approval,
             ids: self.ids,
             delegates: self.delegates,
+            delegation: self.delegation,
         }
     }
 }
@@ -473,6 +480,7 @@ pub struct AgentBuilder {
     worktree: Option<WorktreeRef>,
     ids: Option<FacadeIds>,
     delegates: Vec<LocalSubagent>,
+    delegation: Option<Delegation>,
 }
 
 impl std::fmt::Debug for AgentBuilder {
@@ -503,6 +511,7 @@ impl std::fmt::Debug for AgentBuilder {
                     .map(LocalSubagent::name)
                     .collect::<Vec<_>>(),
             )
+            .field("delegation", &self.delegation)
             .finish_non_exhaustive()
     }
 }
@@ -646,6 +655,18 @@ impl AgentBuilder {
         self
     }
 
+    /// Sets the delegation routing strategy for the registered subagents.
+    ///
+    /// Defaults to [`Delegation::model_routed`] (one `ask_<name>` tool per
+    /// subagent, `docs/facade-api.md` §13.1). Pass
+    /// [`Delegation::single_tool`] to collapse every delegate behind one unified
+    /// `<name>(agent, task)` tool that routes by its `agent` argument (§10.2).
+    #[must_use]
+    pub fn delegation(mut self, delegation: Delegation) -> Self {
+        self.delegation = Some(delegation);
+        self
+    }
+
     /// Finalizes the builder into an [`Agent`], assembling the §8.3 machine stack.
     ///
     /// # Errors
@@ -653,8 +674,9 @@ impl AgentBuilder {
     /// - [`FacadeError::Config`] when no model was set, or when neither an
     ///   explicit client nor a provider was supplied.
     /// - [`FacadeError::DuplicateTool`] when a tool name is declared more than
-    ///   once across the typed tools, the escape-hatch declarations, and the
-    ///   custom registry.
+    ///   once across the typed tools, the escape-hatch declarations, the custom
+    ///   registry, and the synthesized delegation tools (two subagents minting
+    ///   the same `ask_<name>`, or a delegation tool clashing with another tool).
     pub fn build(self) -> Result<Agent, FacadeError> {
         let model_name = self.model.ok_or_else(|| {
             FacadeError::Config("agent configuration is missing a `model`".to_owned())
@@ -694,19 +716,23 @@ impl AgentBuilder {
 
         // The advertised tool set must mirror what the run-scoped
         // FacadeToolRegistry reports, so build it from the same three sources,
-        // then append one synthesized delegation tool per registered subagent so
-        // the supervising model can route work to a child (§10.1).
+        // then append the delegation tool declarations the configured
+        // `Delegation` mode advertises for the registered subagents: one
+        // `ask_<name>` tool per delegate (model-routed, §10.1) or a single
+        // unified `<name>(agent, task)` tool (§10.2).
+        let delegation = self.delegation.unwrap_or_default();
         let mut declarations: Vec<ToolDecl> = self.tools.iter().map(Tool::declaration).collect();
         declarations.extend(self.extra_declarations.iter().cloned());
         if let Some(custom) = &self.custom_registry {
             declarations.extend(custom.declarations());
         }
-        for delegate in &self.delegates {
-            declarations.push(delegation_declaration(
-                delegate.name(),
-                delegate.description(),
-            ));
-        }
+        declarations.extend(delegation.declarations(&self.delegates));
+
+        // Reject any name collision the delegation tools introduce — two
+        // delegates minting the same `ask_<name>`, or a delegation tool clashing
+        // with a typed tool / escape-hatch declaration (§10.1). The base tool
+        // sources were already checked above; this covers the delegation layer.
+        ensure_unique_declaration_names(&declarations)?;
 
         let spec = AgentSpec::new(
             ids.agent_id(),
@@ -737,6 +763,7 @@ impl AgentBuilder {
             approval,
             ids,
             delegates: self.delegates,
+            delegation,
         })
     }
 }

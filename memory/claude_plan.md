@@ -1,46 +1,65 @@
-# M3-2 Plan — model-routed delegation
+# M3-3 Plan — `Delegation` config + multi-delegate + delegate/pending snapshot
 
-Task: **M3-2** in `TODO.md` (first incomplete). Expose each registered subagent
-as an `ask_<name>(task)` tool; on a model call, fulfil via the existing
-`SubagentHandler` (`DrivingSubagentHandler`), drive the child machine, fold the
-child summary back as the supervisor tool result, collect a `DelegationTrace`
-into `RunOutput.delegations`, and emit `RunEvent::DelegationStarted/Finished/
-Failed`. Child approval-requiring tools still trigger approval (§9.2).
+Task: **M3-3** in `TODO.md` (first incomplete). Docs: `docs/facade-api.md`
+§10.2, §13.1, §15.2; `PLAN.md` R5 (task brief not persisted).
 
-## Key architectural facts
-- `DefaultAgentMachine` only ever emits `NeedTool`, never `NeedSubagent`. So a
-  delegation is intercepted at the `NeedTool` boundary by a custom `ToolHandler`
-  that internally drives the child via `DrivingSubagentHandler` +
-  `SubagentSpawner` — the established codebase bridge (see
-  `tests/agent_tool_adapter.rs`, `tests/agent_complex_subagent.rs`). This is the
-  faithful "reuse SubagentHandler" path.
-- LLM request tools come from machine state (`current_tool_set().tools()`), so
-  `ask_<name>` declarations MUST be appended to the supervisor's `AgentSpec`
-  tool set at `AgentBuilder::build` time.
-- `summarize(&TurnDone)` cannot see child machine state; a `RecordingChildMachine`
-  wrapper captures the child's `final_turn_summary` (text + usage + stop_reason)
-  into a shared slot when the child cursor reaches `Done`.
+## Deliverables
+1. `Delegation` config type (`src/facade/delegate.rs`):
+   - `model_routed()` (default; one `ask_<name>` tool per delegate) with
+     `.expose_subagents_as_tools()` / `.expose_as_tools()` (idempotent refiners).
+   - `single_tool(name)` (unified `<name>(agent, task)` tool that routes by the
+     `agent` argument).
+   - `AgentBuilder::delegation(..)` wiring; stored on `Agent`.
+2. Multiple subagents: each exposes an independent tool (model-routed) or the
+   unified tool routes by `agent` (single-tool). **Name collisions rejected at
+   build time** (`FacadeError::DuplicateTool`).
+3. Extend `AgentSnapshot`:
+   - `delegates: Vec<DelegateSnapshot>` — data-only spec (name, description,
+     spec, tools, inherit_model); approval omitted (runtime handle).
+   - `pending_delegations: Vec<DelegationSnapshot>` — in-progress child
+     `ConversationSnapshot` + delegate name (capturable + restorable; the
+     synchronous one-shot drive leaves none at a committed point, so it is empty
+     in normal capture, documented).
+   - persist the `Delegation` mode so restore re-routes correctly.
+   - `restore()` rebuilds delegates (and can rebuild child machine from a pending
+     snapshot). Task brief is never added to the persistent snapshot (R5).
+4. rustdoc complete; update §15.2 doc to match the extended snapshot.
+
+## Key facts
+- `DefaultAgentMachine` only emits `NeedTool`; delegation intercepted at the
+  `NeedTool` boundary by `DelegationToolHandler`. Refactor its `delegates` map to
+  a `DelegationRoute` enum knowing the mode.
+- Delegation tool declarations are baked into the supervisor `AgentSpec` tool set
+  at build time (LLM tools come from machine state), so build appends per mode.
+- `AgentSpec`/`ToolSetRef`/`ConversationSnapshot` are Serialize; `AgentSpec` is
+  not `Eq` (f32 temperature) → `DelegateSnapshot` is PartialEq only.
+- `LocalSubagent` is not Serialize (approval handler); snapshot uses its public
+  accessors + a `pub(crate)` `from_parts` constructor for rebuild.
 
 ## Steps
-1. run.rs: add `DelegationStatus{Completed,Failed}`; extend `DelegationTrace`
-   with `status` + `usage`. Re-export `DelegationStatus` from `facade/mod.rs`.
-2. agent.rs: make `assemble_machine` + `final_turn_summary` `pub(crate)`.
-   Append delegation declarations to the spec tool set in `build`. Change
-   `FacadeAgentScope.tool` to `DelegationToolHandler`. Build recorder + handler
-   per-run in `run_full`. Replace `collect_tool_traces` with `collect_traces`
-   that also yields delegations + subagent usage using the recorder.
-3. delegate.rs: `delegation_tool_name`/`delegation_declaration`,
-   `DEFAULT_MAX_DELEGATION_DEPTH`, `ChildSummary`, `RecordingChildMachine`,
-   `ChildAgentScope`, `FacadeSubagentSpawner`, `DelegationToolHandler`,
-   `EmptyScope`, `DelegationRecorder`.
-4. stream.rs: route delegation through `DelegationToolHandler`, emit Delegation
-   live events, assemble delegations + subagent usage from the recorder.
-5. Tests in delegate.rs (offline).
-6. Validate seq 1-6, mark [DONE], commit, STOP.
+1. delegate.rs: `Delegation`/`DelegationMode` (serde), `expose_*`,
+   `delegation_single_tool_declaration`, `DelegationRoute` + builder,
+   `LocalSubagent::from_parts`. Refactor `DelegationToolHandler` to route.
+2. tool.rs: `ensure_unique_declaration_names(&[ToolDecl])`.
+3. agent.rs: `AgentBuilder.delegation` field + `.delegation(..)`; build appends
+   per mode + collision check; `Agent.delegation` field + accessor;
+   `delegation_route()` replaces `delegate_table()`; pass to handler in run_full;
+   `into_parts`/snapshot pass delegates+delegation.
+4. agent/snapshot.rs: populate `DelegateSnapshot`/`DelegationSnapshot`; persist
+   `delegation`; `capture(state, delegates, delegation)`; restore rebuilds
+   delegates + delegation; optional `.subagent(..)` override on restore builder.
+5. agent/stream.rs: use `delegation_route()`.
+6. mod.rs/prelude: export `Delegation`.
+7. Tests (delegate.rs offline): two subagents each callable; single_tool routes
+   by arg; duplicate-name build error; snapshot carries delegates + no brief;
+   restore re-delegates; DelegationSnapshot round-trip rebuilds child.
+8. Validate seq 1-6, mark [DONE], commit, STOP.
 
 ## Status
-- [x] Investigation + design complete.
-- [x] Implement run.rs / agent.rs / delegate.rs / stream.rs — compiles clean.
-- [x] Tests (delegate.rs offline: declaration unit + `model_routed_tests` A/B) + validation seq 1–6 all green.
-- [x] Marked M3-2 `[DONE]` in TODO.md with completion record.
-- [ ] Commit + STOP (in progress).
+- [x] Implement (all files wired; library + tests compile clean)
+- [x] Tests + validation seq 1-6 (fmt; clippy default + external features clean;
+      `cargo test -p agent-lib --lib facade::delegate` 16 passed incl. 6 new;
+      `cargo test --all --all-targets` all green, lib 753 passed;
+      `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` clean;
+      `git diff --check` clean)
+- [x] Mark [DONE] in TODO.md + completion record; commit next, then STOP

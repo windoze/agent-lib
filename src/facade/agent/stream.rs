@@ -128,7 +128,7 @@ pub(super) fn start(
         tool: TapToolHandler {
             inner: DelegationToolHandler::new(
                 ToolRegistryHandler::new(registry),
-                agent.delegate_table(),
+                agent.delegation_route(),
                 agent.client.clone(),
                 agent.supervisor_model(),
                 agent.ids.clone(),

@@ -586,6 +586,28 @@ pub(crate) fn ensure_unique_tool_names(
     Ok(())
 }
 
+/// Rejects duplicate names across a fully assembled tool-declaration list.
+///
+/// [`ensure_unique_tool_names`] checks the three base tool sources before the
+/// delegation layer is added; this complements it by scanning the final
+/// advertised declaration list (base tools plus synthesized delegation tools),
+/// so a delegation tool that collides with a typed tool, an escape-hatch
+/// declaration, or another delegate is rejected at build time with
+/// [`FacadeError::DuplicateTool`] (`docs/facade-api.md` §10.1).
+pub(crate) fn ensure_unique_declaration_names(
+    declarations: &[ToolDecl],
+) -> Result<(), FacadeError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for declaration in declarations {
+        if !seen.insert(declaration.name.as_str()) {
+            return Err(FacadeError::DuplicateTool {
+                name: declaration.name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 impl fmt::Debug for FacadeToolRegistry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

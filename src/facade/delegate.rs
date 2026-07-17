@@ -51,6 +51,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::agent::{
@@ -165,6 +166,33 @@ impl LocalSubagent {
     pub(crate) fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
+    }
+
+    /// Rebuilds a data-first delegate from its persisted parts.
+    ///
+    /// A snapshot ([`DelegateSnapshot`](crate::facade::DelegateSnapshot))
+    /// persists a delegate's data — its `name`, `description`, child
+    /// [`AgentSpec`], advertised [`ToolSetRef`], and inheritance flag — but never
+    /// its [`ApprovalPolicy`] (a possibly closure-bearing runtime handle, §15.2).
+    /// Restore therefore re-supplies the policy, defaulting to
+    /// [`ApprovalPolicy::default`] unless the caller re-registers the delegate.
+    #[must_use]
+    pub(crate) fn from_parts(
+        name: String,
+        description: String,
+        spec: AgentSpec,
+        tools: ToolSetRef,
+        approval: ApprovalPolicy,
+        inherit_model: bool,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            spec,
+            tools,
+            approval,
+            inherit_model,
+        }
     }
 }
 
@@ -436,6 +464,189 @@ pub(crate) fn delegation_declaration(name: &str, description: &str) -> ToolDecl 
     }
 }
 
+/// The delegation routing strategy for an agent's registered subagents
+/// (`docs/facade-api.md` §10.2, §13.1).
+///
+/// Two shapes are supported at this milestone:
+///
+/// - [`model_routed`](Self::model_routed) (the default): every registered
+///   subagent is advertised to the supervising model as its own
+///   `ask_<name>(task)` tool. Separate tools make it easy for the model to call
+///   the right delegate and keep each delegation's trace distinct.
+/// - [`single_tool`](Self::single_tool): all delegates are collapsed behind one
+///   unified `<name>(agent, task)` tool that routes to the requested delegate by
+///   its `agent` argument. This suits a dynamic delegate roster or an outer
+///   policy that wants to own routing.
+///
+/// ```
+/// use agent_lib::facade::Delegation;
+///
+/// // Default: one tool per subagent.
+/// let per_subagent = Delegation::model_routed().expose_subagents_as_tools();
+///
+/// // Advanced: a single unified delegation tool.
+/// let unified = Delegation::single_tool("delegate");
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Delegation {
+    mode: DelegationMode,
+}
+
+/// The internal routing mode carried by a [`Delegation`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum DelegationMode {
+    /// One `ask_<name>` tool per registered subagent (§13.1).
+    PerSubagentTool,
+    /// A single unified `<tool_name>(agent, task)` tool routing by `agent`
+    /// (§10.2).
+    SingleTool {
+        /// The advertised name of the unified delegation tool.
+        tool_name: String,
+    },
+}
+
+impl Default for Delegation {
+    /// The default is [`model_routed`](Self::model_routed): one tool per
+    /// subagent, the mode closest to the ordinary tool-use loop (§13.1).
+    fn default() -> Self {
+        Self::model_routed()
+    }
+}
+
+impl Delegation {
+    /// Model-routed delegation: expose each subagent as its own `ask_<name>`
+    /// tool (the default, §13.1).
+    #[must_use]
+    pub fn model_routed() -> Self {
+        Self {
+            mode: DelegationMode::PerSubagentTool,
+        }
+    }
+
+    /// A no-op refinement making the model-routed intent explicit (§13.1).
+    ///
+    /// Model-routed delegation already exposes each subagent as a tool, so this
+    /// only documents that choice at the call site; it is idempotent and leaves
+    /// the mode unchanged.
+    #[must_use]
+    pub fn expose_subagents_as_tools(self) -> Self {
+        self
+    }
+
+    /// Alias of [`expose_subagents_as_tools`](Self::expose_subagents_as_tools)
+    /// matching the spelling used in `docs/facade-api.md` §13.1.
+    #[must_use]
+    pub fn expose_as_tools(self) -> Self {
+        self
+    }
+
+    /// Single-tool delegation: collapse every delegate behind one unified
+    /// `<tool_name>(agent, task)` tool that routes by the `agent` argument
+    /// (§10.2).
+    #[must_use]
+    pub fn single_tool(tool_name: impl Into<String>) -> Self {
+        Self {
+            mode: DelegationMode::SingleTool {
+                tool_name: tool_name.into(),
+            },
+        }
+    }
+
+    /// Synthesizes the tool declarations this delegation advertises for
+    /// `delegates`, appended to the supervisor's advertised tool set at build
+    /// time (§10.1).
+    ///
+    /// Model-routed delegation yields one `ask_<name>` declaration per delegate;
+    /// single-tool delegation yields exactly one unified declaration whose
+    /// `agent` argument enumerates the delegate names.
+    #[must_use]
+    pub(crate) fn declarations(&self, delegates: &[LocalSubagent]) -> Vec<ToolDecl> {
+        match &self.mode {
+            DelegationMode::PerSubagentTool => delegates
+                .iter()
+                .map(|delegate| delegation_declaration(delegate.name(), delegate.description()))
+                .collect(),
+            DelegationMode::SingleTool { tool_name } => {
+                vec![delegation_single_tool_declaration(tool_name, delegates)]
+            }
+        }
+    }
+
+    /// Builds the per-run [`DelegationRoute`] that a
+    /// [`DelegationToolHandler`] consults to recognize and dispatch delegation
+    /// calls for `delegates`.
+    #[must_use]
+    pub(crate) fn route(&self, delegates: &[LocalSubagent]) -> DelegationRoute {
+        match &self.mode {
+            DelegationMode::PerSubagentTool => DelegationRoute::PerSubagent(
+                delegates
+                    .iter()
+                    .map(|delegate| (delegation_tool_name(delegate.name()), delegate.clone()))
+                    .collect(),
+            ),
+            DelegationMode::SingleTool { tool_name } => DelegationRoute::SingleTool {
+                tool_name: tool_name.clone(),
+                by_name: delegates
+                    .iter()
+                    .map(|delegate| (delegate.name().to_owned(), delegate.clone()))
+                    .collect(),
+            },
+        }
+    }
+}
+
+/// Synthesizes the unified single-tool delegation declaration (§10.2).
+///
+/// The tool takes a required `agent` (which delegate to route to, enumerated
+/// from the registered delegate names) and a required `task` (the brief). The
+/// description lists the available delegates so the model can choose.
+#[must_use]
+pub(crate) fn delegation_single_tool_declaration(
+    tool_name: &str,
+    delegates: &[LocalSubagent],
+) -> ToolDecl {
+    let names: Vec<Value> = delegates
+        .iter()
+        .map(|delegate| Value::String(delegate.name().to_owned()))
+        .collect();
+    let roster = delegates
+        .iter()
+        .map(|delegate| {
+            if delegate.description().is_empty() {
+                delegate.name().to_owned()
+            } else {
+                format!("`{}` ({})", delegate.name(), delegate.description())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let description = if roster.is_empty() {
+        "Delegate a task to a subagent by name.".to_owned()
+    } else {
+        format!("Delegate a task to one of the available subagents: {roster}.")
+    };
+    ToolDecl {
+        name: tool_name.to_owned(),
+        description,
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description": "Which subagent to delegate to.",
+                    "enum": names
+                },
+                "task": {
+                    "type": "string",
+                    "description": "The task to delegate to the subagent."
+                }
+            },
+            "required": ["agent", "task"]
+        }),
+    }
+}
+
 /// A per-run map from a delegation call's framework id to its recorded trace.
 ///
 /// The [`DelegationToolHandler`] writes one entry per delegation call; the run
@@ -646,11 +857,98 @@ impl SubagentSpawner for FacadeSubagentSpawner {
     }
 }
 
+/// The run-scoped routing table a [`DelegationToolHandler`] consults to
+/// recognize a delegation tool call and select the target subagent.
+///
+/// Built once per run from the agent's [`Delegation`] config and its registered
+/// delegates (see [`Delegation::route`]). Two shapes mirror the two delegation
+/// modes: [`PerSubagent`](Self::PerSubagent) keys delegates by their synthesized
+/// `ask_<name>` tool name, while [`SingleTool`](Self::SingleTool) recognizes one
+/// unified tool name and routes by the call's `agent` argument.
+pub(crate) enum DelegationRoute {
+    /// Model-routed: `ask_<name>` tool name → delegate (§13.1).
+    PerSubagent(HashMap<String, LocalSubagent>),
+    /// Single-tool: one unified tool name plus a delegate-name → delegate map
+    /// the `agent` argument selects into (§10.2).
+    SingleTool {
+        /// The advertised name of the unified delegation tool.
+        tool_name: String,
+        /// Delegates keyed by their registration name.
+        by_name: HashMap<String, LocalSubagent>,
+    },
+}
+
+impl DelegationRoute {
+    /// Reports whether `name` is this route's delegation tool.
+    fn is_delegation(&self, name: &str) -> bool {
+        match self {
+            Self::PerSubagent(by_tool) => by_tool.contains_key(name),
+            Self::SingleTool { tool_name, .. } => name == tool_name,
+        }
+    }
+
+    /// Resolves a tool call into the target delegate and task brief, or reports
+    /// that the call is not a delegation / names an unknown delegate.
+    fn resolve<'a>(&'a self, call: &ToolCall) -> Resolved<'a> {
+        let task = call
+            .input
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        match self {
+            Self::PerSubagent(by_tool) => match by_tool.get(&call.name) {
+                Some(subagent) => Resolved::Delegate { subagent, task },
+                None => Resolved::NotDelegation,
+            },
+            Self::SingleTool { tool_name, by_name } => {
+                if &call.name != tool_name {
+                    return Resolved::NotDelegation;
+                }
+                let requested = call
+                    .input
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                match by_name.get(&requested) {
+                    Some(subagent) => Resolved::Delegate { subagent, task },
+                    None => Resolved::UnknownDelegate {
+                        requested,
+                        available: {
+                            let mut names: Vec<&str> = by_name.keys().map(String::as_str).collect();
+                            names.sort_unstable();
+                            names.join(", ")
+                        },
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// The outcome of resolving a tool call against a [`DelegationRoute`].
+enum Resolved<'a> {
+    /// The call routes to `subagent` with the given `task` brief.
+    Delegate {
+        subagent: &'a LocalSubagent,
+        task: String,
+    },
+    /// A single-tool delegation named a delegate that is not registered.
+    UnknownDelegate {
+        requested: String,
+        available: String,
+    },
+    /// The call is not a delegation and belongs to the base registry.
+    NotDelegation,
+}
+
 /// The run-scoped [`ToolHandler`] that routes delegation tool calls to the
 /// subagent path and forwards every other call to the base registry handler.
 ///
-/// A call whose name matches a registered `ask_<name>` delegate is fulfilled by
-/// building a child machine from the delegate's data-first spec and driving it
+/// A call the run's [`DelegationRoute`] recognizes — either a model-routed
+/// `ask_<name>` tool or the unified single-tool name — is fulfilled by building
+/// a child machine from the target delegate's data-first spec and driving it
 /// through the reference
 /// [`DrivingSubagentHandler`](crate::agent::DrivingSubagentHandler) — the same
 /// `NeedSubagent` mechanism the agent layer already owns — then folding the
@@ -660,7 +958,7 @@ impl SubagentSpawner for FacadeSubagentSpawner {
 /// agent with no delegates behaves exactly as before (§10.1, §19).
 pub(crate) struct DelegationToolHandler {
     base: ToolRegistryHandler,
-    delegates: Arc<HashMap<String, LocalSubagent>>,
+    route: DelegationRoute,
     client: Arc<dyn LlmClient>,
     supervisor_model: ModelRef,
     ids: FacadeIds,
@@ -669,11 +967,11 @@ pub(crate) struct DelegationToolHandler {
 }
 
 impl DelegationToolHandler {
-    /// Wraps `base`, routing calls named after a registered delegate through the
-    /// subagent path and recording each delegation's trace into `recorder`.
+    /// Wraps `base`, routing calls the `route` recognizes through the subagent
+    /// path and recording each delegation's trace into `recorder`.
     pub(crate) fn new(
         base: ToolRegistryHandler,
-        delegates: Arc<HashMap<String, LocalSubagent>>,
+        route: DelegationRoute,
         client: Arc<dyn LlmClient>,
         supervisor_model: ModelRef,
         ids: FacadeIds,
@@ -681,7 +979,7 @@ impl DelegationToolHandler {
     ) -> Self {
         Self {
             base,
-            delegates,
+            route,
             client,
             supervisor_model,
             ids,
@@ -692,7 +990,7 @@ impl DelegationToolHandler {
 
     /// Reports whether `name` is a registered delegation tool.
     pub(crate) fn is_delegation(&self, name: &str) -> bool {
-        self.delegates.contains_key(name)
+        self.route.is_delegation(name)
     }
 
     /// Drives one delegation to completion and folds its summary back as the
@@ -702,15 +1000,9 @@ impl DelegationToolHandler {
         call_id: ToolCallId,
         call: &ToolCall,
         subagent: &LocalSubagent,
+        task: String,
         ctx: &RunContext,
     ) -> RequirementResult {
-        let task = call
-            .input
-            .get("task")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-
         let slot: ChildSummarySlot = Arc::new(Mutex::new(None));
         let spawner = Arc::new(FacadeSubagentSpawner {
             subagent: subagent.clone(),
@@ -794,10 +1086,32 @@ impl ToolHandler for DelegationToolHandler {
         call: &ToolCall,
         ctx: &RunContext,
     ) -> RequirementResult {
-        if let Some(subagent) = self.delegates.get(&call.name) {
-            self.drive_delegation(call_id, call, subagent, ctx).await
-        } else {
-            self.base.fulfill(call_id, call, ctx).await
+        match self.route.resolve(call) {
+            Resolved::Delegate { subagent, task } => {
+                self.drive_delegation(call_id, call, subagent, task, ctx)
+                    .await
+            }
+            Resolved::UnknownDelegate {
+                requested,
+                available,
+            } => {
+                // A single-tool delegation named a delegate that is not
+                // registered. Record a failed trace (so the tap still brackets
+                // it) and fold a classified error back to the model.
+                self.record(
+                    &call_id,
+                    &requested,
+                    DelegationStatus::Failed,
+                    Usage::default(),
+                );
+                RequirementResult::Tool(Err(ToolRuntimeError::ExecutionFailed {
+                    tool_name: call.name.clone(),
+                    message: format!(
+                        "unknown delegate `{requested}`; available delegates: {available}"
+                    ),
+                }))
+            }
+            Resolved::NotDelegation => self.base.fulfill(call_id, call, ctx).await,
         }
     }
 }
@@ -1268,5 +1582,349 @@ mod model_routed_tests {
         assert_eq!(output.reply.text(), "Final: done.");
         assert_eq!(output.delegations.len(), 1);
         assert_eq!(output.delegations[0].status, DelegationStatus::Completed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Delegation config, multi-delegate, and snapshot coverage (milestone M3-3)
+    // -----------------------------------------------------------------------
+
+    use crate::facade::{Delegation, DelegationSnapshot};
+
+    #[tokio::test]
+    async fn two_subagents_each_expose_independent_tools_and_route() {
+        // The supervisor calls each delegate's own `ask_<name>` tool in turn;
+        // each routes to the matching child and folds that child's summary back.
+        let client = RoutingClient::new(vec![
+            route(
+                "SUPERVISOR",
+                vec![
+                    tool_call_response("d1", "ask_reviewer", json!({ "task": "review" })),
+                    tool_call_response("d2", "ask_researcher", json!({ "task": "research" })),
+                    text_response("Final: both done."),
+                ],
+            ),
+            route("REVIEWER", vec![text_response("review: LGTM")]),
+            route("RESEARCHER", vec![text_response("research: found it")]),
+        ]);
+
+        let reviewer = Agent::worker()
+            .description("Strict reviewer.")
+            .system("You are the REVIEWER.")
+            .build()
+            .expect("worker builds");
+        let researcher = Agent::worker()
+            .description("Focused researcher.")
+            .system("You are the RESEARCHER.")
+            .build()
+            .expect("worker builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .subagent("reviewer", reviewer)
+            .subagent("researcher", researcher)
+            .build()
+            .expect("agent builds");
+
+        // Both `ask_reviewer` and `ask_researcher` are advertised to the model.
+        let advertised: Vec<&str> = agent
+            .state()
+            .spec()
+            .initial_tools()
+            .tools()
+            .iter()
+            .map(|decl| decl.name.as_str())
+            .collect();
+        assert!(advertised.contains(&"ask_reviewer"));
+        assert!(advertised.contains(&"ask_researcher"));
+
+        let output = agent.run_full("Do both.").await.unwrap();
+        assert_eq!(output.reply.text(), "Final: both done.");
+
+        // One trace per delegate, recorded in call order.
+        assert_eq!(output.delegations.len(), 2);
+        assert_eq!(output.delegations[0].delegate, "reviewer");
+        assert_eq!(output.delegations[1].delegate, "researcher");
+        assert!(
+            output
+                .delegations
+                .iter()
+                .all(|trace| trace.status == DelegationStatus::Completed)
+        );
+
+        // Each child's summary was folded back as its own tool result.
+        let texts = tool_result_texts(&agent);
+        assert!(texts.iter().any(|text| text == "review: LGTM"));
+        assert!(texts.iter().any(|text| text == "research: found it"));
+    }
+
+    #[tokio::test]
+    async fn single_tool_delegation_routes_by_agent_argument() {
+        // One unified `delegate(agent, task)` tool routes to the delegate named
+        // by the `agent` argument.
+        let client = RoutingClient::new(vec![
+            route(
+                "SUPERVISOR",
+                vec![
+                    tool_call_response(
+                        "d1",
+                        "delegate",
+                        json!({ "agent": "researcher", "task": "dig in" }),
+                    ),
+                    text_response("Final: routed."),
+                ],
+            ),
+            route("REVIEWER", vec![text_response("review: unused")]),
+            route(
+                "RESEARCHER",
+                vec![text_response("research: the answer is 42")],
+            ),
+        ]);
+
+        let reviewer = Agent::worker()
+            .system("You are the REVIEWER.")
+            .build()
+            .expect("worker builds");
+        let researcher = Agent::worker()
+            .system("You are the RESEARCHER.")
+            .build()
+            .expect("worker builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .subagent("reviewer", reviewer)
+            .subagent("researcher", researcher)
+            .delegation(Delegation::single_tool("delegate"))
+            .build()
+            .expect("agent builds");
+
+        // Exactly one unified delegation tool is advertised (no `ask_*`).
+        let delegation_tools: Vec<&str> = agent
+            .state()
+            .spec()
+            .initial_tools()
+            .tools()
+            .iter()
+            .map(|decl| decl.name.as_str())
+            .filter(|name| *name == "delegate" || name.starts_with("ask_"))
+            .collect();
+        assert_eq!(delegation_tools, vec!["delegate"]);
+
+        let output = agent.run_full("Route this.").await.unwrap();
+        assert_eq!(output.reply.text(), "Final: routed.");
+
+        // The call routed to the researcher, and only the researcher.
+        assert_eq!(output.delegations.len(), 1);
+        assert_eq!(output.delegations[0].delegate, "researcher");
+        let texts = tool_result_texts(&agent);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "research: the answer is 42")
+        );
+        assert!(texts.iter().all(|text| text != "review: unused"));
+    }
+
+    #[test]
+    fn duplicate_delegate_name_is_rejected_at_build() {
+        let first = Agent::worker()
+            .system("You are the REVIEWER.")
+            .build()
+            .expect("worker builds");
+        let second = Agent::worker()
+            .system("You are another REVIEWER.")
+            .build()
+            .expect("worker builds");
+
+        let error = AgentBuilder::default()
+            .client(RoutingClient::new(vec![route(
+                "SUPERVISOR",
+                vec![text_response("unused")],
+            )]))
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .subagent("reviewer", first)
+            .subagent("reviewer", second)
+            .build()
+            .expect_err("two delegates under the same name collide");
+
+        match error {
+            crate::facade::FacadeError::DuplicateTool { name } => {
+                assert_eq!(name, "ask_reviewer");
+            }
+            other => panic!("expected a DuplicateTool error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_carries_delegates_and_restore_can_delegate_again() {
+        let client = RoutingClient::new(vec![
+            route(
+                "SUPERVISOR",
+                vec![
+                    tool_call_response("d1", "ask_reviewer", json!({ "task": "review the diff" })),
+                    text_response("Final: first pass done."),
+                ],
+            ),
+            route("REVIEWER", vec![text_response("review: LGTM")]),
+        ]);
+
+        let reviewer = Agent::worker()
+            .description("Strict reviewer.")
+            .system("You are the REVIEWER.")
+            .build()
+            .expect("worker builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .subagent("reviewer", reviewer)
+            .build()
+            .expect("agent builds");
+
+        agent.run_full("Please review.").await.unwrap();
+
+        // The snapshot carries the delegate as a data-only recipe and the
+        // model-routed delegation mode.
+        let snapshot = agent.snapshot().expect("snapshot at a committed point");
+        assert_eq!(snapshot.delegates.len(), 1);
+        assert_eq!(snapshot.delegates[0].name, "reviewer");
+        assert_eq!(snapshot.delegates[0].description, "Strict reviewer.");
+        assert!(snapshot.delegates[0].inherit_model);
+        assert!(snapshot.pending_delegations.is_empty());
+        assert_eq!(snapshot.delegation, Delegation::model_routed());
+
+        // A restored agent re-advertises the delegate and can delegate again.
+        let restore_client = RoutingClient::new(vec![
+            route(
+                "SUPERVISOR",
+                vec![
+                    tool_call_response("d2", "ask_reviewer", json!({ "task": "review again" })),
+                    text_response("Final: second pass done."),
+                ],
+            ),
+            route("REVIEWER", vec![text_response("review: still LGTM")]),
+        ]);
+        let restore_reviewer = Agent::worker()
+            .system("You are the REVIEWER.")
+            .approval(Approval::auto_allow())
+            .build()
+            .expect("worker builds");
+        let mut restored = Agent::restore()
+            .snapshot(snapshot)
+            .client(restore_client)
+            .approval(Approval::auto_allow())
+            .subagent("reviewer", restore_reviewer)
+            .build()
+            .expect("restore agent");
+
+        let output = restored.run_full("Review once more.").await.unwrap();
+        assert_eq!(output.reply.text(), "Final: second pass done.");
+        assert_eq!(output.delegations.len(), 1);
+        assert_eq!(output.delegations[0].delegate, "reviewer");
+        assert!(
+            tool_result_texts(&restored)
+                .iter()
+                .any(|text| text == "review: still LGTM"),
+            "the restored agent drove its re-registered delegate"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_does_not_persist_the_task_brief_in_delegation_data() {
+        // A distinctive brief only the supervising model routes through the
+        // delegation tool call.
+        const BRIEF: &str = "SECRET_TASK_BRIEF_9f2a";
+        let client = RoutingClient::new(vec![
+            route(
+                "SUPERVISOR",
+                vec![
+                    tool_call_response("d1", "ask_reviewer", json!({ "task": BRIEF })),
+                    text_response("Final: done."),
+                ],
+            ),
+            route("REVIEWER", vec![text_response("review: LGTM")]),
+        ]);
+
+        let reviewer = Agent::worker()
+            .system("You are the REVIEWER.")
+            .build()
+            .expect("worker builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .subagent("reviewer", reviewer)
+            .build()
+            .expect("agent builds");
+
+        agent
+            .run_full("Delegate with a secret brief.")
+            .await
+            .unwrap();
+        let snapshot = agent.snapshot().expect("snapshot");
+
+        // The delegation-specific persistence (delegate recipes + in-flight
+        // delegations) never carries the runtime task brief (R5): delegates hold
+        // only static spec, and no child is left in flight.
+        let delegates_json =
+            serde_json::to_string(&snapshot.delegates).expect("serialize delegates");
+        assert!(
+            !delegates_json.contains(BRIEF),
+            "delegate recipes must not carry the runtime task brief"
+        );
+        let pending_json =
+            serde_json::to_string(&snapshot.pending_delegations).expect("serialize pending");
+        assert!(
+            !pending_json.contains(BRIEF),
+            "pending-delegation persistence must not carry the runtime task brief"
+        );
+        assert!(snapshot.pending_delegations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delegation_snapshot_round_trips_and_rebuilds_child_conversation() {
+        // Drive a standalone child agent to produce a committed child
+        // conversation, then round-trip it through a `DelegationSnapshot` and
+        // rebuild the child's live conversation from it (§15.2).
+        let child_client = RoutingClient::new(vec![route(
+            "REVIEWER",
+            vec![text_response("review: child ran")],
+        )]);
+        let mut child = AgentBuilder::default()
+            .client(child_client)
+            .model("child-model")
+            .system("You are the REVIEWER.")
+            .approval(Approval::auto_allow())
+            .build()
+            .expect("child agent builds");
+        child.run_full("child task").await.unwrap();
+        let turns_before = child.conversation().turns().len();
+        assert!(turns_before > 0);
+
+        let pending =
+            DelegationSnapshot::capture("reviewer", child.conversation()).expect("capture pending");
+        assert_eq!(pending.delegate, "reviewer");
+
+        // Serde round-trip preserves the pending delegation exactly.
+        let json = serde_json::to_string(&pending).expect("serialize pending");
+        let restored: DelegationSnapshot =
+            serde_json::from_str(&json).expect("deserialize pending");
+        assert_eq!(restored, pending);
+
+        // Restore rebuilds the child's live conversation with its committed turns.
+        let rebuilt = restored
+            .restore_conversation()
+            .expect("rebuild child conversation");
+        assert_eq!(rebuilt.turns().len(), turns_before);
     }
 }

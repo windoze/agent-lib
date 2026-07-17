@@ -15,6 +15,6 @@
 //! managed-external-agent types as they land.
 
 pub use crate::facade::{
-    Agent, Approval, ApprovalPolicy, Chat, ChatSession, ModelConfig, ProviderConfig, Reply,
-    RunEvent, RunOutput, RunStream, Tool, ToolContext,
+    Agent, Approval, ApprovalPolicy, Chat, ChatSession, Delegation, ModelConfig, ProviderConfig,
+    Reply, RunEvent, RunOutput, RunStream, Tool, ToolContext,
 };
