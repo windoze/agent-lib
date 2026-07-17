@@ -180,6 +180,19 @@ host_subagents 保守 `false`)。配套的 [`OpenCodeConfig`](../src/agent/exter
 Claude/Codex 一样,该探测反映「CLI 自称支持什么」,仍**不是** e2e 实测;decoder 待 M8-2、live adapter 与真机
 e2e 待 M8-3,故下表 OpenCode 行仍保持保守 `false`。
 
+里程碑 8-2 起,`external-opencode` 下新增了 adapter 私有的 `opencode run --format json` **stream decoder**
+([`OpenCodeStreamDecoder`](../src/agent/external/opencode/decoder.rs)):它把 CLI 逐行输出的
+`{ type, timestamp, sessionID, ... }` 事件信封(`text` / `tool_use` / `step_start` / `step_finish` /
+`reasoning` / `error`)归一化成 sequenced [`ExternalObservedEvent`](../src/agent/external/mod.rs) 与
+per-turn `OpenCodeDecision`。与 `codex exec --json` 一样,`run --format json` **自主运行**——权限提示按
+`--auto` 启动开关裁决,不回灌 host——故 decoder 无 host-pausable 决策臂:一个 turn 只会 `Completed`
+(终结 `step_finish`,跨步累加 usage)或 `Failed`(顶层 `error`)。被权限拒绝的工具在流里表现为
+`state.status = error` 且错误串是 OpenCode 稳定的 `PermissionRejectedError`/`PermissionDeniedError`
+文案,decoder 据此发**信息型** `PermissionRequested` 观测(runtime 已裁决,host 无需应答)。私有 wire
+schema 不外泄为稳定 API,回归由离线 cassette([`tests/agent_opencode_cassette.rs`](../tests/agent_opencode_cassette.rs) +
+`tests/fixtures/external/opencode/full_session.json`)冻结,覆盖 text/command/patch/permission/
+tool/subtask/completion/error;live adapter 与真机 e2e 仍待 M8-3。
+
 ### 受管能力清单（`ExternalCapability`，共 8 项）
 
 | `ExternalCapability` | serde 标签 | 覆盖的决策点 / 旁路 | 保守默认 |

@@ -1,19 +1,23 @@
 # `opencode` runtime cassettes
 
-Reserved for **recorded** OpenCode runtime cassettes
-([`ExternalRuntimeCassette`](../../../../crates/agent-testkit/src/external/cassette.rs)).
+Recorded **offline** OpenCode runtime cassettes for `opencode run --format json`
+stream-decoder regression.
 
-The feature-gated OpenCode launch config and capability probe already landed in
-M8-1 (`external-opencode`:
+The feature-gated OpenCode launch config and capability probe landed in M8-1
+(`external-opencode`:
 [`OpenCodeConfig`](../../../../src/agent/external/opencode/config.rs),
 [`opencode_probe`](../../../../src/agent/external/opencode/probe.rs)); those are
 exercised by in-module offline unit tests and need no cassette.
 
-No stream cassettes live here yet: the concrete OpenCode stream decoder lands in
-M8-2 and the live adapter in M8-3. When they do, redacted recordings of real
-`opencode run --format json` output frames plus the expected observed-event
-stream and decision point go in this directory, and are replayed offline through
-`CassetteRuntimeExternalSessionHandler` for parser-drift regression.
+`full_session.json` is the M8-2 stream cassette: a redacted, hand-tuned recording
+of `opencode run --format json` output frames (two turns — a completing turn and a
+failing turn) that pins the [`OpenCodeStreamDecoder`](../../../../src/agent/external/opencode/decoder.rs)
+against parser drift. It is regenerated only via
+`AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1 cargo test --features external-opencode
+--test agent_opencode_cassette opencode_cassette_regenerate_fixture`, and replayed
+offline (no real `opencode` binary) by
+[`tests/agent_opencode_cassette.rs`](../../../agent_opencode_cassette.rs). The live
+session adapter and on-device e2e land in M8-3.
 
 Every committed cassette must pass the redaction scan
 (`ExternalRuntimeCassette::assert_no_secrets`): no `API_KEY`, `AUTH_TOKEN`,

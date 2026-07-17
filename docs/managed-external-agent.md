@@ -1167,6 +1167,23 @@ OpenCode 需要先做 capability probe,因为部署形态可能更多。
 > 到 `run` 的唯一权限旁路开关 `--auto`:**仅 `BypassPermissions` 发 `--auto`**,其余模式不加(交给
 > permission bridge 或默认拒绝),避免用全量自动批准越权放宽宿主权限边界;更细的 read-only/accept-edits 由
 > `--agent` 预设 agent 表达。stream decoder 待 M8-2,live session adapter 与真机 e2e 待 M8-3。
+>
+> **实现状态(M8-2,已落地)**:`external-opencode` 下新增了 adapter 私有的 `opencode run --format json`
+> **stream decoder**([`OpenCodeStreamDecoder`](../src/agent/external/opencode/decoder.rs))。它防御式地
+> 解析 CLI 逐行输出的事件信封 `{ type, timestamp, sessionID, ... }`(`run.ts` 的 `emit()` 只镜像
+> `text` / `tool_use` / `step_start` / `step_finish` / `reasoning` / `error` 六种),归一化成 sequenced
+> [`ExternalObservedEvent`](../src/agent/external/mod.rs) 与 per-turn `OpenCodeDecision`,不把私有
+> wire schema 变成稳定 public API。与 `codex exec --json` 一样,`run --format json` **自主运行**:权限提示
+> 按 `--auto` 启动开关裁决而非回灌 host(JSON `run` loop 在 `--auto` 下自动批准、否则自动拒绝,从不把
+> `permission.asked` 镜像到 stdout),故 decoder **无 host-pausable 决策臂**——turn 只会 `Completed`
+> (终结 `step_finish`,`reason != "tool-calls"`;usage 跨步累加)或 `Failed`(顶层 `error`)。因为流里只镜像
+> **已结算**的 tool part(`state.status` 已是 `completed`/`error`),decoder 从这一帧重建 started/finished
+> 事件对:`bash` → `CommandStarted`+`CommandFinished`,`edit`/`write`/`patch` → `FilePatch`,`task` 子代理
+> 与其余工具 → `ToolStarted`+`ToolFinished`;被权限拒绝的工具(错误串是 OpenCode 稳定的
+> `PermissionRejectedError`/`PermissionDeniedError` 文案)→ **信息型** `PermissionRequested`。回归由离线
+> cassette([`tests/agent_opencode_cassette.rs`](../tests/agent_opencode_cassette.rs) +
+> `tests/fixtures/external/opencode/full_session.json`)冻结,覆盖 text/command/patch/permission/tool/
+> subtask/completion/error 及容忍/畸形帧分类;live session adapter 与真机 e2e 仍待 M8-3。
 
 ### 14.1 probe 项
 

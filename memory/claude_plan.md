@@ -1,48 +1,63 @@
-# M7-4 Review：Codex adapter 正确性检查
+# M8-2 实现 OpenCode stream decoder cassette 测试
 
-**当前执行 = TODO.md 第一个未完成任务 = M7-4**（行 2312 `### [TODO] M7-4`；
-M7-3 已 `[DONE]`，M8-1 虽 `[DONE]` 但排在其后，故 M7-4 是首个未完成任务）。
+**当前任务 = TODO.md 第一个未完成任务 = M8-2**（TODO.md 行 2452 `### [TODO] M8-2`）。
+M8-1 已 `[DONE]`（config+probe），M8-2 = 私有 `opencode run --format json` decoder + cassette。
 
-## 任务性质
-Review 任务（非新实现）。做什么：
-1. 检查 CLI 参数顺序、sandbox/approval mode 文档与 tests。
-2. 检查 feature gate、依赖、no-secret logging。
-3. 检查 cleanup 与 trace。
-4. 更新 `docs/capability-matrix.md` Codex 行。
+## 真实 OpenCode wire 格式（已核对 sst/opencode 源码，非硬编码假设）
+`opencode run --format json` 逐行输出信封：
+`{ "type": <emit-type>, "timestamp": <ms>, "sessionID": <id>, ...data }`
+（源：packages/opencode/src/cli/cmd/run.ts `emit()`；part schema：packages/sdk/js/src/gen/types.gen.ts）
 
-验证条件：`cargo test --all --all-targets`、
-`cargo test --features external-codex -p agent-lib codex_cassette`、`git diff --check`、
-完成记录列出 Codex 支持/不支持能力和真实 e2e 状态。
+emit 类型仅 6 种（run.ts loop 只对这些调用 emit）：
+- `text` → `{ part: TextPart }`（仅 part.time.end 时）→ TextDelta(part.text)
+- `reasoning` → `{ part: ReasoningPart }`（仅 thinking，默认关）→ 容忍
+- `tool_use` → `{ part: ToolPart }`（仅 state.status ∈ {completed,error}）
+  - ToolPart = { type:"tool", callID, tool:<name>, state }
+  - tool id "bash"（input.command, metadata.exit, metadata.output/output, title=command）
+  - "edit"/"write"/"apply_patch"（title=filePath 或 input.filePath, metadata.diff）
+  - "task"（子代理：input.description/prompt/subagent_type）
+  - 其他（grep/read/glob/webfetch...）
+  - state error 且是权限拒绝 → opencode 稳定错误串 "The user rejected permission to use..."/
+    "prevents you from using this specific tool call" → 信息型 PermissionRequested（run 模式自动裁决，
+    不回灌 host，等价 Codex declined 处理）
+- `step_start` → `{ part: StepStartPart }` → 容忍（边界）
+- `step_finish` → `{ part: StepFinishPart }`：{ reason, cost, tokens:{input,output,reasoning,cache:{read,write}} }
+  - reason=="tool-calls" → 继续（无决策）；其余（"stop"/"length"...）→ 终结 Completed
+  - usage 跨 turn 内所有 step_finish 累加为 turn 总量
+- `error` → `{ error: ApiError }`（session.error，{name, data?:{message}}）→ Failed(Runtime)
 
-## Review 结论（已逐项核对源码）
-- CLI 参数顺序：base_exec_args 全局 -a 在 exec 前；base_resume_args 把 -s/-p 上提顶层；
-  CodexTurnSpec::args 追加 prompt/message。测试齐全。✓
-- sandbox/approval 映射：4 模式全覆盖，config.rs rustdoc 文档化。✓
-- feature gate external-codex off by default、无新依赖、cfg-gated re-export。✓
-- no-secret logging：Debug 脱敏 env、stderr=null、decoder 诊断固定串。✓
-- cleanup：close grace→ForcedKill、kill_on_drop、shutdown 分类；e2e 断言 Graceful。✓
-- trace：Codex 自主运行按 thread id resume，observations 不需 run/step id（刻意差异）；
-  advance 尊重 ctx.is_cancelled()。✓
-- 能力：streaming/resume/artifacts/usage/graceful=true；host_tools/host_subagents/
-  permission_bridge=false，声明工具/Respond* 拒绝；with_probed 取交。✓
-- 无缺陷：实现与测试完整、无 workaround、无 spec 偏离。review 不改代码，只更新 doc。
+SessionStarted：无独立 init 帧，从首个带 sessionID 的帧惰性发一次。
+权限：run --format json **不**输出 permission.asked（--auto 自动批准/否则自动拒绝），
+故 decoder 自主（Completed/Failed only，同 Codex），无 host-pausable 决策。
 
-## 交付
-- 更新 docs/capability-matrix.md：Codex 叙述后补 Codex live adapter 实报能力表，标 e2e 状态。
-- TODO.md M7-4 标 [DONE] + 完成记录。
+## 决策类型 OpenCodeDecision = { Completed{output}, Failed{error} }（同 Codex，无 Paused 臂）
+
+## 交付物
+1. src/agent/external/opencode/decoder.rs：OpenCodeDecodeContext / OpenCodeDecision / OpenCodeStreamDecoder
+   （push_line/take_observations/session_id；防御式 serde_json::Value 解析；私有 schema 不外泄）
+2. opencode/mod.rs：mod decoder + pub use
+3. external/mod.rs：feature-gated 追加 decoder 三型 re-export
+4. tests/agent_opencode_cassette.rs：#![cfg(feature="external-opencode")] cassette 套件
+   （regenerate/matches/secret-free/decode-full/tolerance/malformed/error 各 test）
+5. tests/fixtures/external/opencode/full_session.json：AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1 生成
+   覆盖 text/command/patch/permission/tool/subtask/completion/error
+6. 更新 fixtures README、docs/managed-external-agent.md §14、docs/capability-matrix.md
+7. TODO.md M8-2 → [DONE] + 完成记录
 
 ## 验证序列
 1. cargo fmt --all -- --check
-2. cargo clippy --all-targets -- -D warnings（feature off + --features external-codex）
-3. cargo test --features external-codex -p agent-lib codex（lib）
-4. cargo test --features external-codex -p agent-lib --test agent_codex_cassette
-5. cargo test --all --all-targets（<=30min）
-6. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features external-codex
+2. cargo test -p agent-lib --features external-opencode opencode（lib）
+3. AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1 生成 fixture，再 cargo test --features external-opencode --test agent_opencode_cassette
+4. cargo clippy --all-targets -- -D warnings（off）+ --features external-opencode
+5. cargo test --all --all-targets（off，<=30min）
+6. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features external-opencode
 7. git diff --check
 
 ## 进度
-- [x] 读 TODO/PLAN/源码，完成 review 核对
-- [x] 更新 capability-matrix.md
-- [x] 跑验证序列（fmt/clippy(off+codex)/lib codex 30/cassette 7/full suite/doc/diff 全过）
-- [x] TODO.md 标 DONE + 完成记录
-- [ ] commit
+- [x] 读 TODO/PLAN/源码/真实 opencode schema
+- [x] 写 decoder.rs
+- [x] 挂 mod + re-export
+- [x] 写 cassette test + 生成 fixture
+- [x] 更新 docs（managed-external-agent.md §14、capability-matrix.md、fixtures README）
+- [x] 跑验证序列 1-6 全过（fmt / clippy off+on / lib opencode 13 + cassette 7 / full suite / doc / diff --check）
+- [x] TODO.md M8-2 DONE + 完成记录 → commit

@@ -17,10 +17,13 @@
 //!   [`ExternalRuntimeCapabilities`](crate::agent::external::ExternalRuntimeCapabilities)
 //!   set whose every flag defaults to `false` until the help text advertises the
 //!   backing feature.
-//! - **M8-2 (later):** the private `opencode run --format json` decoder turning
-//!   raw CLI frames into sequenced
+//! - **M8-2 (this task):** the private [`opencode run --format json` decoder`](decoder)
+//!   turning raw CLI frames into sequenced
 //!   [`ExternalObservedEvent`](crate::agent::external::ExternalObservedEvent)
-//!   observations and per-turn decisions.
+//!   observations and per-turn [`OpenCodeDecision`]s. Like `codex exec --json`,
+//!   `run --format json` runs autonomously — its permission prompts are resolved
+//!   against the `--auto` launch flag rather than bridged back to the host — so a
+//!   turn only ever completes or fails.
 //! - **M8-3 (later):** the live
 //!   [`ExternalRuntimeSession`](crate::agent::external::ExternalRuntimeSession)
 //!   process management that wraps the decoder into start/resume/advance.
@@ -35,9 +38,11 @@
 //! `--version` / `--help` / `run --help`.
 
 mod config;
+mod decoder;
 mod probe;
 
 pub use config::OpenCodeConfig;
+pub use decoder::{OpenCodeDecision, OpenCodeDecodeContext, OpenCodeStreamDecoder};
 pub use probe::{
     OpenCodeProbeExec, OpenCodeProbeOutput, SystemOpenCodeExec, probe, probe_with_exec,
 };

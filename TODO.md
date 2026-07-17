@@ -2449,7 +2449,7 @@ capability model 明确降级。
   5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --features external-opencode` 通过。
   6. `git diff --check` 干净。
 
-### [TODO] M8-2 实现 OpenCode stream decoder cassette 测试
+### [DONE] M8-2 实现 OpenCode stream decoder cassette 测试
 
 **上下文**:
 
@@ -2468,6 +2468,51 @@ capability model 明确降级。
 - cassette redaction test 通过。
 - 无真实 OpenCode 依赖。
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- 新增 `src/agent/external/opencode/decoder.rs`:adapter 私有 `OpenCodeStreamDecoder` /
+  `OpenCodeDecodeContext` / `OpenCodeDecision`,把 `opencode run --format json` 逐行事件信封归一化成
+  sequenced `ExternalObservedEvent` 与 per-turn decision,私有 wire schema **不外泄**为稳定 public API
+  (镜像 Codex decoder 结构)。
+- Wire 对齐真实源码(sst/opencode `packages/opencode/src/cli/cmd/run.ts` 的 `emit()` +
+  `packages/sdk/js/src/gen/types.gen.ts`,非臆测):每行 = `{ type, timestamp, sessionID, ...data }`;`emit()`
+  只镜像 `text`(part.time.end 已置)、`reasoning`、`tool_use`(仅 state.status=completed/error)、`step_start`、
+  `step_finish`、`error` 六种;**无 init 帧/无显式完成帧**——sessionID 随每帧到达(首帧惰性捕获 → 发一次
+  `SessionStarted`),turn 结束在 json 模式不发 `session.idle`。
+- 自主运行语义(与 `codex exec --json` 同):`run --format json` 的权限提示按 `--auto` 启动开关裁决、**不回灌
+  host**(loop 内 auto-approve/auto-reject,从不镜像 `permission.asked`),故 `OpenCodeDecision` **只有**
+  `Completed{output}` / `Failed{error}` 两臂,无 host-pausable 决策臂。turn 完成 = 终结 `step_finish`
+  (`reason != "tool-calls"`;`reason == "tool-calls"` 是 agentic 续跑,容忍不决策);turn 失败 = 顶层 `error`
+  → `Failed(Runtime{ message = error.data.message ?? error.name })`。
+- 帧 → 观测映射:`text` → `TextDelta`(并记 last_message 作 summary);已结算 `tool_use` 依 `tool` 分派——
+  `bash` → `CommandStarted`+`CommandFinished`(从单帧重建,附 exit/输出),`edit`/`write`/`apply_patch` →
+  `FilePatch`,`task` 子代理与其余工具 → `ToolStarted`+`ToolFinished`;被拒权限的工具(错误串是 OpenCode 稳定
+  的 `PermissionRejectedError`/`PermissionDeniedError`/`PermissionCorrectedError` 文案)→ **信息型**
+  `PermissionRequested`(runtime 已裁决,host 无需应答);`step_finish` 跨步累加 `Usage`
+  (input/output/reasoning/cache_read/cache_write)与 `cost`(USD → `cost_micros = round(cost*1e6)`),
+  turn 结束发 `SessionCompleted`+`Completed`。`seq` 跨 turn 单调;turn 结算后 `reset_turn()` 清 last_message
+  /usage/cost,续跑 turn 只记自身产出。
+- 严格性:非法 JSON / 非对象 / 缺字符串 `type` / `text`|`tool_use`|`step_finish` 缺 `part` 对象 → `Protocol`
+  错误;`step_start`/`reasoning`/未知 type 容忍(`_ => None`)。
+- 模块接线:`opencode/mod.rs` `mod decoder;` + `pub use`;`external/mod.rs` feature-gated re-export
+  `OpenCodeDecision` / `OpenCodeDecodeContext` / `OpenCodeStreamDecoder`。
+- 离线 cassette:新增 `tests/agent_opencode_cassette.rs`(`#![cfg(feature = "external-opencode")]`,7 test)+
+  committed fixture `tests/fixtures/external/opencode/full_session.json`(2 turn:Completed turn 12 帧→12 观测、
+  usage 跨步求和 input 1200/output 210/cache 80+25/reasoning 10、cost 3000 micros;Failed turn 3 帧→1 观测 +
+  网络错误)。覆盖 decode/in-code-builder 一致性/redaction 无密钥/未知+空行容忍/畸形帧分类/error→Failed;
+  fixture 仅由 `AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1` 重生成,回放无真实 `opencode` 依赖。
+- 文档:`docs/managed-external-agent.md` §14 与 `docs/capability-matrix.md` 增补 M8-2 decoder 段(自主语义、帧
+  映射、cassette 冻结、e2e 待 M8-3);`tests/fixtures/external/opencode/README.md` 从「cassette 待 M8-2」更新为
+  cassette 已落地并说明重生成命令。
+- 验证序列 1-6 全过:
+  1. `cargo fmt --all -- --check` 通过。
+  2. `cargo clippy --all-targets -- -D warnings`(feature off)与 `--features external-opencode` 均 0 warning。
+  3. `cargo test -p agent-lib --features external-opencode --lib opencode` = 13 passed;
+     `cargo test --features external-opencode --test agent_opencode_cassette` = 7 passed;未启 feature = 0 test。
+  4. `cargo test --all --all-targets`(feature off)全部 result 块 ok,0 failed。
+  5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features external-opencode` 通过。
+  6. `git diff --check` 干净。
 
 ### [TODO] M8-3 实现 OpenCode session adapter 与 ignored real e2e
 

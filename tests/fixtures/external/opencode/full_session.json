@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "kind": "open_code",
+    "version": "0.4.0-opencode-fixture",
+    "probe": "opencode 0.4.0 (offline decoder fixture)",
+    "session_id": "ses_8b1f7a2c9d3e4f50"
+  },
+  "redaction": {
+    "applied": true,
+    "placeholder": "<redacted>",
+    "notes": "synthetic opencode run --format json; no real prompt or credential content"
+  },
+  "turns": [
+    {
+      "expect_input": "start",
+      "input_frames": [
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"id\":\"prt_0\",\"messageID\":\"msg_1\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"snapshot\":\"snap_0\",\"type\":\"step-start\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000000,\"type\":\"step_start\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"id\":\"prt_1\",\"messageID\":\"msg_1\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"text\":\"I'll update the parser.\",\"time\":{\"end\":1700000000001,\"start\":1700000000000},\"type\":\"text\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000001,\"type\":\"text\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"callID\":\"call_1\",\"id\":\"prt_2\",\"messageID\":\"msg_1\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"state\":{\"input\":{\"command\":\"cargo fmt\"},\"metadata\":{\"exit\":0,\"output\":\"formatted 3 files\"},\"output\":\"formatted 3 files\",\"status\":\"completed\",\"time\":{\"end\":1700000000002,\"start\":1700000000001},\"title\":\"cargo fmt\"},\"tool\":\"bash\",\"type\":\"tool\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000002,\"type\":\"tool_use\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"callID\":\"call_2\",\"id\":\"prt_3\",\"messageID\":\"msg_1\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"state\":{\"input\":{\"filePath\":\"src/parser.rs\"},\"metadata\":{\"diff\":\"@@ parser @@\"},\"output\":\"\",\"status\":\"completed\",\"time\":{\"end\":1700000000003,\"start\":1700000000002},\"title\":\"src/parser.rs\"},\"tool\":\"edit\",\"type\":\"tool\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000003,\"type\":\"tool_use\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"callID\":\"call_3\",\"id\":\"prt_4\",\"messageID\":\"msg_1\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"state\":{\"input\":{\"pattern\":\"parser\"},\"metadata\":{},\"output\":\"3 matches\",\"status\":\"completed\",\"time\":{\"end\":1700000000004,\"start\":1700000000003},\"title\":\"grep\"},\"tool\":\"grep\",\"type\":\"tool\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000004,\"type\":\"tool_use\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"cost\":0.001,\"id\":\"prt_5\",\"messageID\":\"msg_1\",\"reason\":\"tool-calls\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"snapshot\":\"snap_1\",\"tokens\":{\"cache\":{\"read\":50,\"write\":20},\"input\":800,\"output\":120,\"reasoning\":0},\"type\":\"step-finish\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000005,\"type\":\"step_finish\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"id\":\"prt_6\",\"messageID\":\"msg_1\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"snapshot\":\"snap_1\",\"type\":\"step-start\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000006,\"type\":\"step_start\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"callID\":\"call_4\",\"id\":\"prt_7\",\"messageID\":\"msg_1\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"state\":{\"input\":{\"description\":\"review parser\",\"prompt\":\"Review the parser changes.\",\"subagent_type\":\"reviewer\"},\"metadata\":{\"subagent_type\":\"reviewer\"},\"output\":\"looks good\",\"status\":\"completed\",\"time\":{\"end\":1700000000007,\"start\":1700000000006},\"title\":\"review parser\"},\"tool\":\"task\",\"type\":\"tool\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000007,\"type\":\"tool_use\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"callID\":\"call_5\",\"id\":\"prt_8\",\"messageID\":\"msg_1\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"state\":{\"error\":\"The user rejected permission to use this specific tool call.\",\"input\":{\"command\":\"git commit -am wip\"},\"metadata\":{},\"status\":\"error\",\"time\":{\"end\":1700000000008,\"start\":1700000000007}},\"tool\":\"bash\",\"type\":\"tool\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000008,\"type\":\"tool_use\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"id\":\"prt_9\",\"messageID\":\"msg_1\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"text\":\"Refactored the parser and ran a review.\",\"time\":{\"end\":1700000000009,\"start\":1700000000008},\"type\":\"text\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000009,\"type\":\"text\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"cost\":0.002,\"id\":\"prt_10\",\"messageID\":\"msg_1\",\"reason\":\"stop\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"snapshot\":\"snap_2\",\"tokens\":{\"cache\":{\"read\":30,\"write\":5},\"input\":400,\"output\":90,\"reasoning\":10},\"type\":\"step-finish\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000010,\"type\":\"step_finish\"}"
+        }
+      ],
+      "expected_events": [
+        {
+          "seq": 0,
+          "event": {
+            "session_started": {
+              "session_id": "ses_8b1f7a2c9d3e4f50"
+            }
+          }
+        },
+        {
+          "seq": 1,
+          "event": {
+            "text_delta": {
+              "text": "I'll update the parser."
+            }
+          }
+        },
+        {
+          "seq": 2,
+          "event": {
+            "command_started": {
+              "command": "cargo fmt",
+              "cwd": "/repo/agent-lib"
+            }
+          }
+        },
+        {
+          "seq": 3,
+          "event": {
+            "command_finished": {
+              "exit_code": 0,
+              "stdout_tail": "formatted 3 files",
+              "stderr_tail": ""
+            }
+          }
+        },
+        {
+          "seq": 4,
+          "event": {
+            "file_patch": {
+              "path": "src/parser.rs",
+              "summary": "edit src/parser.rs"
+            }
+          }
+        },
+        {
+          "seq": 5,
+          "event": {
+            "tool_started": {
+              "name": "grep"
+            }
+          }
+        },
+        {
+          "seq": 6,
+          "event": {
+            "tool_finished": {
+              "name": "grep",
+              "status": "ok"
+            }
+          }
+        },
+        {
+          "seq": 7,
+          "event": {
+            "tool_started": {
+              "name": "task"
+            }
+          }
+        },
+        {
+          "seq": 8,
+          "event": {
+            "tool_finished": {
+              "name": "task",
+              "status": "ok"
+            }
+          }
+        },
+        {
+          "seq": 9,
+          "event": {
+            "permission_requested": {
+              "action_id": "call_5",
+              "summary": "`bash` (rejected by permission policy)"
+            }
+          }
+        },
+        {
+          "seq": 10,
+          "event": {
+            "text_delta": {
+              "text": "Refactored the parser and ran a review."
+            }
+          }
+        },
+        {
+          "seq": 11,
+          "event": "session_completed"
+        }
+      ],
+      "decision": {
+        "kind": "completed",
+        "output": {
+          "summary": "Refactored the parser and ran a review.",
+          "artifacts": [],
+          "usage": {
+            "input": 1200,
+            "output": 210,
+            "cache_read": 80,
+            "cache_write": 25,
+            "reasoning": 10
+          },
+          "cost_micros": 3000
+        }
+      }
+    },
+    {
+      "expect_input": "continue",
+      "input_frames": [
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"id\":\"prt_20\",\"messageID\":\"msg_2\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"snapshot\":\"snap_3\",\"type\":\"step-start\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000020,\"type\":\"step_start\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"part\":{\"id\":\"prt_21\",\"messageID\":\"msg_2\",\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"text\":\"I cannot reach the network.\",\"time\":{\"end\":1700000000021,\"start\":1700000000020},\"type\":\"text\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000021,\"type\":\"text\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"error\":{\"data\":{\"message\":\"model request failed: network unreachable\"},\"name\":\"ProviderError\"},\"sessionID\":\"ses_8b1f7a2c9d3e4f50\",\"timestamp\":1700000000022,\"type\":\"error\"}"
+        }
+      ],
+      "expected_events": [
+        {
+          "seq": 12,
+          "event": {
+            "text_delta": {
+              "text": "I cannot reach the network."
+            }
+          }
+        }
+      ],
+      "decision": {
+        "kind": "failed",
+        "error": {
+          "runtime": {
+            "message": "model request failed: network unreachable"
+          }
+        }
+      }
+    }
+  ]
+}
