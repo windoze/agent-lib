@@ -1,93 +1,42 @@
-# M5-3 增加 cassette replay 层用于 runtime parser 回归
+# M5-4 Review：runtime abstraction 与离线 e2e 完整性检查
 
-**当前执行 = TODO.md 第一个未完成任务 = M5-3**（M1..M4、M5-1、M5-2 均 `[DONE]`）。
+**当前执行 = TODO.md 第一个未完成任务 = M5-4**（M1..M4、M5-1、M5-2、M5-3 均 `[DONE]`）。
 
 ## 任务理解
-runtime adapter parser（M6-M8 才实现）会消费真实 CLI 的 JSON/JSONL 输出，需要
-cassette 冻结「原始帧 → 解析出的 ExternalObservedEvent + decision point」以防协议漂移。
-这是一个**独立于 M3 effect-level cassette** 的新概念（runtime parser cassette）。
+M5-4 是**审查任务**（review），是真实 adapter（M6-M8）前的边界冻结点。
+目的是确认后续 Claude/Codex/OpenCode 只需在 adapter 层填 parser + process 管理，
+不需要改 machine/driver。这是真实任务，不能跳过。
 
 ## 目标（TODO.md 做什么）
-1. 定义 cassette 格式：runtime kind/version/probe、input frames、expected
-   ExternalObservedEvent + decision point、redaction metadata。
-2. cassette loader/parser test helper（磁盘加载 + schema 版本护栏 + 未知字段保守保留）。
-3. 最小 synthetic cassette 覆盖：text delta / command start-finish / permission request /
-   tool call / completion。
-4. 预留目录：tests/fixtures/external/{claude_code,codex,opencode}/（暂不需真实 cassette）。
+1. 检查 `ExternalSessionHandler` 生产路径是否只组合 registry + adapter，不含 machine 状态逻辑。
+2. 检查 scripted tests 是否覆盖：tool / interaction / subagent / mixed tool+subagent /
+   observations live sink + buffered replay / cancel cleanup。
+3. 检查 cassette schema 是否文档化并脱敏。
+4. 更新 `docs/managed-external-agent.md` runtime adapter 章节的实现状态。
 
 ## 验证条件
-- loader 对未知字段保守：raw 保留（#[serde(flatten)] extra）并测试。
-- redaction test 确认 fixture 不含 API_KEY / AUTH_TOKEN / sk- 等。
+- `cargo test -p agent-lib scripted_external`
 - `cargo test -p agent-lib external_cassette`
 - 完整验证序列 1-6 全过。
+- 完成记录中列出真实 adapter 必须实现的 trait 方法和错误映射。
 
-## 设计
-### 新模块 crates/agent-testkit/src/external/cassette.rs
-Schema（serde）:
-- `EXTERNAL_CASSETTE_SCHEMA_VERSION: u32 = 1`
-- `ExternalRuntimeCassette { schema_version, runtime: CassetteRuntimeInfo, redaction:
-  RedactionMetadata(default), turns: Vec<CassetteTurn>(default), #[flatten] extra }`
-- `CassetteRuntimeInfo { kind: ExternalRuntimeKind, version?, probe?, session_id?, #[flatten] extra }`
-- `RedactionMetadata { applied(default false), placeholder?, notes? }`
-- `CassetteTurn { expect_input?: CassetteInputKind, input_frames: Vec<CassetteFrame>(default),
-  expected_events: Vec<ExternalObservedEvent>(default), decision: CassetteDecision, #[flatten] extra }`
-- `CassetteFrame { stream: CassetteStream(default Stdout), payload: String, #[flatten] extra }`
-- `CassetteStream { Stdout, Stderr }`（snake_case）
-- `CassetteInputKind { Start, Continue, RespondInteraction, RespondToolResults, RespondSubagent,
-  Shutdown }`（snake_case）+ matches(&ExternalSessionInput) + expected(): assertions::ExternalInputKind
-- `CassetteDecision`（tag="kind", snake_case）{ Completed{output}, PausedForInteraction{action_id,request},
-  PausedForToolCalls{batch_id,calls}, PausedForSubagent{request}, Failed{error} }
+## 执行计划
+1. [进行中] 读 runtime.rs（ExternalRuntimeAdapter/Session/Registry + Handler 生产路径）。
+2. 读 scripted tests + cassette 测试，逐项核对 6 类覆盖；缺口需补测试。
+3. 读 cassette.rs 与 fixtures，确认 schema 文档化 + redaction。
+4. 更新 docs/managed-external-agent.md runtime adapter 章节实现状态。
+5. 验证序列 1-6。
+6. TODO.md 标 [DONE] + 完成记录（含真实 adapter 必须实现的 trait 方法 + 错误映射清单）。
+7. 提交 `[M5-4] ...` 并停止。
 
-Loader / error（手写 Display/Error，仿 M3，testkit 无 thiserror）:
-- `ExternalRuntimeCassette::{from_json_str, load(path), to_json_string[_pretty]}`；schema_version 先读后 parse。
-- `ExternalCassetteError { Serialize, Deserialize, Io{path,err}, MissingSchemaVersion, UnsupportedSchemaVersion{found,supported} }`
-
-Redaction:
-- `SECRET_PATTERNS`（含 API_KEY / AUTH_TOKEN / sk- / Bearer  / -----BEGIN）
-- `scan_secrets(&str) -> Vec<SecretHit{pattern,offset}>`
-- `ExternalRuntimeCassette::assert_no_secrets()`（序列化后扫描，命中则 panic 列出）
-
-Replay 层（复用 M5-1 registry + M5-2 ScriptedSinkLog/ScriptedRuntimeStartLog + ExternalAgentCallLog）:
-- `CassetteExternalRuntimeSession`(impl ExternalRuntimeSession)：VecDeque<CassetteTurn>；advance
-  弹一 turn、断言 expect_input、**按记录 seq 原样** emit expected_events 到 sink 且缓冲为
-  observations、last_event_seq = max seq、由 CassetteDecision 生成 RuntimeDecisionPoint（Failed->Err）。
-- `CassetteExternalRuntimeAdapter`(impl ExternalRuntimeAdapter)：capabilities.resume=false，start 领 turns、记 start log。
-- `CassetteRuntimeExternalSessionHandler`(impl ExternalSessionHandler)：registry-backed，同 scripted 形状。
-- `CassetteRuntimePlayer::load(cassette) -> handler`（+ log/sink/start_log/registry 访问器）。
-
-### fixtures
-- `tests/fixtures/external/synthetic/full_stream.json`：单 turn Start→Completed，observations 覆盖
-  text_delta/command_started/command_finished/permission_requested/tool_started/tool_finished/session_completed；
-  drain 到 Done 无需 tool/interaction handler。由 env-gated 生成器写出后提交。
-- `tests/fixtures/external/synthetic/forward_compat.json`：含未知顶层/turn/frame 字段，测保守保留。
-- `tests/fixtures/external/{claude_code,codex,opencode}/README.md`：预留目录。
-
-### 测试
-- `tests/agent_external_cassette.rs`：`external_cassette_*`
-  - loads_synthetic_fixture（磁盘加载 + 字段断言）
-  - replay_drains_to_done（加载 full_stream → drain → Done + sink seq）
-  - replay_tool_batch / interaction / subagent（in-code 造 cassette，JSON round-trip 后 drain）
-  - rejects_unknown_schema_version / preserves_unknown_fields（forward_compat）
-  - fixtures_are_redacted（扫描磁盘所有 synthetic fixture 原文 + assert_no_secrets）
-  - regenerate_fixtures（env-gated 生成器，正常 no-op）
-- cassette.rs 内 `#[cfg(test)]` 单测若干（cassette_* 前缀，走 -p agent-testkit）。
-
-### 导出
-- external/mod.rs `pub mod cassette;` + re-export；prelude.rs 追加导出。
-
-## 验证序列（TODO.md 1-6）
-1. `cargo fmt --all -- --check`
-2. `cargo test -p agent-lib external_cassette`
-3. `cargo clippy --all-targets -- -D warnings`
-4. `cargo test --all --all-targets`（有代码改动，≤30min）
-5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
-6. `git diff --check`
+## 状态：调查中
 
 ## 状态：完成
-- [x] 实现 cassette.rs（schema/loader/redaction/replay）
-- [x] 生成并提交 synthetic fixtures + 预留目录
-- [x] 新增 tests/agent_external_cassette.rs（9 个 external_cassette_*）
-- [x] mod/prelude 导出 + ScriptedRuntimeStartLog::record 提 pub(crate)
-- [x] 验证序列 1-6 全过（fmt/focus 9passed/clippy/full-suite 40 ok 0 failed/doc/diff-check clean）
-- [x] 标记 [DONE] + 完成记录写入 TODO.md
-- [ ] 提交 `[M5-3] ...`（本轮最后一步）
+- [x] 核对 handler = registry+adapter，无 machine 状态（runtime.rs/cassette.rs/registry.rs）
+- [x] 覆盖核对：tool/interaction/subagent/live-sink/buffered-replay/cancel-cleanup 已覆盖
+- [x] 补缺口测试 scripted_external_mixed_tool_and_subagent_round_trip（唯一缺口）
+- [x] 核对 cassette schema 文档化 + 脱敏（scan_secrets/assert_no_secrets/fixtures_are_redacted）
+- [x] 更新 docs/managed-external-agent.md（§1 能力表 + §11.4 实现状态 + trait/错误映射）
+- [x] 验证序列 1-6 全过（fmt / scripted 5 / cassette 9 / clippy / 全量 40 binary 0 failed / doc / diff-check）
+- [x] TODO.md 标 [DONE] + 完成记录（含真实 adapter trait 方法 + 错误映射清单）
+- [ ] 提交 `[M5-4] ...`（本轮最后一步）

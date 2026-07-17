@@ -30,6 +30,9 @@
 //! - subagent round-trip — a `PausedForSubagent` becomes a host `NeedSubagent`,
 //!   whose driven child relays back as a `RespondSubagent` that completes the
 //!   session.
+//! - mixed tool + subagent — one live session pauses first for a host tool batch
+//!   and then for a host subagent across three advances; both bridges reattach
+//!   the same live handle (no restart) before the session completes.
 //!
 //! Run in isolation with `cargo test --test agent_external_scripted`, or filter
 //! with `cargo test scripted_external`.
@@ -307,6 +310,119 @@ async fn scripted_external_subagent_round_trip() {
 
     // The child ran to completion (one resume: its own answered interaction), and
     // the handler drove exactly one child.
+    assert_eq!(
+        child_log.resume_tags(),
+        vec![RequirementKindTag::Interaction]
+    );
+    assert_eq!(spawner.spawn_calls(), 1);
+
+    let machine = harness.into_machine();
+    assert_conversation(machine.state().conversation())
+        .committed_turns(1)
+        .pending_none()
+        .last_assistant_text("refactor complete");
+}
+
+/// One live session pauses first for a host tool batch and then for a host
+/// subagent before completing. Both bridges reattach the same live handle across
+/// three advances (`Start → PausedForToolCalls`, `RespondToolResults →
+/// PausedForSubagent`, `RespondSubagent → Completed`) without ever restarting the
+/// session, proving the milestone-5 registry keeps one live handle across
+/// interleaved tool and subagent phases.
+#[tokio::test]
+async fn scripted_external_mixed_tool_and_subagent_round_trip() {
+    let ids = SeqIds::new();
+    let ctx = root_context(&ids);
+    let fixture = ExternalAgentFixture::new(&ids);
+    let machine = fixture.machine_with_tool_ids();
+
+    // Child: emits one NeedInteraction its own attended scope answers in place,
+    // so it never pops to the parent and runs to completion.
+    let child_machine = ScriptMachine::builder()
+        .requirement(Requirement::at_root(
+            ids.requirement_id(),
+            RequirementKind::NeedInteraction {
+                request: Interaction::question(ids.step_id(), "child needs a human".to_owned()),
+            },
+        ))
+        .done_after_all_resumed()
+        .label("child")
+        .build();
+    let child_log = Arc::clone(child_machine.log());
+    let child_interaction = Arc::new(ScriptedInteractionHandler::fixed(
+        InteractionDecision::Answer("done".to_owned()),
+    ));
+    let child = SpawnedChildBuilder::new()
+        .machine(child_machine)
+        .scope(attended_child_scope(child_interaction).build())
+        .opening(user_input(&ids, "open child"))
+        .build();
+
+    let spawner = Arc::new(
+        ScriptedSubagentSpawner::builder(ids.clone())
+            .child(child)
+            .summary("child summary")
+            .build(),
+    );
+    let subagent = Arc::clone(&spawner).into_handler(4);
+
+    let handler = ScriptedRuntimeBuilder::new()
+        .advance(
+            ScriptedAdvance::paused_for_tool_calls(
+                fixture.tool_batch_id(),
+                vec![fixture.tool_call("call-a", "apply_patch")],
+            )
+            .expecting(ExternalInputKind::Start)
+            .emitting([fixture.command_finished_event()]),
+        )
+        .advance(
+            ScriptedAdvance::paused_for_subagent(fixture.subagent_request("spawn-1"))
+                .expecting(ExternalInputKind::RespondToolResults),
+        )
+        .advance(
+            ScriptedAdvance::completed(fixture.output("refactor complete"))
+                .expecting(ExternalInputKind::RespondSubagent),
+        )
+        .build();
+    let external_log = Arc::clone(handler.log());
+    let start_log = handler.start_log().clone();
+
+    let tool = ScriptedToolHandler::from_steps([ToolStep::ok("call-a", "patch applied")]);
+    let tool_log = Arc::clone(tool.log());
+
+    let scope = TestScope::builder()
+        .external(Arc::new(handler))
+        .tool(Arc::new(tool))
+        .subagent(Arc::new(subagent))
+        .build();
+
+    let mut harness = DrainHarness::with_ids(machine, &scope, None, &ctx, ids);
+    let observed = harness
+        .run_user("refactor the parser and investigate the flaky test")
+        .await
+        .expect("the mixed tool + subagent round-trip drains to completion");
+
+    assert_eq!(observed.final_cursor().kind(), LoopCursorKind::Done);
+
+    // A single fresh session serviced all three advances: neither the tool nor
+    // the subagent reattach restarts the live handle.
+    assert_eq!(start_log.len(), 1);
+    assert_external_calls(&external_log)
+        .count(3)
+        .all_completed()
+        .input_kinds(&[
+            ExternalInputKind::Start,
+            ExternalInputKind::RespondToolResults,
+            ExternalInputKind::RespondSubagent,
+        ])
+        .result_kinds(&[
+            ExternalResultKind::PausedForToolCalls,
+            ExternalResultKind::PausedForSubagent,
+            ExternalResultKind::Completed,
+        ]);
+
+    // The bridged tool call ran once, and the handler drove exactly one child.
+    assert_eq!(tool_log.records().len(), 1);
     assert_eq!(
         child_log.resume_tags(),
         vec![RequirementKindTag::Interaction]

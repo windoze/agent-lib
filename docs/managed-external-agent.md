@@ -54,12 +54,13 @@ scope wiring 决定 attended / headless 行为。
 | artifact refs 记录到 `ExternalAgentState` | 已实现 |
 | cancel / abandon 标记 `cleanup_required` | 已实现 |
 | 作为 subagent child 被 `DrivingSubagentHandler` 驱动 | 已实现 |
-| 真实 Claude Code / Codex / OpenCode runtime adapter | 未实现 |
-| external runtime 发起 host tool call | machine 已实现(runtime handler 待实现) |
-| external runtime 发起 host subagent | machine 已实现(runtime handler 待实现) |
-| 长生命周期 session registry / process handles | 未实现 |
-| structured streaming live sink + replay sequence | 部分实现(sink 已 sequenced,`ExternalStreamPolicy` 选择/runtime 接线待实现) |
-| cassette replay 真实 external session | 未实现 |
+| runtime adapter 抽象(`ExternalRuntimeAdapter` / `ExternalRuntimeSession`) | 已实现(离线 scripted/cassette 替身;真实 CLI adapter 待 M6-M8) |
+| 真实 Claude Code / Codex / OpenCode runtime adapter | 未实现(待 M6-M8) |
+| external runtime 发起 host tool call | machine + scripted runtime handler 已实现(真实 adapter 待实现) |
+| external runtime 发起 host subagent | machine + scripted runtime handler 已实现(真实 adapter 待实现) |
+| 长生命周期 session registry / process handles | `ExternalSessionRegistry`(start/reattach/resume/cleanup)已实现;真实 process handle 待 M6-M8 |
+| structured streaming live sink + replay sequence | 已实现(sink 已 sequenced + buffered replay dedup;`ExternalStreamPolicy` 选择/真实 runtime 接线待实现) |
+| cassette replay 真实 external session | runtime-parser cassette 回放层已实现(synthetic fixtures);真实 Claude/Codex/OpenCode cassette 待 M6-M8 |
 
 也就是说,当前实现证明了“外部 agent 可作为一个 effect-driven machine 挂进系统”;但它还没有达到
 内部 agent 的能力 parity。本文设计补齐这一层。
@@ -808,6 +809,58 @@ CLI adapter 通用需求:
 - cancellation watcher。
 - graceful shutdown timeout。
 - forced kill fallback。
+
+### 11.4 实现状态（M5，已落地）
+
+Milestone 5（TODO `M5-1`..`M5-3`）冻结了 runtime abstraction 边界。真实
+Claude/Codex/OpenCode adapter（M6-M8）只需在 adapter 层填 parser + process 管理，
+**不需要改 `ExternalAgentMachine` / driver**。已落地的形状与上面草案略有出入，以实际代码为准：
+
+**已落地的 trait / 类型**（`src/agent/external/adapter.rs`、`registry.rs`）：
+
+- `ExternalRuntimeAdapter`（per-runtime 工厂，`Send + Sync`）：
+  - `fn kind(&self) -> ExternalRuntimeKind`
+  - `fn capabilities(&self) -> ExternalRuntimeCapabilities`（保守基线 `none()`，probe 确认后逐项开启）
+  - `async fn start(&self, request, ctx, sink) -> Result<Box<dyn ExternalRuntimeSession>, ExternalAgentError>`
+  - `async fn resume(&self, session, request, ctx, sink) -> Result<Box<dyn ExternalRuntimeSession>, ExternalAgentError>`
+    （默认返回 `ResumeUnavailable`；仅 `capabilities().resume` 的 adapter override）
+- `ExternalRuntimeSession`（单个 live session，`Send`）：
+  - `fn session_ref(&self) -> ExternalSessionRef`（start/resume 后必须带 `session_id` 供 registry keying）
+  - `async fn advance(&mut self, input: &ExternalSessionInput, ctx) -> Result<RuntimeDecisionPoint, ExternalAgentError>`
+    （驱动到**下一个** decision point，禁止一次阻塞跑到底）
+  - `async fn shutdown(&mut self) -> ExternalSessionShutdown`
+- `ExternalSessionRegistry`（**具体 struct**，非 trait；不进 `ExternalAgentState`）：
+  - `get_or_start(request, ctx, sink)`：`session=None` → `start`；已注册 → reattach live handle；未注册且 `resume`
+    支持 → `resume`；否则 `ResumeUnavailable`。
+  - `cleanup(agent_id, session)` / `cleanup_agent(agent_id)`：cancel/drop 清扫，返回 `ExternalSessionShutdown`。
+  - `get` / `live_len` / `kind` / `capabilities`。
+- `RuntimeDecisionPoint`（`advance` 的成功返回）五路：`Completed` / `PausedForInteraction` /
+  `PausedForToolCalls` / `PausedForSubagent`，外加 `Err` → machine 折成 `ExternalSessionResult::Failed`。每路都带
+  buffered `observations`（machine 按 `seq` dedup 后转 `Notification::ExternalAgent`）。
+
+**真实 adapter 必须实现的错误映射**（`ExternalAgentError` 分类，禁止 ad-hoc error / panic）：
+
+- `Launch { runtime, detail }`：CLI/SDK 启动失败。
+- `Protocol { .. }`：wire schema 漂移 / 缺 `session_id` 等协议违例。
+- `SessionLost { session, .. }`：live session 中途丢失。
+- `ResumeUnavailable { session, detail }`：无 live handle 且不支持 resume。
+- `ShutdownFailed { session, .. }`：关闭失败。
+- `LimitExceeded { limit }`：max_turns / budget 触顶。
+- `UnsupportedCapability { .. }`：请求了 capability 未开启的功能。
+- `Runtime { code, message }`：其他运行期错误兜底。
+
+**生产 handler 组合**：production `ExternalSessionHandler` 只组合 `registry + adapter`，
+**不持有 machine 状态**（每次 `fulfill` 走 `registry.get_or_start` → `session.advance` → 折成
+`RequirementResult::ExternalSession`）。离线替身 `ScriptedRuntimeExternalSessionHandler`
+（`crates/agent-testkit/src/external/runtime.rs`）与 cassette `CassetteRuntimeExternalSessionHandler`
+（`.../external/cassette.rs`）都是这个形状，驱动整条 managed loop（start / tool batch / interaction /
+subagent / mixed tool+subagent）离线跑通，证明边界无需改 machine。
+
+**runtime-parser cassette 层**（`.../external/cassette.rs`，schema version 1）：冻结「原始帧 → sequenced
+observations + decision point」，未知字段 `#[serde(flatten)]` 保守保留可 round-trip；`scan_secrets` /
+`assert_no_secrets` + `external_cassette_fixtures_are_redacted` 保证 fixture 脱敏（`API_KEY` / `AUTH_TOKEN`
+/ `sk-` / `-----BEGIN` 等）。synthetic fixtures 在 `tests/fixtures/external/synthetic/`；
+`tests/fixtures/external/{claude_code,codex,opencode}/` 目录已预留，真实录制待 M6-M8。
 
 ## 12. Claude Code adapter
 
