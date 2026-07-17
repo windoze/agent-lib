@@ -10,6 +10,10 @@
 `OpenAiRespAdapter` 的 `LlmClient::capability()` 分别返回对应默认表项。当前没有运行时
 能力探测；部署、模型或 API 版本有差异时，调用方应克隆默认值并应用自己的覆盖。
 
+除 LLM wire protocol 外，本文末尾另有一节
+[Managed External Runtime 能力模型](#managed-external-runtime-能力模型)，描述受管外部 agent
+（`ExternalAgentMachine`）所用的、与上述互不相同的 `ExternalCapability` 模型及其保守默认。
+
 ## 协议级默认值
 
 | `Capability` 字段 | Anthropic Messages 默认值 | OpenAI Responses 默认值 |
@@ -77,3 +81,91 @@ fixture，通过公开的 adapter 解析 API 做以下断言：
 
 因此，归一化字段可供跨 provider 逻辑直接使用，调用方同时仍能检查具体 endpoint 的
 方言证据；新增 provider 字段不会因为当前模型尚未认识它们而静默丢失。
+
+## Managed External Runtime 能力模型
+
+上面两节描述的是 **LLM wire protocol** 的 `Capability`（`agent-lib` 直接说 provider API 时的
+默认能力）。受管外部 agent（`ExternalAgentMachine` 驱动 Claude Code / Codex / OpenCode 等
+CLI/进程 runtime）用的是另一套、互不相同的能力模型：它回答的不是「某个 model 支持什么
+modality」，而是「某个具体 runtime session 能否兑现某个受管特性」——实时流式、会话
+resume、host 工具注入、subagent 桥接等。这套模型的唯一代码来源是
+[`src/agent/external/capability.rs`](../src/agent/external/capability.rs) 的
+`ExternalCapability` 与 `ExternalRuntimeCapabilities`。
+
+**保守基线（关键约束）**：受管 runtime 从不假设支持任何特性。
+`ExternalRuntimeKind::conservative_capabilities()` /
+`ExternalRuntimeCapabilities::none(runtime)` 把每个特性都置为 `false`；只有真实探测或 adapter
+声明才会逐字段打开（design §15，PLAN 非目标「能力差异通过 capability model 显式暴露，不能
+静默假装支持」）。**当前 crate 尚未接入任何真实 runtime 探测或 adapter，因此下表所有 runtime
+的每一项都保持 `unsupported`，本文不声称任何已验证的 runtime 支持。**
+
+### 受管能力清单（`ExternalCapability`，共 8 项）
+
+| `ExternalCapability` | serde 标签 | 覆盖的决策点 / 旁路 | 保守默认 |
+|---|---|---|---|
+| `Streaming` | `streaming` | 把细粒度事件转发给 live [`ExternalEventSink`](../src/agent/external/sink.rs) | `false` |
+| `Resume` | `resume` | 用存储的 session ref/token 续跑既有会话 | `false` |
+| `PermissionBridge` | `permission_bridge` | 把 runtime 权限/交互 pause 桥成 host approval | `false` |
+| `HostTools` | `host_tools` | 注入 host 提供、runtime 可调用的工具 | `false` |
+| `HostSubagents` | `host_subagents` | 把 runtime spawn 请求桥成 host 管理的 subagent | `false` |
+| `Artifacts` | `artifacts` | 把产出的 artifact（patch/文件）回报给 host | `false` |
+| `Usage` | `usage` | 回报 token/cost usage 供 budget charging | `false` |
+| `GracefulShutdown` | `graceful_shutdown` | 无残留副作用地干净关闭会话 | `false` |
+
+`ExternalCapability::ALL` 固定按上表顺序穷举全部 8 项，供能力矩阵与 round-trip 断言使用；
+新增能力只需扩展该数组即被自动覆盖。`ExternalRuntimeCapabilities` 为每一项持有同名 `bool`
+字段，`supports(cap)` 逐项映射，`none(runtime)` 为全 `false` 的保守起点。
+
+### 各 runtime 当前声明（全部保守 = 未验证）
+
+| 受管能力 | Claude Code | Codex | OpenCode | Custom |
+|---|---|---|---|---|
+| streaming | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） |
+| resume | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） |
+| permission_bridge | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） |
+| host_tools | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） |
+| host_subagents | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） |
+| artifacts | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） |
+| usage | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） |
+| graceful_shutdown | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） | 未验证（`false`） |
+
+「未验证」= 保守基线返回 `false`，尚无探测/adapter 覆盖；这是待填表，接入真实 runtime
+adapter（里程碑 5-8）后才逐项翻真并注明验证来源。**不要把此表当成任一 runtime 的服务等级
+承诺。**
+
+### 能力缺失时的 fallback 策略
+
+`ExternalAgentMachine` 遇到某个 runtime 无法兑现的决策点时不静默降级，而是按下述策略明确
+处置（源码：[`machine.rs`](../src/agent/external/machine.rs)、
+[`config.rs`](../src/agent/external/config.rs)）：
+
+- **声明为 required 的能力缺失** → 分类错误
+  `ExternalAgentError::UnsupportedCapability { runtime, capability, detail }`。
+  运行方通过 `ExternalAgentMachineConfig::require_host_tools()` /
+  `require_subagents()` / `require_capability(cap)` 声明本次 run 依赖的能力；缺失时错误显式
+  命名 runtime 与 capability，scheduler 据此避免再次 dispatch 该 worker。
+- **未声明 required 的能力缺失** → 保留原通用错误（例如缺 tool-call id 源时的
+  `tool id unavailable`），与 pre-M4-3 行为兼容，不升级为能力分类错误。
+- **host 工具调用失败** → 由 `ExternalToolFailurePolicy` 决定：`ReturnErrorToRuntime`（默认，把
+  失败当作 failed tool result 回灌，runtime 自主决定后续）或 `StopRun`（停止 host turn）。
+- **decision loop 超限** → 若配置了 `ExternalAgentMachineConfig::max_decision_loops`，超过即
+  `ExternalAgentError::LimitExceeded`，防止无界 pause/respond 循环。
+- **streaming 旁路** → 由 `ExternalStreamPolicy::{Buffered(默认)/Streaming/Disabled}` 控制。
+  live sink 是**可丢弃**旁路：它绝不阻塞 continuation，可自由丢事件；exact-once 回放由
+  `ExternalSessionResult::observations` 按 `seq` 去重独家保证，sink 只是这条权威流的 lossy
+  实时镜像，永不替代它。
+
+### 职责边界：runtime-facing policy vs machine-local config
+
+受管配置刻意分成两半，二者不重叠：
+
+- **`ExternalSessionPolicy`（runtime-facing）**：随每个 `ExternalSessionRequest` 传给 handler，
+  作为转发给底层 runtime 的 hint——`permission_mode`、`isolation`（worktree）、`max_turns`
+  （runtime 侧回合上限）、`stream_events`。它描述「希望 runtime 怎么跑」。
+- **`ExternalAgentMachineConfig`（machine-local）**：只由 machine 自己在把 runtime pause 桥成 host
+  requirement 时强制执行——`tool_failure`、`required_capabilities`、`max_decision_loops`
+  （machine 侧决策循环上限，区别于 runtime 侧 `max_turns`）。它是纯数据 serde DTO，不含任何
+  live handler / sink / id 源，因此**不进入**可序列化的 `ExternalAgentState`，与 live 身份源
+  （`RequirementIds` / `ToolExecutionIds`）各自通过 builder 注入而互不污染。
+
+两者的 `Default` 都刻意保守/宽松：不显式配置时 machine 行为与引入该配置前完全一致。
