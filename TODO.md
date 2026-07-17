@@ -1768,7 +1768,7 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
 不改底层状态机语义；每个注入口有保持现有保守行为的默认值（不注入时行为与 M1–M6 完全一致）；**本 milestone 不实现
 任何 AI 决策逻辑，只开放注入口**。
 
-### [TODO] M7-1 `AgentBuilder::interaction_handler(..)` 注入自定义 async interaction handler
+### [DONE] M7-1 `AgentBuilder::interaction_handler(..)` 注入自定义 async interaction handler
 
 **上下文**：
 
@@ -1799,6 +1799,42 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
   两条路径都覆盖；未注入 handler 时行为与既有 M2 测试一致。
 - 聚焦：`cargo test -p agent-lib facade::agent`（含新 interaction handler 注入用例）。
 - 完整验证序列 1–6。
+
+**完成记录**：
+
+- 实现（Option A：只替换 InteractionHandler 角色，机器 gate 仍为 `FacadeApproval`）：
+  - `AgentBuilder` 新增字段 `interaction_handler: Option<Arc<dyn InteractionHandler>>` 与构造方法
+    `interaction_handler(self, handler) -> Self`（`src/facade/agent.rs`）；`Agent` 新增同名字段 +
+    私有解析器 `fn interaction_handler(&self) -> Arc<dyn InteractionHandler>`（注入优先，未注入回退
+    `self.approval.clone()`，`Arc<FacadeApproval>` unsize 到 `Arc<dyn InteractionHandler>`）。
+  - 同步路径 `FacadeAgentScope.interaction` 字段类型改为 `Arc<dyn InteractionHandler>`，接线为
+    `self.interaction_handler()`。
+  - 流式路径 `TapInteractionHandler` 拆成 `approval: Arc<FacadeApproval>`（仅用于 `pending_tool_name`
+    peek 标注 `ApprovalRequested`）+ `inner: Arc<dyn InteractionHandler>`（被 delegate 的 handler），
+    保留「先 emit 再 delegate」结构（`src/facade/agent/stream.rs`）。
+  - restore 路径构造 `Agent { .. interaction_handler: None }`（快照是 data-only，运行期句柄由调用方在
+    rebuild 时重注，回退保守 M2 行为，`src/facade/agent/snapshot.rs`）。
+  - `Agent`/`AgentBuilder` 的 Debug 各加 `has_interaction_handler`（不泄漏句柄）。
+- 优先级与取舍已写进 rustdoc：注入 handler 时它是**回答**暂停交互的唯一权威（覆盖 `ApprovalPolicy` 的
+  per-decision ask/deny 逻辑）；但机器 gate 仍由 `ApprovalPolicy` 决定「哪些调用会暂停」（`auto_allow`
+  的工具不暂停、不到达 handler）——要让每个工具都过 handler，配 `Approval::auto_deny()`/`ask_tool`。
+  未注入时与 M2 完全一致。**未新增 effect family / 未改底层状态机语义**。
+- 测试（`src/facade/agent/tests.rs`，全离线）：
+  - `injected_interaction_handler_pauses_until_approved`：脚本化 `GatedInteractionHandler` 在 `fulfill` 里
+    `await` 一个 test `oneshot`；`futures::poll!` 轮询证明 resolve 前 run future **不完成**（且被 gate 的工具
+    未执行），host approve 后才继续、工具执行一次。
+  - `injected_interaction_handler_pauses_until_denied`：同上但 deny → 工具不执行。
+  - `stream_routes_approval_through_injected_handler`：流式路径仍 emit `ApprovalRequested`（含 `get_weather`
+    tool name），注入 approve 覆盖 policy 的 auto_deny → 工具执行、末文本正常流出。
+  - 未注入回退（== M2）由既有 `auto_deny_skips_tool_execution` / `stream_reports_approval_request` 覆盖。
+- 验证（未触碰 external adapter，故不需全 external features clippy）：
+  1. `cargo fmt --all -- --check` 绿。
+  2. 聚焦 `cargo test -p agent-lib facade::agent`：24 passed（含 3 新用例）。
+  3. `cargo clippy --all-targets -- -D warnings` 绿（修掉 2 处 `redundant_pattern_matching`）。
+  4. `cargo test --all --all-targets`：无失败。
+  5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 绿（修掉 1 处 `redundant_explicit_links`）；
+     doctests 亦绿（含新 `interaction_handler` 示例）。
+  6. `git diff --check` 干净。
 
 ### [TODO] M7-2 `RunEvent` 可序列化投影（`WireRunEvent`）
 

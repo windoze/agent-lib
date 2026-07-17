@@ -161,7 +161,8 @@ pub(super) fn start(
             sink: sink.clone(),
         },
         interaction: TapInteractionHandler {
-            inner: agent.approval.clone(),
+            approval: agent.approval.clone(),
+            inner: agent.interaction_handler(),
             sink: sink.clone(),
         },
     };
@@ -540,15 +541,20 @@ impl ToolHandler for TapToolHandler {
     }
 }
 
-/// Fulfills a `NeedInteraction` (approval) by delegating to the shared
-/// [`FacadeApproval`], emitting a live [`RunEvent::ApprovalRequested`] first.
+/// Fulfills a `NeedInteraction` (approval) by delegating to the resolved
+/// [`InteractionHandler`], emitting a live [`RunEvent::ApprovalRequested`] first.
 ///
-/// An [`Approval`](InteractionKind::Approval) interaction only carries the
-/// framework [`ToolCallId`], so the tool name is recovered from the pending
-/// decision the policy already recorded (peeked *before* delegating, because the
-/// delegate consumes and removes that pending entry).
+/// The delegate `inner` is the host-injected handler when one was supplied to
+/// [`AgentBuilder::interaction_handler`](crate::facade::AgentBuilder::interaction_handler),
+/// otherwise the shared [`FacadeApproval`] fallback. The tool-name label is
+/// always recovered from `approval` — the machine gate stays [`FacadeApproval`]
+/// and records the pending decision regardless of which handler answers, so the
+/// emit is labelled even under an injected handler. The name is peeked *before*
+/// delegating, because the fallback handler consumes and removes that pending
+/// entry.
 struct TapInteractionHandler {
-    inner: Arc<FacadeApproval>,
+    approval: Arc<FacadeApproval>,
+    inner: Arc<dyn InteractionHandler>,
     sink: EventSink,
 }
 
@@ -556,7 +562,10 @@ struct TapInteractionHandler {
 impl InteractionHandler for TapInteractionHandler {
     async fn fulfill(&self, request: &Interaction, ctx: &RunContext) -> RequirementResult {
         if let InteractionKind::Approval { call_id, .. } = request.kind() {
-            let tool_name = self.inner.pending_tool_name(*call_id).unwrap_or_default();
+            let tool_name = self
+                .approval
+                .pending_tool_name(*call_id)
+                .unwrap_or_default();
             emit(
                 &self.sink,
                 RunEvent::ApprovalRequested(ApprovalRequest { tool_name }),

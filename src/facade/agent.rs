@@ -135,6 +135,14 @@ pub struct Agent {
     custom_registry: Option<Arc<dyn ToolRegistry>>,
     extra_declarations: Vec<ToolDecl>,
     approval: Arc<FacadeApproval>,
+    /// An optional host-supplied interaction handler that replaces
+    /// [`FacadeApproval`] as the scope's [`InteractionHandler`] when set (§19).
+    ///
+    /// When present it answers every interaction the machine pauses on — chiefly
+    /// tool-call approvals — so a host can `await` a cross-process decision
+    /// instead of resolving synchronously. When absent the run falls back to the
+    /// conservative [`FacadeApproval`] behavior of Milestone 2.
+    interaction_handler: Option<Arc<dyn InteractionHandler>>,
     ids: FacadeIds,
     delegates: Vec<LocalSubagent>,
     external_agents: Vec<ManagedExternalDelegate>,
@@ -161,6 +169,10 @@ impl std::fmt::Debug for Agent {
                 &self.tools.iter().map(Tool::name).collect::<Vec<_>>(),
             )
             .field("has_custom_registry", &self.custom_registry.is_some())
+            .field(
+                "has_interaction_handler",
+                &self.interaction_handler.is_some(),
+            )
             .field(
                 "extra_declarations",
                 &self
@@ -318,7 +330,7 @@ impl Agent {
                 self.approval.clone(),
                 self.collab_bridge(),
             ),
-            interaction: self.approval.clone(),
+            interaction: self.interaction_handler(),
         };
 
         let agent_input = AgentInput::user_message(
@@ -478,6 +490,22 @@ impl Agent {
     /// spec when a delegation is fulfilled (R4).
     fn supervisor_model(&self) -> ModelRef {
         self.machine.state().spec().model().clone()
+    }
+
+    /// Resolves the [`InteractionHandler`] a drive scope answers paused
+    /// interactions with: the host-injected handler when one was supplied to
+    /// [`AgentBuilder::interaction_handler`], otherwise the shared
+    /// [`FacadeApproval`] fallback (§19).
+    ///
+    /// The machine gate ([`ToolApprovalPolicy`]) is always [`FacadeApproval`], so
+    /// it still decides which tool calls pause and records the pending decision
+    /// the streaming path peeks; only the *answer* to a paused interaction is
+    /// delegated to the resolved handler here.
+    fn interaction_handler(&self) -> Arc<dyn InteractionHandler> {
+        match &self.interaction_handler {
+            Some(handler) => handler.clone(),
+            None => self.approval.clone(),
+        }
     }
 
     /// Builds the per-run [`DelegationToolHandler`] used to drive a rules-routed
@@ -795,6 +823,7 @@ pub struct AgentBuilder {
     custom_registry: Option<Arc<dyn ToolRegistry>>,
     extra_declarations: Vec<ToolDecl>,
     approval: Option<ApprovalPolicy>,
+    interaction_handler: Option<Arc<dyn InteractionHandler>>,
     max_steps: Option<u32>,
     max_tool_rounds: Option<u32>,
     tool_failure_policy: Option<ToolFailurePolicy>,
@@ -823,6 +852,10 @@ impl std::fmt::Debug for AgentBuilder {
             )
             .field("has_custom_registry", &self.custom_registry.is_some())
             .field("approval", &self.approval)
+            .field(
+                "has_interaction_handler",
+                &self.interaction_handler.is_some(),
+            )
             .field("max_steps", &self.max_steps)
             .field("max_tool_rounds", &self.max_tool_rounds)
             .field("tool_failure_policy", &self.tool_failure_policy)
@@ -934,6 +967,51 @@ impl AgentBuilder {
     #[must_use]
     pub fn approval(mut self, approval: impl Into<ApprovalPolicy>) -> Self {
         self.approval = Some(approval.into());
+        self
+    }
+
+    /// Injects a custom async [`InteractionHandler`] that answers whatever the
+    /// agent machine pauses on (chiefly tool-call approvals), replacing the
+    /// synchronous [`FacadeApproval`] fallback (`docs/facade-api.md` §19).
+    ///
+    /// The default facade approval path resolves a decision **synchronously** on
+    /// the drive task, so it cannot `await` a cross-process answer. The
+    /// lower-layer [`InteractionHandler`] is an
+    /// `async` pause point: a host can emit a request from
+    /// [`fulfill`](crate::agent::InteractionHandler::fulfill), `await` a
+    /// `oneshot`, and return the caller's
+    /// [`InteractionResponse`](crate::agent::InteractionResponse) once it
+    /// arrives. Both the blocking [`run`](Agent::run) path and the incremental
+    /// [`stream`](Agent::stream) path route their paused interactions through the
+    /// injected handler.
+    ///
+    /// # Priority relative to [`approval`](Self::approval)
+    ///
+    /// When a handler is injected it becomes the **sole authority** for
+    /// *answering* a paused interaction: the [`ApprovalPolicy`]'s per-decision
+    /// `ask`/`deny` logic is overridden by the handler's own decision. The policy
+    /// still governs the machine **gate** — that is, which tool calls pause at
+    /// all (an [`auto_allow`](crate::facade::Approval::auto_allow) tool runs
+    /// unattended and never reaches the handler). To route every tool call
+    /// through the injected handler, pair it with an ask/deny default such as
+    /// [`Approval::auto_deny`](crate::facade::Approval::auto_deny) or
+    /// [`ask_tool`](ApprovalPolicy::ask_tool). When no handler is injected the
+    /// behavior is identical to Milestone 2's [`FacadeApproval`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use agent_lib::agent::InteractionHandler;
+    /// # use agent_lib::facade::{AgentBuilder, Approval};
+    /// # fn wire(builder: AgentBuilder, handler: Arc<dyn InteractionHandler>) -> AgentBuilder {
+    /// // Pause every tool call, then let the injected handler decide.
+    /// builder
+    ///     .approval(Approval::auto_deny())
+    ///     .interaction_handler(handler)
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn interaction_handler(mut self, handler: Arc<dyn InteractionHandler>) -> Self {
+        self.interaction_handler = Some(handler);
         self
     }
 
@@ -1213,6 +1291,7 @@ impl AgentBuilder {
             custom_registry: self.custom_registry,
             extra_declarations: self.extra_declarations,
             approval,
+            interaction_handler: self.interaction_handler,
             ids,
             delegates: self.delegates,
             external_agents: self.external_agents,
@@ -1267,15 +1346,18 @@ pub(crate) fn assemble_machine(
 }
 
 /// One total drain layer carrying the LLM client, the run-scoped tool registry,
-/// and the shared [`FacadeApproval`] interaction handler.
+/// and the resolved interaction handler.
 ///
 /// The three accessors [`drain`] consults are provided; every other handler
 /// family defaults to `None` because the facade never emits those requirements
 /// (no reconfiguration, subagents, or host permissions on the base agent path).
+/// The [`interaction`](Self::interaction) handler is the host-injected
+/// [`InteractionHandler`] when one was supplied, otherwise the shared
+/// [`FacadeApproval`] (§19).
 struct FacadeAgentScope {
     llm: LlmClientHandler,
     tool: DelegationToolHandler,
-    interaction: Arc<FacadeApproval>,
+    interaction: Arc<dyn InteractionHandler>,
 }
 
 impl HandlerScope for FacadeAgentScope {

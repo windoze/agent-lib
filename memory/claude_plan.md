@@ -1,52 +1,58 @@
-# M6-R — Review: Collaboration convenience + overall facade acceptance
+# M7-1 — AgentBuilder::interaction_handler(..) inject custom async InteractionHandler
 
-Task: TODO.md → first incomplete = **M6-R** (capstone review for facade M1–M6).
-Review task (`*R`): do NOT decompose unless the entry itself is structurally wrong.
+TODO.md first incomplete task = **M7-1** (Milestone 7 host-embedding injection points).
 
-## What to verify
-1. §14 consistency: topology auto-enable correct; external collab bridged to lib
-   primitives (no runtime-private protocol leak into public facade API, §14/§19);
-   only promise landed capabilities (R8 honesty — no silent "pretend support").
-2. Overall acceptance vs §2/§18/§19:
-   - progressive usage (Chat → ChatSession → Agent → subagent → external)
-   - strong invariants preserved (internal Conversation + DefaultAgentMachine +
-     Requirement/HandlerScope/drain/Pop; no bypass state machine)
-   - default-usable, recoverable (snapshot has NO secret), observable (RunOutput
-     full dimensions), escape hatches clear
-   - prelude vs §3 list consistency
-   - README / docs: is a facade getting-started example needed?
-3. Summarize milestone leftover gaps → follow-up tasks in TODO.md (if any).
-   Confirm NO unscheduled failing tests (Test Failure Policy).
+## Goal
+Expose an injection point so a host can supply an async `InteractionHandler`
+(a true pause point that can `await` a cross-process oneshot) instead of the
+hardcoded synchronous `FacadeApproval`. Un-injected behavior == M2 exactly.
 
-## Acceptance deliverable
-- Comparison table: facade implemented vs docs/facade-api.md §2–§17 promises;
-  uncovered items explicitly recorded as follow-up tasks or confirmed non-goals.
+## Design (Option A — swap only the InteractionHandler role)
+- The machine gate (`ToolApprovalPolicy`) stays `FacadeApproval` — it still
+  decides pause-or-not from the `ApprovalPolicy` tiers, and still `record_pending`
+  (so the stream path can peek the tool name).
+- Only the scope's `interaction()` handler is swapped:
+  injected handler if present, else fall back to `FacadeApproval`.
+- Priority vs `.approval(..)`: when injected, the custom handler is the sole
+  authority for *answering* paused interactions (FacadeApproval::fulfill's
+  ask/deny logic is overridden). The ApprovalPolicy still governs which calls
+  pause; to route every call through the handler use an ask/deny default.
+  Document this in rustdoc.
 
-## Validation (full sequence 1–6 + all-external clippy)
+## Edits
+1. `src/facade/agent.rs`
+   - `AgentBuilder`: add field `interaction_handler: Option<Arc<dyn InteractionHandler>>`
+     + builder method `interaction_handler(self, handler) -> Self` (rustdoc: priority/caveat).
+   - `AgentBuilder` Debug: add `has_interaction_handler`.
+   - `Agent`: add field `interaction_handler: Option<Arc<dyn InteractionHandler>>`
+     + private helper `fn interaction_handler(&self) -> Arc<dyn InteractionHandler>`
+       returning injected or `self.approval.clone()` (coerce Arc<FacadeApproval>).
+   - sync `run` path: `FacadeAgentScope.interaction = self.interaction_handler()`.
+   - `FacadeAgentScope.interaction` field type -> `Arc<dyn InteractionHandler>`.
+   - `build()`: pass `interaction_handler: self.interaction_handler`.
+2. `src/facade/agent/stream.rs`
+   - `TapInteractionHandler`: fields become `approval: Arc<FacadeApproval>`
+     (peek pending_tool_name) + `inner: Arc<dyn InteractionHandler>` (delegate) + sink.
+   - `start()`: wire `approval: agent.approval.clone()`, `inner: agent.interaction_handler()`.
+3. `src/facade/agent/snapshot.rs`
+   - restore `Agent { .. }`: add `interaction_handler: None` (conservative M2 fallback).
+
+## Tests (src/facade/agent/tests.rs)
+- sync: scripted InteractionHandler awaits a oneshot; approval-requiring turn
+  (policy auto_deny -> gate pauses); assert future does NOT complete before
+  test resolves; then approve -> tool runs; deny -> tool skipped. Cover both.
+- stream: injected handler still emits ApprovalRequested with tool_name, and
+  the injected decision (approve) runs the tool (vs default deny).
+- Confirm existing no-injection tests still pass (fallback == M2).
+
+## Validation (full sequence 1-6; no external adapter touched)
 1 cargo fmt --all -- --check
-2 focused: cargo test -p agent-lib facade::collab
+2 cargo test -p agent-lib facade::agent
 3 cargo clippy --all-targets -- -D warnings
-   + clippy --features "external-claude-code external-codex external-opencode external-acp"
 4 cargo test --all --all-targets (<=30min)
 5 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 6 git diff --check
 
-## Status: IN PROGRESS
-- Reading docs §2/§3/§14/§18/§19 + facade sources; running validation.
-
----
-
-## M6-R Status: DONE
-- §14 collab convenience verified faithful (derive_default table + CollabBridge
-  provider-neutral, no runtime-private types in public API, R8 honesty).
-- §2–§17 acceptance comparison table recorded in TODO.md M6-R completion record;
-  all facade promises (M1–M6) landed, no uncovered §2–§17 item needs a follow-up.
-- prelude vs §3: only diff is `AgentSession` (resolved open-question §20 #2 →
-  unified stateful `Agent`); not a gap.
-- README gap FIXED (doc-only): added Facade layer to intro list + module table,
-  new "快速开始：Facade 层" getting-started (Chat + tool Agent, from verified
-  doctests), and docs/facade-api.md reference link.
-- Validation ALL GREEN: fmt-check; facade::collab 17; clippy default + all-external;
-  default suite 1071/0 (10 ignored e2e); rustdoc -D warnings; git diff --check;
-  all-external suite 1094/0 (18 ignored e2e). No unscheduled failing tests.
-- endtag NOT applied: Milestone 7 still has open tasks.
+## Status: DONE
+- All edits landed; full validation 1-6 green (+ doctests). TODO.md M7-1 marked [DONE].
+- No external adapter touched -> all-external clippy not required for this task.

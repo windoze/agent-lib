@@ -746,6 +746,11 @@ impl AgentRestoreBuilder {
             custom_registry: self.custom_registry,
             extra_declarations: self.extra_declarations,
             approval,
+            // A snapshot is data-only: a host-injected interaction handler is a
+            // runtime handle it never carries, so a restored agent falls back to
+            // the conservative `FacadeApproval` path until the caller re-injects
+            // one on the rebuild.
+            interaction_handler: None,
             ids,
             delegates,
             // External delegates are a runtime attachment (their session handler
