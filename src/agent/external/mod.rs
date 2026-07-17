@@ -652,6 +652,11 @@ pub enum ExternalAgentEvent {
         status: ToolStatus,
     },
     /// The agent sent a message to another agent (mixed-agent sessions).
+    ///
+    /// This is the provider-neutral shape of a `send_message` collab event; the
+    /// facade collab bridge routes it into the shared
+    /// [`Mailbox`](crate::agent::collab::Mailbox) when one is provisioned
+    /// (`docs/facade-api.md` §14).
     MessageSent {
         /// Recipient agent identity.
         to: AgentId,
@@ -659,11 +664,33 @@ pub enum ExternalAgentEvent {
         summary: String,
     },
     /// A tracked task's status changed.
+    ///
+    /// This is the provider-neutral shape of a `plan_update` collab event; the
+    /// facade collab bridge reflects it into the shared
+    /// [`Plan`](crate::agent::collab::Plan) when one is provisioned
+    /// (`docs/facade-api.md` §14).
     TaskUpdated {
         /// Identifier of the task whose status changed.
         task_id: String,
         /// New status label reported by the runtime.
         status: String,
+    },
+    /// The agent posted a message to a shared blackboard channel (mixed-agent
+    /// sessions).
+    ///
+    /// This is the provider-neutral shape of a `blackboard_post` collab event.
+    /// Like [`MessageSent`](Self::MessageSent) it is a model-complete
+    /// observation the facade collab bridge routes into the shared
+    /// [`Blackboard`](crate::agent::collab::Blackboard) when one is provisioned
+    /// (`docs/facade-api.md` §14); a runtime that speaks its own private
+    /// blackboard protocol is normalized into this event rather than bridged
+    /// directly, so the same collaboration stays observable and replayable
+    /// across runtimes (design §3.5).
+    BlackboardPosted {
+        /// Channel the message was posted to.
+        channel: String,
+        /// Short human-readable summary of the message (untrusted).
+        summary: String,
     },
     /// The session finished producing output for this step.
     SessionCompleted,

@@ -37,19 +37,42 @@
 //! `agent::collab` objects — a caller, a delegate, or the managed-external
 //! collab-event bridge can post to, read, and message through them.
 //!
-//! What M6-1 deliberately does **not** do (to avoid promising unlanded
-//! behavior): it neither advertises `agent::collab` bridge tools to the
-//! supervising model nor auto-routes delegate coordination through the
-//! primitives. §14's named mechanism for *populating* the mailbox / blackboard /
-//! plan is the external-runtime collab-event bridge, which lands in M6-2; this
-//! layer provisions the substrate that bridge writes into. Every §14 tier maps
-//! to a landed primitive, so no auto tier is silently skipped.
+//! The provisioning layer deliberately does **not** advertise `agent::collab`
+//! bridge tools to the supervising model or auto-route delegate coordination
+//! through the primitives. §14's named mechanism for *populating* the mailbox /
+//! blackboard / plan is the external-runtime collab-event bridge
+//! (`CollabBridge`, M6-2): it normalizes a managed external delegate's
+//! observations into writes against whichever primitives are provisioned. Every
+//! §14 tier maps to a landed primitive, so no auto tier is silently skipped.
+//!
+//! # External collab-event bridge (§14 末段)
+//!
+//! A managed external delegate reports collaboration activity as provider-neutral
+//! [`ExternalAgentEvent`] observations. The internal `CollabBridge` reflects the
+//! three that §14 names into the shared substrate, keeping the coordination
+//! observable and replayable across runtimes rather than reaching into any
+//! runtime's private protocol (design §3.5):
+//!
+//! | external observation | bridged into |
+//! |---|---|
+//! | `send_message` → [`MessageSent`](ExternalAgentEvent::MessageSent) | [`Mailbox`] |
+//! | `plan_update` → [`TaskUpdated`](ExternalAgentEvent::TaskUpdated) | [`Plan`] |
+//! | `blackboard_post` → [`BlackboardPosted`](ExternalAgentEvent::BlackboardPosted) | [`Blackboard`] |
+//!
+//! `spawn_agent` is already bridged as a
+//! [`NeedSubagent`](crate::agent::RequirementKind::NeedSubagent) requirement on
+//! the external tool path (M3-3), so it is not re-reflected here. A disabled
+//! substrate simply drops its events, and a status/label the [`Plan`] cannot
+//! accept is skipped — the bridge is best-effort, matching the mailbox and
+//! blackboard primitives it writes to.
 
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{Blackboard, Mailbox, Plan};
+use crate::agent::collab::TaskStatus;
+use crate::agent::external::ExternalAgentEvent;
+use crate::agent::{Blackboard, Mailbox, Notification, Plan};
 use crate::facade::delegate::Delegation;
 use crate::facade::ids::FacadeIds;
 
@@ -241,9 +264,176 @@ impl CollabState {
     }
 }
 
+/// A shareable handle set that bridges a managed external delegate's collab
+/// observations into the facade's provisioned collab substrate (§14 末段).
+///
+/// [`CollabState`] provisions the live shared primitives (M6-1); this bridge is
+/// the mechanism that *populates* them from an external runtime. It holds only
+/// cloned `Arc` handles to whichever substrates are enabled, so it is cheap to
+/// clone into the per-run delegation handler and share with the child external
+/// drive. A substrate the topology did not enable is `None`, and its events are
+/// dropped.
+///
+/// The bridge is intentionally provider-neutral: it consumes agent-layer
+/// [`ExternalAgentEvent`] observations (never a runtime's private message shape),
+/// so the same collaboration protocol is observable and replayable across
+/// runtimes (design §3.5).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CollabBridge {
+    /// The shared directed mailbox, when enabled.
+    mailbox: Option<Arc<Mailbox>>,
+    /// The shared blackboard, when enabled.
+    blackboard: Option<Arc<Blackboard>>,
+    /// The shared plan board, when enabled.
+    plan: Option<Arc<Plan>>,
+}
+
+impl CollabBridge {
+    /// Builds a bridge over the primitives `state` provisioned.
+    pub(crate) fn from_state(state: &CollabState) -> Self {
+        Self {
+            mailbox: state.mailbox.clone(),
+            blackboard: state.blackboard.clone(),
+            plan: state.plan.clone(),
+        }
+    }
+
+    /// Reports whether any substrate is enabled, so a caller can skip scanning
+    /// observations when nothing would be written.
+    pub(crate) fn is_active(&self) -> bool {
+        self.mailbox.is_some() || self.blackboard.is_some() || self.plan.is_some()
+    }
+
+    /// Reflects every collab observation in `notifications` into the enabled
+    /// substrate, attributing each write to `from` (the delegate's name).
+    ///
+    /// Non-collab notifications and events whose substrate is disabled are
+    /// ignored. A machine replays a decision point's observations exactly once
+    /// (seq-deduped, design §5.5), so each event is absorbed a single time.
+    pub(crate) fn absorb_notifications(&self, from: &str, notifications: &[Notification]) {
+        if !self.is_active() {
+            return;
+        }
+        for notification in notifications {
+            if let Notification::ExternalAgent(event) = notification {
+                self.absorb_event(from, event);
+            }
+        }
+    }
+
+    /// Reflects one external observation into the enabled substrate.
+    ///
+    /// - [`MessageSent`](ExternalAgentEvent::MessageSent) → [`Mailbox::send`];
+    /// - [`TaskUpdated`](ExternalAgentEvent::TaskUpdated) → the [`Plan`]
+    ///   (best-effort reconcile, see [`reflect_plan_update`]);
+    /// - [`BlackboardPosted`](ExternalAgentEvent::BlackboardPosted) →
+    ///   [`Blackboard::post`].
+    ///
+    /// Every other observation is not a collab event and is left alone.
+    pub(crate) fn absorb_event(&self, from: &str, event: &ExternalAgentEvent) {
+        match event {
+            ExternalAgentEvent::MessageSent { to, summary } => {
+                if let Some(mailbox) = &self.mailbox {
+                    mailbox.send(from.to_owned(), to.to_string(), summary.clone());
+                }
+            }
+            ExternalAgentEvent::TaskUpdated { task_id, status } => {
+                if let Some(plan) = &self.plan {
+                    reflect_plan_update(plan, from, task_id, status);
+                }
+            }
+            ExternalAgentEvent::BlackboardPosted { channel, summary } => {
+                if let Some(blackboard) = &self.blackboard {
+                    blackboard.post(channel.clone(), from.to_owned(), summary.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Parses an external runtime's task-status label into a [`TaskStatus`], mapping
+/// common provider synonyms onto the plan's canonical vocabulary.
+///
+/// The [`Plan`]'s own labels are accepted verbatim; beyond those a small synonym
+/// set keeps the bridge provider-neutral (for example ACP reports `pending`
+/// rather than `todo`, and runtimes commonly say `done`/`finished` for a
+/// completed task). An unrecognized label yields `None`, so the reflection is a
+/// best-effort no-op rather than a guess.
+fn parse_task_status(label: &str) -> Option<TaskStatus> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "todo" | "pending" | "not_started" | "open" | "queued" => Some(TaskStatus::Todo),
+        "in_progress" | "in-progress" | "active" | "running" | "started" => {
+            Some(TaskStatus::InProgress)
+        }
+        "completed" | "complete" | "done" | "finished" => Some(TaskStatus::Completed),
+        "blocked" | "waiting" | "stuck" => Some(TaskStatus::Blocked),
+        "cancelled" | "canceled" | "abandoned" => Some(TaskStatus::Cancelled),
+        _ => None,
+    }
+}
+
+/// Reflects an external `plan_update` observation into the shared [`Plan`],
+/// attributing the reporting delegate `owner`.
+///
+/// The [`Plan`] enforces ownership, legal transitions, and version CAS, but an
+/// external observation is an authoritative *report*, not a model-issued claim.
+/// This reconciles best-effort against the public API:
+///
+/// 1. add the task (with no dependencies) if the plan has never seen it;
+/// 2. claim it for `owner` if it is unclaimed, so a status update is permitted;
+/// 3. apply the reported [`TaskStatus`] when the transition is legal.
+///
+/// Every step is a no-op on failure (an illegal transition, a task owned by a
+/// different agent, or an unparsable status label), so a noisy external plan
+/// never corrupts the shared board.
+fn reflect_plan_update(plan: &Plan, owner: &str, task_id: &str, status_label: &str) {
+    let Some(status) = parse_task_status(status_label) else {
+        return;
+    };
+
+    // Ensure the task exists before we try to move it.
+    if !plan.snapshot().tasks.contains_key(task_id) {
+        let _ = plan.add_task(task_id, Vec::<String>::new());
+    }
+
+    let snapshot = plan.snapshot();
+    let Some(task) = snapshot.tasks.get(task_id) else {
+        return;
+    };
+    if task.status == status {
+        return;
+    }
+
+    // Establish ownership: an unclaimed task is claimed for `owner` (which moves
+    // it to InProgress), so a subsequent `update_status` is authorized.
+    let mut owned = task.owner.as_deref() == Some(owner);
+    if !owned && task.owner.is_none() && status != TaskStatus::Todo {
+        owned = plan.claim(task_id, owner, snapshot.version).is_ok();
+    }
+    if !owned {
+        return;
+    }
+
+    // Re-read the version after any claim, then apply the target status when the
+    // transition is legal (a no-op otherwise).
+    let snapshot = plan.snapshot();
+    if let Some(task) = snapshot.tasks.get(task_id)
+        && task.status != status
+        && task.status.can_transition_to(status)
+    {
+        let _ = plan.update_status(task_id, owner, status, snapshot.version);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CollabState, Collaboration, derive_default, resolve};
+    use super::{
+        CollabBridge, CollabState, Collaboration, derive_default, parse_task_status, resolve,
+    };
+    use crate::agent::collab::TaskStatus;
+    use crate::agent::external::ExternalAgentEvent;
+    use crate::agent::{AgentId, Notification};
     use crate::facade::delegate::Delegation;
     use crate::facade::ids::FacadeIds;
 
@@ -354,5 +544,232 @@ mod tests {
         let to_a = mailbox.inbox("worker-a");
         assert_eq!(to_a.len(), 1);
         assert_eq!(to_a[0].text, "reviewed: looks good");
+    }
+
+    // ----- external collab-event bridge (M6-2) -----------------------------
+
+    /// A recipient agent id the scripted `MessageSent` observation addresses.
+    fn recipient_id() -> AgentId {
+        AgentId::parse_str("018f0d9c-7b6a-7c12-8f31-1234567890b7").expect("agent id")
+    }
+
+    #[test]
+    fn parse_task_status_accepts_canonical_and_synonyms() {
+        assert_eq!(parse_task_status("todo"), Some(TaskStatus::Todo));
+        assert_eq!(parse_task_status("pending"), Some(TaskStatus::Todo));
+        assert_eq!(
+            parse_task_status("in_progress"),
+            Some(TaskStatus::InProgress)
+        );
+        assert_eq!(parse_task_status(" Running "), Some(TaskStatus::InProgress));
+        assert_eq!(parse_task_status("completed"), Some(TaskStatus::Completed));
+        assert_eq!(parse_task_status("DONE"), Some(TaskStatus::Completed));
+        assert_eq!(parse_task_status("blocked"), Some(TaskStatus::Blocked));
+        assert_eq!(parse_task_status("cancelled"), Some(TaskStatus::Cancelled));
+        assert_eq!(parse_task_status("nonsense"), None);
+    }
+
+    #[test]
+    fn bridge_over_no_substrate_is_inactive() {
+        let ids = FacadeIds::new();
+        let bridge = CollabBridge::from_state(&CollabState::provision(Collaboration::new(), &ids));
+        assert!(!bridge.is_active());
+
+        // Absorbing an event through an inactive bridge is a harmless no-op.
+        bridge.absorb_event(
+            "coder",
+            &ExternalAgentEvent::BlackboardPosted {
+                channel: "default".to_owned(),
+                summary: "ignored".to_owned(),
+            },
+        );
+    }
+
+    #[test]
+    fn bridge_routes_send_message_into_mailbox() {
+        // §14: an external `send_message` observation lands in the shared mailbox.
+        let ids = FacadeIds::new();
+        let state = CollabState::provision(Collaboration::new().mailbox(), &ids);
+        let mailbox = state.mailbox.clone().expect("mailbox provisioned");
+        let bridge = CollabBridge::from_state(&state);
+        assert!(bridge.is_active());
+
+        let to = recipient_id();
+        bridge.absorb_event(
+            "coder",
+            &ExternalAgentEvent::MessageSent {
+                to,
+                summary: "handing off the parser fix".to_owned(),
+            },
+        );
+
+        let inbox = mailbox.inbox(&to.to_string());
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].from, "coder");
+        assert_eq!(inbox[0].text, "handing off the parser fix");
+    }
+
+    #[test]
+    fn bridge_routes_blackboard_post_into_blackboard() {
+        // §14: an external `blackboard_post` observation appends to the shared
+        // blackboard channel it names.
+        let ids = FacadeIds::new();
+        let state = CollabState::provision(Collaboration::new().blackboard(), &ids);
+        let blackboard = state.blackboard.clone().expect("blackboard provisioned");
+        let bridge = CollabBridge::from_state(&state);
+
+        bridge.absorb_event(
+            "coder",
+            &ExternalAgentEvent::BlackboardPosted {
+                channel: "status".to_owned(),
+                summary: "parser passes; moving to lints".to_owned(),
+            },
+        );
+
+        let posts = blackboard.snapshot("status");
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].sender, "coder");
+        assert_eq!(posts[0].text, "parser passes; moving to lints");
+    }
+
+    #[test]
+    fn bridge_reflects_plan_update_into_plan() {
+        // §14: an external `plan_update` observation reconciles into the shared
+        // plan — a fresh task is added, claimed, and driven to the reported
+        // status, then a later update advances it.
+        let ids = FacadeIds::new();
+        let state = CollabState::provision(Collaboration::new().plan(), &ids);
+        let plan = state.plan.clone().expect("plan provisioned");
+        let bridge = CollabBridge::from_state(&state);
+
+        bridge.absorb_event(
+            "coder",
+            &ExternalAgentEvent::TaskUpdated {
+                task_id: "parser".to_owned(),
+                status: "in_progress".to_owned(),
+            },
+        );
+
+        let snapshot = plan.snapshot();
+        let task = snapshot.tasks.get("parser").expect("task added");
+        assert_eq!(task.status, TaskStatus::InProgress);
+        assert_eq!(task.owner.as_deref(), Some("coder"));
+
+        bridge.absorb_event(
+            "coder",
+            &ExternalAgentEvent::TaskUpdated {
+                task_id: "parser".to_owned(),
+                status: "completed".to_owned(),
+            },
+        );
+        assert_eq!(
+            plan.snapshot().tasks.get("parser").expect("task").status,
+            TaskStatus::Completed
+        );
+    }
+
+    #[test]
+    fn bridge_plan_update_reaching_completed_directly_claims_then_completes() {
+        // A task reported straight as `completed` is added (Todo), claimed
+        // (InProgress), then completed — the legal Todo→InProgress→Completed path.
+        let ids = FacadeIds::new();
+        let state = CollabState::provision(Collaboration::new().plan(), &ids);
+        let plan = state.plan.clone().expect("plan provisioned");
+        let bridge = CollabBridge::from_state(&state);
+
+        bridge.absorb_event(
+            "coder",
+            &ExternalAgentEvent::TaskUpdated {
+                task_id: "lint".to_owned(),
+                status: "done".to_owned(),
+            },
+        );
+        assert_eq!(
+            plan.snapshot().tasks.get("lint").expect("task").status,
+            TaskStatus::Completed
+        );
+    }
+
+    #[test]
+    fn bridge_plan_update_with_unparsable_status_is_noop() {
+        let ids = FacadeIds::new();
+        let state = CollabState::provision(Collaboration::new().plan(), &ids);
+        let plan = state.plan.clone().expect("plan provisioned");
+        let bridge = CollabBridge::from_state(&state);
+
+        bridge.absorb_event(
+            "coder",
+            &ExternalAgentEvent::TaskUpdated {
+                task_id: "mystery".to_owned(),
+                status: "??".to_owned(),
+            },
+        );
+        assert!(!plan.snapshot().tasks.contains_key("mystery"));
+    }
+
+    #[test]
+    fn bridge_drops_events_for_disabled_substrates() {
+        // Only the plan is enabled: a message and a blackboard post are dropped,
+        // but the plan update still lands.
+        let ids = FacadeIds::new();
+        let state = CollabState::provision(Collaboration::new().plan(), &ids);
+        let plan = state.plan.clone().expect("plan provisioned");
+        let bridge = CollabBridge::from_state(&state);
+
+        bridge.absorb_event(
+            "coder",
+            &ExternalAgentEvent::MessageSent {
+                to: recipient_id(),
+                summary: "dropped".to_owned(),
+            },
+        );
+        bridge.absorb_event(
+            "coder",
+            &ExternalAgentEvent::BlackboardPosted {
+                channel: "default".to_owned(),
+                summary: "dropped".to_owned(),
+            },
+        );
+        bridge.absorb_event(
+            "coder",
+            &ExternalAgentEvent::TaskUpdated {
+                task_id: "kept".to_owned(),
+                status: "in_progress".to_owned(),
+            },
+        );
+
+        assert!(bridge.mailbox.is_none() && bridge.blackboard.is_none());
+        assert_eq!(
+            plan.snapshot().tasks.get("kept").expect("task").status,
+            TaskStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn absorb_notifications_routes_only_external_collab_events() {
+        // Non-external notifications are ignored; the collab observations wrapped
+        // in `Notification::ExternalAgent` are routed to their substrate.
+        let ids = FacadeIds::new();
+        let state = CollabState::provision(Collaboration::new().mailbox().blackboard(), &ids);
+        let mailbox = state.mailbox.clone().expect("mailbox provisioned");
+        let blackboard = state.blackboard.clone().expect("blackboard provisioned");
+        let bridge = CollabBridge::from_state(&state);
+
+        let to = recipient_id();
+        let notifications = vec![
+            Notification::ExternalAgent(ExternalAgentEvent::SessionStarted { session_id: None }),
+            Notification::ExternalAgent(ExternalAgentEvent::MessageSent {
+                to,
+                summary: "ping".to_owned(),
+            }),
+            Notification::ExternalAgent(ExternalAgentEvent::BlackboardPosted {
+                channel: "default".to_owned(),
+                summary: "posted".to_owned(),
+            }),
+        ];
+        bridge.absorb_notifications("coder", &notifications);
+
+        assert_eq!(mailbox.inbox(&to.to_string()).len(), 1);
+        assert_eq!(blackboard.snapshot("default").len(), 1);
     }
 }

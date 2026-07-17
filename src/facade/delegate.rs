@@ -70,6 +70,7 @@ use crate::facade::agent::{
     final_turn_summary,
 };
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
+use crate::facade::collab::CollabBridge;
 use crate::facade::config::ModelConfig;
 use crate::facade::error::FacadeError;
 use crate::facade::external::{ManagedExternalDelegate, drive_external};
@@ -1472,6 +1473,9 @@ pub(crate) struct DelegationToolHandler {
     recorder: DelegationRecorder,
     approval: Arc<FacadeApproval>,
     max_depth: u32,
+    /// Bridge a driven managed external delegate's collab observations flow into
+    /// (§14 末段). Empty when no substrate is provisioned.
+    collab: CollabBridge,
 }
 
 impl DelegationToolHandler {
@@ -1481,7 +1485,10 @@ impl DelegationToolHandler {
     /// `approval` is the run's [`FacadeApproval`]; a managed external delegate is
     /// gated through its
     /// [`resolve_external_start`](FacadeApproval::resolve_external_start) before
-    /// it is driven (§9.2).
+    /// it is driven (§9.2). `collab` is the facade's provisioned collaboration
+    /// substrate (§14); a driven external delegate's collab observations are
+    /// reflected into it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         base: ToolRegistryHandler,
         route: DelegationRoute,
@@ -1490,6 +1497,7 @@ impl DelegationToolHandler {
         ids: FacadeIds,
         recorder: DelegationRecorder,
         approval: Arc<FacadeApproval>,
+        collab: CollabBridge,
     ) -> Self {
         Self {
             base,
@@ -1500,6 +1508,7 @@ impl DelegationToolHandler {
             recorder,
             approval,
             max_depth: DEFAULT_MAX_DELEGATION_DEPTH,
+            collab,
         }
     }
 
@@ -1638,7 +1647,16 @@ impl DelegationToolHandler {
                 ),
             }));
         }
-        match drive_external(delegate.name(), delegate.agent(), &self.ids, task, ctx).await {
+        match drive_external(
+            delegate.name(),
+            delegate.agent(),
+            &self.ids,
+            task,
+            &self.collab,
+            ctx,
+        )
+        .await
+        {
             Ok(outcome) => {
                 let status = if outcome.completed && !outcome.cleanup_required {
                     DelegationStatus::Completed
@@ -1996,6 +2014,7 @@ mod model_routed_tests {
     use futures::stream::BoxStream;
     use serde_json::{Map, json};
 
+    use crate::agent::AgentId;
     use crate::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
     use crate::facade::approval::{Approval, ApprovalDecision, ApprovalPolicy};
     use crate::facade::run::{DelegationStatus, RunEvent};
@@ -2407,6 +2426,119 @@ mod model_routed_tests {
             artifact < finished,
             "the artifact precedes DelegationFinished"
         );
+    }
+
+    /// Builds a [`FixedExternalSessionHandler`] that completes with `summary` and
+    /// a trail of the three collaboration observations §14 bridges: a directed
+    /// `send_message`, a `plan_update`, and a `blackboard_post`.
+    fn collab_external_handler(summary: &str, recipient: AgentId) -> FixedExternalSessionHandler {
+        use crate::agent::external::{
+            ExternalAgentEvent, ExternalAgentOutput, ExternalObservedEvent, ExternalRuntimeKind,
+            ExternalSessionRef, ExternalSessionResult,
+        };
+
+        let result = ExternalSessionResult::Completed {
+            session: ExternalSessionRef {
+                runtime: ExternalRuntimeKind::ClaudeCode,
+                session_id: Some("sess-collab".to_owned()),
+                transcript_ref: None,
+                resume_token: None,
+                last_event_seq: Some(2),
+            },
+            output: ExternalAgentOutput {
+                summary: summary.to_owned(),
+                artifacts: Vec::new(),
+                usage: None,
+                cost_micros: None,
+            },
+            observations: ExternalObservedEvent::unsequenced_for_tests(vec![
+                ExternalAgentEvent::MessageSent {
+                    to: recipient,
+                    summary: "please review the parser change".to_owned(),
+                },
+                ExternalAgentEvent::TaskUpdated {
+                    task_id: "parser".to_owned(),
+                    status: "completed".to_owned(),
+                },
+                ExternalAgentEvent::BlackboardPosted {
+                    channel: "status".to_owned(),
+                    summary: "parser done".to_owned(),
+                },
+            ]),
+        };
+        FixedExternalSessionHandler { result }
+    }
+
+    #[tokio::test]
+    async fn external_collab_observations_bridge_into_provisioned_primitives() {
+        // §14 末段: an external delegate's send_message / plan_update /
+        // blackboard_post observations reflect into the facade's provisioned
+        // collab substrate. An explicit `Collaboration` provisions all three
+        // primitives (a lone external delegate would otherwise only get
+        // artifacts), so the bridge has somewhere to write.
+        use crate::facade::{Collaboration, ManagedExternalAgent};
+
+        let recipient =
+            AgentId::parse_str("018f0d9c-7b6a-7c12-8f31-1234567890c4").expect("agent id");
+        let client = RoutingClient::new(vec![route(
+            "SUPERVISOR",
+            vec![
+                tool_call_response(
+                    "del-1",
+                    "ask_coder",
+                    json!({ "task": "refactor the parser" }),
+                ),
+                text_response("Final: the coder finished."),
+            ],
+        )]);
+
+        let coder = ManagedExternalAgent::claude_code()
+            .session_handler(Arc::new(collab_external_handler(
+                "refactor complete",
+                recipient,
+            )))
+            .build()
+            .expect("managed external agent builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .external_agent("coder", coder)
+            .collaboration(
+                Collaboration::new()
+                    .plan()
+                    .blackboard()
+                    .mailbox()
+                    .artifacts(),
+            )
+            .build()
+            .expect("agent builds");
+
+        agent.run_full("Please refactor the parser.").await.unwrap();
+
+        // send_message → the shared mailbox, attributed to the delegate.
+        let mailbox = agent.mailbox().expect("mailbox provisioned");
+        let inbox = mailbox.inbox(&recipient.to_string());
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].from, "coder");
+        assert_eq!(inbox[0].text, "please review the parser change");
+
+        // plan_update → the shared plan, reconciled to the reported status and
+        // owned by the delegate.
+        let plan = agent.plan().expect("plan provisioned");
+        let snapshot = plan.snapshot();
+        let task = snapshot.tasks.get("parser").expect("task reflected");
+        assert_eq!(task.status, crate::agent::collab::TaskStatus::Completed);
+        assert_eq!(task.owner.as_deref(), Some("coder"));
+
+        // blackboard_post → the shared blackboard channel it named.
+        let blackboard = agent.blackboard().expect("blackboard provisioned");
+        let posts = blackboard.snapshot("status");
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].sender, "coder");
+        assert_eq!(posts[0].text, "parser done");
     }
 
     #[tokio::test]

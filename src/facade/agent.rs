@@ -56,7 +56,7 @@ use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig};
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
 use crate::facade::chat::client_for_provider;
-use crate::facade::collab::{CollabState, Collaboration, resolve};
+use crate::facade::collab::{CollabBridge, CollabState, Collaboration, resolve};
 use crate::facade::config::{ModelConfig, ProviderConfig};
 use crate::facade::delegate::{
     AgentWorkerBuilder, DISPATCHER_ESCALATE_MARKER, Delegation, DelegationRecorder,
@@ -316,6 +316,7 @@ impl Agent {
                 self.ids.clone(),
                 recorder.clone(),
                 self.approval.clone(),
+                self.collab_bridge(),
             ),
             interaction: self.approval.clone(),
         };
@@ -462,6 +463,17 @@ impl Agent {
             .route(&self.delegates, &self.external_agents)
     }
 
+    /// Builds the collab bridge a run-scoped [`DelegationToolHandler`] hands to a
+    /// driven managed external delegate so its `send_message` / `plan_update` /
+    /// `blackboard_post` observations reflect into the provisioned substrate
+    /// (§14 末段). The bridge shares the same live primitives the accessors
+    /// return, so a caller reading [`mailbox`](Self::mailbox) /
+    /// [`blackboard`](Self::blackboard) / [`plan`](Self::plan) sees the bridged
+    /// writes.
+    fn collab_bridge(&self) -> CollabBridge {
+        CollabBridge::from_state(&self.collab)
+    }
+
     /// Returns the supervisor's own model, substituted into any inheriting child
     /// spec when a delegation is fulfilled (R4).
     fn supervisor_model(&self) -> ModelRef {
@@ -499,6 +511,7 @@ impl Agent {
             self.ids.clone(),
             recorder,
             self.approval.clone(),
+            self.collab_bridge(),
         ))
     }
 

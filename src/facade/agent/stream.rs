@@ -155,6 +155,7 @@ pub(super) fn start(
                 agent.ids.clone(),
                 recorder.clone(),
                 agent.approval.clone(),
+                agent.collab_bridge(),
             ),
             recorder: recorder.clone(),
             sink: sink.clone(),

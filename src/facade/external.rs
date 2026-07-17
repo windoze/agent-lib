@@ -76,6 +76,7 @@ use crate::agent::{
 };
 use crate::conversation::{Conversation, ConversationConfig};
 use crate::facade::agent::final_turn_summary;
+use crate::facade::collab::CollabBridge;
 use crate::facade::delegate::DEFAULT_MAX_DELEGATION_DEPTH;
 use crate::facade::error::FacadeError;
 use crate::facade::ids::FacadeIds;
@@ -941,7 +942,8 @@ pub(crate) struct ExternalDriveOutcome {
 /// A shared, single-slot capture of an [`ExternalDriveOutcome`].
 type ExternalOutcomeSlot = Arc<Mutex<Option<ExternalDriveOutcome>>>;
 
-/// Wraps an [`ExternalAgentMachine`] to capture its terminal facts.
+/// Wraps an [`ExternalAgentMachine`] to capture its terminal facts and bridge
+/// its collab observations.
 ///
 /// The [`SubagentSpawner`] only observes the drained [`TurnDone`], never the
 /// child machine state, so this wrapper snapshots the current
@@ -951,9 +953,19 @@ type ExternalOutcomeSlot = Arc<Mutex<Option<ExternalDriveOutcome>>>;
 /// [`cleanup_required`](ExternalAgentState::cleanup_required) marker. The
 /// [`drive_external`] caller then reads the slot to fold the result back and
 /// record the delegation trace, artifacts, and usage.
+///
+/// Every step's notifications are also handed to the [`CollabBridge`], which
+/// reflects the delegate's `send_message` / `plan_update` / `blackboard_post`
+/// observations into the facade's provisioned collab substrate (§14 末段). A
+/// machine replays each observation exactly once (design §5.5), so the bridge
+/// absorbs each collab event a single time.
 struct RecordingExternalMachine {
     inner: ExternalAgentMachine,
     slot: ExternalOutcomeSlot,
+    /// The delegate's name, attributed as the sender of bridged collab writes.
+    from: String,
+    /// Bridge into the facade's provisioned collab substrate.
+    bridge: CollabBridge,
 }
 
 impl AgentMachine for RecordingExternalMachine {
@@ -971,6 +983,8 @@ impl AgentMachine for RecordingExternalMachine {
             cleanup_required: state.cleanup_required(),
             session: state.session().cloned(),
         });
+        self.bridge
+            .absorb_notifications(&self.from, &outcome.notifications);
         outcome
     }
 
@@ -1024,6 +1038,8 @@ struct FacadeExternalSpawner {
     ids: FacadeIds,
     task: String,
     slot: ExternalOutcomeSlot,
+    /// Bridge the child machine's collab observations flow into (§14 末段).
+    bridge: CollabBridge,
 }
 
 impl SubagentSpawner for FacadeExternalSpawner {
@@ -1059,6 +1075,8 @@ impl SubagentSpawner for FacadeExternalSpawner {
         let recording = RecordingExternalMachine {
             inner: machine,
             slot: self.slot.clone(),
+            from: self.name.clone(),
+            bridge: self.bridge.clone(),
         };
 
         let scope = ExternalChildScope {
@@ -1120,6 +1138,7 @@ pub(crate) async fn drive_external(
     agent: &ManagedExternalAgent,
     ids: &FacadeIds,
     task: String,
+    collab: &CollabBridge,
     ctx: &RunContext,
 ) -> Result<ExternalDriveOutcome, FacadeError> {
     let Some(handler) = agent.session_handler() else {
@@ -1154,6 +1173,7 @@ pub(crate) async fn drive_external(
         ids: ids.clone(),
         task: task.clone(),
         slot: slot.clone(),
+        bridge: collab.clone(),
     });
     let handler = DrivingSubagentHandler::new(spawner, DEFAULT_MAX_DELEGATION_DEPTH);
 
@@ -1416,6 +1436,7 @@ mod tests {
             BudgetLimits, ExternalSessionHandler, ExternalSessionRequest, RequirementResult,
             RunContext,
         };
+        use crate::facade::collab::CollabBridge;
         use crate::facade::ids::FacadeIds;
         use async_trait::async_trait;
         use std::sync::Arc;
@@ -1448,9 +1469,16 @@ mod tests {
         );
         ctx.cancellation().cancel();
 
-        let outcome = drive_external("coder", &coder, &ids, "refactor".to_owned(), &ctx)
-            .await
-            .expect("a cancelled drive still returns its captured outcome");
+        let outcome = drive_external(
+            "coder",
+            &coder,
+            &ids,
+            "refactor".to_owned(),
+            &CollabBridge::default(),
+            &ctx,
+        )
+        .await
+        .expect("a cancelled drive still returns its captured outcome");
 
         // The abandoned session left a cleanup marker for the handle layer to
         // sweep, and never reached a completed state (design §6.4).
