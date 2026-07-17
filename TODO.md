@@ -120,7 +120,7 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   0 failed）✅；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✅；`git diff --check` 干净 ✅。
 
 
-### [TODO] M1-2 `Reply` / `RunOutput` / `UsageSummary` / `RunEvent` / `IntoUserMessage`
+### [DONE] M1-2 `Reply` / `RunOutput` / `UsageSummary` / `RunEvent` / `IntoUserMessage`
 
 **上下文**：
 
@@ -151,6 +151,43 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   `RunOutput.response`）；`IntoUserMessage` 四种输入产出等价 `Message`；`UsageSummary` 聚合求和正确。
 - 聚焦：`cargo test -p agent-lib facade::run`。
 - 完整验证序列 1、3、5、6（步骤 2 用聚焦名）。
+
+**完成记录**：
+
+- 新建 `src/facade/run.rs`：
+  - `Reply { text, usage: Option<Usage>, stop_reason: Option<StopReason> }` + `text()/usage()/stop_reason()`。
+    spec §6.1 写 `TokenUsage`，但本 crate 无该类型（TODO 已授权「确认实际类型名」）→ 采用
+    `model::usage::Usage`；`stop_reason` 取 `Response.stop_reason.value`（`Normalized<StopReason>` 的归一值）。
+    文本聚合 `aggregate_text` 只拼接 `ContentBlock::Text`，其余（tool-use/image/thinking）不进 `text` 但
+    完整保留在 `RunOutput.response`。构造走 `impl From<&Response> for Reply`（公开、惯用、避免 dead_code）。
+  - `RunOutput { reply, response: Option<Response>, usage: UsageSummary, tool_calls: Vec<ToolTrace>,
+    delegations: Vec<DelegationTrace>, artifacts: Vec<ArtifactRef>, events: Vec<RunEvent> }`，
+    `impl From<Response> for RunOutput`（M1 只填 supervisor usage，其余 Vec 空）。
+  - `UsageSummary { supervisor, subagents, external: Usage }` + `from_supervisor/total/add_supervisor/
+    add_subagent/add_external`（`total()` 用 `Usage::merge` 求和；M1 只填 supervisor）。
+  - `RunEvent` 枚举全变体现在就定死：`TextDelta/ToolStarted/ToolFinished/ApprovalRequested/
+    DelegationStarted/DelegationProgress/DelegationMessage/DelegationArtifact/DelegationFinished/
+    DelegationFailed/Escalated/Done(Box<RunOutput>)/RawStream(StreamEvent)/RawNotification(Notification)`；
+    M1 只有 `TextDelta/Done/RawStream/RawNotification` 有实义，其余占位待 M2–M5 填。
+  - 最小占位类型（`#[non_exhaustive]`，rustdoc 注明后续 milestone 填充）：`ToolTrace{name,call_id}`、
+    `ApprovalRequest{tool_name}`、`DelegationTrace{delegate}`、`DelegationProgress{delegate,message}`、
+    `DelegationMessage{delegate,message}`、`ArtifactRef{path}`、`EscalationTrace{from,to}`。
+  - `IntoUserMessage` trait + 4 impl（`&str`/`String`/`Message`/`Vec<ContentBlock>` → user `Message`）。
+- **R7（序列化承诺）**：`RunEvent`/`RunOutput` 不 derive serde（`RawStream`/`RawNotification` 逃生舱不作稳定
+  序列化契约，且 `RunOutput` 内含 `Vec<RunEvent>`）；归一化叶子类型（`Reply`/`UsageSummary`/各 trace 占位）
+  仍 derive `Serialize+Deserialize`。rustdoc 已注明该取舍。
+- **spec 取舍（供 M1-R 记录）**：①`Reply.usage` 用 `Usage` 而非 spec 的 `TokenUsage`（后者不存在）；
+  ②`RunEvent::Done` 采 `Box<RunOutput>`（clippy `large_enum_variant`；spec §6.3 写不带 Box，Deref 后
+  字段访问一致，示例不受影响）。
+- `src/facade/mod.rs` 重导 `run::{Reply, RunOutput, UsageSummary, RunEvent, IntoUserMessage, ToolTrace,
+  ApprovalRequest, DelegationTrace, DelegationProgress, DelegationMessage, ArtifactRef, EscalationTrace}`；
+  `src/prelude.rs` 补 `Reply, RunEvent, RunOutput`（对齐 `docs/facade-api.md` §3 prelude 列表）。
+- 单元测试（`src/facade/run/tests.rs`，5 个，全离线）：Reply 多 text block 顺序聚合 + usage/stop_reason 映射；
+  `RunOutput.response` 保留非文本 tool-use 且 M1 各 Vec 空、supervisor usage 正确；`IntoUserMessage` 四输入
+  产等价 `Message`；`UsageSummary::total` 三片求和；`from_supervisor`+`add_*` 累加。
+- 验证：`cargo fmt --all -- --check` ✅；`cargo test -p agent-lib --lib facade::run` 5 passed ✅；
+  `cargo clippy --all-targets -- -D warnings` ✅；`cargo test --all --all-targets` 全绿（50 组 test result: ok，
+  0 failed）✅；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✅；`git diff --check` 干净 ✅。
 
 ### [TODO] M1-3 `Chat` / `ChatBuilder` + `ask` / `ask_full`（one-shot，无 tool-use）
 

@@ -12,6 +12,9 @@
 //!   lower-layer error `source` ([`error`]).
 //! - [`FacadeIds`] — a built-in monotonic identity source, since the library
 //!   core never mints ids itself ([`ids`]).
+//! - [`Reply`], [`RunOutput`], [`UsageSummary`], [`RunEvent`], and
+//!   [`IntoUserMessage`] — the shared result, usage, event, and input types
+//!   returned and accepted by every run entry point ([`run`]).
 //!
 //! Later milestones add the `Chat`/`ChatSession`, `Agent`/`AgentSession`,
 //! subagent, managed-external-agent, dispatcher, and collaboration facades on
@@ -20,7 +23,12 @@
 pub mod config;
 pub mod error;
 pub mod ids;
+pub mod run;
 
 pub use config::{ModelConfig, ProviderConfig, ProviderConfigBuilder};
 pub use error::FacadeError;
 pub use ids::FacadeIds;
+pub use run::{
+    ApprovalRequest, ArtifactRef, DelegationMessage, DelegationProgress, DelegationTrace,
+    EscalationTrace, IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary,
+};

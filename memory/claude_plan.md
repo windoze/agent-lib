@@ -1,56 +1,55 @@
-# M1-1 建 facade 模块骨架 + 内建 id source + ProviderConfig + ModelConfig + FacadeError
+# M1-2 Reply / RunOutput / UsageSummary / RunEvent / IntoUserMessage
 
-**当前任务 = TODO.md 首个未完成 = M1-1**（`### [TODO] M1-1`）。
-上一工作线（Managed External Agent，M1..M10 + H-1）已全部 `[DONE]` 并归档。
-本轮开始新的 Facade API 落地任务单（`docs/facade-api.md` 为唯一设计输入）。
+**当前任务 = TODO.md 首个未完成 = M1-2**（`### [TODO] M1-2`）。M1-1 已 `[DONE]`。
+唯一设计输入：`docs/facade-api.md` §5.2、§6。装配层，不新增 effect family。
 
-## 目标（TODO.md M1-1「做什么」）
+## 目标（TODO.md M1-2「做什么」）
 
-1. `src/lib.rs` 加 `pub mod facade;` + `pub mod prelude;`。
-2. 建 `src/facade/{mod.rs, config.rs, ids.rs, error.rs}` + `src/prelude.rs`。
-3. `ProviderConfig`（config.rs）：包 `EndpointConfig` + `ProviderId`；构造器
-   `anthropic_from_env()` / `openai_from_env()` / `anthropic()` / `openai()` builder / `custom(..)`；
-   凭据不 debug/log/persist（手写脱敏 Debug）。
-4. `ModelConfig`（config.rs）：`new(model).max_tokens(u32).temperature(f32)`；`to_model_ref()`→`ModelRef`；
-   `apply_to_request(&mut ChatRequest)` helper。
-5. `FacadeError`（error.rs）：M1 变体 `Config(String)`、`Client(ClientError)`、`Conversation(ConversationError)`、
-   `UnexpectedToolUse`、`InvalidState(String)`；`#[non_exhaustive]`；impl Error+Display 保留 source；
-   rustdoc 注明后续 milestone 增补。
-6. `FacadeIds`（ids.rs）：内建单调计数器 → `uuid::Uuid::from_u128`（从 1 起），实现 `RequirementIds`+
-   `ToolExecutionIds`，并生成 `ConversationId/TurnId/MessageId/ToolCallId/StepId/AgentId/RunId/ToolSetId/TraceNodeId`。
-7. prelude 先只重导已存在类型：`ProviderConfig, ModelConfig`（Chat/ChatSession/Reply/RunOutput/RunEvent 后续补）。
-8. 全部公开项带 rustdoc（lib.rs 已开 `#![warn(missing_docs)]`）。
+1. 新建 `src/facade/run.rs`：
+   - `Reply { text: String, usage: Option<Usage>, stop_reason: Option<StopReason> }`
+     + `text()/usage()/stop_reason()`；`text()` 聚合 `Response` 的 Text blocks。
+     （spec 写 `TokenUsage` 但代码无此类型；TODO 注「确认实际类型名」→ 用 `model::usage::Usage`。）
+   - `RunOutput { reply, response: Option<Response>, usage: UsageSummary, tool_calls: Vec<ToolTrace>,
+     delegations: Vec<DelegationTrace>, artifacts: Vec<ArtifactRef>, events: Vec<RunEvent> }`。
+   - `UsageSummary { supervisor, subagents, external: Usage }` + `from_supervisor/total/add_*`（M1 只填 supervisor）。
+   - `RunEvent`（枚举，全变体现在就定死避免后续破坏）：TextDelta/ToolStarted/ToolFinished/
+     ApprovalRequested/DelegationStarted/DelegationProgress/DelegationMessage/DelegationArtifact/
+     DelegationFinished/DelegationFailed/Escalated/Done(RunOutput)/RawStream(StreamEvent)/RawNotification(Notification)。
+     M1 只有 TextDelta/Done/RawStream/RawNotification 有实义，其余占位。
+2. 最小占位类型（放 run.rs）：`ToolTrace/ApprovalRequest/DelegationTrace/DelegationProgress/
+   DelegationMessage/ArtifactRef/EscalationTrace`，`#[non_exhaustive]`，rustdoc 注明后续 milestone 填充。
+   M1 里 RunOutput 对应 Vec 默认空。
+3. `IntoUserMessage` trait + 4 impl：`&str`/`String`/`Message`/`Vec<ContentBlock>` → user `Message`。
+4. R7：RunEvent 归一化变体尽量可序列化；Raw* 标注非序列化承诺 → RunEvent 不 derive Serde；
+   叶子数据类型（Reply/UsageSummary/traces）可 derive Serialize+Deserialize。
+5. 全部公开项带 rustdoc。
+6. mod.rs 重导 Reply/RunOutput/UsageSummary/RunEvent/IntoUserMessage + trace 占位类型；
+   prelude 补 Reply/RunOutput/RunEvent（§3 列表）。
 
 ## 已核实代码锚点
 
-- `client::{EndpointConfig, AuthScheme}`（src/client/config.rs）。`EndpointConfig{base_url, auth, query_params, extra_headers}`。
-- `client::ChatRequest`（src/client/request.rs）字段 model/messages/tools/system/max_tokens/temperature/stream/provider_extras。
-- `client::ClientError`（src/client/error.rs）。
-- `model::extras::{ProviderId, ProviderExtras}`（src/model/extras.rs）；`ProviderId::{Anthropic, OpenAiResp}`（`#[non_exhaustive]`）。
-- `agent::ModelRef::new(model, NonZeroU32 max_tokens, Option<f32>, Option<ProviderExtras>)`（src/agent/spec.rs）。
-- `conversation::ConversationError`（src/conversation/error.rs）。
-- id 构造器 `X::new(uuid::Uuid)`；`TraceNodeId::new(impl Into<String>)`。
-- id trait：`RequirementIds::next_requirement_id(&self, RequirementKindTag)->Result<RequirementId,RequirementError>`；
-  `ToolExecutionIds::{tool_call_id, tool_result_message_id, next_assistant_message_id, next_step_id}`。
-- 现有样板 `examples/agent_chat.rs` 的 `DemoIds`（本轮抽成库内 `FacadeIds`）。
-- env 约定（对齐 examples/support）：
-  - Anthropic：ANTHROPIC_BASE_URL(必) ANTHROPIC_AUTH_TOKEN(必, Bearer) ANTHROPIC_VERSION(可选 def 2023-06-01)→ header anthropic-version。
-  - OpenAI：OPENAI_BASE_URL(必) OPENAI_API_KEY(必, Header api-key) OPENAI_API_VERSION(可选 def 2025-04-01-preview)→ query api-version。
-- `uuid`、`thiserror` 均为正式依赖（非 dev-only）。
+- `client::Response { message: Message, usage: Usage, stop_reason: Normalized<StopReason>, extra }`（src/client/response.rs，`crate::client::Response`）。
+- `model::usage::Usage`（derive Serialize + 自定义 Deserialize；有 `merge`、`total_computed`；Clone/Debug/Default/PartialEq/Eq）。
+- `model::normalized::{Normalized<T>{value,raw}, StopReason}`（StopReason: Copy/Eq/Serialize/Deserialize）。
+- `model::message::{Message{role,content}, Role}`；`model::content::ContentBlock::Text{text,extra}`（enum tag=type）。
+- `stream::StreamEvent`（`crate::stream::StreamEvent`，Serialize/Deserialize/Clone/Debug/PartialEq/Eq）。
+- `agent::Notification`（`crate::agent::Notification`，同上派生）。
+- 无 `TokenUsage` 类型 → 用 `Usage`（TODO 已授权确认实际类型名）。
 
-## 验证（TODO.md M1-1）
+## 验证（TODO.md M1-2）
 
-- 单元测试：ProviderConfig::custom/builder 生成正确 EndpointConfig+ProviderId；env 缺变量→FacadeError::Config
-  （用临时 env，不落真凭据）；ModelConfig::to_model_ref 与 ChatRequest 字段映射正确；ProviderConfig/凭据 Debug 无明文 key。
-- 聚焦：`cargo test -p agent-lib facade::config`。
-- 序列 1(cargo fmt --all -- --check)、3(cargo clippy --all-targets -- -D warnings)、
-  5(RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace)、6(git diff --check)；步骤 2 用聚焦名；步骤 4 视改动运行。
+- 单测：Reply::text() 多 text block 聚合正确、非文本 content 不丢（保留在 RunOutput.response）；
+  IntoUserMessage 四种输入产等价 Message；UsageSummary 聚合求和正确。
+- 聚焦：`cargo test -p agent-lib facade::run`。
+- 完整序列 1(fmt --check)、3(clippy -D warnings)、4(cargo test --all --all-targets)、
+  5(RUSTDOCFLAGS=-D warnings doc)、6(git diff --check)。步骤 2 用聚焦名。
 
 ## 执行步骤
 
-1. [x] 读 TODO M1-1、锚点类型、facade-api.md §3/§4/§16。
-2. [x] 建 4 个 facade 文件 + prelude.rs，改 lib.rs。
-3. [x] 写单元测试（config：builder/custom/env-missing/debug 脱敏/model-ref/chatrequest 映射）。
-4. [x] fmt → clippy → 聚焦测试 → doc → git diff --check。
-5. [x] TODO.md 把 M1-1 标 [DONE] + 完成记录。
-6. [~] commit（进行中） [M1-1] ...，停。
+1. [x] 读 TODO M1-2 + 锚点类型 + facade-api §3/§5.2/§6 + PLAN R7。
+2. [x] 写 src/facade/run.rs（类型 + `From` 构造器 + IntoUserMessage + 占位类型 + rustdoc）+ run/tests.rs。
+3. [x] mod.rs / prelude.rs 补重导。
+4. [x] fmt ✅ / clippy -D warnings ✅（Done 改 Box<RunOutput> 消 large_enum_variant）/ 聚焦 5 passed ✅ /
+       cargo test --all --all-targets 50 组 ok ✅ / doc ✅ / git diff --check ✅。
+5. [x] TODO.md 标 M1-2 [DONE] + 完成记录（含 TokenUsage→Usage、Box 两处 spec 取舍留给 M1-R）。
+6. [~] commit `[M1-2] ...`，停（进行中）。
