@@ -2592,7 +2592,7 @@ capability model 明确降级。
   5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features external-opencode` 通过。
   6. `git diff --check` 干净。
 
-### [TODO] M8-4 Review：OpenCode adapter 正确性检查
+### [DONE] M8-4 Review：OpenCode adapter 正确性检查
 
 **上下文**:
 
@@ -2614,7 +2614,60 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
 - `git diff --check`
 - 完成记录中列出 OpenCode 支持/不支持能力和真实 e2e 状态。
 
----
+**完成记录**:
+
+- **性质**:纯 review + 文档更新任务。逐项核对 M8-1/2/3 落地的 OpenCode adapter 源码,并与 Claude Code /
+  Codex adapter 三方对比,确认共享同一 `ExternalRuntimeAdapter`/`ExternalRuntimeSession` trait 与
+  `ExternalCapability` 语义、无 workaround、无 spec 偏离,**未发现需修复的缺陷**,故不改任何代码,仅更新
+  `docs/capability-matrix.md`。
+- **trait 实现一致(已核对源码)**:三者都 impl `ExternalRuntimeAdapter`(kind/capabilities/start/resume)
+  + `ExternalRuntimeSession`(session_ref/advance/shutdown)。**Codex 与 OpenCode 同构**(自主、一进程/一 turn):
+  `begin`/`read_line`/`drain_and_emit`/`spawn_follow_up_turn`/`finish`(仅 `Completed`/`Failed`)/`advance`
+  (cancel→`SessionLost`)/`shutdown`(close stream 或 `Graceful`)结构逐行一致;`OpenCodeLauncher`/
+  `OpenCodeTurnStream` 镜像 `CodexLauncher`/`CodexTurnStream`。**Claude Code 的差异是设计意图**——常驻 stdio
+  进程(非一进程/一 turn),`finish` 多出 `PausedForToolCalls`/`PausedForInteraction` 臂(permission bridge),
+  `write_input` 替代 `spawn_follow_up_turn`,`shutdown` 直接关 io。
+- **capability fallback 一致**:三者 `new()`→`implemented_capabilities()`;`with_probed_capabilities()`→
+  `intersect_capabilities()`(逐位 AND,helper 三份逐行一致);`reject_unsupported_tools`(host_tools 门禁)+
+  `turn_message` 拒绝式(PermissionBridge/HostTools/HostSubagents→`UnsupportedCapability`,Shutdown→`Protocol`)
+  三份一致。唯一能力差异 = `permission_bridge`(Claude=`true` 权限控制通道;Codex/OpenCode=`false` 自主),
+  由 capability model 显式暴露、非静默假装。
+- **parser cassette 覆盖层级一致**:三份 `agent_<rt>_cassette.rs` 各 7 个并行层(regenerate_fixture /
+  matches_in_code_builder / is_secret_free / decodes_full_session / tolerates_unknown_and_blank_frames /
+  rejects_malformed_frames / decodes_*_as_failed),各有 committed fixture
+  `tests/fixtures/external/<rt>/full_session.json`。inline adapter 单测同构(advance/session-lost/protocol-error/
+  shutdown/respond-unsupported/resume-defers/rejects-declared-tools/caps 三件套);OpenCode 多一个
+  `resume_survives_a_session_that_never_re_reports_its_id`(OpenCode 无 init 帧、sessionID 随帧惰性到达,合理)。
+- **cleanup/trace 一致**:三者 `advance` 均先 `ctx.is_cancelled()`→`SessionLost`;`shutdown`→
+  `ExternalSessionShutdown`(关 stream/io,turn 间无进程返回 `Graceful`);生产 launcher 均 `stderr=null`、
+  `stdin=null`、`kill_on_drop(true)`。adapter 层不自发 tracing——trace 经 `RunContext` trace node 透传;
+  与 Claude Code 用 `ctx.run_id()` 建 `StepId` 关联 permission 不同,Codex/OpenCode 自主运行不需宿主 run/step
+  id 关联(`start`/`resume` 的 `ctx` 未用即 `_ctx`),decode context 只按 config/worktree 的 cwd 给 `bash`/
+  `command_execution` 观测补目录,绝不取自 model 输出——**刻意且诚实的差异**。
+- **OpenCode 支持/不支持能力(诚实反映 M8-2,非 workaround)**:
+  - **支持(`new()` 实报 `true`)**:`streaming`、`resume`、`artifacts`、`usage`、`graceful_shutdown`。
+  - **不支持(恒 `false`)**:`permission_bridge`、`host_tools`、`host_subagents`——`opencode run --format json`
+    自主运行、按 `--auto` 解审批、自己执行工具,流里无 host-pausable 帧。声明 `tools` 的 `start`/`resume` 以
+    `UnsupportedCapability{HostTools}` 拒绝;follow-up 的 `RespondToolResults`→`{HostTools}`、
+    `RespondSubagent`→`{HostSubagents}`、`RespondInteraction`→`{PermissionBridge}` 均拒绝而非静默忽略。
+  - `with_probed_capabilities` 把上述实报位与本机 probe 逐位 AND(host bridge 三项无论 probe 恒 `false`)。
+- **真实 e2e 状态**:`tests/external_opencode.rs`(`#[ignore]`,`OPENCODE_BIN`/PATH 发现,缺 binary/登录自跳过
+  退绿),**本机 opencode 1.17.15 实跑通过**(M8-3 记录):`BypassPermissions`/`--auto` 驱动
+  probe→start→advance→completion→graceful shutdown,在 `--dir` 临时 worktree 内生成 `READY.txt` 并断言其
+  **不泄漏**进启动它的 checkout(worktree 隔离),6 个观测事件、约 20s。e2e 覆盖 streaming(sink 多事件)+
+  graceful_shutdown(断言 `Graceful`)+ worktree 隔离;resume 由离线单测覆盖(真机 e2e 单 turn 未跑 resume);
+  artifacts/usage 由离线 cassette + 单测覆盖。三份 e2e(claude/codex/opencode)结构一致(envrc 加载、
+  command_available green-skip、drive_session 同形)。
+- **文档**:`docs/capability-matrix.md` 把 OpenCode「实报能力」小节标注为「M8-3 落地、**M8-4 review 定案**」,
+  并在 OpenCode e2e 状态段后新增「**三个 runtime adapter 统一接入路径对照(M8-4 review 定案)**」表——逐维
+  (进程模型 / trait / decision 臂 / capability fallback / host-tool 门禁 / permission_bridge / 其余能力 /
+  cassette 层级 / inline 单测 / cleanup / trace / 真机 e2e)对比三方,并给结论:四维一致、唯一差异 = Claude
+  常驻进程 + `permission_bridge`。末尾「各 runtime 当前声明」保守基线 `none()` 表本身不改(它忠实表示默认构建)。
+- **验证(全过)**:`cargo fmt --all -- --check` 干净;`cargo clippy --all-targets --features external-opencode
+  -- -D warnings` 0 warning;`cargo test --features external-opencode -p agent-lib --lib opencode` 32 passed;
+  `cargo test --features external-opencode --test agent_opencode_cassette` 7 passed(opencode_cassette_*);
+  `cargo test --all --all-targets` 全 ok、exit 0、0 failed;`git diff --check` 干净。(源码自 M8-3 绿跑后未变,
+  本任务仅改 `docs/*.md`;仍重跑上述以完成 review 签核。)
 
 ## Milestone 9 — worktree/budget/reconfig/docs/real mixed e2e hardening
 

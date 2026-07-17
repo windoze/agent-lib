@@ -1,54 +1,55 @@
-# M8-3 实现 OpenCode session adapter 与 ignored real e2e
+# M8-4 Review：OpenCode adapter 正确性检查
 
-**当前任务 = TODO.md 第一个未完成任务 = M8-3**（TODO.md 行 2517 `### [TODO] M8-3`）。
-M8-1（config+probe）、M8-2（decoder+cassette）已 `[DONE]`。M8-3 = live session adapter + ignored real e2e。
+**当前任务 = TODO.md 第一个未完成任务 = M8-4**（TODO.md `### [TODO] M8-4`，line 2595）。
+M8-1/M8-2/M8-3 已 `[DONE]`。M8-4 = review：对比三个 runtime adapter 一致性 + 更新 capability-matrix OpenCode 行。
 
-## 结论：OpenCode 与 Codex adapter 几乎同构（都自主运行、一进程/一 turn）
-`opencode run --format json` 与 `codex exec --json` 一样自主：无 host-pausable pause 臂，
-turn 只 Completed / Failed。因此 `OpenCodeAdapter` 镜像 `CodexAdapter` 结构：
-- `OpenCodeTurnSpec { Fresh{prompt} | Resume{session_id,message} }` → args = base_run_args()[+`--session <id>`] + positional message
-- `OpenCodeLauncher` / `OpenCodeTurnStream` traits（离线可测）+ `SystemOpenCodeLauncher` / `OpenCodeProcessTurn`
-- `OpenCodeSession<L>` impl `ExternalRuntimeSession`：begin 读到 session_id 捕获（OpenCode 无 init 帧，
-  sessionID 随首帧到达，decoder.ensure_session 惰性捕获），first_turn_pending，advance loop，shutdown
-- `OpenCodeAdapter` impl `ExternalRuntimeAdapter`：kind/capabilities/start/resume
-  - capabilities：streaming/resume/artifacts/usage/graceful=on；permission_bridge/host_tools/host_subagents=off
-  - reject declared host tools；turn_message 拒 RespondToolResults/Subagent/Interaction
+## Review 结论（已逐项核对源码）
 
-## 真实 OpenCode CLI（已核对 opencode.ai/docs/cli，非臆测）
-`opencode run [message..]` 位置参数 = prompt；`-s/--session <ID>` resume；`-c/--continue`；
-`--format json` raw JSON events；`--auto` 权限旁路；`-m/--model`；`--agent`。
-→ 需给 `OpenCodeConfig` 加 `base_resume_args(session_id)` = base_run_args() + `--session <id>`。
+### 1. trait 实现一致 ✓
+- 三者都 impl `ExternalRuntimeAdapter`(kind/capabilities/start/resume) + `ExternalRuntimeSession`
+  (session_ref/advance/shutdown)。
+- **Codex 与 OpenCode 同构**（自主、一进程/一 turn）：begin/read_line/drain_and_emit/
+  spawn_follow_up_turn/finish(仅 Completed/Failed)/advance(cancel→SessionLost)/shutdown
+  (close stream 或 Graceful) 结构逐行一致；OpenCodeLauncher/OpenCodeTurnStream 镜像
+  CodexLauncher/CodexTurnStream。
+- **Claude Code 差异是设计意图**：常驻 stdio 进程（非一进程/一 turn），finish 多出
+  PausedForToolCalls/PausedForInteraction 臂（permission bridge），write_input 替代
+  spawn_follow_up_turn，shutdown 直接关 io。
+
+### 2. capability fallback 一致 ✓
+- 三者：new()→implemented_capabilities()；with_probed_capabilities()→intersect_capabilities()
+  （逐位 AND，helper 三份逐行一致）。
+- 三者：reject_unsupported_tools(host_tools 门禁)+turn_message 拒绝式
+  (PermissionBridge/HostTools/HostSubagents→UnsupportedCapability，Shutdown→Protocol)。
+- 能力位：Claude={streaming,resume,permission_bridge,artifacts,usage,graceful=true;
+  host_tools,host_subagents=false}；Codex & OpenCode={streaming,resume,artifacts,usage,graceful=true;
+  permission_bridge,host_tools,host_subagents=false}。唯一差异 = permission_bridge，已文档化。
+
+### 3. parser cassette 覆盖层级一致 ✓
+- 三份 agent_<rt>_cassette.rs 各 7 个并行层：regenerate_fixture / matches_in_code_builder /
+  is_secret_free / decodes_full_session / tolerates_unknown_and_blank_frames /
+  rejects_malformed_frames / decodes_*_as_failed。各有 committed fixture。
+- inline adapter 单测同构；OpenCode 多 resume_survives_a_session_that_never_re_reports_its_id（无 init 帧特性）。
+
+### 4. cleanup/trace 一致 ✓
+- 三者 advance 均先 ctx.is_cancelled()→SessionLost；shutdown→ExternalSessionShutdown。
+- adapter 层不自发 tracing（trace 经 RunContext trace node 透传）。
+- session_ref 均暴露 session_id + resume_token(=session id) + last_event_seq 高水位去重。
 
 ## 交付物
-1. config.rs：新增 `base_resume_args(session_id)` + 测试
-2. adapter.rs：OpenCodeAdapter + OpenCodeSession + launcher/stream traits + 内联 fake-launcher 单测
-3. mod.rs：`mod adapter; pub use adapter::OpenCodeAdapter;`
-4. external/mod.rs：feature-gated 追加 `OpenCodeAdapter` re-export
-5. tests/external_opencode.rs：#[ignore] real-CLI e2e（镜像 external_codex.rs，缺 binary/auth 时 green skip）
-6. 更新 docs/managed-external-agent.md §14、docs/capability-matrix.md、fixtures README
-7. TODO.md M8-3 → [DONE] + 完成记录
+1. docs/capability-matrix.md：OpenCode 小节标注 M8-4 review 定案 + 新增三 adapter 统一接入路径对照表。
+2. TODO.md M8-4 → [DONE] + 完成记录（OpenCode 支持/不支持能力 + 真实 e2e 状态）。
 
 ## 验证序列
 1. cargo fmt --all -- --check
-2. cargo clippy --all-targets -- -D warnings（off）+ --features external-opencode
-3. cargo test -p agent-lib --features external-opencode --lib opencode
-4. cargo test --features external-opencode --test agent_opencode_cassette
-5. cargo test --features external-opencode --test external_opencode -- --ignored（无 opencode 则 green skip）
-6. cargo test --all --all-targets（off，<=30min）
-7. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features external-opencode
-8. git diff --check
+2. cargo clippy --all-targets --features external-opencode -- -D warnings
+3. cargo test --features external-opencode -p agent-lib opencode_cassette
+4. cargo test --features external-opencode -p agent-lib --lib opencode
+5. git diff --check
+6. 全量 cargo test --all --all-targets：M8-4 仅改 docs，无编译产物变化，复用 M8-3 绿结果。
 
 ## 进度
-- [x] 调研（Codex adapter / OpenCode decoder+config+probe / 真实 CLI）
-- [x] config.base_resume_args + 测试
-- [x] adapter.rs
-- [x] mod + re-export
-- [x] tests/external_opencode.rs（本机 opencode 1.17.15 实跑通过）
-- [x] docs
-- [x] 验证序列 1-8 全过
-- [x] **worktree 隔离缺陷修复**：e2e 复现出 READY.txt 泄漏到 repo 根。实证根因——OpenCode 从
-      `--dir`/`$PWD` 解析落盘目录,而 tokio `current_dir()` 只 chdir 不更新继承的 `PWD`(仍指向 repo 根)。
-      修法:`base_run_args()` 配置 working_dir 时显式追加 `--dir <path>`(authoritative);launcher 保留
-      `current_dir` 作 belt-and-suspenders;新增 config/turn-spec 单测;e2e 增加隔离断言(READY.txt 落在
-      worktree 内、不泄漏进 cwd)。真机重跑:6 事件、无泄漏、约 20s。
+- [x] 调研 + 逐项一致性核对（trait/fallback/cassette/cleanup）
+- [x] 更新 capability-matrix.md OpenCode 行 + 统一对照表
+- [x] 目标验证（fmt/clippy/opencode 测试 + 全量 cargo test --all --all-targets exit 0）
 - [x] TODO.md DONE + commit

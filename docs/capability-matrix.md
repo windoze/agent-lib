@@ -202,7 +202,7 @@ tool/subtask/completion/error;live adapter 与真机 e2e 仍待 M8-3。
 `OpenCodeLauncher`/`OpenCodeTurnStream` trait 离线跑通(fresh+resume+shutdown),生产 `SystemOpenCodeLauncher`
 用 `tokio::process`(stdin=null、stderr 丢弃、每读超时、kill_on_drop)。
 
-**OpenCode live adapter 实报能力（M8-3,feature `external-opencode`）**——下表列的是
+**OpenCode live adapter 实报能力（M8-3 落地、M8-4 review 定案，feature `external-opencode`）**——下表列的是
 `OpenCodeAdapter::new()` **实报**的能力(与末尾「各 runtime 当前声明」的保守基线 `none()` 不同);
 `with_probed_capabilities` 会把这些实报位与本机 probe 逐位 AND,故某项能力只有 adapter 实现且 probe 也广告时
 才最终为 `true`;host bridge 三项无论 probe 如何都恒 `false`。
@@ -222,6 +222,34 @@ tool/subtask/completion/error;live adapter 与真机 e2e 仍待 M8-3。
 以 `BypassPermissions`/`--auto` 驱动 probe→start→advance→completion→graceful shutdown,在 `--dir` 临时
 worktree 内生成 `READY.txt` 并断言其**不泄漏**进启动它的 checkout(worktree 隔离,详见 §14),
 6 个观测事件、约 20s);缺 binary/登录时该 `#[ignore]` 测试自跳过(退出为绿)。
+
+### 三个 runtime adapter 统一接入路径对照（M8-4 review 定案）
+
+OpenCode adapter 落地后三个目标 runtime（Claude Code / Codex / OpenCode）都走同一条受管接入路径。
+M8-4 review 逐项核对了源码，确认四个维度一致，唯一差异是 Claude Code 的常驻进程 + permission bridge：
+
+| 维度 | Claude Code | Codex | OpenCode | 一致性 |
+|---|---|---|---|---|
+| 进程模型 | 常驻 stdio 进程（stdin 帧续跑） | 一进程/一 turn（`exec resume`） | 一进程/一 turn（`run --session`） | Codex≡OpenCode 同构；Claude 常驻（设计意图） |
+| `ExternalRuntimeAdapter` | kind/capabilities/start/resume | 同 | 同 | ✓ 一致 |
+| `ExternalRuntimeSession` | session_ref/advance/shutdown | 同 | 同 | ✓ 一致 |
+| decision 臂（`finish`） | Completed/Failed/**PausedForToolCalls**/**PausedForInteraction** | Completed/Failed | Completed/Failed | Claude 多 host-pausable 臂（permission bridge） |
+| capability fallback | `new()`→implemented；`with_probed_capabilities()`→逐位 AND | 同 | 同 | ✓ 一致 helper |
+| host-tool 门禁 | `reject_unsupported_tools` + `turn_message` 拒绝 | 同 | 同 | ✓ 一致（`UnsupportedCapability`/`Protocol`） |
+| `permission_bridge` | `true`（权限控制通道） | `false`（自主） | `false`（自主） | **唯一能力差异**（诚实暴露） |
+| 其余能力 | streaming/resume/artifacts/usage/graceful=`true`；host_tools/host_subagents=`false` | 同 | 同 | ✓ 一致 |
+| parser cassette 层级 | 7 层（regenerate/matches/secret-free/full-session/tolerates-unknown/rejects-malformed/decodes-failed）+ committed fixture | 同 7 层 | 同 7 层 | ✓ 一致 |
+| inline adapter 单测 | advance/session-lost/protocol-error/shutdown/respond-unsupported/resume-defers/rejects-declared-tools/caps | 同 | 同（多 `resume_survives_a_session_that_never_re_reports_its_id`，因无 init 帧） | ✓ 一致 |
+| cleanup（`advance`） | `ctx.is_cancelled()`→`SessionLost` | 同 | 同 | ✓ 一致 |
+| cleanup（`shutdown`） | 关 io→`ExternalSessionShutdown` | 关 stream/Graceful | 关 stream/Graceful | ✓ 一致语义 |
+| trace | 不自发 tracing，经 `RunContext` trace node 透传 | 同 | 同 | ✓ 一致 |
+| 真机 e2e（`#[ignore]`，green-skip） | 待具备登录的机器跑绿 | codex-cli 0.144.1 实跑通过 | opencode 1.17.15 实跑通过 | ✓ 结构一致（envrc/command_available/drive_session） |
+
+**结论**：三个 adapter 的 trait 实现、capability fallback、parser cassette 覆盖层级、cleanup/trace
+均一致；`permission_bridge`（Claude=`true`，Codex/OpenCode=`false`）与 Claude 的常驻进程/host-pausable
+决策臂是唯一（且设计内的）差异，已由 capability model 显式暴露、未静默假装支持。OpenCode
+支持能力=`streaming`/`resume`/`artifacts`/`usage`/`graceful_shutdown`；不支持=`permission_bridge`/
+`host_tools`/`host_subagents`（恒 `false`）。真机 e2e：本机 opencode 1.17.15 实跑通过。
 
 ### 受管能力清单（`ExternalCapability`，共 8 项）
 
