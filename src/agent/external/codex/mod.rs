@@ -19,9 +19,14 @@
 //!   turning raw CLI frames into sequenced
 //!   [`ExternalObservedEvent`](crate::agent::external::ExternalObservedEvent)
 //!   observations and per-turn [`CodexDecision`]s.
-//! - **M7-3 (later):** the live
+//! - **M7-3 (this task):** the live
 //!   [`ExternalRuntimeSession`](crate::agent::external::ExternalRuntimeSession)
-//!   process management that wraps the decoder into start/resume/advance.
+//!   process management ([`CodexAdapter`]) that wraps the decoder into
+//!   start/resume/advance. `codex exec` is one-shot per turn (the prompt is a CLI
+//!   positional argument, not a stdin frame), so a follow-up turn is a fresh
+//!   `codex exec resume <thread_id> <message>` process; the adapter reports
+//!   host-tool, host-subagent, and permission bridging as unsupported because the
+//!   stream never pauses for the host (M7-2).
 //!
 //! The [`CodexConfig`] captures the CLI's split-flag layout: the approval policy
 //! is a top-level flag placed before the `exec` subcommand, while the sandbox
@@ -29,10 +34,12 @@
 //! here parses or re-exports Codex's private wire schema as stable public API
 //! (design 非目标): the probe reads only `--version` / `--help` / `exec --help`.
 
+mod adapter;
 mod config;
 mod decoder;
 mod probe;
 
+pub use adapter::CodexAdapter;
 pub use config::CodexConfig;
 pub use decoder::{CodexDecision, CodexDecodeContext, CodexStreamDecoder};
 pub use probe::{CodexProbeExec, CodexProbeOutput, SystemCodexExec, probe, probe_with_exec};

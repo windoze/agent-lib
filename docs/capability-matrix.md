@@ -132,8 +132,21 @@ approval（`untrusted`/`on-request`/`never`）+ sandbox（`read-only`/`workspace
 /决策并有 committed cassette(`tests/fixtures/external/codex/full_session.json`)回归。要点:codex exec 自主
 运行,自己执行工具(含 MCP)、按预设策略内部解决审批,故 decoder 每 turn 只落定 `Completed`/`Failed`,exec
 `--json` 流里**没有** host-pausable 的 tool-call / permission 帧(被拒动作表现为 `command_execution`
-`declined`)。live session adapter 与真机 e2e 待 M7-3,故下表 Codex 行仍保持保守 `false`;待该 e2e 在具备
-Codex 登录的机器上跑绿后再逐项翻真。
+`declined`)。
+
+里程碑 7-3 起,Codex adapter 把配方 + decoder 接成 feature-gated 的 **live session adapter**
+（[`CodexAdapter`](../src/agent/external/codex/adapter.rs)）:它 `start`/`resume`/`advance`/`shutdown` 真实
+`codex exec` 会话,并把观测镜像到 live sink。**关键差异**:`codex exec` 每 turn 一个一次性进程(prompt 是 CLI
+位置参数,不是 stdin 帧),续跑是全新的 `codex exec resume <thread_id> <message>` 进程;为此新增
+`CodexConfig::base_resume_args()` 把 `resume` 子命令不接受的 `-s`/`-p` 上提到顶层。其状态机由注入的
+`FakeLauncher` **离线**单测跑通(fresh + resume + 拒绝 host-bridge 输入),真机路径由 `#[ignore]` 的
+[`tests/external_codex.rs`](../tests/external_codex.rs) 覆盖(通过 `CODEX_BIN`/PATH 发现 `codex`,缺失即跳过),
+本机 codex-cli 0.144.1 **实跑通过**(以 `AcceptEdits`/`workspace-write` 生成 `READY.txt`,5 个观测事件、优雅
+关闭)。因 `codex exec --json` 自主运行、流里没有 host-pausable 帧,该 adapter 诚实报告
+`host_tools`/`host_subagents`/`permission_bridge` **恒 `false`**(声明工具的请求以
+`UnsupportedCapability{HostTools}` 拒绝,follow-up 的 `Respond*` 也明确拒绝),其余
+`streaming`/`resume`/`artifacts`/`usage`/`graceful_shutdown` 由 `new()` 报告为 `true`、或经
+`with_probed_capabilities` 与本机 probe 逐位取交。下表是保守基线(`none()`),不代表 adapter 的实报能力。
 
 里程碑 8-1 起,feature-gated 的 OpenCode adapter 同样提供了一个 **capability probe**（`external-opencode`
 下的 [`agent::external::opencode_probe`](../src/agent/external/opencode/probe.rs)）:它以**当前本机

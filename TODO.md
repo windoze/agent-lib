@@ -2231,7 +2231,7 @@ e2e。注意 Codex CLI 参数顺序必须按当前 CLI 要求验证。
 - Codex 真实 e2e 与 live session adapter 未在本任务范围(属 M7-3);本机仅回放合成 cassette,未运行真实 Codex
   会话(需登录/网络)。
 
-### [TODO] M7-3 实现 Codex session adapter 与 ignored real e2e
+### [DONE] M7-3 实现 Codex session adapter 与 ignored real e2e
 
 **上下文**:
 
@@ -2258,6 +2258,56 @@ e2e。注意 Codex CLI 参数顺序必须按当前 CLI 要求验证。
 - ignored 测试命令文档化。
 - 若本机环境具备 Codex,运行 ignored e2e 并记录结果；否则记录 skip 原因。
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- 新增 feature-gated live adapter `src/agent/external/codex/adapter.rs`(**唯一 pub 类型**
+  `CodexAdapter`),把 M7-1 配方 + M7-2 decoder 接进 M5 的 `ExternalRuntimeAdapter` /
+  `ExternalRuntimeSession` 抽象,复用 `ExternalSessionRegistry`/handler,不复制 machine 逻辑。经
+  `codex/mod.rs` 与 `external/mod.rs` 的 `#[cfg(feature = "external-codex")]` re-export `CodexAdapter`。
+- **关键差异——每 turn 一个一次性进程**(与 Claude Code 长驻 `stream-json` 进程根本不同):`codex exec` 的
+  prompt 是 CLI **位置参数**(不是 stdin 帧),进程在一个 turn 落定后退出;续跑是全新的
+  `codex exec resume <thread_id> <message>` 进程。故私有 `CodexSession<L>` 在 `begin` 为首个 turn spawn 进程并
+  读到 `thread.started` 拿真实 thread id(作 registry key + resume token),该 turn 其余帧留给第一次 `advance`
+  续读(`first_turn_pending` 防重复);此后每个 `Continue` 在 `advance` spawn 新的 `exec resume` 进程。整段
+  session 共用一个跨全程单调 `seq` 的 `CodexStreamDecoder`。
+- **参数顺序(以当前本机 codex-cli 0.144.1 实测为准)**:`resume` 子命令**不接受** `-s/--sandbox`、
+  `-p/--profile`,故新增 `CodexConfig::base_resume_args(session_id)`(additive,不改 frozen `base_exec_args()`)
+  把 sandbox/model/profile **上提到顶层**:`codex -a <approval> -s <sandbox> [--model M][--profile P] exec
+  resume --json --skip-git-repo-check <id>`,adapter 追加 `<message>`;已用 bogus id 实测该顺序被 CLI 接受
+  (报 "no rollout found",即通过 arg parse)。生产进程 **stdin=null**(否则 codex 阻塞在 "Reading additional
+  input from stdin…")、**stderr 丢弃**(防原始文本泄漏)、stdout piped 逐行喂 decoder,`kill_on_drop`、每读
+  超时。IO 经私有 `CodexLauncher`/`CodexTurnStream` trait 注入。
+- **能力(诚实按 M7-2 结论,非 workaround)**:`codex exec --json` 自主运行、审批按命令行预置策略解决、自己执行
+  工具,流里**没有** host-pausable 的 tool-call/approval 帧,一个 turn 只会 `Completed`/`Failed`。故
+  `implemented_capabilities()`:`streaming`/`resume`/`artifacts`/`usage`/`graceful_shutdown`=true,
+  **`host_tools`=`host_subagents`=`permission_bridge`=false**。声明 `tools` 的 `start`/`resume` 请求以
+  `UnsupportedCapability{HostTools}` **明确拒绝**;follow-up 的 `RespondToolResults`→`{HostTools}`、
+  `RespondSubagent`→`{HostSubagents}`、`RespondInteraction`→`{PermissionBridge}` 均拒绝而非静默忽略;
+  `with_probed_capabilities` 与本机 probe 逐位取交。`ExternalPermissionMode` 复用 M7-1 config 映射
+  (Prompt→untrusted+read-only、AcceptEdits→on-request+workspace-write、Plan→never+read-only、
+  BypassPermissions→never+danger-full-access)。cleanup 经 `shutdown()` 关闭当前 turn 进程并归类
+  `Graceful`/`ForcedKill`/`Failed`。
+- 单测(inline 16 个,均离线、无需真实 Codex、无网络):`FakeLauncher` 回放固定 JSONL 帧并**逐 turn 捕获
+  `CodexTurnSpec`**——advance 驱动 text→completion 且观测流单调、follow-up 用 thread id spawn `exec resume`、
+  提前 EOF→`SessionLost`、malformed→`Protocol`、`turn.failed`→`Runtime`、shutdown 归类 close、resume defer 首 turn
+  并记录 thread id、`begin` spawn 失败按 fresh/resume 归类 `Launch`/`ResumeUnavailable`、`Respond*` 拒绝、`start`
+  拒绝声明工具、caps/intersect/turn_message/turn_spec 参数。另 `config.rs` 增 `base_resume_args` 顺序测试。
+- ignored 真机 e2e `tests/external_codex.rs`:临时 git worktree,`CODEX_BIN`/PATH 发现 `codex`,缺失 binary/登录带
+  清晰信息**跳过**(退出为绿);以 `AcceptEdits`(`workspace-write`,让自主 CLI 落盘且无需 host 审批)驱动
+  probe→start→advance→completion→graceful shutdown,断言观测流多步(SessionStarted + ≥1 文本 +
+  SessionCompleted,≥3 事件)。命令:`cargo test --features external-codex --test external_codex --
+  --ignored --nocapture`。**本机 codex-cli 0.144.1 实跑通过**:5 个观测事件(2 文本)、生成 `READY.txt`、优雅关闭,
+  约 51s。
+- 文档:`docs/managed-external-agent.md` §13.3 增补「实现状态(M7-3,已落地)」;`docs/capability-matrix.md` 增补
+  M7-3 live adapter + 真机 e2e 通过段落(并说明保守基线表是 `none()`,不代表 adapter 实报能力);
+  `tests/fixtures/external/codex/README.md` 从 M7-3 占位改为指向已落地的 live adapter + ignored e2e。
+- 验证(完整序列 1-6):`cargo fmt --all -- --check` 干净;`cargo clippy --all-targets -- -D warnings` 与
+  `--features external-codex` 均 0 warning;`cargo test -p agent-lib --features external-codex --lib codex`
+  30 passed;`cargo test --features external-codex --test agent_codex_cassette` 7 passed;
+  `cargo test --features external-codex --all-targets` 全 ok、0 failed(ignored e2e 不在默认集);
+  `cargo test --all --all-targets`(未启 feature)44 个 test binary 全 ok、0 failed;
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features external-codex` 干净。
 
 ### [TODO] M7-4 Review：Codex adapter 正确性检查
 

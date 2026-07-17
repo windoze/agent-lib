@@ -25,6 +25,13 @@ policy-declined action surfaces as a `command_execution` with a `declined`
 status. Redacted recordings of *real* CLI output land alongside the live session
 adapter in a later milestone (M7-3).
 
+The M7-3 live session adapter ([`CodexAdapter`](../../../../src/agent/external/codex/adapter.rs))
+now drives the real CLI end to end; its opt-in coverage lives in
+[`tests/external_codex.rs`](../../../../tests/external_codex.rs) (`#[ignore]`,
+discovered via `CODEX_BIN`/PATH, skipped when the binary or its auth is missing).
+That suite spawns a real `codex exec` process rather than replaying a cassette,
+so no additional committed recording is required here.
+
 Every committed cassette must pass the redaction scan
 (`ExternalRuntimeCassette::assert_no_secrets`): no `API_KEY`, `AUTH_TOKEN`,
 `sk-…`, bearer tokens, or private-key material.

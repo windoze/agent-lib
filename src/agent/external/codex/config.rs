@@ -282,6 +282,44 @@ impl CodexConfig {
         }
         args
     }
+
+    /// Builds the base managed-mode CLI arguments for resuming a live session
+    /// with `codex exec resume <session_id>`.
+    ///
+    /// The `resume` subcommand does **not** accept the `-s/--sandbox` or
+    /// `-p/--profile` flags that [`base_exec_args`](Self::base_exec_args) places
+    /// after `exec` (verified against the current CLI: `codex exec resume --help`
+    /// advertises only `--json`, `--skip-git-repo-check`, and `-m/--model`). The
+    /// sandbox policy, model, and profile are therefore hoisted to their
+    /// *top-level* positions before the `exec` subcommand — where the CLI also
+    /// accepts them — while the approval policy stays top-level as it does for a
+    /// fresh launch and `--json` / `--skip-git-repo-check` ride on the `resume`
+    /// subcommand. The adapter's live session (M7-3) appends the per-turn
+    /// follow-up message after the session id; the working directory is applied
+    /// to the spawned process rather than passed as `--cd`.
+    #[must_use]
+    pub fn base_resume_args(&self, session_id: &str) -> Vec<String> {
+        let mut args = vec![
+            "-a".to_owned(),
+            self.approval_policy_arg().to_owned(),
+            "-s".to_owned(),
+            self.sandbox_mode_arg().to_owned(),
+        ];
+        if let Some(model) = &self.model {
+            args.push("--model".to_owned());
+            args.push(model.clone());
+        }
+        if let Some(profile) = &self.profile {
+            args.push("--profile".to_owned());
+            args.push(profile.clone());
+        }
+        args.push("exec".to_owned());
+        args.push("resume".to_owned());
+        args.push("--json".to_owned());
+        args.push("--skip-git-repo-check".to_owned());
+        args.push(session_id.to_owned());
+        args
+    }
 }
 
 impl std::fmt::Debug for CodexConfig {
@@ -384,6 +422,69 @@ mod tests {
         let bare = CodexConfig::new().base_exec_args();
         assert!(!bare.iter().any(|arg| arg == "--model"));
         assert!(!bare.iter().any(|arg| arg == "--profile"));
+    }
+
+    #[test]
+    fn codex_config_base_resume_args_hoist_sandbox_and_selectors_before_exec() {
+        let config = CodexConfig::new()
+            .with_permission_mode(ExternalPermissionMode::AcceptEdits)
+            .with_model("gpt-5-codex")
+            .with_profile("reviewer");
+        let args = config.base_resume_args("thread-42");
+        assert_eq!(
+            args,
+            vec![
+                "-a",
+                "on-request",
+                "-s",
+                "workspace-write",
+                "--model",
+                "gpt-5-codex",
+                "--profile",
+                "reviewer",
+                "exec",
+                "resume",
+                "--json",
+                "--skip-git-repo-check",
+                "thread-42",
+            ]
+        );
+
+        // The `resume` subcommand rejects `-s`/`-p`, so both the sandbox flag and
+        // the profile selector must precede the `exec` subcommand.
+        let exec_pos = args.iter().position(|a| a == "exec").expect("exec subcmd");
+        let sandbox_pos = args.iter().position(|a| a == "-s").expect("sandbox flag");
+        let profile_pos = args
+            .iter()
+            .position(|a| a == "--profile")
+            .expect("profile flag");
+        assert!(sandbox_pos < exec_pos, "-s must precede exec: {args:?}");
+        assert!(
+            profile_pos < exec_pos,
+            "--profile must precede exec: {args:?}"
+        );
+        // The session id is the trailing positional argument (the message the
+        // adapter appends follows it).
+        assert_eq!(args.last().map(String::as_str), Some("thread-42"));
+
+        // Without model/profile those pairs are omitted entirely.
+        let bare = CodexConfig::new().base_resume_args("thread-1");
+        assert!(!bare.iter().any(|arg| arg == "--model"));
+        assert!(!bare.iter().any(|arg| arg == "--profile"));
+        assert_eq!(
+            bare,
+            vec![
+                "-a",
+                "untrusted",
+                "-s",
+                "read-only",
+                "exec",
+                "resume",
+                "--json",
+                "--skip-git-repo-check",
+                "thread-1",
+            ]
+        );
     }
 
     #[test]

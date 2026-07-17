@@ -1112,6 +1112,45 @@ Codex 的 full tool injection 取决于当前 CLI/exec-server/MCP 能力:
   - `ExternalSessionRequest.tools` 不暴露或仅作为 prompt contract。
 - 对 unsupported tool bridge 的任务,dispatcher 应避免派给 Codex 或升级到支持 runtime。
 
+#### 实现状态（M7-3,已落地）
+
+`external-codex` feature 下已落地 **live session + runtime adapter**,把 M7-1 的启动配方与 M7-2 的私有
+decoder 接进 milestone-5 的 `ExternalRuntimeAdapter` / `ExternalRuntimeSession` 抽象(§11):
+
+- `CodexAdapter`(`src/agent/external/codex/adapter.rs`,**唯一 pub 类型**):per-runtime 工厂。
+  `new(config)` 报告本 adapter 实现的全部能力;`with_probed_capabilities(config, &probed)` 把实现能力与
+  probe 实测能力**逐位取交**。`start` 用 `codex … exec … <prompt>` 启动全新 session,`resume` 用
+  `codex … exec resume … <thread_id> <message>` 复活既有 thread,启动失败分别归类 `Launch` /
+  `ResumeUnavailable`。
+- **关键差异——每 turn 一个一次性进程**:与 Claude Code 的单条长驻 `stream-json` 进程不同,`codex exec`
+  的 prompt 是 CLI **位置参数**(不是 stdin 帧),进程在一个 turn 落定后即退出;续跑是全新的
+  `codex exec resume <thread_id> <message>` 进程。故 `CodexSession`(私有)在 `begin` 里为首个 turn spawn
+  一个进程并读到 `thread.started` 帧拿到真实 thread id(作为 registry key、resume token),该 turn 其余帧
+  (`item.*`/`turn.completed`)留给第一次 `advance` 续读;此后每个 `Continue` follow-up 在 `advance` 里 spawn
+  一个新的 `exec resume` 进程。整段 session 共用一个跨全程单调 `seq` 的 `CodexStreamDecoder`。
+- **参数顺序**:`resume` 子命令**不接受** `-s/--sandbox`、`-p/--profile`(实测当前 CLI),故新增
+  `CodexConfig::base_resume_args(session_id)` 把 sandbox/model/profile 上提到顶层
+  (`codex -a <approval> -s <sandbox> [--model M][--profile P] exec resume --json --skip-git-repo-check
+  <id>`),再由 adapter 追加 `<message>`;frozen 的 `base_exec_args()`(M7-1,有断言精确顺序的测试)不改动。
+  生产进程 **stdin=null**(否则 codex 阻塞在 "Reading additional input from stdin…")、**stderr 丢弃**(防原始
+  文本泄漏)、stdout piped 逐行喂 decoder,`kill_on_drop`、每读超时。
+- 能力(诚实按 M7-2 结论):`codex exec --json` **自主运行**——审批按命令行预置的 sandbox/approval 策略解决、
+  自己执行工具,流里**没有**任何 host 可暂停的 tool-call/approval 帧,一个 turn 只会 `Completed` 或
+  `Failed`。故 `implemented_capabilities()` 报告 `host_tools=false` / `host_subagents=false` /
+  **`permission_bridge=false`**;`streaming`/`resume`/`artifacts`/`usage`/`graceful_shutdown` 为 true。声明了
+  `tools` 的 `start`/`resume` 请求以 `UnsupportedCapability{HostTools}` 明确拒绝;follow-up 的
+  `RespondToolResults`→`UnsupportedCapability{HostTools}`、`RespondSubagent`→`{HostSubagents}`、
+  `RespondInteraction`→`{PermissionBridge}`,均**明确拒绝而非静默忽略**。
+- IO 经私有 `CodexLauncher` / `CodexTurnStream` trait 注入:生产用 `SystemCodexLauncher`(`tokio::process`),
+  单测注入 `FakeLauncher` 回放固定 JSONL 帧并**逐 turn 捕获 `CodexTurnSpec`**,**离线**跑通
+  begin/advance(fresh + resume)/shutdown 全状态机,无需真实 binary、无网络。
+- 真机 e2e:`tests/external_codex.rs` 有一个 `#[ignore]` 用例,通过 `CODEX_BIN` 或 PATH 发现 `codex`,缺失
+  binary/登录即带清晰信息**跳过**(退出为绿),否则在临时 git worktree 里以 `AcceptEdits`(`workspace-write`,
+  让自主 CLI 能落盘且无需 host 审批)驱动 probe→start→advance→completion→graceful shutdown,断言观测流确为
+  多步(SessionStarted + ≥1 文本 + SessionCompleted)。本机 codex-cli 0.144.1 实跑通过(5 个观测事件、生成
+  `READY.txt`、优雅关闭,约 51s)。运行:
+  `cargo test --features external-codex --test external_codex -- --ignored --nocapture`。
+
 ## 14. OpenCode adapter
 
 OpenCode 需要先做 capability probe,因为部署形态可能更多。
