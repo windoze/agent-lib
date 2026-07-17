@@ -500,7 +500,7 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   --no-deps --workspace` 默认 + `--features facade-schema` 均通过（doctest 默认 1 / feature 2 通过）✅｜
   `git diff --check` 干净 ✅。
 
-### [TODO] M2-2 `Approval` 三档 + `ApprovalPolicy` → `ToolApprovalPolicy`/`InteractionHandler`
+### [DONE] M2-2 `Approval` 三档 + `ApprovalPolicy` → `ToolApprovalPolicy`/`InteractionHandler`
 
 **上下文**：
 
@@ -526,6 +526,42 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   执行；工具级覆盖优先于 agent 级；headless 无匹配 policy → error 而非挂起。
 - 聚焦：`cargo test -p agent-lib facade::approval`。
 - 完整验证序列 1–6。
+
+**完成记录**：
+
+- **落地**：新增 `src/facade/approval.rs`。
+  - `Approval` 三档（`auto_allow`/`auto_deny`/`ask(handler)`，`Clone` + 手写 `Debug`）。`ask` handler 为
+    `Fn(&ApprovalRequest) -> ApprovalDecision + Send + Sync`；`ApprovalDecision` 从 `crate::agent` re-export。
+    内部另有 `Ask(None)` 档（不对外暴露），供 `ApprovalPolicy::ask_tool` 使用（下沉到 policy default handler，
+    否则 headless deny）。
+  - `ApprovalPolicy`（`Clone` + 手写 `Debug`）：`{ default, per_tool, ask_external_agents, ask_worktree_write }`。
+    `Default` = default 档为 `auto_allow`（typed tool 是用户自写 Rust 函数，默认放行）。builder：`new`/
+    `allow_tool`/`ask_tool`/`deny_tool`/`tool(name, Approval)`/`ask_external_agents`/`ask_worktree_write` +
+    两个 flag 的 getter。`impl From<Approval> for ApprovalPolicy`（AgentBuilder `.approval(..)` 可收 `Approval`
+    或 `ApprovalPolicy`，M2-3 用 `Into`）。§9.2 的 external/worktree flag 先记录、M4 再消费。
+  - `FacadeApproval` 同时实现 `agent::ToolApprovalPolicy` 与 `agent::InteractionHandler`（`Arc` 共享）：
+    `approval_requirement` 对 `auto_allow` 产 `AutoApprove`，其余产 `RequireApproval` 并把已解析决策
+    （`Deny{msg}` / `Ask{request,handler}`）写入共享 `Mutex<HashMap<ToolCallId, PendingDecision>>`；
+    `fulfill` 对 `InteractionKind::Approval` 弹出决策产 `ApprovalResponse`（`auto_deny`/headless→Deny，
+    `ask`→调 handler），对 `Question`/`Choice` 走 in-family 平凡默认，对 `Permission` 默认 deny（§9.2，M4 细化）。
+    `InteractionKind::Approval` 只带 `call_id` 不带工具名 → 通过 policy（先）→ interaction（后）的调用序共享
+    pending map 关联，避免脆弱的 reason 解析。解析优先级：tool-level override > policy per_tool > default。
+    `with_tool_override(name, Approval)` 供 M2-3 注入每工具级覆盖。
+- **Tool 工具级覆盖**（`src/facade/tool.rs`）：`Tool` 增 `approval: Option<Approval>` 字段 + `.approval(Approval)`
+  builder + `approval_override()` getter；`Debug` 增 `has_approval_override`。
+- **错误**（`src/facade/error.rs`）：新增 `FacadeError::{ApprovalDenied, PermissionDenied}` 单元变体（§16）。
+  run-path 把 deny 决策映射为 `ApprovalDenied` 属 M2-3 装配职责（本任务只备好变体与适配器）。
+- **导出**：`facade/mod.rs` + root 导出 `Approval/ApprovalDecision/ApprovalPolicy/FacadeApproval`（prelude
+  增补留待 M2-R）。
+- **测试**（`src/facade/approval.rs` 离线单测 8 个）：`auto_allow`→`AutoApprove`；`auto_deny`→`RequireApproval`
+  且 `fulfill` 产 Deny；`ask`→调 handler 并按其 Approve/Deny 决策；tool-level override 覆盖 agent policy；
+  `ask_tool` 无 handler（headless）→Deny 不挂起；`ask_tool` 回落 policy default handler；`Question`/`Choice`/
+  `Permission` 非审批 kind 的安全默认；`From<Approval>` + flag getter。
+- **验证**：`cargo fmt --all` ✅｜`cargo clippy --all-targets -- -D warnings` 默认 + `--features facade-schema`
+  均 0 警告 ✅｜`cargo test -p agent-lib --lib facade::approval` 8 全绿 ✅｜`cargo test --all --all-targets`
+  全绿（agent-lib lib 720 通过）✅｜`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 默认 +
+  `--features facade-schema` 均通过；`cargo test --doc -p agent-lib` 默认 14 / `--features facade-schema` 15
+  全绿 ✅｜`git diff --check` 干净 ✅。
 
 ### [TODO] M2-3 `Agent` / `AgentBuilder` + `run` / `run_full`（装配 machine + drive）
 

@@ -22,8 +22,11 @@
 //! Later milestones add the `Agent`/`AgentSession`, subagent,
 //! managed-external-agent, dispatcher, and collaboration facades on top of these
 //! foundations. Milestone 2 begins with the typed function tool surface
-//! ([`Tool`], [`ToolContext`], [`ToolResult`], [`IntoToolResult`]) in [`tool`].
+//! ([`Tool`], [`ToolContext`], [`ToolResult`], [`IntoToolResult`]) in [`tool`],
+//! then the approval surface ([`Approval`], [`ApprovalPolicy`],
+//! [`ApprovalDecision`]) in [`approval`].
 
+pub mod approval;
 pub mod chat;
 pub mod config;
 pub mod error;
@@ -31,6 +34,7 @@ pub mod ids;
 pub mod run;
 pub mod tool;
 
+pub use approval::{Approval, ApprovalDecision, ApprovalPolicy, FacadeApproval};
 pub use chat::{Chat, ChatBuilder, ChatSession, ChatSessionBuilder, RunStream};
 pub use config::{ModelConfig, ProviderConfig, ProviderConfigBuilder};
 pub use error::FacadeError;

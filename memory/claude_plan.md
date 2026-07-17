@@ -1,55 +1,74 @@
-# M2-1 typed function `Tool` + `ToolContext` + internal `ToolRegistry` bridge
+# M2-2 `Approval` three-tier + `ApprovalPolicy` -> `ToolApprovalPolicy`/`InteractionHandler`
 
-## Task (TODO.md M2-1)
-Build `src/facade/tool.rs`: facade `Tool` (typed function tool), `ToolContext`, and an
-internal adapter bridging a set of facade tools into `agent::ToolRegistry`. Resolve the
-schemars R1 hard-decision. Build-time name-conflict check across typed tools + escape-hatch
-registry/declarations → `FacadeError`.
+## Task (TODO.md M2-2)
+Build `src/facade/approval.rs`: three-tier `Approval` (auto_allow/auto_deny/ask) +
+`ApprovalPolicy` builder. Bridge into adapters implementing `agent::ToolApprovalPolicy`
+(produces `ApprovalRequirement` per tool name/policy) and `agent::InteractionHandler`
+(auto_allow/auto_deny produce `ApprovalResponse` directly; `ask` calls the user handler;
+non-Approval `InteractionKind` -> reasonable default or deny). headless (ask but no handler)
+-> deny (surfaces as `FacadeError::ApprovalDenied`), never hangs. Add tool-level override
+`Tool::function(..).approval(..)` with priority over agent-level. Full rustdoc.
 
-## R1 schema decision (chosen)
-- `schemars` is **not** a core dependency (only transitive under `external-acp`).
-- Add an **off-by-default optional feature `facade-schema`** → `schemars = { version = "1", optional = true }`.
-  - With `facade-schema`: `Tool::function(name, desc, handler)` where `Args: DeserializeOwned + JsonSchema`
-    derives the JSON schema (matches docs §7.1 exactly). Strip the top-level `$schema` meta key.
-  - Always available (no feature): `Tool::function_with_schema(name, desc, input_schema: Value, handler)`
-    — explicit-schema degraded path.
-- Document in rustdoc + PLAN.md (R1) + TODO.md completion record. Default build pulls no schemars.
-- Verified: schemars 1.x `schema_for!(T)` works with a generic type param; blanket
-  `impl<T: Serialize> IntoToolResult` + `impl IntoToolResult for ToolResult` (non-Serialize) compiles.
+## Anchors (verified)
+- `agent::{ToolApprovalPolicy, ApprovalRequirement, ApprovalResponse, ApprovalDecision,
+  Interaction, InteractionHandler, InteractionKind, InteractionResponse, PermissionResponse,
+  RequirementResult, RunContext}`. Reference: `ApprovalInteractionHandler`, example
+  `RequireApproval`/`StdinApproval` in examples/agent_chat.rs.
+- `ToolApprovalPolicy::approval_requirement(&self, ToolCallId, &ToolCall) -> ApprovalRequirement`
+  (requires `fmt::Debug`). `InteractionHandler::fulfill(&self, &Interaction, &RunContext)
+  -> RequirementResult` (`#[async_trait]`). `InteractionKind::Approval { call_id, requirement }`
+  carries NO tool name -> correlate via shared pending map keyed by `ToolCallId`.
+- Machine always calls the policy BEFORE the interaction handler for the same call_id
+  (tool-use -> approval_requirement -> RequireApproval -> NeedInteraction -> fulfill). So the
+  policy populates the pending map and the interaction handler consumes it.
+- `facade::run::ApprovalRequest { tool_name }` (non_exhaustive; constructible in-crate).
 
-## Design (`src/facade/tool.rs`)
-1. `ToolContext { run_id, agent_id, tool_call_id, worktree, cancel, trace }` — all Clone anchors,
-   controlled handles only (no mutable Conversation refs).
-2. `ToolResult { content, status, extra }` — facade result type. **Not** `Serialize` (keeps
-   blanket + explicit impls coherent). Constructors text/blocks/error/with_status + accessors +
-   `into_response(call_id)`.
-3. `IntoToolResult` trait: blanket `impl<T: Serialize>` (Value::String → raw text, else compact JSON)
-   + `impl for ToolResult`. Covers String / Value / impl Serialize / explicit ToolResult.
-4. `Tool { name, description, input_schema: Value, executor: Arc<dyn ToolExecutorFn> }`, Clone, manual
-   Debug. `Tool::function` (feature) + `Tool::function_with_schema` (always). `declaration()` →
-   `model::tool::Tool`.
-5. internal `ToolExecutorFn` (async_trait) + `FunctionTool<F, Args>`: deserialize args (invalid →
-   structured error), call handler (Err → structured error), `IntoToolResult`.
-6. `pub(crate) FacadeToolRegistry` impl `agent::ToolRegistry`: typed tools + optional escape-hatch
-   custom registry + extra declarations + context parts. Ctor validates name conflicts →
-   `FacadeError::DuplicateTool`. `declarations()` merges all; `execute()` dispatches to typed executor
-   (builds ToolContext) or delegates to custom, else `UnknownTool`. Tool failures →
-   `ToolRuntimeError::ExecutionFailed` so the loop's `ToolFailurePolicy` governs.
+## Design (`src/facade/approval.rs`)
+1. `pub use crate::agent::ApprovalDecision;`
+2. `Approval` (Clone, manual Debug): enum kind AutoAllow / AutoDeny / Ask(Arc<AskFn>).
+   `AskFn = dyn Fn(&ApprovalRequest) -> ApprovalDecision + Send + Sync`. ctors
+   `auto_allow()/auto_deny()/ask(handler)`.
+3. `ApprovalPolicy` (Clone, manual Debug): { default: Approval, per_tool: BTreeMap<String,
+   Approval>, ask_external_agents: bool, ask_worktree_write: bool }. `Default` -> default =
+   auto_allow (typed tools are user code, trusted). Builder: `new(Approval)`, `allow_tool`,
+   `ask_tool` (Ask with no handler -> falls back to default handler else headless deny),
+   `deny_tool`, `tool(name, Approval)`, `ask_external_agents`, `ask_worktree_write`. Getters
+   for the two flags. `impl From<Approval> for ApprovalPolicy` (so AgentBuilder `.approval(..)`
+   accepts both `Approval` and `ApprovalPolicy` via `Into`).
+4. `FacadeApproval` implements BOTH `ToolApprovalPolicy` and `InteractionHandler`, shared via
+   `Arc`. Holds resolved config (default + per_tool + tool_overrides + flags) and
+   `Mutex<HashMap<ToolCallId, PendingDecision>>`. Ctor `new(ApprovalPolicy)` +
+   `with_tool_override(name, Approval)` (tool-level, highest priority; M2-3 feeds Tool.approval).
+   - resolve(name) = tool_overrides > per_tool > default.
+   - `approval_requirement`: AutoAllow -> AutoApprove; else RequireApproval{reason} and store
+     PendingDecision (Deny{msg} for auto_deny / headless-ask, Ask{request,handler} otherwise).
+   - `fulfill`: Approval -> pop PendingDecision, produce ApprovalResponse (deny/ask handler);
+     Question -> empty answer; Choice -> index 0; Permission -> deny (safe default, M4 refines).
+   - Manual Debug (closures not Debug).
+5. `Tool` (tool.rs): add `approval: Option<Approval>`, `.approval(self, Approval) -> Self`,
+   `approval_override(&self) -> Option<&Approval>`. Update Debug to include has_approval.
+6. `FacadeError`: add unit variants `ApprovalDenied`, `PermissionDenied` (spec §16). Add a
+   helper to classify a denied approval decision (used by M2-3 run path).
+7. Exports in facade/mod.rs + module rustdoc note.
 
-## FacadeError
-Add `#[non_exhaustive]` variant `DuplicateTool { name }`.
+## Tests (offline, in src/facade/approval.rs)
+- auto_allow -> AutoApprove requirement.
+- auto_deny -> RequireApproval + fulfill yields Deny response.
+- ask -> RequireApproval + fulfill calls handler, returns its decision (approve & deny cases).
+- tool-level override beats agent per_tool (with_tool_override wins).
+- ask_tool with no handler and default auto_allow -> headless deny (fulfill returns Deny, no hang).
+- ask_tool with default = ask(handler) -> uses default handler.
+- non-Approval kinds: Question -> empty answer; Choice -> 0; Permission -> deny.
+- ApprovalPolicy::from(Approval) sets default; flags stored/readable.
 
 ## Validation
-- `cargo fmt --all -- --check`
-- `cargo test -p agent-lib facade::tool` (and `--features facade-schema`)
-- `cargo clippy --all-targets -- -D warnings` (+ `--features facade-schema`)
-- `cargo test --all --all-targets` (≤30 min)
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
-- `git diff --check`
+1. cargo fmt --all
+2. cargo clippy --all-targets -- -D warnings  (+ --features facade-schema for the CLI-free set touched)
+3. cargo test -p agent-lib facade::approval  (focused) then cargo test --all --all-targets (<=30 min)
+4. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+5. git diff --check
 
 ## Status: DONE
-- Validation series all green: fmt --check ✅ | facade::tool 10 (default) / 11 (facade-schema) ✅ |
-  clippy default + facade-schema 0 warnings ✅ | full suite (152 lib) ✅ | doc default + facade-schema
-  + doctests ✅ | git diff --check clean ✅.
-- R1 decided & documented (facade-schema off-by-default feature + explicit-schema fallback); no new
-  prerequisite task needed. TODO.md M2-1 marked [DONE] with completion record; PLAN.md R1 updated.
+- All validation green: fmt; clippy default + facade-schema (0 warnings); facade::approval 8 tests;
+  full suite (agent-lib lib 720); doc default + facade-schema; doctests 14/15; git diff --check clean.
+- TODO.md M2-2 marked [DONE] with completion record. No PLAN.md phase change; no new prerequisite tasks.

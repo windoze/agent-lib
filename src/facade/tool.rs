@@ -44,6 +44,7 @@ use crate::agent::{
     AgentId, CancellationToken, RunId, ToolRegistry, ToolRuntimeError, TraceHandle, WorktreeRef,
 };
 use crate::conversation::ToolCallId;
+use crate::facade::approval::Approval;
 use crate::facade::error::FacadeError;
 use crate::model::content::ContentBlock;
 use crate::model::tool::{Tool as ToolDecl, ToolCall, ToolResponse, ToolStatus};
@@ -272,6 +273,7 @@ pub struct Tool {
     description: String,
     input_schema: Value,
     executor: Arc<dyn ToolExecutorFn>,
+    approval: Option<Approval>,
 }
 
 impl fmt::Debug for Tool {
@@ -281,6 +283,7 @@ impl fmt::Debug for Tool {
             .field("name", &self.name)
             .field("description", &self.description)
             .field("input_schema", &self.input_schema)
+            .field("has_approval_override", &self.approval.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -339,6 +342,7 @@ impl Tool {
                 handler,
                 _args: PhantomData,
             }),
+            approval: None,
         }
     }
 
@@ -414,6 +418,44 @@ impl Tool {
             description: self.description.clone(),
             input_schema: self.input_schema.clone(),
         }
+    }
+
+    /// Overrides the approval treatment for this specific tool.
+    ///
+    /// A tool-level [`Approval`] takes precedence over the agent-level
+    /// [`crate::facade::ApprovalPolicy`] (see `docs/facade-api.md` §9.1). For
+    /// example, gate one dangerous tool behind an interactive prompt while the
+    /// rest of the agent auto-allows:
+    ///
+    /// ```
+    /// use agent_lib::facade::{Approval, tool::{Tool, ToolContext}};
+    /// use serde_json::json;
+    ///
+    /// let tool = Tool::function_with_schema(
+    ///     "shell",
+    ///     "Run a shell command.",
+    ///     json!({ "type": "object" }),
+    ///     |_ctx: ToolContext, _args: serde_json::Value| async move {
+    ///         Ok::<_, std::convert::Infallible>("ok")
+    ///     },
+    /// )
+    /// .approval(Approval::auto_deny());
+    /// assert!(tool.approval_override().is_some());
+    /// ```
+    #[must_use]
+    pub fn approval(mut self, approval: Approval) -> Self {
+        self.approval = Some(approval);
+        self
+    }
+
+    /// Returns this tool's approval override, if one was set.
+    ///
+    /// The Agent facade merges each override into the agent-level approval
+    /// policy at build time, where it wins over any agent-level entry for the
+    /// same tool name.
+    #[must_use]
+    pub const fn approval_override(&self) -> Option<&Approval> {
+        self.approval.as_ref()
     }
 }
 

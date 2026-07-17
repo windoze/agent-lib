@@ -48,6 +48,27 @@ pub enum FacadeError {
     #[error("model returned an unexpected tool-use block")]
     UnexpectedToolUse,
 
+    /// A tool call was refused by the approval policy (or by a headless run with
+    /// no interaction handler to service an `ask`).
+    ///
+    /// Surfaced when [`crate::facade::Approval::auto_deny`] is in effect, when an
+    /// `ask` handler returns a non-approving [`crate::facade::ApprovalDecision`],
+    /// or when a tool requires approval in a headless run that has no handler to
+    /// answer it (see `docs/facade-api.md` §9.2, §16). A denial never blocks: the
+    /// run fails fast rather than waiting for input that cannot arrive.
+    #[error("tool execution was denied by the approval policy")]
+    ApprovalDenied,
+
+    /// A privileged agent action was refused by the permission policy.
+    ///
+    /// Reserved for the managed-external and permission-bearing runtimes
+    /// (`docs/facade-api.md` §9.2, §16): a
+    /// [`crate::agent::InteractionKind::Permission`] request that resolves to a
+    /// deny surfaces here. The default in-library machine never emits a
+    /// permission interaction, so the facade denies them by default.
+    #[error("a privileged action was denied by the permission policy")]
+    PermissionDenied,
+
     /// Two tools were registered under the same name.
     ///
     /// Raised at build time when typed [`crate::facade::Tool`] values collide
