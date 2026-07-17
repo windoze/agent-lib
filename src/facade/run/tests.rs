@@ -217,9 +217,15 @@ fn normalized_run_events_project_losslessly_and_round_trip() {
         (
             RunEvent::ApprovalRequested(ApprovalRequest {
                 tool_name: "get_weather".to_owned(),
+                call_id: "call-1".to_owned(),
+                reason: Some("approve execution of tool `get_weather`".to_owned()),
+                input: Some("{\"city\":\"Shanghai\"}".to_owned()),
             }),
             WireRunEvent::ApprovalRequested(ApprovalRequest {
                 tool_name: "get_weather".to_owned(),
+                call_id: "call-1".to_owned(),
+                reason: Some("approve execution of tool `get_weather`".to_owned()),
+                input: Some("{\"city\":\"Shanghai\"}".to_owned()),
             }),
         ),
         (

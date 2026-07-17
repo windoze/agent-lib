@@ -440,15 +440,60 @@ pub struct ToolTrace {
     pub call_id: String,
 }
 
-/// Placeholder for an approval request surfaced to the caller.
+/// An approval request surfaced to the caller (`docs/facade-api.md` §9).
 ///
-/// Populated by the Agent facade (Milestone 2, `docs/facade-api.md` §9). The
-/// field set is minimal and may grow (the type is `#[non_exhaustive]`).
+/// Populated by the Agent facade (Milestone 2, enriched in Milestone 7-3) so a
+/// UI/CLI can render a meaningful approval box. The field set may still grow
+/// (the type is `#[non_exhaustive]`).
+///
+/// # Fields and redaction
+///
+/// - [`tool_name`](Self::tool_name) — the tool whose execution is paused.
+/// - [`call_id`](Self::call_id) — the framework tool-call id the decision must
+///   address, stringified. Empty only for the synchronous external-delegate
+///   start path (which has no framework call id).
+/// - [`reason`](Self::reason) — the stable, model-visible reason carried by the
+///   underlying [`ApprovalRequirement`](crate::agent::ApprovalRequirement), if
+///   any.
+/// - [`input`](Self::input) — a **compact, redaction-safe** one-line summary of
+///   the tool call arguments, not the raw payload. Object keys that look like
+///   credentials (for example `token`, `api_key`, `password`) have their values
+///   replaced with `<redacted>`, and the summary is truncated to a bounded
+///   length, so a value can be logged or shipped over a wire without leaking
+///   secrets or large payloads. `None` when the call carried no arguments.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ApprovalRequest {
     /// Name of the tool whose execution is awaiting approval.
     pub tool_name: String,
+    /// Framework tool-call id the approval decision must address (stringified).
+    ///
+    /// Empty for the synchronous external-delegate start path, which is gated
+    /// before any framework call id exists.
+    pub call_id: String,
+    /// Stable, model-visible reason for the pause, if the requirement carried one.
+    pub reason: Option<String>,
+    /// Compact, redaction-safe summary of the tool arguments (never the raw
+    /// payload); `None` when the call carried no arguments.
+    pub input: Option<String>,
+}
+
+impl ApprovalRequest {
+    /// Builds a request naming only `tool_name`, leaving the enriched fields
+    /// empty.
+    ///
+    /// Used by the synchronous external-delegate start path, which decides
+    /// before any framework [`call_id`](Self::call_id), reason, or tool input is
+    /// available.
+    #[must_use]
+    pub fn for_tool(tool_name: impl Into<String>) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+            call_id: String::new(),
+            reason: None,
+            input: None,
+        }
+    }
 }
 
 /// The terminal outcome of a single delegation (`docs/facade-api.md` §10.2).

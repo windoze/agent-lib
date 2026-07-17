@@ -602,13 +602,29 @@ async fn stream_reports_approval_request() {
     let events = drain_agent_stream(&mut agent, "weather?").await;
 
     let approval = events.iter().find_map(|event| match event {
-        RunEvent::ApprovalRequested(request) => Some(request.tool_name.clone()),
+        RunEvent::ApprovalRequested(request) => Some(request.clone()),
         _ => None,
     });
+    let Some(approval) = approval else {
+        panic!("an ApprovalRequested event is emitted, got {events:?}");
+    };
     assert_eq!(
-        approval.as_deref(),
-        Some("get_weather"),
-        "an ApprovalRequested event names the pending tool, got {events:?}"
+        approval.tool_name, "get_weather",
+        "the ApprovalRequested event names the pending tool, got {events:?}"
+    );
+    assert!(
+        !approval.call_id.is_empty(),
+        "the ApprovalRequested event carries the pending call id, got {approval:?}"
+    );
+    assert_eq!(
+        approval.reason.as_deref(),
+        Some("approve execution of tool `get_weather`"),
+        "the ApprovalRequested event carries the requirement reason, got {approval:?}"
+    );
+    assert_eq!(
+        approval.input.as_deref(),
+        Some("{\"city\":\"Shanghai\"}"),
+        "the ApprovalRequested event carries a redacted input summary, got {approval:?}"
     );
     assert_eq!(
         executions.load(Ordering::SeqCst),

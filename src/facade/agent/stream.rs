@@ -19,8 +19,9 @@
 //!   [`ToolRegistryHandler`] and brackets each execution with
 //!   [`RunEvent::ToolStarted`] / [`RunEvent::ToolFinished`].
 //! - [`TapInteractionHandler`] wraps the shared
-//!   [`FacadeApproval`] and emits a [`RunEvent::ApprovalRequested`] labelled with
-//!   the pending tool name before delegating the approval.
+//!   [`FacadeApproval`] and emits a [`RunEvent::ApprovalRequested`] enriched with
+//!   the pending tool name, `call_id`, reason, and a redacted input summary
+//!   before delegating the approval.
 //!
 //! When the drive finishes the terminal [`RunOutput`] is assembled exactly as
 //! [`Agent::run_full`](super::Agent::run_full) assembles it, then yielded as one
@@ -546,12 +547,13 @@ impl ToolHandler for TapToolHandler {
 ///
 /// The delegate `inner` is the host-injected handler when one was supplied to
 /// [`AgentBuilder::interaction_handler`](crate::facade::AgentBuilder::interaction_handler),
-/// otherwise the shared [`FacadeApproval`] fallback. The tool-name label is
-/// always recovered from `approval` — the machine gate stays [`FacadeApproval`]
-/// and records the pending decision regardless of which handler answers, so the
-/// emit is labelled even under an injected handler. The name is peeked *before*
-/// delegating, because the fallback handler consumes and removes that pending
-/// entry.
+/// otherwise the shared [`FacadeApproval`] fallback. The enriched request (tool
+/// name plus a redacted input summary) is always recovered from `approval` — the
+/// machine gate stays [`FacadeApproval`] and records the pending decision
+/// regardless of which handler answers, so the emit is populated even under an
+/// injected handler — while the `call_id` and `reason` are taken from the
+/// machine-carried interaction. The pending entry is peeked *before* delegating,
+/// because the fallback handler consumes and removes it.
 struct TapInteractionHandler {
     approval: Arc<FacadeApproval>,
     inner: Arc<dyn InteractionHandler>,
@@ -561,15 +563,23 @@ struct TapInteractionHandler {
 #[async_trait]
 impl InteractionHandler for TapInteractionHandler {
     async fn fulfill(&self, request: &Interaction, ctx: &RunContext) -> RequirementResult {
-        if let InteractionKind::Approval { call_id, .. } = request.kind() {
-            let tool_name = self
+        if let InteractionKind::Approval {
+            call_id,
+            requirement,
+        } = request.kind()
+        {
+            // The enriched request (tool name + redacted input summary) is
+            // recovered from the pending decision the policy recorded; the
+            // `call_id` and `reason` are re-bound from the machine-carried
+            // interaction so the emit reflects exactly what the machine paused
+            // on, even under an injected handler.
+            let mut approval_request = self
                 .approval
-                .pending_tool_name(*call_id)
-                .unwrap_or_default();
-            emit(
-                &self.sink,
-                RunEvent::ApprovalRequested(ApprovalRequest { tool_name }),
-            );
+                .pending_request(*call_id)
+                .unwrap_or_else(|| ApprovalRequest::for_tool(String::new()));
+            approval_request.call_id = call_id.to_string();
+            approval_request.reason = requirement.reason().map(ToOwned::to_owned);
+            emit(&self.sink, RunEvent::ApprovalRequested(approval_request));
         }
         self.inner.fulfill(request, ctx).await
     }

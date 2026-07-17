@@ -1898,7 +1898,7 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
   5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 绿。
   6. `git diff --check` 干净。
 
-### [TODO] M7-3 富化 `ApprovalRequest`
+### [DONE] M7-3 富化 `ApprovalRequest`
 
 **上下文**：
 
@@ -1922,6 +1922,48 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
   `reason`（及输入摘要，若实现）。
 - 聚焦：`cargo test -p agent-lib facade::agent`（审批 emit 用例）。
 - 完整验证序列 1–6。
+
+**完成记录**：
+
+- 富化 `ApprovalRequest`（`src/facade/run.rs`，`#[non_exhaustive]` **纯加字段**，不破坏既有构造点）：
+  - 新增 `call_id: String`、`reason: Option<String>`、`input: Option<String>`。
+  - **`input` 用 `Option<String>`（spec 允许的「精简摘要」选项）而非 `serde_json::Value`**：因
+    `serde_json::Value` 不实现 `Eq`，用它会迫使从 `ApprovalRequest`/`RunEvent`/`RunOutput`/
+    `WireRunEvent`/`WireRunOutput` 5 个公开类型上级联移除 `Eq`；String 摘要既保住 `Eq` 又天然
+    redaction 友好（我方控制内容、限长、可脱敏）。
+  - 新增 `ApprovalRequest::for_tool(name)` 便捷构造，供同步 external-delegate start 路径
+    （`decide_tier`/`decide_ask_deferred`，无 framework call/输入）使用。
+  - rustdoc 逐字段写清含义与 redaction 语义（`input` 为脱敏、限长的紧凑摘要，非原始载荷；
+    敏感 key 值替换为 `<redacted>`；`None` 表示无参数）。
+- redaction + 单一来源（`src/facade/approval.rs`）：
+  - 新增自由函数 `summarize_tool_input(&Value) -> Option<String>`：`null`/`{}`/`[]` → `None`；
+    否则递归对「凭据样式 key」（`token`/`secret`/`password`/`api_key`/`auth`/`credential`/
+    `bearer`/`private_key`/`access_key`/`session`/`cookie` 等，大小写不敏感子串匹配）的值替换为
+    `<redacted>`，紧凑 JSON 渲染后按 UTF-8 边界截断到 `MAX_INPUT_SUMMARY_LEN=512` 并加省略号。
+  - `PendingDecision::{Deny,Ask}` 现均携带完整 `ApprovalRequest`（`Deny` 由原 `tool_name` 改为
+    `request` + `message`），`record_pending(call_id, &ToolCall, reason)` **一处**组装
+    tool_name/call_id/reason/input 摘要，Ask 路径的 `AskFn` 也因此收到富化 request（附带收益）。
+  - 新增 peek `pending_request(call_id) -> Option<ApprovalRequest>`（保留 `pending_tool_name`，改为委托
+    存储的 request）；`approval_requirement` 复用同一 reason 字符串给 requirement 与 pending。
+- emit（`src/facade/agent/stream.rs`）：`TapInteractionHandler` 从 `pending_request(call_id)` 取富化 request，
+  再用 interaction 携带的 `call_id`/`requirement.reason()` 覆盖 `call_id`/`reason`（权威来源），
+  然后 emit `RunEvent::ApprovalRequested`；模块/结构体 doc 同步更新。
+- 测试（全离线）：
+  - `src/facade/agent/tests.rs::stream_reports_approval_request` 扩展为断言富化字段：
+    `tool_name=get_weather`、`call_id` 非空、`reason="approve execution of tool \`get_weather\`"`、
+    `input={"city":"Shanghai"}`。
+  - `src/facade/approval.rs`：新增 3 用例 —
+    `pending_request_carries_enriched_fields_and_redacts_secrets`（脱敏 2 个敏感 key、保留 benign 参数）、
+    `pending_request_omits_input_for_argless_call`（`{}` → `None`）、
+    `input_summary_is_size_bounded`（超长截断到界内并以省略号收尾）。
+  - `src/facade/run/tests.rs`：更新 2 处 `ApprovalRequest {..}` 构造为富化字段，round-trip 仍保真。
+- 验证（未触碰 external adapter，故不需全 external features clippy）：
+  1. `cargo fmt --all` 绿。
+  2. 聚焦 `cargo test -p agent-lib --lib facade::approval|facade::agent|facade::run`：161 passed（含新用例）。
+  3. `cargo clippy --all-targets -- -D warnings` 绿。
+  4. `cargo test --all --all-targets`：全绿，无失败（lib 820 + 集成/文档/replay 测试）。
+  5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 绿。
+  6. `git diff --check` 干净。
 
 ### [TODO] M7-4 生产级 registry-backed `ExternalSessionHandler`（feature-gated）
 

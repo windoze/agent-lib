@@ -46,8 +46,92 @@ use crate::agent::{
 use crate::conversation::ToolCallId;
 use crate::facade::run::ApprovalRequest;
 use crate::model::tool::ToolCall;
+use serde_json::Value;
 
 pub use crate::agent::ApprovalDecision;
+
+/// Key fragments that mark a tool-argument value as a likely credential.
+///
+/// Matched case-insensitively as substrings so `apiKey`, `AUTH_TOKEN`, and
+/// `user_password` all redact. Kept deliberately broad: an over-redacted
+/// summary is safe, an under-redacted one leaks secrets.
+const SENSITIVE_KEY_FRAGMENTS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "api_key",
+    "apikey",
+    "authorization",
+    "auth",
+    "credential",
+    "bearer",
+    "private_key",
+    "access_key",
+    "session",
+    "cookie",
+];
+
+/// Upper bound (in bytes) on a rendered tool-input summary.
+///
+/// Bounds the size shipped into a [`RunEvent`](crate::facade::RunEvent) so a
+/// large payload never rides along; the summary is truncated at a UTF-8
+/// boundary and marked with an ellipsis when it would exceed this.
+const MAX_INPUT_SUMMARY_LEN: usize = 512;
+
+/// Builds a compact, redaction-safe summary of one tool call's arguments.
+///
+/// Returns `None` for a call that carried no arguments (`null`, `{}`, or `[]`).
+/// Otherwise the value is rendered as compact JSON after redacting every object
+/// value whose key looks like a credential (see [`SENSITIVE_KEY_FRAGMENTS`]) and
+/// truncating to [`MAX_INPUT_SUMMARY_LEN`]. The result is intended for display
+/// or logging, so a truncated summary may not be valid JSON.
+fn summarize_tool_input(input: &Value) -> Option<String> {
+    match input {
+        Value::Null => return None,
+        Value::Object(map) if map.is_empty() => return None,
+        Value::Array(items) if items.is_empty() => return None,
+        _ => {}
+    }
+    let mut summary = redact_value(input).to_string();
+    if summary.len() > MAX_INPUT_SUMMARY_LEN {
+        let mut end = MAX_INPUT_SUMMARY_LEN;
+        while !summary.is_char_boundary(end) {
+            end -= 1;
+        }
+        summary.truncate(end);
+        summary.push('…');
+    }
+    Some(summary)
+}
+
+/// Recursively replaces credential-looking object values with `<redacted>`.
+fn redact_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, val)| {
+                    let redacted = if is_sensitive_key(key) {
+                        Value::String("<redacted>".to_owned())
+                    } else {
+                        redact_value(val)
+                    };
+                    (key.clone(), redacted)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redact_value).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Returns whether `key` names a likely-credential argument (case-insensitive).
+fn is_sensitive_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SENSITIVE_KEY_FRAGMENTS
+        .iter()
+        .any(|fragment| lower.contains(fragment))
+}
 
 /// A user-supplied callback that decides one pending tool approval.
 ///
@@ -288,10 +372,14 @@ impl fmt::Debug for ApprovalPolicy {
 
 /// The resolved decision for one pending tool call, recorded by the policy for
 /// the interaction handler to consume.
+///
+/// Both variants carry the full [`ApprovalRequest`] (tool name, call id, reason,
+/// and a redacted input summary) so the streaming path and any `ask` handler
+/// observe the same enriched request the policy assembled.
 enum PendingDecision {
-    /// The call is denied; carries the tool name and the model-visible message.
+    /// The call is denied; carries the request and the model-visible message.
     Deny {
-        tool_name: String,
+        request: ApprovalRequest,
         message: Option<String>,
     },
     /// The call is deferred to a handler.
@@ -302,12 +390,16 @@ enum PendingDecision {
 }
 
 impl PendingDecision {
+    /// Returns the full request this pending decision concerns.
+    fn request(&self) -> &ApprovalRequest {
+        match self {
+            Self::Deny { request, .. } | Self::Ask { request, .. } => request,
+        }
+    }
+
     /// Returns the tool name this pending decision concerns.
     fn tool_name(&self) -> &str {
-        match self {
-            Self::Deny { tool_name, .. } => tool_name,
-            Self::Ask { request, .. } => &request.tool_name,
-        }
+        &self.request().tool_name
     }
 }
 
@@ -433,9 +525,7 @@ impl FacadeApproval {
             ApprovalKind::AutoAllow => true,
             ApprovalKind::AutoDeny => false,
             ApprovalKind::Ask(Some(handler)) => {
-                let request = ApprovalRequest {
-                    tool_name: tool_name.to_owned(),
-                };
+                let request = ApprovalRequest::for_tool(tool_name);
                 handler(&request) == ApprovalDecision::Approve
             }
             ApprovalKind::Ask(None) => self.decide_ask_deferred(tool_name),
@@ -447,9 +537,7 @@ impl FacadeApproval {
     fn decide_ask_deferred(&self, tool_name: &str) -> bool {
         match &self.default.kind {
             ApprovalKind::Ask(Some(handler)) => {
-                let request = ApprovalRequest {
-                    tool_name: tool_name.to_owned(),
-                };
+                let request = ApprovalRequest::for_tool(tool_name);
                 handler(&request) == ApprovalDecision::Approve
             }
             _ => false,
@@ -457,32 +545,39 @@ impl FacadeApproval {
     }
 
     /// Records the pending decision for one require-approval call.
-    fn record_pending(&self, call_id: ToolCallId, tool_name: &str) {
-        let decision = match &self.resolve(tool_name).kind {
+    ///
+    /// Builds the enriched [`ApprovalRequest`] (tool name, stringified
+    /// `call_id`, `reason`, and a redacted input summary) once here so both the
+    /// streaming emit and any `ask` handler observe the same request.
+    fn record_pending(&self, call_id: ToolCallId, call: &ToolCall, reason: Option<String>) {
+        let request = ApprovalRequest {
+            tool_name: call.name.clone(),
+            call_id: call_id.to_string(),
+            reason,
+            input: summarize_tool_input(&call.input),
+        };
+        let decision = match &self.resolve(&call.name).kind {
             // Never routed here: an auto-allow tool auto-approves in the policy.
             ApprovalKind::AutoAllow => return,
             ApprovalKind::AutoDeny => PendingDecision::Deny {
-                tool_name: tool_name.to_owned(),
-                message: Some(format!("tool `{tool_name}` denied by approval policy")),
+                message: Some(format!("tool `{}` denied by approval policy", call.name)),
+                request,
             },
             ApprovalKind::Ask(Some(handler)) => PendingDecision::Ask {
-                request: ApprovalRequest {
-                    tool_name: tool_name.to_owned(),
-                },
+                request,
                 handler: Arc::clone(handler),
             },
             ApprovalKind::Ask(None) => match &self.default.kind {
                 ApprovalKind::Ask(Some(handler)) => PendingDecision::Ask {
-                    request: ApprovalRequest {
-                        tool_name: tool_name.to_owned(),
-                    },
+                    request,
                     handler: Arc::clone(handler),
                 },
                 _ => PendingDecision::Deny {
-                    tool_name: tool_name.to_owned(),
                     message: Some(format!(
-                        "tool `{tool_name}` requires approval but no handler is configured"
+                        "tool `{}` requires approval but no handler is configured",
+                        call.name
                     )),
+                    request,
                 },
             },
         };
@@ -507,6 +602,23 @@ impl FacadeApproval {
             .expect("approval pending map poisoned")
             .get(&call_id)
             .map(|decision| decision.tool_name().to_owned())
+    }
+
+    /// Peeks the full enriched [`ApprovalRequest`] recorded for a pending
+    /// require-approval `call_id`.
+    ///
+    /// Like [`pending_tool_name`](Self::pending_tool_name) but returns the whole
+    /// request the policy assembled (tool name, `call_id`, `reason`, and a
+    /// redacted input summary) so the streaming path can emit a fully populated
+    /// [`RunEvent::ApprovalRequested`](crate::facade::RunEvent::ApprovalRequested).
+    /// Returns `None` when no pending approval exists for `call_id`.
+    #[must_use]
+    pub fn pending_request(&self, call_id: ToolCallId) -> Option<ApprovalRequest> {
+        self.pending
+            .lock()
+            .expect("approval pending map poisoned")
+            .get(&call_id)
+            .map(|decision| decision.request().clone())
     }
 }
 
@@ -535,8 +647,9 @@ impl ToolApprovalPolicy for FacadeApproval {
         if matches!(self.resolve(&call.name).kind, ApprovalKind::AutoAllow) {
             return ApprovalRequirement::AutoApprove;
         }
-        self.record_pending(call_id, &call.name);
-        ApprovalRequirement::required(Some(format!("approve execution of tool `{}`", call.name)))
+        let reason = format!("approve execution of tool `{}`", call.name);
+        self.record_pending(call_id, call, Some(reason.clone()));
+        ApprovalRequirement::required(Some(reason))
     }
 }
 
@@ -773,5 +886,85 @@ mod tests {
         let bridge = FacadeApproval::new(policy);
         assert!(bridge.asks_external_agents());
         assert!(bridge.asks_worktree_write());
+    }
+
+    #[test]
+    fn pending_request_carries_enriched_fields_and_redacts_secrets() {
+        let bridge = FacadeApproval::new(ApprovalPolicy::new(Approval::auto_deny()));
+        let id = call_id();
+        let call = ToolCall {
+            id: "call-x".to_owned(),
+            name: "deploy".to_owned(),
+            input: json!({ "region": "us", "api_key": "sk-secret", "token": "abc" }),
+        };
+        bridge.approval_requirement(id, &call);
+
+        let request = bridge
+            .pending_request(id)
+            .expect("a pending require-approval decision was recorded");
+        assert_eq!(request.tool_name, "deploy");
+        assert_eq!(request.call_id, id.to_string());
+        assert_eq!(
+            request.reason.as_deref(),
+            Some("approve execution of tool `deploy`")
+        );
+
+        let input = request.input.expect("a non-empty input is summarized");
+        assert!(
+            input.contains("\"region\":\"us\""),
+            "keeps benign args: {input}"
+        );
+        assert!(
+            !input.contains("sk-secret"),
+            "redacts credential values: {input}"
+        );
+        assert!(!input.contains("abc"), "redacts token values: {input}");
+        assert!(
+            input.matches("<redacted>").count() == 2,
+            "both sensitive keys are redacted: {input}"
+        );
+    }
+
+    #[test]
+    fn pending_request_omits_input_for_argless_call() {
+        let bridge = FacadeApproval::new(ApprovalPolicy::new(Approval::auto_deny()));
+        let id = call_id();
+        bridge.approval_requirement(id, &call("noop"));
+
+        let request = bridge
+            .pending_request(id)
+            .expect("a pending decision was recorded");
+        assert_eq!(
+            request.input, None,
+            "an empty `{{}}` input summarizes to None"
+        );
+        assert_eq!(bridge.pending_tool_name(id).as_deref(), Some("noop"));
+    }
+
+    #[test]
+    fn input_summary_is_size_bounded() {
+        let bridge = FacadeApproval::new(ApprovalPolicy::new(Approval::auto_deny()));
+        let id = call_id();
+        let big = "x".repeat(4_096);
+        let call = ToolCall {
+            id: "call-big".to_owned(),
+            name: "write".to_owned(),
+            input: json!({ "blob": big }),
+        };
+        bridge.approval_requirement(id, &call);
+
+        let input = bridge
+            .pending_request(id)
+            .and_then(|request| request.input)
+            .expect("a non-empty input is summarized");
+        assert!(
+            input.chars().count() <= super::MAX_INPUT_SUMMARY_LEN + 1,
+            "the summary is truncated to a bounded length (plus one ellipsis char): {}",
+            input.chars().count()
+        );
+        assert!(
+            input.ends_with('…'),
+            "a truncated summary is marked: {input}"
+        );
     }
 }
