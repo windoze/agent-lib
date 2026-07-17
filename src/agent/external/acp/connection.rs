@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-use crate::agent::external::ExternalAgentError;
+use crate::agent::external::{ExternalAgentError, ExternalSessionShutdown};
 
 use super::{AcpConfig, acp_runtime_kind};
 
@@ -53,11 +53,15 @@ pub trait AcpLauncher: Send + Sync {
 /// [`SessionLost`](ExternalAgentError::SessionLost). When built from a real child
 /// the process handle is retained so `kill_on_drop` reaps it on drop.
 pub struct SpawnedAcpAgent {
-    writer: Box<dyn AsyncWrite + Send + Unpin>,
+    // `None` after `close` drops stdin to signal the agent EOF.
+    writer: Option<Box<dyn AsyncWrite + Send + Unpin>>,
     reader: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
     read_timeout: Duration,
     // Retained purely so the spawned child is killed when the transport drops.
     child: Option<Child>,
+    // Test-only override: the disposition a childless (fake) transport reports
+    // from `close`. Real child-backed transports classify from the exit instead.
+    shutdown_disposition: Option<ExternalSessionShutdown>,
 }
 
 impl fmt::Debug for SpawnedAcpAgent {
@@ -79,11 +83,21 @@ impl SpawnedAcpAgent {
     {
         let reader: Box<dyn AsyncRead + Send + Unpin> = Box::new(reader);
         Self {
-            writer: Box::new(writer),
+            writer: Some(Box::new(writer)),
             reader: BufReader::new(reader),
             read_timeout,
             child: None,
+            shutdown_disposition: None,
         }
+    }
+
+    /// Overrides the disposition a childless (fake) transport reports from
+    /// [`close`](Self::close), so offline tests can assert every shutdown
+    /// classification without a real child process.
+    #[must_use]
+    pub fn with_shutdown_disposition(mut self, disposition: ExternalSessionShutdown) -> Self {
+        self.shutdown_disposition = Some(disposition);
+        self
     }
 
     /// Builds a transport over a spawned child's piped stdio, retaining the child
@@ -96,10 +110,11 @@ impl SpawnedAcpAgent {
     ) -> Self {
         let reader: Box<dyn AsyncRead + Send + Unpin> = Box::new(stdout);
         Self {
-            writer: Box::new(stdin),
+            writer: Some(Box::new(stdin)),
             reader: BufReader::new(reader),
             read_timeout,
             child: Some(child),
+            shutdown_disposition: None,
         }
     }
 
@@ -107,18 +122,23 @@ impl SpawnedAcpAgent {
     ///
     /// # Errors
     ///
-    /// Returns [`ExternalAgentError::SessionLost`] when the write or flush fails
-    /// (the agent's stdin closed).
+    /// Returns [`ExternalAgentError::SessionLost`] when the transport's stdin has
+    /// already been closed by [`close`](Self::close) or when the write or flush
+    /// fails (the agent's stdin closed).
     pub async fn write_line(&mut self, line: &str) -> Result<(), ExternalAgentError> {
-        self.writer
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| session_lost("acp transport stdin already closed"))?;
+        writer
             .write_all(line.as_bytes())
             .await
             .map_err(|error| session_lost(format!("acp transport write failed: {error}")))?;
-        self.writer
+        writer
             .write_all(b"\n")
             .await
             .map_err(|error| session_lost(format!("acp transport write failed: {error}")))?;
-        self.writer
+        writer
             .flush()
             .await
             .map_err(|error| session_lost(format!("acp transport flush failed: {error}")))
@@ -146,6 +166,36 @@ impl SpawnedAcpAgent {
             line.pop();
         }
         Ok(Some(line))
+    }
+
+    /// Closes the transport, returning how the session ended.
+    ///
+    /// Drops stdin so the agent observes EOF (the graceful stop signal), then, for
+    /// a real child, waits up to `grace` for a clean exit and force-kills on
+    /// overrun. A childless (fake) transport reports the injected
+    /// [`with_shutdown_disposition`](Self::with_shutdown_disposition) value,
+    /// defaulting to [`Graceful`](ExternalSessionShutdown::Graceful).
+    pub async fn close(&mut self, grace: Duration) -> ExternalSessionShutdown {
+        // Dropping stdin signals EOF to the agent, the ACP graceful stop hint.
+        self.writer = None;
+
+        let Some(child) = self.child.as_mut() else {
+            return self
+                .shutdown_disposition
+                .unwrap_or(ExternalSessionShutdown::Graceful);
+        };
+
+        match tokio::time::timeout(grace, child.wait()).await {
+            Ok(Ok(_status)) => ExternalSessionShutdown::Graceful,
+            Ok(Err(_error)) => ExternalSessionShutdown::Failed,
+            Err(_elapsed) => match child.start_kill() {
+                Ok(()) => {
+                    let _ = child.wait().await;
+                    ExternalSessionShutdown::ForcedKill
+                }
+                Err(_error) => ExternalSessionShutdown::Failed,
+            },
+        }
     }
 }
 
@@ -314,5 +364,53 @@ mod tests {
             Duration::from_secs(1),
         );
         assert_eq!(agent.read_line().await.expect("eof read"), None);
+    }
+
+    /// A childless transport reports the injected disposition from `close`, and
+    /// the default (no injection) is `Graceful`.
+    #[tokio::test]
+    async fn close_reports_injected_disposition() {
+        use crate::agent::external::ExternalSessionShutdown;
+
+        let mut graceful = SpawnedAcpAgent::new(
+            tokio::io::sink(),
+            tokio::io::empty(),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            graceful.close(Duration::from_millis(10)).await,
+            ExternalSessionShutdown::Graceful,
+        );
+
+        for disposition in [
+            ExternalSessionShutdown::ForcedKill,
+            ExternalSessionShutdown::Failed,
+        ] {
+            let mut agent = SpawnedAcpAgent::new(
+                tokio::io::sink(),
+                tokio::io::empty(),
+                Duration::from_secs(1),
+            )
+            .with_shutdown_disposition(disposition);
+            assert_eq!(agent.close(Duration::from_millis(10)).await, disposition);
+        }
+    }
+
+    /// After `close` drops stdin, a subsequent write is classified as
+    /// `SessionLost` rather than panicking.
+    #[tokio::test]
+    async fn write_after_close_is_session_lost() {
+        let mut agent = SpawnedAcpAgent::new(
+            tokio::io::sink(),
+            tokio::io::empty(),
+            Duration::from_secs(1),
+        );
+        agent.close(Duration::from_millis(10)).await;
+        match agent.write_line("{}").await {
+            Err(ExternalAgentError::SessionLost { detail, .. }) => {
+                assert!(detail.contains("already closed"));
+            }
+            other => panic!("expected SessionLost after close, got {other:?}"),
+        }
     }
 }

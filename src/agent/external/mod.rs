@@ -89,9 +89,10 @@ mod worktree;
 
 #[cfg(feature = "external-acp")]
 pub use acp::{
-    ACP_RUNTIME_LABEL, ACP_WIRE_VERSION, AcpConfig, AcpDecision, AcpLauncher,
-    AcpNegotiatedCapabilities, AcpStreamDecoder, PendingClientRequest, SpawnedAcpAgent,
-    TokioProcessLauncher, acp_runtime_kind, capabilities_from_initialize,
+    ACP_RUNTIME_LABEL, ACP_WIRE_VERSION, AcpAdapter, AcpConfig, AcpDecision, AcpLauncher,
+    AcpNegotiatedCapabilities, AcpPermissionOption, AcpPermissionOptionKind, AcpStreamDecoder,
+    PendingClientRequest, SpawnedAcpAgent, TokioProcessLauncher, acp_runtime_kind,
+    capabilities_from_initialize,
 };
 pub use adapter::{ExternalRuntimeAdapter, ExternalRuntimeSession, RuntimeDecisionPoint};
 pub use budget::{

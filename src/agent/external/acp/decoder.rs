@@ -82,13 +82,54 @@ pub enum AcpDecision {
     },
 }
 
-/// An agent→client request the decoder recognized but did **not** answer.
+/// The disposition hint an ACP permission option advertises.
+///
+/// ACP does not answer a `session/request_permission` with a free-form
+/// allow/deny; the agent supplies a list of [`AcpPermissionOption`]s and the
+/// client must echo back the `optionId` of the one it selected. This neutral
+/// enum mirrors the schema's `PermissionOptionKind` so the live adapter can map
+/// a host [`PermissionDecision`](crate::agent::permission::PermissionDecision)
+/// onto the right option without leaking a crate type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcpPermissionOptionKind {
+    /// Allow this operation only this time.
+    AllowOnce,
+    /// Allow this operation and remember the choice.
+    AllowAlways,
+    /// Reject this operation only this time.
+    RejectOnce,
+    /// Reject this operation and remember the choice.
+    RejectAlways,
+}
+
+impl AcpPermissionOptionKind {
+    /// Whether selecting this option grants the gated action.
+    #[must_use]
+    pub const fn is_allow(self) -> bool {
+        matches!(self, Self::AllowOnce | Self::AllowAlways)
+    }
+}
+
+/// One option the agent offered on a `session/request_permission` request.
+///
+/// Provider-neutral: the `option_id` is echoed verbatim when answering and the
+/// `kind` tells the adapter whether it grants or refuses the action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcpPermissionOption {
+    /// The `optionId` echoed back in the permission response (never model logic).
+    pub option_id: String,
+    /// Whether this option allows or rejects the action.
+    pub kind: AcpPermissionOptionKind,
+}
+
+/// An agent→client request the decoder recognized and cached for servicing.
 ///
 /// ACP defines several requests the *client* must service (`request_permission`,
-/// `fs/*`, `terminal/*`). M10-2 only needs to identify and cache their arrival;
-/// the live adapter (M10-3) drains these with [`AcpStreamDecoder::take_client_requests`]
-/// and fulfils them (permission via the host-pausable interaction arm, `fs`/`terminal`
-/// against the worktree). Every field is provider-neutral — no crate type leaks.
+/// `fs/*`, `terminal/*`). The decoder identifies and caches each arrival with the
+/// JSON-RPC `action_id` needed to answer it; the live adapter (M10-3) drains
+/// these with [`AcpStreamDecoder::take_client_requests`] and fulfils them
+/// (permission via the host-pausable interaction arm, `fs`/`terminal` against the
+/// worktree). Every field is provider-neutral — no crate type leaks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingClientRequest {
     /// A `session/request_permission` the host must resolve.
@@ -97,19 +138,33 @@ pub enum PendingClientRequest {
         action_id: String,
         /// Short human-readable summary of the gated action (untrusted).
         summary: String,
+        /// The options the agent offered; the answer selects one by `optionId`.
+        options: Vec<AcpPermissionOption>,
     },
     /// A `fs/read_text_file` the client is expected to service.
     ReadFile {
+        /// JSON-RPC request id echoed back on the response.
+        action_id: String,
         /// Absolute path the agent asked to read (untrusted).
         path: String,
+        /// Optional 1-based start line the agent requested.
+        line: Option<u32>,
+        /// Optional maximum number of lines the agent requested.
+        limit: Option<u32>,
     },
     /// A `fs/write_text_file` the client is expected to service.
     WriteFile {
+        /// JSON-RPC request id echoed back on the response.
+        action_id: String,
         /// Absolute path the agent asked to write (untrusted).
         path: String,
+        /// The text content the agent asked to write (untrusted).
+        content: String,
     },
     /// A `terminal/*` request the client is expected to service.
     Terminal {
+        /// JSON-RPC request id echoed back on the response.
+        action_id: String,
         /// The concrete `terminal/*` method that arrived.
         method: String,
     },
@@ -248,19 +303,37 @@ impl AcpStreamDecoder {
                 Ok(None)
             }
             "fs/read_text_file" => {
+                let params = frame.get("params");
                 self.client_requests.push(PendingClientRequest::ReadFile {
+                    action_id: jsonrpc_id(frame),
                     path: request_path(frame),
+                    line: params
+                        .and_then(|params| params.get("line"))
+                        .and_then(Value::as_u64)
+                        .and_then(|line| u32::try_from(line).ok()),
+                    limit: params
+                        .and_then(|params| params.get("limit"))
+                        .and_then(Value::as_u64)
+                        .and_then(|limit| u32::try_from(limit).ok()),
                 });
                 Ok(None)
             }
             "fs/write_text_file" => {
                 self.client_requests.push(PendingClientRequest::WriteFile {
+                    action_id: jsonrpc_id(frame),
                     path: request_path(frame),
+                    content: frame
+                        .get("params")
+                        .and_then(|params| params.get("content"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
                 });
                 Ok(None)
             }
             other if other.starts_with("terminal/") => {
                 self.client_requests.push(PendingClientRequest::Terminal {
+                    action_id: jsonrpc_id(frame),
                     method: other.to_owned(),
                 });
                 Ok(None)
@@ -458,12 +531,30 @@ impl AcpStreamDecoder {
     fn cache_permission_request(&mut self, frame: &serde_json::Map<String, Value>) {
         let action_id = jsonrpc_id(frame);
         let summary = permission_summary(frame.get("params"));
+        let options = permission_options(frame.get("params"));
         self.emit(ExternalAgentEvent::PermissionRequested {
             action_id: action_id.clone(),
             summary: summary.clone(),
         });
-        self.client_requests
-            .push(PendingClientRequest::Permission { action_id, summary });
+        self.client_requests.push(PendingClientRequest::Permission {
+            action_id,
+            summary,
+            options,
+        });
+    }
+
+    /// Emits a [`FilePatch`](ExternalAgentEvent::FilePatch) for a file the client
+    /// itself materialized while servicing a `fs/write_text_file` request.
+    ///
+    /// The live adapter (M10-3) fulfils `fs/*` requests directly against the
+    /// worktree and calls this so the write still appears in the sequenced
+    /// observation stream under the decoder's monotonic `seq`.
+    pub(crate) fn note_file_patch(&mut self, path: String) {
+        self.emit(ExternalAgentEvent::FilePatch {
+            summary: format!("edit {path}"),
+            path,
+            diff_ref: None,
+        });
     }
 }
 
@@ -545,6 +636,31 @@ fn permission_summary(params: Option<&Value>) -> String {
     "permission requested".to_owned()
 }
 
+/// Extracts the offered permission options (id + allow/reject kind) from
+/// `request_permission` params, dropping any malformed entries.
+fn permission_options(params: Option<&Value>) -> Vec<AcpPermissionOption> {
+    let Some(options) = params
+        .and_then(|params| params.get("options"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    options
+        .iter()
+        .filter_map(|option| {
+            let option_id = option.get("optionId").and_then(Value::as_str)?.to_owned();
+            let kind = match option.get("kind").and_then(Value::as_str)? {
+                "allow_once" => AcpPermissionOptionKind::AllowOnce,
+                "allow_always" => AcpPermissionOptionKind::AllowAlways,
+                "reject_once" => AcpPermissionOptionKind::RejectOnce,
+                "reject_always" => AcpPermissionOptionKind::RejectAlways,
+                _ => return None,
+            };
+            Some(AcpPermissionOption { option_id, kind })
+        })
+        .collect()
+}
+
 /// Extracts the untrusted `path` from an `fs/*` request's params.
 fn request_path(frame: &serde_json::Map<String, Value>) -> String {
     frame
@@ -557,7 +673,10 @@ fn request_path(frame: &serde_json::Map<String, Value>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcpDecision, AcpStreamDecoder, PendingClientRequest};
+    use super::{
+        AcpDecision, AcpPermissionOption, AcpPermissionOptionKind, AcpStreamDecoder,
+        PendingClientRequest,
+    };
     use crate::agent::external::{ExternalAgentError, ExternalAgentEvent, ExternalObservedEvent};
     use crate::model::tool::ToolStatus;
 
@@ -808,7 +927,10 @@ mod tests {
                     "params": {
                         "sessionId": "s1",
                         "toolCall": { "toolCallId": "tc1", "title": "write /repo/x.rs" },
-                        "options": [],
+                        "options": [
+                            { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+                            { "optionId": "reject", "name": "Reject", "kind": "reject_once" },
+                        ],
                     },
                 })
                 .to_string(),
@@ -854,11 +976,24 @@ mod tests {
                 PendingClientRequest::Permission {
                     action_id: "7".to_owned(),
                     summary: "write /repo/x.rs".to_owned(),
+                    options: vec![
+                        AcpPermissionOption {
+                            option_id: "allow".to_owned(),
+                            kind: AcpPermissionOptionKind::AllowOnce,
+                        },
+                        AcpPermissionOption {
+                            option_id: "reject".to_owned(),
+                            kind: AcpPermissionOptionKind::RejectOnce,
+                        },
+                    ],
                 },
                 PendingClientRequest::WriteFile {
+                    action_id: "8".to_owned(),
                     path: "/repo/x.rs".to_owned(),
+                    content: "...".to_owned(),
                 },
                 PendingClientRequest::Terminal {
+                    action_id: "9".to_owned(),
                     method: "terminal/create".to_owned(),
                 },
             ],

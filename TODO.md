@@ -3452,7 +3452,7 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
 - **feature 隔离**:decoder/connection/cassette 全部 `#[cfg(feature = "external-acp")]` 或
   `#![cfg(feature = "external-acp")]` 门控;默认构建既不编译新代码也不拉入 ACP crate,默认全量测试与改动前一致。
 
-### [TODO] M10-3 实现 ACP live session adapter、permission bridge 与 ignored real e2e
+### [DONE] M10-3 实现 ACP live session adapter、permission bridge 与 ignored real e2e
 
 **上下文**:
 
@@ -3524,7 +3524,73 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
     否则清晰跳过)
 - 完整验证序列 1-6 全过(默认 + `--features external-acp`)。
 
-### [TODO] M10-4 Review:ACP adapter 正确性与协议一致性检查
+**完成记录**：
+
+- **新增唯一 pub 模块类型 `AcpAdapter`**(`src/agent/external/acp/adapter.rs`,~1080 行含单测):impl
+  `ExternalRuntimeAdapter`。`new(config)` 报告本 adapter 实现能力;`with_probed_capabilities(config, &probed)`
+  与实现能力逐位取交(复用 `intersect_capabilities`,保留左侧 ACP runtime label);`with_launcher(config,
+  Arc<dyn AcpLauncher>)` 供离线注入 fake transport。私有 `AcpSession` impl `ExternalRuntimeSession`,持单条长驻
+  连接 + 跨全程单调 `seq`(承 M10-2 `AcpStreamDecoder`)。`acp/mod.rs` `mod adapter;` 挂载并 re-export
+  `AcpAdapter`;`decoder` re-export 补 `AcpPermissionOption` / `AcpPermissionOptionKind`;`external/mod.rs`
+  的 `#[cfg(feature="external-acp")]` 块同步补齐,故 `agent_lib::agent::external::AcpAdapter` 等可用。**未导出任何
+  `agent-client-protocol*` raw 类型**。
+- **握手 / 会话**:`start` → `initialize`(advertise `clientCapabilities.fs.{readTextFile,writeTextFile}=true`、
+  `terminal=false`、`protocolVersion=ACP_WIRE_VERSION(=1)`)→ 据返回 `negotiated_from_initialize` 记录
+  `loadSession` → `session/new`(cwd + 空 mcpServers)取 ACP session id(作 registry key / resume token)。
+  `resume` 仅当协商到 `loadSession` 时用 `session/load` 复活,否则 `ResumeUnavailable`。`advance`:`Start`/
+  `Continue` → `session/prompt` 读 `session/update` 直到落定 decision;`RespondInteraction` → 校验后回写 ACP
+  permission response 再续读;turn 结束(`stopReason`)→ `Completed`;`session/request_permission` →
+  `PausedForInteraction`;连接断 → `SessionLost`(带 session ref);协议违例 → `Protocol`。`shutdown` 发
+  `session/cancel` + `close(grace)`,超时 forced kill,归类 `ExternalSessionShutdown`。
+- **permission bridge(ACP 首次真正驱动 host-pausable 臂)**:`session/request_permission` → 构造 host 绑定
+  `Interaction`——`step_id = StepId::new(RunContext.run_id)`、`actor = request.agent_id`、
+  `PermissionCategory::Other`、`PermissionRisk::Medium`,**绝不**取自 runtime 输出;应答先经
+  `Interaction::accepts_response`(并核对 `action_id == pending.request_id`)校验后,才用
+  `permission_outcome` 把 `PermissionDecision` 映射为 ACP `outcome`:Approve→选 allow 选项(优先 once 后
+  always)、Deny→选 reject 选项、Cancel/无匹配→`{"outcome":"cancelled"}`;response id 经 `json_rpc_id_value`
+  还原为数值以精确关联。
+- **fs/terminal 作 client 环境服务**(不折成 `NeedTool`,首版 `host_tools=false`):`fs/write_text_file` 在
+  `Plan` 模式拒绝(JSON-RPC error),否则建父目录 + 写 + `decoder.note_file_patch()`(汇报为 `FilePatch` 观测)+
+  回 `{}`;`fs/read_text_file` 读(可选 `line`/`limit` 窗口)+ 回 `{content}`;`terminal/*` 以 `-32601` 拒绝
+  (client advertised `terminal:false`)。错误诊断只用 `error.kind()`,永不夹带文件内容/凭据。
+- **能力(诚实)**:`streaming` / `permission_bridge` / `graceful_shutdown` = true;`resume` 静态乐观 true 但
+  runtime `resume()` 依 `loadSession` 协商回落 `ResumeUnavailable`;`artifacts` / `usage`(unstable) / `reconfigure`
+  / `host_tools` / `host_subagents` = false。声明 `tools` 的 `start`/`resume` 以
+  `UnsupportedCapability{HostTools}` 拒绝;follow-up `RespondToolResults`→`{HostTools}`、
+  `RespondSubagent`→`{HostSubagents}` 明确拒绝。**相对三个 CLI adapter 的关键差异**:Claude Code /
+  Codex / OpenCode 的 `permission_bridge=false`(自治或每-turn 一次性进程,不把 gated action 交回宿主),ACP
+  是首个 `permission_bridge=true` 的 adapter,`resume` 亦由 `loadSession` 协商而非固定。
+- **测试(全绿,均 <1s)**:adapter inline 11 个 fake-transport 单测(`acp_adapter_*`):
+  start→permission→completion(断言 `action_id="100"`、`Interaction.step_id==StepId(run_id)`、permission
+  `actor==agent_id`、≥3 观测、写出 initialize/session/new/session/prompt + 选 allow 的 permission response、
+  summary "working done"、sink `seq` 单调)、deny 选 reject、fs 写经审批后落盘 + `FilePatch`、Plan 模式拒写、
+  连接断→SessionLost、协议违例→Protocol、shutdown 分类(注入 `ForcedKill` + 断言写出 `session/cancel`)、
+  声明 tools→`UnsupportedCapability{HostTools}`、tool/subagent results 拒绝、resume 需 loadSession、能力诚实、
+  outcome 映射、json-rpc id 数值保真、line window。新增 `tests/agent_acp_adapter_drain.rs`:registry-backed
+  handler + `AcpAdapter::with_launcher` + fake transport,经真实 `ExternalAgentMachine::drain` 跑通
+  Start→PausedForInteraction→NeedInteraction(`ScriptedInteractionHandler([Approve])`)→RespondInteraction→
+  Completed(断言 `Done`、1 次 interaction、committed 1 turn、写出握手 + 选 allow),**证明 ACP 首次真正驱动
+  host-pausable 臂且无需改 machine/driver/state**。
+- **真机 e2e**:新增 `#[ignore]` `tests/external_acp.rs`:经 `ACP_AGENT_BIN`(+ `ACP_AGENT_ARGS`)或 PATH 发现
+  `opencode acp` / `claude-agent-acp` / `codex-acp`;测试 env 覆盖 `ACP_CODEX_HOME`→`CODEX_HOME`、
+  `ACP_OPENCODE_CONFIG`→`OPENCODE_CONFIG`、`ACP_CLAUDE_SETTINGS`→`--settings <file>`(映射到 `AcpConfig`
+  env/args,均不读 API key、不打印);临时 git worktree 驱动 start→advance(自动 approve 权限暂停)→completion→
+  graceful shutdown,断言多步观测(SessionStarted + ≥1 文本 + SessionCompleted,≥3 事件)与 worktree 隔离
+  (产物落 worktree 内、不泄漏到启动 checkout)。**本机 `opencode acp`(自带 ACP)实跑通过**:19 条观测(15 文本)、
+  创建 `READY.txt`、graceful 关闭、13.9s;缺 binary/登录即清晰非-secret 跳过退绿。运行命令:
+  `cargo test --features external-acp --test external_acp -- --ignored --nocapture`。
+- **验证序列 1-6 全过**(默认 + `--features external-acp` 两配置):`cargo fmt --all` 通过;
+  `cargo clippy --all-targets -- -D warnings`(默认)、`--features external-acp`、
+  `--features "external-claude-code external-codex external-opencode"` 均无告警;
+  `cargo test --all --all-targets`(默认)全绿、`--features external-acp` 全绿(lib 新增 11 个 acp adapter 单测,
+  集成新增 drain 测试 + ignored e2e);`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 默认与
+  `--features external-acp` 均通过。聚焦:`cargo test -p agent-lib --features external-acp acp_adapter` 11 passed。
+- **feature 隔离**:adapter/drain/e2e 全 `#[cfg(feature="external-acp")]` / `#![cfg(...)]` 门控;
+  `cargo tree -e normal -i agent-client-protocol`(默认)报 `did not match any packages`(证明不拉入),
+  `--features external-acp` 下为 `agent-client-protocol v1.2.0 └── agent-lib`。machine/driver/`ExternalAgentState`
+  无任何 ACP 特判改动。
+
+
 
 **上下文**:
 

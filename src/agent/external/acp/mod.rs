@@ -35,13 +35,18 @@
 //! rather than a schema type so the crate boundary stays inside the adapter; the
 //! projection is built from the handshake by the connection layer in later tasks.
 
+mod adapter;
 mod config;
 mod connection;
 mod decoder;
 
+pub use adapter::AcpAdapter;
 pub use config::AcpConfig;
 pub use connection::{AcpLauncher, SpawnedAcpAgent, TokioProcessLauncher};
-pub use decoder::{AcpDecision, AcpStreamDecoder, PendingClientRequest};
+pub use decoder::{
+    AcpDecision, AcpPermissionOption, AcpPermissionOptionKind, AcpStreamDecoder,
+    PendingClientRequest,
+};
 
 use crate::agent::external::{ExternalRuntimeCapabilities, ExternalRuntimeKind};
 

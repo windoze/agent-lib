@@ -254,6 +254,7 @@ fn expected_client_request() -> PendingClientRequest {
     PendingClientRequest::Permission {
         action_id: "10".to_owned(),
         summary: "write src/lib.rs".to_owned(),
+        options: Vec::new(),
     }
 }
 
