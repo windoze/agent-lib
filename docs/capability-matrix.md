@@ -96,8 +96,14 @@ resume、host 工具注入、subagent 桥接等。这套模型的唯一代码来
 `ExternalRuntimeKind::conservative_capabilities()` /
 `ExternalRuntimeCapabilities::none(runtime)` 把每个特性都置为 `false`；只有真实探测或 adapter
 声明才会逐字段打开（design §15，PLAN 非目标「能力差异通过 capability model 显式暴露，不能
-静默假装支持」）。**当前 crate 尚未接入任何真实 runtime 探测或 adapter，因此下表所有 runtime
-的每一项都保持 `unsupported`，本文不声称任何已验证的 runtime 支持。**
+静默假装支持」）。**默认构建（未启 `external-claude-code` 等 adapter feature）下 crate 仍不接入
+任何真实 runtime 探测或 adapter，下表所有 runtime 的每一项都保持 `unsupported`，本文不声称任何
+已验证的 runtime 支持。** 里程碑 6 起，feature-gated 的 Claude Code adapter 提供了一个
+**capability probe**（`external-claude-code` 下的
+[`agent::external::probe`](../src/agent/external/claude_code/probe.rs)）：它调用 `claude --version`
+/ `--help`，把缺失/损坏的 binary 分类为 `Launch`、把不支持 `stream-json` 的 CLI 分类为
+`UnsupportedCapability{Streaming}`，并从 `--help` 广告出的开关**保守探测**能力位。该探测反映的是
+「CLI 自称支持什么」，仍**不是** e2e 实测；下表 Claude Code 行要等 M6-3/M6-4 真实会话跑通后才逐项翻真。
 
 ### 受管能力清单（`ExternalCapability`，共 8 项）
 

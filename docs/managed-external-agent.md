@@ -888,6 +888,23 @@ claude --print --output-format stream-json --input-format stream-json ...
 - `--model` 从 runtime config 注入。
 - `--max-budget-usd` 可映射 budget。
 
+#### 实现状态（M6-1，已落地）
+
+`external-claude-code` feature 下已落地**启动配置 + capability probe**（尚无 stream decoder /
+live session，见 M6-2/M6-3）：
+
+- `ClaudeCodeConfig`（`src/agent/external/claude_code/config.rs`）：binary path / env override /
+  working dir(worktree) / permission mode / optional model / profile / timeout 的纯数据配置。serde
+  round-trip；手写 `Debug` 脱敏 env 值（只印 key + `<redacted>`）。`permission_mode_arg()` 映射
+  `ExternalPermissionMode` → Claude CLI `--permission-mode` 值（`Prompt→default`、
+  `AcceptEdits→acceptEdits`、`Plan→plan`、`BypassPermissions→bypassPermissions`）；`base_session_args()`
+  产出 `--print --output-format stream-json --input-format stream-json --permission-mode <m> [--model <m>]`。
+- `probe`/`probe_with_exec`（`.../claude_code/probe.rs`）：跑 `--version` + `--help`。缺失/损坏 binary
+  或非零退出 → `ExternalAgentError::Launch`；不广告 `stream-json` 结构化流 → `UnsupportedCapability{Streaming}`；
+  其余能力从 `--help` 开关**保守探测**（未广告即 `false`），永不 panic。探测走可注入的
+  `ClaudeCodeProbeExec`（生产实现 `SystemClaudeCodeExec` 用 `tokio::process`），单测用 fake exec 离线覆盖
+  全部错误分类，无需真实 Claude Code，也不泄露 env secret。
+
 ### 12.2 streaming decoder
 
 Claude stream-json frame 映射:

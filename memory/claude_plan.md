@@ -1,42 +1,52 @@
-# M5-4 Review：runtime abstraction 与离线 e2e 完整性检查
+# M6-1 增加 Claude Code capability probe 与启动配置
 
-**当前执行 = TODO.md 第一个未完成任务 = M5-4**（M1..M4、M5-1、M5-2、M5-3 均 `[DONE]`）。
+**当前执行 = TODO.md 第一个未完成任务 = M6-1**（M1..M5 全部 `[DONE]`）。
 
 ## 任务理解
-M5-4 是**审查任务**（review），是真实 adapter（M6-M8）前的边界冻结点。
-目的是确认后续 Claude/Codex/OpenCode 只需在 adapter 层填 parser + process 管理，
-不需要改 machine/driver。这是真实任务，不能跳过。
+M6-1 是 Milestone 6（Claude Code managed adapter）的第一步：**只做启动配置 + capability
+probe**，不做 stream decoder（M6-2）也不做 session adapter（M6-3）。必须 feature-gated，
+默认 `cargo test --all --all-targets` 在未启 feature 时通过。
 
 ## 目标（TODO.md 做什么）
-1. 检查 `ExternalSessionHandler` 生产路径是否只组合 registry + adapter，不含 machine 状态逻辑。
-2. 检查 scripted tests 是否覆盖：tool / interaction / subagent / mixed tool+subagent /
-   observations live sink + buffered replay / cancel cleanup。
-3. 检查 cassette schema 是否文档化并脱敏。
-4. 更新 `docs/managed-external-agent.md` runtime adapter 章节的实现状态。
+1. 新增 feature gate `external-claude-code`（非默认）。
+2. `ClaudeCodeConfig`：binary path/env override、working dir/worktree、permission mode 映射、
+   optional model/profile、timeout。Debug 必须脱敏 env 值。
+3. probe：
+   - 检查 binary/version（`--version`）。
+   - 检查 output format / stream mode（`--help` 中 `--output-format` + `stream-json` + `--input-format`）。
+   - 返回 `ExternalRuntimeCapabilities`。
+   - 失败必须返回 `ExternalAgentError::Launch`（缺 binary / 启动失败 / 非零退出）或
+     `UnsupportedCapability`（缺 stream-json 结构化流），**不 panic**。
 
-## 验证条件
-- `cargo test -p agent-lib scripted_external`
-- `cargo test -p agent-lib external_cassette`
-- 完整验证序列 1-6 全过。
-- 完成记录中列出真实 adapter 必须实现的 trait 方法和错误映射。
+## 设计
+- 新目录 `src/agent/external/claude_code/`，feature-gated：`mod.rs` + `config.rs` + `probe.rs`。
+- probe 用可注入 exec 抽象 `ClaudeCodeProbeExec`（async trait），生产实现
+  `SystemClaudeCodeExec` 走 `tokio::process::Command`（tokio "full" 已含 process，无新重依赖），
+  测试用 fake exec 返回罐装输出 → 离线验证错误分类，无需真实 Claude binary。
+- permission_mode 映射真实 Claude CLI 值：Prompt→`default`、AcceptEdits→`acceptEdits`、
+  Plan→`plan`、BypassPermissions→`bypassPermissions`。
+- capability 探测（保守，未检出即 false）：
+  streaming = help 含 `--output-format`+`stream-json`+`--input-format`；
+  permission_bridge = `--permission-mode`；resume = `--resume`/`--continue`；
+  host_tools = `--mcp-config`；usage/artifacts = 同 streaming；graceful_shutdown = true；
+  host_subagents = false（留待 M6-3）。若 !streaming → `UnsupportedCapability{Streaming}`。
+- `ClaudeCodeConfig` 派生 Serialize/Deserialize + round-trip 测试；手写 Debug 脱敏 env。
+
+## 验证条件（TODO.md）
+- `cargo test -p agent-lib claude_code_probe`（无 feature → 0 test）
+- 真正验证：`cargo test -p agent-lib --features external-claude-code claude_code_probe`
+- `cargo test --all --all-targets`（未启 feature）通过。
+- 不泄露 env secret。
+- 完整验证序列 1-6 全过 + feature-enabled clippy/doc/test。
 
 ## 执行计划
-1. [进行中] 读 runtime.rs（ExternalRuntimeAdapter/Session/Registry + Handler 生产路径）。
-2. 读 scripted tests + cassette 测试，逐项核对 6 类覆盖；缺口需补测试。
-3. 读 cassette.rs 与 fixtures，确认 schema 文档化 + redaction。
-4. 更新 docs/managed-external-agent.md runtime adapter 章节实现状态。
-5. 验证序列 1-6。
-6. TODO.md 标 [DONE] + 完成记录（含真实 adapter 必须实现的 trait 方法 + 错误映射清单）。
-7. 提交 `[M5-4] ...` 并停止。
+1. [x] 写 memory plan。
+2. [x] Cargo.toml 加 `[features] external-claude-code = []`。
+3. [x] 新增 `claude_code/{mod.rs,config.rs,probe.rs}` + external/mod.rs feature-gated 挂载/re-export。
+4. [x] 单元测试（config + probe，filter 名含 `claude_code_probe`）。
+5. [x] 更新 docs/capability-matrix.md Claude Code 行。
+6. [x] 验证序列 1-6（+ feature-enabled clippy/doc/test）。
+7. [x] TODO.md 标 [DONE] + 完成记录。
+8. [ ] 提交 `[M6-1] ...` 并停止。
 
-## 状态：调查中
-
-## 状态：完成
-- [x] 核对 handler = registry+adapter，无 machine 状态（runtime.rs/cassette.rs/registry.rs）
-- [x] 覆盖核对：tool/interaction/subagent/live-sink/buffered-replay/cancel-cleanup 已覆盖
-- [x] 补缺口测试 scripted_external_mixed_tool_and_subagent_round_trip（唯一缺口）
-- [x] 核对 cassette schema 文档化 + 脱敏（scan_secrets/assert_no_secrets/fixtures_are_redacted）
-- [x] 更新 docs/managed-external-agent.md（§1 能力表 + §11.4 实现状态 + trait/错误映射）
-- [x] 验证序列 1-6 全过（fmt / scripted 5 / cassette 9 / clippy / 全量 40 binary 0 failed / doc / diff-check）
-- [x] TODO.md 标 [DONE] + 完成记录（含真实 adapter trait 方法 + 错误映射清单）
-- [ ] 提交 `[M5-4] ...`（本轮最后一步）
+## 状态：完成（待提交）

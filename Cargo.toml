@@ -7,6 +7,14 @@ name = "agent-lib"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Enables the managed Claude Code runtime adapter (launch config + capability
+# probe, with the stream decoder and live session added in later milestones).
+# Off by default so the core crate pulls in no CLI-adapter machinery unless a
+# host opts in; the probe reuses tokio's process support, so enabling it adds no
+# new heavy dependency.
+external-claude-code = []
+
 [dependencies]
 async-trait = "0.1"
 eventsource-stream = "0.2.3"

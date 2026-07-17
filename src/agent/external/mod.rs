@@ -65,6 +65,8 @@ use thiserror::Error;
 
 mod adapter;
 mod capability;
+#[cfg(feature = "external-claude-code")]
+mod claude_code;
 mod config;
 mod dispatch;
 mod escalation;
@@ -79,6 +81,11 @@ mod state;
 
 pub use adapter::{ExternalRuntimeAdapter, ExternalRuntimeSession, RuntimeDecisionPoint};
 pub use capability::{ExternalCapability, ExternalRuntimeCapabilities};
+#[cfg(feature = "external-claude-code")]
+pub use claude_code::{
+    ClaudeCodeConfig, ClaudeCodeProbeExec, ProbeOutput, SystemClaudeCodeExec, probe,
+    probe_with_exec,
+};
 pub use config::{ExternalAgentMachineConfig, ExternalToolFailurePolicy};
 pub use dispatch::{
     CostPreference, DispatchError, DispatchReason, Dispatcher, ImpactScope, RuleRouter,

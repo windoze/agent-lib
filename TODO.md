@@ -1827,7 +1827,7 @@ process 管理,不需要改 machine/driver。
 目标:实现 feature-gated Claude Code adapter,支持 stream-json 解码、permission bridge、tool/subagent bridge
 能力探测；真实 e2e ignored。
 
-### [TODO] M6-1 增加 Claude Code capability probe 与启动配置
+### [DONE] M6-1 增加 Claude Code capability probe 与启动配置
 
 **上下文**:
 
@@ -1857,6 +1857,40 @@ process 管理,不需要改 machine/driver。
 - `cargo test -p agent-lib claude_code_probe`
 - `cargo test --all --all-targets` 在未启 feature 时通过。
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- 新增非默认 feature gate `external-claude-code`（`Cargo.toml`）。开启才编译 adapter；探测复用
+  tokio 的 process 支持，不引入新重依赖。
+- 新增 feature-gated 模块 `src/agent/external/claude_code/{mod.rs,config.rs,probe.rs}`，在
+  `src/agent/external/mod.rs` 以 `#[cfg(feature = "external-claude-code")]` 挂载并 re-export
+  `ClaudeCodeConfig`、`ClaudeCodeProbeExec`、`ProbeOutput`、`SystemClaudeCodeExec`、`probe`、
+  `probe_with_exec`。为 M6-2/M6-3 预留目录，但本任务只填 config + probe。
+- `ClaudeCodeConfig`：binary path / env override / working dir(worktree) / permission mode /
+  optional model / profile / timeout。serde round-trip（可持久化）；手写 `Debug` 脱敏 env 值
+  （只印 key + `<redacted>`）。`permission_mode_arg()` 映射 `ExternalPermissionMode` → Claude CLI
+  `--permission-mode`（`Prompt→default`/`AcceptEdits→acceptEdits`/`Plan→plan`/
+  `BypassPermissions→bypassPermissions`）；`base_session_args()` 产出结构化流启动参数。
+- probe：跑 `--version`（缺失/损坏/非零退出 → `ExternalAgentError::Launch`）+ `--help`（空输出 →
+  `Launch`；从开关保守探测能力位）。无 `stream-json` 结构化流 → `UnsupportedCapability{Streaming}`。
+  能力探测保守：streaming/usage/artifacts 由 `--output-format stream-json`+`--input-format` 决定，
+  permission_bridge←`--permission-mode`，resume←`--resume`/`--continue`，host_tools←`--mcp-config`，
+  graceful_shutdown=true，host_subagents=false（留待 M6-3）。永不 panic。探测走可注入
+  `ClaudeCodeProbeExec`（生产实现 `SystemClaudeCodeExec` 用 `tokio::process`，kill_on_drop + timeout）。
+- 测试（`src/agent/external/claude_code/*` 内联，13 个）：config 默认/权限映射/启动参数/serde
+  round-trip/Debug 脱敏；probe full-capability 探测、缺 binary→Launch、非零 version→Launch、空 help→Launch、
+  无 stream-json→Unsupported、env secret 不泄露（Display+Debug 均断言）、真实 `SystemClaudeCodeExec`
+  对不存在 binary→Launch（离线、不 panic）、`detect_capabilities` 未广告即 false。fake exec 覆盖全部
+  分类，无需真实 Claude Code、无网络。
+- 文档：`docs/managed-external-agent.md` §12.1 增补「实现状态（M6-1）」；`docs/capability-matrix.md`
+  保守基线段落说明 feature-gated 探测存在但仍非 e2e 实测，Claude Code 行待 M6-3/M6-4 翻真。
+- 验证：`cargo fmt --all -- --check` 干净；`cargo test -p agent-lib --features external-claude-code
+  --lib claude_code_probe`（7 passed）与全量 `claude_code`（13 passed）；`cargo clippy --all-targets
+  -- -D warnings` 与 `--features external-claude-code` 均 0 warning；`cargo test --all --all-targets`
+  （未启 feature）40 个 test binary 全 ok、0 failed；`cargo test -p agent-lib claude_code_probe`
+  （未启 feature）0 test（feature 关闭时模块不编译）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --workspace`（含 `--features external-claude-code`）干净；`git diff --check` 干净。
+- Claude Code 真实 e2e 未在本任务范围（属 M6-3）；本机未运行真实 CLI。
 
 ### [TODO] M6-2 实现 Claude Code stream decoder cassette 测试
 
