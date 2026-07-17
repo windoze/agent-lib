@@ -43,19 +43,20 @@ use std::sync::Arc;
 
 use crate::agent::requirement::AgentSpecRef;
 use crate::agent::{
-    AgentError, AgentInput, AgentSpec, AgentState, BudgetLimits, Capability, CostTier,
+    AgentError, AgentInput, AgentSpec, AgentState, Blackboard, BudgetLimits, Capability, CostTier,
     DefaultAgentMachine, EscalationError, EscalationOutcome, EscalationRules, EscalationTrigger,
     Escalator, HandlerScope, HumanGate, ImpactScope, InteractionHandler, LlmClientHandler,
-    LlmHandler, LlmStepMode, LoopCursor, LoopPolicy, ModelRef, Notification, PermissionRisk,
-    RequirementIds, RequirementResult, RunContext, RunId, ScriptedVerifier, TaskDescriptor,
-    ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy, ToolHandler, ToolRegistry,
-    ToolRegistryHandler, ToolSetRef, Uncertainty, WorkerProfile, WorkerProfileRef, WorkerReport,
-    WorkerRoster, WorktreeRef, drain,
+    LlmHandler, LlmStepMode, LoopCursor, LoopPolicy, Mailbox, ModelRef, Notification,
+    PermissionRisk, Plan, RequirementIds, RequirementResult, RunContext, RunId, ScriptedVerifier,
+    TaskDescriptor, ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy, ToolHandler,
+    ToolRegistry, ToolRegistryHandler, ToolSetRef, Uncertainty, WorkerProfile, WorkerProfileRef,
+    WorkerReport, WorkerRoster, WorktreeRef, drain,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig};
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
 use crate::facade::chat::client_for_provider;
+use crate::facade::collab::{CollabState, Collaboration, resolve};
 use crate::facade::config::{ModelConfig, ProviderConfig};
 use crate::facade::delegate::{
     AgentWorkerBuilder, DISPATCHER_ESCALATE_MARKER, Delegation, DelegationRecorder,
@@ -138,6 +139,10 @@ pub struct Agent {
     delegates: Vec<LocalSubagent>,
     external_agents: Vec<ManagedExternalDelegate>,
     delegation: Delegation,
+    /// The resolved collaboration substrate (config plus the live shared
+    /// mailbox/blackboard/plan primitives), derived from the delegate topology
+    /// or from an explicit [`Collaboration`] (`docs/facade-api.md` §14).
+    collab: CollabState,
     /// The last-known data-only session facts for each managed external delegate,
     /// keyed by delegate name, refreshed after every `run_full` drive so a later
     /// [`snapshot`](Agent::snapshot) can persist them (§15.2).
@@ -181,6 +186,7 @@ impl std::fmt::Debug for Agent {
                     .collect::<Vec<_>>(),
             )
             .field("delegation", &self.delegation)
+            .field("collaboration", &self.collab.config)
             .finish_non_exhaustive()
     }
 }
@@ -408,6 +414,44 @@ impl Agent {
     #[must_use]
     pub const fn delegation(&self) -> &Delegation {
         &self.delegation
+    }
+
+    /// Returns the resolved collaboration substrate set for this agent.
+    ///
+    /// The set is derived from the delegate topology (`docs/facade-api.md` §14)
+    /// unless an explicit [`Collaboration`] was supplied through
+    /// [`AgentBuilder::collaboration`], in which case that value applies verbatim.
+    #[must_use]
+    pub const fn collaboration(&self) -> &Collaboration {
+        &self.collab.config
+    }
+
+    /// Returns the shared [`Mailbox`] when the collaboration set enabled it.
+    ///
+    /// The returned handle is shared (`Arc`), so a caller, a delegate, or the
+    /// external collab-event bridge all message through the one live inbox layer
+    /// (`docs/facade-api.md` §14). Returns `None` when the mailbox is not enabled.
+    #[must_use]
+    pub fn mailbox(&self) -> Option<Arc<Mailbox>> {
+        self.collab.mailbox.clone()
+    }
+
+    /// Returns the shared [`Blackboard`] when the collaboration set enabled it.
+    ///
+    /// The returned handle is shared (`Arc`). Returns `None` when the blackboard
+    /// is not enabled.
+    #[must_use]
+    pub fn blackboard(&self) -> Option<Arc<Blackboard>> {
+        self.collab.blackboard.clone()
+    }
+
+    /// Returns the shared [`Plan`] board when the collaboration set enabled it.
+    ///
+    /// The returned handle is shared (`Arc`). Returns `None` when the plan board
+    /// is not enabled.
+    #[must_use]
+    pub fn plan(&self) -> Option<Arc<Plan>> {
+        self.collab.plan.clone()
     }
 
     /// Builds the per-run [`DelegationRoute`] the run-scoped
@@ -746,6 +790,7 @@ pub struct AgentBuilder {
     delegates: Vec<LocalSubagent>,
     external_agents: Vec<ManagedExternalDelegate>,
     delegation: Option<Delegation>,
+    collaboration: Option<Collaboration>,
 }
 
 impl std::fmt::Debug for AgentBuilder {
@@ -785,6 +830,7 @@ impl std::fmt::Debug for AgentBuilder {
                     .collect::<Vec<_>>(),
             )
             .field("delegation", &self.delegation)
+            .field("collaboration", &self.collaboration)
             .finish_non_exhaustive()
     }
 }
@@ -984,6 +1030,34 @@ impl AgentBuilder {
         self
     }
 
+    /// Sets the collaboration substrate for the registered delegates.
+    ///
+    /// By default the substrate is derived from the delegate topology
+    /// (`docs/facade-api.md` §14): no delegate enables nothing, multiple
+    /// delegates auto-enable a shared mailbox, a dispatcher-routed loop
+    /// additionally enables a plan board and blackboard, and a managed external
+    /// delegate enables the artifact store. Passing an explicit
+    /// [`Collaboration`] **replaces** that derived default in full, so a caller
+    /// can enable exactly the subset they want:
+    ///
+    /// ```no_run
+    /// # fn demo(builder: agent_lib::facade::AgentBuilder) -> agent_lib::facade::AgentBuilder {
+    /// use agent_lib::facade::Collaboration;
+    ///
+    /// builder.collaboration(Collaboration::new().plan().blackboard().mailbox().artifacts())
+    /// # }
+    /// ```
+    ///
+    /// Enabling a substrate provisions a live, shared primitive reachable through
+    /// [`Agent::mailbox`], [`Agent::blackboard`], and [`Agent::plan`]. The
+    /// external-runtime collab-event bridge that populates them is a later
+    /// milestone; this layer provisions the substrate that bridge writes into.
+    #[must_use]
+    pub fn collaboration(mut self, collaboration: Collaboration) -> Self {
+        self.collaboration = Some(collaboration);
+        self
+    }
+
     /// Finalizes the builder into an [`Agent`], assembling the §8.3 machine stack.
     ///
     /// # Errors
@@ -1108,6 +1182,17 @@ impl AgentBuilder {
 
         let machine = assemble_machine(state, &ids, approval.clone());
 
+        // Resolve the collaboration substrate from the delegate topology (§14),
+        // letting an explicit `Collaboration` override the derived default, then
+        // provision the live shared primitives each enabled substrate needs.
+        let collaboration = resolve(
+            self.collaboration,
+            &delegation,
+            self.delegates.len(),
+            self.external_agents.len(),
+        );
+        let collab = CollabState::provision(collaboration, &ids);
+
         Ok(Agent {
             machine,
             client,
@@ -1119,6 +1204,7 @@ impl AgentBuilder {
             delegates: self.delegates,
             external_agents: self.external_agents,
             delegation,
+            collab,
             last_external_sessions: HashMap::new(),
         })
     }

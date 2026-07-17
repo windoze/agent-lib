@@ -32,6 +32,7 @@ use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationSnapshot};
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
 use crate::facade::chat::client_for_provider;
+use crate::facade::collab::{CollabState, resolve};
 use crate::facade::config::ProviderConfig;
 use crate::facade::delegate::{Delegation, LocalSubagent};
 use crate::facade::error::FacadeError;
@@ -726,6 +727,18 @@ impl AgentRestoreBuilder {
             }
         }
 
+        // Re-derive the collaboration substrate from the restored topology (§14).
+        // A snapshot carries no explicit `Collaboration` (§15.2), so restore
+        // reconstructs the default set the same delegate topology would enable
+        // and re-provisions fresh shared primitives.
+        let collaboration = resolve(
+            None,
+            &snapshot.delegation,
+            delegates.len(),
+            external_agents.len(),
+        );
+        let collab = CollabState::provision(collaboration, &ids);
+
         Ok(Agent {
             machine,
             client,
@@ -743,6 +756,7 @@ impl AgentRestoreBuilder {
             // policy above (§15.2, §15.3).
             external_agents,
             delegation: snapshot.delegation,
+            collab,
             last_external_sessions,
         })
     }

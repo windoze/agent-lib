@@ -1,51 +1,48 @@
-# M5-R Review: Dispatcher / Escalator correctness + doc consistency
+# M6-1 — `Collaboration` config + topology-driven collab substrate
 
-Task: `TODO.md` §Milestone 5 → **M5-R** (first incomplete task). Review + convergence only.
-Spec anchors: `docs/facade-api.md` §13.2–§13.3, §6.3 (`RunEvent::Escalated`/`EscalationTrace`),
-§18.5, §19 (no new scheduler runtime).
+Task: `TODO.md` §Milestone 6 → **M6-1** (first incomplete task).
+Spec anchors: `docs/facade-api.md` §14 (default table + explicit `Collaboration`), §18.6, §19;
+`PLAN.md` R8 (only promise landed collab; don't fake). `agent::collab` primitives (Mailbox/
+Blackboard/Plan) are landed and public.
 
-## Goal
-Certify M5-1 (rules-routed) + M5-2 (dispatcher-routed) match §13.2–§13.3:
-- rules-routed: model unaware (no delegate tools advertised).
-- dispatcher-routed maps onto existing `agent::external::{Dispatcher, Escalator}` (no new runtime, §19).
-- escalation path + `DelegationTrace` / `RunEvent::Escalated` complete.
-- dispatcher is never a first-version default.
-Fix small deviations; record gaps as follow-up tasks (per rules). Produce §13 promise vs
-M5-impl comparison table. Run full validation sequence 1–6 (+ external-features clippy).
+## §14 default table (topology -> substrate)
+- no delegate -> none
+- 1 delegate, model-routed -> mailbox optional, default OFF -> none
+- multiple delegates -> mailbox
+- dispatcher / verifier -> plan + blackboard + mailbox
+- managed external agent -> artifact store (additive)
 
-## Review findings (code read)
-- `delegate.rs`: `DelegationMode::{Rules,Dispatcher}` → `declarations()`/`route()`/
-  `external_tool_names()` all return empty ⇒ model never sees delegates. ✓ (§13.2/§13.3)
-- `route_task`: first-match-wins, case-insensitive substring. ✓
-- Build-time validation: `first_unknown_rule_delegate` / `first_unknown_dispatcher_delegate` +
-  empty-primary check ⇒ `FacadeError::Config`. ✓
-- `agent.rs drive_dispatcher_routed`: primary→verify→escalate loop capped by `max_attempts`;
-  escalation *decision* via real `Escalator::assess` over a `WorkerRoster`
-  (primary=Cheap+EscalationRules→strong; strong=Premium terminal), `with_budget_headroom(0)`.
-  Emits `RunEvent::Escalated(EscalationTrace{from,to})`; per-attempt worker/verifier →
-  `DelegationTrace`. No supervisor LLM; usage=0; not folded into Conversation. ✓ (§19)
-- Uses `Escalator` (escalation engine) but not `Dispatcher` (initial budget-aware router):
-  faithful, since the primary is an explicitly-named fixed worker (no ambiguous routing to
-  dispatch). Documented in M5-2 record. → note in comparison table, no code change.
-- prelude / facade §3: §3's list has no `RoutingRule`/`DispatcherConfig`/`EscalationTrace`;
-  current prelude already matches §3 (has `Delegation`, `RunEvent`, `RunOutput`, `ManagedExternalAgent`).
-  ⇒ no prelude change needed (unlike M4-R which had a pending prelude add).
+Explicit `.collaboration(Collaboration::new().plan().blackboard().mailbox().artifacts())`
+overrides the derived default (full replacement).
 
-## Decision
-No source deviation found requiring a fix. Pure review: run full validation, write completion
-record + comparison table in TODO.md, mark M5-R `[DONE]`, commit, stop.
+## Scope decision (honest, non-faking, per R8)
+- collab Mailbox/Blackboard/Plan and `ArtifactRef` all landed -> all four §14 substrates map to
+  real primitives. No auto-tier faked/skipped.
+- "Wire into scope/state" = provision live, shared primitives on `Agent` (real state), exposed
+  via public accessors so callers / delegates / the M6-2 external bridge can use them.
+- §14's named populate mechanism is the external runtime collab-event bridge = M6-2. So M6-1 does
+  NOT give the supervisor LLM collab tools / auto-route coordination (would over-reach/fake).
+- Snapshot: reserved collab fields stay reserved in M6-1 (serialization + restore lands w/ bridge,
+  M6-2). Provisioning is live-state only. Base-path snapshot test stays green (base provisions none).
+- Prelude: §3 has NO `Collaboration` -> export from `facade` only, NOT prelude (M6-R check green).
 
-## Validation (sequence 1–6 + external clippy)
-1. cargo fmt --all -- --check
-2. cargo clippy --all-targets -- -D warnings
-3. cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
-4. cargo test -p agent-lib facade::delegate  (focused)
-5. cargo test --all --all-targets  (full)
-6. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace ; git diff --check
+## Steps
+1. FacadeIds: add blackboard_id() + plan_id().
+2. New src/facade/collab.rs: Collaboration (Copy, serde) + builders/accessors; RoutingKind +
+   derive_default(count,kind,has_external) per §14; resolve(explicit,...); pub(crate) CollabState
+   {config,mailbox,blackboard,plan} + provision(config,&ids); #[cfg(test)] mod tests.
+3. facade/mod.rs: pub mod collab; pub use collab::Collaboration;
+4. AgentBuilder: collaboration field + setter; build() resolves+provisions -> Agent.collab;
+   Agent accessors collaboration()/mailbox()/blackboard()/plan(); Debug prints collaboration.
+5. Rustdoc + honest notes.
+
+## Validation (1-6 + external clippy)
+1 fmt; 2 clippy; 3 clippy --features external-*; 4 cargo test -p agent-lib facade::collab;
+5 cargo test --all --all-targets (<30min); 6 RUSTDOCFLAGS=-D warnings cargo doc; git diff --check
 
 ## Status: DONE
 
-All validation green (fmt, clippy default + 4 external features, focused 46 delegate tests,
-full `cargo test --all --all-targets`, doc, git diff --check). No source deviation found;
-review-only. M5-R marked [DONE] in TODO.md with §13 comparison table. PLAN.md unchanged
-(no phase-level change). Committing and stopping (do not start M6-1).
+All validation green (fmt, clippy default + 4 external features, focused facade::collab 12,
+full cargo test --all --all-targets exit 0, doctests incl. 3 collab, doc, git diff --check).
+M6-1 marked [DONE] in TODO.md with completion record. PLAN.md unchanged (no phase-level change).
+Committing and stopping (do not start M6-2).

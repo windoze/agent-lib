@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::agent::id::{BlackboardId, PlanId};
 use crate::agent::{
     AgentId, RequirementError, RequirementId, RequirementIds, RequirementKindTag, RunId, StepId,
     ToolExecutionIds, ToolRuntimeError, ToolSetId, TraceNodeId,
@@ -151,6 +152,28 @@ impl FacadeIds {
     #[must_use]
     pub fn step_id(&self) -> StepId {
         StepId::new(self.next_uuid())
+    }
+
+    /// Mints the next blackboard-stream identity.
+    ///
+    /// Used by the collaboration layer to provision a shared
+    /// [`Blackboard`](crate::agent::collab::Blackboard) when a delegate topology
+    /// (or an explicit [`Collaboration`](crate::facade::Collaboration)) enables it
+    /// (`docs/facade-api.md` §14).
+    #[must_use]
+    pub fn blackboard_id(&self) -> BlackboardId {
+        BlackboardId::new(self.next_uuid())
+    }
+
+    /// Mints the next plan-board identity.
+    ///
+    /// Used by the collaboration layer to provision a shared
+    /// [`Plan`](crate::agent::collab::Plan) when a delegate topology (or an
+    /// explicit [`Collaboration`](crate::facade::Collaboration)) enables it
+    /// (`docs/facade-api.md` §14).
+    #[must_use]
+    pub fn plan_id(&self) -> PlanId {
+        PlanId::new(self.next_uuid())
     }
 
     /// Builds a stable trace-root node id from a caller-provided label.

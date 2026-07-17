@@ -33,6 +33,7 @@
 pub mod agent;
 pub mod approval;
 pub mod chat;
+pub mod collab;
 pub mod config;
 pub mod delegate;
 pub mod error;
@@ -48,6 +49,7 @@ pub use agent::{
 };
 pub use approval::{Approval, ApprovalDecision, ApprovalPolicy, FacadeApproval};
 pub use chat::{Chat, ChatBuilder, ChatSession, ChatSessionBuilder, RunStream};
+pub use collab::Collaboration;
 pub use config::{ModelConfig, ProviderConfig, ProviderConfigBuilder};
 pub use delegate::{AgentWorkerBuilder, Delegation, LocalSubagent};
 pub use error::FacadeError;
