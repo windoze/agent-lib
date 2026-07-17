@@ -695,7 +695,7 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
 - 说明：`prelude` 增补与 `RunStream` 别名收敛留待 M2-R。为避与 chat facade 既有 `RunStream` 同名冲突，agent 的
   流类型命名为 `AgentRunStream`（§8.2 中 `RunStream` 为概念名）。
 
-### [TODO] M2-R Review：基础 Agent facade 正确性与文档一致性检查
+### [DONE] M2-R Review：基础 Agent facade 正确性与文档一致性检查
 
 **上下文**：M2-1..M2-4 落地了 typed tool、approval、Agent 装配与 run/stream/snapshot。仅审查+收敛。
 
@@ -712,6 +712,63 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
 
 - 完整验证序列 1–6 全绿。
 - 对照表：M2 已实现 vs §7–§9 承诺项，缺口记为后续任务。
+
+**完成记录**：
+
+审查 `src/facade/{tool,approval,agent}.rs` 对照 `docs/facade-api.md` §6.2、§7–§9、
+§8.3–§8.4、§19，结论：核心装配与语义均一致，仅 `prelude` 缺 M2 类型（唯一偏离），已修。
+
+- **§8.3 内部映射（§19 不绕过底层）**：`assemble_machine` 建 `DefaultAgentMachine`
+  （`.with_tool_execution_ids(FacadeIds)` + `.with_approval_policy(FacadeApproval)`），
+  `run_full`/`stream` 经 `drain(&mut machine, AgentInput, &FacadeAgentScope, None, &ctx)`
+  兑现 `Requirement`；scope 只暴露 llm/tool/interaction 三个 handler，其余 `None`。✓
+- **§7.1 typed tool schema（R1）**：`Tool::function` 走 off-by-default `facade-schema`
+  feature（`dep:schemars`），无 feature 时用 always-available `function_with_schema`；
+  feature 边界在模块 doc + `Cargo.toml` 注释里写清。默认构建不链接 `schemars`。✓
+  返回值 `String`/`Value`/`Serialize`/`ToolResult` 由 `impl<T: Serialize> IntoToolResult`
+  + `impl IntoToolResult for ToolResult` 覆盖。✓
+- **§7.2 ToolContext**：run_id/agent_id/tool_call_id/worktree/cancel/trace 全为受控
+  clone handle，无 `&mut Conversation`。✓
+- **§7.3 逃生舱**：`tool_registry` + `tool_declarations` builder 方法；build 期
+  `ensure_unique_tool_names` 检查 typed/custom/declaration 三源 name 冲突。✓
+- **§9.1/§9.2 approval**：三档（auto_allow/auto_deny/ask）+ 每工具 override（override >
+  per-tool > default）；headless `ask` 无 handler 时 deny 而非阻塞；
+  external-agent / worktree-write 标志记录待 M4 强制。`FacadeApproval` 同时实现
+  `ToolApprovalPolicy` + `InteractionHandler`，共享 pending map。✓
+- **§8.4 loop policy 默认值**：max_steps=8、max_tool_rounds=4、
+  tool_failure_policy=ReturnErrorToModel、非流式（`LlmStepMode::NonStreaming`，`stream`
+  另走 tap handler）、pending 失败丢弃未提交工作回到上一致点。`build_loop_policy` 映射为
+  `min(max_steps, max_tool_rounds+1)` 单预算。✓
+- **§6.2/§19 RunOutput**：`collect_tool_traces` 从 `Notification::ToolCallStarted/Finished`
+  投影出 `RunOutput.tool_calls` 与 `RunEvent::ToolStarted/ToolFinished`；`RunEvent` 枚举涵盖
+  tool/delegation/artifact/raw 全谱。✓
+
+**修正**：`src/prelude.rs` 之前只导出 M1 类型；按本任务要求补齐 M2 的
+`Agent / Tool / ToolContext / Approval / ApprovalPolicy`（§3 prelude 中已落地的子集），
+并更新模块 doc。`AgentSession`/`Delegation`/`ManagedExternalAgent` 属后续里程碑，暂不导出。
+
+**对照表（M2 已实现 vs §7–§9 承诺）**：
+
+| §  | 承诺项 | 状态 |
+|----|--------|------|
+| 7.1 | typed function tool + schema 派生 | ✅ `function_with_schema` 常驻，`function` 由 `facade-schema` gate |
+| 7.1 | 返回 String/Value/Serialize/ToolResult | ✅ |
+| 7.2 | ToolContext（只读受控 handle） | ✅ blackboard/artifact/mailbox 写句柄留待后续里程碑 |
+| 7.3 | 逃生到 ToolRegistry + name 冲突检查 | ✅ |
+| 8.2 | run/run_full/stream/conversation/state/snapshot/restore/into_parts | ✅ |
+| 8.2 | `Agent::worker()` | ⏳ 缺口 → 已排期 M3-1 |
+| 8.3 | DefaultAgentMachine + drain + Requirement | ✅ |
+| 8.4 | loop policy 默认值 + pending 失败 cancel | ✅ |
+| 9.1 | 三档 approval + per-tool override | ✅ |
+| 9.2 | 默认权限语义（headless deny、external/worktree 标志） | ✅ external/worktree 标志记录，M4 强制 |
+| 3   | prelude 导出 M2 类型 | ✅ 本任务补齐；`AgentSession`/`Delegation`/`ManagedExternalAgent` → M3/M4/M5 |
+
+未发现未排期的 spec 偏离或失败测试，无需新增前置任务。
+
+**验证**：序列 1–6 全绿——`cargo fmt --all -- --check`；聚焦 `cargo test -p agent-lib
+facade::`（72 passed）；`cargo clippy --all-targets -- -D warnings` 及
+`--features facade-schema` 均 clean；`cargo test --all --all-targets` 全绿；
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` clean；`git diff --check` clean。
 
 ---
 

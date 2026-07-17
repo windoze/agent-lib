@@ -1,48 +1,52 @@
-# Task: M2-4 `Agent::stream` + `snapshot`/`restore` + `into_parts`
+# Task: M2-R Review — 基础 Agent facade 正确性与文档一致性检查
 
-First incomplete task in `TODO.md` (M1-*, M2-1..M2-3 all `[DONE]`).
+First incomplete task in `TODO.md` (M1-*, M2-1..M2-4 all `[DONE]`; M2-R is `[TODO]`).
 
-## Requirements (TODO.md §M2-4, docs/facade-api.md §8.2, §15.2)
+## Scope (review + converge only; docs/facade-api.md §6.2, §7–§9, §8.3–§8.4, §19)
 
-- `Agent::stream(&mut self, input) -> Result<AgentRunStream, FacadeError>`:
-  drive streaming, forward `TextDelta`/`ToolStarted`/`ToolFinished`/
-  `ApprovalRequested`, end with `Done(RunOutput)`.
-- `snapshot() -> Result<AgentSnapshot, FacadeError>` (M2 scope: supervisor
-  `ConversationSnapshot` + `AgentStateSnapshot`; delegates/pending/mailbox/
-  blackboard/plan/artifacts left empty/None).
-- `restore() -> AgentRestoreBuilder` (re-inject provider/client/tools/approval).
-- `into_parts() -> AgentParts` escape hatch.
-- Full rustdoc + validation sequence 1-6.
+Verify `src/facade/{tool,approval,agent}.rs` against the spec, fix small
+deviations, and record gaps as follow-up tasks.
 
-## Key findings
+## Review findings
 
-- Reference `LlmClientHandler` in Streaming mode folds the stream internally and
-  surfaces nothing incrementally. The only way for the facade to surface deltas
-  is a custom tapping `LlmHandler`. Keep machine NonStreaming; the tap handler
-  always calls `chat_stream`, folds via `Accumulator`, forwards `TextDelta`.
-- `drain` returns notifications only at the end. Real-time tool/approval events
-  come from wrapping the Tool/Interaction handlers.
-- Approval interaction carries only `call_id`. Add `tool_name` to
-  `PendingDecision::Deny` + `FacadeApproval::pending_tool_name(call_id)` peek so
-  the interaction tap can emit `ApprovalRequested { tool_name }`.
-- `AgentState` is Serialize/Deserialize but NOT Clone/PartialEq; `AgentStateSnapshot`
-  = `#[serde(transparent)]` newtype over `serde_json::Value` (holds serialized state).
-- Restore approach A: deserialize AgentState authoritatively, re-inject
-  client/tools/approval; `ids = FacadeIds::continuing_after(conversation)`.
-- `AgentRunStream<'a>` holds `Pin<Box<dyn Future<Output=Result<RunOutput,
-  FacadeError>> + 'a>>` (borrows `&mut machine`) + `Arc<Mutex<VecDeque<RunEvent>>>`
-  sink. poll: drain sink first, then poll future; on Ready store RunOutput,
-  drain remaining sink, then emit `Done`.
+- §8.3 internal mapping: `assemble_machine` builds `DefaultAgentMachine`; `run_full`
+  drives via `drain(&mut machine, input, &scope, None, &ctx)`. Not bypassed. ✓ (§19)
+- §7.1 typed tool schema (R1): `Tool::function` gated behind off-by-default
+  `facade-schema` feature (`dep:schemars`); `function_with_schema` always available.
+  Feature boundary documented in module docs + Cargo.toml. ✓
+- §7.1 return types: `impl<T: Serialize> IntoToolResult` + `impl IntoToolResult for
+  ToolResult` cover String/Value/Serialize/ToolResult. ✓
+- §7.2 ToolContext: run_id/agent_id/tool_call_id/worktree/cancel/trace, no &mut Conv. ✓
+- §7.3 escape hatch: `tool_registry` + `tool_declarations` builder methods; build-time
+  `ensure_unique_tool_names` conflict check. ✓
+- §9.1 three tiers (auto_allow/auto_deny/ask) + per-tool override; §9.2 default
+  permission semantics: headless `ask` with no handler denies (not blocks);
+  external-agent/worktree flags recorded for M4. ✓
+- §8.4 loop policy defaults: max_steps=8, max_tool_rounds=4,
+  tool_failure_policy=ReturnErrorToModel, non-streaming unless stream, pending
+  failure cancels uncommitted work. ✓
+- §6.2/§19 RunOutput: `collect_tool_traces` fills `tool_calls` + ToolStarted/Finished
+  events; RunEvent enum covers full tool/delegation trace surface. ✓
+
+## Concrete deviation to fix
+
+- **prelude gap**: `src/prelude.rs` exports only M1 types. M2-R requires adding
+  `Agent, Tool, Approval, ApprovalPolicy, ToolContext`. Fix + update module doc.
+
+## Gaps vs §7–§9 (recorded as follow-up; already scheduled)
+
+- `Agent::worker()` (§8.2) → M3-1 (scheduled).
+- prelude `AgentSession`/`Delegation`/`ManagedExternalAgent` → later milestones
+  (M3/M4/M5). `AgentSession` type-name is open question #2; §3 sanctions single
+  `Agent` entry for v1, so no new task needed.
+
+No unscheduled gaps or test failures found → no new prerequisite tasks needed.
 
 ## Steps
-1. [done] Explore.
-2. [done] approval.rs: tool_name on Deny + pending_tool_name.
-3. [done] snapshot.rs: AgentSnapshot/AgentStateSnapshot/placeholders/AgentParts/AgentRestoreBuilder.
-4. [done] stream.rs: AgentRunStream + tap handlers + scope.
-5. [done] agent.rs: submodules + methods stream/snapshot/restore/into_parts (+ extracted build_facade_approval / assemble_machine helpers).
-6. [done] mod.rs exports.
-7. [done] tests: 8 new offline tests (stream==run_full, tool events, approval event, snapshot round-trip + restore, into_parts, restore guards).
-8. [done] validate: fmt clean, clippy -D warnings clean, focused facade::agent 15/15 pass; full suite + rustdoc running.
-9. [done] TODO.md [DONE] + commit.
+1. [done] Review facade tool/approval/agent vs spec.
+2. [done] Fix prelude: add Agent/Tool/Approval/ApprovalPolicy/ToolContext + doc.
+3. Validation sequence 1–6 (fmt, focused facade tests, clippy -D warnings,
+   full test suite, rustdoc -D warnings, git diff --check).
+4. Mark M2-R [DONE] in TODO.md with completion record + comparison table; commit.
 
-## Status: done (all validation green; committing)
+## Status: done (validation 1-6 green; committing)

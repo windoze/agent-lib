@@ -8,9 +8,13 @@
 //!
 //! Milestone 1 exposes the configuration wrappers, the shared result/event
 //! types, and the one-shot `Chat` plus stateful `ChatSession` (including its
-//! incremental `RunStream`) entry points. Subsequent milestones extend this
-//! prelude with the Agent-facade types as they land.
+//! incremental `RunStream`) entry points. Milestone 2 adds the base Agent
+//! facade — the tool-using [`Agent`], the typed [`Tool`] surface with its
+//! [`ToolContext`], and the [`Approval`] / [`ApprovalPolicy`] tiers. Subsequent
+//! milestones extend this prelude with the remaining delegation and
+//! managed-external-agent types as they land.
 
 pub use crate::facade::{
-    Chat, ChatSession, ModelConfig, ProviderConfig, Reply, RunEvent, RunOutput, RunStream,
+    Agent, Approval, ApprovalPolicy, Chat, ChatSession, ModelConfig, ProviderConfig, Reply,
+    RunEvent, RunOutput, RunStream, Tool, ToolContext,
 };
