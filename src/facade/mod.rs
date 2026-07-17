@@ -21,13 +21,15 @@
 //!
 //! Later milestones add the `Agent`/`AgentSession`, subagent,
 //! managed-external-agent, dispatcher, and collaboration facades on top of these
-//! foundations.
+//! foundations. Milestone 2 begins with the typed function tool surface
+//! ([`Tool`], [`ToolContext`], [`ToolResult`], [`IntoToolResult`]) in [`tool`].
 
 pub mod chat;
 pub mod config;
 pub mod error;
 pub mod ids;
 pub mod run;
+pub mod tool;
 
 pub use chat::{Chat, ChatBuilder, ChatSession, ChatSessionBuilder, RunStream};
 pub use config::{ModelConfig, ProviderConfig, ProviderConfigBuilder};
@@ -36,4 +38,7 @@ pub use ids::FacadeIds;
 pub use run::{
     ApprovalRequest, ArtifactRef, DelegationMessage, DelegationProgress, DelegationTrace,
     EscalationTrace, IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary,
+};
+pub use tool::{
+    FacadeToolRegistry, IntoToolResult, Tool, ToolContext, ToolContextParts, ToolResult,
 };

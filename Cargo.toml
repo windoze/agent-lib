@@ -35,8 +35,19 @@ external-opencode = []
 # ACP wire version negotiated by these crate versions is recorded as
 # `agent::external::ACP_WIRE_VERSION`.
 external-acp = ["dep:agent-client-protocol", "dep:agent-client-protocol-schema"]
+# Enables typed-function tool JSON-schema derivation in the Chat/Agent facade
+# (`facade::Tool::function`, which requires `Args: schemars::JsonSchema`). Off by
+# default so the core crate never links `schemars`; without this feature callers
+# use the always-available `facade::Tool::function_with_schema`, supplying the
+# JSON input schema explicitly (see `docs/facade-api.md` §7.1 and `PLAN.md` R1).
+facade-schema = ["dep:schemars"]
 
 [dependencies]
+# Typed-function tool schema derivation. Optional and gated behind
+# `facade-schema`; a default build never compiles or links it. Pinned to the
+# major version already resolved transitively by the ACP schema crate so the two
+# stay on one `schemars` build.
+schemars = { version = "1", optional = true }
 # ACP adapter dependencies. Optional and gated behind `external-acp`; the default
 # build never compiles or links them. Pinned to the latest stable releases so the
 # adapter reuses the well-tested Zed-side JSON-RPC framing and protocol types

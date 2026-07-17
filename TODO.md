@@ -430,7 +430,7 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
 `AgentSpec`→`AgentState`→`DefaultAgentMachine`→`ReferenceScope`/`HandlerScope`→`RunContext`→`drain`
 （参照 `examples/agent_chat.rs`）。用户不直接看到 `Requirement`。
 
-### [TODO] M2-1 typed function `Tool` + `ToolContext` + 内部 `ToolRegistry` 桥接
+### [DONE] M2-1 typed function `Tool` + `ToolContext` + 内部 `ToolRegistry` 桥接
 
 **上下文**：
 
@@ -464,6 +464,41 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   期报错。
 - 聚焦：`cargo test -p agent-lib facade::tool`（若引入 feature，附带 `--features <schema-feature>` 的聚焦跑）。
 - 完整验证序列 1–6；若新增 feature，额外跑该 feature 的 clippy/test。
+
+**完成记录**：
+
+- **R1 schema 决策**：新增 off-by-default feature `facade-schema = ["dep:schemars"]`（`schemars = { version = "1",
+  optional = true }`）。开启后 `Tool::function(name, desc, handler)`（`Args: schemars::JsonSchema`）派生 schema
+  并去掉顶层 `$schema` 元键；**始终可用** `Tool::function_with_schema(name, desc, input_schema: Value, handler)`
+  为无 feature 降级路径。默认 `cargo build` 不链接 `schemars`。已在 `src/facade/tool.rs` rustdoc、`PLAN.md` R1、
+  本记录三处注明。未新增任何前置任务。
+- **落地**：新增 `src/facade/tool.rs`。
+  - `Tool`（facade，`Clone` + 手写 `Debug`，与 `model::tool::Tool` 用 `ToolDecl` 别名消歧）、
+    `Tool::function`/`function_with_schema`、`declaration() -> model::tool::Tool`。
+  - `ToolContext{run_id, agent_id, tool_call_id, worktree, cancel, trace}`：全部为受控 Clone handle
+    （锚点 `RunId`/`AgentId`/`ToolCallId`/`WorktreeRef`/`CancellationToken`/`TraceHandle`），不暴露破坏
+    Conversation 不变量的可变引用。
+  - `ToolResult`（facade 结果，**不** derive `Serialize` 以保证下述归一化 impl 相容）+ `IntoToolResult`：
+    blanket `impl<T: Serialize>`（`Value::String` → 原文本，其它 → 紧凑 JSON 文本）+ `impl for ToolResult`，
+    覆盖 `String`/`Value`/`impl Serialize`/显式 `ToolResult` 四种返回。
+  - `FacadeToolRegistry` 实现 `agent::ToolRegistry`：`declarations()` 汇出 typed + escape-hatch 声明，
+    `execute()` 反序列化 args（非法 → 结构化 `ToolRuntimeError::ExecutionFailed`）、构造 `ToolContext`、
+    调闭包、归一化结果为 `ToolResponse`；工具失败一律 `ExecutionFailed`，交给 loop 的 `ToolFailurePolicy`
+    裁决（不自行 pre-empt）。逃生舱（§7.3）：可选 `custom` registry + `extra` 声明；构造期跨 typed/extra/custom
+    检查 name 冲突 → 新增 `FacadeError::DuplicateTool`。
+  - `FacadeToolRegistry`/`ToolContextParts` 设为 `pub`（装配 seam，M2-3 装配、进阶用户可手工复用），
+    避免 dead-code 告警而无需 `#[allow(dead_code)]`。
+  - `facade/mod.rs` + `facade` root 导出 `Tool/ToolContext/ToolResult/IntoToolResult/FacadeToolRegistry/
+    ToolContextParts`（prelude 增补留待 M2-R）。
+- **测试**（`src/facade/tool.rs` 离线单测）：declaration schema 正确；合法 args → Ok；非法 args → 结构化
+  `ExecutionFailed`；handler Err → `ExecutionFailed`；unknown tool → `UnknownTool`；四种返回归一化正确；
+  显式 `ToolResult` 状态贯通 `execute`；typed/extra/custom name 冲突构造期报错；custom registry 声明合并 +
+  委派执行；`#[cfg(feature = "facade-schema")]` 下 `function` 从 `Args` 派生 schema（无 `$schema`）。
+- **验证**：`cargo fmt --all -- --check` ✅｜`cargo test -p agent-lib --lib facade::tool` 默认 10 / `--features
+  facade-schema` 11 全绿 ✅｜`cargo clippy --all-targets -- -D warnings` 默认 + `--features facade-schema` 均 0
+  警告 ✅｜`cargo test --all --all-targets` 全绿（lib 152 通过）✅｜`RUSTDOCFLAGS="-D warnings" cargo doc
+  --no-deps --workspace` 默认 + `--features facade-schema` 均通过（doctest 默认 1 / feature 2 通过）✅｜
+  `git diff --check` 干净 ✅。
 
 ### [TODO] M2-2 `Approval` 三档 + `ApprovalPolicy` → `ToolApprovalPolicy`/`InteractionHandler`
 

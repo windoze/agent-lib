@@ -48,6 +48,17 @@ pub enum FacadeError {
     #[error("model returned an unexpected tool-use block")]
     UnexpectedToolUse,
 
+    /// Two tools were registered under the same name.
+    ///
+    /// Raised at build time when typed [`crate::facade::Tool`] values collide
+    /// with each other or with an escape-hatch registry / declaration list (see
+    /// `docs/facade-api.md` §7.3).
+    #[error("duplicate tool name `{name}`")]
+    DuplicateTool {
+        /// The tool name that was registered more than once.
+        name: String,
+    },
+
     /// The facade was driven into a state its API cannot service.
     #[error("facade invalid state: {0}")]
     InvalidState(String),
