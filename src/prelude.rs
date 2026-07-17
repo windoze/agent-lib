@@ -13,10 +13,15 @@
 //! [`ToolContext`], and the [`Approval`] / [`ApprovalPolicy`] tiers. Milestone 3
 //! adds the [`Delegation`] routing type, and Milestone 4 adds the
 //! [`ManagedExternalAgent`] entry point for managed external-agent delegates.
-//! Subsequent milestones extend this prelude with the remaining delegation
-//! types as they land.
+//! Milestone 7 completes the host-embedding surface, so the prelude also brings
+//! in the serializable event/output projections [`WireRunEvent`] /
+//! [`WireRunOutput`] (see [`RunEvent::to_wire`] / [`RunOutput::to_wire`]) and the
+//! enriched [`ApprovalRequest`] a UI renders, since cross-process hosts reach for
+//! them directly. Subsequent milestones extend this prelude with the remaining
+//! delegation types as they land.
 
 pub use crate::facade::{
-    Agent, Approval, ApprovalPolicy, Chat, ChatSession, Delegation, ManagedExternalAgent,
-    ModelConfig, ProviderConfig, Reply, RunEvent, RunOutput, RunStream, Tool, ToolContext,
+    Agent, Approval, ApprovalPolicy, ApprovalRequest, Chat, ChatSession, Delegation,
+    ManagedExternalAgent, ModelConfig, ProviderConfig, Reply, RunEvent, RunOutput, RunStream, Tool,
+    ToolContext, WireRunEvent, WireRunOutput,
 };

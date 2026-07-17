@@ -2107,7 +2107,7 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
   5) `cargo test --all --all-targets`（exit 0，全绿）；6) `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
   （修正 4 处指向已 import 类型的冗余 intra-doc 链接目标后洁净）+ `cargo test --doc -p agent-lib` 绿；7) `git diff --check` 干净。
 
-### [TODO] M7-R Review：宿主嵌入接入面正确性与文档一致性检查
+### [DONE] M7-R Review：宿主嵌入接入面正确性与文档一致性检查
 
 **上下文**：M7-1..M7-5 落地 facade 的依赖注入口，是宿主嵌入接入面的收官 review。
 
@@ -2124,3 +2124,42 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
 - 完整验证序列 1–6 全绿，+ 全 external features clippy 全绿。
 - 对照表：5 个缺口 vs M7 实现，逐条标注「已通过 facade 注入解决 / 仍需下沉（列原因）」。
 - 若 M7 全部完成且验收通过，按调用方约定收尾——由后续调用决定。
+
+**完成记录（M7-R）**：
+
+- **接入面验收对照表（PLAN §「Milestone 7」5 个缺口 vs M7 实现）**——逐条均**通过 facade 注入解决**，宿主无需
+  下沉到 agent 层自组 `HandlerScope`+`drain`：
+
+  | # | 缺口（facade 写死项） | 任务 | facade 注入接缝 | 未注入默认（保持 M1–M6） | 结论 |
+  |---|---|---|---|---|---|
+  | 1 | 审批 handler 硬编码同步 `FacadeApproval`，宿主无法「发前端→await→折回」 | M7-1 | `AgentBuilder::interaction_handler(Arc<dyn InteractionHandler>)`（`src/facade/agent.rs:145`；`interaction_handler()`:504 同步+流式两路都接） | 回退到共享 `FacadeApproval`；与 `.approval(..)` 优先级已写清 | ✅ 已通过 facade 注入解决 |
+  | 2 | `RunEvent` 整体不可序列化，宿主无法把事件投给前端 | M7-2 | `RunEvent::to_wire()`→`WireRunEvent`、`RunOutput::to_wire()`→`WireRunOutput`（`src/facade/run.rs`） | R7 不变：`RunEvent` 本体仍不 serde；`Raw*` 降级为 opaque `RawEventKind` | ✅ 已通过 facade 投影解决 |
+  | 3 | `ApprovalRequest` 只有 tool name，UI 无法渲染有意义审批框 | M7-3 | 富化 `ApprovalRequest{ tool_name, call_id, reason, input }`，`#[non_exhaustive]`（`src/facade/run.rs:466`） | 加字段兼容；`for_tool()` 保留同步 external-start 路径 | ✅ 已通过 facade 富化解决 |
+  | 4 | 无生产级 live-adapter-backed `ExternalSessionHandler`（全库仅 test double） | M7-4 | `default_external_session_handler()` + `RegistryExternalSessionHandler`（`src/facade/external.rs`，feature-gated） | feature 关闭时不透出；宿主 `.session_handler(default_..)` 直接用 | ✅ 已通过 facade 注入解决（feature-gated） |
+  | 5 | AI 路由/权限接缝写死（`ScriptedVerifier::passing()` / 权限默认 deny） | M7-5 | `Delegation::dispatcher_evaluator/verifier(..)` + `ApprovalPolicy::on_permission(..)` | 未注入逐字节还原 M5 dispatcher 与「权限默认 deny」；**零 AI 逻辑** | ✅ 已通过 facade 注入解决 |
+
+- **§19 / Milestone 7 一致性核对**（M7-5 记录把 §19 一致性核对留给本 review）——M7 触碰到的每条 §19 约束均成立，
+  无违背：
+  - 「Facade 是装配层，不是第二套 runtime」+「Agent 内部用 `AgentMachine`+effect handler，不绕过 `Requirement`」：
+    M7-1..M7-5 仅在装配层加**依赖注入口**，**未新增 effect family**、未改底层状态机语义——注入的 handler/evaluator/
+    verifier/decider 都喂给既有 `InteractionHandler`/`TaskEvaluator`/`Verifier`/`InteractionKind::Permission` 接缝。
+  - 「Snapshot 不保存 secret、闭包、client、live process handle」：M7-5 的 `DispatcherHooks`（`src/facade/delegate.rs:515`
+    `#[serde(skip)]`）与 M7-5/M7-1 的 permission decider / interaction handler 均为运行时字段，快照丢弃、回落内置默认，
+    与 §15.2 一致。
+  - 兼容性：M7 新增/富化的所有 facade 公开类型（`ApprovalRequest`、`ToolTrace` 等）均 `#[non_exhaustive]` 加字段，
+    未注入即保持 M1–M6 行为；无破坏性变更。
+- **prelude 核查 + 修复（本 review 唯一代码改动）**：`src/prelude.rs` 原止步于 M4，**遗漏 M7 宿主嵌入接入面公开类型**
+  （`facade::mod` 已 re-export 但 prelude 未透出）。补齐 `WireRunEvent`、`WireRunOutput`、`ApprovalRequest` 三个宿主
+  跨进程直接会用到的类型，并刷新 prelude rustdoc 说明 M7 补充；均为简单 path-friendly facade 类型（`Serialize`/
+  `Deserialize`），不违背 prelude「不透出 lower-layer machinery」原则。M7-1/M7-4/M7-5 的注入口是 builder 方法
+  （`interaction_handler`/`session_handler`/`dispatcher_*`/`on_permission`），经已在 prelude 的 `Agent`/`ApprovalPolicy`/
+  `Delegation` 到达，无需另加类型。
+- **遗留缺口 / 后续任务**：无。M7 明确非目标（不实现任何 AI 决策逻辑）按设计保留为注入口；feature-gated external 类型
+  按设计不入 prelude。无需新增 follow-up 任务。
+- **Test Failure Policy**：`cargo test --all --all-targets` 全绿（exit 0），无未调度失败测试；real-CLI e2e 仍 `#[ignore]`
+  且无 binary/login 时干净 skip（既有调度，非新失败）。
+- 验证序列全绿：1) `cargo fmt --all`；2) `cargo clippy --all-targets -- -D warnings`；
+  3) `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  4) `cargo test --all --all-targets`（exit 0，全绿）；5) `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（洁净）；
+  6) `cargo test --doc -p agent-lib`（12 passed）；7) `git diff --check` 干净。
+- **收官**：M7-R 为 `TODO.md` 最后一个任务，至此全部任务 `[DONE]`；按 Completion & Release 打 `endtag`。

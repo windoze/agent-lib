@@ -1,71 +1,46 @@
-# M7-5 — facade 透出 AI 决策注入口（不实现 AI 逻辑）
+# M7-R — Review: host-embedding surface correctness + doc consistency
 
-TODO.md first incomplete task = **M7-5** (line 2041). M7-1..M7-4 are `[DONE]`.
+TODO.md first incomplete task = **M7-R** (line 2110). M7-1..M7-5 are `[DONE]`.
+M7-R is the LAST task → on completion, all tasks done → final review + `endtag`.
 
-## Goal
-Open two injection seams in the facade **without implementing any AI logic**, keeping
-M5/M2 default behavior byte-for-byte when nothing is injected:
-
-1. `Delegation::dispatcher()` accepts a caller-injected `TaskEvaluator` and/or
-   `Verifier`, replacing the hardwired `ScriptedVerifier::passing()` + keyword/`ESCALATE`
-   seam used inside `drive_dispatcher_routed`.
-2. `ApprovalPolicy` provides a caller-injectable **permission decider** hook that answers
-   `InteractionKind::Permission` (returning `PermissionResponse`); default stays "deny".
-
-## Key facts
-- `Delegation` (delegate.rs) derives Clone/Debug/PartialEq/Eq/Serialize/Deserialize and is
-  serialized in `AgentSnapshot` (agent/snapshot.rs). Hooks are runtime handlers → store as
-  `#[serde(skip)]` field, dropped on snapshot (consistent with §15.2 dropping runtime handlers).
-- Seams exported from `crate::agent`: `TaskEvaluator`, `Verifier`, `ScriptedTaskEvaluator`,
-  `ScriptedVerifier`, `Escalator<V: Verifier>`, `WorkerProfileRef`, `WorkerReport`, `TaskDescriptor`.
-- Facade dispatcher loop = `drive_dispatcher_routed` (agent.rs), called from `run_dispatcher_routed`
-  (agent.rs) and `start_dispatcher_routed` (agent/stream.rs).
-- `resolve_dispatcher_targets` resolves only config-referenced delegates (primary/verifier/
-  escalate_to); roster from `build_dispatcher_roster`. Evaluator picks among those.
-- Permission default-deny is `FacadeApproval::fulfill` Permission arm (approval.rs).
-- Dispatcher e2e tests: delegate.rs tests (RoutingClient harness). Permission tests: approval.rs.
-
-## Design
-### Dispatcher injection (delegate.rs + agent.rs + stream.rs + escalation.rs)
-- `impl<V: Verifier + ?Sized> Verifier for Arc<V>` blanket (escalation.rs) so an
-  `Arc<dyn Verifier+Send+Sync>` can be the Escalator's `V`.
-- `Delegation`: `#[serde(skip)] dispatcher_hooks: DispatcherHooks`
-  `{ evaluator: Option<Arc<dyn TaskEvaluator+Send+Sync>>, verifier: Option<Arc<dyn Verifier+Send+Sync>> }`.
-  DispatcherHooks: derive Clone+Default; manual Debug (presence bools); manual PartialEq(always true)+Eq
-  so Delegation keeps its derives (config identity ignores runtime hooks).
-- Builder: `dispatcher_evaluator(..)`, `dispatcher_verifier(..)` (switch to dispatcher mode).
-  Accessors `dispatcher_evaluator()`/`dispatcher_verifier()`.
-- `drive_dispatcher_routed(+ evaluator, verifier: Option<Arc<..>>)`:
-  - Escalator uses injected verifier else `ScriptedVerifier::passing()`.
-  - Verdict = `worker_failed || run_verifier(..) || injected_verifier_rejects(..)`.
-  - Escalation target: evaluator injected → `injected_escalation_target` (evaluate vs roster,
-    resolve name via targets, decline/unknown/current → None) else `dispatcher_escalation_target` (M5).
-- Both callers read `agent.delegation.dispatcher_{evaluator,verifier}()` cloned Options.
-
-### Permission decider (approval.rs)
-- `type PermissionDecider = Arc<dyn Fn(&PermissionRequest) -> PermissionResponse + Send + Sync>`.
-- ApprovalPolicy: `permission_decider: Option<PermissionDecider>`; builder `on_permission(F)`;
-  init None in From<Approval>; Debug shows presence.
-- FacadeApproval: carry it; `new` copies; `fulfill` Permission arm → decider (re-stamp action_id
-  for correlation) else default deny.
-
-## Tests
-- delegate.rs: dispatcher_injected_verifier_forces_escalation (escalate where default wouldn't);
-  dispatcher_injected_evaluator_declines_escalation (suppress escalation default would do);
-  dispatcher_injection_hooks_stored_and_serde_drops_them.
-- approval.rs: permission_decider_can_approve (+ existing default-deny remains).
+## What M7-R requires
+1. Verify consistency with docs/facade-api.md §19 + PLAN.md Milestone 7:
+   - still assembly layer, NO new effect family, no change to lower-layer semantics.
+   - each injection seam has a default preserving M1–M6 behavior; no compat break
+     (`#[non_exhaustive]` add-field, un-injected fallback).
+2. Access-surface acceptance: confirm each of the "5 gaps" (= M7-1..M7-5 subgoals) is
+   solvable **via facade injection**, host never descends to agent layer to self-assemble
+   a HandlerScope+drain. Check whether `prelude` needs new public types (WireRunEvent etc.).
+3. Summarize leftover gaps as follow-up tasks; confirm NO unscheduled failing tests.
 
 ## Validation
-1. cargo fmt --all  2. cargo test -p agent-lib facade::delegate facade::approval
-3. cargo clippy --all-targets -- -D warnings (+ full external features clippy — touches escalation seam)
-4. cargo test --all --all-targets  5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-6. git diff --check
+- Full sequence 1–6 all green + all-external-features clippy.
+- Produce comparison table: 5 gaps vs M7 impl (solved via facade / needs descent + reason).
+
+## Findings / actions
+- prelude.rs currently exports NO M7 host-embedding types. facade::mod re-exports
+  WireRunEvent/WireRunOutput/ApprovalRequest but prelude omits them.
+  → ACTION: add host-embedding types to prelude (WireRunEvent, WireRunOutput,
+    ApprovalRequest) + update prelude rustdoc mentioning M7.
+- §19 design constraints: M7-5 hooks are #[serde(skip)] (dropped on snapshot) → consistent
+  with "Snapshot 不保存 secret、闭包、client". No new effect family. Verify in code.
 
 ## Progress
-- [x] Arc<V> Verifier blanket impl (escalation.rs)
-- [x] delegate.rs hooks + builder + accessors
-- [x] drive_dispatcher_routed + 2 callers
-- [x] approval permission decider
-- [x] tests (delegate.rs: 3 new; approval.rs: 2 new — all green)
-- [x] docs/rustdoc (defaults + injection points, §19; fixed 4 redundant intra-doc links) + TODO.md [DONE]
-- [x] full validation (fmt, focused, clippy default + external features, full suite exit 0, doc, doctests, git diff --check) — committing next
+- [ ] Verify each of 5 gaps in code (interaction_handler / WireRunEvent / ApprovalRequest /
+      external session handler / dispatcher+permission seams)
+- [ ] Decide + apply prelude additions
+- [ ] Run validation sequence 1–6 + external clippy
+- [ ] Fill completion record (comparison table), mark M7-R [DONE]
+- [ ] Final review + git tag endtag (all tasks done)
+
+## Progress (updated — M7-R COMPLETE)
+- [x] Verified all 5 gaps solved via facade injection (interaction_handler / to_wire /
+      enriched ApprovalRequest / default_external_session_handler / dispatcher+on_permission)
+- [x] §19 constraints all hold (assembly layer, no new effect family, snapshot drops hooks,
+      non_exhaustive add-field compat)
+- [x] prelude fix: added WireRunEvent, WireRunOutput, ApprovalRequest + refreshed rustdoc
+- [x] Validation 1–7 green: fmt / clippy default / clippy all-external-features /
+      test --all --all-targets (exit 0) / doc -D warnings / doctest (12) / git diff --check
+- [x] No leftover gaps, no unscheduled failing tests
+- [x] Completion record + comparison table in TODO.md, M7-R [DONE]
+- [ ] Commit + git tag endtag (all tasks done → project complete)
