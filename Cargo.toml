@@ -26,8 +26,23 @@ external-codex = []
 # in; the probe reuses tokio's process support, so enabling it adds no new heavy
 # dependency.
 external-opencode = []
+# Enables the managed ACP (Agent Client Protocol) runtime adapter. Unlike the
+# three CLI adapters above (which are empty features that only reuse tokio's
+# process support), this one is **off by default and pulls in real optional
+# dependencies**: the official `agent-client-protocol` runtime and its
+# `agent-client-protocol-schema` protocol types, activated only under this
+# feature via `dep:`. A default `cargo build` therefore links neither crate. The
+# ACP wire version negotiated by these crate versions is recorded as
+# `agent::external::ACP_WIRE_VERSION`.
+external-acp = ["dep:agent-client-protocol", "dep:agent-client-protocol-schema"]
 
 [dependencies]
+# ACP adapter dependencies. Optional and gated behind `external-acp`; the default
+# build never compiles or links them. Pinned to the latest stable releases so the
+# adapter reuses the well-tested Zed-side JSON-RPC framing and protocol types
+# instead of hand-rolling them.
+agent-client-protocol = { version = "1", optional = true }
+agent-client-protocol-schema = { version = "1", optional = true }
 async-trait = "0.1"
 eventsource-stream = "0.2.3"
 futures = "0.3"

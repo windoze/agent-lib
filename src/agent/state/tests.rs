@@ -447,7 +447,12 @@ fn state_json_has_expected_top_level_data_shape() {
     let state = AgentState::new(spec(), committed_conversation());
     let encoded = serde_json::to_value(state).expect("serialize state");
     let object = encoded.as_object().expect("state object");
-    let keys = object.keys().cloned().collect::<Vec<_>>();
+    // Sort before comparing: JSON object key order is not a stable contract and
+    // flips between sorted (default `serde_json`) and insertion order when a
+    // dependency unifies `serde_json/preserve_order` (e.g. the `external-acp`
+    // adapter's schema crate). The shape assertion is about *which* keys exist.
+    let mut keys = object.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
 
     assert_eq!(keys, vec!["conversation", "loop_cursor", "spec"]);
     assert_eq!(encoded["loop_cursor"], json!({"state": "idle"}));

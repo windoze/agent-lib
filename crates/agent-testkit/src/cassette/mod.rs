@@ -450,6 +450,16 @@ impl ReconfigEntry {
 ///
 /// Mirrors the [`RequirementResult::Llm`](agent_lib::agent::RequirementResult::Llm)
 /// family with serializable halves.
+///
+/// The `Ok` half embeds a [`Response`], which transitively contains
+/// `serde_json::Value` fields. When a dependency unifies
+/// `serde_json/preserve_order` (for example enabling `agent-lib`'s `external-acp`
+/// adapter, whose schema crate pulls it in), that `Value` layout grows and trips
+/// `clippy::large_enum_variant`. Boxing the `Ok` half would ripple `Box::new` /
+/// deref changes through every cassette construction site for a purely
+/// feature-driven size heuristic, so the lint is allowed here with this
+/// rationale instead — matching the crate's existing `result_large_err` handling.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmOutcome {

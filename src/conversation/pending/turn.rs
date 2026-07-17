@@ -294,7 +294,7 @@ impl PendingTurn {
                 actual: self.phase(),
             });
         }
-        self.state = PendingTurnState::AssistantInProgress(pending);
+        self.state = PendingTurnState::AssistantInProgress(Box::new(pending));
         Ok(())
     }
 
@@ -366,7 +366,12 @@ impl std::fmt::Debug for PendingTurn {
 /// Internal state keeps the unique mutable accumulator out of public views.
 enum PendingTurnState {
     AwaitingAssistant,
-    AssistantInProgress(PendingMessage),
+    // Boxed so the in-progress accumulator does not dominate the size of every
+    // `PendingTurnState`. `PendingMessage` embeds `serde_json::Value`, whose
+    // layout grows when a dependency (for example the `external-acp` adapter's
+    // schema crate) unifies `serde_json/preserve_order`; boxing keeps the enum
+    // compact regardless of that feature unification.
+    AssistantInProgress(Box<PendingMessage>),
     AwaitingToolCallMappings { provider_call_ids: Vec<String> },
     AwaitingToolResults,
     ReadyToCommit,

@@ -99,3 +99,69 @@
 - [x] 真机 ignored e2e 全绿：claude 11.6s(6ev)/codex 59.8s(5ev)/opencode 19.1s(4ev)/mixed 188.8s(3 tests)
 - [x] TODO.md M9-6 标 [DONE] + 完成记录（含最终能力矩阵摘要 + 剩余 runtime-dependent 限制）
 - 下一个未完成 = M10-1（ACP feature + AcpConfig），留给下次 invocation。
+
+---
+
+# M10-1 增加 `external-acp` feature、ACP 依赖与 `AcpConfig` / capability 协商
+
+**当前任务 = TODO.md 首个未完成 = M10-1**（`### [TODO] M10-1`, line 3233）。M1..M9 全 `[DONE]`。
+
+## 任务要求（TODO.md 3233-3302）
+1. `Cargo.toml`: 新增非默认 feature `external-acp`，把 `agent-client-protocol` /
+   `agent-client-protocol-schema` 作 **optional** dep，只在该 feature 下启用。
+   注释写明默认关闭 + 记录 ACP wire 版本（实测最新稳定版）。
+2. 新增 feature-gated `src/agent/external/acp/{mod.rs,config.rs}`，在
+   `src/agent/external/mod.rs` 以 `#[cfg(feature="external-acp")]` 挂载并 re-export `AcpConfig`。
+3. `AcpConfig`（纯数据 serde DTO）：
+   - `binary` + `args`（任意 program+args）。
+   - 配置继承+注入：默认继承宿主完整 env；`env` override（BTreeMap，Debug 脱敏）；
+     一个开关表达「是否继承父进程 env」（默认继承）。**绝不**承载 API key。
+   - `working_dir`（worktree）。
+   - `ExternalPermissionMode`（首版只存下+doc 语义；应答逻辑在 M10-3）。
+   - `timeout`。
+   - 预设构造器：`claude_agent_acp()`（binary=claude-agent-acp）、`codex_acp()`（binary=codex-acp）、
+     `opencode_acp()`（binary=opencode, args=["acp"]）、通用 `new(binary, args)`。
+4. capability 协商：纯函数 ACP initialize agent capabilities（中立投影）→ `ExternalRuntimeCapabilities`。
+   保守基线 none()，只开协商位：loadSession→resume，fs/terminal 广告（记录，不等于 host_tools），
+   始终 permission_bridge=true、streaming=true、graceful_shutdown=true；host_tools/host_subagents=false。
+   用 `ExternalRuntimeKind::Custom("acp")` 承载。
+
+## 验证条件（TODO.md 3287-3302）
+- `AcpConfig` serde round-trip；Debug/Display 不泄漏 env secret。
+- 预设构造器单测（opencode args 含 "acp"；无 API-key 字段）。
+- 配置继承/注入单测（不 spawn；断言构造的 spawn env/args）：默认继承父 env；
+  设 env override 后键出现；「不继承」开关下父 env 不透传。
+- capability 映射纯函数单测：loadSession+fs → resume/permission_bridge/streaming true、host_tools false；
+  空握手 → 只有协议保证位 true。
+- 默认 `cargo build` 不拉 ACP crate；`cargo build --features external-acp` 通过。
+- 聚焦测试：`acp_config_roundtrip`、`acp_capabilities_from_initialize`。
+- 完整验证序列 1-6（默认 + `--features external-acp` 两配置）。
+
+## 设计决定
+- crate 版本：agent-client-protocol 1.2.0 + agent-client-protocol-schema 1.4.0（crates.io 最新稳定）。
+- M10-1 只需 config + 纯 capability 映射；握手 IO 在 M10-3。为不把 crate raw 类型泄漏为 public API，
+  capability 映射输入用**中立投影** struct（AcpNegotiatedCapabilities），不直接暴露 schema crate 类型。
+- ACP wire 版本：需从下载的 crate 源码确认 ProtocolVersion 常量，记入注释/常量。
+- 因 M10-1 不引用 crate（映射用中立投影），deps 加了但仅由 `cargo build --features` 编译验证可拉取。
+  lint 仅 warn(missing_docs)，无 unused_crate_dependencies，故安全。
+
+## 进度
+- [ ] Cargo.toml: external-acp feature + optional deps + wire 版本注释
+- [ ] 确认 ACP wire 版本（下载 crate 源码 grep ProtocolVersion）
+- [ ] src/agent/external/acp/config.rs (AcpConfig + spawn env/args builder + 预设)
+- [ ] src/agent/external/acp/mod.rs (capability 映射纯函数 + 中立投影 + re-export)
+- [ ] mod.rs 挂载 + re-export
+- [ ] 单测（roundtrip / 预设 / env inherit+inject / capability 映射）
+- [ ] 验证序列 1-6（default + feature）
+- [ ] TODO.md 标 [DONE] + commit
+
+## 完成状态（M10-1 DONE）
+- [x] Cargo.toml: external-acp feature + optional deps(1.2.0/1.4.0) + wire 版本注释(ACP_WIRE_VERSION=1)
+- [x] src/agent/external/acp/config.rs（AcpConfig + resolved_env + 预设 + Debug/Display 脱敏）
+- [x] src/agent/external/acp/mod.rs（AcpNegotiatedCapabilities 中立投影 + capabilities_from_initialize + 常量）
+- [x] mod.rs 挂载 + re-export
+- [x] 6 单测全绿（roundtrip / 预设 / debug+display 脱敏 / env inherit+inject / capability 映射 / wire version）
+- [x] 连带修复 preserve_order 统一副作用：turn.rs 装箱 / LlmOutcome allow / state 测试排序 / Display intra-doc link
+- [x] 验证 1-6 全过（default + external-acp 两配置）；feature 隔离 cargo tree 证据
+- [x] TODO.md M10-1 标 [DONE] + 完成记录
+- 下一个未完成 = M10-2（ACP client 连接 + session/update 解码），留给下次 invocation。

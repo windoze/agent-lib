@@ -3230,7 +3230,7 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
 - 复用现有 `ExternalRuntimeKind::Custom(String)` 承载 ACP(如 `Custom("acp")` 或带 agent 标签),**不新增**
   enum 变体(除非 review 明确需要一等公民);machine / driver / `ExternalAgentState` **不改**。
 
-### [TODO] M10-1 增加 `external-acp` feature、ACP 依赖与 `AcpConfig` / capability 协商
+### [DONE] M10-1 增加 `external-acp` feature、ACP 依赖与 `AcpConfig` / capability 协商
 
 **上下文**:
 
@@ -3300,6 +3300,58 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
   - `cargo test -p agent-lib --features external-acp acp_config_roundtrip`
   - `cargo test -p agent-lib --features external-acp acp_capabilities_from_initialize`
 - 完整验证序列 1-6 全过(其中 clippy/test/doc 需分别在默认与 `--features external-acp` 两种配置下跑通)。
+
+**完成记录**：
+
+- **Cargo.toml**：新增非默认 feature `external-acp = ["dep:agent-client-protocol",
+  "dep:agent-client-protocol-schema"]`，把 `agent-client-protocol` / `agent-client-protocol-schema`
+  作 **optional** dep（`version = "1"`）。feature 注释写明默认关闭、开启才拉入 ACP 依赖，并指向
+  `agent::external::ACP_WIRE_VERSION`。实测解析版本：`agent-client-protocol 1.2.0` /
+  `agent-client-protocol-schema 1.4.0`（crates.io 最新稳定）；schema crate 的
+  `ProtocolVersion::LATEST == V1`，故 **ACP wire 版本 = 1**，记为常量 `ACP_WIRE_VERSION: u16 = 1`。
+- **新增 feature-gated 模块** `src/agent/external/acp/{mod.rs,config.rs}`，在
+  `src/agent/external/mod.rs` 以 `#[cfg(feature = "external-acp")]` 挂载，re-export
+  `AcpConfig` / `AcpNegotiatedCapabilities` / `capabilities_from_initialize` / `acp_runtime_kind`
+  / `ACP_WIRE_VERSION` / `ACP_RUNTIME_LABEL`。
+- **`AcpConfig`**（纯数据 serde DTO）：`binary` + `args`（任意 program+args）、`env` override
+  （`BTreeMap`，手写 `Debug`+`Display` 只印 key + `<redacted>`）、`inherit_env` 开关（默认继承宿主
+  完整 env，可 `without_inherited_env()` 清空只留 override）、`working_dir`、`ExternalPermissionMode`
+  （首版只存下 + doc 语义，应答逻辑留 M10-3）、`timeout`。**无任何 API-key 字段**——凭据边界在被包装
+  CLI 侧。纯函数 `resolved_env(parent_env)` 让 spawn env 可离线断言（默认继承+override 覆盖；不继承时
+  只留 override）。预设：`claude_agent_acp()`（`claude-agent-acp`）、`codex_acp()`（`codex-acp`）、
+  `opencode_acp()`（`opencode` + `args=["acp"]`）、通用 `new(binary, args)`。
+- **capability 协商**：纯函数 `capabilities_from_initialize(&AcpNegotiatedCapabilities)` 从中立投影
+  （`load_session` / `fs` / `terminal`，**不**暴露 schema crate raw 类型）映射到
+  `ExternalRuntimeCapabilities`：保守基线 `none(Custom("acp"))`，只开协议保证位
+  `streaming` / `permission_bridge` / `graceful_shutdown = true` 与协商位 `resume = load_session`；
+  `fs`/`terminal` 广告仅记录**不**等于 `host_tools`；`host_tools` / `host_subagents` / `artifacts`
+  / `usage` / `reconfigure = false`（后者由 M10-3 live adapter 视 crate 暴露决定）。
+- **测试**（6 个 lib 单测，全绿）：`acp_config_roundtrip`（含继承/清空两态 round-trip、无 key 字段、
+  `inherit_env=true` 与空集合被 skip）、`acp_config_presets_carry_expected_launch_lines`
+  （`opencode` args 含 `"acp"`、均无 key、默认继承+prompt）、
+  `acp_config_debug_and_display_redact_env_secrets`（Debug/Display 均不泄漏注入的假 secret）、
+  `acp_config_resolved_env_inherits_by_default_and_injects_overrides`、
+  `acp_capabilities_from_initialize`（loadSession+fs → resume/permission_bridge/streaming true、
+  host_tools false；空握手只有协议保证位）、`acp_wire_version_and_runtime_label_are_stable`。
+- **连带修复（feature 统一副作用，属本任务范围）**：`agent-client-protocol-schema` 经 schemars/serde_with
+  传递启用 `serde_json/preserve_order`，全局把 `serde_json::Value` 布局变大，触发两类回归——
+  (1) `clippy::large_enum_variant`：`conversation/pending/turn.rs` 的 `PendingTurnState::AssistantInProgress`
+  改为 `Box<PendingMessage>`（干净、两种构建都受益）；dev-only `agent-testkit` 的 `LlmOutcome` 因构造点
+  众多、装箱会波及大量 cassette 测试，改用带说明的 `#[allow(clippy::large_enum_variant)]`（沿用本仓已有的
+  `result_large_err` allow 先例）。(2) 顺序敏感断言：`agent/state/tests.rs` 的
+  `state_json_has_expected_top_level_data_shape` 依赖 `serde_json` 默认字母序 key，preserve_order 下变插入
+  序而失败——改为 `keys.sort()` 后比较（key 顺序非契约，仅断言存在哪些 key）。已全仓搜索，无其它顺序敏感的
+  精确序列化字符串断言。
+- **验证序列 1-6 全过**（默认 + `--features external-acp` 两配置）：`cargo fmt --all -- --check` 通过；
+  聚焦测试 `acp_config_roundtrip` / `acp_capabilities_from_initialize` 通过；
+  `cargo clippy --all-targets -- -D warnings`（默认）与 `--features external-acp` 均无告警；
+  `cargo test --all --all-targets`（默认）全绿、`--features external-acp` 全绿（lib 669 passed，
+  含 6 个 acp 单测；集成/ignored 与默认一致）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  默认与 `--features external-acp` 均通过（修好两处 `[`Display`]` 未解析 intra-doc link → 限定
+  `std::fmt::Display`）；`git diff --check` 干净。
+- **feature 隔离证据**：`cargo tree -e normal -i agent-client-protocol`（默认）报 "did not match any
+  packages"（未拉入）；`--features external-acp` 下 `agent-client-protocol v1.2.0 └── agent-lib` 出现。
+  `cargo build`（无 feature）不含 ACP crate；`cargo build --features external-acp` 通过。
 
 ### [TODO] M10-2 用官方 crate 建立 ACP client 连接与 `session/update` 观测解码
 

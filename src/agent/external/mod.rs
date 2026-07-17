@@ -63,6 +63,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+#[cfg(feature = "external-acp")]
+mod acp;
 mod adapter;
 mod budget;
 mod capability;
@@ -85,6 +87,11 @@ mod spec;
 mod state;
 mod worktree;
 
+#[cfg(feature = "external-acp")]
+pub use acp::{
+    ACP_RUNTIME_LABEL, ACP_WIRE_VERSION, AcpConfig, AcpNegotiatedCapabilities, acp_runtime_kind,
+    capabilities_from_initialize,
+};
 pub use adapter::{ExternalRuntimeAdapter, ExternalRuntimeSession, RuntimeDecisionPoint};
 pub use budget::{
     ExternalSessionSweeper, ExternalUsageCharge, ExternalUsageChargingHandler, NoSweep,
