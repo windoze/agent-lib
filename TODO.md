@@ -312,7 +312,7 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   `cargo test --all --all-targets` 全绿（`--lib` 698 passed，其余各 suite 0 failed）✅；
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✅；`git diff --check` 干净 ✅。
 
-### [TODO] M1-5 `ChatSession::stream` + `RunStream`（基于 `Accumulator`）
+### [DONE] M1-5 `ChatSession::stream` + `RunStream`（基于 `Accumulator`）
 
 **上下文**：
 
@@ -334,6 +334,34 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   usage 与非流式一致、流结束后 `conversation()` 已提交该轮；tool-use 流 → `UnexpectedToolUse`。
 - 聚焦：`cargo test -p agent-lib facade::chat`（含 stream 用例）。
 - 完整验证序列 1–6。
+
+**完成记录**：
+
+- 新增 `src/facade/chat/stream.rs`（模块化，chat.rs 已 21KB）落地 `RunStream<'a>`：
+  - 持 `&'a mut Conversation` + `BoxStream<'static, Result<StreamEvent, ClientError>>` + `Option<Accumulator>`
+    + `FacadeIds`（clone）+ `VecDeque<RunEvent>` 缓冲 + `State{Streaming,Finishing,Done}` 状态机。
+  - `impl futures::Stream`（全字段 `Unpin`，`inner.poll_next_unpin`；finish 全同步无 async）：每个上行
+    `StreamEvent` 先缓冲 `RunEvent::TextDelta`（text delta 时），再 `RunEvent::RawStream(event.clone())`，然后
+    push 进 `Accumulator`；inner 耗尽→`accumulator.finish()`→`Response`→与非流式 `drive_pending` **相同尾巴**
+    （`start_assistant_response`→`finish_assistant`→`commit_pending`）→末尾单个 `Done(Box<RunOutput>)`。
+  - 便捷 inherent `pub async fn next(&mut self)`（包 `StreamExt::next`，免导入即可 `stream.next().await`）。
+  - 错误处理：inner `Err`、`Accumulator` 校验错误、tool-use（`finish_assistant` 返回 `RequiresToolCallMappings`
+    → `UnexpectedToolUse`）一律 `cancel_pending(DiscardTurn)` 回滚 pending turn，会话回到最近 committed 点仍可用。
+  - `AccumulatorError` 映射：`Stream(e)`→`FacadeError::Client(e)`；其余（协议/校验违规）→`Client(Protocol(..))`。
+- `src/facade/chat.rs`：`ChatSession::stream` 打开 pending turn（`begin_turn`）→ `build_request(stream=true)` →
+  `client.chat_stream().await`（失败即回滚 pending 并直接返回 `Err`）→ `RunStream::new`。`build_request` 增
+  `stream: bool` 参数（`drive_pending` 传 `false`）。`mod stream; pub use stream::RunStream;`；模块 rustdoc 更新
+  （stream 落地本任务）。
+- `src/facade/mod.rs` / `src/prelude.rs` 重导 `RunStream` 并更新 rustdoc。
+- 单元测试：`src/facade/chat/tests.rs` 追加 `StreamingFakeClient`（脚本化 `chat_stream` 事件序列 + 记录请求）与 4
+  个离线用例：text 流 `TextDelta` 顺序正确、`RawStream` 已转发、`Done` 文本/usage 正确、流结束后 `conversation()`
+  已提交（effective_view 2 条）；`Done` 的 `RunOutput` 与 `RunOutput::from(等价 Response)` **整体相等**（证与非流式
+  一致）；tool-use 流 → `UnexpectedToolUse` 且无 `Done`、turn 已回滚（无 committed 历史）；连续两次 `stream` 累积
+  历史（请求消息数 `[1,3]`、effective_view 4 条）。
+- 验证：`cargo fmt --all` ✅；`cargo clippy --all-targets -- -D warnings` ✅（未触碰 external adapter）；
+  `cargo test -p agent-lib --lib facade::chat` 16 passed ✅；`cargo test --all --all-targets` 全绿（`--lib` 702
+  passed，doctest 12 passed，其余各 suite 0 failed）✅；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  ✅；`git diff --check` 干净 ✅。
 
 ### [TODO] M1-R Review：Chat facade 正确性与文档一致性检查
 

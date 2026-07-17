@@ -17,9 +17,11 @@
 //! need tools should use the Agent facade (Milestone 2).
 //!
 //! The stateful [`ChatSession`] reuses a single [`Conversation`] across turns so
-//! history accumulates; its `stream` entry point lands in a later Milestone 1
-//! task. Both the one-shot [`Chat`] and the stateful [`ChatSession`] share the
-//! same private `drive_turn` drive.
+//! history accumulates. Its [`stream`](ChatSession::stream) entry point folds an
+//! incremental [`crate::stream::accumulator::Accumulator`] into the same
+//! [`Response`](crate::client::Response) the non-streaming path produces. Both
+//! the one-shot [`Chat`] and the stateful [`ChatSession`] share the same private
+//! `drive_turn` drive.
 
 use std::sync::Arc;
 
@@ -34,6 +36,10 @@ use crate::facade::config::{ModelConfig, ProviderConfig};
 use crate::facade::error::FacadeError;
 use crate::facade::ids::FacadeIds;
 use crate::facade::run::{IntoUserMessage, Reply, RunOutput};
+
+mod stream;
+
+pub use stream::RunStream;
 
 /// A shareable Chat configuration bound to one concrete [`LlmClient`].
 ///
@@ -193,7 +199,7 @@ async fn drive_pending(
     model: &ModelConfig,
     ids: &FacadeIds,
 ) -> Result<RunOutput, FacadeError> {
-    let request = build_request(conversation, model);
+    let request = build_request(conversation, model, false);
     let response = client.chat(request).await?;
 
     conversation.start_assistant_response(response.clone())?;
@@ -206,11 +212,13 @@ async fn drive_pending(
     Ok(RunOutput::from(response))
 }
 
-/// Renders a non-streaming [`ChatRequest`] from committed history plus the
-/// frozen pending user message.
+/// Renders a [`ChatRequest`] from committed history plus the frozen pending user
+/// message.
 ///
-/// The Chat facade never advertises tools, so `tools` is always empty.
-fn build_request(conversation: &Conversation, model: &ModelConfig) -> ChatRequest {
+/// The Chat facade never advertises tools, so `tools` is always empty. `stream`
+/// selects the non-streaming ([`LlmClient::chat`]) or streaming
+/// ([`LlmClient::chat_stream`]) wire path.
+fn build_request(conversation: &Conversation, model: &ModelConfig, stream: bool) -> ChatRequest {
     let (system, mut messages) = conversation.effective_view().into_parts();
     if let Some(pending) = conversation.pending_context() {
         messages.extend(pending.into_messages());
@@ -223,7 +231,7 @@ fn build_request(conversation: &Conversation, model: &ModelConfig) -> ChatReques
         system,
         max_tokens: 0,
         temperature: None,
-        stream: false,
+        stream,
         provider_extras: None,
     };
     model.apply_to_request(&mut request);
@@ -453,6 +461,85 @@ impl ChatSession {
             input,
         )
         .await
+    }
+
+    /// Runs one turn as an incremental [`RunStream`] over the retained history.
+    ///
+    /// The returned stream forwards each normalized
+    /// [`RunEvent::TextDelta`](crate::facade::RunEvent::TextDelta) and the
+    /// underlying [`RunEvent::RawStream`](crate::facade::RunEvent::RawStream)
+    /// escape hatch as they arrive, then yields exactly one terminal
+    /// [`RunEvent::Done`](crate::facade::RunEvent::Done) carrying the complete
+    /// [`RunOutput`]. Internally the incremental events are folded with a
+    /// [`stream::accumulator::Accumulator`](crate::stream::accumulator::Accumulator)
+    /// into the same [`Response`](crate::client::Response) the non-streaming
+    /// [`send_full`](ChatSession::send_full) would produce, so the terminal
+    /// `RunOutput` (text, usage, response) matches turn for turn.
+    ///
+    /// Only when the terminal `Done` is reached is the assistant response
+    /// committed to this session's [`Conversation`]; until then no history is
+    /// mutated beyond opening the pending turn. Dropping the stream before it
+    /// completes discards the in-flight turn, leaving the session at its last
+    /// committed point.
+    ///
+    /// # Errors
+    ///
+    /// The `await` itself returns:
+    ///
+    /// - [`FacadeError::Client`] if [`LlmClient::chat_stream`] fails before the
+    ///   response headers arrive.
+    /// - [`FacadeError::Conversation`] if opening the pending turn is rejected.
+    ///
+    /// Failures observed while streaming (transport errors, malformed events) and
+    /// a [`FacadeError::UnexpectedToolUse`] for a tool-use stream (the Chat facade
+    /// never executes tools) are surfaced as an `Err` item yielded by the stream.
+    /// On any such failure the in-flight turn is discarded, so the session returns
+    /// to its last committed, consistent point and remains usable.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn demo(mut session: agent_lib::facade::ChatSession)
+    /// #     -> Result<(), agent_lib::facade::FacadeError> {
+    /// use agent_lib::facade::RunEvent;
+    ///
+    /// let mut stream = session.stream("Write a short poem.").await?;
+    /// while let Some(event) = stream.next().await.transpose()? {
+    ///     match event {
+    ///         RunEvent::TextDelta(text) => print!("{text}"),
+    ///         RunEvent::Done(output) => eprintln!("usage={:?}", output.usage),
+    ///         _ => {}
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn stream(
+        &mut self,
+        input: impl IntoUserMessage,
+    ) -> Result<RunStream<'_>, FacadeError> {
+        let turn_id = self.ids.turn_id();
+        let user_message_id = self.ids.message_id();
+        self.conversation
+            .begin_turn(turn_id, user_message_id, input.into_user_message())?;
+
+        let request = build_request(&self.conversation, &self.model, true);
+        let inner = match self.client.chat_stream(request).await {
+            Ok(inner) => inner,
+            Err(error) => {
+                // Roll back the just-opened turn so the session stays consistent.
+                let _ = self
+                    .conversation
+                    .cancel_pending(CancelDisposition::DiscardTurn);
+                return Err(FacadeError::from(error));
+            }
+        };
+
+        Ok(RunStream::new(
+            &mut self.conversation,
+            inner,
+            self.ids.clone(),
+        ))
     }
 
     /// Returns the live [`Conversation`] backing this session.

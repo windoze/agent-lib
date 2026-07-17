@@ -17,7 +17,7 @@
 //!   returned and accepted by every run entry point ([`run`]).
 //! - [`Chat`] and [`ChatBuilder`] — the stateless one-shot Chat facade, plus
 //!   [`ChatSession`] / [`ChatSessionBuilder`] for stateful multi-turn chat with
-//!   snapshot/restore ([`chat`]).
+//!   snapshot/restore and an incremental [`RunStream`] ([`chat`]).
 //!
 //! Later milestones add the `Agent`/`AgentSession`, subagent,
 //! managed-external-agent, dispatcher, and collaboration facades on top of these
@@ -29,7 +29,7 @@ pub mod error;
 pub mod ids;
 pub mod run;
 
-pub use chat::{Chat, ChatBuilder, ChatSession, ChatSessionBuilder};
+pub use chat::{Chat, ChatBuilder, ChatSession, ChatSessionBuilder, RunStream};
 pub use config::{ModelConfig, ProviderConfig, ProviderConfigBuilder};
 pub use error::FacadeError;
 pub use ids::FacadeIds;

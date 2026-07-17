@@ -7,6 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Map, json};
 
@@ -14,11 +15,12 @@ use super::{Chat, ChatBuilder, ChatSession};
 use crate::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
 use crate::conversation::ConversationSnapshot;
 use crate::facade::error::FacadeError;
+use crate::facade::run::{RunEvent, RunOutput};
 use crate::model::content::ContentBlock;
 use crate::model::message::{Message, Role};
-use crate::model::normalized::StopReason;
+use crate::model::normalized::{Normalized, StopReason};
 use crate::model::usage::Usage;
-use crate::stream::StreamEvent;
+use crate::stream::{BlockId, BlockKind, Delta, StreamEvent};
 
 /// A scripted client that returns a fixed response and records each request.
 #[derive(Debug)]
@@ -293,4 +295,260 @@ async fn restore_continues_history_with_reinjected_client() {
     // The restored session replays the prior [user, assistant] pair plus the new
     // user message, proving history survived the round-trip.
     assert_eq!(restore_client.request_message_counts(), vec![3]);
+}
+
+/// A scripted client whose `chat_stream` replays a fixed normalized event
+/// sequence and records the request each turn sent.
+#[derive(Debug)]
+struct StreamingFakeClient {
+    events: Vec<StreamEvent>,
+    requests: Mutex<Vec<ChatRequest>>,
+}
+
+impl StreamingFakeClient {
+    fn new(events: Vec<StreamEvent>) -> Self {
+        Self {
+            events,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Returns the number of messages sent on each recorded request, in order.
+    fn request_message_counts(&self) -> Vec<usize> {
+        self.requests
+            .lock()
+            .expect("requests mutex")
+            .iter()
+            .map(|request| request.messages.len())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl LlmClient for StreamingFakeClient {
+    fn capability(&self) -> &Capability {
+        &crate::client::ANTHROPIC_DEFAULT_CAPABILITY
+    }
+
+    async fn chat(&self, _request: ChatRequest) -> Result<Response, ClientError> {
+        Err(ClientError::Other(
+            "chat not used in streaming fixture".to_owned(),
+        ))
+    }
+
+    async fn chat_stream(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError> {
+        self.requests.lock().expect("requests mutex").push(request);
+        let events = self.events.clone();
+        Ok(futures::stream::iter(events.into_iter().map(Ok::<_, ClientError>)).boxed())
+    }
+}
+
+/// A stop reason shared by every text stream fixture and its expected response.
+fn end_turn() -> Normalized<StopReason> {
+    Normalized::from_mapped(StopReason::EndTurn, "end_turn")
+}
+
+/// Builds a text response stream: message start, one text block streamed in
+/// `chunks`, a fixed usage report, and a normalized end-turn stop.
+fn text_stream_events(chunks: &[&str], usage: Usage) -> Vec<StreamEvent> {
+    let id = BlockId::new("text-1");
+    let mut events = vec![
+        StreamEvent::MessageStart {
+            role: Role::Assistant,
+        },
+        StreamEvent::BlockStart {
+            id: id.clone(),
+            kind: BlockKind::Text,
+        },
+    ];
+    for chunk in chunks {
+        events.push(StreamEvent::BlockDelta {
+            id: id.clone(),
+            delta: Delta::Text((*chunk).to_owned()),
+        });
+    }
+    events.push(StreamEvent::BlockStop { id: id.clone() });
+    events.push(StreamEvent::Usage(usage));
+    events.push(StreamEvent::MessageStop {
+        stop_reason: end_turn(),
+    });
+    events
+}
+
+/// Builds a tool-use response stream that streams one tool-input block.
+fn tool_stream_events() -> Vec<StreamEvent> {
+    let id = BlockId::new("tool-1");
+    vec![
+        StreamEvent::MessageStart {
+            role: Role::Assistant,
+        },
+        StreamEvent::BlockStart {
+            id: id.clone(),
+            kind: BlockKind::ToolInput {
+                tool_name: "get_weather".to_owned(),
+                tool_call_id: "call-1".to_owned(),
+            },
+        },
+        StreamEvent::BlockDelta {
+            id: id.clone(),
+            delta: Delta::Json("{\"city\":\"Shanghai\"}".to_owned()),
+        },
+        StreamEvent::BlockStop { id: id.clone() },
+        StreamEvent::MessageStop {
+            stop_reason: Normalized::from_mapped(StopReason::ToolUse, "tool_use"),
+        },
+    ]
+}
+
+/// Drains a session stream to completion, returning every yielded item.
+async fn drain_stream(
+    session: &mut ChatSession,
+    input: &str,
+) -> Vec<Result<RunEvent, FacadeError>> {
+    let mut stream = session.stream(input).await.expect("open stream");
+    let mut collected = Vec::new();
+    while let Some(item) = stream.next().await {
+        collected.push(item);
+    }
+    collected
+}
+
+/// Extracts the ordered `TextDelta` payloads from a drained event list.
+fn text_deltas(events: &[Result<RunEvent, FacadeError>]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|item| match item {
+            Ok(RunEvent::TextDelta(text)) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn stream_forwards_text_deltas_then_commits() {
+    let usage = Usage {
+        input: 11,
+        output: 7,
+        ..Usage::default()
+    };
+    let client = Arc::new(StreamingFakeClient::new(text_stream_events(
+        &["Hello ", "world"],
+        usage,
+    )));
+    let chat = chat_with(client.clone());
+    let mut session = chat.session().build().expect("build session");
+
+    let events = drain_stream(&mut session, "hi").await;
+
+    // The normalized text deltas arrive in order and concatenate to the full text.
+    assert_eq!(text_deltas(&events), vec!["Hello ", "world"]);
+
+    // The raw stream events are forwarded as an escape hatch.
+    let raw_count = events
+        .iter()
+        .filter(|item| matches!(item, Ok(RunEvent::RawStream(_))))
+        .count();
+    assert!(raw_count > 0, "raw stream events should be forwarded");
+
+    // Exactly one terminal Done carries the aggregated reply and usage.
+    let done = match events.last().expect("at least one event") {
+        Ok(RunEvent::Done(output)) => output,
+        other => panic!("expected terminal Done, got {other:?}"),
+    };
+    assert_eq!(done.reply.text(), "Hello world");
+    assert_eq!(done.usage.supervisor.input, 11);
+    assert_eq!(done.usage.supervisor.output, 7);
+
+    // After the stream ends the turn is committed: the effective view holds the
+    // [user, assistant] pair.
+    let (_system, messages) = session.conversation().effective_view().into_parts();
+    assert_eq!(messages.len(), 2);
+}
+
+#[tokio::test]
+async fn stream_done_matches_the_non_streaming_response() {
+    let usage = Usage {
+        input: 5,
+        output: 9,
+        ..Usage::default()
+    };
+    let client = Arc::new(StreamingFakeClient::new(text_stream_events(
+        &["stream ", "done"],
+        usage.clone(),
+    )));
+    let chat = chat_with(client);
+    let mut session = chat.session().build().expect("build session");
+
+    let events = drain_stream(&mut session, "hi").await;
+    let done = match events.last().expect("at least one event") {
+        Ok(RunEvent::Done(output)) => output.clone(),
+        other => panic!("expected terminal Done, got {other:?}"),
+    };
+
+    // The folded response is identical to what the non-streaming drive builds
+    // from the same complete response, so the whole RunOutput compares equal.
+    let expected_response = Response {
+        message: Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "stream done".to_owned(),
+                extra: Map::new(),
+            }],
+        },
+        usage,
+        stop_reason: end_turn(),
+        extra: Map::new(),
+    };
+    assert_eq!(*done, RunOutput::from(expected_response));
+}
+
+#[tokio::test]
+async fn stream_rejects_tool_use_and_rolls_back() {
+    let client = Arc::new(StreamingFakeClient::new(tool_stream_events()));
+    let chat = chat_with(client);
+    let mut session = chat.session().build().expect("build session");
+
+    let events = drain_stream(&mut session, "hi").await;
+
+    // The terminal item is the tool-use rejection; no Done is produced.
+    let error = match events.last().expect("at least one event") {
+        Err(error) => error,
+        other => panic!("expected terminal error, got {other:?}"),
+    };
+    assert!(matches!(error, FacadeError::UnexpectedToolUse));
+    assert!(
+        !events
+            .iter()
+            .any(|item| matches!(item, Ok(RunEvent::Done(_)))),
+        "a rejected tool-use stream must not commit a Done",
+    );
+
+    // The in-flight turn was discarded, so no history was committed.
+    assert!(session.conversation().turns().is_empty());
+    let (_system, messages) = session.conversation().effective_view().into_parts();
+    assert!(messages.is_empty());
+}
+
+#[tokio::test]
+async fn consecutive_streams_accumulate_history() {
+    let client = Arc::new(StreamingFakeClient::new(text_stream_events(
+        &["ok"],
+        Usage::default(),
+    )));
+    let chat = chat_with(client.clone());
+    let mut session = chat.session().build().expect("build session");
+
+    drain_stream(&mut session, "first").await;
+    drain_stream(&mut session, "second").await;
+
+    // The first request carries only the current user message; the second replays
+    // the committed [user, assistant] pair plus the new user message.
+    assert_eq!(client.request_message_counts(), vec![1, 3]);
+
+    // The effective view exposes [user, assistant, user, assistant].
+    let (_system, messages) = session.conversation().effective_view().into_parts();
+    assert_eq!(messages.len(), 4);
 }
