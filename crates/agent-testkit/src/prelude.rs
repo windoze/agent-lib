@@ -31,7 +31,10 @@ pub use crate::concurrency::{
     DelayingToolHandler, InFlightGuard, PanicOnCall, PeakInFlight, YieldTicks,
 };
 pub use crate::external::{
-    ExternalAgentCallLog, ExternalAgentFixture, ExternalSessionStep, ScriptedExternalSessionHandler,
+    ExternalAgentCallLog, ExternalAgentFixture, ExternalSessionStep, ScriptedAdvance,
+    ScriptedExternalRuntimeAdapter, ScriptedExternalRuntimeSession, ScriptedExternalSessionHandler,
+    ScriptedRuntimeBuilder, ScriptedRuntimeExternalSessionHandler, ScriptedRuntimeStartLog,
+    ScriptedSinkLog,
 };
 pub use crate::fixtures::{
     agent_spec, agent_spec_with_tools, agent_state, assistant_text, assistant_tool_use,

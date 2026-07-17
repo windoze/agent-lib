@@ -29,9 +29,27 @@
 //! Read the recorded traffic back with
 //! [`assert_external_calls`](crate::assertions::assert_external_calls).
 //!
+//! The [`runtime`] submodule sits one layer *below* this scripted handler: it
+//! exercises the milestone-5 runtime abstraction
+//! ([`ExternalRuntimeAdapter`](agent_lib::agent::external::ExternalRuntimeAdapter)
+//! / [`ExternalRuntimeSession`](agent_lib::agent::external::ExternalRuntimeSession)
+//! / [`ExternalSessionRegistry`](agent_lib::agent::external::ExternalSessionRegistry))
+//! with a [`ScriptedExternalRuntimeAdapter`]
+//! that advances a live session through a script of decision points, so the full
+//! managed loop (start, tool batch, interaction, subagent) can be driven offline
+//! through a registry-backed handler.
+//!
 //! Offline replay of a *recorded* external session
 //! (`CassetteExternalSessionHandler`, design §12) is deferred to a later
 //! milestone; this module only covers the scripted path.
+
+pub mod runtime;
+
+pub use runtime::{
+    ScriptedAdvance, ScriptedExternalRuntimeAdapter, ScriptedExternalRuntimeSession,
+    ScriptedRuntimeBuilder, ScriptedRuntimeExternalSessionHandler, ScriptedRuntimeStartLog,
+    ScriptedSinkLog,
+};
 
 use std::sync::Arc;
 
@@ -40,7 +58,8 @@ use agent_lib::agent::external::{
     ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef,
     ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
     ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
-    ExternalStreamPolicy, ExternalSubagentRequest, ExternalSubagentRequestId, WorktreeIsolation,
+    ExternalStreamPolicy, ExternalSubagentRequest, ExternalSubagentRequestId, ExternalToolBatchId,
+    ExternalToolCall, WorktreeIsolation,
 };
 use agent_lib::agent::{
     AgentSpecRef, ExternalSessionHandler, Interaction, PermissionCategory, PermissionRequest,
@@ -246,6 +265,21 @@ impl ExternalAgentFixture {
         ExternalAgentMachine::new(self.agent_state(), Arc::new(self.ids.clone()))
     }
 
+    /// Builds an [`ExternalAgentMachine`] wired with a deterministic tool-execution
+    /// id source, ready to bridge a runtime tool-call pause into `NeedTool`
+    /// requirements.
+    ///
+    /// Identical to [`machine`](Self::machine) but additionally injects the shared
+    /// [`SeqIds`] tree as the machine's
+    /// [`ToolExecutionIds`](agent_lib::agent::ToolExecutionIds) source, so a
+    /// `PausedForToolCalls` decision point can mint host tool-call ids while
+    /// staying globally unique across the fixture tree.
+    #[must_use]
+    pub fn machine_with_tool_ids(&self) -> ExternalAgentMachine {
+        ExternalAgentMachine::new(self.agent_state(), Arc::new(self.ids.clone()))
+            .with_tool_execution_ids(Arc::new(self.ids.clone()))
+    }
+
     /// A `Start` [`ExternalSessionRequest`] carrying `prompt` and no prior
     /// session.
     #[must_use]
@@ -436,6 +470,30 @@ impl ExternalAgentFixture {
             observations: ExternalObservedEvent::unsequenced_for_tests(vec![
                 self.command_finished_event(),
             ]),
+        }
+    }
+
+    /// The batch id a [`tool_call`](Self::tool_call) pause groups its calls under.
+    #[must_use]
+    pub fn tool_batch_id(&self) -> ExternalToolBatchId {
+        ExternalToolBatchId::new("batch-1")
+    }
+
+    /// One runtime [`ExternalToolCall`] correlated by `provider_call_id` and
+    /// selecting a `name`d tool over a fixed read-only input.
+    ///
+    /// The machine bridges this into a provider-neutral
+    /// [`ToolCall`](agent_lib::model::tool::ToolCall) whose `id` is
+    /// `provider_call_id`, so a scripted tool handler keys its result by the same
+    /// id and the machine echoes it back in the
+    /// [`RespondToolResults`](ExternalSessionInput::RespondToolResults) batch.
+    #[must_use]
+    pub fn tool_call(&self, provider_call_id: &str, name: &str) -> ExternalToolCall {
+        ExternalToolCall {
+            provider_call_id: provider_call_id.to_owned(),
+            name: name.to_owned(),
+            input: serde_json::json!({ "path": "src/parser.rs" }),
+            raw: None,
         }
     }
 

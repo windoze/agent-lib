@@ -55,9 +55,11 @@ Start→PausedForInteraction→RespondInteraction→Completed、Start→PausedFo
 5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
 6. `git diff --check`
 
-## 状态：进行中
+## 状态：完成
 - [x] 恢复 M5-2 标题（单独提交）
-- [ ] 实现 scripted adapter/session/handler
-- [ ] 新增 scripted_external_* drain 测试
-- [ ] 验证序列 1-6
-- [ ] 标记 [DONE] + 提交
+- [x] 实现 scripted adapter/session/handler（`crates/agent-testkit/src/external/runtime.rs`）
+- [x] 新增 scripted_external_* drain 测试（`tests/agent_external_scripted.rs`，4 个）
+- [x] testkit 内 6 个 `scripted_runtime_*` 单测
+- [x] 验证序列 1-6 全过（fmt/focus/clippy/full-suite/doc/diff-check 均 clean）
+- [x] 标记 [DONE] + 完成记录写入 TODO.md
+- [ ] 提交 `[M5-2] ...`（本轮最后一步）
