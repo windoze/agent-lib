@@ -11,10 +11,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Map, Value, json};
 
-use super::{Agent, AgentBuilder};
+use super::{Agent, AgentBuilder, AgentSnapshot};
 use crate::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
 use crate::facade::approval::Approval;
 use crate::facade::error::FacadeError;
@@ -22,9 +23,9 @@ use crate::facade::run::RunEvent;
 use crate::facade::tool::{Tool, ToolContext};
 use crate::model::content::ContentBlock;
 use crate::model::message::{Message, Role};
-use crate::model::normalized::StopReason;
+use crate::model::normalized::{Normalized, StopReason};
 use crate::model::usage::Usage;
-use crate::stream::StreamEvent;
+use crate::stream::{BlockId, BlockKind, Delta, StreamEvent};
 
 /// A scripted client that returns responses in order, repeating the last once
 /// the script is exhausted, and counts how many `chat` calls it served.
@@ -356,5 +357,371 @@ fn build_rejects_duplicate_tool_names() {
     assert!(
         matches!(error, FacadeError::DuplicateTool { name } if name == "get_weather"),
         "duplicate tool names are rejected at build",
+    );
+}
+
+// -- Streaming, snapshot/restore, and escape-hatch tests (M2-4) --------------
+
+/// A scripted client whose `chat_stream` replays a per-step normalized event
+/// sequence (repeating the last once exhausted) and counts how many streams it
+/// served, so a tool round trip can script one stream per LLM step offline.
+#[derive(Debug)]
+struct StreamingScriptedClient {
+    scripts: Vec<Vec<StreamEvent>>,
+    calls: Mutex<usize>,
+}
+
+impl StreamingScriptedClient {
+    fn new(scripts: Vec<Vec<StreamEvent>>) -> Arc<Self> {
+        Arc::new(Self {
+            scripts,
+            calls: Mutex::new(0),
+        })
+    }
+
+    fn call_count(&self) -> usize {
+        *self.calls.lock().expect("calls mutex")
+    }
+}
+
+#[async_trait]
+impl LlmClient for StreamingScriptedClient {
+    fn capability(&self) -> &Capability {
+        &crate::client::ANTHROPIC_DEFAULT_CAPABILITY
+    }
+
+    async fn chat(&self, _request: ChatRequest) -> Result<Response, ClientError> {
+        Err(ClientError::Other(
+            "chat not used in streaming fixture".to_owned(),
+        ))
+    }
+
+    async fn chat_stream(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError> {
+        let mut calls = self.calls.lock().expect("calls mutex");
+        let index = (*calls).min(self.scripts.len() - 1);
+        *calls += 1;
+        let events = self.scripts[index].clone();
+        Ok(futures::stream::iter(events.into_iter().map(Ok::<_, ClientError>)).boxed())
+    }
+}
+
+/// The normalized end-turn stop shared by every text stream fixture.
+fn end_turn() -> Normalized<StopReason> {
+    Normalized::from_mapped(StopReason::EndTurn, "end_turn")
+}
+
+/// Builds a text response stream: message start, one text block streamed in
+/// `chunks`, the given usage, and a normalized end-turn stop.
+fn text_stream(chunks: &[&str], usage: Usage) -> Vec<StreamEvent> {
+    let id = BlockId::new("text-1");
+    let mut events = vec![
+        StreamEvent::MessageStart {
+            role: Role::Assistant,
+        },
+        StreamEvent::BlockStart {
+            id: id.clone(),
+            kind: BlockKind::Text,
+        },
+    ];
+    for chunk in chunks {
+        events.push(StreamEvent::BlockDelta {
+            id: id.clone(),
+            delta: Delta::Text((*chunk).to_owned()),
+        });
+    }
+    events.push(StreamEvent::BlockStop { id: id.clone() });
+    events.push(StreamEvent::Usage(usage));
+    events.push(StreamEvent::MessageStop {
+        stop_reason: end_turn(),
+    });
+    events
+}
+
+/// Builds a tool-use response stream that asks to call `get_weather`.
+fn tool_stream() -> Vec<StreamEvent> {
+    let id = BlockId::new("tool-1");
+    vec![
+        StreamEvent::MessageStart {
+            role: Role::Assistant,
+        },
+        StreamEvent::BlockStart {
+            id: id.clone(),
+            kind: BlockKind::ToolInput {
+                tool_name: "get_weather".to_owned(),
+                tool_call_id: "call-1".to_owned(),
+            },
+        },
+        StreamEvent::BlockDelta {
+            id: id.clone(),
+            delta: Delta::Json("{\"city\":\"Shanghai\"}".to_owned()),
+        },
+        StreamEvent::BlockStop { id: id.clone() },
+        StreamEvent::MessageStop {
+            stop_reason: Normalized::from_mapped(StopReason::ToolUse, "tool_use"),
+        },
+    ]
+}
+
+/// Drives an [`Agent::stream`] to exhaustion, returning every yielded event.
+async fn drain_agent_stream(agent: &mut Agent, input: &str) -> Vec<RunEvent> {
+    let mut stream = agent.stream(input).await.expect("open stream");
+    let mut events = Vec::new();
+    while let Some(item) = stream.next().await {
+        events.push(item.expect("stream item is ok"));
+    }
+    events
+}
+
+/// The aggregated assistant text carried by every `TextDelta` in `events`.
+fn streamed_text(events: &[RunEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RunEvent::TextDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn stream_text_matches_run_full() {
+    let usage = Usage {
+        input: 11,
+        output: 7,
+        ..Usage::default()
+    };
+
+    // Non-streaming reference over an equivalent response.
+    let reference_client = ScriptedClient::new(vec![text_response("It is sunny.")]);
+    let mut reference = agent_with(
+        reference_client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    let expected = reference.run_full("weather?").await.unwrap();
+
+    // Streaming the same generation in three chunks.
+    let stream_client =
+        StreamingScriptedClient::new(vec![text_stream(&["It ", "is ", "sunny."], usage)]);
+    let mut streamed = agent_with(
+        stream_client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    let events = drain_agent_stream(&mut streamed, "weather?").await;
+
+    assert_eq!(
+        streamed_text(&events),
+        "It is sunny.",
+        "text deltas reassemble the full assistant text"
+    );
+    let Some(RunEvent::Done(output)) = events.last() else {
+        panic!("the stream ends with a terminal Done, got {events:?}");
+    };
+    assert_eq!(
+        **output, expected,
+        "the streamed terminal output matches run_full"
+    );
+}
+
+#[tokio::test]
+async fn stream_tool_round_trip_emits_tool_events() {
+    let usage = Usage {
+        input: 11,
+        output: 7,
+        ..Usage::default()
+    };
+    let client =
+        StreamingScriptedClient::new(vec![tool_stream(), text_stream(&["It is sunny."], usage)]);
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut agent = agent_with(
+        client.clone(),
+        counting_weather_tool(executions.clone()),
+        Approval::auto_allow(),
+    );
+
+    let events = drain_agent_stream(&mut agent, "weather?").await;
+
+    let started = events.iter().position(
+        |event| matches!(event, RunEvent::ToolStarted(trace) if trace.name == "get_weather"),
+    );
+    let finished = events.iter().position(
+        |event| matches!(event, RunEvent::ToolFinished(trace) if trace.name == "get_weather"),
+    );
+    assert!(
+        matches!((started, finished), (Some(s), Some(f)) if s < f),
+        "a live ToolStarted precedes the matching ToolFinished, got {events:?}"
+    );
+
+    assert_eq!(
+        streamed_text(&events),
+        "It is sunny.",
+        "final text streams after the tool round"
+    );
+
+    let Some(RunEvent::Done(output)) = events.last() else {
+        panic!("the stream ends with a terminal Done, got {events:?}");
+    };
+    assert_eq!(output.tool_calls.len(), 1);
+    assert_eq!(output.tool_calls[0].name, "get_weather");
+    assert_eq!(executions.load(Ordering::SeqCst), 1, "the tool ran once");
+    assert_eq!(
+        client.call_count(),
+        2,
+        "one tool-use step plus one final step"
+    );
+}
+
+#[tokio::test]
+async fn stream_reports_approval_request() {
+    let usage = Usage {
+        input: 11,
+        output: 7,
+        ..Usage::default()
+    };
+    let client =
+        StreamingScriptedClient::new(vec![tool_stream(), text_stream(&["Denied."], usage)]);
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut agent = agent_with(
+        client,
+        counting_weather_tool(executions.clone()),
+        Approval::auto_deny(),
+    );
+
+    let events = drain_agent_stream(&mut agent, "weather?").await;
+
+    let approval = events.iter().find_map(|event| match event {
+        RunEvent::ApprovalRequested(request) => Some(request.tool_name.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        approval.as_deref(),
+        Some("get_weather"),
+        "an ApprovalRequested event names the pending tool, got {events:?}"
+    );
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "a denied tool never executes"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_then_restore_continues_history() {
+    let client = ScriptedClient::new(vec![text_response("First."), text_response("Second.")]);
+    let mut agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+
+    let first = agent.run("one").await.unwrap();
+    assert_eq!(first.text(), "First.");
+    assert_eq!(agent.conversation().turns().len(), 1);
+
+    let snapshot = agent.snapshot().expect("snapshot at a committed point");
+
+    // Restore against a fresh client and re-injected tool.
+    let restore_client = ScriptedClient::new(vec![text_response("Second.")]);
+    let mut restored = Agent::restore()
+        .snapshot(snapshot)
+        .client(restore_client)
+        .tool(counting_weather_tool(Arc::new(AtomicUsize::new(0))))
+        .approval(Approval::auto_allow())
+        .build()
+        .expect("restore agent");
+
+    assert_eq!(
+        restored.conversation().turns().len(),
+        1,
+        "restore preserves the first committed turn"
+    );
+
+    let second = restored.run("two").await.unwrap();
+    assert_eq!(second.text(), "Second.");
+    assert_eq!(
+        restored.conversation().turns().len(),
+        2,
+        "a run after restore appends to the restored history"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_round_trips_through_json() {
+    let client = ScriptedClient::new(vec![text_response("Hello.")]);
+    let mut agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    agent.run("hi").await.unwrap();
+
+    let snapshot = agent.snapshot().expect("snapshot");
+    let json = serde_json::to_string(&snapshot).expect("serialize snapshot");
+    let restored: AgentSnapshot = serde_json::from_str(&json).expect("deserialize snapshot");
+
+    assert_eq!(restored, snapshot, "snapshot survives a JSON round trip");
+    assert!(
+        snapshot.delegates.is_empty()
+            && snapshot.pending_delegations.is_empty()
+            && snapshot.artifacts.is_empty(),
+        "reserved slices are empty on the base agent path"
+    );
+    assert!(
+        snapshot.mailbox.is_none() && snapshot.blackboard.is_none() && snapshot.plan.is_none(),
+        "reserved options are absent on the base agent path"
+    );
+}
+
+#[tokio::test]
+async fn into_parts_exposes_usable_state() {
+    let client = ScriptedClient::new(vec![text_response("Hello.")]);
+    let mut agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    agent.run("hi").await.unwrap();
+
+    let parts = agent.into_parts();
+    assert_eq!(
+        parts.state.conversation().turns().len(),
+        1,
+        "the handed-out state owns the committed history"
+    );
+    assert_eq!(parts.tools.len(), 1);
+    assert_eq!(parts.tools[0].name(), "get_weather");
+}
+
+#[test]
+fn restore_requires_a_snapshot() {
+    let error = Agent::restore()
+        .client(ScriptedClient::new(vec![text_response("x")]))
+        .build()
+        .unwrap_err();
+    assert!(
+        matches!(error, FacadeError::Config(_)),
+        "restore without a snapshot is a config error, got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn restore_requires_a_client_or_provider() {
+    let client = ScriptedClient::new(vec![text_response("Hi.")]);
+    let mut agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    agent.run("hi").await.unwrap();
+    let snapshot = agent.snapshot().expect("snapshot");
+
+    let error = Agent::restore().snapshot(snapshot).build().unwrap_err();
+    assert!(
+        matches!(error, FacadeError::Config(_)),
+        "restore without a client or provider is a config error, got {error:?}"
     );
 }

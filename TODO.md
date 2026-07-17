@@ -628,7 +628,7 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
 - 说明：`prelude` 增补 `Agent/Tool/Approval/...` 与 `stream`/`snapshot`/`restore`/`into_parts` 按计划留待
   M2-4 / M2-R；本任务仅从 `facade` 根导出 `Agent`/`AgentBuilder`。
 
-### [TODO] M2-4 `Agent::stream` + `snapshot`/`restore` + `into_parts`
+### [DONE] M2-4 `Agent::stream` + `snapshot`/`restore` + `into_parts`
 
 **上下文**：
 
@@ -653,6 +653,47 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   后 `run` 能接上历史；snapshot 不含 client/凭据/闭包；`into_parts()` 交出可用的底层状态。
 - 聚焦：`cargo test -p agent-lib facade::agent`（含 stream/snapshot 用例）。
 - 完整验证序列 1–6。
+
+**完成记录**：
+
+- 新增 `src/facade/agent/stream.rs`：`Agent::stream(&mut self, input) -> Result<AgentRunStream<'_>, FacadeError>`。
+  是 `ChatSession::stream` 的 tool/approval 版对应物。机器保持 `NonStreaming`，改由三个 *tapping* handler
+  在 `drain` 过程中把实时 `RunEvent` 推进共享 sink：`StreamingTapHandler`（`LlmHandler`）无论请求 mode 一律
+  走 `chat_stream`，用 `Accumulator` 折回同一个 `Response` 供机器消费，每个 `BlockDelta{Text}` 发 `TextDelta`；
+  `TapToolHandler` 包裹参考 `ToolRegistryHandler`，围绕执行发 `ToolStarted`/`ToolFinished`；`TapInteractionHandler`
+  包裹共享 `Arc<FacadeApproval>`，在委派前 peek 出待决工具名发 `ApprovalRequested`。未引入任何新 effect
+  家族——机器跑的仍是普通循环。`AgentRunStream<'a>` 持 `Pin<Box<dyn Future<..>+'a>>`（借 `&mut machine`）+
+  sink：`poll_next` 先排空 sink 再 poll future，`Ready(Ok)` 存 `RunOutput` 转 Draining、排空尾部事件后发唯一
+  `Done`；`Pending` 时补发已入 sink 的事件避免停摆。终态 `RunOutput` 与 `run_full` 逐字段一致（同 `final_turn_summary`
+  / `collect_tool_traces` / `classify_error`）。注册/输入校验错误在 `stream().await` 即刻返回。
+- 新增 `src/facade/agent/snapshot.rs`：`AgentSnapshot`（`Clone/Debug/PartialEq/Serialize/Deserialize`，因
+  `serde_json::Value` 无 `Eq` 故不派生 `Eq`）含 §15.2 的 `supervisor: ConversationSnapshot` +
+  `agent_state: AgentStateSnapshot` + 预留空槽（`delegates/pending_delegations/artifacts` 空 `Vec`、
+  `mailbox/blackboard/plan` `None`）。`AgentStateSnapshot` 为 `#[serde(transparent)]` 包 `serde_json::Value`
+  的 newtype（`AgentState` 有 serde 但无 `Clone/PartialEq`）。`snapshot()` 先 `conversation().snapshot()?`（挂起 turn
+  → 干净 `FacadeError::Conversation`）再序列化整个 state。`restore()` 返回 `AgentRestoreBuilder`：反序列化
+  `agent_state` 为权威 `AgentState`（保留 spec/声明/model/loop policy/loop cursor），重注入 client（provider 或显式）
+  + tools + approval，`ids = self.ids | FacadeIds::continuing_after(conversation)`。`into_parts() -> AgentParts`
+  逃生舱交出 `state/client/tools/custom_registry/extra_declarations/approval/ids`。占位快照类型
+  `DelegateSnapshot/DelegationSnapshot/MailboxSnapshot/BlackboardSnapshot`（空、`#[non_exhaustive]`）。
+- `src/facade/approval.rs`：`PendingDecision::Deny` 增 `tool_name`（`record_pending` 两处 Deny 臂填入），
+  新增 `PendingDecision::tool_name()` 与 `pub fn FacadeApproval::pending_tool_name(call_id) -> Option<String>`
+  —— approval interaction 仅带 `call_id`，据此把已记录的待决决策工具名回补给 `ApprovalRequested`。
+- `src/facade/agent.rs`：从 `build()` 抽出 `build_facade_approval` / `assemble_machine` 私有 helper 供 build 与
+  restore 复用；声明 `mod stream; mod snapshot;` 并 `pub use` 新公有类型；`impl Agent` 增 `stream`/`snapshot`/
+  `restore`/`into_parts`（`state()` 文档同步更新）。`mod.rs` 从 `facade` 根导出全部新类型。
+- 测试 `src/facade/agent/tests.rs`（全离线，新增 `StreamingScriptedClient` + `text_stream`/`tool_stream` 帮手，
+  各 < 1s，8 个新用例）：`stream` 文本分块重组为整段且末尾 `Done` 与 `run_full` 逐字段相等；tool round-trip 实时
+  发 `ToolStarted`→`ToolFinished`（名对、序对）、尾部 text、`Done.tool_calls` 记录调用、工具恰执行一次、两步
+  LLM；`auto_deny` 时发 `ApprovalRequested{get_weather}` 且工具不执行；`snapshot()`→JSON 往返相等且预留槽为空；
+  `snapshot()`→`restore()`（换新 client + 重注入 tool）保留首轮并可接上第二轮；`into_parts()` 交出仍持历史的
+  `state`；restore 缺 snapshot / 缺 client|provider 均 `Config` 报错。
+- 验证：`cargo fmt --all` ✅｜`cargo clippy --all-targets -- -D warnings` 0 警告 ✅｜
+  `cargo test -p agent-lib facade::agent` 15 全绿 ✅｜`cargo test --all --all-targets` 全绿
+  （lib 735 passed / 0 failed，各集成 target 全绿）✅｜`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  通过 ✅｜`git diff --check` 干净 ✅。
+- 说明：`prelude` 增补与 `RunStream` 别名收敛留待 M2-R。为避与 chat facade 既有 `RunStream` 同名冲突，agent 的
+  流类型命名为 `AgentRunStream`（§8.2 中 `RunStream` 为概念名）。
 
 ### [TODO] M2-R Review：基础 Agent facade 正确性与文档一致性检查
 

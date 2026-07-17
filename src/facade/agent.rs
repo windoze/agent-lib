@@ -60,6 +60,15 @@ use crate::facade::tool::{FacadeToolRegistry, Tool, ToolContextParts, ensure_uni
 use crate::model::content::ContentBlock;
 use crate::model::tool::Tool as ToolDecl;
 
+mod snapshot;
+mod stream;
+
+pub use snapshot::{
+    AgentParts, AgentRestoreBuilder, AgentSnapshot, AgentStateSnapshot, BlackboardSnapshot,
+    DelegateSnapshot, DelegationSnapshot, MailboxSnapshot,
+};
+pub use stream::AgentRunStream;
+
 /// Default per-turn LLM-step budget when a builder does not set one (§8.4).
 const DEFAULT_MAX_STEPS: u32 = 8;
 /// Default number of tool-call rounds allowed per turn when unset (§8.4).
@@ -261,11 +270,111 @@ impl Agent {
 
     /// Returns the agent's live [`AgentState`] through a read-only view.
     ///
-    /// The full snapshot / restore / escape-hatch surface is added by a later
-    /// milestone; this accessor exposes the assembled state for inspection.
+    /// Use [`snapshot`](Agent::snapshot) to capture a serializable copy, or
+    /// [`into_parts`](Agent::into_parts) to consume the agent and take ownership
+    /// of the underlying state.
     #[must_use]
     pub const fn state(&self) -> &AgentState {
         self.machine.state()
+    }
+
+    /// Runs one agent turn as an incremental [`AgentRunStream`].
+    ///
+    /// The returned stream is the tool-using, approval-gated analog of
+    /// [`ChatSession::stream`](crate::facade::ChatSession::stream). It forwards
+    /// each incremental [`RunEvent::TextDelta`] as the assistant text arrives and
+    /// each [`RunEvent::ToolStarted`] / [`RunEvent::ToolFinished`] /
+    /// [`RunEvent::ApprovalRequested`] as the drive reaches it, then yields
+    /// exactly one terminal [`RunEvent::Done`] carrying the complete
+    /// [`RunOutput`]. That terminal `RunOutput` is built exactly as
+    /// [`run_full`](Agent::run_full) builds it, so a streamed turn and a
+    /// non-streamed turn agree field for field.
+    ///
+    /// Streaming is realized by a per-run LLM handler that always drives
+    /// [`LlmClient::chat_stream`] and folds
+    /// the deltas back into the same [`Response`](crate::client::Response) the
+    /// machine consumes, so no new effect family is introduced and the held
+    /// [`DefaultAgentMachine`] runs its ordinary loop. The turn is committed to
+    /// this agent's [`Conversation`] only when the drive reaches a final
+    /// assistant message; dropping the stream before completion leaves the
+    /// agent's committed history unchanged.
+    ///
+    /// # Errors
+    ///
+    /// The `await` itself returns:
+    ///
+    /// - [`FacadeError::Agent`] if building the user input for the turn fails.
+    /// - [`FacadeError::DuplicateTool`] if the run-scoped registry rejects a
+    ///   duplicate tool name (already validated at build, so this is defensive).
+    ///
+    /// Failures observed while driving the turn (LLM transport errors, tool
+    /// failures, an exhausted loop budget) are surfaced as an `Err` item yielded
+    /// by the stream. On any such failure the in-flight turn is discarded inside
+    /// the machine, so the agent stays usable and its committed history is
+    /// unchanged.
+    pub async fn stream(
+        &mut self,
+        input: impl IntoUserMessage,
+    ) -> Result<AgentRunStream<'_>, FacadeError> {
+        stream::start(self, input.into_user_message())
+    }
+
+    /// Captures a serializable [`AgentSnapshot`] of the supervisor state.
+    ///
+    /// The snapshot carries only data — the accumulated [`Conversation`] plus the
+    /// serializable [`AgentState`] (spec, active tool-set declarations, model,
+    /// loop policy, and loop cursor). It never contains the LLM client, provider
+    /// credentials, tool closures, or the approval handler, so it is safe to
+    /// persist and later feed to [`Agent::restore`]. Delegate, mailbox,
+    /// blackboard, plan, and artifact slices are reserved for later milestones
+    /// and are empty here (`docs/facade-api.md` §15.2).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacadeError::Conversation`] if an uncommitted turn is in flight
+    /// (a [`ConversationSnapshot`](crate::conversation::ConversationSnapshot) is
+    /// only available at a committed consistency point). In normal use each
+    /// [`run`](Agent::run) commits before returning, so the agent rests at a
+    /// snapshot-able point.
+    pub fn snapshot(&self) -> Result<AgentSnapshot, FacadeError> {
+        AgentSnapshot::capture(self.machine.state())
+    }
+
+    /// Starts a fluent [`AgentRestoreBuilder`] that rebuilds an [`Agent`] from an
+    /// [`AgentSnapshot`].
+    ///
+    /// A snapshot is data-only, so the restore builder re-injects the runtime
+    /// handles a snapshot deliberately omits: the LLM client (through a
+    /// [`provider`](AgentRestoreBuilder::provider) or an explicit
+    /// [`client`](AgentRestoreBuilder::client)), the executable
+    /// [`tool`](AgentRestoreBuilder::tool)s, and the
+    /// [`approval`](AgentRestoreBuilder::approval) policy. The restored agent
+    /// continues the snapshotted conversation, so the next [`run`](Agent::run)
+    /// appends to that history.
+    #[must_use]
+    pub fn restore() -> AgentRestoreBuilder {
+        AgentRestoreBuilder::default()
+    }
+
+    /// Consumes the agent and returns its internal parts as an escape hatch.
+    ///
+    /// This hands ownership of the underlying [`AgentState`] (which owns the live
+    /// [`Conversation`]), the LLM client, the registered tools and escape-hatch
+    /// declarations, the shared approval bridge, and the identity source to an
+    /// advanced caller who needs to drive the layers directly
+    /// (`docs/facade-api.md` §8.2). The facade never reclaims these parts, so the
+    /// caller owns the assembled state after this call.
+    #[must_use]
+    pub fn into_parts(self) -> AgentParts {
+        AgentParts {
+            state: self.machine.into_state(),
+            client: self.client,
+            tools: self.tools,
+            custom_registry: self.custom_registry,
+            extra_declarations: self.extra_declarations,
+            approval: self.approval,
+            ids: self.ids,
+        }
     }
 }
 
@@ -513,20 +622,9 @@ impl AgentBuilder {
         // One FacadeApproval bridges both runtime roles: it is the machine's pure
         // ToolApprovalPolicy and the scope's InteractionHandler, sharing one
         // pending-decision map through a single Arc.
-        let mut approval = FacadeApproval::new(self.approval.unwrap_or_default());
-        for tool in &self.tools {
-            if let Some(tool_approval) = tool.approval_override() {
-                approval = approval.with_tool_override(tool.name(), tool_approval.clone());
-            }
-        }
-        let approval = Arc::new(approval);
+        let approval = build_facade_approval(self.approval.unwrap_or_default(), &self.tools);
 
-        let requirement_ids: Arc<dyn RequirementIds> = Arc::new(ids.clone());
-        let tool_ids: Arc<dyn ToolExecutionIds> = Arc::new(ids.clone());
-        let approval_policy: Arc<dyn ToolApprovalPolicy> = approval.clone();
-        let machine = DefaultAgentMachine::new(state, LlmStepMode::NonStreaming, requirement_ids)
-            .with_tool_execution_ids(tool_ids)
-            .with_approval_policy(approval_policy);
+        let machine = assemble_machine(state, &ids, approval.clone());
 
         Ok(Agent {
             machine,
@@ -538,6 +636,42 @@ impl AgentBuilder {
             ids,
         })
     }
+}
+
+/// Builds the shared [`FacadeApproval`] bridge from an agent-level policy and the
+/// per-tool overrides carried on each typed [`Tool`].
+///
+/// A tool-level [`Approval`](crate::facade::Approval) override wins over the
+/// agent-level entry for the same name (`docs/facade-api.md` §9.1). The returned
+/// value is shared behind one [`Arc`] so the machine (as
+/// [`ToolApprovalPolicy`]) and the drive scope (as [`InteractionHandler`])
+/// observe the same pending-decision map.
+fn build_facade_approval(policy: ApprovalPolicy, tools: &[Tool]) -> Arc<FacadeApproval> {
+    let mut approval = FacadeApproval::new(policy);
+    for tool in tools {
+        if let Some(tool_approval) = tool.approval_override() {
+            approval = approval.with_tool_override(tool.name(), tool_approval.clone());
+        }
+    }
+    Arc::new(approval)
+}
+
+/// Assembles the §8.3 [`DefaultAgentMachine`] over `state`, wiring the facade
+/// identity source and the shared approval policy.
+///
+/// Both [`AgentBuilder::build`] and the restore path share this so a rebuilt
+/// machine is wired identically to a freshly built one.
+fn assemble_machine(
+    state: AgentState,
+    ids: &FacadeIds,
+    approval: Arc<FacadeApproval>,
+) -> DefaultAgentMachine {
+    let requirement_ids: Arc<dyn RequirementIds> = Arc::new(ids.clone());
+    let tool_ids: Arc<dyn ToolExecutionIds> = Arc::new(ids.clone());
+    let approval_policy: Arc<dyn ToolApprovalPolicy> = approval;
+    DefaultAgentMachine::new(state, LlmStepMode::NonStreaming, requirement_ids)
+        .with_tool_execution_ids(tool_ids)
+        .with_approval_policy(approval_policy)
 }
 
 /// One total drain layer carrying the LLM client, the run-scoped tool registry,

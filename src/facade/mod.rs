@@ -35,7 +35,10 @@ pub mod ids;
 pub mod run;
 pub mod tool;
 
-pub use agent::{Agent, AgentBuilder};
+pub use agent::{
+    Agent, AgentBuilder, AgentParts, AgentRestoreBuilder, AgentRunStream, AgentSnapshot,
+    AgentStateSnapshot, BlackboardSnapshot, DelegateSnapshot, DelegationSnapshot, MailboxSnapshot,
+};
 pub use approval::{Approval, ApprovalDecision, ApprovalPolicy, FacadeApproval};
 pub use chat::{Chat, ChatBuilder, ChatSession, ChatSessionBuilder, RunStream};
 pub use config::{ModelConfig, ProviderConfig, ProviderConfigBuilder};

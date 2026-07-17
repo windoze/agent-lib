@@ -283,13 +283,26 @@ impl fmt::Debug for ApprovalPolicy {
 /// The resolved decision for one pending tool call, recorded by the policy for
 /// the interaction handler to consume.
 enum PendingDecision {
-    /// The call is denied; carries the model-visible message.
-    Deny { message: Option<String> },
+    /// The call is denied; carries the tool name and the model-visible message.
+    Deny {
+        tool_name: String,
+        message: Option<String>,
+    },
     /// The call is deferred to a handler.
     Ask {
         request: ApprovalRequest,
         handler: Arc<AskFn>,
     },
+}
+
+impl PendingDecision {
+    /// Returns the tool name this pending decision concerns.
+    fn tool_name(&self) -> &str {
+        match self {
+            Self::Deny { tool_name, .. } => tool_name,
+            Self::Ask { request, .. } => &request.tool_name,
+        }
+    }
 }
 
 /// Bridges a facade [`ApprovalPolicy`] (plus tool-level overrides) onto the
@@ -361,6 +374,7 @@ impl FacadeApproval {
             // Never routed here: an auto-allow tool auto-approves in the policy.
             ApprovalKind::AutoAllow => return,
             ApprovalKind::AutoDeny => PendingDecision::Deny {
+                tool_name: tool_name.to_owned(),
                 message: Some(format!("tool `{tool_name}` denied by approval policy")),
             },
             ApprovalKind::Ask(Some(handler)) => PendingDecision::Ask {
@@ -377,6 +391,7 @@ impl FacadeApproval {
                     handler: Arc::clone(handler),
                 },
                 _ => PendingDecision::Deny {
+                    tool_name: tool_name.to_owned(),
                     message: Some(format!(
                         "tool `{tool_name}` requires approval but no handler is configured"
                     )),
@@ -387,6 +402,23 @@ impl FacadeApproval {
             .lock()
             .expect("approval pending map poisoned")
             .insert(call_id, decision);
+    }
+
+    /// Peeks the tool name recorded for a pending require-approval `call_id`.
+    ///
+    /// The Agent facade's streaming path uses this to label an
+    /// [`ApprovalRequest`] event: an [`Approval`](InteractionKind::Approval)
+    /// interaction only carries the framework [`ToolCallId`], so the tool name is
+    /// recovered from the decision the policy already recorded. Returns `None`
+    /// when no pending approval exists for `call_id` (for example an auto-approved
+    /// call that never routed through the interaction handler).
+    #[must_use]
+    pub fn pending_tool_name(&self, call_id: ToolCallId) -> Option<String> {
+        self.pending
+            .lock()
+            .expect("approval pending map poisoned")
+            .get(&call_id)
+            .map(|decision| decision.tool_name().to_owned())
     }
 }
 
@@ -424,7 +456,9 @@ impl InteractionHandler for FacadeApproval {
                     .expect("approval pending map poisoned")
                     .remove(call_id);
                 let (decision, message) = match pending {
-                    Some(PendingDecision::Deny { message }) => (ApprovalDecision::Deny, message),
+                    Some(PendingDecision::Deny { message, .. }) => {
+                        (ApprovalDecision::Deny, message)
+                    }
                     Some(PendingDecision::Ask { request, handler }) => (handler(&request), None),
                     None => (
                         ApprovalDecision::Deny,
