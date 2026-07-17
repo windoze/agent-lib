@@ -71,3 +71,31 @@
       test-all(default 47 ok)/test-all(feature 51 ok)/doc(-D warnings)/git diff --check
 - [x] TODO.md M9-5 标 [DONE] + 完成记录
 - 下一个未完成 = M9-6（总体 Review），留给下次 invocation。
+
+## M9-6（总体 Review）执行计划（当前 invocation）
+性质：最终验收 review。默认代码应已完整；我的职责是逐项核对 + 跑验证 + 记录，
+若发现缺陷则修复或新增任务。
+
+### 步骤
+- [ ] 逐项核对 §3 parity 表 13 项（文本/多轮/流式/tool/approval/question/subagent/cancel/budget/artifact/worktree/reconfig/snapshot）都有源码 + 测试支撑
+- [ ] 核对 PLAN.md §风险每条有测试或明确限制
+- [ ] 确认所有真实 e2e `#[ignore]`；cassette fixtures 脱敏（is_secret_free 等）
+- [ ] 确认默认 feature 无重 runtime 依赖（三 adapter feature off-by-default）
+- [ ] 确认 ExternalAgentMachine 仍无 IO
+- [ ] 验证序列 1-6：fmt --check / clippy(-D warnings, default + 全 feature) / test --all / doc(-D warnings) / git diff --check
+- [ ] feature-gated cassette tests：claude/codex/opencode
+- [ ] 真机 ignored e2e：有环境则跑并记录；否则记录 skip 条件
+- [ ] 完成记录写最终能力矩阵摘要 + 剩余 runtime-dependent 限制
+- [ ] TODO.md M9-6 标 [DONE] + commit
+
+## 完成状态（M9-6 DONE — 总体验收）
+- [x] §3 parity 表 13 项逐项验收（源码 + 测试锚点）
+- [x] PLAN.md §风险逐条有测试/明确限制（ACP 两条属 M10 未来）
+- [x] 全部真实 e2e `#[ignore]`（10 处）；3 份 cassette is_secret_free + fixtures 凭据扫描干净
+- [x] 默认 feature 无重 runtime 依赖（3 feature = []；无 agent-client-protocol）
+- [x] ExternalAgentMachine 无 IO（machine.rs + machine/ 无 .await/tokio/process/fs/reqwest）
+- [x] 验证序列 1-6 全过（fmt/clippy default+全feature/test-all default 753+/doc -D warnings/git diff --check）
+- [x] feature-gated cassette：claude 7 / codex 7 / opencode 7
+- [x] 真机 ignored e2e 全绿：claude 11.6s(6ev)/codex 59.8s(5ev)/opencode 19.1s(4ev)/mixed 188.8s(3 tests)
+- [x] TODO.md M9-6 标 [DONE] + 完成记录（含最终能力矩阵摘要 + 剩余 runtime-dependent 限制）
+- 下一个未完成 = M10-1（ACP feature + AcpConfig），留给下次 invocation。

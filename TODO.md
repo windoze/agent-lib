@@ -3019,7 +3019,7 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
 - **本机限制**:无 `claude`/`codex`/`opencode` CLI 与登录，`cargo run --example managed_*` 会走
   非密 skip 分支（打印缺失提示、exit 0）；真机运行需在具备对应 CLI 的环境按 `AGENTS.md` 命令执行。
 
-### [TODO] M9-6 Review：Managed External Agent 总体验收
+### [DONE] M9-6 Review：Managed External Agent 总体验收
 
 **上下文**:
 
@@ -3055,6 +3055,110 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
   - OpenCode。
 - 在具备环境时运行真实 ignored e2e 并记录结果；不具备时记录 skip 条件。
 - 完成记录中给出最终能力矩阵摘要和剩余 runtime-dependent 限制。
+
+**完成记录**:
+
+- **性质**:整个 M1–M9 计划的最终验收 review。逐项核对源码 + 测试 + 文档,确认 managed external agent
+  达到 `docs/managed-external-agent.md` §3 设计要求且默认测试稳定,**未发现需修复的缺陷或 spec 偏离**,
+  故不改任何代码/测试/文档,仅重跑完整验证并签核。(源码自 M9-5 绿跑后未变;本任务仅新增 TODO.md 完成记录
+  与 `memory/claude_plan.md` 进度,不影响编译产物——但为最终验收仍重跑了全部离线 + 真机验证。)
+
+- **§3 能力 parity 表逐项验收(13 项,全部 as-built 落地,有源码 + 测试锚点)**:
+  1. **文本 turn** — machine 折 `RuntimeDecisionPoint::Completed.output` 进 Conversation(machine/tests.rs
+     `external_completed_resume_commits_and_settles_done`);三 adapter 解结构化流(cassette `decodes_full_session`)。
+  2. **多轮 session** — registry `get_or_start` 首轮 start / 后续 reattach;`resume` 按 capability 门控。
+  3. **流式输出** — `ExternalEventSink` sequenced(`sink.rs`,`ExternalObservedEvent.seq`);三 adapter 镜像
+     解码帧到 live sink;真机 e2e 均观测到多事件。
+  4. **tool call** — machine external tool phase → `NeedTool` → `RespondToolResults`;host custom-tool 注入仍
+     `host_tools=false` 门控关,声明工具的请求以 `UnsupportedCapability{HostTools}` 拒绝(非静默降级)。
+  5. **tool approval/permission** — runtime permission `PausedForInteraction` → `NeedInteraction`;真机
+     Claude e2e 观测到 permission summary(`0 permission prompts` 因 e2e 用 `approve_all`/bypass 策略)。
+  6. **user question/choice** — runtime question/choice → `NeedInteraction(Question)`(M3-2)。
+  7. **subagent** — `PausedForSubagent` → `NeedSubagent` + `spawn_agent` tool-bridge 特判(M3-1/3-3);真机
+     mixed e2e:DeepSeek 协调器派生 Claude + Codex child。
+  8. **cancel cleanup** — registry `cleanup`/`cleanup_agent` 强关 live session → `ExternalSessionShutdown`
+     disposition;`shutdown.rs` `leaves_residual_side_effects`(Forced/Failed→true)+ 单测;adapter
+     `kill_on_drop` 兜底。
+  9. **budget/usage** — `ExternalUsageChargingHandler` 把 runtime usage/cost 计入 run budget(M9-2,`budget.rs`
+     + tests)。
+  10. **artifact** — patch/diff/test/file artifact refs(§18)。
+  11. **worktree isolation** — `WorktreeManager`/`GitWorktreeManager` prepare/cleanup + residual 标记(M9-1,
+      `worktree.rs`);真机三 e2e 均断言产物**不泄漏**回启动它的 checkout。
+  12. **reconfig** — `ExternalAgentMachine::reconfigure` + `ExternalReconfigTiming`/`ExternalReconfigOutcome`
+      (boundary 应用/排队;in-flight `Hot` → `UnsupportedCapability{Reconfigure}`,M9-3)。
+  13. **snapshot/restore** — `ExternalAgentState` 持久化 spec/session/cursor/conversation;registry 按
+      `ExternalSessionRef` reattach/`resume`(capability-gated),不可 resume 以 `ResumeUnavailable` 显式失败;
+      mid-turn cursor + 恢复去重由 machine/tests.rs resume 用例覆盖(observation dedup on resume,§5.5)。
+
+- **PLAN.md §风险逐条有测试或明确限制**:
+  - runtime 协议漂移 → parser 私有化 + cassette 覆盖(3×7 cassette tests)+ capability probe;raw schema 不导出。
+  - tool bridge 能力不对称 → capability model 显式 `UnsupportedCapability`(`capability.rs` + adapter 单测拒绝式)。
+  - cancel 后副作用残留 → `ExternalSessionShutdown` 分类 + worktree residual 标记(`shutdown.rs`/`worktree.rs` + 单测)。
+  - stream 事件重复 → `ExternalObservedEvent.seq` 单一 replay 进度(`sink.rs`)。
+  - 恢复 mid-turn scratch → serializable cursor + resume 去重测试(machine/tests.rs)。
+  - (ACP 两条风险属 M10 未来里程碑,不在本 M9 验收范围。)
+
+- **`#[ignore]` + 脱敏确认**:全部真实 endpoint/CLI 测试均 `#[ignore]`(external_claude_code / external_codex /
+  external_opencode / agent_external_managed_real_e2e / agent_external_real_e2e / integration_anthropic /
+  integration_openai_resp / integration_normalization,共 10 处 ignore 标记),缺 binary/登录/key 时 green-skip。
+  三份 cassette 各含 `*_cassette_is_secret_free` 断言;committed fixtures
+  `tests/fixtures/external/{claude_code,codex,opencode}/full_session.json` 凭据形态扫描(sk-*/api_key/bearer/
+  auth_token/password)干净。
+
+- **默认无重 runtime 依赖**:`external-claude-code`/`external-codex`/`external-opencode` 三 feature 均 `= []`
+  (off by default,仅门控已有 tokio process 支持);`[dependencies]` 无 `agent-client-protocol*`(M10 未起)。
+  默认 `cargo test --all --all-targets` 不编译任何 adapter 机制。
+
+- **`ExternalAgentMachine` 仍无 IO**:`src/agent/external/machine.rs` + `machine/` 代码内无 `.await`/`async fn`/
+  `tokio::`/`std::process`/`Command::new`/`std::fs::{File,read,write}`/`reqwest`(仅注释提及 `spawn_agent`
+  tool-bridge 概念,非真实 IO)。IO 全部在 handler/adapter 层。
+
+- **验证(全过)**:
+  - **默认序列 1-6**:① `cargo fmt --all -- --check` 干净;② 聚焦测试见下;③ `cargo clippy --all-targets
+    -- -D warnings` 0 warning;④ `cargo test --all --all-targets` exit 0(753 lib + 全 integration,真实
+    endpoint 正确 ignored);⑤ `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` exit 0;
+    ⑥ `git diff --check` 干净。
+  - **全 feature clippy**:`cargo clippy --all-targets --features "external-claude-code external-codex
+    external-opencode" -- -D warnings` 0 warning;全 feature `cargo test --all --all-targets --features "…"`
+    exit 0(753 lib + adapter inline 单测 + cassette)。
+  - **feature-gated cassette tests 全过**:Claude Code 7 / Codex 7 / OpenCode 7(共 21 passed)。
+  - **真机 ignored e2e(本机 2026-07 全部实跑绿)**:
+    - `external_claude_code`:1 passed,11.6s,6 观测事件(2 text)。
+    - `external_codex`:1 passed,59.8s,5 观测事件(2 text)。
+    - `external_opencode`:1 passed,19.1s,4 观测事件(1 text)。
+    - `agent_external_managed_real_e2e`(DeepSeek 协调器 + Claude/Codex child):3 passed,188.8s——
+      claude child 7 观测 / codex child 4 观测 / coordinator 2 DeepSeek 调用 + 28 观测、0 managed interaction。
+    - 三 e2e 均在临时 `git init` worktree 内生成 `READY.txt` 并断言其**不泄漏**回启动它的 checkout。
+
+- **最终能力矩阵摘要(三 runtime 默认构建 = 保守 `none()`;下列为实报能力,以 ignored e2e 跑绿为准)**:
+
+  | 能力 | Claude Code | Codex | OpenCode |
+  |---|---|---|---|
+  | streaming | ✅ | ✅ | ✅ |
+  | resume(多轮) | ✅ | ✅ | ✅ |
+  | artifacts | ✅ | ✅ | ✅ |
+  | usage/cost | ✅ | ✅ | ✅ |
+  | graceful_shutdown | ✅ | ✅ | ✅ |
+  | permission_bridge | ✅(常驻 stdio,host-pausable) | ❌(自主) | ❌(自主) |
+  | host_tools | ❌(§12.3,首版保守) | ❌ | ❌ |
+  | host_subagents | ❌(`spawn_agent` 经 tool-bridge 特判,非 host 注入) | ❌ | ❌ |
+
+  进程模型:Claude = 常驻 stdio 进程(点亮 permission bridge);Codex/OpenCode = 一进程/一 turn 自主运行。
+  唯一结构性差异 = Claude 常驻 + `permission_bridge=true`;三者共享同一 `ExternalRuntimeAdapter`/
+  `ExternalRuntimeSession` trait + `with_probed_capabilities` 逐位取交模型。
+
+- **剩余 runtime-dependent 限制(诚实记录,非 workaround)**:
+  1. **host custom-tool 注入(`host_tools`)三 runtime 恒 `false`**——CLI 自主执行工具,流里无 host-pausable
+     tool 帧;声明工具的请求 fail-fast `UnsupportedCapability{HostTools}`。首个可能点亮的 adapter 是 M10 ACP
+     (未来里程碑)。
+  2. **permission_bridge 仅 Claude Code 为 `true`**;Codex/OpenCode 自主解审批(`--auto`/bypass),host 无法
+     就地插入审批(能力矩阵显式暴露)。
+  3. **真实能力矩阵仍以 ignored e2e 跑绿为准**——默认构建保守 `none()`,实报能力需 `with_probed_capabilities`
+     本机 probe 逐位取交;缺 binary/登录时能力位为 `false` 且 e2e green-skip。
+  4. **真机 e2e 单 turn 未跑 cross-process resume**——resume/去重由离线 machine/tests.rs 覆盖;artifacts/usage
+     由离线 cassette + 单测覆盖。
+  5. **协议漂移**由 crate/CLI 升级 + cassette 兜底,非静态保证。
+  - 以上均为设计意图的能力边界,由 capability model 显式暴露、fail-fast,无 silent degradation。
 
 ---
 
