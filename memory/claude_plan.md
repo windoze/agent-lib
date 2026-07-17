@@ -83,11 +83,11 @@ Replay 层（复用 M5-1 registry + M5-2 ScriptedSinkLog/ScriptedRuntimeStartLog
 5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
 6. `git diff --check`
 
-## 状态：进行中
-- [ ] 实现 cassette.rs（schema/loader/redaction/replay）
-- [ ] 生成并提交 synthetic fixtures + 预留目录
-- [ ] 新增 tests/agent_external_cassette.rs
-- [ ] mod/prelude 导出
-- [ ] 验证序列 1-6
-- [ ] 标记 [DONE] + 完成记录写入 TODO.md
-- [ ] 提交 `[M5-3] ...`
+## 状态：完成
+- [x] 实现 cassette.rs（schema/loader/redaction/replay）
+- [x] 生成并提交 synthetic fixtures + 预留目录
+- [x] 新增 tests/agent_external_cassette.rs（9 个 external_cassette_*）
+- [x] mod/prelude 导出 + ScriptedRuntimeStartLog::record 提 pub(crate)
+- [x] 验证序列 1-6 全过（fmt/focus 9passed/clippy/full-suite 40 ok 0 failed/doc/diff-check clean）
+- [x] 标记 [DONE] + 完成记录写入 TODO.md
+- [ ] 提交 `[M5-3] ...`（本轮最后一步）

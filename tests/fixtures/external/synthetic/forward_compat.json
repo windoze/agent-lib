@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "kind": "codex",
+    "version": "0.42.0-synthetic",
+    "session_id": "forward-compat-sess-1",
+    "future_runtime_field": { "capability_flags": ["speculative"] }
+  },
+  "redaction": {
+    "applied": true,
+    "placeholder": "<redacted>",
+    "notes": "synthetic fixture; no real prompt or credential content"
+  },
+  "turns": [
+    {
+      "expect_input": "start",
+      "input_frames": [
+        {
+          "stream": "stdout",
+          "payload": "{\"type\":\"text\",\"delta\":\"hello\"}",
+          "future_frame_field": 7
+        }
+      ],
+      "expected_events": [
+        { "seq": 0, "event": { "text_delta": { "text": "hello" } } },
+        { "seq": 1, "event": "session_completed" }
+      ],
+      "decision": {
+        "kind": "completed",
+        "output": { "summary": "forward-compatible completion" }
+      },
+      "future_turn_field": { "note": "unknown turn fields are preserved raw" }
+    }
+  ],
+  "future_top_level": { "recorded_with": "a-newer-build", "nested": true }
+}

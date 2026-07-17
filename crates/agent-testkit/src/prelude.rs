@@ -31,10 +31,14 @@ pub use crate::concurrency::{
     DelayingToolHandler, InFlightGuard, PanicOnCall, PeakInFlight, YieldTicks,
 };
 pub use crate::external::{
-    ExternalAgentCallLog, ExternalAgentFixture, ExternalSessionStep, ScriptedAdvance,
-    ScriptedExternalRuntimeAdapter, ScriptedExternalRuntimeSession, ScriptedExternalSessionHandler,
-    ScriptedRuntimeBuilder, ScriptedRuntimeExternalSessionHandler, ScriptedRuntimeStartLog,
-    ScriptedSinkLog,
+    CassetteDecision, CassetteExternalRuntimeAdapter, CassetteExternalRuntimeSession,
+    CassetteFrame, CassetteInputKind, CassetteRuntimeExternalSessionHandler, CassetteRuntimeInfo,
+    CassetteStream, CassetteTurn, EXTERNAL_CASSETTE_SCHEMA_VERSION, ExternalAgentCallLog,
+    ExternalAgentFixture, ExternalCassetteError, ExternalRuntimeCassette, ExternalSessionStep,
+    RedactionMetadata, ScriptedAdvance, ScriptedExternalRuntimeAdapter,
+    ScriptedExternalRuntimeSession, ScriptedExternalSessionHandler, ScriptedRuntimeBuilder,
+    ScriptedRuntimeExternalSessionHandler, ScriptedRuntimeStartLog, ScriptedSinkLog, SecretHit,
+    scan_secrets,
 };
 pub use crate::fixtures::{
     agent_spec, agent_spec_with_tools, agent_state, assistant_text, assistant_tool_use,

@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "kind": "claude_code",
+    "version": "1.0.0-synthetic",
+    "probe": "claude-code 1.0.0-synthetic (offline fixture)",
+    "session_id": "cassette-sess-1"
+  },
+  "redaction": {
+    "applied": true,
+    "placeholder": "<redacted>",
+    "notes": "synthetic fixture; no real prompt or credential content"
+  },
+  "turns": [
+    {
+      "expect_input": "start",
+      "input_frames": [
+        {
+          "stream": "stdout",
+          "payload": "{\"type\":\"session\",\"event\":\"started\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"type\":\"assistant\",\"text\":\"Refactoring the parser.\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"type\":\"command\",\"phase\":\"start\",\"cmd\":\"cargo fmt\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"type\":\"command\",\"phase\":\"end\",\"exit\":0}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"type\":\"permission\",\"id\":\"act-1\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"type\":\"tool\",\"phase\":\"start\",\"name\":\"apply_patch\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"type\":\"tool\",\"phase\":\"end\",\"name\":\"apply_patch\"}"
+        },
+        {
+          "stream": "stdout",
+          "payload": "{\"type\":\"session\",\"event\":\"completed\"}"
+        }
+      ],
+      "expected_events": [
+        {
+          "seq": 0,
+          "event": {
+            "session_started": {
+              "session_id": "cassette-sess-1"
+            }
+          }
+        },
+        {
+          "seq": 1,
+          "event": {
+            "text_delta": {
+              "text": "Refactoring the parser module."
+            }
+          }
+        },
+        {
+          "seq": 2,
+          "event": {
+            "command_started": {
+              "command": "cargo fmt",
+              "cwd": "/workspace"
+            }
+          }
+        },
+        {
+          "seq": 3,
+          "event": {
+            "command_finished": {
+              "exit_code": 0,
+              "stdout_tail": "ok",
+              "stderr_tail": ""
+            }
+          }
+        },
+        {
+          "seq": 4,
+          "event": {
+            "permission_requested": {
+              "action_id": "act-1",
+              "summary": "run `cargo test`"
+            }
+          }
+        },
+        {
+          "seq": 5,
+          "event": {
+            "tool_started": {
+              "name": "apply_patch"
+            }
+          }
+        },
+        {
+          "seq": 6,
+          "event": {
+            "tool_finished": {
+              "name": "apply_patch",
+              "status": "ok"
+            }
+          }
+        },
+        {
+          "seq": 7,
+          "event": "session_completed"
+        }
+      ],
+      "decision": {
+        "kind": "completed",
+        "output": {
+          "summary": "refactored the parser module",
+          "artifacts": []
+        }
+      }
+    }
+  ]
+}

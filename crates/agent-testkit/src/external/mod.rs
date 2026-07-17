@@ -39,12 +39,21 @@
 //! managed loop (start, tool batch, interaction, subagent) can be driven offline
 //! through a registry-backed handler.
 //!
-//! Offline replay of a *recorded* external session
-//! (`CassetteExternalSessionHandler`, design §12) is deferred to a later
-//! milestone; this module only covers the scripted path.
+//! The [`cassette`] submodule sits alongside the scripted runtime: it replays a
+//! *recorded* runtime session from a redacted on-disk fixture
+//! ([`CassetteRuntimeExternalSessionHandler`], design §12), freezing the parser
+//! output (sequenced observations + decision point) for regression coverage of
+//! the real Claude/Codex/OpenCode adapters landing in later milestones.
 
+pub mod cassette;
 pub mod runtime;
 
+pub use cassette::{
+    CassetteDecision, CassetteExternalRuntimeAdapter, CassetteExternalRuntimeSession,
+    CassetteFrame, CassetteInputKind, CassetteRuntimeExternalSessionHandler, CassetteRuntimeInfo,
+    CassetteStream, CassetteTurn, EXTERNAL_CASSETTE_SCHEMA_VERSION, ExternalCassetteError,
+    ExternalRuntimeCassette, RedactionMetadata, SecretHit, scan_secrets,
+};
 pub use runtime::{
     ScriptedAdvance, ScriptedExternalRuntimeAdapter, ScriptedExternalRuntimeSession,
     ScriptedRuntimeBuilder, ScriptedRuntimeExternalSessionHandler, ScriptedRuntimeStartLog,

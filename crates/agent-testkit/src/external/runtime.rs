@@ -257,7 +257,7 @@ pub struct ScriptedRuntimeStartLog {
 }
 
 impl ScriptedRuntimeStartLog {
-    fn record(&self, request: ExternalSessionRequest) {
+    pub(crate) fn record(&self, request: ExternalSessionRequest) {
         self.requests
             .lock()
             .expect("start log mutex poisoned")
