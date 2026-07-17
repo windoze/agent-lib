@@ -19,7 +19,7 @@ use crate::agent::{
     AgentId, RequirementError, RequirementId, RequirementIds, RequirementKindTag, RunId, StepId,
     ToolExecutionIds, ToolRuntimeError, ToolSetId, TraceNodeId,
 };
-use crate::conversation::{ConversationId, MessageId, ToolCallId, TurnId};
+use crate::conversation::{Conversation, ConversationId, MessageId, ToolCallId, TurnId};
 use crate::model::tool::ToolCall;
 
 /// A cloneable, monotonic identity source for the facade layer.
@@ -39,6 +39,59 @@ impl FacadeIds {
         Self {
             counter: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Creates an identity source whose counter starts at `start` (clamped to at
+    /// least `1`, so no minted id is the nil UUID).
+    ///
+    /// This is mainly used to continue a previously advanced counter, for example
+    /// after restoring a [`Conversation`] from a snapshot. Prefer
+    /// [`continuing_after`](FacadeIds::continuing_after) when the exact start is
+    /// derived from restored history.
+    #[must_use]
+    pub fn seeded(start: u64) -> Self {
+        Self {
+            counter: Arc::new(AtomicU64::new(start.max(1))),
+        }
+    }
+
+    /// Creates an identity source seeded to continue *after* every id already
+    /// present in `conversation`, so newly minted ids cannot collide with
+    /// restored history.
+    ///
+    /// A [`ConversationSnapshot`](crate::conversation::ConversationSnapshot) is
+    /// data-only and does not carry a runtime counter, so a naive fresh source
+    /// (starting at `1`) would re-mint ids that already exist in the restored
+    /// history and be rejected as duplicates. This constructor scans the restored
+    /// ids and continues past the largest one.
+    ///
+    /// Only ids whose UUID fits the built-in monotonic counter space (the low
+    /// 64 bits) are considered; externally supplied random or UUIDv7 ids are
+    /// ignored, because the small counter values this source mints can never
+    /// collide with them.
+    #[must_use]
+    pub fn continuing_after(conversation: &Conversation) -> Self {
+        let mut max_seen: u64 = 0;
+        let mut consider = |uuid: uuid::Uuid| {
+            if let Ok(narrow) = u64::try_from(uuid.as_u128()) {
+                max_seen = max_seen.max(narrow);
+            }
+        };
+
+        consider(conversation.id().into_uuid());
+        for turn in conversation.turns() {
+            consider(turn.id().into_uuid());
+            for message in turn.messages() {
+                consider(message.id().into_uuid());
+            }
+            for pairing in turn.pairings() {
+                consider(pairing.call_id().into_uuid());
+                consider(pairing.call_msg().into_uuid());
+                consider(pairing.result_msg().into_uuid());
+            }
+        }
+
+        Self::seeded(max_seen.saturating_add(1))
     }
 
     /// Returns the next raw UUID, advancing the shared counter.
@@ -204,5 +257,16 @@ mod tests {
         assert_ne!(tool_call.into_uuid(), result_msg.into_uuid());
         assert_ne!(result_msg.into_uuid(), assistant_msg.into_uuid());
         assert_ne!(assistant_msg.into_uuid(), step.into_uuid());
+    }
+
+    #[test]
+    fn seeded_starts_from_the_supplied_value_and_clamps_zero() {
+        let ids = FacadeIds::seeded(10);
+        assert_eq!(ids.turn_id().into_uuid(), uuid::Uuid::from_u128(10));
+        assert_eq!(ids.turn_id().into_uuid(), uuid::Uuid::from_u128(11));
+
+        // A zero seed is clamped to 1 so no minted id is the nil UUID.
+        let clamped = FacadeIds::seeded(0);
+        assert_eq!(clamped.turn_id().into_uuid(), uuid::Uuid::from_u128(1));
     }
 }

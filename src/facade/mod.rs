@@ -15,12 +15,13 @@
 //! - [`Reply`], [`RunOutput`], [`UsageSummary`], [`RunEvent`], and
 //!   [`IntoUserMessage`] — the shared result, usage, event, and input types
 //!   returned and accepted by every run entry point ([`run`]).
-//! - [`Chat`] and [`ChatBuilder`] — the stateless one-shot Chat facade
-//!   ([`chat`]).
+//! - [`Chat`] and [`ChatBuilder`] — the stateless one-shot Chat facade, plus
+//!   [`ChatSession`] / [`ChatSessionBuilder`] for stateful multi-turn chat with
+//!   snapshot/restore ([`chat`]).
 //!
-//! Later milestones add the `ChatSession`, `Agent`/`AgentSession`,
-//! subagent, managed-external-agent, dispatcher, and collaboration facades on
-//! top of these foundations.
+//! Later milestones add the `Agent`/`AgentSession`, subagent,
+//! managed-external-agent, dispatcher, and collaboration facades on top of these
+//! foundations.
 
 pub mod chat;
 pub mod config;
@@ -28,7 +29,7 @@ pub mod error;
 pub mod ids;
 pub mod run;
 
-pub use chat::{Chat, ChatBuilder};
+pub use chat::{Chat, ChatBuilder, ChatSession, ChatSessionBuilder};
 pub use config::{ModelConfig, ProviderConfig, ProviderConfigBuilder};
 pub use error::FacadeError;
 pub use ids::FacadeIds;

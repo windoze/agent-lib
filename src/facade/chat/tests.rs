@@ -10,8 +10,9 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde_json::{Map, json};
 
-use super::{Chat, ChatBuilder};
+use super::{Chat, ChatBuilder, ChatSession};
 use crate::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
+use crate::conversation::ConversationSnapshot;
 use crate::facade::error::FacadeError;
 use crate::model::content::ContentBlock;
 use crate::model::message::{Message, Role};
@@ -193,4 +194,103 @@ fn builder_requires_a_client_or_provider() {
         .expect_err("missing client and provider is rejected");
 
     assert!(matches!(error, FacadeError::Config(_)));
+}
+
+#[tokio::test]
+async fn session_accumulates_history_across_turns() {
+    let client = Arc::new(FakeClient::new(text_response("ok")));
+    let chat = chat_with(client.clone());
+    let mut session = chat.session().build().expect("build session");
+
+    session.send("first").await.expect("first send");
+    session.send("second").await.expect("second send");
+
+    // The first request carries only the current user message; the second replays
+    // the committed [user, assistant] pair plus the new user message.
+    assert_eq!(client.request_message_counts(), vec![1, 3]);
+
+    // The effective view exposes the accumulated [user, assistant, user, assistant].
+    let (_system, messages) = session.conversation().effective_view().into_parts();
+    assert_eq!(messages.len(), 4);
+}
+
+#[tokio::test]
+async fn session_build_inherits_chat_system_prompt() {
+    let client = Arc::new(FakeClient::new(text_response("ok")));
+    let chat = chat_with(client.clone());
+    let mut session = chat.session().build().expect("build session");
+
+    session.send("hello").await.expect("send");
+
+    let requests = client.requests.lock().expect("requests mutex");
+    assert_eq!(requests[0].system.as_deref(), Some("Answer concisely."));
+}
+
+#[tokio::test]
+async fn session_system_override_replaces_inherited_prompt() {
+    let client = Arc::new(FakeClient::new(text_response("ok")));
+    let chat = chat_with(client.clone());
+    let mut session = chat
+        .session()
+        .system("Only speak French.")
+        .build()
+        .expect("build session");
+
+    session.send("hello").await.expect("send");
+
+    let requests = client.requests.lock().expect("requests mutex");
+    assert_eq!(requests[0].system.as_deref(), Some("Only speak French."));
+}
+
+#[tokio::test]
+async fn session_rejects_tool_use() {
+    let client = Arc::new(FakeClient::new(tool_use_response()));
+    let chat = chat_with(client);
+    let mut session = chat.session().build().expect("build session");
+
+    let error = session.send("hi").await.expect_err("tool use is rejected");
+
+    assert!(matches!(error, FacadeError::UnexpectedToolUse));
+}
+
+#[tokio::test]
+async fn snapshot_is_data_only_and_round_trips() {
+    let client = Arc::new(FakeClient::new(text_response("ok")));
+    let chat = chat_with(client);
+    let mut session = chat.session().build().expect("build session");
+    session.send("hello").await.expect("send");
+
+    let snapshot = session.snapshot().expect("snapshot at committed point");
+    let json = serde_json::to_string(&snapshot).expect("serialize snapshot");
+
+    // The snapshot is pure conversation data: it round-trips through serde and
+    // carries neither a client handle nor any credential.
+    let restored: ConversationSnapshot = serde_json::from_str(&json).expect("round-trip");
+    assert_eq!(restored, snapshot);
+    assert!(!json.contains("client"));
+    assert!(!json.contains("api_key"));
+    assert!(!json.contains("LlmClient"));
+}
+
+#[tokio::test]
+async fn restore_continues_history_with_reinjected_client() {
+    let client = Arc::new(FakeClient::new(text_response("ok")));
+    let chat = chat_with(client);
+    let mut session = chat.session().build().expect("build session");
+    session.send("first").await.expect("first send");
+
+    let snapshot = session.snapshot().expect("snapshot at committed point");
+
+    // Restore into a fresh session backed by a different Chat: the snapshot
+    // restores the committed history, while the client is re-injected from `chat`.
+    let restore_client = Arc::new(FakeClient::new(text_response("second-ok")));
+    let restore_chat = chat_with(restore_client.clone());
+    let mut restored = ChatSession::restore(snapshot, restore_chat).expect("restore");
+
+    let reply = restored.send("second").await.expect("send after restore");
+    assert_eq!(reply.text(), "second-ok");
+
+    // The restored session replays the prior [user, assistant] pair plus the new
+    // user message, proving history survived the round-trip.
+    assert_eq!(restore_client.request_message_counts(), vec![3]);
 }

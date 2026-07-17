@@ -253,7 +253,7 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   `cargo clippy --all-targets -- -D warnings` ✅；`cargo test --all --all-targets` 全绿（50 组 test result: ok，
   947 passed，0 failed）✅；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✅；`git diff --check` 干净 ✅。
 
-### [TODO] M1-4 `ChatSession` + `send` / `send_full` + `conversation()` + snapshot/restore
+### [DONE] M1-4 `ChatSession` + `send` / `send_full` + `conversation()` + snapshot/restore
 
 **上下文**：
 
@@ -279,6 +279,38 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   client/凭据（类型层面即不可能，断言字段）。
 - 聚焦：`cargo test -p agent-lib facade::chat`（含 session 用例）。
 - 完整验证序列 1–6。
+
+**完成记录**：
+
+- 在 `src/facade/chat.rs` 落地 `ChatSession` + `ChatSessionBuilder`，并加 `Chat::session(&self) -> ChatSessionBuilder`：
+  - `ChatSession` 持 `Conversation` + `Arc<dyn LlmClient>` + `ModelConfig` + `FacadeIds`；手写脱敏 `Debug`（client 打成 `<dyn LlmClient>`）。
+  - `send_full(&mut self, input)` / `send(&mut self, input)` 复用同一 `Conversation` + 同一 id source，直接调用已有共享
+    `drive_turn`——每轮 `begin_turn` 续接committed 历史，无 tool-use 才 commit；tool-use → `UnexpectedToolUse`；失败兜底
+    `cancel_pending(DiscardTurn)`。`send` = `send_full().reply`。
+  - `conversation(&self) -> &Conversation`（`const fn`）；`snapshot(&self) -> Result<ConversationSnapshot, FacadeError>`
+    （`Conversation::snapshot()`，pending 时 `ConversationError::Snapshot(PendingTurn)`）；
+    `restore(snapshot, chat) -> Result<Self, FacadeError>`（`Conversation::restore` + 从 `chat` 重注入 client/model）。
+  - `ChatSessionBuilder`（`chat.session().system(..).build()`）继承 Chat 的 client/model/system/ids；`.system(..)` 覆盖用
+    `system_overridden` 标记区分「显式设空」与「未设」；`build()` 返回 `Result`（对齐 doc §5.1 `.build()?`，当前 infallible，
+    rustdoc 注明为将来校验预留）。
+- **前置缺陷修复（class-wide，非 workaround）**：内建 `FacadeIds` 用「从 1 起的单调计数器 → `Uuid::from_u128`」，
+  `ConversationSnapshot` 是纯数据、不含 runtime 计数器，故用**新的**默认计数器 restore 后再 `send` 会 re-mint 与恢复历史
+  相同的 id → `DuplicateMessageId`（实测 `MessageId(...-000000000003)` 冲突），会让 spec §15.1 的 restore 示例失败。修复：
+  - `src/facade/ids.rs` 新增 `FacadeIds::seeded(u64)`（clamp≥1）与 `FacadeIds::continuing_after(&Conversation)`——扫描
+    conversation.id/turn.id/每条 message.id 以及 tool pairing 的 call_id/call_msg/result_msg，取「落在 u64 计数器空间内」
+    的最大值 +1 作为新计数器起点（真实随机/UUIDv7 id 落在高 64 位、与小计数器值不可能冲突，故忽略）。
+  - `ChatSession::restore` 改用 `FacadeIds::continuing_after(&conversation)` 派生 id source，保证续接不撞已恢复历史。
+- `src/facade/mod.rs` 重导 `ChatSession, ChatSessionBuilder` 并更新模块 rustdoc；`src/prelude.rs` 补 `ChatSession`
+  （对齐 §3 prelude 列表）；`chat.rs` 模块 rustdoc 更新（stateful session 落地本任务，stream 留 M1-5）。
+- 单元测试：`src/facade/chat/tests.rs` 追加 6 个（全离线）——两轮 `send` 请求 message 数 `[1,3]`、`effective_view` 累积 4 条；
+  build 继承 Chat system / `.system(..)` 覆盖；session tool-use → `UnexpectedToolUse`；`snapshot()` 在 committed 点成功且
+  serde round-trip、断言 JSON 不含 `client`/`api_key`/`LlmClient`（快照不含 client/凭据）；`restore()` 用不同 client 的 Chat
+  续接、回放 `[3]` 且返回新 client 文本。`src/facade/ids.rs` 追加 `seeded` 起点+clamp 测试（`continuing_after` 由 restore
+  e2e 覆盖）。
+- 验证：`cargo fmt --all -- --check` ✅；`cargo test -p agent-lib --lib facade::` 35 passed ✅；
+  `cargo clippy --all-targets -- -D warnings` ✅（未触碰 external adapter，无需 external features 额外 pass）；
+  `cargo test --all --all-targets` 全绿（`--lib` 698 passed，其余各 suite 0 failed）✅；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✅；`git diff --check` 干净 ✅。
 
 ### [TODO] M1-5 `ChatSession::stream` + `RunStream`（基于 `Accumulator`）
 

@@ -14,9 +14,12 @@
 //!
 //! The Chat facade never executes tools: a response carrying a tool-use block is
 //! a hard [`FacadeError::UnexpectedToolUse`] rather than a loop step. Callers who
-//! need tools should use the Agent facade (Milestone 2). The stateful
-//! [`ChatSession`](crate::facade) and streaming entry points land in later
-//! Milestone 1 tasks.
+//! need tools should use the Agent facade (Milestone 2).
+//!
+//! The stateful [`ChatSession`] reuses a single [`Conversation`] across turns so
+//! history accumulates; its `stream` entry point lands in a later Milestone 1
+//! task. Both the one-shot [`Chat`] and the stateful [`ChatSession`] share the
+//! same private `drive_turn` drive.
 
 use std::sync::Arc;
 
@@ -24,7 +27,8 @@ use crate::adapter::anthropic::AnthropicAdapter;
 use crate::adapter::openai_resp::OpenAiRespAdapter;
 use crate::client::{ChatRequest, LlmClient};
 use crate::conversation::{
-    AssistantFinish, CancelDisposition, Conversation, ConversationConfig, TurnMeta,
+    AssistantFinish, CancelDisposition, Conversation, ConversationConfig, ConversationSnapshot,
+    TurnMeta,
 };
 use crate::facade::config::{ModelConfig, ProviderConfig};
 use crate::facade::error::FacadeError;
@@ -142,6 +146,16 @@ impl Chat {
             input,
         )
         .await
+    }
+
+    /// Starts a fluent [`ChatSessionBuilder`] for a stateful multi-turn session.
+    ///
+    /// The returned builder inherits this Chat's client, model, identity source,
+    /// and (unless overridden) system prompt. Unlike [`ask`](Chat::ask), a
+    /// [`ChatSession`] retains history across turns.
+    #[must_use]
+    pub fn session(&self) -> ChatSessionBuilder {
+        ChatSessionBuilder::new(self.clone())
     }
 }
 
@@ -342,6 +356,230 @@ fn client_for_provider(provider: ProviderConfig) -> Arc<dyn LlmClient> {
     match provider_id {
         ProviderId::Anthropic => Arc::new(AnthropicAdapter::new(endpoint)),
         ProviderId::OpenAiResp => Arc::new(OpenAiRespAdapter::new(endpoint)),
+    }
+}
+
+/// A stateful, multi-turn Chat session backed by one live [`Conversation`].
+///
+/// Unlike the one-shot [`Chat::ask`], a `ChatSession` reuses a single
+/// [`Conversation`] and identity source across turns, so each
+/// [`send`](ChatSession::send) appends to the committed history and subsequent
+/// requests replay the full context (`docs/facade-api.md` §5.1–§5.3).
+///
+/// A session is created from a [`Chat`] via [`Chat::session`], which inherits the
+/// client, model, identity source, and system prompt:
+///
+/// ```no_run
+/// # async fn demo() -> Result<(), agent_lib::facade::FacadeError> {
+/// use agent_lib::facade::{Chat, ProviderConfig};
+///
+/// let chat = Chat::builder()
+///     .provider(ProviderConfig::openai_from_env()?)
+///     .model("gpt-5.5")
+///     .system("Answer concisely.")
+///     .build()?;
+///
+/// let mut session = chat.session().build()?;
+/// let _first = session.send("Explain ownership.").await?;
+/// let _second = session.send("Give an example.").await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The session state is a plain [`Conversation`]; it never holds the provider
+/// configuration or credentials, so a [`snapshot`](ChatSession::snapshot) is safe
+/// to persist and a [`restore`](ChatSession::restore) re-injects the client from a
+/// caller-supplied [`Chat`].
+pub struct ChatSession {
+    conversation: Conversation,
+    client: Arc<dyn LlmClient>,
+    model: ModelConfig,
+    ids: FacadeIds,
+}
+
+impl std::fmt::Debug for ChatSession {
+    /// Prints the conversation and model while treating the client as opaque.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChatSession")
+            .field("conversation", &self.conversation)
+            .field("client", &"<dyn LlmClient>")
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
+impl ChatSession {
+    /// Runs one turn against the retained history and returns the [`Reply`].
+    ///
+    /// This is a convenience wrapper over [`send_full`](ChatSession::send_full);
+    /// see that method for the exact drive and error semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`FacadeError`] produced by
+    /// [`send_full`](ChatSession::send_full), including
+    /// [`FacadeError::UnexpectedToolUse`] when the model asks to call a tool.
+    pub async fn send(&mut self, input: impl IntoUserMessage) -> Result<Reply, FacadeError> {
+        Ok(self.send_full(input).await?.reply)
+    }
+
+    /// Runs one turn against the retained history and returns the [`RunOutput`].
+    ///
+    /// The turn continues this session's [`Conversation`]: the request replays the
+    /// committed history plus the new user message, and a tool-free assistant
+    /// response is committed so the next turn sees it. The drive follows
+    /// `docs/facade-api.md` §5.3.
+    ///
+    /// # Errors
+    ///
+    /// - [`FacadeError::Client`] if the underlying [`LlmClient::chat`] call fails.
+    /// - [`FacadeError::UnexpectedToolUse`] if the model returns a tool-use
+    ///   block (the Chat facade never executes tools).
+    /// - [`FacadeError::Conversation`] if folding the response through the
+    ///   Conversation transaction is rejected.
+    ///
+    /// On any error the in-flight turn is discarded, so the session returns to its
+    /// last committed, consistent point and remains usable.
+    pub async fn send_full(
+        &mut self,
+        input: impl IntoUserMessage,
+    ) -> Result<RunOutput, FacadeError> {
+        drive_turn(
+            &mut self.conversation,
+            &*self.client,
+            &self.model,
+            &self.ids,
+            input,
+        )
+        .await
+    }
+
+    /// Returns the live [`Conversation`] backing this session.
+    ///
+    /// Useful for inspecting accumulated history, for example via
+    /// [`Conversation::effective_view`].
+    #[must_use]
+    pub const fn conversation(&self) -> &Conversation {
+        &self.conversation
+    }
+
+    /// Captures a data-only [`ConversationSnapshot`] of the committed history.
+    ///
+    /// The snapshot carries only conversation facts — never the client, provider
+    /// configuration, or credentials — so it is safe to persist and later
+    /// [`restore`](ChatSession::restore) against a fresh [`Chat`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacadeError::Conversation`] wrapping a
+    /// [`SnapshotError::PendingTurn`](crate::conversation::SnapshotError::PendingTurn)
+    /// if an uncommitted turn is in flight. In normal use each
+    /// [`send`](ChatSession::send) commits before returning, so the session rests
+    /// at a snapshot-able consistency point.
+    pub fn snapshot(&self) -> Result<ConversationSnapshot, FacadeError> {
+        Ok(self.conversation.snapshot()?)
+    }
+
+    /// Rebuilds a session from a [`ConversationSnapshot`], re-injecting a client.
+    ///
+    /// The snapshot restores the committed history; the supplied [`Chat`] provides
+    /// the client and model to continue the session. Pending turns are
+    /// intentionally absent from snapshots and are never restored, so the rebuilt
+    /// session begins at a committed consistency point.
+    ///
+    /// A fresh identity source is derived with
+    /// [`FacadeIds::continuing_after`], seeded past every id in the restored
+    /// history. This matters because a [`ConversationSnapshot`] is data-only and
+    /// carries no runtime counter: reusing the [`Chat`]'s counter (which restarts
+    /// at `1` on a new process) would otherwise re-mint ids that already exist in
+    /// the restored history and be rejected as duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacadeError::Conversation`] wrapping a
+    /// [`RestoreError`](crate::conversation::RestoreError) when the snapshot is
+    /// malformed or its schema version is unsupported.
+    pub fn restore(snapshot: ConversationSnapshot, chat: Chat) -> Result<Self, FacadeError> {
+        let conversation = Conversation::restore(snapshot)?;
+        let ids = FacadeIds::continuing_after(&conversation);
+        Ok(Self {
+            conversation,
+            client: chat.client,
+            model: chat.model,
+            ids,
+        })
+    }
+}
+
+/// A fluent builder for a [`ChatSession`], created via [`Chat::session`].
+///
+/// The builder inherits the originating [`Chat`]'s client, model, identity
+/// source, and system prompt. Use [`system`](ChatSessionBuilder::system) to
+/// override the inherited system prompt for this session only.
+#[derive(Clone)]
+pub struct ChatSessionBuilder {
+    chat: Chat,
+    system: Option<String>,
+    system_overridden: bool,
+}
+
+impl std::fmt::Debug for ChatSessionBuilder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChatSessionBuilder")
+            .field("chat", &self.chat)
+            .field("system", &self.system)
+            .field("system_overridden", &self.system_overridden)
+            .finish()
+    }
+}
+
+impl ChatSessionBuilder {
+    /// Creates a builder that inherits configuration from `chat`.
+    fn new(chat: Chat) -> Self {
+        Self {
+            chat,
+            system: None,
+            system_overridden: false,
+        }
+    }
+
+    /// Overrides the system prompt for this session.
+    ///
+    /// When unset, the session inherits the originating [`Chat`]'s system prompt.
+    #[must_use]
+    pub fn system(mut self, system: impl Into<String>) -> Self {
+        self.system = Some(system.into());
+        self.system_overridden = true;
+        self
+    }
+
+    /// Finalizes the builder into a fresh, empty [`ChatSession`].
+    ///
+    /// The new session starts a fresh [`Conversation`] seeded with the effective
+    /// system prompt (the override, if any, else the inherited one).
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible, but returns a [`Result`] so future configuration
+    /// validation can surface a [`FacadeError`] without a breaking change.
+    pub fn build(self) -> Result<ChatSession, FacadeError> {
+        let system = if self.system_overridden {
+            self.system
+        } else {
+            self.chat.system.clone()
+        };
+        let conversation = Conversation::new(
+            self.chat.ids.conversation_id(),
+            ConversationConfig::new(system),
+        );
+        Ok(ChatSession {
+            conversation,
+            client: self.chat.client,
+            model: self.chat.model,
+            ids: self.chat.ids,
+        })
     }
 }
 
