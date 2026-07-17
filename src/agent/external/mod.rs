@@ -67,6 +67,8 @@ mod adapter;
 mod capability;
 #[cfg(feature = "external-claude-code")]
 mod claude_code;
+#[cfg(feature = "external-codex")]
+mod codex;
 mod config;
 mod dispatch;
 mod escalation;
@@ -85,6 +87,11 @@ pub use capability::{ExternalCapability, ExternalRuntimeCapabilities};
 pub use claude_code::{
     ClaudeCodeAdapter, ClaudeCodeConfig, ClaudeCodeProbeExec, ClaudeDecision, ClaudeDecodeContext,
     ClaudeStreamDecoder, ProbeOutput, SystemClaudeCodeExec, probe, probe_with_exec,
+};
+#[cfg(feature = "external-codex")]
+pub use codex::{
+    CodexConfig, CodexProbeExec, CodexProbeOutput, SystemCodexExec, probe as codex_probe,
+    probe_with_exec as codex_probe_with_exec,
 };
 pub use config::{ExternalAgentMachineConfig, ExternalToolFailurePolicy};
 pub use dispatch::{

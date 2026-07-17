@@ -2070,7 +2070,7 @@ Claude Code adapter 是第一个真实 runtime adapter,其边界会成为 Codex/
 目标:实现 feature-gated Codex adapter,支持 stream decoder、permission/tool bridge 能力探测与 ignored real
 e2e。注意 Codex CLI 参数顺序必须按当前 CLI 要求验证。
 
-### [TODO] M7-1 增加 Codex capability probe 与启动配置
+### [DONE] M7-1 增加 Codex capability probe 与启动配置
 
 **上下文**:
 
@@ -2101,6 +2101,52 @@ e2e。注意 Codex CLI 参数顺序必须按当前 CLI 要求验证。
 - 未启 feature 时默认测试通过。
 - `cargo test -p agent-lib codex_probe`
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+- 新增非默认 feature gate `external-codex`（`Cargo.toml`）;开启才编译 adapter,探测复用 tokio 的
+  process 支持,不引入新重依赖。范围同 M6-1:本任务只填 config + probe,decoder/adapter 留给 M7-2/M7-3。
+- **以当前本机 Codex CLI（v0.144.1）实测 `--help` / `exec --help` 为准**（TODO 明确要求),而非旧版
+  参数假设。实测要点:结构化事件流 `--json` 在 `codex exec` 子命令;审批策略 `-a/--ask-for-approval`
+  （`untrusted`/`on-request`/`never`）与 `mcp` 子命令在**顶层**;`-s/--sandbox`
+  （`read-only`/`workspace-write`/`danger-full-access`）顶层与 `exec` 均有;`exec resume <id>` 支持续跑;
+  实测确认 `codex -a never exec` 顺序被接受（全局 flag 排在 `exec` 前）。
+- 新增 feature-gated 模块 `src/agent/external/codex/{mod.rs,config.rs,probe.rs}`,在
+  `src/agent/external/mod.rs` 以 `#[cfg(feature = "external-codex")]` 挂载并 re-export `CodexConfig`、
+  `CodexProbeExec`、`CodexProbeOutput`、`SystemCodexExec`,以及别名 `codex_probe`、
+  `codex_probe_with_exec`（避免与 Claude adapter 的裸 `probe`/`probe_with_exec` 名在两 feature 同开时
+  冲突）。
+- `CodexConfig`:binary / env override（BTreeMap,手写 `Debug` 只印 key + `<redacted>` 脱敏）/ working
+  dir(worktree) / permission mode / optional model / profile / timeout;serde round-trip 可持久化。
+  `approval_policy_arg()` + `sandbox_mode_arg()` 把 `ExternalPermissionMode` 映射到当前 CLI 词汇:
+  `Prompt→untrusted+read-only`、`AcceptEdits→on-request+workspace-write`、`Plan→never+read-only`、
+  `BypassPermissions→never+danger-full-access`。`base_exec_args()` 产出
+  `-a <approval> exec --json -s <sandbox> --skip-git-repo-check [--model M] [--profile P]`,顶层全局 flag
+  严格排在 `exec` 之前(规避「全局参数放 exec 后」踩坑),working dir 走进程 `current_dir`。
+- probe:跑 `--version`（缺失/损坏/非零退出 → `ExternalAgentError::Launch`）+ `--help`（顶层）+
+  `exec --help`;两份 help 均空 → `Launch`;`exec` help 无 `--json` → `UnsupportedCapability{Streaming}`。
+  能力探测保守（未广告即 `false`）:streaming←`exec --json`,permission_bridge←`--ask-for-approval`/
+  `--sandbox`,resume←`resume` 子命令,host_tools←顶层 `mcp`,usage/artifacts←结构化流,
+  graceful_shutdown=true,host_subagents=false（留待后续）。探测走可注入 `CodexProbeExec`（生产实现
+  `SystemCodexExec` 用 `tokio::process`,kill_on_drop + timeout）,永不 panic;错误 `detail` 只含 binary
+  路径 / `io::ErrorKind` / 缺失能力,绝不夹带 env 值或原始 CLI 输出。
+- 支持能力（探测层,feature-gated,仍非 e2e 实测）:streaming / permission_bridge / resume / host_tools /
+  usage / artifacts / graceful_shutdown 由当前 CLI help 保守探测;**不支持**:host_subagents（留待后续）。
+  真实 e2e 未在本任务范围(属 M7-3),本机未运行真实 Codex 会话。
+- 测试（模块内联 13 个,离线、无需真实 Codex、无网络）:config 默认/approval+sandbox 每模式映射/
+  `base_exec_args` 顺序与 model/profile 省略/serde round-trip/Debug 脱敏;probe full-capability 探测、
+  缺 binary→Launch、非零 version→Launch、空 help→Launch、无 `--json`→Unsupported{Streaming}、env secret
+  不泄露（Display+Debug 均断言）、真实 `SystemCodexExec` 对不存在 binary→Launch（离线不 panic）、
+  `detect_capabilities` 未广告即 false、探测子命令顺序（version→--help→exec --help）。
+- 文档:`docs/managed-external-agent.md` §13.1 增补「实现状态（M7-1,已落地）」;
+  `docs/capability-matrix.md` 保守基线段落说明 Codex feature-gated 探测已存在但仍非 e2e,Codex 行维持保守
+  `false`,待 M7-2/M7-3 与真机 e2e 后再翻真。
+- 验证:`cargo fmt --all -- --check` 干净;`cargo test -p agent-lib --features external-codex --lib codex`
+  13 passed;`cargo test -p agent-lib codex_probe`（未启 feature）0 test（feature 关闭时模块不编译）;
+  `cargo clippy --all-targets -- -D warnings` 与 `--features external-codex` 均 0 warning;
+  `cargo test --all --all-targets`（未启 feature）42 个 test binary 全 ok、0 failed;
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --features external-codex` 干净;
+  `git diff --check` 干净。
 
 ### [TODO] M7-2 实现 Codex stream decoder cassette 测试
 

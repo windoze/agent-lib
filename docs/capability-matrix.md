@@ -115,6 +115,17 @@ Code 行仍保持保守 `false`;待该 e2e 在具备 Claude Code 登录的机器
 adapter **不 bridge 宿主工具**(不跑 MCP server),故即便实测,`host_tools`/`host_subagents` 也维持
 `false`(spec §12.3 允许),并对声明了工具的请求以 `UnsupportedCapability{HostTools}` 明确拒绝。
 
+里程碑 7-1 起,feature-gated 的 Codex adapter 同样提供了一个 **capability probe**（`external-codex`
+下的 [`agent::external::codex_probe`](../src/agent/external/codex/probe.rs)）:它以**当前本机 Codex CLI
+（v0.144.1）实测 `--version` / `--help` / `exec --help` 为准**,把缺失/损坏的 binary 分类为 `Launch`、
+把 `codex exec` 无 `--json` 结构化事件流的 CLI 分类为 `UnsupportedCapability{Streaming}`,并从两份 help
+广告出的开关**保守探测**能力位(streaming←`exec --json`,permission_bridge←`--ask-for-approval`/
+`--sandbox`,resume←`resume` 子命令,host_tools←顶层 `mcp`,usage/artifacts←结构化流)。配套的
+[`CodexConfig`](../src/agent/external/codex/config.rs) 把 `ExternalPermissionMode` 映射到当前 CLI 词汇的
+approval（`untrusted`/`on-request`/`never`）+ sandbox（`read-only`/`workspace-write`/
+`danger-full-access`),并保证顶层全局 flag 排在 `exec` 子命令之前。与 Claude 一样,该探测反映「CLI 自称
+支持什么」,仍**不是** e2e 实测;decoder/live session 待 M7-2/M7-3,故下表 Codex 行仍保持保守 `false`。
+
 ### 受管能力清单（`ExternalCapability`，共 8 项）
 
 | `ExternalCapability` | serde 标签 | 覆盖的决策点 / 旁路 | 保守默认 |

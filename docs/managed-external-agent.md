@@ -1021,6 +1021,39 @@ codex -s read-only -a never exec --json -C <worktree> ...
 | `Plan` | `-s read-only -a never` |
 | `BypassPermissions` | `--dangerously-bypass-approvals-and-sandbox`,必须显式允许 |
 
+#### 实现状态（M7-1，已落地）
+
+- 新增非默认 feature gate `external-codex`（`Cargo.toml`）；开启才编译 adapter，探测复用 tokio 的
+  process 支持，不引入新重依赖。
+- 新增 feature-gated 模块 `src/agent/external/codex/{mod.rs,config.rs,probe.rs}`，在
+  `src/agent/external/mod.rs` 以 `#[cfg(feature = "external-codex")]` 挂载并 re-export `CodexConfig`、
+  `CodexProbeExec`、`CodexProbeOutput`、`SystemCodexExec`，以及别名 `codex_probe`、
+  `codex_probe_with_exec`（避免与 Claude adapter 的裸 `probe`/`probe_with_exec` 名冲突）。为 M7-2/M7-3
+  预留目录,本任务只填 config + probe。
+- 本任务以**当前本机 Codex CLI（v0.144.1）实测 `--help` / `exec --help` 为准**，而非旧版参数假设。
+  实测要点:结构化事件流 `--json` 位于 `codex exec` 子命令;审批策略 `-a/--ask-for-approval`
+  （`untrusted`/`on-request`/`never`）与 `mcp` 子命令位于**顶层**;`-s/--sandbox`
+  （`read-only`/`workspace-write`/`danger-full-access`）顶层与 `exec` 均有;`exec resume <id>` 支持续跑。
+- `CodexConfig`:binary path / env override（BTreeMap，手写 `Debug` 脱敏,只印 key + `<redacted>`）/
+  working dir(worktree) / permission mode / optional model / profile / timeout;serde round-trip 可持久化。
+  `approval_policy_arg()` 与 `sandbox_mode_arg()` 把 `ExternalPermissionMode` 映射到当前 CLI 词汇:
+  `Prompt→untrusted+read-only`（仅受信命令免批,其余升级宿主）、`AcceptEdits→on-request+workspace-write`、
+  `Plan→never+read-only`、`BypassPermissions→never+danger-full-access`。`base_exec_args()` 产出
+  `-a <approval> exec --json -s <sandbox> --skip-git-repo-check [--model M] [--profile P]`,顶层全局 flag
+  严格排在 `exec` 子命令之前(规避“全局参数放 exec 后”的 CLI 踩坑),working dir 走进程 `current_dir`。
+- probe:跑 `--version`（缺失/损坏/非零退出 → `ExternalAgentError::Launch`）+ `--help`（顶层）+
+  `exec --help`;两份 help 均空 → `Launch`;`exec` help 无 `--json` 结构化流 →
+  `UnsupportedCapability{Streaming}`。能力探测保守（未广告即 `false`）:streaming←`exec --json`,
+  permission_bridge←`--ask-for-approval`/`--sandbox`,resume←`resume` 子命令,host_tools←顶层 `mcp`,
+  usage/artifacts←结构化流,graceful_shutdown=true,host_subagents=false（留待后续）。探测走可注入
+  `CodexProbeExec`（生产实现 `SystemCodexExec` 用 `tokio::process`,kill_on_drop + timeout）,永不 panic。
+- 测试（模块内联 13 个,离线、无需真实 Codex、无网络）:config 默认/approval+sandbox 映射/`base_exec_args`
+  顺序与 model/profile 省略/serde round-trip/Debug 脱敏;probe full-capability 探测、缺 binary→Launch、
+  非零 version→Launch、空 help→Launch、无 `--json`→Unsupported{Streaming}、env secret 不泄露
+  （Display+Debug 均断言）、真实 `SystemCodexExec` 对不存在 binary→Launch、`detect_capabilities` 未广告即
+  false、探测子命令顺序（version→--help→exec --help）。
+- Codex 真实 e2e 未在本任务范围（属 M7-3）;本机未运行真实 CLI。
+
 ### 13.2 streaming decoder
 
 优先 `codex exec --json` JSONL:
