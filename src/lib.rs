@@ -256,5 +256,7 @@ pub mod adapter;
 pub mod agent;
 pub mod client;
 pub mod conversation;
+pub mod facade;
 pub mod model;
+pub mod prelude;
 pub mod stream;

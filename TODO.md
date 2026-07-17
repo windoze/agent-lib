@@ -43,7 +43,7 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
 §5.3）。M1 直接驱动 `Conversation`（`begin_turn`→`start_assistant_response`→`finish_assistant`→
 `commit_pending`），**不**引入 `DefaultAgentMachine`（那属于 M2）。
 
-### [TODO] M1-1 建 facade 模块骨架 + 内建 id source + `ProviderConfig` + `ModelConfig` + `FacadeError`
+### [DONE] M1-1 建 facade 模块骨架 + 内建 id source + `ProviderConfig` + `ModelConfig` + `FacadeError`
 
 **上下文**：
 
@@ -83,6 +83,42 @@ Chat facade **不执行工具**：模型返回 tool-use 时报 `FacadeError::Une
   映射正确；`ProviderConfig`/凭据的 `Debug` 不含明文 key。
 - 聚焦：`cargo test -p agent-lib facade::config`。
 - 完整验证序列 1、3、5、6（M1-1 不含跨包行为，步骤 2 用上面的聚焦名；步骤 4 视改动运行）。
+
+**完成记录**：
+
+- `src/lib.rs` 新增 `pub mod facade;` 与 `pub mod prelude;`（保持模块声明字母序）。
+- 新建 `src/facade/mod.rs`（层级/职责 rustdoc + 重导 `ProviderConfig/ProviderConfigBuilder/ModelConfig/
+  FacadeError/FacadeIds`）。
+- `src/facade/config.rs`：
+  - `ProviderConfig`（包 `EndpointConfig`+`ProviderId`）构造器 `custom` / `anthropic_from_env` /
+    `openai_from_env` / `anthropic()` / `openai()` builder（`ProviderConfigBuilder`，
+    `.base_url/.api_key/.api_version/.build`，缺 `base_url`/`api_key` → `FacadeError::Config`）。
+    env 约定对齐 `examples/support`（Anthropic：`ANTHROPIC_BASE_URL` 默认 `https://api.anthropic.com`、
+    必填 `ANTHROPIC_AUTH_TOKEN` Bearer、`ANTHROPIC_VERSION` 默认 `2023-06-01`→`anthropic-version` header；
+    OpenAI：必填 `OPENAI_BASE_URL`、`OPENAI_API_KEY`→`api-key` header、`OPENAI_API_VERSION`
+    默认 `2025-04-01-preview`→`api-version` query）。
+  - 手写脱敏 `Debug`（`RedactedAuth`/`RedactedPairs`：只显示 auth 种类/header/query 键名，值一律
+    `<redacted>`；不派生 `Serialize`），凭据不落明文；rustdoc 注明不应 log/persist、不入 snapshot。
+  - `ModelConfig::new(model).max_tokens(u32).temperature(f32)`（`max_tokens` 默认 1024，传 0 保留默认并
+    注明）；`.provider_extras(..)`；`to_model_ref()`→`agent::ModelRef`；`apply_to_request(&mut ChatRequest)`
+    只覆盖 `model/max_tokens/temperature/provider_extras`。
+- `src/facade/error.rs`：`FacadeError`（`thiserror`，`#[non_exhaustive]`）变体 `Config(String)`/
+  `Client(#[from] ClientError)`/`Conversation(#[from] ConversationError)`/`UnexpectedToolUse`/
+  `InvalidState(String)`，保留 source；rustdoc 注明后续 milestone 按 §16 增补。
+- `src/facade/ids.rs`：`FacadeIds`（`Arc<AtomicU64>` 从 1 起 → `uuid::Uuid::from_u128`，`Clone` 共享计数器）
+  实现 `RequirementIds`+`ToolExecutionIds`，并提供 `agent_id/run_id/tool_set_id/conversation_id/turn_id/
+  message_id/step_id/trace_root` 便捷生成器（去掉与 trait 冲突的同名 `tool_call_id` 便捷方法，`ToolCallId`
+  经 trait 方法生成）。
+- `src/prelude.rs`：先只重导已存在的 `ProviderConfig, ModelConfig`（rustdoc 注明后续补 Chat/ChatSession/
+  Reply/RunOutput/RunEvent 等）。
+- 单元测试（17 个，全离线）：`config`（custom/builder/anthropic+openai env-读取与默认/env 缺变量→`Config`/
+  builder 缺字段→`Config`/`Debug` 脱敏 bearer+header 值/`ModelConfig` 默认+builder+`max_tokens(0)` 保默认/
+  `to_model_ref` 全字段映射/`apply_to_request` 只覆盖公共字段；env 测试用进程级 `Mutex`+`EnvGuard` 串行、
+  不落真凭据），`ids`（跨 family 唯一非 nil/克隆共享计数器/trait 方法各自出新 id）。
+- 验证：`cargo fmt --all -- --check` ✅；`cargo test -p agent-lib --lib facade::` 17 passed ✅；
+  `cargo clippy --all-targets -- -D warnings` ✅；`cargo test --all --all-targets` 全绿（50 组 test result: ok，
+  0 failed）✅；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✅；`git diff --check` 干净 ✅。
+
 
 ### [TODO] M1-2 `Reply` / `RunOutput` / `UsageSummary` / `RunEvent` / `IntoUserMessage`
 
