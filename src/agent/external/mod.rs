@@ -64,6 +64,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod capability;
+mod config;
 mod dispatch;
 mod escalation;
 mod machine;
@@ -75,6 +76,7 @@ mod spec;
 mod state;
 
 pub use capability::{ExternalCapability, ExternalRuntimeCapabilities};
+pub use config::{ExternalAgentMachineConfig, ExternalToolFailurePolicy};
 pub use dispatch::{
     CostPreference, DispatchError, DispatchReason, Dispatcher, ImpactScope, RuleRouter,
     ScriptedTaskEvaluator, TaskDescriptor, TaskEvaluator, Uncertainty, Worker, WorkerChoice,

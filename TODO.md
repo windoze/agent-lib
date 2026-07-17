@@ -1304,7 +1304,7 @@ M4-2 capability model。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
 - `git diff --check` clean。
 
-### [TODO] M4-3 扩展 `ExternalSessionPolicy` / `ExternalAgentSpec` 支持 managed mode 配置
+### [DONE] M4-3 扩展 `ExternalSessionPolicy` / `ExternalAgentSpec` 支持 managed mode 配置
 
 **上下文**:
 
@@ -1334,6 +1334,64 @@ M4-2 capability model。
 - config serde 如属于 DTO 则 round-trip；live config 不 serde 则测试其不进入 `ExternalAgentState`。
 - policy 超限有 unit test,例如 `external_loop_limit_fails_before_unbounded_pause_loop`。
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+*方案*:保持 `ExternalSessionPolicy`(runtime-facing hints)不动,新增独立 machine-local 配置层,把两半职责
+分离(design §7)。machine-local config 是纯数据 serde DTO,不持有 live handler/sink/id source,也不进
+serializable `ExternalAgentState`;live 的 `RequirementIds` / `ToolExecutionIds` 仍走各自 builder 注入。能力
+需求用 M4-2 的 `ExternalCapability` 集表达("capability set" 形态,同时提供 `require_host_tools()` /
+`require_subagents()` 便捷 builder)。
+
+*改动*:
+
+- `src/agent/external/config.rs`(新增):
+  - `ExternalToolFailurePolicy`(`ReturnErrorToRuntime` 默认 / `StopRun`,snake_case serde)。
+  - `ExternalAgentMachineConfig`(serde DTO,`Default` 语义与旧行为一致):`tool_failure`、
+    `required_capabilities: BTreeSet<ExternalCapability>`、`max_decision_loops: Option<u32>`;builder
+    `with_tool_failure_policy` / `with_max_decision_loops` / `require_capability` / `require_host_tools` /
+    `require_subagents`;accessor `tool_failure` / `requires` / `required_capabilities` / `max_decision_loops`。
+- `src/agent/external/capability.rs`:`ExternalCapability` 加 `PartialOrd, Ord`(`BTreeSet` 需要)。
+- `src/agent/external/mod.rs`:`mod config;` + re-export `ExternalAgentMachineConfig` / `ExternalToolFailurePolicy`。
+- `src/agent/mod.rs`:顶层 re-export 两个新类型。
+- `src/agent/external/state.rs`:`ExternalAgentState` 新增持久化计数 `decision_loops: u32`
+  (record `#[serde(default, skip_serializing_if = is_zero)]` → 干净态字节兼容,旧快照 default=0);
+  accessor `decision_loops()` + `record_decision_loop()`(saturating)。计数是纯数据,跨 restore 存活,
+  不属于 live handler/sink。
+- `src/agent/external/machine.rs`:`ExternalAgentMachine` 新增 `config` 字段(`new` 用 `Default`,兼容);
+  builder `with_external_config` / `with_tool_failure_policy` / `with_max_decision_loops`(保留
+  `with_tool_execution_ids`);`block_on_session` 作为所有 session round-trip 的唯一漏斗,先
+  `record_decision_loop()` 再对 `max_decision_loops` 判限 → 超限 `LimitExceeded` fail;`pause_for_tool_calls`
+  两处 tool-id mint 失败经 `fail_tool_id_unavailable` 分类:声明 `require_host_tools` / `require_subagents`
+  时升级为 classified `UnsupportedCapability`,否则保留原 "tool id unavailable"(默认兼容);`resume_tool`
+  的 `Tool(Err)` 按 `tool_failure` 分流(`StopRun` → fail turn;默认 `ReturnErrorToRuntime` → 回灌)。
+
+*测试*:
+
+- `config.rs`:`external_machine_config_defaults_are_permissive`、`external_machine_config_roundtrip`
+  (serde DTO round-trip + default 为空对象仅含 `tool_failure`)。
+- `machine/tests.rs`:`external_loop_limit_fails_before_unbounded_pause_loop`(TODO 指定;limit=2,第 3 次
+  round-trip 前 `LimitExceeded` 挡住无界 pause loop,计数=3,pending turn 丢弃)、
+  `external_default_config_leaves_decision_loop_unbounded`、`external_tool_failure_stop_run_fails_turn`、
+  `external_tool_failure_default_returns_error_to_runtime`、
+  `external_require_host_tools_reports_unsupported_capability`、
+  `external_require_subagents_reports_unsupported_capability`、
+  `external_require_host_tools_without_source_keeps_generic_error_when_unset`(未声明时仍走通用错误,证明
+  require 标志非 no-op)。
+- `state.rs`:`external_agent_state_decision_loops_persist_and_skip_when_zero`(零值跳过快照 + round-trip 持久)。
+
+*文档同步*(`docs/managed-external-agent.md`,markdown-only):§7 由「拟新增」改为「已落地(M4-3)」,写实际
+两半职责、config DTO 字段与 builder、loop/tool-failure/capability 行为约定;§6.3 补 `max_decision_loops`
+落地说明;能力表 tool failure policy 行改为「已落地(M4-3)」。
+
+*验证*(完整序列 1-6 全过):
+
+- `cargo fmt --all -- --check` clean。
+- 聚焦:M4-3 相关 12 个测试全 passed。
+- `cargo clippy --all-targets -- -D warnings` 0 warning(loop-limit `if let ... && ...` 合并 collapsible_if)。
+- `cargo test --all --all-targets` 全绿(38 个 test binary `test result: ok`,0 failed)。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
+- `git diff --check` clean。
 
 ### [TODO] M4-4 Review：stream/capability/policy 完整性检查
 

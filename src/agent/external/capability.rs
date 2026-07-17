@@ -28,7 +28,7 @@ use super::{ExternalAgentError, ExternalRuntimeKind};
 /// errors, and test assertions — not a wire protocol. The set mirrors the review
 /// checklist for milestone 4 (streaming, resume, permission bridge, host tools,
 /// host subagents, artifacts, usage, graceful shutdown).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalCapability {
     /// Forwarding fine-grained events to a live [`ExternalEventSink`](super::ExternalEventSink).

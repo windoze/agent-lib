@@ -138,10 +138,12 @@ use crate::{
         ToolWaitRequirements,
         collab::{SPAWN_AGENT, SpawnAgentRequest},
         external::{
-            ExternalAgentCursor, ExternalAgentOutput, ExternalAgentState, ExternalObservedEvent,
+            ExternalAgentCursor, ExternalAgentError, ExternalAgentMachineConfig,
+            ExternalAgentOutput, ExternalAgentState, ExternalCapability, ExternalObservedEvent,
             ExternalSessionInput, ExternalSessionRef, ExternalSessionRequest,
             ExternalSessionResult, ExternalSubagentOutput, ExternalSubagentRequest,
-            ExternalSubagentRequestId, ExternalToolBatchId, ExternalToolCall, ExternalToolResult,
+            ExternalSubagentRequestId, ExternalToolBatchId, ExternalToolCall,
+            ExternalToolFailurePolicy, ExternalToolResult,
         },
     },
     client::Response,
@@ -306,6 +308,12 @@ pub struct ExternalAgentMachine {
     /// (design: the serializable cursor keeps the resumable addressing; this
     /// scratch keeps the volatile per-call correlation).
     pending_tool_batch: Option<PendingExternalToolBatch>,
+    /// Machine-local policy bundle (tool-failure handling, required
+    /// capabilities, decision-loop bound). Plain data injected via
+    /// [`with_external_config`](Self::with_external_config); it never enters the
+    /// serializable [`ExternalAgentState`]. Defaults to the permissive
+    /// [`ExternalAgentMachineConfig::default`], preserving pre-M4-3 behavior.
+    config: ExternalAgentMachineConfig,
 }
 
 impl ExternalAgentMachine {
@@ -325,6 +333,7 @@ impl ExternalAgentMachine {
             loop_cursor,
             in_flight: None,
             pending_tool_batch: None,
+            config: ExternalAgentMachineConfig::default(),
         }
     }
 
@@ -334,6 +343,35 @@ impl ExternalAgentMachine {
     #[must_use]
     pub fn with_tool_execution_ids(mut self, tool_ids: Arc<dyn ToolExecutionIds>) -> Self {
         self.tool_ids = tool_ids;
+        self
+    }
+
+    /// Replaces the machine-local policy bundle.
+    ///
+    /// The [`ExternalAgentMachineConfig`] carries the tool-failure policy, the
+    /// capabilities this run requires, and the decision-loop bound the machine
+    /// enforces. It is plain data and never enters the serializable
+    /// [`ExternalAgentState`]; the live identity sources stay behind their own
+    /// builder injections ([`with_tool_execution_ids`](Self::with_tool_execution_ids)).
+    #[must_use]
+    pub fn with_external_config(mut self, config: ExternalAgentMachineConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Sets how a failed bridged host tool call is handled, leaving the rest of
+    /// the machine-local config untouched.
+    #[must_use]
+    pub fn with_tool_failure_policy(mut self, policy: ExternalToolFailurePolicy) -> Self {
+        self.config = self.config.with_tool_failure_policy(policy);
+        self
+    }
+
+    /// Sets the decision-loop bound (`None` clears it), leaving the rest of the
+    /// machine-local config untouched.
+    #[must_use]
+    pub fn with_max_decision_loops(mut self, max: Option<u32>) -> Self {
+        self.config = self.config.with_max_decision_loops(max);
         self
     }
 
@@ -378,7 +416,28 @@ impl ExternalAgentMachine {
 
     /// Reifies one external session effect and parks on
     /// [`AwaitingSession`](ExternalAgentCursor::AwaitingSession).
+    ///
+    /// Every runtime round-trip funnels through here (the initial
+    /// `Start`/`Continue`, and each `RespondToolResults` / `RespondInteraction` /
+    /// `RespondSubagent`), so it is the single place the machine bounds the
+    /// managed loop: it records another decision loop and, when the injected
+    /// [`ExternalAgentMachineConfig::max_decision_loops`] cap is exceeded, fails
+    /// with a classified [`LimitExceeded`](ExternalAgentError::LimitExceeded)
+    /// before minting another `NeedExternalSession` — so an unbounded
+    /// pause/respond loop stops loudly instead of spinning (design §6.3).
     fn block_on_session(&mut self, step_id: StepId, input: ExternalSessionInput) -> StepOutcome {
+        let loops = self.state.record_decision_loop();
+        if let Some(limit) = self.config.max_decision_loops()
+            && loops > limit
+        {
+            return self.fail(
+                ExternalAgentError::LimitExceeded {
+                    limit: format!("max external decision loops ({limit}) exceeded"),
+                }
+                .to_string(),
+            );
+        }
+
         let requirement_id = match self
             .requirement_ids
             .next_requirement_id(RequirementKindTag::ExternalSession)
@@ -747,8 +806,9 @@ impl ExternalAgentMachine {
                         call_id: match self.tool_ids.tool_call_id(&tool_call) {
                             Ok(id) => id,
                             Err(error) => {
-                                return self.fail_with(
-                                    format!("tool id unavailable: {error}"),
+                                return self.fail_tool_id_unavailable(
+                                    ExternalCapability::HostTools,
+                                    &error,
                                     notifications,
                                 );
                             }
@@ -768,8 +828,11 @@ impl ExternalAgentMachine {
                 _ => match self.tool_ids.tool_call_id(&tool_call) {
                     Ok(id) => id,
                     Err(error) => {
-                        return self
-                            .fail_with(format!("tool id unavailable: {error}"), notifications);
+                        return self.fail_tool_id_unavailable(
+                            ExternalCapability::HostSubagents,
+                            &error,
+                            notifications,
+                        );
                     }
                 },
             };
@@ -931,14 +994,21 @@ impl ExternalAgentMachine {
         let tool_result = match kind {
             ExternalBridgeCallKind::Tool => match resolution.result {
                 // A runtime error is returned to the runtime as a failed tool
-                // result (the fixed return-error-to-runtime policy) rather than
-                // stopping the turn.
+                // result (the default return-error-to-runtime policy) unless the
+                // machine is configured to stop the run, in which case the host
+                // turn fails on a classified error cursor instead of relaying the
+                // failure (design §8.4).
                 RequirementResult::Tool(Ok(response)) => {
                     let mut result = ExternalToolResult::from_tool_response(&response);
                     result.provider_call_id = provider_call_id.clone();
                     result
                 }
                 RequirementResult::Tool(Err(error)) => {
+                    if self.config.tool_failure() == ExternalToolFailurePolicy::StopRun {
+                        return self.fail(format!(
+                            "external host tool failed under stop-run policy: {error}"
+                        ));
+                    }
                     ExternalToolResult::from_tool_runtime_error(provider_call_id.clone(), &error)
                 }
                 other => {
@@ -1036,6 +1106,37 @@ impl ExternalAgentMachine {
                 results,
             },
         )
+    }
+
+    /// Fails a tool-call pause that could not mint a host tool-call id.
+    ///
+    /// The missing id source is the same defect either way, but the diagnostic
+    /// is sharpened when the run *declared* it requires the corresponding managed
+    /// capability: a configured [`HostTools`](ExternalCapability::HostTools) or
+    /// [`HostSubagents`](ExternalCapability::HostSubagents) requirement surfaces
+    /// a classified [`UnsupportedCapability`](ExternalAgentError::UnsupportedCapability)
+    /// naming the runtime and capability (design §15), so a scheduler avoids
+    /// re-dispatching that worker. Without the requirement the generic
+    /// id-unavailable failure is preserved, matching pre-M4-3 behavior. The
+    /// detail is a stable diagnostic and carries no prompt or tool input.
+    fn fail_tool_id_unavailable(
+        &mut self,
+        capability: ExternalCapability,
+        id_error: &ToolRuntimeError,
+        notifications: Vec<Notification>,
+    ) -> StepOutcome {
+        let message = if self.config.requires(capability) {
+            ExternalAgentError::UnsupportedCapability {
+                runtime: self.state.spec().runtime().clone(),
+                capability,
+                detail: "host provided no tool-call id source for runtime-initiated calls"
+                    .to_owned(),
+            }
+            .to_string()
+        } else {
+            format!("tool id unavailable: {id_error}")
+        };
+        self.fail_with(message, notifications)
     }
 
     /// Parks on a subagent spawn the runtime paused for and emits one

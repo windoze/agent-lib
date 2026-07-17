@@ -219,6 +219,7 @@ pub struct ExternalAgentState {
     active_tools: ToolSetRef,
     artifacts: Vec<ExternalArtifactRef>,
     cleanup_required: bool,
+    decision_loops: u32,
 }
 
 impl ExternalAgentState {
@@ -238,6 +239,7 @@ impl ExternalAgentState {
             active_tools,
             artifacts: Vec::new(),
             cleanup_required: false,
+            decision_loops: 0,
         }
     }
 
@@ -355,6 +357,31 @@ impl ExternalAgentState {
         self.cleanup_required = false;
     }
 
+    /// Returns how many runtime decision loops (session round-trips) the machine
+    /// has opened over its lifetime.
+    ///
+    /// Every time the machine hands control back to the runtime — the initial
+    /// `Start`/`Continue`, and each `RespondToolResults` / `RespondInteraction` /
+    /// `RespondSubagent` that reparks on a fresh `NeedExternalSession` — counts
+    /// as one loop. The count is persisted so a restored machine keeps enforcing
+    /// [`ExternalAgentMachineConfig::max_decision_loops`](super::ExternalAgentMachineConfig::max_decision_loops)
+    /// across process boundaries (design §6.3).
+    #[must_use]
+    pub const fn decision_loops(&self) -> u32 {
+        self.decision_loops
+    }
+
+    /// Records that the machine opened another runtime decision loop and returns
+    /// the new running total.
+    ///
+    /// The counter saturates at [`u32::MAX`] rather than wrapping, so a machine
+    /// that somehow reaches the ceiling keeps reporting an over-limit count
+    /// instead of silently resetting.
+    pub fn record_decision_loop(&mut self) -> u32 {
+        self.decision_loops = self.decision_loops.saturating_add(1);
+        self.decision_loops
+    }
+
     fn from_record(record: ExternalAgentStateRecord) -> Result<Self, ConversationError> {
         let conversation = Conversation::restore(record.conversation)?;
         Ok(Self {
@@ -365,6 +392,7 @@ impl ExternalAgentState {
             active_tools: record.active_tools,
             artifacts: record.artifacts,
             cleanup_required: record.cleanup_required,
+            decision_loops: record.decision_loops,
         })
     }
 }
@@ -383,6 +411,7 @@ impl Serialize for ExternalAgentState {
             active_tools: self.active_tools.clone(),
             artifacts: self.artifacts.clone(),
             cleanup_required: self.cleanup_required,
+            decision_loops: self.decision_loops,
         }
         .serialize(serializer)
     }
@@ -412,6 +441,8 @@ struct ExternalAgentStateRecord {
     artifacts: Vec<ExternalArtifactRef>,
     #[serde(default, skip_serializing_if = "is_false")]
     cleanup_required: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    decision_loops: u32,
 }
 
 /// Serde predicate: skips the pending-cleanup flag when it is not set, keeping
@@ -419,6 +450,13 @@ struct ExternalAgentStateRecord {
 /// snapshot.
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// Serde predicate: skips the decision-loop counter when it is still zero,
+/// keeping a fresh clean-state snapshot byte-for-byte compatible with the
+/// pre-M4-3 shape.
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]
@@ -685,6 +723,34 @@ mod tests {
             serde_json::from_value(encoded).expect("deserialize external agent state");
         assert!(decoded.cursor().is_idle());
         assert!(decoded.session().is_none());
+    }
+
+    #[test]
+    fn external_agent_state_decision_loops_persist_and_skip_when_zero() {
+        // A fresh state has opened no decision loops, and the zero counter is
+        // omitted from the snapshot so the clean-state shape stays compatible.
+        let mut state = ExternalAgentState::new(spec(), committed_conversation());
+        assert_eq!(state.decision_loops(), 0);
+        let encoded = serde_json::to_value(&state).expect("serialize external agent state");
+        assert!(
+            encoded
+                .as_object()
+                .expect("object")
+                .get("decision_loops")
+                .is_none(),
+            "a zero decision-loop counter must be skipped"
+        );
+
+        // Recording loops advances the running total, which then rides the
+        // snapshot and survives a round-trip so a restored machine keeps
+        // enforcing the loop bound.
+        assert_eq!(state.record_decision_loop(), 1);
+        assert_eq!(state.record_decision_loop(), 2);
+        let encoded = serde_json::to_value(&state).expect("serialize external agent state");
+        assert_eq!(encoded["decision_loops"], json!(2));
+        let decoded: ExternalAgentState =
+            serde_json::from_value(encoded).expect("deserialize external agent state");
+        assert_eq!(decoded.decision_loops(), 2);
     }
 
     #[test]

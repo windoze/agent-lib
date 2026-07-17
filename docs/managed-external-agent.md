@@ -115,7 +115,7 @@ scope wiring 决定 attended / headless 行为。
 | tool approval | `NeedInteraction(Approval)` | runtime permission 或 host tool approval -> `NeedInteraction` | machine 已实现(interaction 校验),runtime handler 待实现 |
 | user question | `NeedInteraction(Question)` | runtime question -> `NeedInteraction(Question)` | machine 已实现(`NeedInteraction`),runtime handler 待实现 |
 | subagent | `NeedSubagent` | runtime spawn request -> `NeedSubagent` | machine 已实现,runtime handler 待实现 |
-| tool failure policy | `ToolFailurePolicy` | external tool result error 回灌或 fail turn | 拟新增 |
+| tool failure policy | `ToolFailurePolicy` | external tool result error 回灌或 fail turn | 已落地(M4-3):`ExternalToolFailurePolicy`(`ReturnErrorToRuntime` 默认 / `StopRun`) |
 | cancel | `StepInput::Abandon` closes pending | abandon marks cleanup + handler kills session | machine 已有,handler 待实现 |
 | budget | handler/driver charge tokens/cost | runtime usage/cost event charge | 拟新增 |
 | trace | requirement + tool + subagent nodes | external events + shutdown + artifacts | 部分已有 |
@@ -458,7 +458,11 @@ struct PendingExternalToolBatch {
 | `max_interaction_rounds` | permission/question 循环次数 |
 | `max_wall_time` | handler/session registry 层 |
 
-超限映射到 `ExternalAgentError::LimitExceeded` 或 machine error cursor。
+超限映射到 `ExternalAgentError::LimitExceeded` 或 machine error cursor。已落地(M4-3):
+`ExternalAgentMachineConfig::max_decision_loops` 提供一个统一的 session round-trip 上限(`max_session_steps`
+的粗粒度实现),计数持久化在 `ExternalAgentState::decision_loops`,超限时在铸下一个 `NeedExternalSession`
+之前以 `LimitExceeded` 失败;更细的 per-phase 上限(tool rounds / parallel tools / interaction rounds /
+wall time)仍待后续里程碑补齐。
 
 ### 6.4 pivot
 
@@ -490,31 +494,54 @@ StepInput::External(AgentInput::Pivot)
 - `LlmStepMode`
 - `LoopPolicy`
 
-external 也需要对应能力:
+external 也需要对应能力。已落地(M4-3)的做法把配置分成两半:
+
+- **runtime-facing hints** = `ExternalSessionPolicy`(permission/isolation/max_turns/stream_events),
+  随每个 `ExternalSessionRequest` 传给 handler / runtime。
+- **machine-local policy** = `ExternalAgentMachineConfig`(纯数据 serde DTO,不进 `ExternalAgentState`,
+  也不持有 live handler/sink/id source):
 
 ```rust
 pub struct ExternalAgentMachineConfig {
-    pub requirement_ids: Arc<dyn RequirementIds>,
-    pub tool_execution_ids: Arc<dyn ToolExecutionIds>,
-    pub approval_policy: Arc<dyn ToolApprovalPolicy>,
-    pub tool_failure_policy: ToolFailurePolicy,
-    pub tool_registry_resolver: Arc<dyn ToolRegistryResolver>,
-    pub loop_policy: ExternalLoopPolicy,
+    tool_failure: ExternalToolFailurePolicy,        // ReturnErrorToRuntime(默认) / StopRun
+    required_capabilities: BTreeSet<ExternalCapability>, // 覆盖 require host tools / require subagents 等
+    max_decision_loops: Option<u32>,               // 运行期 session round-trip 上限,None=不限
 }
 ```
 
-可用 builder 接口避免破坏现有构造:
+live 的 `RequirementIds` / `ToolExecutionIds` 仍走各自的构造/builder 注入,不放进上面的 DTO(避免把
+不可序列化的句柄混进 machine-local policy)。builder 接口保持向后兼容:
 
 ```rust
-ExternalAgentMachine::new(state, requirement_ids)
+ExternalAgentMachine::new(state, requirement_ids)   // 默认 config = 与旧行为一致
     .with_tool_execution_ids(ids)
-    .with_approval_policy(policy)
-    .with_tool_failure_policy(ToolFailurePolicy::ReturnErrorToModel)
-    .with_loop_policy(policy)
+    .with_external_config(
+        ExternalAgentMachineConfig::default()
+            .with_tool_failure_policy(ExternalToolFailurePolicy::StopRun)
+            .with_max_decision_loops(Some(32))
+            .require_host_tools()
+            .require_subagents(),
+    )
+    // 也可用聚焦 setter:
+    .with_tool_failure_policy(ExternalToolFailurePolicy::StopRun)
+    .with_max_decision_loops(Some(32))
 ```
 
-若 `ExternalAgentMachine` 没有 `ToolExecutionIds`,但 runtime 发起 tool call,应进入 classified error,不能
-静默丢弃。
+行为约定:
+
+- **loop limit**:每次把控制权交回 runtime(初始 `Start`/`Continue`,以及每个 `RespondToolResults` /
+  `RespondInteraction` / `RespondSubagent`)都记一次 decision loop,计数持久化在 `ExternalAgentState`
+  (跨 restore 存活),超过 `max_decision_loops` 时以 `ExternalAgentError::LimitExceeded` 失败,在再铸一个
+  `NeedExternalSession` 之前挡住无界 pause loop。
+- **tool failure policy**:bridged host tool 返回 `Err` 时,`ReturnErrorToRuntime`(默认)把失败作为
+  `ExternalToolResult{status: Error}` 回灌 runtime;`StopRun` 直接 fail turn(Error cursor,丢弃 pending turn)。
+- **required capabilities**:声明本次 run 依赖的 managed feature(capability set)。当到达需要该能力的决策点
+  但宿主无法服务时(例如声明 `require_host_tools` / `require_subagents` 却没有注入 `ToolExecutionIds`,
+  无法为 runtime 发起的 tool / spawn_agent 调用铸造 tool-call id),以 classified
+  `ExternalAgentError::UnsupportedCapability` 失败而非静默降级或吐通用错误。
+
+若 `ExternalAgentMachine` 没有 `ToolExecutionIds`,但 runtime 发起 tool call,始终进入 classified error,不能
+静默丢弃;声明了对应 capability requirement 时错误会升级为 `UnsupportedCapability`。
 
 ## 8. tool 注入设计
 
