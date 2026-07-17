@@ -152,13 +152,14 @@ pub(super) fn start(
                 let (text, usage, stop_reason) = final_turn_summary(machine.state().conversation());
                 let mut usage_summary = UsageSummary::from_supervisor(usage.clone());
                 usage_summary.add_subagent(collected.subagent_usage);
+                usage_summary.add_external(collected.external_usage);
                 Ok(RunOutput {
                     reply: Reply::from_parts(text, Some(usage), stop_reason),
                     response: None,
                     usage: usage_summary,
                     tool_calls: collected.tool_calls,
                     delegations: collected.delegations,
-                    artifacts: Vec::new(),
+                    artifacts: collected.artifacts,
                     events: collected.events,
                 })
             }
@@ -372,16 +373,20 @@ impl ToolHandler for TapToolHandler {
     ) -> RequirementResult {
         if self.inner.is_delegation(&call.name) {
             let result = self.inner.fulfill(call_id, call, ctx).await;
-            if let Some(trace) = self
+            if let Some(record) = self
                 .recorder
                 .lock()
                 .expect("delegation recorder poisoned")
                 .get(&call_id.to_string())
                 .cloned()
             {
+                let trace = record.trace;
                 emit(&self.sink, RunEvent::DelegationStarted(trace.clone()));
                 match trace.status {
                     DelegationStatus::Completed => {
+                        for artifact in record.artifacts {
+                            emit(&self.sink, RunEvent::DelegationArtifact(artifact));
+                        }
                         emit(&self.sink, RunEvent::DelegationFinished(trace));
                     }
                     DelegationStatus::Failed => {

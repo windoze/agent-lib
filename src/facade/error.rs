@@ -122,6 +122,25 @@ pub enum FacadeError {
         missing: String,
     },
 
+    /// A managed external delegate could not be driven to fulfill a delegation.
+    ///
+    /// Raised while fulfilling an `ask_<name>` external delegation (M4-2) when
+    /// the managed agent has no runtime
+    /// [`ExternalSessionHandler`](crate::agent::ExternalSessionHandler) attached
+    /// (nothing can advance the session), or when driving the
+    /// [`ExternalAgentMachine`](crate::agent::ExternalAgentMachine) fails before
+    /// it reaches a terminal cursor. The facade fails fast with this variant
+    /// rather than silently degrading an unconfigured or broken external
+    /// delegate (see `docs/facade-api.md` §11.2, §16). The message is a stable,
+    /// non-secret description; runtime output and credentials are never included.
+    #[error("external agent `{name}` error: {message}")]
+    ExternalAgent {
+        /// The registration name of the external delegate that failed.
+        name: String,
+        /// A stable, non-secret description of the failure.
+        message: String,
+    },
+
     /// The facade was driven into a state its API cannot service.
     #[error("facade invalid state: {0}")]
     InvalidState(String),

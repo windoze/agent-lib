@@ -11,7 +11,7 @@
 //! [`ManagedExternalAgentBuilder`] with per-runtime presets, the
 //! [`ExternalRunMode`] capability grade, and the [`ExternalAgentCapabilities`]
 //! facade view. Wiring a built spec into a running delegate (`NeedSubagent` →
-//! [`ExternalAgentMachine`](crate::agent::ExternalAgentMachine)) and the external
+//! [`ExternalAgentMachine`]) and the external
 //! approval/restore policy land in later milestones (M4-2, M4-3).
 //!
 //! # Capability grading is negotiated, not assumed (§11.3)
@@ -60,12 +60,30 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use crate::agent::external::{
+    ExternalAgentMachine, ExternalAgentSpec, ExternalAgentState, ExternalArtifactRef,
+    ExternalSessionPolicy, ExternalStreamPolicy, WorktreeIsolation,
+};
 use crate::agent::{
+    AgentError, AgentId, AgentInput, AgentMachine, AgentSpecRef, DrivingSubagentHandler,
     ExternalCapability, ExternalPermissionMode, ExternalRuntimeCapabilities, ExternalRuntimeKind,
+    ExternalSessionHandler, HandlerScope, Interaction, LoopCursor, RequirementIds,
+    RequirementResult, RunContext, RunId, ScopePop, SpawnedChild, StepInput, StepOutcome,
+    SubagentHandler, SubagentOutput, SubagentSpawner, ToolSetRef, TraceNodeId, TurnDone,
     WorktreeRef,
 };
+use crate::conversation::{Conversation, ConversationConfig};
+use crate::facade::agent::final_turn_summary;
+use crate::facade::delegate::DEFAULT_MAX_DELEGATION_DEPTH;
 use crate::facade::error::FacadeError;
+use crate::facade::ids::FacadeIds;
+use crate::facade::run::ArtifactRef;
+use crate::model::content::ContentBlock;
+use crate::model::message::{Message, Role};
+use crate::model::usage::Usage;
+use serde_json::Map;
 
 #[cfg(feature = "external-acp")]
 use crate::agent::external::{
@@ -248,7 +266,7 @@ impl ExternalAgentCapabilities {
 /// [`opencode`](Self::opencode), or — under the `external-acp` feature — the ACP
 /// presets `acp`, `claude_agent_acp`, `codex_acp`, `opencode_acp`, and
 /// `gemini_acp`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManagedExternalAgent {
     runtime: ExternalRuntimeKind,
     mode: ExternalRunMode,
@@ -258,6 +276,34 @@ pub struct ManagedExternalAgent {
     model: Option<String>,
     args: Vec<String>,
     permission_mode: ExternalPermissionMode,
+    /// The runtime IO seam that advances the managed session (M4-2).
+    ///
+    /// A [`ManagedExternalAgent`] is data-first, but driving it to fulfill a
+    /// delegation needs *some* [`ExternalSessionHandler`] to advance the real
+    /// (or scripted) runtime. That handler is the one non-data attachment: it is
+    /// held behind an `Arc`, never serialized, and rendered opaquely by
+    /// [`Debug`]. Presets leave it `None`; attach one with
+    /// [`ManagedExternalAgentBuilder::session_handler`].
+    session_handler: Option<Arc<dyn ExternalSessionHandler>>,
+}
+
+impl std::fmt::Debug for ManagedExternalAgent {
+    /// Renders the data fields, treating the session handler as opaque so no
+    /// live runtime attachment leaks into diagnostics.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedExternalAgent")
+            .field("runtime", &self.runtime)
+            .field("mode", &self.mode)
+            .field("capabilities", &self.capabilities)
+            .field("worktree", &self.worktree)
+            .field("binary", &self.binary)
+            .field("model", &self.model)
+            .field("args", &self.args)
+            .field("permission_mode", &self.permission_mode)
+            .field("has_session_handler", &self.session_handler.is_some())
+            .finish()
+    }
 }
 
 impl ManagedExternalAgent {
@@ -389,6 +435,16 @@ impl ManagedExternalAgent {
     pub const fn permission_mode(&self) -> ExternalPermissionMode {
         self.permission_mode
     }
+
+    /// Returns the injected runtime session handler, if one was attached.
+    ///
+    /// This is the IO seam a delegation drive advances (M4-2). It is `None`
+    /// unless a host attached one with
+    /// [`ManagedExternalAgentBuilder::session_handler`].
+    #[must_use]
+    pub(crate) fn session_handler(&self) -> Option<&Arc<dyn ExternalSessionHandler>> {
+        self.session_handler.as_ref()
+    }
 }
 
 /// Builder for a [`ManagedExternalAgent`], reached through a preset constructor.
@@ -396,7 +452,7 @@ impl ManagedExternalAgent {
 /// The mode defaults to [`ExternalRunMode::Managed`] and the permission mode to
 /// [`ExternalPermissionMode::Prompt`] (the safest). [`build`](Self::build)
 /// validates the requested mode against the runtime's capabilities.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManagedExternalAgentBuilder {
     runtime: ExternalRuntimeKind,
     mode: ExternalRunMode,
@@ -406,6 +462,26 @@ pub struct ManagedExternalAgentBuilder {
     model: Option<String>,
     args: Vec<String>,
     permission_mode: ExternalPermissionMode,
+    session_handler: Option<Arc<dyn ExternalSessionHandler>>,
+}
+
+impl std::fmt::Debug for ManagedExternalAgentBuilder {
+    /// Mirrors [`ManagedExternalAgent`]'s [`Debug`]: data fields verbatim, the
+    /// session handler opaque.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedExternalAgentBuilder")
+            .field("runtime", &self.runtime)
+            .field("mode", &self.mode)
+            .field("capabilities", &self.capabilities)
+            .field("worktree", &self.worktree)
+            .field("binary", &self.binary)
+            .field("model", &self.model)
+            .field("args", &self.args)
+            .field("permission_mode", &self.permission_mode)
+            .field("has_session_handler", &self.session_handler.is_some())
+            .finish()
+    }
 }
 
 impl ManagedExternalAgentBuilder {
@@ -423,6 +499,7 @@ impl ManagedExternalAgentBuilder {
             model: None,
             args: Vec::new(),
             permission_mode: ExternalPermissionMode::Prompt,
+            session_handler: None,
         }
     }
 
@@ -443,6 +520,7 @@ impl ManagedExternalAgentBuilder {
             model: None,
             args: config.args().to_vec(),
             permission_mode: config.permission_mode(),
+            session_handler: None,
         }
     }
 
@@ -521,6 +599,28 @@ impl ManagedExternalAgentBuilder {
         self
     }
 
+    /// Attaches the runtime session handler that advances this managed agent's
+    /// sessions (M4-2).
+    ///
+    /// A [`ManagedExternalAgent`] stays data-first, but *driving* it as an
+    /// external delegate needs an [`ExternalSessionHandler`]: the sans-io
+    /// [`ExternalAgentMachine`] reifies each
+    /// runtime round-trip as a `NeedExternalSession` requirement, and this
+    /// handler is what advances the real (or, in tests, scripted) runtime to its
+    /// next decision point. It is the one non-data attachment on the spec — held
+    /// behind an `Arc`, never serialized, and treated as opaque by
+    /// [`Debug`]; a snapshot persists only the data fields (M4-3).
+    ///
+    /// Without a handler an external delegation fails fast rather than silently
+    /// degrading (see [`FacadeError::ExternalAgent`]). A host wires a real
+    /// registry-backed handler here (behind the matching `external-*` feature);
+    /// offline tests inject a scripted handler.
+    #[must_use]
+    pub fn session_handler(mut self, handler: Arc<dyn ExternalSessionHandler>) -> Self {
+        self.session_handler = Some(handler);
+        self
+    }
+
     /// Validates the requested mode against the runtime's capabilities and
     /// produces the [`ManagedExternalAgent`] spec.
     ///
@@ -557,6 +657,7 @@ impl ManagedExternalAgentBuilder {
             model: self.model,
             args: self.args,
             permission_mode: self.permission_mode,
+            session_handler: self.session_handler,
         })
     }
 }
@@ -605,6 +706,341 @@ fn declared_capabilities(runtime: &ExternalRuntimeKind) -> ExternalRuntimeCapabi
         ExternalRuntimeKind::Custom(_) => {}
     }
     capabilities
+}
+
+/// A named managed external delegate registered on an [`Agent`](crate::facade::Agent).
+///
+/// This pairs the registration `name` (which mints the `ask_<name>` delegation
+/// tool, §13.1) with the data-first [`ManagedExternalAgent`] recipe that is
+/// driven when the supervising model routes work to it (M4-2). It mirrors
+/// [`LocalSubagent`](crate::facade::LocalSubagent) for the external side: the
+/// live runtime is assembled only when a delegation is fulfilled.
+#[derive(Clone, Debug)]
+pub struct ManagedExternalDelegate {
+    name: String,
+    agent: ManagedExternalAgent,
+}
+
+impl ManagedExternalDelegate {
+    /// Stamps `name` onto `agent`, forming a registered external delegate.
+    #[must_use]
+    pub(crate) fn new(name: impl Into<String>, agent: ManagedExternalAgent) -> Self {
+        Self {
+            name: name.into(),
+            agent,
+        }
+    }
+
+    /// Returns the delegate's registration name (the `ask_<name>` stem).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns a terse description advertised on the delegation tool.
+    ///
+    /// A managed external agent carries no free-form description, so this is a
+    /// generated one naming the backing runtime and run mode.
+    #[must_use]
+    pub fn description(&self) -> String {
+        format!(
+            "Delegate a task to the `{}` managed external agent ({} runtime, {} mode).",
+            self.name,
+            runtime_label(self.agent.runtime()),
+            self.agent.mode().as_str()
+        )
+    }
+
+    /// Returns the data-first managed external agent recipe.
+    #[must_use]
+    pub const fn agent(&self) -> &ManagedExternalAgent {
+        &self.agent
+    }
+}
+
+/// The facts captured from a driven external delegation.
+///
+/// A [`RecordingExternalMachine`] snapshots these off the
+/// [`ExternalAgentState`] after every step, so the last write reflects the final
+/// state whether the session ran to completion or was abandoned on cancel.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ExternalDriveOutcome {
+    /// The session's final summary text, folded back as the tool result.
+    pub summary: String,
+    /// Token usage reported by the runtime for the delegated turn.
+    pub usage: Usage,
+    /// Artifacts (patches/diffs/test results/files) the session reported.
+    pub artifacts: Vec<ArtifactRef>,
+    /// Whether the machine reached its terminal `Done` cursor.
+    pub completed: bool,
+    /// Whether the abandoned session left a live runtime for the handle layer to
+    /// sweep (the cancel cleanup marker, design §6.4).
+    pub cleanup_required: bool,
+}
+
+/// A shared, single-slot capture of an [`ExternalDriveOutcome`].
+type ExternalOutcomeSlot = Arc<Mutex<Option<ExternalDriveOutcome>>>;
+
+/// Wraps an [`ExternalAgentMachine`] to capture its terminal facts.
+///
+/// The [`SubagentSpawner`] only observes the drained [`TurnDone`], never the
+/// child machine state, so this wrapper snapshots the current
+/// [`ExternalAgentState`] into a shared slot after every step. On a
+/// `Completed` step it captures the committed turn's summary/usage plus the
+/// recorded artifacts; on a cancel `Abandon` step it captures the
+/// [`cleanup_required`](ExternalAgentState::cleanup_required) marker. The
+/// [`drive_external`] caller then reads the slot to fold the result back and
+/// record the delegation trace, artifacts, and usage.
+struct RecordingExternalMachine {
+    inner: ExternalAgentMachine,
+    slot: ExternalOutcomeSlot,
+}
+
+impl AgentMachine for RecordingExternalMachine {
+    fn step(&mut self, input: StepInput) -> StepOutcome {
+        let outcome = self.inner.step(input);
+        let state = self.inner.state();
+        let completed = matches!(self.inner.cursor(), LoopCursor::Done(_));
+        let (summary, usage, _stop) = final_turn_summary(state.conversation());
+        let artifacts = state.artifacts().iter().map(map_artifact).collect();
+        *self.slot.lock().expect("external outcome slot poisoned") = Some(ExternalDriveOutcome {
+            summary,
+            usage,
+            artifacts,
+            completed,
+            cleanup_required: state.cleanup_required(),
+        });
+        outcome
+    }
+
+    fn cursor(&self) -> &LoopCursor {
+        self.inner.cursor()
+    }
+}
+
+/// The child external session's own drain layer: it serves only the
+/// `NeedExternalSession` family through the injected handler.
+///
+/// Every other requirement the external machine could emit (a bridged
+/// `NeedInteraction`, `NeedTool`, or `NeedSubagent`) pops to the outer layer;
+/// M4-2 wires a headless [`EmptyExternalScope`] there, so a request the base
+/// approval/host path does not serve surfaces as an
+/// [`UnhandledRequirement`](crate::agent::AgentError::UnhandledRequirement)
+/// rather than being silently dropped. The richer external approval wiring lands
+/// in M4-3.
+struct ExternalChildScope {
+    external: Arc<dyn ExternalSessionHandler>,
+}
+
+impl HandlerScope for ExternalChildScope {
+    fn external(&self) -> Option<&dyn ExternalSessionHandler> {
+        Some(self.external.as_ref())
+    }
+}
+
+/// An empty outer layer for the external child drive.
+#[derive(Default)]
+struct EmptyExternalScope;
+
+impl HandlerScope for EmptyExternalScope {}
+
+/// Turns one external delegation into a drivable [`ExternalAgentMachine`], its
+/// scope, and its opening input.
+///
+/// Built fresh per delegation call so its capture `slot` is call-local. The
+/// external [`ExternalAgentSpec`] is rebuilt from the delegate's data-first
+/// [`ManagedExternalAgent`]: its runtime kind, worktree, permission mode, and an
+/// empty tool set (host tools are an M4-3+ capability). The scope serves the
+/// machine's `NeedExternalSession` requirements through the delegate's injected
+/// [`ExternalSessionHandler`].
+struct FacadeExternalSpawner {
+    name: String,
+    agent_id: AgentId,
+    runtime: ExternalRuntimeKind,
+    worktree: WorktreeRef,
+    policy: ExternalSessionPolicy,
+    handler: Arc<dyn ExternalSessionHandler>,
+    ids: FacadeIds,
+    task: String,
+    slot: ExternalOutcomeSlot,
+}
+
+impl SubagentSpawner for FacadeExternalSpawner {
+    fn child_ids(&self, _spec_ref: &AgentSpecRef) -> Result<(RunId, TraceNodeId), AgentError> {
+        Ok((
+            self.ids.run_id(),
+            TraceNodeId::new(format!("external:{}", self.name)),
+        ))
+    }
+
+    fn spawn(
+        &self,
+        _spec_ref: &AgentSpecRef,
+        _brief: &Interaction,
+        _result_schema: Option<&serde_json::Value>,
+    ) -> Result<SpawnedChild, AgentError> {
+        let spec = ExternalAgentSpec::new(
+            self.agent_id,
+            self.runtime.clone(),
+            self.worktree.clone(),
+            None,
+            ToolSetRef::new(self.ids.tool_set_id(), Vec::new()),
+            self.policy,
+        );
+        let state = ExternalAgentState::new(
+            spec,
+            Conversation::new(self.ids.conversation_id(), ConversationConfig::new(None)),
+        );
+        let requirement_ids: Arc<dyn RequirementIds> = Arc::new(self.ids.clone());
+        let machine = ExternalAgentMachine::new(state, requirement_ids);
+        let recording = RecordingExternalMachine {
+            inner: machine,
+            slot: self.slot.clone(),
+        };
+
+        let scope = ExternalChildScope {
+            external: self.handler.clone(),
+        };
+
+        let user = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: self.task.clone(),
+                extra: Map::new(),
+            }],
+        };
+        let opening = AgentInput::user_message(
+            self.ids.turn_id(),
+            self.ids.message_id(),
+            user,
+            self.ids.message_id(),
+            self.ids.step_id(),
+        )?;
+
+        Ok(SpawnedChild {
+            machine: Box::new(recording),
+            scope: Box::new(scope),
+            opening,
+        })
+    }
+
+    fn summarize(&self, _done: &TurnDone) -> SubagentOutput {
+        let summary = self
+            .slot
+            .lock()
+            .expect("external outcome slot poisoned")
+            .as_ref()
+            .map(|captured| captured.summary.clone())
+            .unwrap_or_default();
+        SubagentOutput { summary }
+    }
+}
+
+/// Drives one managed external delegation to its next terminal state, returning
+/// the captured [`ExternalDriveOutcome`].
+///
+/// The external agent is driven the same way a local subagent is (M3-2): through
+/// the reference [`DrivingSubagentHandler`], so it shares the host's scope
+/// derivation, cancel propagation, budget ledger, and trace node. The child
+/// machine is an [`ExternalAgentMachine`] whose `NeedExternalSession`
+/// requirements are served by the delegate's injected
+/// [`ExternalSessionHandler`] (design §11.2). A cancelled `ctx` makes the drive
+/// abandon the outstanding session step, so the returned outcome carries the
+/// runtime cleanup marker.
+///
+/// # Errors
+///
+/// Returns [`FacadeError::ExternalAgent`] when the delegate has no session
+/// handler attached, or when the drive fails before reaching a terminal cursor.
+pub(crate) async fn drive_external(
+    name: &str,
+    agent: &ManagedExternalAgent,
+    ids: &FacadeIds,
+    task: String,
+    ctx: &RunContext,
+) -> Result<ExternalDriveOutcome, FacadeError> {
+    let Some(handler) = agent.session_handler() else {
+        return Err(FacadeError::ExternalAgent {
+            name: name.to_owned(),
+            message: "no runtime session handler is attached; call \
+                      ManagedExternalAgentBuilder::session_handler(..) to drive it"
+                .to_owned(),
+        });
+    };
+
+    let worktree = agent
+        .worktree()
+        .cloned()
+        .unwrap_or_else(|| WorktreeRef::new("."));
+    let policy = ExternalSessionPolicy {
+        permission_mode: agent.permission_mode(),
+        isolation: WorktreeIsolation::EphemeralGitWorktree,
+        max_turns: None,
+        stream_events: ExternalStreamPolicy::Buffered,
+    };
+
+    let slot: ExternalOutcomeSlot = Arc::new(Mutex::new(None));
+    let agent_id = ids.agent_id();
+    let spawner = Arc::new(FacadeExternalSpawner {
+        name: name.to_owned(),
+        agent_id,
+        runtime: agent.runtime().clone(),
+        worktree,
+        policy,
+        handler: handler.clone(),
+        ids: ids.clone(),
+        task: task.clone(),
+        slot: slot.clone(),
+    });
+    let handler = DrivingSubagentHandler::new(spawner, DEFAULT_MAX_DELEGATION_DEPTH);
+
+    let spec_ref = AgentSpecRef(agent_id);
+    let brief = Interaction::question(ids.step_id(), task);
+    let empty = EmptyExternalScope;
+    let mut outer = ScopePop::new(&empty, None);
+
+    let result = handler
+        .fulfill(&spec_ref, &brief, None, &mut outer, ctx)
+        .await;
+
+    let captured = slot
+        .lock()
+        .expect("external outcome slot poisoned")
+        .clone()
+        .unwrap_or_default();
+
+    match result {
+        RequirementResult::Subagent(Ok(_output)) => Ok(captured),
+        RequirementResult::Subagent(Err(error)) => Err(FacadeError::ExternalAgent {
+            name: name.to_owned(),
+            message: error.to_string(),
+        }),
+        other => Err(FacadeError::ExternalAgent {
+            name: name.to_owned(),
+            message: format!(
+                "external drive returned an unexpected `{}` result",
+                other.tag()
+            ),
+        }),
+    }
+}
+
+/// Projects an agent-layer [`ExternalArtifactRef`] into the facade
+/// [`ArtifactRef`] surface.
+///
+/// The facade artifact reference carries only a locating `path`; the agent-layer
+/// reference may leave `path` unset (for example a bare test result), so this
+/// falls back to the opaque stored `reference` and finally the untrusted
+/// `summary` so an artifact is never advertised without a locator. Only
+/// references are copied — never inline diffs — keeping the mapping
+/// redaction-safe (design §11).
+fn map_artifact(artifact: &ExternalArtifactRef) -> ArtifactRef {
+    let path = artifact
+        .path
+        .clone()
+        .or_else(|| artifact.reference.clone())
+        .unwrap_or_else(|| artifact.summary.clone());
+    ArtifactRef { path }
 }
 
 #[cfg(test)]
@@ -808,6 +1244,62 @@ mod tests {
                 .supports(ExternalCapability::Resume)
         );
         assert_eq!(attachable.mode(), ExternalRunMode::Attachable);
+    }
+
+    #[tokio::test]
+    async fn drive_external_marks_cleanup_on_cancel() {
+        use super::drive_external;
+        use crate::agent::{
+            BudgetLimits, ExternalSessionHandler, ExternalSessionRequest, RequirementResult,
+            RunContext,
+        };
+        use crate::facade::ids::FacadeIds;
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        // A handler that must never be invoked: a pre-cancelled drive abandons the
+        // session's opening `NeedExternalSession` before reaching `fulfill`.
+        struct NeverInvokedHandler;
+
+        #[async_trait]
+        impl ExternalSessionHandler for NeverInvokedHandler {
+            async fn fulfill(
+                &self,
+                _request: &ExternalSessionRequest,
+                _ctx: &RunContext,
+            ) -> RequirementResult {
+                panic!("the session handler must not run when the drive is cancelled");
+            }
+        }
+
+        let coder = ManagedExternalAgent::claude_code()
+            .session_handler(Arc::new(NeverInvokedHandler))
+            .build()
+            .expect("managed external agent builds");
+
+        let ids = FacadeIds::seeded(7);
+        let ctx = RunContext::new_root(
+            ids.run_id(),
+            BudgetLimits::unbounded(),
+            ids.trace_root("external-cancel"),
+        );
+        ctx.cancellation().cancel();
+
+        let outcome = drive_external("coder", &coder, &ids, "refactor".to_owned(), &ctx)
+            .await
+            .expect("a cancelled drive still returns its captured outcome");
+
+        // The abandoned session left a cleanup marker for the handle layer to
+        // sweep, and never reached a completed state (design §6.4).
+        assert!(
+            outcome.cleanup_required,
+            "a cancelled external session leaves a cleanup marker"
+        );
+        assert!(
+            !outcome.completed,
+            "a cancelled external session did not complete"
+        );
+        assert!(outcome.artifacts.is_empty());
     }
 
     #[cfg(feature = "external-acp")]

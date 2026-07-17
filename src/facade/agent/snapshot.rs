@@ -519,6 +519,11 @@ impl AgentRestoreBuilder {
             approval,
             ids,
             delegates,
+            // External delegates are a runtime attachment (their session handler
+            // is never serialized); the snapshot carries none, so a restored
+            // agent starts with an empty external-delegate table until the caller
+            // re-registers one. Persisted external snapshot/restore is M4-3.
+            external_agents: Vec::new(),
             delegation: snapshot.delegation,
         })
     }

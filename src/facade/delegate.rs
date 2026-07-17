@@ -71,8 +71,9 @@ use crate::facade::agent::{
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
 use crate::facade::config::ModelConfig;
 use crate::facade::error::FacadeError;
+use crate::facade::external::{ManagedExternalDelegate, drive_external};
 use crate::facade::ids::FacadeIds;
-use crate::facade::run::{DelegationStatus, DelegationTrace};
+use crate::facade::run::{ArtifactRef, DelegationStatus, DelegationTrace};
 use crate::facade::tool::{FacadeToolRegistry, ToolContextParts};
 use crate::model::content::ContentBlock;
 use crate::model::message::{Message, Role};
@@ -534,6 +535,17 @@ impl Delegation {
         self
     }
 
+    /// A no-op refinement making the external-delegate intent explicit (§13.1).
+    ///
+    /// Model-routed delegation already exposes each registered managed external
+    /// agent as its own `ask_<name>` tool, exactly like a local subagent, so this
+    /// only documents that choice at the call site; it is idempotent and leaves
+    /// the mode unchanged.
+    #[must_use]
+    pub fn expose_external_agents_as_tools(self) -> Self {
+        self
+    }
+
     /// Alias of [`expose_subagents_as_tools`](Self::expose_subagents_as_tools)
     /// matching the spelling used in `docs/facade-api.md` §13.1.
     #[must_use]
@@ -554,40 +566,62 @@ impl Delegation {
     }
 
     /// Synthesizes the tool declarations this delegation advertises for
-    /// `delegates`, appended to the supervisor's advertised tool set at build
-    /// time (§10.1).
+    /// `subagents` and `external` delegates, appended to the supervisor's
+    /// advertised tool set at build time (§10.1, §13.1).
     ///
-    /// Model-routed delegation yields one `ask_<name>` declaration per delegate;
-    /// single-tool delegation yields exactly one unified declaration whose
-    /// `agent` argument enumerates the delegate names.
+    /// Model-routed delegation yields one `ask_<name>` declaration per delegate
+    /// (local subagents first, then managed external agents); single-tool
+    /// delegation yields exactly one unified declaration whose `agent` argument
+    /// enumerates every delegate name.
     #[must_use]
-    pub(crate) fn declarations(&self, delegates: &[LocalSubagent]) -> Vec<ToolDecl> {
+    pub(crate) fn declarations(
+        &self,
+        subagents: &[LocalSubagent],
+        external: &[ManagedExternalDelegate],
+    ) -> Vec<ToolDecl> {
         match &self.mode {
-            DelegationMode::PerSubagentTool => delegates
+            DelegationMode::PerSubagentTool => subagents
                 .iter()
                 .map(|delegate| delegation_declaration(delegate.name(), delegate.description()))
+                .chain(external.iter().map(|delegate| {
+                    delegation_declaration(delegate.name(), &delegate.description())
+                }))
                 .collect(),
             DelegationMode::SingleTool { tool_name } => {
-                vec![delegation_single_tool_declaration(tool_name, delegates)]
+                vec![delegation_single_tool_declaration(
+                    tool_name, subagents, external,
+                )]
             }
         }
     }
 
     /// Builds the per-run [`DelegationRoute`] that a
     /// [`DelegationToolHandler`] consults to recognize and dispatch delegation
-    /// calls for `delegates`.
+    /// calls for `subagents` and `external` delegates.
     #[must_use]
-    pub(crate) fn route(&self, delegates: &[LocalSubagent]) -> DelegationRoute {
+    pub(crate) fn route(
+        &self,
+        subagents: &[LocalSubagent],
+        external: &[ManagedExternalDelegate],
+    ) -> DelegationRoute {
         match &self.mode {
-            DelegationMode::PerSubagentTool => DelegationRoute::PerSubagent(
-                delegates
+            DelegationMode::PerSubagentTool => DelegationRoute::PerSubagent {
+                local: subagents
                     .iter()
                     .map(|delegate| (delegation_tool_name(delegate.name()), delegate.clone()))
                     .collect(),
-            ),
+                external: external
+                    .iter()
+                    .map(|delegate| (delegation_tool_name(delegate.name()), delegate.clone()))
+                    .collect(),
+            },
             DelegationMode::SingleTool { tool_name } => DelegationRoute::SingleTool {
                 tool_name: tool_name.clone(),
-                by_name: delegates
+                local_by_name: subagents
+                    .iter()
+                    .map(|delegate| (delegate.name().to_owned(), delegate.clone()))
+                    .collect(),
+                external_by_name: external
                     .iter()
                     .map(|delegate| (delegate.name().to_owned(), delegate.clone()))
                     .collect(),
@@ -599,18 +633,25 @@ impl Delegation {
 /// Synthesizes the unified single-tool delegation declaration (§10.2).
 ///
 /// The tool takes a required `agent` (which delegate to route to, enumerated
-/// from the registered delegate names) and a required `task` (the brief). The
-/// description lists the available delegates so the model can choose.
+/// from every registered delegate name, local subagents then managed external
+/// agents) and a required `task` (the brief). The description lists the
+/// available delegates so the model can choose.
 #[must_use]
 pub(crate) fn delegation_single_tool_declaration(
     tool_name: &str,
-    delegates: &[LocalSubagent],
+    subagents: &[LocalSubagent],
+    external: &[ManagedExternalDelegate],
 ) -> ToolDecl {
-    let names: Vec<Value> = delegates
+    let names: Vec<Value> = subagents
         .iter()
         .map(|delegate| Value::String(delegate.name().to_owned()))
+        .chain(
+            external
+                .iter()
+                .map(|delegate| Value::String(delegate.name().to_owned())),
+        )
         .collect();
-    let roster = delegates
+    let roster = subagents
         .iter()
         .map(|delegate| {
             if delegate.description().is_empty() {
@@ -619,6 +660,11 @@ pub(crate) fn delegation_single_tool_declaration(
                 format!("`{}` ({})", delegate.name(), delegate.description())
             }
         })
+        .chain(
+            external
+                .iter()
+                .map(|delegate| format!("`{}` ({})", delegate.name(), delegate.description())),
+        )
         .collect::<Vec<_>>()
         .join(", ");
     let description = if roster.is_empty() {
@@ -647,12 +693,31 @@ pub(crate) fn delegation_single_tool_declaration(
     }
 }
 
+/// One recorded delegation: its [`DelegationTrace`], the artifacts an external
+/// delegate reported, and whether it routed to an external agent.
+///
+/// The [`DelegationToolHandler`] writes one entry per delegation call; the run
+/// assembly (`collect_traces`) reads it to split delegation calls out from
+/// ordinary tool calls, to fold child usage into the summary (external usage is
+/// folded separately from local-subagent usage, §17.3), and to surface external
+/// [`artifacts`](RecordedDelegation::artifacts) on the run output.
+#[derive(Clone, Debug)]
+pub(crate) struct RecordedDelegation {
+    /// The trace (delegate name, terminal status, usage) for this call.
+    pub trace: DelegationTrace,
+    /// Artifacts an external delegate reported; always empty for a local
+    /// subagent.
+    pub artifacts: Vec<ArtifactRef>,
+    /// Whether this delegation routed to a managed external agent.
+    pub is_external: bool,
+}
+
 /// A per-run map from a delegation call's framework id to its recorded trace.
 ///
 /// The [`DelegationToolHandler`] writes one entry per delegation call; the run
 /// assembly (`collect_traces`) reads it to split delegation calls out from
 /// ordinary tool calls and to fold child usage into the summary.
-pub(crate) type DelegationRecorder = Arc<Mutex<HashMap<String, DelegationTrace>>>;
+pub(crate) type DelegationRecorder = Arc<Mutex<HashMap<String, RecordedDelegation>>>;
 
 /// Creates an empty [`DelegationRecorder`].
 #[must_use]
@@ -866,15 +931,24 @@ impl SubagentSpawner for FacadeSubagentSpawner {
 /// `ask_<name>` tool name, while [`SingleTool`](Self::SingleTool) recognizes one
 /// unified tool name and routes by the call's `agent` argument.
 pub(crate) enum DelegationRoute {
-    /// Model-routed: `ask_<name>` tool name → delegate (§13.1).
-    PerSubagent(HashMap<String, LocalSubagent>),
-    /// Single-tool: one unified tool name plus a delegate-name → delegate map
-    /// the `agent` argument selects into (§10.2).
+    /// Model-routed: `ask_<name>` tool name → delegate (§13.1). Local subagents
+    /// and managed external agents share the tool-name space but keep separate
+    /// maps so the handler can pick the right fulfillment path.
+    PerSubagent {
+        /// Local subagents keyed by their `ask_<name>` tool name.
+        local: HashMap<String, LocalSubagent>,
+        /// Managed external agents keyed by their `ask_<name>` tool name.
+        external: HashMap<String, ManagedExternalDelegate>,
+    },
+    /// Single-tool: one unified tool name plus delegate-name → delegate maps the
+    /// `agent` argument selects into (§10.2).
     SingleTool {
         /// The advertised name of the unified delegation tool.
         tool_name: String,
-        /// Delegates keyed by their registration name.
-        by_name: HashMap<String, LocalSubagent>,
+        /// Local subagents keyed by their registration name.
+        local_by_name: HashMap<String, LocalSubagent>,
+        /// Managed external agents keyed by their registration name.
+        external_by_name: HashMap<String, ManagedExternalDelegate>,
     },
 }
 
@@ -882,7 +956,9 @@ impl DelegationRoute {
     /// Reports whether `name` is this route's delegation tool.
     fn is_delegation(&self, name: &str) -> bool {
         match self {
-            Self::PerSubagent(by_tool) => by_tool.contains_key(name),
+            Self::PerSubagent { local, external } => {
+                local.contains_key(name) || external.contains_key(name)
+            }
             Self::SingleTool { tool_name, .. } => name == tool_name,
         }
     }
@@ -897,11 +973,20 @@ impl DelegationRoute {
             .unwrap_or_default()
             .to_owned();
         match self {
-            Self::PerSubagent(by_tool) => match by_tool.get(&call.name) {
-                Some(subagent) => Resolved::Delegate { subagent, task },
-                None => Resolved::NotDelegation,
-            },
-            Self::SingleTool { tool_name, by_name } => {
+            Self::PerSubagent { local, external } => {
+                if let Some(subagent) = local.get(&call.name) {
+                    Resolved::Delegate { subagent, task }
+                } else if let Some(delegate) = external.get(&call.name) {
+                    Resolved::External { delegate, task }
+                } else {
+                    Resolved::NotDelegation
+                }
+            }
+            Self::SingleTool {
+                tool_name,
+                local_by_name,
+                external_by_name,
+            } => {
                 if &call.name != tool_name {
                     return Resolved::NotDelegation;
                 }
@@ -911,16 +996,23 @@ impl DelegationRoute {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                match by_name.get(&requested) {
-                    Some(subagent) => Resolved::Delegate { subagent, task },
-                    None => Resolved::UnknownDelegate {
+                if let Some(subagent) = local_by_name.get(&requested) {
+                    Resolved::Delegate { subagent, task }
+                } else if let Some(delegate) = external_by_name.get(&requested) {
+                    Resolved::External { delegate, task }
+                } else {
+                    Resolved::UnknownDelegate {
                         requested,
                         available: {
-                            let mut names: Vec<&str> = by_name.keys().map(String::as_str).collect();
+                            let mut names: Vec<&str> = local_by_name
+                                .keys()
+                                .chain(external_by_name.keys())
+                                .map(String::as_str)
+                                .collect();
                             names.sort_unstable();
                             names.join(", ")
                         },
-                    },
+                    }
                 }
             }
         }
@@ -929,9 +1021,15 @@ impl DelegationRoute {
 
 /// The outcome of resolving a tool call against a [`DelegationRoute`].
 enum Resolved<'a> {
-    /// The call routes to `subagent` with the given `task` brief.
+    /// The call routes to a local `subagent` with the given `task` brief.
     Delegate {
         subagent: &'a LocalSubagent,
+        task: String,
+    },
+    /// The call routes to a managed external `delegate` with the given `task`
+    /// brief.
+    External {
+        delegate: &'a ManagedExternalDelegate,
         task: String,
     },
     /// A single-tool delegation named a delegate that is not registered.
@@ -1069,10 +1167,105 @@ impl DelegationToolHandler {
             .expect("delegation recorder poisoned")
             .insert(
                 call_id.to_string(),
-                DelegationTrace {
-                    delegate: delegate.to_owned(),
+                RecordedDelegation {
+                    trace: DelegationTrace {
+                        delegate: delegate.to_owned(),
+                        status,
+                        usage,
+                    },
+                    artifacts: Vec::new(),
+                    is_external: false,
+                },
+            );
+    }
+
+    /// Drives one managed external delegation and folds its summary back as the
+    /// tool result, recording the delegation trace, usage, and artifacts under
+    /// `call_id`.
+    ///
+    /// The external agent is driven through the shared
+    /// [`drive_external`](crate::facade::external) helper — the same
+    /// `NeedSubagent`/[`DrivingSubagentHandler`] mechanism a local subagent uses
+    /// — so cancellation, budget, and trace propagation are identical. A drive
+    /// that reaches its terminal `Done` cursor without a lingering cleanup marker
+    /// is [`Completed`](DelegationStatus::Completed); a failed drive or a
+    /// cancel-abandoned session is [`Failed`](DelegationStatus::Failed) and folds
+    /// a classified error back to the model.
+    async fn drive_external_delegation(
+        &self,
+        call_id: ToolCallId,
+        call: &ToolCall,
+        delegate: &ManagedExternalDelegate,
+        task: String,
+        ctx: &RunContext,
+    ) -> RequirementResult {
+        match drive_external(delegate.name(), delegate.agent(), &self.ids, task, ctx).await {
+            Ok(outcome) => {
+                let status = if outcome.completed && !outcome.cleanup_required {
+                    DelegationStatus::Completed
+                } else {
+                    DelegationStatus::Failed
+                };
+                let summary = outcome.summary;
+                self.record_external(
+                    &call_id,
+                    delegate.name(),
                     status,
-                    usage,
+                    outcome.usage,
+                    outcome.artifacts,
+                );
+                match status {
+                    DelegationStatus::Completed => {
+                        RequirementResult::Tool(Ok(delegation_response(call, &summary)))
+                    }
+                    DelegationStatus::Failed => {
+                        RequirementResult::Tool(Err(ToolRuntimeError::ExecutionFailed {
+                            tool_name: call.name.clone(),
+                            message: "external delegation did not reach a completed state"
+                                .to_owned(),
+                        }))
+                    }
+                }
+            }
+            Err(error) => {
+                self.record_external(
+                    &call_id,
+                    delegate.name(),
+                    DelegationStatus::Failed,
+                    Usage::default(),
+                    Vec::new(),
+                );
+                RequirementResult::Tool(Err(ToolRuntimeError::ExecutionFailed {
+                    tool_name: call.name.clone(),
+                    message: error.to_string(),
+                }))
+            }
+        }
+    }
+
+    /// Records one external delegation trace (with any reported artifacts) under
+    /// its framework call id.
+    fn record_external(
+        &self,
+        call_id: &ToolCallId,
+        delegate: &str,
+        status: DelegationStatus,
+        usage: Usage,
+        artifacts: Vec<ArtifactRef>,
+    ) {
+        self.recorder
+            .lock()
+            .expect("delegation recorder poisoned")
+            .insert(
+                call_id.to_string(),
+                RecordedDelegation {
+                    trace: DelegationTrace {
+                        delegate: delegate.to_owned(),
+                        status,
+                        usage,
+                    },
+                    artifacts,
+                    is_external: true,
                 },
             );
     }
@@ -1089,6 +1282,10 @@ impl ToolHandler for DelegationToolHandler {
         match self.route.resolve(call) {
             Resolved::Delegate { subagent, task } => {
                 self.drive_delegation(call_id, call, subagent, task, ctx)
+                    .await
+            }
+            Resolved::External { delegate, task } => {
+                self.drive_external_delegation(call_id, call, delegate, task, ctx)
                     .await
             }
             Resolved::UnknownDelegate {
@@ -1520,6 +1717,295 @@ mod model_routed_tests {
                 .iter()
                 .any(|event| matches!(event, RunEvent::ToolStarted(_))),
             "no ordinary tool events for a delegation"
+        );
+    }
+
+    /// A minimal in-crate [`ExternalSessionHandler`](crate::agent::ExternalSessionHandler)
+    /// double that returns a fixed [`ExternalSessionResult`] on every `fulfill`.
+    ///
+    /// An in-crate unit test cannot use `agent-testkit`'s scripted handler: the
+    /// testkit implements the trait against the *dependency* copy of `agent-lib`,
+    /// which the test harness treats as a different crate than the `crate::` under
+    /// test. This local double implements the `crate::` trait directly, keeping
+    /// the delegation drive fully offline.
+    struct FixedExternalSessionHandler {
+        result: crate::agent::ExternalSessionResult,
+    }
+
+    #[async_trait]
+    impl crate::agent::ExternalSessionHandler for FixedExternalSessionHandler {
+        async fn fulfill(
+            &self,
+            _request: &crate::agent::ExternalSessionRequest,
+            _ctx: &crate::agent::RunContext,
+        ) -> crate::agent::RequirementResult {
+            crate::agent::RequirementResult::ExternalSession(Box::new(self.result.clone()))
+        }
+    }
+
+    /// Builds a [`FixedExternalSessionHandler`] that completes with `summary`, one
+    /// patch artifact at `path`, and the given runtime-reported `usage`, plus a
+    /// command/patch observation trail.
+    fn completed_external_handler(
+        summary: &str,
+        path: &str,
+        usage: Usage,
+    ) -> FixedExternalSessionHandler {
+        use crate::agent::external::{
+            ExternalAgentEvent, ExternalAgentOutput, ExternalArtifactKind, ExternalArtifactRef,
+            ExternalObservedEvent, ExternalRuntimeKind, ExternalSessionRef, ExternalSessionResult,
+        };
+
+        let result = ExternalSessionResult::Completed {
+            session: ExternalSessionRef {
+                runtime: ExternalRuntimeKind::ClaudeCode,
+                session_id: Some("sess-1".to_owned()),
+                transcript_ref: None,
+                resume_token: Some("resume-1".to_owned()),
+                last_event_seq: Some(2),
+            },
+            output: ExternalAgentOutput {
+                summary: summary.to_owned(),
+                artifacts: vec![ExternalArtifactRef {
+                    kind: ExternalArtifactKind::Patch,
+                    summary: "parser patch".to_owned(),
+                    path: Some(path.to_owned()),
+                    reference: Some("diff-1".to_owned()),
+                }],
+                usage: Some(usage),
+                cost_micros: None,
+            },
+            observations: ExternalObservedEvent::unsequenced_for_tests(vec![
+                ExternalAgentEvent::CommandFinished {
+                    exit_code: Some(0),
+                    stdout_tail: "test result: ok. 1 passed".to_owned(),
+                    stderr_tail: String::new(),
+                },
+                ExternalAgentEvent::FilePatch {
+                    path: path.to_owned(),
+                    summary: "tighten the token loop".to_owned(),
+                    diff_ref: Some("diff-1".to_owned()),
+                },
+            ]),
+        };
+        FixedExternalSessionHandler { result }
+    }
+
+    #[tokio::test]
+    async fn model_routed_external_delegation_records_trace_artifacts_and_usage() {
+        use crate::facade::ManagedExternalAgent;
+
+        let client = RoutingClient::new(vec![route(
+            "SUPERVISOR",
+            vec![
+                tool_call_response(
+                    "del-1",
+                    "ask_coder",
+                    json!({ "task": "refactor the parser" }),
+                ),
+                text_response("Final: the coder finished."),
+            ],
+        )]);
+
+        let handler = completed_external_handler(
+            "refactor complete",
+            "src/parser.rs",
+            Usage {
+                input: 13,
+                output: 9,
+                ..Usage::default()
+            },
+        );
+        let coder = ManagedExternalAgent::claude_code()
+            .session_handler(Arc::new(handler))
+            .build()
+            .expect("managed external agent builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .external_agent("coder", coder)
+            .build()
+            .expect("agent builds");
+
+        let output = agent.run_full("Please refactor the parser.").await.unwrap();
+
+        // The supervisor advanced past the delegation to its final message.
+        assert_eq!(output.reply.text(), "Final: the coder finished.");
+
+        // The external session summary was folded back as the tool result.
+        assert!(
+            tool_result_texts(&agent)
+                .iter()
+                .any(|text| text == "refactor complete"),
+            "the external summary is folded back as the tool result"
+        );
+
+        // Exactly one delegation trace, attributed to the external delegate,
+        // completed, carrying the runtime-reported usage.
+        assert_eq!(output.delegations.len(), 1);
+        let trace = &output.delegations[0];
+        assert_eq!(trace.delegate, "coder");
+        assert_eq!(trace.status, DelegationStatus::Completed);
+        assert_eq!(trace.usage.input, 13);
+        assert_eq!(trace.usage.output, 9);
+
+        // External usage is attributed to the external slice, not the subagent or
+        // supervisor slices (§17.3).
+        assert_eq!(output.usage.external.input, 13);
+        assert_eq!(output.usage.external.output, 9);
+        assert_eq!(output.usage.subagents.input, 0);
+        assert_eq!(output.usage.subagents.output, 0);
+
+        // The reported artifact surfaces on the run output, projected to its
+        // locating path.
+        assert_eq!(output.artifacts.len(), 1);
+        assert_eq!(output.artifacts[0].path, "src/parser.rs");
+
+        // The delegation is not double-counted as an ordinary tool call.
+        assert!(
+            output.tool_calls.is_empty(),
+            "an external delegation is not an ordinary tool call"
+        );
+        assert!(
+            !output
+                .events
+                .iter()
+                .any(|event| matches!(event, RunEvent::ToolStarted(_))),
+            "no ordinary tool events for a delegation"
+        );
+
+        // The event order brackets the delegation with Started, then the
+        // artifact, then Finished.
+        let started = output
+            .events
+            .iter()
+            .position(|event| matches!(event, RunEvent::DelegationStarted(_)))
+            .expect("a DelegationStarted event");
+        let artifact = output
+            .events
+            .iter()
+            .position(|event| matches!(event, RunEvent::DelegationArtifact(_)))
+            .expect("a DelegationArtifact event");
+        let finished = output
+            .events
+            .iter()
+            .position(|event| matches!(event, RunEvent::DelegationFinished(_)))
+            .expect("a DelegationFinished event");
+        assert!(
+            started < artifact,
+            "DelegationStarted precedes the artifact"
+        );
+        assert!(
+            artifact < finished,
+            "the artifact precedes DelegationFinished"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_delegate_is_advertised_as_an_ask_tool() {
+        use crate::facade::ManagedExternalAgent;
+
+        let handler = completed_external_handler(
+            "done",
+            "src/lib.rs",
+            Usage {
+                input: 1,
+                output: 1,
+                ..Usage::default()
+            },
+        );
+        let coder = ManagedExternalAgent::claude_code()
+            .session_handler(Arc::new(handler))
+            .build()
+            .expect("managed external agent builds");
+
+        let agent = AgentBuilder::default()
+            .client(RoutingClient::new(vec![route(
+                "SUPERVISOR",
+                vec![text_response("nothing to do")],
+            )]))
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .external_agent("coder", coder)
+            .build()
+            .expect("agent builds");
+
+        // The delegate is registered and exposed as its own `ask_coder` tool.
+        assert_eq!(agent.external_agents().len(), 1);
+        assert_eq!(agent.external_agents()[0].name(), "coder");
+        assert!(
+            agent
+                .state()
+                .spec()
+                .initial_tools()
+                .tools()
+                .iter()
+                .any(|tool| tool.name == "ask_coder"),
+            "the external delegate mints an `ask_coder` delegation tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_delegation_without_session_handler_fails_the_delegation() {
+        use crate::facade::ManagedExternalAgent;
+
+        let client = RoutingClient::new(vec![route(
+            "SUPERVISOR",
+            vec![
+                tool_call_response(
+                    "del-1",
+                    "ask_coder",
+                    json!({ "task": "refactor the parser" }),
+                ),
+                text_response("Final: gave up on the coder."),
+            ],
+        )]);
+
+        // No session handler is attached, so the delegation cannot be driven.
+        let coder = ManagedExternalAgent::claude_code()
+            .build()
+            .expect("managed external agent builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .external_agent("coder", coder)
+            .build()
+            .expect("agent builds");
+
+        let output = agent.run_full("Please refactor the parser.").await.unwrap();
+
+        // The supervisor still reached its final message after the failed tool.
+        assert_eq!(output.reply.text(), "Final: gave up on the coder.");
+
+        // The delegation is recorded as failed, with no artifacts.
+        assert_eq!(output.delegations.len(), 1);
+        assert_eq!(output.delegations[0].delegate, "coder");
+        assert_eq!(output.delegations[0].status, DelegationStatus::Failed);
+        assert!(
+            output.artifacts.is_empty(),
+            "a failed drive yields no artifacts"
+        );
+
+        // A failed delegation emits Failed, never Finished.
+        assert!(
+            output
+                .events
+                .iter()
+                .any(|event| matches!(event, RunEvent::DelegationFailed(_))),
+            "a failed external delegation emits DelegationFailed"
+        );
+        assert!(
+            !output
+                .events
+                .iter()
+                .any(|event| matches!(event, RunEvent::DelegationFinished(_))),
+            "a failed external delegation does not emit DelegationFinished"
         );
     }
 

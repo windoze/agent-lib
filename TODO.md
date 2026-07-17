@@ -1098,7 +1098,7 @@ approval defaults（比 local 更保守）+ artifact trace + external restore po
   4 features clippy 均 clean；`cargo test --all --all-targets` 全绿；
   `RUSTDOCFLAGS="-D warnings" cargo doc`（default + 4 features）clean；`git diff --check` clean。
 
-### [TODO] M4-2 `.external_agent(..)` external delegate 兑现 + artifact/delegation trace
+### [DONE] M4-2 `.external_agent(..)` external delegate 兑现 + artifact/delegation trace
 
 **上下文**：
 
@@ -1128,6 +1128,33 @@ approval defaults（比 local 更保守）+ artifact trace + external restore po
   `DelegationFinished`；cancel 时 external session 走 cleanup（cleanup 标记）。
 - 聚焦：`cargo test -p agent-lib facade::external`（含 delegate 兑现用例）。
 - 完整验证序列 1–6（+ external features clippy 同 M4-1）。
+
+**完成记录**：
+
+- `AgentBuilder::external_agent(name, ManagedExternalAgent)` 登记 external delegate；经 model-routed
+  暴露为 `ask_<name>` 工具（与 local subagent 共用 declarations/route/single-tool 路径）。新增
+  `ManagedExternalAgent::session_handler(..)` seam 注入 scoped `ExternalSessionHandler`。
+- 兑现路径复用 local subagent 的 `DrivingSubagentHandler::fulfill`：`FacadeExternalSpawner` 构造
+  `ExternalAgentMachine`（包在 `RecordingExternalMachine` 中，按步捕获 summary/usage/artifacts/
+  cleanup/completed），由 `ExternalChildScope` 经注入的 handler 兑现 `NeedExternalSession`，
+  外层 `EmptyExternalScope` + `ScopePop`。`drive_external` 把 `Subagent(Ok)` 映射为捕获的
+  `ExternalDriveOutcome`，`Subagent(Err)` 映射为 `FacadeError::ExternalAgent`。
+- external observations 折叠为 `DelegationTrace`（usage/status：`Completed` 当且仅当
+  `completed && !cleanup_required`，否则 `Failed`）+ `RunOutput.artifacts`（`map_artifact`
+  将 `ExternalArtifactRef` 归一为 `ArtifactRef`）；usage 走 `UsageSummary.external`（§17.3）。
+  沿途产 `RunEvent::DelegationStarted`/`DelegationArtifact`/`DelegationFinished`（`run_full`
+  与 streaming 两路一致）。
+- 离线单测（`src/facade/delegate.rs` `model_routed_tests`，用 in-crate `FixedExternalSessionHandler`
+  绕开 agent-testkit 的 crate-重复问题）：`ask_coder` Start→Completed、`RunOutput.delegations`
+  含 external（usage/status）、`RunOutput.artifacts` 含上报 artifact、三个 `Delegation*` 事件、
+  external delegate 广告为 `ask_` 工具、缺 session_handler 时 delegation 失败。新增
+  `src/facade/external.rs` `drive_external_marks_cleanup_on_cancel`：预取消 `RunContext` 下
+  external session 走 abandon→cleanup 标记（`cleanup_required` 置位、未 completed、无 artifact）。
+- 验证：`cargo fmt --all` ✓；`cargo clippy --all-targets -- -D warnings` ✓；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D warnings` ✓；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✓；`cargo test --all --all-targets`
+  ✓（0 失败）；`cargo test -p agent-lib --lib --features "external-claude-code external-codex external-opencode"`
+  ✓（855 passed）。聚焦 `cargo test -p agent-lib --lib facade::` ✓（102 passed）。
 
 ### [TODO] M4-3 external approval defaults + restore policy + `AgentSnapshot` external 字段
 

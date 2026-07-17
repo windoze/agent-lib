@@ -58,10 +58,11 @@ use crate::facade::delegate::{
     LocalSubagent, new_delegation_recorder,
 };
 use crate::facade::error::FacadeError;
+use crate::facade::external::{ManagedExternalAgent, ManagedExternalDelegate};
 use crate::facade::ids::FacadeIds;
 use crate::facade::run::{
-    DelegationStatus, DelegationTrace, IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace,
-    UsageSummary,
+    ArtifactRef, DelegationStatus, DelegationTrace, IntoUserMessage, Reply, RunEvent, RunOutput,
+    ToolTrace, UsageSummary,
 };
 use crate::facade::tool::{
     FacadeToolRegistry, Tool, ToolContextParts, ensure_unique_declaration_names,
@@ -127,6 +128,7 @@ pub struct Agent {
     approval: Arc<FacadeApproval>,
     ids: FacadeIds,
     delegates: Vec<LocalSubagent>,
+    external_agents: Vec<ManagedExternalDelegate>,
     delegation: Delegation,
 }
 
@@ -156,6 +158,14 @@ impl std::fmt::Debug for Agent {
                     .delegates
                     .iter()
                     .map(LocalSubagent::name)
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "external_agents",
+                &self
+                    .external_agents
+                    .iter()
+                    .map(ManagedExternalDelegate::name)
                     .collect::<Vec<_>>(),
             )
             .field("delegation", &self.delegation)
@@ -284,13 +294,14 @@ impl Agent {
                     final_turn_summary(self.machine.state().conversation());
                 let mut usage_summary = UsageSummary::from_supervisor(usage.clone());
                 usage_summary.add_subagent(collected.subagent_usage);
+                usage_summary.add_external(collected.external_usage);
                 Ok(RunOutput {
                     reply: Reply::from_parts(text, Some(usage), stop_reason),
                     response: None,
                     usage: usage_summary,
                     tool_calls: collected.tool_calls,
                     delegations: collected.delegations,
-                    artifacts: Vec::new(),
+                    artifacts: collected.artifacts,
                     events: collected.events,
                 })
             }
@@ -332,6 +343,17 @@ impl Agent {
         &self.delegates
     }
 
+    /// Returns the managed external agents registered as delegates on this agent.
+    ///
+    /// Each entry is a data-first [`ManagedExternalDelegate`] registered through
+    /// [`AgentBuilder::external_agent`]; the live external runtime is driven only
+    /// when a delegation is fulfilled (milestone M4-2), exposed to the
+    /// supervising model as its own `ask_<name>` tool.
+    #[must_use]
+    pub fn external_agents(&self) -> &[ManagedExternalDelegate] {
+        &self.external_agents
+    }
+
     /// Returns the delegation routing strategy configured on this agent.
     ///
     /// Defaults to [`Delegation::model_routed`] (one `ask_<name>` tool per
@@ -345,7 +367,8 @@ impl Agent {
     /// [`DelegationToolHandler`] (and the streaming tap) consult to recognize and
     /// dispatch delegation calls (§10.1, §10.2).
     fn delegation_route(&self) -> DelegationRoute {
-        self.delegation.route(&self.delegates)
+        self.delegation
+            .route(&self.delegates, &self.external_agents)
     }
 
     /// Returns the supervisor's own model, substituted into any inheriting child
@@ -480,6 +503,7 @@ pub struct AgentBuilder {
     worktree: Option<WorktreeRef>,
     ids: Option<FacadeIds>,
     delegates: Vec<LocalSubagent>,
+    external_agents: Vec<ManagedExternalDelegate>,
     delegation: Option<Delegation>,
 }
 
@@ -509,6 +533,14 @@ impl std::fmt::Debug for AgentBuilder {
                     .delegates
                     .iter()
                     .map(LocalSubagent::name)
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "external_agents",
+                &self
+                    .external_agents
+                    .iter()
+                    .map(ManagedExternalDelegate::name)
                     .collect::<Vec<_>>(),
             )
             .field("delegation", &self.delegation)
@@ -655,6 +687,46 @@ impl AgentBuilder {
         self
     }
 
+    /// Registers a managed external agent delegate under `name`.
+    ///
+    /// The `agent` is a data-first [`ManagedExternalAgent`] recipe; this stamps
+    /// `name` onto it and records it in the agent's external-delegate table
+    /// (`docs/facade-api.md` §13.1). Like a local subagent it is exposed to the
+    /// supervising model as its own `ask_<name>` tool, but a fulfilled delegation
+    /// drives the external CLI runtime instead of an in-library child (milestone
+    /// M4-2). Registration order is preserved and exposed through
+    /// [`Agent::external_agents`].
+    ///
+    /// The delegate must carry a runtime session handler (attached with
+    /// [`ManagedExternalAgentBuilder::session_handler`](crate::facade::ManagedExternalAgentBuilder::session_handler))
+    /// before a delegation can be driven; a delegate without one fails the
+    /// delegation with [`FacadeError::ExternalAgent`].
+    ///
+    /// ```no_run
+    /// # fn demo() -> Result<(), agent_lib::facade::FacadeError> {
+    /// use agent_lib::facade::{Agent, ManagedExternalAgent, ProviderConfig};
+    ///
+    /// let coder = ManagedExternalAgent::claude_code().build()?;
+    /// let agent = Agent::builder()
+    ///     .provider(ProviderConfig::openai_from_env()?)
+    ///     .model("gpt-5.5")
+    ///     .system("You coordinate a managed coding agent.")
+    ///     .external_agent("coder", coder)
+    ///     .build()?;
+    ///
+    /// // The delegate is exposed to the supervising model as an `ask_coder` tool.
+    /// assert_eq!(agent.external_agents().len(), 1);
+    /// assert_eq!(agent.external_agents()[0].name(), "coder");
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn external_agent(mut self, name: impl Into<String>, agent: ManagedExternalAgent) -> Self {
+        self.external_agents
+            .push(ManagedExternalDelegate::new(name, agent));
+        self
+    }
+
     /// Sets the delegation routing strategy for the registered subagents.
     ///
     /// Defaults to [`Delegation::model_routed`] (one `ask_<name>` tool per
@@ -726,7 +798,7 @@ impl AgentBuilder {
         if let Some(custom) = &self.custom_registry {
             declarations.extend(custom.declarations());
         }
-        declarations.extend(delegation.declarations(&self.delegates));
+        declarations.extend(delegation.declarations(&self.delegates, &self.external_agents));
 
         // Reject any name collision the delegation tools introduce — two
         // delegates minting the same `ask_<name>`, or a delegation tool clashing
@@ -763,6 +835,7 @@ impl AgentBuilder {
             approval,
             ids,
             delegates: self.delegates,
+            external_agents: self.external_agents,
             delegation,
         })
     }
@@ -870,8 +943,13 @@ pub(crate) struct CollectedTraces {
     pub tool_calls: Vec<ToolTrace>,
     /// Traces for delegation calls, recorded by the delegation handler.
     pub delegations: Vec<DelegationTrace>,
-    /// Aggregate token usage reported by every driven child.
+    /// Aggregate token usage reported by every driven local subagent.
     pub subagent_usage: crate::model::usage::Usage,
+    /// Aggregate token usage reported by every driven managed external agent.
+    pub external_usage: crate::model::usage::Usage,
+    /// Artifacts (patches/diffs/files/test results) reported by external
+    /// delegates, in the order their delegations completed.
+    pub artifacts: Vec<ArtifactRef>,
     /// The ordered normalized events for the run.
     pub events: Vec<RunEvent>,
 }
@@ -882,11 +960,14 @@ pub(crate) struct CollectedTraces {
 /// A [`Notification::ToolCallStarted`] carries the tool name and framework call
 /// id. When that call id was recorded as a delegation by the
 /// [`DelegationToolHandler`], it seeds a [`DelegationTrace`] in `delegations`
-/// (its child usage folded into `subagent_usage`) and a
+/// (its child usage folded into `subagent_usage` for a local subagent or
+/// `external_usage` for a managed external agent) and a
 /// [`RunEvent::DelegationStarted`]; otherwise it seeds a [`ToolTrace`] and a
 /// [`RunEvent::ToolStarted`]. A [`Notification::ToolCallFinished`] carries only
 /// the call id, so its role is recovered from the same recorder / started map to
-/// emit the matching finished (or failed) event.
+/// emit the matching finished (or failed) event; an external delegation that
+/// completed also emits one [`RunEvent::DelegationArtifact`] per reported
+/// artifact and folds those artifacts into the run output.
 pub(crate) fn collect_traces(
     notifications: &[Notification],
     recorder: &DelegationRecorder,
@@ -898,6 +979,8 @@ pub(crate) fn collect_traces(
     let mut tool_calls = Vec::new();
     let mut delegations = Vec::new();
     let mut subagent_usage = crate::model::usage::Usage::default();
+    let mut external_usage = crate::model::usage::Usage::default();
+    let mut artifacts = Vec::new();
     let mut events = Vec::new();
     let mut names: HashMap<String, String> = HashMap::new();
 
@@ -905,10 +988,14 @@ pub(crate) fn collect_traces(
         match notification {
             Notification::ToolCallStarted(started) => {
                 let call_id = started.call_id().to_string();
-                if let Some(trace) = recorded.get(&call_id) {
-                    delegations.push(trace.clone());
-                    subagent_usage.merge(trace.usage.clone());
-                    events.push(RunEvent::DelegationStarted(trace.clone()));
+                if let Some(record) = recorded.get(&call_id) {
+                    delegations.push(record.trace.clone());
+                    if record.is_external {
+                        external_usage.merge(record.trace.usage.clone());
+                    } else {
+                        subagent_usage.merge(record.trace.usage.clone());
+                    }
+                    events.push(RunEvent::DelegationStarted(record.trace.clone()));
                 } else {
                     let name = started.call().name.clone();
                     names.insert(call_id.clone(), name.clone());
@@ -919,13 +1006,17 @@ pub(crate) fn collect_traces(
             }
             Notification::ToolCallFinished(finished) => {
                 let call_id = finished.call_id().to_string();
-                if let Some(trace) = recorded.get(&call_id) {
-                    match trace.status {
+                if let Some(record) = recorded.get(&call_id) {
+                    match record.trace.status {
                         DelegationStatus::Completed => {
-                            events.push(RunEvent::DelegationFinished(trace.clone()));
+                            for artifact in &record.artifacts {
+                                artifacts.push(artifact.clone());
+                                events.push(RunEvent::DelegationArtifact(artifact.clone()));
+                            }
+                            events.push(RunEvent::DelegationFinished(record.trace.clone()));
                         }
                         DelegationStatus::Failed => {
-                            events.push(RunEvent::DelegationFailed(trace.clone()));
+                            events.push(RunEvent::DelegationFailed(record.trace.clone()));
                         }
                     }
                 } else {
@@ -941,6 +1032,8 @@ pub(crate) fn collect_traces(
         tool_calls,
         delegations,
         subagent_usage,
+        external_usage,
+        artifacts,
         events,
     }
 }
