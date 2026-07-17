@@ -1,72 +1,81 @@
-# M6-2 实现 Claude Code stream decoder cassette 测试
+# M6-3 实现 Claude Code session adapter 与 ignored real e2e
 
-**当前执行 = TODO.md 第一个未完成任务 = M6-2**（M1..M5 全 `[DONE]`，M6-1 `[DONE]`）。
+**当前执行 = TODO.md 第一个未完成任务 = M6-3**（M1..M5 全 `[DONE]`，M6-1/M6-2 `[DONE]`）。
 
-## 任务理解
-M6-1 已落地 `external-claude-code` feature 下的 `ClaudeCodeConfig` + capability probe。
-M6-2 要实现 **Claude Code 私有 stream-json 帧解码器**：消费原始 CLI 帧，产出中立的
-`ExternalObservedEvent` 观测流 + 决策点（`Completed` / `PausedForToolCalls` /
-`PausedForInteraction` / `Failed`）。raw schema 不得暴露为 public DTO。并加 cassette
-fixture + parser 测试（覆盖 text / permission / tool / patch / completion）。
-
-## 真实 Claude stream-json 帧模型（JSONL，逐行一个 JSON 对象）
-- `{"type":"system","subtype":"init","session_id","cwd","tools","model"}` → SessionStarted
-- `{"type":"assistant","message":{"id","role","content":[blocks],"usage"}}`
-  - text block → TextDelta
-  - tool_use Bash → CommandStarted；Edit/Write/... → FilePatch；其它内建 → ToolStarted
-  - tool_use `mcp__*`（宿主桥接工具）→ 累积成 PausedForToolCalls 批次
-- `{"type":"user","message":{"content":[tool_result...]}}`
-  - 关联到内建 Bash → CommandFinished；其它内建 → ToolFinished
-- `{"type":"control_request","request_id","request":{"subtype":"can_use_tool","tool_name","input"}}`
-  → PermissionRequested 观测 + PausedForInteraction 决策
-- `{"type":"result","subtype":"success","result","usage","total_cost_usd",...}`
-  → SessionCompleted 观测 + Completed 决策；error 子类型 → Failed(LimitExceeded/Runtime)
-
-## 未知/异常帧策略（稳定）
-- 非法 JSON / 非对象 / 缺 `type` 字符串 / 已知类型但内层结构缺失 → `ExternalAgentError::Protocol`
-- 已知类型但**未知子结构块**（未知 content block）/ **未知 `type`** / 空行 → 容忍（忽略）
+## 任务
+在 `external-claude-code` feature 下，实现真实 Claude Code runtime adapter：
+- start / resume / advance / cleanup（`ExternalRuntimeAdapter` + `ExternalRuntimeSession`）。
+- 包裹 M6-2 的 `ClaudeStreamDecoder`，把真实 CLI stream-json stdout 逐行喂给 decoder，
+  驱动到**下一个** decision point（禁止一次跑到底）。
+- 接入 live sink（每行 drain 后 emit）。
+- host tools：本 adapter 不实现 MCP server，因此 `host_tools=false`/`host_subagents=false`
+  （§12.3 允许的分支）；start 请求携带 `tools` 时返回 `UnsupportedCapability{HostTools}`。
+- ignored real e2e：检测 `CLAUDE_CODE_BIN`/PATH + 登录态，缺失则 skip；临时 worktree；
+  验证 text -> permission -> completion 单进程多步会话。
 
 ## 设计
-- 新增 feature-gated 私有模块 `src/agent/external/claude_code/decoder.rs`：
-  - `ClaudeDecodeContext { step_id, actor }`（宿主提供，用于构造 permission Interaction）
-  - `ClaudeStreamDecoder`：有状态，跨 turn 单调 `seq`，`push_line -> Result<Option<ClaudeDecision>,_>`，
-    `take_observations()`；私有 raw 解析走 `serde_json::Value` 防御式导航（容忍未知）。
-  - `ClaudeDecision`（crate 私有）：Completed / PausedForInteraction / PausedForToolCalls / Failed。
-  - raw 帧结构不暴露；`mod.rs` 以 `pub(crate) use` 挂载 decoder，不进 public API。
-- cassette fixture：`tests/fixtures/external/claude_code/full_session.json`（3 turn：
-  Start→PausedForToolCalls，RespondToolResults→PausedForInteraction，RespondInteraction→Completed），
-  覆盖 text/command/patch/tool/permission/completion。使用 `ExternalRuntimeCassette` 格式。
-- 测试放 decoder.rs 内联 `#[cfg(test)] mod tests`（名字含 `claude_code_cassette`），
-  用 dev-dep `agent_testkit::prelude::ExternalRuntimeCassette` 加载 fixture，逐 turn 喂
-  `input_frames` 给解码器，断言观测 == `expected_events` 且决策匹配 `decision`；
-  加 in-code builder + `AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1` regenerate 守卫 + round-trip +
-  `assert_no_secrets`。再加内联 raw-frame 单测覆盖未知帧容忍 / 空行 / 非法JSON→Protocol /
-  缺 type→Protocol / error result→Failed。
+新增 feature-gated 私有模块 `src/agent/external/claude_code/adapter.rs`：
+- `ClaudeSessionIo` trait（可注入 IO，离线测试用 fake，生产用真实 process）：
+  - write_frame / read_frame -> Option<String> / close -> ExternalSessionShutdown。
+- `ClaudeProcessIo`：tokio::process spawn（stdin/stdout piped、kill_on_drop、working_dir、env、
+  per-read timeout）；close = drop stdin -> wait(grace) -> Graceful / kill->ForcedKill / Failed。
+- `ClaudeCodeSession<Io>`（实现 `ExternalRuntimeSession`）：持有 io + ClaudeStreamDecoder
+  + session_id + last_event_seq + sink + capabilities + carried(prelude 观测)。
+  - prelude 时序修正（真机验证）：Claude Code **在收到首条 stdin turn 前不产出任何 frame**（连
+    `system/init` 都不发）。故 start 先写首个输入(prompt)，再 read 到 `init` 帧拿 session_id 作 key；
+    该 turn 余帧留给第一次 advance 续读（`first_turn_pending` 标记，避免重复写）。resume 已知 id，
+    begin 不预读，首次 advance 写续跑 turn 并读新 init。
+  - advance(input)：非首turn 先写 input 对应 stdin 帧，再 drive 到 decision：
+    - Start{prompt}/Continue{msg} -> user text frame；
+    - RespondInteraction(Permission) -> control_response allow/deny(request_id=action_id)；
+    - RespondToolResults/RespondSubagent -> UnsupportedCapability（防御，正常不会到达）。
+  - drive loop：read_frame -> push_line -> take_observations -> emit sink + 累积；
+    Some(decision)->返回；EOF 未决策 -> SessionLost；push_line Err -> 透传（Protocol）。
+  - shutdown -> io.close()。
+- `ClaudeCodeAdapter`（实现 `ExternalRuntimeAdapter`）：config + effective capabilities
+  = 实现能力(streaming/permission_bridge/resume/artifacts/usage/graceful=true, host_tools/subagents=false)
+  与传入(probe)能力交集。start（gate tools）/resume（--resume <id>）/kind/capabilities。
+- decode context：StepId::new(*ctx.run_id().as_uuid())（caller-supplied run id 派生，不随机生成）
+  + actor = request.agent_id。
+- stdin 帧用 serde_json 构造（转义安全）。
 
-## 验证条件（TODO.md）
-- `cargo test -p agent-lib claude_code_cassette`（未启 feature → 0 test）
-- 真正验证：`cargo test -p agent-lib --features external-claude-code claude_code_cassette`
-- 完整序列：fmt → clippy(`--all-targets -D warnings`，含 feature) → `cargo test --all --all-targets`
-  （未启 feature）→ feature-enabled 测试 → doc。
-- parser 不需真实 Claude Code；fixture 无 secret。
+## 测试
+- 内联 #[cfg(test)] mod tests（claude_code_adapter*，离线，仅用 agent-lib 类型 + 手写 FakeIo，
+  规避 agent-testkit<->agent-lib 依赖环）：
+  - session 全程 text->permission->completion 回放、sink 观测、session_ref/last_event_seq、
+    EOF->SessionLost、malformed->Protocol、shutdown 分类、resume prelude。
+  - adapter kind/capabilities（host_tools/subagents=false 其余 true、与 probe 交集）、
+    start tools->UnsupportedCapability。
+- ignored real e2e：tests/external_claude_code.rs（feature-gated，#[ignore]）。
 
-## 执行计划
-1. [x] 写 memory plan。
-2. [x] 实现 decoder.rs + mod.rs 挂载（feature-gated `pub`,非 `pub(crate)`,见下方修订）。
-3. [x] 建 fixture full_session.json（in-code builder + `AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1` 生成）。
-4. [x] 测试：改放 feature-gated 集成测试 `tests/agent_claude_code_cassette.rs`（cassette 回归 + raw-frame 边界）。
-5. [x] 更新 docs（managed-external-agent.md §12.2 实现状态 / capability-matrix / fixture README）。
-6. [x] 验证序列全过。
-7. [x] TODO.md 标 [DONE] + 完成记录。
-8. [x] 提交 `[M6-2] ...` 并停止。
+## mod / 导出 / 文档
+- claude_code/mod.rs 增 mod adapter; + re-export；external/mod.rs re-export 新公有类型。
+- docs：managed-external-agent.md §12.1/§12.3 增「实现状态(M6-3)」；capability-matrix.md Claude 行。
 
-## 设计修订（落地时）
-- decoder 改为 **feature-gated `pub`** 并 re-export（非 `pub(crate)`）：`agent-testkit` 依赖 `agent-lib`
-  且 `agent-lib` dev-dep `agent-testkit`,内联 `#[cfg(test)]` 用 `agent_testkit` 会产生两个 agent-lib
-  实例导致类型不一致。故测试改放 feature-gated 集成测试 `tests/agent_claude_code_cassette.rs`
-  （agent-lib 只链一次;未启 feature 时该文件为空 → 0 test,符合 `cargo test -p agent-lib claude_code_cassette` 约束）。
-- 同步小-`Ok` decoder helper 触发 `clippy::result_large_err`（`ExternalAgentError` ≥136B,未装箱,
-  是模块 canonical 错误）：以 decoder 模块级 `#![allow(clippy::result_large_err)]` + 说明注释显式接受,
-  与 `adapter.rs`/`registry.rs`/`probe.rs` 保持一致,不装箱、不改共享错误类型。
+## 验证序列（TODO.md 1-6 + 聚焦）
+1. cargo fmt --all -- --check
+2. cargo test -p agent-lib --features external-claude-code claude_code_adapter +
+   cargo test -p agent-lib claude_code_cassette（feature off -> 0 test；on -> pass）
+3. cargo clippy --all-targets -- -D warnings（+ --features external-claude-code）
+4. cargo test --all --all-targets（feature off）
+5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace（+ feature）
+6. git diff --check
+- e2e：本机若有真实 Claude Code + 登录态则跑 ignored，否则记录 skip 原因。
 
-## 状态：已完成（M6-2 [DONE]，已提交）
+## 进度
+- [x] adapter.rs 实现（含首turn时序修正 + first_turn_pending）
+- [x] mod / 导出
+- [x] 内联离线测试（15 个 claude_code_adapter_*，全过）
+- [x] ignored e2e（tests/external_claude_code.rs）
+- [x] 文档（managed-external-agent §12.1/§12.3 时序修正 + capability-matrix）
+- [x] 验证序列（fmt/clippy on+off/full suite feature-on 42 ok/doc on+off/diff --check 全过）
+- [x] 本机真机 e2e 实跑通过（10 观测事件，started→text→completed，23s，graceful shutdown）
+- [ ] TODO.md [DONE] + 完成记录
+- [ ] commit
+
+## 关键发现（真机）
+Claude Code `--print --output-format stream-json --input-format stream-json` 模式下，CLI 在读到第一条
+stdin `user` 帧前不发任何 frame（含 `system/init`）。最初的 adapter 假设 init 先于 stdin，导致 start 的
+prelude 读阻塞到超时（`SessionLost{TimedOut}`）。已按真实时序修正 begin/advance（见上），真机 e2e 随后
+跑通。权限桥接在本次非交互运行中未触发 `control_request`（CLI 直接阻塞受管工具并在文本里说明），故
+真机未覆盖 permission 分支；该分支由离线单测（control_response 映射 + text→permission→completion 回放）覆盖。

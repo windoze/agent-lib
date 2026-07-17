@@ -28,10 +28,12 @@
 //! ever exposing a raw frame type — its outputs are the provider-neutral
 //! observation and decision DTOs.
 
+mod adapter;
 mod config;
 mod decoder;
 mod probe;
 
+pub use adapter::ClaudeCodeAdapter;
 pub use config::ClaudeCodeConfig;
 pub use decoder::{ClaudeDecision, ClaudeDecodeContext, ClaudeStreamDecoder};
 pub use probe::{ClaudeCodeProbeExec, ProbeOutput, SystemClaudeCodeExec, probe, probe_with_exec};

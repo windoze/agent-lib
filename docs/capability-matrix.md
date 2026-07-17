@@ -105,8 +105,15 @@ resume、host 工具注入、subagent 桥接等。这套模型的唯一代码来
 `UnsupportedCapability{Streaming}`，并从 `--help` 广告出的开关**保守探测**能力位。该探测反映的是
 「CLI 自称支持什么」,仍**不是** e2e 实测。里程碑 6-2 又补上了 feature-gated 的私有 `stream-json`
 **decoder**（[`ClaudeStreamDecoder`](../src/agent/external/claude_code/decoder.rs)）,它离线地把 CLI
-帧解成中立观测/决策并有 committed cassette 回归,但仍未跑真实会话;下表 Claude Code 行要等
-M6-3/M6-4 真实会话跑通后才逐项翻真。
+帧解成中立观测/决策并有 committed cassette 回归。里程碑 6-3 再把配方 + decoder 接成 feature-gated 的
+**live session adapter**（[`ClaudeCodeAdapter`](../src/agent/external/claude_code/adapter.rs)）:它
+`start`/`resume`/`advance`/`shutdown` 真实 CLI 会话,并把观测镜像到 live sink。其状态机由注入的 fake
+transport **离线**单测跑通,真机路径则由 `#[ignore]` 的
+[`tests/external_claude_code.rs`](../tests/external_claude_code.rs) 覆盖(通过 `CLAUDE_CODE_BIN`/PATH
+发现 `claude`,缺失即跳过)。因为「实测」以真实会话跑通为准,该 e2e 未在本环境实际执行前,下表 Claude
+Code 行仍保持保守 `false`;待该 e2e 在具备 Claude Code 登录的机器上跑绿后再逐项翻真。注意:M6-3 的
+adapter **不 bridge 宿主工具**(不跑 MCP server),故即便实测,`host_tools`/`host_subagents` 也维持
+`false`(spec §12.3 允许),并对声明了工具的请求以 `UnsupportedCapability{HostTools}` 明确拒绝。
 
 ### 受管能力清单（`ExternalCapability`，共 8 项）
 

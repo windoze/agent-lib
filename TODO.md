@@ -1969,7 +1969,7 @@ process 管理,不需要改 machine/driver。
   `git diff --check` 干净。
 - Claude Code 真实 e2e 未在本任务范围（属 M6-3）;本机未运行真实 CLI,仅回放合成 cassette。
 
-### [TODO] M6-3 实现 Claude Code session adapter 与 ignored real e2e
+### [DONE] M6-3 实现 Claude Code session adapter 与 ignored real e2e
 
 **上下文**:
 
@@ -1998,7 +1998,49 @@ process 管理,不需要改 machine/driver。
 - 若本机环境具备 Claude Code,运行 ignored e2e 并在完成记录中记录结果；否则记录 skip 原因。
 - 完整验证序列 1-6 全过。
 
-### [TODO] M6-4 Review：Claude Code adapter 正确性检查
+**完成记录**:
+
+- 新增 feature-gated live adapter `src/agent/external/claude_code/adapter.rs`（唯一 pub 类型
+  `ClaudeCodeAdapter`），把 M6-1 启动配方 + M6-2 私有 decoder 接进 M5 的
+  `ExternalRuntimeAdapter`/`ExternalRuntimeSession` 抽象：
+  - `ClaudeCodeAdapter`：`new(config)` 报告实现能力；`with_probed_capabilities(config,&probed)` 与 probe
+    实测能力逐位取交；`kind`/`capabilities`/`start`/`resume`。`start`/`resume` 对携带 `tools` 的请求以
+    `UnsupportedCapability{HostTools}` 拒绝（本 adapter 不跑 MCP server，§12.3 允许的分支）。
+  - `ClaudeCodeSession<Io>`（私有，实现 `ExternalRuntimeSession`）：持有 CLI 子进程 + 跨全程单调 `seq` 的
+    `ClaudeStreamDecoder`；`advance` 写 stdin `stream-json` 帧（`Start`/`Continue`→`user` 文本帧、
+    `RespondInteraction`(权限)→`control_response` allow/deny、`RespondToolResults`/`RespondSubagent`→
+    `UnsupportedCapability`），逐行读 stdout 喂 decoder、镜像观测到 live sink，driving 到下一个
+    `RuntimeDecisionPoint`（EOF 未决策→`SessionLost`、非法帧→`Protocol`）；`shutdown` 丢 stdin→在 grace 内
+    等优雅退出，超时 `start_kill`→`ForcedKill`。
+  - IO 经私有 `ClaudeSessionIo` trait 注入：生产 `ClaudeProcessIo`（tokio::process，stderr 丢弃、
+    kill_on_drop、per-read timeout），单测注入 `FakeIo` 回放固定帧并捕获 stdin，离线跑通全状态机。
+  - decode context：`StepId::new(*ctx.run_id().as_uuid())` + actor=`request.agent_id`（不随机/取时钟）。
+- **真机时序修正（关键）**：真实 CLI（`--print --output-format stream-json --input-format stream-json`）在
+  收到首条 stdin `user` 帧前不产出任何 frame（连 `system/init` 都不发）。原实现的 `begin` 假设 init 先于
+  stdin、先读后写，导致 start prelude 阻塞到读超时（`SessionLost{TimedOut}`）。已按真实协议改为：fresh
+  `start` 先写首个 prompt 帧再读 init 拿 session_id，该 turn 余帧由第一次 `advance` 续读（`first_turn_pending`
+  标记避免重复写）；`resume` 已知 id，`begin` 不预读，首次 `advance` 写续跑 turn 并读新 init。新增
+  `..._start_writes_prompt_before_reading_init` 与 `..._resume_defers_first_turn_to_advance` 两个离线单测锁定此行为。
+- mod/导出：`claude_code/mod.rs` 增 `mod adapter;` + `pub use adapter::ClaudeCodeAdapter;`；`external/mod.rs`
+  re-export 列表加 `ClaudeCodeAdapter`（`external` 为 `pub mod`，故对外可达
+  `agent::external::ClaudeCodeAdapter`）。
+- ignored real e2e：`tests/external_claude_code.rs`（`#![cfg(feature="external-claude-code")]`，一个
+  `#[ignore]` `#[tokio::test]`）。从 `CLAUDE_CODE_BIN` 或 PATH 发现 `claude`，缺失即带清晰信息 skip（退出为绿）；
+  临时 git worktree；用 `ClaudeCodeAdapter`+`ExternalSessionRegistry` 驱动 start→advance（自动 approve 任何权限
+  暂停）→completion，断言观测流确为多步（SessionStarted+文本+SessionCompleted、≥3 事件）+ graceful shutdown；
+  auth/launch 失败折成 skip 不判失败。命令：
+  `cargo test --features external-claude-code --test external_claude_code -- --ignored --nocapture`。
+- 文档：`managed-external-agent.md` §12.1 增「实现状态(M6-3)」并修正 init/stdin 时序、§12.3 说明不 bridge 宿主
+  工具的分支；`capability-matrix.md` 叙述更新（表项保守留 `false`，因非 CI 默认覆盖）。
+- **本机真机 e2e 实跑通过**：`claude` v2.1.207（订阅登录，apiKeySource=none）。观测 10 个事件（2 text、
+  0 permission），SessionStarted→多个 TextDelta→SessionCompleted，graceful shutdown，23.5s。注：本次非交互
+  `Prompt` 模式下 CLI 未发 `control_request`（直接阻塞受管工具并在文本说明），故真机未覆盖 permission 分支；
+  该分支由离线单测（`control_response_frame` 映射 + `advance_drives_text_permission_completion` 回放）覆盖。
+- 验证：`cargo fmt --all -- --check` 干净；`cargo clippy --all-targets -- -D warnings`（feature on+off）干净；
+  聚焦 `cargo test -p agent-lib --features external-claude-code --lib claude_code`（28 passed，含 15 个
+  `claude_code_adapter_*`）+ `--test agent_claude_code_cassette`（7 passed）通过；`cargo test --all --all-targets
+  --features external-claude-code` 全绿（42 个 test-result:ok，0 失败）；`RUSTDOCFLAGS="-D warnings" cargo doc
+  --no-deps --workspace`（feature on+off）干净；`git diff --check` 干净。全部用例 <1min。
 
 **上下文**:
 

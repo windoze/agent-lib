@@ -947,6 +947,41 @@ decoder 必须:
   decoder 回放全程,断言观测流与每 turn 决策;另有内联 raw-frame 单测覆盖容忍 / `Protocol` / error-result 分类。
   `assert_no_secrets` 保证 fixture 无凭据。离线,无需真实 Claude Code。
 
+#### 实现状态（M6-3,已落地）
+
+`external-claude-code` feature 下已落地**live session + runtime adapter**,把 M6-1 的启动配方与 M6-2 的
+私有 decoder 接进 milestone-5 的 `ExternalRuntimeAdapter` / `ExternalRuntimeSession` 抽象(§11):
+
+- `ClaudeCodeAdapter`(`src/agent/external/claude_code/adapter.rs`,**唯一 pub 类型**):per-runtime 工厂。
+  `new(config)` 报告本 adapter 实现的全部能力;`with_probed_capabilities(config, &probed)` 把实现能力与
+  probe 实测能力**逐位取交**(缺 `--resume` 即关 resume)。`start` 启动全新 CLI session,`resume` 用
+  `--resume <session_id>` 复活既有 session,失败回落到 `ResumeUnavailable`。
+- `ClaudeCodeSession`(私有):单条 live session,持有 CLI 子进程与一个跨全程单调 `seq` 的
+  `ClaudeStreamDecoder`。**关键时序**:Claude Code 在收到第一条 stdin turn 之前不产出任何 frame(连
+  `system/init` 都不发)。因此 `start` 先把首个输入(prompt)写进 stdin,再读 stdout 直到 `system/init`
+  帧给出真实 session id 作为 registry key;该 turn 其余帧(text/result)留给第一次 `advance` 续读,故第一次
+  `advance`(携带同一 input)**不再重复写入**。`resume` 走 `--resume <id>`,session id 已从持久化 ref 得到,
+  `begin` 不做预读,直接由第一次 `advance` 写续跑 turn 并读新的 `init`。`advance(input)` 先把输入写成 stdin 的
+  `stream-json` 帧(`Start`/`Continue`→`user` 文本帧;`RespondInteraction`(权限)→`control_response`
+  `allow`/`deny` 帧),再逐行读 stdout 喂 decoder、把观测镜像到 live sink,直到 decoder 落定一个
+  `RuntimeDecisionPoint`;stdout 提前 EOF→`SessionLost`,非法帧→`Protocol`。`shutdown` 丢弃 stdin 让 CLI
+  见 EOF,在 timeout 内等待优雅退出(超时则 `start_kill` → `ForcedKill`,归类
+  `Graceful`/`ForcedKill`/`Failed`)。
+- IO 经私有 `ClaudeSessionIo` trait 注入:生产用 `ClaudeProcessIo`(`tokio::process`,stderr 丢弃、
+  `kill_on_drop`、每读超时),单测注入 fake transport 回放固定帧并捕获 stdin,**离线**跑通
+  start/advance/resume/shutdown 全状态机,无需真实 binary、无网络。
+- 宿主工具(spec 允许,§12.3):本 adapter **不跑 MCP server**,故 `implemented_capabilities()` 诚实报告
+  `host_tools=false` / `host_subagents=false`,并对声明了 `tools` 的 `start`/`resume` 请求以
+  `UnsupportedCapability{HostTools}` 明确拒绝,而非静默忽略;`RespondToolResults`/`RespondSubagent`
+  同样拒绝。其余能力(streaming/resume/permission_bridge/artifacts/usage/graceful_shutdown)为 true。
+  权限暂停对应的 `Interaction` `step_id`/`actor` 绑定宿主 `RunContext.run_id`/请求 `agent_id`,绝不取自
+  runtime 输出。
+- 真机 e2e:`tests/external_claude_code.rs` 有一个 `#[ignore]` 用例,通过 `CLAUDE_CODE_BIN` 或 PATH 发现
+  `claude`,缺失 binary/登录即带清晰信息**跳过**(退出为绿),否则在临时 git worktree 里用
+  `ClaudeCodeAdapter` + `ExternalSessionRegistry` 驱动 start→advance(自动 approve 权限暂停)→completion,
+  断言观测流确为多步(SessionStarted + 文本 + SessionCompleted)。运行:
+  `cargo test --features external-claude-code --test external_claude_code -- --ignored --nocapture`。
+
 ### 12.3 tool 注入
 
 Claude Code 可优先通过 MCP/custom tools 注入宿主工具:
@@ -959,6 +994,11 @@ Claude Code 可优先通过 MCP/custom tools 注入宿主工具:
 
 - capability `tool_bridge = false`。
 - `ExternalSessionRequest.tools` 只能作为 prompt hint,不得声明 full parity。
+
+M6-3 的 `ClaudeCodeAdapter` 走的正是**不 bridge** 这条路:它不启动 MCP server,因此
+`host_tools`/`host_subagents` 恒为 `false`;为避免"声明了工具却被静默忽略"的 spec 偏离,它对任何声明了
+`tools` 的 `start`/`resume` 请求直接以 `UnsupportedCapability{HostTools}` 拒绝。MCP tool bridge 本身是后续
+milestone 的独立任务,不在 M6-3 范围内。
 
 ## 13. Codex adapter
 
