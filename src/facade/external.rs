@@ -1028,10 +1028,12 @@ struct FacadeExternalSpawner {
 
 impl SubagentSpawner for FacadeExternalSpawner {
     fn child_ids(&self, _spec_ref: &AgentSpecRef) -> Result<(RunId, TraceNodeId), AgentError> {
-        Ok((
-            self.ids.run_id(),
-            TraceNodeId::new(format!("external:{}", self.name)),
-        ))
+        // See `FacadeSubagentSpawner::child_ids`: the freshly minted run id keeps
+        // the trace node id unique across repeated drives of the same external
+        // delegate within one run (a fixed `external:{name}` would collide).
+        let run_id = self.ids.run_id();
+        let node = TraceNodeId::new(format!("external:{}:{run_id}", self.name));
+        Ok((run_id, node))
     }
 
     fn spawn(

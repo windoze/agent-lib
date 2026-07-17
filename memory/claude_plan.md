@@ -1,44 +1,44 @@
-# M5-1 rules-routed delegation — DONE
+# M5-2 dispatcher-routed delegation — execution plan
 
-## Task
-First incomplete task in TODO.md: **M5-1 rules-routed delegation** (docs/facade-api.md §13.2).
-Extend `Delegation` with `rules()` + `when_task_contains(keywords, delegate)`; the facade
-routes a whole task to a matching delegate (local or external) WITHOUT exposing any delegate
-as a model tool. rustdoc + offline tests + full validation sequence.
+Task: `TODO.md` §Milestone 5 → **M5-2 dispatcher-routed delegation (primary → verify → escalate)**.
+Spec: `docs/facade-api.md` §13.3, §17.4, §6.3 (`RunEvent::Escalated`), §19.
+
+## Goal
+`Delegation::dispatcher().primary("cheap").verify_with("verifier").escalate_to("strong").max_attempts(2)`
+maps onto `agent::external::{Dispatcher, Escalator}` semantics (no new scheduler runtime, §19).
+Loop: primary runs → verifier checks product → on reject, escalate to strong, capped by
+`max_attempts`. Attempts + escalation path recorded into `DelegationTrace`s; emit `RunEvent::Escalated`.
 
 ## Design decisions
-- New internal `DelegationMode::Rules { rules: Vec<RoutingRule> }`.
-- Matching: case-insensitive substring `contains`; ANY keyword hits; FIRST rule (registration
-  order) wins = priority. No match → falls through to normal supervisor drive.
-- Rules-routed bypasses the supervisor LLM entirely: supervisor usage = 0, and the routed turn
-  is NOT folded into the supervisor `Conversation` (keeps DefaultAgentMachine sans-io
-  encapsulation intact). The delegation is reported fully via RunOutput + trace + events.
-- Reuse: `fulfill_rules_routed` synthesizes an `ask_<name>(task)` ToolCall keyed by a fresh
-  framework call id, then dispatches to the existing `drive_delegation` /
-  `drive_external_delegation`, so recorder/usage/artifacts/§9.2 approval gate are identical.
-- External approval-denial → `Err(FacadeError::ApprovalDenied)`; a failed (non-denied)
-  delegation → Ok(RunOutput) with a Failed trace + DelegationFailed event.
-- Build-time validation: a rule naming an unregistered delegate → `FacadeError::Config`.
+- New `DispatcherConfig { primary, verifier: Option, escalate_to: Option, max_attempts }` +
+  `DelegationMode::Dispatcher`. Builder mirrors rules-routed switch behavior.
+- Dispatcher mode exposes **no** delegate tool to the model (like Rules): declarations/route/
+  external_tool_names empty. Facade drives delegates directly via the existing
+  `DelegationToolHandler::fulfill_rules_routed` path (reuses subagent/external drive, §9.2 gate).
+- Escalation **decision** uses the real `agent::external::Escalator` + `WorkerRoster`: primary
+  registered `CostTier::Cheap` with `EscalationRules{escalate_to: strong}`, strong `Premium`
+  terminal. `assess()` on `WorkerReport::failed(current, ReviewRejected)` returns `Reassign(strong)`
+  → read `choice.worker().id()` back to delegate name. Escalator `.with_budget_headroom(0)`.
+- Verifier verdict contract (documented): verifier requests escalation when its reply contains the
+  case-insensitive token `ESCALATE`, or its delegation fails. Otherwise passes. A primary/worker
+  delegation that itself fails also triggers escalation.
+- Final reply text = last worker summary (not verifier). Supervisor usage = 0; child usage on
+  subagent/external slices. Not folded into supervisor Conversation.
 
-## Edits
-- ids.rs: `fresh_tool_call_id()` (renamed to avoid clash with the `ToolExecutionIds::tool_call_id`
-  trait method).
-- delegate.rs: RoutingRule, DelegationMode::Rules, builders (rules/when_task_contains/route_task/
-  is_rules_routed/first_unknown_rule_delegate), empty declarations/route/external_tool_names for
-  Rules, RulesRoutedTarget, fulfill_rules_routed, synthetic_delegation_call. +4 unit tests, +6
-  drive/stream tests.
-- agent.rs: run_full rules branch, build_delegation_handler, resolve_rules_target,
-  run_rules_routed, free fns drive_rules_routed / build_rules_routed_output / rules_routed_summary
-  / user_message_text; build-time validation in AgentBuilder::build.
-- agent/stream.rs: start() rules branch → start_rules_routed (drives delegate, replays events into
-  sink, yields Done).
+## Steps / Status
+1. [config] delegate.rs config+builder+accessors+validation, RulesRoutedTarget Clone, drive_one helper — done
+2. [drive] agent.rs drive_dispatcher_routed + run_dispatcher_routed + run_full branch + retention + build validation — done
+3. [stream] stream.rs start_dispatcher_routed — done
+4. [tests] offline unit + drive + stream tests (10 cases) — done
+5. [validate] fmt/clippy(+external)/focused/full/doc/diff — done, all green
 
-## Validation — ALL GREEN
-1. cargo fmt --all ✓
-2. cargo clippy --all-targets -- -D warnings ✓ (and with the three external features ✓)
-3. cargo test -p agent-lib facade::delegate ✓ (35 passed)
-4. cargo test --all --all-targets ✓ (50 test-result groups, no failures)
-5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace ✓
-6. git diff --check ✓
+## Class-wide bug fixed during M5-2
+- `FacadeSubagentSpawner::child_ids` (delegate.rs) and `FacadeExternalSpawner::child_ids`
+  (external.rs) used a fixed `subagent:{name}` / `external:{name}` trace node id. Driving the same
+  delegate twice in one run (dispatcher re-runs the verifier per attempt) triggered
+  `duplicate trace node id`. Fixed by folding the freshly-minted `run_id` into the trace node id,
+  guaranteeing uniqueness across repeated drives for BOTH subagent and external delegates.
 
-## Status: COMPLETE — TODO.md M5-1 marked [DONE]. Committing, then STOP.
+## Result
+M5-2 complete and marked `[DONE]` in TODO.md. Full validation sequence 1–6 green. Stopping (do
+not start M5-R).

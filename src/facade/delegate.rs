@@ -540,6 +540,87 @@ impl RoutingRule {
     }
 }
 
+/// The default per-task attempt cap for a dispatcher-routed delegation: the
+/// primary worker plus one escalation (`docs/facade-api.md` §13.3).
+pub(crate) const DEFAULT_DISPATCHER_MAX_ATTEMPTS: u32 = 2;
+
+/// The case-insensitive token a verifier delegate emits to reject a worker's
+/// output and force an escalation (`docs/facade-api.md` §13.3).
+///
+/// A verifier whose reply contains this token (or whose delegation fails) is
+/// treated as *not passing*; any other reply is a pass. Held lowercase so the
+/// verdict check is a single case-insensitive `contains`.
+pub(crate) const DISPATCHER_ESCALATE_MARKER: &str = "escalate";
+
+/// Dispatcher-routed configuration: a fixed cheap→verify→strong escalation loop
+/// the facade drives itself, mapping onto `agent::external::{Dispatcher,
+/// Escalator}` semantics (`docs/facade-api.md` §13.3).
+///
+/// The `primary` delegate runs first; when a `verifier` is configured its reply
+/// is checked (the verifier requests escalation by emitting the case-insensitive
+/// token `ESCALATE`, or by failing its own delegation), and a rejected — or a
+/// failed — primary run escalates to `escalate_to`. The whole loop is capped at
+/// `max_attempts` worker runs. Every delegate is named by its registration
+/// string and none is advertised to the supervising model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatcherConfig {
+    /// The registration name of the cheap worker tried first.
+    primary: String,
+    /// The registration name of the verifier delegate, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verifier: Option<String>,
+    /// The registration name of the stronger worker escalation hands off to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    escalate_to: Option<String>,
+    /// The maximum number of worker runs before the loop gives up.
+    max_attempts: u32,
+}
+
+impl DispatcherConfig {
+    /// An empty dispatcher config: no primary yet, no verifier / escalation, and
+    /// the default attempt cap. Refined through the [`Delegation`] builder.
+    fn empty() -> Self {
+        Self {
+            primary: String::new(),
+            verifier: None,
+            escalate_to: None,
+            max_attempts: DEFAULT_DISPATCHER_MAX_ATTEMPTS,
+        }
+    }
+
+    /// Returns the primary (cheap) worker's registration name.
+    #[must_use]
+    pub fn primary(&self) -> &str {
+        &self.primary
+    }
+
+    /// Returns the verifier delegate's registration name, if configured.
+    #[must_use]
+    pub fn verifier(&self) -> Option<&str> {
+        self.verifier.as_deref()
+    }
+
+    /// Returns the escalation target's registration name, if configured.
+    #[must_use]
+    pub fn escalate_to(&self) -> Option<&str> {
+        self.escalate_to.as_deref()
+    }
+
+    /// Returns the maximum number of worker runs allowed for one task.
+    #[must_use]
+    pub const fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+
+    /// Iterates every delegate name this config references (primary, then
+    /// verifier, then escalation target), skipping any that are unset.
+    fn referenced_delegates(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.primary.as_str())
+            .chain(self.verifier.as_deref())
+            .chain(self.escalate_to.as_deref())
+    }
+}
+
 /// The internal routing mode carried by a [`Delegation`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -557,6 +638,12 @@ enum DelegationMode {
     Rules {
         /// The ordered routing rules; the first whose keywords hit wins.
         rules: Vec<RoutingRule>,
+    },
+    /// Facade-owned dispatcher: a fixed cheap→verify→strong escalation loop the
+    /// facade drives itself, exposing no delegate to the model (§13.3).
+    Dispatcher {
+        /// The primary / verifier / escalation names and attempt cap.
+        config: DispatcherConfig,
     },
 }
 
@@ -714,6 +801,129 @@ impl Delegation {
             .map(|rule| rule.delegate.clone())
     }
 
+    /// Dispatcher-routed delegation: a fixed cheap→verify→strong escalation loop
+    /// the facade drives itself, exposing no delegate to the model (§13.3).
+    ///
+    /// Refine it with [`primary`](Self::primary), [`verify_with`](Self::verify_with),
+    /// [`escalate_to`](Self::escalate_to), and [`max_attempts`](Self::max_attempts).
+    /// The named delegates may be local subagents or managed external agents, and
+    /// map onto `agent::external::{Dispatcher, Escalator}` scheduling rather than
+    /// any new orchestration runtime (§19). Dispatcher-routed is an advanced,
+    /// opt-in mode — never a default (§13.3).
+    ///
+    /// ```
+    /// use agent_lib::facade::Delegation;
+    ///
+    /// let routing = Delegation::dispatcher()
+    ///     .primary("cheap-coder")
+    ///     .verify_with("verifier")
+    ///     .escalate_to("strong-coder")
+    ///     .max_attempts(2);
+    /// ```
+    #[must_use]
+    pub fn dispatcher() -> Self {
+        Self {
+            mode: DelegationMode::Dispatcher {
+                config: DispatcherConfig::empty(),
+            },
+        }
+    }
+
+    /// Returns a mutable reference to the dispatcher config, switching the
+    /// delegation into dispatcher-routed mode (from a fresh, empty config) if it
+    /// is not already, so the `dispatcher()` builder methods chain from any base.
+    fn dispatcher_config_mut(&mut self) -> &mut DispatcherConfig {
+        if !matches!(self.mode, DelegationMode::Dispatcher { .. }) {
+            self.mode = DelegationMode::Dispatcher {
+                config: DispatcherConfig::empty(),
+            };
+        }
+        let DelegationMode::Dispatcher { config } = &mut self.mode else {
+            unreachable!("mode was just set to Dispatcher");
+        };
+        config
+    }
+
+    /// Sets the primary (cheap) worker tried first, switching to
+    /// dispatcher-routed mode if needed (§13.3).
+    #[must_use]
+    pub fn primary(mut self, delegate: impl Into<String>) -> Self {
+        self.dispatcher_config_mut().primary = delegate.into();
+        self
+    }
+
+    /// Sets the verifier delegate consulted after each worker run (§13.3).
+    ///
+    /// The verifier requests an escalation by emitting the case-insensitive token
+    /// `ESCALATE` in its reply (or by failing its own delegation); any other
+    /// reply is treated as a pass. Switches to dispatcher-routed mode if needed.
+    #[must_use]
+    pub fn verify_with(mut self, delegate: impl Into<String>) -> Self {
+        self.dispatcher_config_mut().verifier = Some(delegate.into());
+        self
+    }
+
+    /// Sets the stronger worker an escalation hands off to, switching to
+    /// dispatcher-routed mode if needed (§13.3).
+    #[must_use]
+    pub fn escalate_to(mut self, delegate: impl Into<String>) -> Self {
+        self.dispatcher_config_mut().escalate_to = Some(delegate.into());
+        self
+    }
+
+    /// Sets the maximum number of worker runs before the loop gives up,
+    /// switching to dispatcher-routed mode if needed (§13.3).
+    ///
+    /// Clamped to at least `1` so the primary worker always runs at least once.
+    #[must_use]
+    pub fn max_attempts(mut self, max_attempts: u32) -> Self {
+        self.dispatcher_config_mut().max_attempts = max_attempts.max(1);
+        self
+    }
+
+    /// Reports whether this delegation routes through the facade dispatcher
+    /// rather than by the model or by keyword rules (§13.3).
+    #[must_use]
+    pub(crate) fn is_dispatcher_routed(&self) -> bool {
+        matches!(self.mode, DelegationMode::Dispatcher { .. })
+    }
+
+    /// Returns the dispatcher config when this delegation is dispatcher-routed
+    /// (§13.3), else `None`.
+    #[must_use]
+    pub(crate) fn dispatcher_config(&self) -> Option<&DispatcherConfig> {
+        match &self.mode {
+            DelegationMode::Dispatcher { config } => Some(config),
+            _ => None,
+        }
+    }
+
+    /// Returns the first dispatcher delegate name that is not registered among
+    /// `subagents` or `external`, for build-time validation (§13.3).
+    ///
+    /// A dispatcher-routed delegation naming a delegate no agent registered can
+    /// never run it, so [`AgentBuilder::build`](crate::facade::AgentBuilder::build)
+    /// rejects it up front rather than failing silently at run time. An empty
+    /// `primary` is reported separately by the builder.
+    #[must_use]
+    pub(crate) fn first_unknown_dispatcher_delegate(
+        &self,
+        subagents: &[LocalSubagent],
+        external: &[ManagedExternalDelegate],
+    ) -> Option<String> {
+        let DelegationMode::Dispatcher { config } = &self.mode else {
+            return None;
+        };
+        config
+            .referenced_delegates()
+            .filter(|name| !name.is_empty())
+            .find(|name| {
+                !subagents.iter().any(|s| s.name() == *name)
+                    && !external.iter().any(|e| e.name() == *name)
+            })
+            .map(str::to_owned)
+    }
+
     /// Synthesizes the tool declarations this delegation advertises for
     /// `subagents` and `external` delegates, appended to the supervisor's
     /// advertised tool set at build time (§10.1, §13.1).
@@ -743,7 +953,9 @@ impl Delegation {
             }
             // Rules-routed delegation never advertises a delegate to the model:
             // the facade routes the task itself, so no tool is synthesized (§13.2).
-            DelegationMode::Rules { .. } => Vec::new(),
+            // Dispatcher-routed delegation is the same: the facade drives the
+            // cheap→verify→strong loop itself, exposing nothing (§13.3).
+            DelegationMode::Rules { .. } | DelegationMode::Dispatcher { .. } => Vec::new(),
         }
     }
 
@@ -781,11 +993,14 @@ impl Delegation {
             // Rules-routed delegation exposes no delegation tool to the machine,
             // so the run-scoped handler recognizes nothing and forwards every
             // call to the base registry; the facade drives the routed delegate
-            // directly instead (§13.2).
-            DelegationMode::Rules { .. } => DelegationRoute::PerSubagent {
-                local: HashMap::new(),
-                external: HashMap::new(),
-            },
+            // directly instead (§13.2). Dispatcher-routed is identical: the
+            // facade owns the cheap→verify→strong loop (§13.3).
+            DelegationMode::Rules { .. } | DelegationMode::Dispatcher { .. } => {
+                DelegationRoute::PerSubagent {
+                    local: HashMap::new(),
+                    external: HashMap::new(),
+                }
+            }
         }
     }
 
@@ -806,7 +1021,8 @@ impl Delegation {
             DelegationMode::SingleTool { .. } => Vec::new(),
             // Rules-routed delegation never advertises an external start tool to
             // the machine (the facade drives it directly), so nothing to exempt.
-            DelegationMode::Rules { .. } => Vec::new(),
+            // Dispatcher-routed is identical (§13.3).
+            DelegationMode::Rules { .. } | DelegationMode::Dispatcher { .. } => Vec::new(),
         }
     }
 }
@@ -1013,10 +1229,13 @@ struct FacadeSubagentSpawner {
 
 impl SubagentSpawner for FacadeSubagentSpawner {
     fn child_ids(&self, _spec_ref: &AgentSpecRef) -> Result<(RunId, TraceNodeId), AgentError> {
-        Ok((
-            self.ids.run_id(),
-            TraceNodeId::new(format!("subagent:{}", self.subagent.name())),
-        ))
+        // The run id is freshly minted per drive, so folding it into the trace
+        // node id keeps the id unique even when the same delegate is driven more
+        // than once in a single run (e.g. a dispatcher verifier re-run per
+        // attempt, §13.3); a fixed `subagent:{name}` would collide.
+        let run_id = self.ids.run_id();
+        let node = TraceNodeId::new(format!("subagent:{}:{run_id}", self.subagent.name()));
+        Ok((run_id, node))
     }
 
     fn spawn(
@@ -1537,7 +1756,9 @@ impl DelegationToolHandler {
 /// Resolved by the facade from a [`Delegation::route_task`] match against the
 /// agent's registered delegates. It owns the delegate recipe (both variants are
 /// cheap, data-only clones) so the drive holds no borrow of the agent across an
-/// `await`.
+/// `await`. Dispatcher-routed delegation (§13.3) reuses the same target type,
+/// cloning it per worker attempt.
+#[derive(Clone)]
 pub(crate) enum RulesRoutedTarget {
     /// The task routes to a local subagent.
     Local(LocalSubagent),
@@ -3266,5 +3487,418 @@ mod model_routed_tests {
         assert_eq!(done.reply.text(), "streamed review done");
         assert_eq!(done.delegations.len(), 1);
         assert_eq!(done.delegations[0].delegate, "reviewer");
+    }
+
+    // ---- dispatcher-routed delegation (`docs/facade-api.md` §13.3) ----
+
+    /// Builds a local worker subagent whose scripted client route is keyed by the
+    /// marker embedded in its system prompt.
+    fn dispatch_worker(system: &str) -> super::LocalSubagent {
+        Agent::worker()
+            .description("A dispatcher worker.")
+            .system(system)
+            .build()
+            .expect("worker builds")
+    }
+
+    /// Extracts the `(from, to)` of the first [`RunEvent::Escalated`], if any.
+    fn escalation_edge(output: &crate::facade::run::RunOutput) -> Option<(String, String)> {
+        output.events.iter().find_map(|event| match event {
+            RunEvent::Escalated(trace) => Some((trace.from.clone(), trace.to.clone())),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn dispatcher_builder_sets_config_and_advertises_no_tools() {
+        let routing = Delegation::dispatcher()
+            .primary("cheap-coder")
+            .verify_with("verifier")
+            .escalate_to("strong-coder")
+            .max_attempts(3);
+        assert!(routing.is_dispatcher_routed());
+
+        let config = routing
+            .dispatcher_config()
+            .expect("dispatcher config present");
+        assert_eq!(config.primary(), "cheap-coder");
+        assert_eq!(config.verifier(), Some("verifier"));
+        assert_eq!(config.escalate_to(), Some("strong-coder"));
+        assert_eq!(config.max_attempts(), 3);
+
+        // No delegate is ever advertised to the supervising model (§13.3).
+        assert!(
+            routing.declarations(&[], &[]).is_empty(),
+            "dispatcher-routed delegation exposes no delegate to the model"
+        );
+        assert!(routing.external_tool_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn dispatcher_max_attempts_is_clamped_to_at_least_one() {
+        let routing = Delegation::dispatcher().primary("cheap").max_attempts(0);
+        assert_eq!(
+            routing.dispatcher_config().expect("config").max_attempts(),
+            1,
+            "max_attempts clamps up to 1 so the primary always runs once"
+        );
+    }
+
+    #[test]
+    fn dispatcher_builder_switches_a_non_dispatcher_delegation() {
+        // Chaining a dispatcher setter onto the default model-routed delegation
+        // flips it into dispatcher mode, starting from a fresh config.
+        let routing = Delegation::model_routed().primary("cheap");
+        assert!(routing.is_dispatcher_routed());
+        assert_eq!(
+            routing.dispatcher_config().expect("config").primary(),
+            "cheap"
+        );
+    }
+
+    #[test]
+    fn unknown_dispatcher_delegate_is_detected_for_build_validation() {
+        let routing = Delegation::dispatcher()
+            .primary("cheap")
+            .escalate_to("ghost");
+        // `cheap` is unregistered too, but the primary is reported first.
+        assert_eq!(
+            routing
+                .first_unknown_dispatcher_delegate(&[], &[])
+                .as_deref(),
+            Some("cheap")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_empty_primary_is_rejected_at_build() {
+        let error = AgentBuilder::default()
+            .client(RoutingClient::new(vec![route(
+                "SUPERVISOR",
+                vec![text_response("x")],
+            )]))
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .subagent("strong", dispatch_worker("You are the STRONG worker."))
+            .delegation(Delegation::dispatcher().escalate_to("strong"))
+            .build()
+            .expect_err("an empty primary is rejected");
+        assert!(
+            matches!(error, crate::facade::FacadeError::Config(_)),
+            "a dispatcher with no primary fails to build, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_unknown_delegate_is_rejected_at_build() {
+        let error = AgentBuilder::default()
+            .client(RoutingClient::new(vec![route(
+                "SUPERVISOR",
+                vec![text_response("x")],
+            )]))
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .delegation(Delegation::dispatcher().primary("ghost"))
+            .build()
+            .expect_err("an unregistered delegate is rejected");
+        assert!(
+            matches!(error, crate::facade::FacadeError::Config(_)),
+            "a dispatcher naming an unregistered delegate fails to build, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_escalates_when_primary_fails_then_strong_succeeds() {
+        use crate::facade::ManagedExternalAgent;
+
+        // Only the strong worker takes an LLM step; the primary is a managed
+        // external agent with no session handler, so its delegation fails outright
+        // and the loop escalates without ever consulting a verifier.
+        let client = RoutingClient::new(vec![route(
+            "STRONG",
+            vec![text_response("strong solution complete")],
+        )]);
+
+        let cheap = ManagedExternalAgent::claude_code()
+            .build()
+            .expect("managed external agent builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .external_agent("cheap", cheap)
+            .subagent("strong", dispatch_worker("You are the STRONG worker."))
+            .delegation(
+                Delegation::dispatcher()
+                    .primary("cheap")
+                    .escalate_to("strong")
+                    .max_attempts(2),
+            )
+            .build()
+            .expect("agent builds");
+
+        let output = agent
+            .run_full("Please implement the feature.")
+            .await
+            .unwrap();
+
+        // The final reply is the escalation target's summary, not the failed
+        // primary's error.
+        assert_eq!(output.reply.text(), "strong solution complete");
+
+        // The escalation path (primary → strong) is captured as an event.
+        assert_eq!(
+            escalation_edge(&output),
+            Some(("cheap".to_owned(), "strong".to_owned())),
+            "an Escalated event records the primary → strong hand-off"
+        );
+
+        // Both attempts are recorded: the failed primary and the successful strong
+        // worker, in order.
+        assert_eq!(output.delegations.len(), 2);
+        assert_eq!(output.delegations[0].delegate, "cheap");
+        assert_eq!(output.delegations[0].status, DelegationStatus::Failed);
+        assert_eq!(output.delegations[1].delegate, "strong");
+        assert_eq!(output.delegations[1].status, DelegationStatus::Completed);
+
+        // The failed primary emits DelegationFailed; the strong worker Finished.
+        assert!(
+            output
+                .events
+                .iter()
+                .any(|event| matches!(event, RunEvent::DelegationFailed(_))),
+            "the failed primary emits DelegationFailed"
+        );
+
+        // The supervisor took no LLM step.
+        assert_eq!(output.usage.supervisor.input, 0);
+        assert_eq!(output.usage.supervisor.output, 0);
+        assert!(
+            agent.conversation().turns().is_empty(),
+            "a dispatcher-routed turn does not commit to the supervisor conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_verifier_rejection_escalates_to_strong() {
+        // The verifier rejects the primary's output (call 1) then approves the
+        // strong worker's output (call 2), driving exactly one escalation.
+        let client = RoutingClient::new(vec![
+            route("CHEAP", vec![text_response("cheap attempt at the task")]),
+            route(
+                "VERIFIER",
+                vec![
+                    text_response("ESCALATE: this is insufficient"),
+                    text_response("approved, this looks good"),
+                ],
+            ),
+            route("STRONG", vec![text_response("strong result delivered")]),
+        ]);
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .subagent("cheap", dispatch_worker("You are the CHEAP worker."))
+            .subagent("verifier", dispatch_worker("You are the VERIFIER."))
+            .subagent("strong", dispatch_worker("You are the STRONG worker."))
+            .delegation(
+                Delegation::dispatcher()
+                    .primary("cheap")
+                    .verify_with("verifier")
+                    .escalate_to("strong")
+                    .max_attempts(2),
+            )
+            .build()
+            .expect("agent builds");
+
+        let output = agent.run_full("Please solve the problem.").await.unwrap();
+
+        // The final reply is the strong worker's summary, never the verifier's.
+        assert_eq!(output.reply.text(), "strong result delivered");
+        assert_eq!(
+            escalation_edge(&output),
+            Some(("cheap".to_owned(), "strong".to_owned()))
+        );
+
+        // Four delegations run: cheap, verifier (reject), strong, verifier (pass).
+        let names: Vec<&str> = output
+            .delegations
+            .iter()
+            .map(|trace| trace.delegate.as_str())
+            .collect();
+        assert_eq!(names, ["cheap", "verifier", "strong", "verifier"]);
+        assert!(
+            output
+                .delegations
+                .iter()
+                .all(|trace| trace.status == DelegationStatus::Completed),
+            "every worker and verifier delegation completed cleanly"
+        );
+
+        // Child usage is attributed to the subagent slice, not the supervisor.
+        assert_eq!(output.usage.supervisor.input, 0);
+        assert!(output.usage.subagents.input > 0);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_verifier_pass_does_not_escalate() {
+        // The verifier approves the primary on the first pass, so the strong
+        // worker — though configured — never runs.
+        let client = RoutingClient::new(vec![
+            route("CHEAP", vec![text_response("cheap solved it cleanly")]),
+            route("VERIFIER", vec![text_response("approved, looks good")]),
+            route("STRONG", vec![text_response("UNUSED strong output")]),
+        ]);
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .subagent("cheap", dispatch_worker("You are the CHEAP worker."))
+            .subagent("verifier", dispatch_worker("You are the VERIFIER."))
+            .subagent("strong", dispatch_worker("You are the STRONG worker."))
+            .delegation(
+                Delegation::dispatcher()
+                    .primary("cheap")
+                    .verify_with("verifier")
+                    .escalate_to("strong")
+                    .max_attempts(2),
+            )
+            .build()
+            .expect("agent builds");
+
+        let output = agent.run_full("Please solve the problem.").await.unwrap();
+
+        // The primary's summary is the whole reply; no escalation happened.
+        assert_eq!(output.reply.text(), "cheap solved it cleanly");
+        assert!(
+            escalation_edge(&output).is_none(),
+            "a passing verifier produces no Escalated event"
+        );
+
+        // Only the primary and its verifier ran; the strong worker did not.
+        let names: Vec<&str> = output
+            .delegations
+            .iter()
+            .map(|trace| trace.delegate.as_str())
+            .collect();
+        assert_eq!(names, ["cheap", "verifier"]);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_respects_max_attempts_of_one() {
+        use crate::facade::ManagedExternalAgent;
+
+        // A single attempt runs the primary once and never escalates, even though
+        // the primary fails and an escalation target is configured.
+        let client = RoutingClient::new(vec![route(
+            "STRONG",
+            vec![text_response("UNUSED strong output")],
+        )]);
+
+        let cheap = ManagedExternalAgent::claude_code()
+            .build()
+            .expect("managed external agent builds");
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .external_agent("cheap", cheap)
+            .subagent("strong", dispatch_worker("You are the STRONG worker."))
+            .delegation(
+                Delegation::dispatcher()
+                    .primary("cheap")
+                    .escalate_to("strong")
+                    .max_attempts(1),
+            )
+            .build()
+            .expect("agent builds");
+
+        let output = agent
+            .run_full("Please implement the feature.")
+            .await
+            .unwrap();
+
+        assert!(
+            escalation_edge(&output).is_none(),
+            "max_attempts(1) never escalates"
+        );
+        assert_eq!(output.delegations.len(), 1);
+        assert_eq!(output.delegations[0].delegate, "cheap");
+        assert_eq!(output.delegations[0].status, DelegationStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_stream_yields_escalated_then_done() {
+        let client = RoutingClient::new(vec![
+            route("CHEAP", vec![text_response("cheap attempt at the task")]),
+            route(
+                "VERIFIER",
+                vec![
+                    text_response("ESCALATE: this is insufficient"),
+                    text_response("approved, this looks good"),
+                ],
+            ),
+            route("STRONG", vec![text_response("strong result delivered")]),
+        ]);
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .subagent("cheap", dispatch_worker("You are the CHEAP worker."))
+            .subagent("verifier", dispatch_worker("You are the VERIFIER."))
+            .subagent("strong", dispatch_worker("You are the STRONG worker."))
+            .delegation(
+                Delegation::dispatcher()
+                    .primary("cheap")
+                    .verify_with("verifier")
+                    .escalate_to("strong")
+                    .max_attempts(2),
+            )
+            .build()
+            .expect("agent builds");
+
+        let mut stream = agent
+            .stream("Please solve the problem.")
+            .await
+            .expect("stream starts");
+        let mut events = Vec::new();
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("stream item is ok"));
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RunEvent::Escalated(_))),
+            "the dispatcher stream surfaces an Escalated event"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RunEvent::DelegationStarted(_))),
+            "the dispatcher stream surfaces a DelegationStarted event"
+        );
+        let done = events
+            .iter()
+            .find_map(|event| match event {
+                RunEvent::Done(output) => Some(output),
+                _ => None,
+            })
+            .expect("the stream ends with a Done event");
+        assert_eq!(done.reply.text(), "strong result delivered");
+        assert_eq!(
+            escalation_edge(done),
+            Some(("cheap".to_owned(), "strong".to_owned()))
+        );
     }
 }

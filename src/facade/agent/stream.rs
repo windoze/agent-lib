@@ -59,8 +59,8 @@ use crate::stream::accumulator::{Accumulator, AccumulatorError};
 use crate::stream::{Delta, StreamEvent};
 
 use super::{
-    Agent, classify_error, collect_traces, drive_rules_routed, final_turn_summary,
-    user_message_text,
+    Agent, classify_error, collect_traces, drive_dispatcher_routed, drive_rules_routed,
+    final_turn_summary, user_message_text,
 };
 
 /// A shared sink the tapping handlers push live [`RunEvent`]s into while the
@@ -98,6 +98,13 @@ pub(super) fn start(
         if let Some(delegate_name) = agent.delegation.route_task(&task).map(str::to_owned) {
             return start_rules_routed(agent, delegate_name, task);
         }
+    }
+
+    // Dispatcher-routed delegation runs the whole task through the facade
+    // cheap→verify→strong loop with no supervisor LLM step (§13.3).
+    if agent.delegation.is_dispatcher_routed() {
+        let task = user_message_text(&message);
+        return start_dispatcher_routed(agent, task);
     }
 
     let run_id = agent.ids.run_id();
@@ -246,6 +253,64 @@ fn start_rules_routed(
         state: DriveState::Driving,
     })
 }
+
+/// Opens a streamed *dispatcher-routed* turn: the whole task runs through the
+/// facade cheap→verify→strong escalation loop with no supervisor LLM step
+/// (`docs/facade-api.md` §13.3).
+///
+/// The loop is driven eagerly-in-future via [`drive_dispatcher_routed`]; its
+/// ordered [`RunEvent`]s — each worker's `DelegationStarted` / per-artifact
+/// `DelegationArtifact` / `DelegationFinished` or `DelegationFailed`, the
+/// verifier's own bracketing events, and a `RunEvent::Escalated` at each
+/// upgrade — are replayed into the shared sink so a caller streaming the turn
+/// observes the same sequence, then the terminal [`RunOutput`] is yielded as
+/// `Done`.
+///
+/// As on the other streaming paths, an external delegate's session facts are not
+/// retained here (the drive owns its inputs and does not touch `agent`); a
+/// snapshot is taken between runs via [`Agent::run_full`](super::Agent::run_full).
+fn start_dispatcher_routed(
+    agent: &mut Agent,
+    task: String,
+) -> Result<AgentRunStream<'_>, FacadeError> {
+    let config = agent
+        .delegation
+        .dispatcher_config()
+        .cloned()
+        .ok_or_else(|| {
+            FacadeError::InvalidState("dispatcher config missing on a dispatcher stream".to_owned())
+        })?;
+    let run_id = agent.ids.run_id();
+    let ctx = RunContext::new_root(
+        run_id,
+        BudgetLimits::unbounded(),
+        agent.ids.trace_root("agent-run"),
+    );
+    let recorder = new_delegation_recorder();
+    let handler = agent.build_delegation_handler(run_id, &ctx, recorder.clone())?;
+    let targets = agent.resolve_dispatcher_targets(&config)?;
+    let ids = agent.ids.clone();
+    let sink: EventSink = Arc::new(Mutex::new(VecDeque::new()));
+    let sink_for_future = sink.clone();
+    let future = Box::pin(async move {
+        let drive =
+            drive_dispatcher_routed(&handler, &recorder, &ids, &config, &targets, task, &ctx)
+                .await?;
+        for event in &drive.output.events {
+            emit(&sink_for_future, event.clone());
+        }
+        Ok(drive.output)
+    });
+
+    Ok(AgentRunStream {
+        future,
+        sink,
+        output: None,
+        state: DriveState::Driving,
+    })
+}
+
+/// The streaming counterpart to [`Agent::run_full`](super::Agent::run_full).
 ///
 /// `AgentRunStream` implements [`futures::Stream`] with
 /// `Item = Result<RunEvent, FacadeError>` and also offers an inherent

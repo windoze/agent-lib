@@ -41,12 +41,16 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use crate::agent::requirement::AgentSpecRef;
 use crate::agent::{
-    AgentError, AgentInput, AgentSpec, AgentState, BudgetLimits, DefaultAgentMachine, HandlerScope,
-    InteractionHandler, LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor, LoopPolicy,
-    ModelRef, Notification, RequirementIds, RequirementResult, RunContext, RunId,
+    AgentError, AgentInput, AgentSpec, AgentState, BudgetLimits, Capability, CostTier,
+    DefaultAgentMachine, EscalationError, EscalationOutcome, EscalationRules, EscalationTrigger,
+    Escalator, HandlerScope, HumanGate, ImpactScope, InteractionHandler, LlmClientHandler,
+    LlmHandler, LlmStepMode, LoopCursor, LoopPolicy, ModelRef, Notification, PermissionRisk,
+    RequirementIds, RequirementResult, RunContext, RunId, ScriptedVerifier, TaskDescriptor,
     ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy, ToolHandler, ToolRegistry,
-    ToolRegistryHandler, ToolSetRef, WorktreeRef, drain,
+    ToolRegistryHandler, ToolSetRef, Uncertainty, WorkerProfile, WorkerProfileRef, WorkerReport,
+    WorkerRoster, WorktreeRef, drain,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig};
@@ -54,8 +58,9 @@ use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
 use crate::facade::chat::client_for_provider;
 use crate::facade::config::{ModelConfig, ProviderConfig};
 use crate::facade::delegate::{
-    AgentWorkerBuilder, Delegation, DelegationRecorder, DelegationRoute, DelegationToolHandler,
-    LocalSubagent, RecordedDelegation, RulesRoutedTarget, new_delegation_recorder,
+    AgentWorkerBuilder, DISPATCHER_ESCALATE_MARKER, Delegation, DelegationRecorder,
+    DelegationRoute, DelegationToolHandler, DispatcherConfig, LocalSubagent, RecordedDelegation,
+    RulesRoutedTarget, new_delegation_recorder,
 };
 use crate::facade::error::FacadeError;
 use crate::facade::external::{
@@ -63,8 +68,8 @@ use crate::facade::external::{
 };
 use crate::facade::ids::FacadeIds;
 use crate::facade::run::{
-    ArtifactRef, DelegationStatus, DelegationTrace, IntoUserMessage, Reply, RunEvent, RunOutput,
-    ToolTrace, UsageSummary,
+    ArtifactRef, DelegationStatus, DelegationTrace, EscalationTrace, IntoUserMessage, Reply,
+    RunEvent, RunOutput, ToolTrace, UsageSummary,
 };
 use crate::facade::tool::{
     FacadeToolRegistry, Tool, ToolContextParts, ensure_unique_declaration_names,
@@ -260,6 +265,14 @@ impl Agent {
                 let task = user_message_text(&message);
                 return self.run_rules_routed(delegate_name, task).await;
             }
+        }
+
+        // Dispatcher-routed delegation routes *every* task through the facade
+        // cheap→verify→strong escalation loop, again without exposing any
+        // delegate to the model (§13.3).
+        if self.delegation.is_dispatcher_routed() {
+            let task = user_message_text(&message);
+            return self.run_dispatcher_routed(task).await;
         }
 
         let run_id = self.ids.run_id();
@@ -513,8 +526,94 @@ impl Agent {
         Ok(drive.output)
     }
 
-    /// Runs one agent turn as an incremental [`AgentRunStream`].
+    /// Resolves every delegate a dispatcher config references (primary, verifier,
+    /// escalation target) to an owned drive target, keyed by registration name
+    /// (§13.3).
     ///
+    /// Each name is validated at build time, so an unregistered name here is a
+    /// defensive [`FacadeError::InvalidState`]. The returned map is reused across
+    /// worker attempts (a verifier runs once per attempt), so targets are cloned.
+    pub(crate) fn resolve_dispatcher_targets(
+        &self,
+        config: &DispatcherConfig,
+    ) -> Result<HashMap<String, RulesRoutedTarget>, FacadeError> {
+        let mut targets = HashMap::new();
+        for name in [config.primary()]
+            .into_iter()
+            .chain(config.verifier())
+            .chain(config.escalate_to())
+        {
+            if name.is_empty() || targets.contains_key(name) {
+                continue;
+            }
+            targets.insert(name.to_owned(), self.resolve_rules_target(name)?);
+        }
+        Ok(targets)
+    }
+
+    /// Routes one task through the dispatcher cheap→verify→strong escalation loop
+    /// and assembles the terminal [`RunOutput`] (§13.3).
+    ///
+    /// The primary worker runs first; when a verifier is configured its verdict
+    /// (or a worker's own failure) drives an escalation to the stronger worker,
+    /// capped at the config's `max_attempts`. Each worker and verifier run is
+    /// driven through the same delegation machinery a model-routed call uses, so
+    /// traces, usage, artifacts, and events match field for field; the escalation
+    /// *decision* is delegated to `agent::external::Escalator` (§19). As with
+    /// rules-routed delegation there is no supervisor LLM step, so the
+    /// supervisor's own usage is zero and the routed exchange is **not** folded
+    /// into the supervisor [`Conversation`]. A managed external delegate the
+    /// approval policy denies fails with [`FacadeError::ApprovalDenied`] (§9.2),
+    /// and every external delegate's resumable session facts are retained for a
+    /// later [`snapshot`](Agent::snapshot) (§15.2).
+    async fn run_dispatcher_routed(&mut self, task: String) -> Result<RunOutput, FacadeError> {
+        let config = self
+            .delegation
+            .dispatcher_config()
+            .cloned()
+            .ok_or_else(|| {
+                FacadeError::InvalidState(
+                    "dispatcher config missing on a dispatcher run".to_owned(),
+                )
+            })?;
+        let run_id = self.ids.run_id();
+        let ctx = RunContext::new_root(
+            run_id,
+            BudgetLimits::unbounded(),
+            self.ids.trace_root("agent-run"),
+        );
+        let recorder = new_delegation_recorder();
+        let handler = self.build_delegation_handler(run_id, &ctx, recorder.clone())?;
+        let targets = self.resolve_dispatcher_targets(&config)?;
+
+        let drive = drive_dispatcher_routed(
+            &handler, &recorder, &self.ids, &config, &targets, task, &ctx,
+        )
+        .await?;
+
+        // Retain each external delegate's data-only session facts so a later
+        // snapshot can persist them (§15.2), mirroring `run_full`.
+        for record in &drive.records {
+            if !record.is_external {
+                continue;
+            }
+            let status = match record.trace.status {
+                DelegationStatus::Completed => ExternalDelegateStatus::Completed,
+                DelegationStatus::Failed => ExternalDelegateStatus::Failed,
+            };
+            self.last_external_sessions.insert(
+                record.trace.delegate.clone(),
+                RetainedExternalSession {
+                    status,
+                    session: record.session.clone(),
+                    artifacts: record.artifacts.clone(),
+                },
+            );
+        }
+
+        Ok(drive.output)
+    }
+
     /// The returned stream is the tool-using, approval-gated analog of
     /// [`ChatSession::stream`](crate::facade::ChatSession::stream). It forwards
     /// each incremental [`RunEvent::TextDelta`] as the assistant text arrives and
@@ -951,6 +1050,24 @@ impl AgentBuilder {
             )));
         }
 
+        // Dispatcher-routed delegation likewise names its primary / verifier /
+        // escalation delegates by string: a missing primary or an unregistered
+        // name can never run, so reject both up front (§13.3).
+        if let Some(config) = delegation.dispatcher_config() {
+            if config.primary().is_empty() {
+                return Err(FacadeError::Config(
+                    "dispatcher-routed delegation is missing a `primary` delegate".to_owned(),
+                ));
+            }
+            if let Some(unknown) =
+                delegation.first_unknown_dispatcher_delegate(&self.delegates, &self.external_agents)
+            {
+                return Err(FacadeError::Config(format!(
+                    "dispatcher-routed delegation references unregistered delegate `{unknown}`"
+                )));
+            }
+        }
+
         let mut declarations: Vec<ToolDecl> = self.tools.iter().map(Tool::declaration).collect();
         declarations.extend(self.extra_declarations.iter().cloned());
         if let Some(custom) = &self.custom_registry {
@@ -1271,6 +1388,34 @@ pub(crate) async fn drive_rules_routed(
     task: String,
     ctx: &RunContext,
 ) -> Result<RulesRoutedDrive, FacadeError> {
+    let (record, summary) = run_one_delegation(handler, recorder, ids, target, task, ctx).await?;
+
+    // A denied external delegate surfaces as a run-level error, matching the
+    // model-routed path (§9.2).
+    if record.approval_denied {
+        return Err(FacadeError::ApprovalDenied);
+    }
+
+    let output = build_rules_routed_output(&record, summary);
+    Ok(RulesRoutedDrive { output, record })
+}
+
+/// Drives one delegate through the shared [`DelegationToolHandler`] and returns
+/// its recorded trace plus the folded summary text.
+///
+/// The delegate is fulfilled under a framework call id minted from `ids`; the
+/// resulting [`RecordedDelegation`] is read back from `recorder` and the summary
+/// is extracted from the tool result (or the classified error on failure). The
+/// caller decides how to treat an approval denial or a failed status; this
+/// helper never short-circuits so a dispatcher loop can inspect every run.
+async fn run_one_delegation(
+    handler: &DelegationToolHandler,
+    recorder: &DelegationRecorder,
+    ids: &FacadeIds,
+    target: &RulesRoutedTarget,
+    task: String,
+    ctx: &RunContext,
+) -> Result<(RecordedDelegation, String), FacadeError> {
     let call_id = ids.fresh_tool_call_id();
     let key = call_id.to_string();
     let result = handler
@@ -1283,18 +1428,11 @@ pub(crate) async fn drive_rules_routed(
         .get(&key)
         .cloned()
         .ok_or_else(|| {
-            FacadeError::InvalidState("rules-routed delegation was not recorded".to_owned())
+            FacadeError::InvalidState("facade-routed delegation was not recorded".to_owned())
         })?;
 
-    // A denied external delegate surfaces as a run-level error, matching the
-    // model-routed path (§9.2).
-    if record.approval_denied {
-        return Err(FacadeError::ApprovalDenied);
-    }
-
     let summary = rules_routed_summary(&result);
-    let output = build_rules_routed_output(&record, summary);
-    Ok(RulesRoutedDrive { output, record })
+    Ok((record, summary))
 }
 
 /// Projects a single recorded rules-routed delegation into a [`RunOutput`].
@@ -1347,6 +1485,293 @@ fn rules_routed_summary(result: &RequirementResult) -> String {
             .join(""),
         RequirementResult::Tool(Err(error)) => error.to_string(),
         _ => String::new(),
+    }
+}
+
+/// A shared capability tag for the two workers in a dispatcher roster.
+///
+/// The facade dispatcher is a fixed two-tier cheap→strong loop rather than a
+/// capability-routed roster, so both workers advertise the same provider-neutral
+/// [`Capability::Custom`] tag; the escalation decision turns purely on cost tier
+/// and the primary worker's configured escalation target.
+fn dispatcher_capability() -> Capability {
+    Capability::Custom("dispatch".to_owned())
+}
+
+/// The outcome of one dispatcher-routed drive (`docs/facade-api.md` §13.3).
+///
+/// Shared by [`Agent::run_full`] and the streaming path: `output` is the
+/// terminal result to return (or yield as `Done`), while `records` carries every
+/// worker/verifier [`RecordedDelegation`] so the caller can retain each external
+/// delegate's session facts (§15.2).
+pub(crate) struct DispatcherDrive {
+    /// The terminal run output assembled from the loop.
+    pub output: RunOutput,
+    /// Every delegation recorded during the loop, in run order.
+    pub records: Vec<RecordedDelegation>,
+}
+
+/// Accumulates the ordered [`RunOutput`] pieces of a dispatcher loop.
+#[derive(Default)]
+struct DispatcherAccumulator {
+    events: Vec<RunEvent>,
+    delegations: Vec<DelegationTrace>,
+    artifacts: Vec<ArtifactRef>,
+    usage: UsageSummary,
+    records: Vec<RecordedDelegation>,
+}
+
+impl DispatcherAccumulator {
+    /// Folds one recorded delegation into the accumulator, appending its
+    /// bracketing events, trace, artifacts, usage, and record exactly as a
+    /// model- or rules-routed delegation would report them.
+    fn record(&mut self, record: &RecordedDelegation) {
+        self.events
+            .push(RunEvent::DelegationStarted(record.trace.clone()));
+        if record.is_external {
+            self.usage.add_external(record.trace.usage.clone());
+        } else {
+            self.usage.add_subagent(record.trace.usage.clone());
+        }
+        match record.trace.status {
+            DelegationStatus::Completed => {
+                for artifact in &record.artifacts {
+                    self.artifacts.push(artifact.clone());
+                    self.events
+                        .push(RunEvent::DelegationArtifact(artifact.clone()));
+                }
+                self.events
+                    .push(RunEvent::DelegationFinished(record.trace.clone()));
+            }
+            DelegationStatus::Failed => {
+                self.events
+                    .push(RunEvent::DelegationFailed(record.trace.clone()));
+            }
+        }
+        self.delegations.push(record.trace.clone());
+        self.records.push(record.clone());
+    }
+}
+
+/// Drives one task through the dispatcher cheap→verify→strong escalation loop
+/// and assembles its terminal output (`docs/facade-api.md` §13.3).
+///
+/// The primary worker runs first; when a verifier is configured its verdict (or
+/// a worker's own failure) escalates to the stronger worker, capped at
+/// `config.max_attempts`. The escalation *decision* is delegated to
+/// `agent::external::Escalator` (§19). A managed external delegate the approval
+/// policy denies fails with [`FacadeError::ApprovalDenied`] (§9.2).
+pub(crate) async fn drive_dispatcher_routed(
+    handler: &DelegationToolHandler,
+    recorder: &DelegationRecorder,
+    ids: &FacadeIds,
+    config: &DispatcherConfig,
+    targets: &HashMap<String, RulesRoutedTarget>,
+    task: String,
+    ctx: &RunContext,
+) -> Result<DispatcherDrive, FacadeError> {
+    let escalator = Escalator::new(ScriptedVerifier::passing()).with_budget_headroom(0);
+    let roster = build_dispatcher_roster(config, ids);
+
+    let mut acc = DispatcherAccumulator::default();
+    let mut final_summary = String::new();
+    let mut current = config.primary().to_owned();
+
+    for attempt in 1..=config.max_attempts() {
+        let worker = fetch_target(targets, &current)?;
+        let (record, summary) =
+            run_one_delegation(handler, recorder, ids, worker, task.clone(), ctx).await?;
+        if record.approval_denied {
+            return Err(FacadeError::ApprovalDenied);
+        }
+        acc.record(&record);
+        final_summary = summary.clone();
+        let worker_failed = record.trace.status == DelegationStatus::Failed;
+
+        // A clean worker run (that a verifier, if any, accepts) ends the loop.
+        let rejected = worker_failed
+            || run_verifier(
+                handler, recorder, ids, config, targets, &task, &summary, ctx, &mut acc,
+            )
+            .await?;
+        if !rejected {
+            break;
+        }
+
+        // Rejected: escalate to the stronger worker while attempts remain and the
+        // escalation engine offers a target.
+        if attempt >= config.max_attempts() {
+            break;
+        }
+        let Some(next) =
+            dispatcher_escalation_target(&escalator, roster.as_ref(), &current, ctx, ids)?
+        else {
+            break;
+        };
+        acc.events.push(RunEvent::Escalated(EscalationTrace {
+            from: current.clone(),
+            to: next.clone(),
+        }));
+        current = next;
+    }
+
+    let output = RunOutput {
+        reply: Reply::from_parts(
+            final_summary,
+            Some(crate::model::usage::Usage::default()),
+            None,
+        ),
+        response: None,
+        usage: acc.usage,
+        tool_calls: Vec::new(),
+        delegations: acc.delegations,
+        artifacts: acc.artifacts,
+        events: acc.events,
+    };
+    Ok(DispatcherDrive {
+        output,
+        records: acc.records,
+    })
+}
+
+/// Runs the configured verifier (if any) against a worker's `summary`, folding
+/// its delegation into `acc`, and returns whether it requests an escalation.
+///
+/// A verifier rejects when its delegation fails or its reply carries the
+/// [`DISPATCHER_ESCALATE_MARKER`] token (§13.3). With no verifier configured a
+/// clean worker run is always accepted.
+#[allow(clippy::too_many_arguments)]
+async fn run_verifier(
+    handler: &DelegationToolHandler,
+    recorder: &DelegationRecorder,
+    ids: &FacadeIds,
+    config: &DispatcherConfig,
+    targets: &HashMap<String, RulesRoutedTarget>,
+    task: &str,
+    worker_summary: &str,
+    ctx: &RunContext,
+    acc: &mut DispatcherAccumulator,
+) -> Result<bool, FacadeError> {
+    let Some(verifier_name) = config.verifier() else {
+        return Ok(false);
+    };
+    let verifier = fetch_target(targets, verifier_name)?;
+    let brief = verifier_brief(task, worker_summary);
+    let (record, summary) =
+        run_one_delegation(handler, recorder, ids, verifier, brief, ctx).await?;
+    if record.approval_denied {
+        return Err(FacadeError::ApprovalDenied);
+    }
+    let failed = record.trace.status == DelegationStatus::Failed;
+    acc.record(&record);
+    Ok(failed || verifier_requests_escalation(&summary))
+}
+
+/// Looks up a dispatcher target by name, erroring defensively if it is missing
+/// (names are validated at build time, §13.3).
+fn fetch_target<'a>(
+    targets: &'a HashMap<String, RulesRoutedTarget>,
+    name: &str,
+) -> Result<&'a RulesRoutedTarget, FacadeError> {
+    targets.get(name).ok_or_else(|| {
+        FacadeError::InvalidState(format!("dispatcher delegate `{name}` is not registered"))
+    })
+}
+
+/// Builds the verifier's task brief: the original task plus the worker's output
+/// and the escalation-token protocol the facade interprets (§13.3).
+fn verifier_brief(task: &str, worker_summary: &str) -> String {
+    format!(
+        "Review the following worker output for the task and decide whether it is acceptable.\n\n\
+         Task:\n{task}\n\nWorker output:\n{worker_summary}\n\n\
+         If the work is insufficient and must be redone by a stronger worker, reply with the word \
+         ESCALATE; otherwise approve it."
+    )
+}
+
+/// Reports whether a verifier's reply requests an escalation, i.e. contains the
+/// case-insensitive [`DISPATCHER_ESCALATE_MARKER`] token (§13.3).
+fn verifier_requests_escalation(summary: &str) -> bool {
+    summary.to_lowercase().contains(DISPATCHER_ESCALATE_MARKER)
+}
+
+/// Builds the two-worker escalation roster for a dispatcher config, or `None`
+/// when no escalation target is configured (nothing to escalate to).
+///
+/// The primary is registered [`CostTier::Cheap`] with an escalation rule pointing
+/// at the stronger worker; the stronger worker is [`CostTier::Premium`] and
+/// terminal. This is exactly the shape `agent::external::Escalator::assess`
+/// resolves an upward escalation from.
+fn build_dispatcher_roster(config: &DispatcherConfig, ids: &FacadeIds) -> Option<WorkerRoster> {
+    let strong = config.escalate_to()?;
+    let mut roster = WorkerRoster::new();
+    let capability = dispatcher_capability();
+    let spec = AgentSpecRef(ids.agent_id());
+
+    roster.register(
+        WorkerProfile::new(
+            strong,
+            [capability.clone()],
+            CostTier::Premium,
+            EscalationRules::none(),
+        ),
+        spec,
+    );
+    roster.register(
+        WorkerProfile::new(
+            config.primary(),
+            [capability],
+            CostTier::Cheap,
+            EscalationRules::new(
+                [
+                    EscalationTrigger::ReviewRejected,
+                    EscalationTrigger::TestFailure,
+                    EscalationTrigger::Timeout,
+                    EscalationTrigger::LowConfidence,
+                ],
+                Some(WorkerProfileRef::new(strong)),
+                false,
+            ),
+        ),
+        spec,
+    );
+    Some(roster)
+}
+
+/// Asks `agent::external::Escalator` which stronger worker to escalate to after
+/// `current` was rejected, returning the target delegate name or `None`.
+///
+/// A `None` roster (no escalation configured), an escalation the engine declines
+/// (`Accept` / `Human` / `Exhausted`), or a `current` worker the roster does not
+/// know all mean "do not escalate".
+fn dispatcher_escalation_target(
+    escalator: &Escalator<ScriptedVerifier>,
+    roster: Option<&WorkerRoster>,
+    current: &str,
+    ctx: &RunContext,
+    ids: &FacadeIds,
+) -> Result<Option<String>, FacadeError> {
+    let Some(roster) = roster else {
+        return Ok(None);
+    };
+    let report = WorkerReport::failed(
+        WorkerProfileRef::new(current),
+        EscalationTrigger::ReviewRejected,
+    );
+    let descriptor = TaskDescriptor::new(
+        dispatcher_capability(),
+        ImpactScope::SingleFile,
+        PermissionRisk::Low,
+        Uncertainty::Clear,
+    );
+    let gate = HumanGate::new(ids.step_id(), ids.agent_id());
+    match escalator.assess(&descriptor, &report, roster, ctx, &gate) {
+        Ok(EscalationOutcome::Reassign(choice)) => Ok(Some(choice.worker().id().to_owned())),
+        Ok(_) => Ok(None),
+        // The `current` worker is not in the roster (e.g. already the strong
+        // worker, whose profile is terminal): nothing further to escalate to.
+        Err(EscalationError::UnknownWorker { .. }) => Ok(None),
+        Err(error) => Err(FacadeError::InvalidState(error.to_string())),
     }
 }
 

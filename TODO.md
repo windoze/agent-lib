@@ -1378,7 +1378,7 @@ M4（managed external agent 构造/分级/兑现/审批/restore）承诺项**全
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✓；`git diff --check` 无问题 ✓。
 
 
-### [TODO] M5-2 dispatcher-routed delegation（primary → verify → escalate）
+### [DONE] M5-2 dispatcher-routed delegation（primary → verify → escalate）
 
 **上下文**：
 
@@ -1401,6 +1401,38 @@ M4（managed external agent 构造/分级/兑现/审批/restore）承诺项**全
   `DelegationTrace` 含升级路径（primary→strong）；`RunEvent::Escalated` 产出；verifier 通过时不升级。
 - 聚焦：`cargo test -p agent-lib facade::delegate`（含 dispatcher 用例）。
 - 完整验证序列 1–6（若涉及 external features 则附带其 clippy）。
+
+**完成记录**：
+
+- `src/facade/delegate.rs`：新增 `DispatcherConfig`（primary/verifier/escalate_to/max_attempts，`max_attempts`
+  下限钳到 1）与 `DelegationMode::Dispatcher`；`Delegation` 新增 `dispatcher()`、`primary()`/`verify_with()`/
+  `escalate_to()`/`max_attempts()`（链式，非 dispatcher 模式调用会切换为 dispatcher）、`is_dispatcher_routed()`、
+  `dispatcher_config()`、`first_unknown_dispatcher_delegate()`（build 期校验）。`declarations()`/`route()`/
+  `external_tool_names()` 对 Dispatcher 模式同 Rules 返回空——不向模型暴露任何 delegate。verifier 判定协议：
+  回复含大小写不敏感 token `ESCALATE`（常量 `DISPATCHER_ESCALATE_MARKER`）或其自身 delegation 失败＝判不过，
+  否则通过（§13.3 未指定线协议，facade 约定并写入 rustdoc）。
+- `src/facade/agent.rs`：`run_full` 增 dispatcher 分支（整轮走 `run_dispatcher_routed`）；把 rules 与 dispatcher
+  的单次 delegate 驱动抽出共享 `run_one_delegation()`。新增 `resolve_dispatcher_targets()`/`run_dispatcher_routed()`
+  与自由函数 `drive_dispatcher_routed()`（cheap→verify→strong 闭环）、`run_verifier()`、`build_dispatcher_roster()`、
+  `dispatcher_escalation_target()`（升级**决策**委托给 `agent::external::Escalator::assess`：primary 注册
+  `CostTier::Cheap`+`EscalationRules{ReviewRejected/…→strong}`、strong 注册 `CostTier::Premium` 终态；
+  `Escalator::with_budget_headroom(0)` 关闭预算降级，纯上行升级；current==strong 返回 `Exhausted`→停）。每次
+  worker/verifier 走既有 `DelegationToolHandler::fulfill_rules_routed`，recorder/usage/artifacts/§9.2 审批门与
+  model-routed 完全一致；不经 supervisor LLM（supervisor usage=0，不折叠进 `Conversation`），最终回复＝最后一次
+  worker 摘要（非 verifier）。`AgentBuilder::build` 增 build 期校验：空 primary 或未注册 delegate → `FacadeError::Config`。
+- `src/facade/agent/stream.rs`：`start()` 增 dispatcher 分支 `start_dispatcher_routed`，future 跑完闭环后把有序
+  事件（含 `RunEvent::Escalated`）回放进 sink，末尾产 `Done`。
+- **类级 bug 修复**（实现中发现的直接阻塞项）：`FacadeSubagentSpawner::child_ids`（`src/facade/delegate.rs`）与
+  `FacadeExternalSpawner::child_ids`（`src/facade/external.rs`）原用固定 `subagent:{name}` / `external:{name}`
+  作 trace node id，同一 delegate 在一轮内被驱动两次（dispatcher 每次尝试重跑 verifier）即触发
+  `duplicate trace node id`。改为折入每次驱动新铸的 `run_id` 保证唯一，修掉整类（子代理与外部代理）重复驱动碰撞。
+- 测试：`src/facade/delegate.rs` 新增 10 个离线用例：builder 配置/零工具声明、`max_attempts` 钳位、模式切换、
+  未知 delegate 检测、空 primary 与未知 delegate 的 build 拒绝、primary 失败→升级 strong、verifier 判不过→升级、
+  verifier 通过→不升级、`max_attempts(1)` 不升级、stream 产 `Escalated`→`Done`。
+- 验证：`cargo fmt --all` ✓；`cargo clippy --all-targets -- -D warnings` ✓（含
+  `--features external-claude-code external-codex external-opencode` ✓）；`cargo test -p agent-lib facade::delegate`
+  （含 10 个 dispatcher 用例）全绿 ✓；`cargo test --all --all-targets` 全绿（50 组 test result: ok，0 failed）✓；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✓；`git diff --check` 干净 ✓。
 
 ### [TODO] M5-R Review：Dispatcher / Escalator 正确性与文档一致性检查
 
