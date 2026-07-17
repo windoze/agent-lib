@@ -1,52 +1,63 @@
-# M6-1 增加 Claude Code capability probe 与启动配置
+# M6-2 实现 Claude Code stream decoder cassette 测试
 
-**当前执行 = TODO.md 第一个未完成任务 = M6-1**（M1..M5 全部 `[DONE]`）。
+**当前执行 = TODO.md 第一个未完成任务 = M6-2**（M1..M5 全 `[DONE]`，M6-1 `[DONE]`）。
 
 ## 任务理解
-M6-1 是 Milestone 6（Claude Code managed adapter）的第一步：**只做启动配置 + capability
-probe**，不做 stream decoder（M6-2）也不做 session adapter（M6-3）。必须 feature-gated，
-默认 `cargo test --all --all-targets` 在未启 feature 时通过。
+M6-1 已落地 `external-claude-code` feature 下的 `ClaudeCodeConfig` + capability probe。
+M6-2 要实现 **Claude Code 私有 stream-json 帧解码器**：消费原始 CLI 帧，产出中立的
+`ExternalObservedEvent` 观测流 + 决策点（`Completed` / `PausedForToolCalls` /
+`PausedForInteraction` / `Failed`）。raw schema 不得暴露为 public DTO。并加 cassette
+fixture + parser 测试（覆盖 text / permission / tool / patch / completion）。
 
-## 目标（TODO.md 做什么）
-1. 新增 feature gate `external-claude-code`（非默认）。
-2. `ClaudeCodeConfig`：binary path/env override、working dir/worktree、permission mode 映射、
-   optional model/profile、timeout。Debug 必须脱敏 env 值。
-3. probe：
-   - 检查 binary/version（`--version`）。
-   - 检查 output format / stream mode（`--help` 中 `--output-format` + `stream-json` + `--input-format`）。
-   - 返回 `ExternalRuntimeCapabilities`。
-   - 失败必须返回 `ExternalAgentError::Launch`（缺 binary / 启动失败 / 非零退出）或
-     `UnsupportedCapability`（缺 stream-json 结构化流），**不 panic**。
+## 真实 Claude stream-json 帧模型（JSONL，逐行一个 JSON 对象）
+- `{"type":"system","subtype":"init","session_id","cwd","tools","model"}` → SessionStarted
+- `{"type":"assistant","message":{"id","role","content":[blocks],"usage"}}`
+  - text block → TextDelta
+  - tool_use Bash → CommandStarted；Edit/Write/... → FilePatch；其它内建 → ToolStarted
+  - tool_use `mcp__*`（宿主桥接工具）→ 累积成 PausedForToolCalls 批次
+- `{"type":"user","message":{"content":[tool_result...]}}`
+  - 关联到内建 Bash → CommandFinished；其它内建 → ToolFinished
+- `{"type":"control_request","request_id","request":{"subtype":"can_use_tool","tool_name","input"}}`
+  → PermissionRequested 观测 + PausedForInteraction 决策
+- `{"type":"result","subtype":"success","result","usage","total_cost_usd",...}`
+  → SessionCompleted 观测 + Completed 决策；error 子类型 → Failed(LimitExceeded/Runtime)
+
+## 未知/异常帧策略（稳定）
+- 非法 JSON / 非对象 / 缺 `type` 字符串 / 已知类型但内层结构缺失 → `ExternalAgentError::Protocol`
+- 已知类型但**未知子结构块**（未知 content block）/ **未知 `type`** / 空行 → 容忍（忽略）
 
 ## 设计
-- 新目录 `src/agent/external/claude_code/`，feature-gated：`mod.rs` + `config.rs` + `probe.rs`。
-- probe 用可注入 exec 抽象 `ClaudeCodeProbeExec`（async trait），生产实现
-  `SystemClaudeCodeExec` 走 `tokio::process::Command`（tokio "full" 已含 process，无新重依赖），
-  测试用 fake exec 返回罐装输出 → 离线验证错误分类，无需真实 Claude binary。
-- permission_mode 映射真实 Claude CLI 值：Prompt→`default`、AcceptEdits→`acceptEdits`、
-  Plan→`plan`、BypassPermissions→`bypassPermissions`。
-- capability 探测（保守，未检出即 false）：
-  streaming = help 含 `--output-format`+`stream-json`+`--input-format`；
-  permission_bridge = `--permission-mode`；resume = `--resume`/`--continue`；
-  host_tools = `--mcp-config`；usage/artifacts = 同 streaming；graceful_shutdown = true；
-  host_subagents = false（留待 M6-3）。若 !streaming → `UnsupportedCapability{Streaming}`。
-- `ClaudeCodeConfig` 派生 Serialize/Deserialize + round-trip 测试；手写 Debug 脱敏 env。
+- 新增 feature-gated 私有模块 `src/agent/external/claude_code/decoder.rs`：
+  - `ClaudeDecodeContext { step_id, actor }`（宿主提供，用于构造 permission Interaction）
+  - `ClaudeStreamDecoder`：有状态，跨 turn 单调 `seq`，`push_line -> Result<Option<ClaudeDecision>,_>`，
+    `take_observations()`；私有 raw 解析走 `serde_json::Value` 防御式导航（容忍未知）。
+  - `ClaudeDecision`（crate 私有）：Completed / PausedForInteraction / PausedForToolCalls / Failed。
+  - raw 帧结构不暴露；`mod.rs` 以 `pub(crate) use` 挂载 decoder，不进 public API。
+- cassette fixture：`tests/fixtures/external/claude_code/full_session.json`（3 turn：
+  Start→PausedForToolCalls，RespondToolResults→PausedForInteraction，RespondInteraction→Completed），
+  覆盖 text/command/patch/tool/permission/completion。使用 `ExternalRuntimeCassette` 格式。
+- 测试放 decoder.rs 内联 `#[cfg(test)] mod tests`（名字含 `claude_code_cassette`），
+  用 dev-dep `agent_testkit::prelude::ExternalRuntimeCassette` 加载 fixture，逐 turn 喂
+  `input_frames` 给解码器，断言观测 == `expected_events` 且决策匹配 `decision`；
+  加 in-code builder + `AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1` regenerate 守卫 + round-trip +
+  `assert_no_secrets`。再加内联 raw-frame 单测覆盖未知帧容忍 / 空行 / 非法JSON→Protocol /
+  缺 type→Protocol / error result→Failed。
 
 ## 验证条件（TODO.md）
-- `cargo test -p agent-lib claude_code_probe`（无 feature → 0 test）
-- 真正验证：`cargo test -p agent-lib --features external-claude-code claude_code_probe`
-- `cargo test --all --all-targets`（未启 feature）通过。
-- 不泄露 env secret。
-- 完整验证序列 1-6 全过 + feature-enabled clippy/doc/test。
+- `cargo test -p agent-lib claude_code_cassette`（未启 feature → 0 test）
+- 真正验证：`cargo test -p agent-lib --features external-claude-code claude_code_cassette`
+- 完整序列：fmt → clippy(`--all-targets -D warnings`，含 feature) → `cargo test --all --all-targets`
+  （未启 feature）→ feature-enabled 测试 → doc。
+- parser 不需真实 Claude Code；fixture 无 secret。
 
 ## 执行计划
 1. [x] 写 memory plan。
-2. [x] Cargo.toml 加 `[features] external-claude-code = []`。
-3. [x] 新增 `claude_code/{mod.rs,config.rs,probe.rs}` + external/mod.rs feature-gated 挂载/re-export。
-4. [x] 单元测试（config + probe，filter 名含 `claude_code_probe`）。
-5. [x] 更新 docs/capability-matrix.md Claude Code 行。
-6. [x] 验证序列 1-6（+ feature-enabled clippy/doc/test）。
-7. [x] TODO.md 标 [DONE] + 完成记录。
-8. [ ] 提交 `[M6-1] ...` 并停止。
+2. [ ] 实现 decoder.rs + mod.rs 挂载。
+3. [ ] 建 fixture full_session.json（先写 in-code builder，用 regenerate 生成）。
+4. [ ] 内联测试（cassette 回归 + raw-frame 边界）。
+5. [ ] 更新 docs（managed-external-agent.md §12.2 实现状态 / capability-matrix）。
+6. [ ] 验证序列。
+7. [ ] TODO.md 标 [DONE] + 完成记录。
+8. [ ] 提交 `[M6-2] ...` 并停止。
 
-## 状态：完成（待提交）
+## 状态：进行中
