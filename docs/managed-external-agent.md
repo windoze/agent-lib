@@ -924,25 +924,28 @@ OpenCode 需要先做 capability probe,因为部署形态可能更多。
 
 ## 15. capability model
 
-拟新增:
+**已落地**(执行 M4-2,`src/agent/external/capability.rs`)。落地的能力集采用与 M4-4 review 清单
+一致的粗粒度 8 项(而非本节初稿的细粒度字段),避免在 runtime 尚未接线时就固化过细的探测维度:
 
 ```rust
 pub struct ExternalRuntimeCapabilities {
     pub runtime: ExternalRuntimeKind,
-    pub structured_stream: bool,
-    pub text_delta: bool,
-    pub command_events: bool,
-    pub patch_events: bool,
-    pub permission_pause: bool,
-    pub question_pause: bool,
-    pub tool_bridge: bool,
-    pub subagent_bridge: bool,
-    pub session_resume: bool,
-    pub usage_reporting: bool,
-    pub cost_reporting: bool,
-    pub worktree_sandbox: bool,
+    pub streaming: bool,
+    pub resume: bool,
+    pub permission_bridge: bool,
+    pub host_tools: bool,
+    pub host_subagents: bool,
+    pub artifacts: bool,
+    pub usage: bool,
+    pub graceful_shutdown: bool,
 }
 ```
+
+- `ExternalRuntimeCapabilities::none(runtime)` / `ExternalRuntimeKind::conservative_capabilities()`：
+  保守基线,所有能力为 `false`,未探测即不假装支持(§2 非目标)。
+- `supports(ExternalCapability)`：按 enum 查单项能力。
+- `unsupported(ExternalCapability, detail)`：构造 classified error 值(external error 在本 crate 里作为值
+  载入 `ExternalSessionResult::Failed` / cursor,不作为 `Result` err 返回)。
 
 使用场景:
 
@@ -951,12 +954,13 @@ pub struct ExternalRuntimeCapabilities {
 - machine 遇到 unsupported decision point 时给出 classified error。
 - docs/capability-matrix.md 记录实测值。
 
-建议新增错误:
+**已落地**错误(执行 M4-2):`capability` 为强类型 `ExternalCapability` enum(非初稿的 `String`),
+`Display` 只含 runtime + capability 标签 + 稳定 detail,不含 raw prompt/tool input:
 
 ```rust
 ExternalAgentError::UnsupportedCapability {
     runtime: ExternalRuntimeKind,
-    capability: String,
+    capability: ExternalCapability,
     detail: String,
 }
 ```
@@ -1105,7 +1109,9 @@ cargo test --test agent_external_real_e2e -- --ignored --nocapture
 > **编号说明**:本节是设计初稿的里程碑拆分,与实际执行的里程碑编号(见
 > [`PLAN.md`](../PLAN.md) / [`TODO.md`](../TODO.md))并非一一对应。执行侧已落地:sequenced
 > observations(执行 M1)、`ExternalAgentMachine` tool parity(执行 M2)、subagent / interaction
-> parity(执行 M3,含 `spawn_agent` tool-bridge 特判)。下列条目保留设计意图,并就实现差异就地标注。
+> parity(执行 M3,含 `spawn_agent` tool-bridge 特判)、sequenced live sink(执行 M4-1)、capability model
+> (执行 M4-2:`ExternalRuntimeCapabilities` / `ExternalCapability` / `UnsupportedCapability`,设计见
+> §15)。下列条目保留设计意图,并就实现差异就地标注。
 
 ### M1: external tool/subagent 协议
 

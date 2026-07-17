@@ -1206,7 +1206,7 @@ sink 已 sequenced(policy/runtime 接线待实现);§3 parity 流式文本行改
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过(含 sink doctest)。
 - `git diff --check` clean。
 
-### [TODO] M4-2 新增 `ExternalRuntimeCapabilities` 与 unsupported capability 错误
+### [DONE] M4-2 新增 `ExternalRuntimeCapabilities` 与 unsupported capability 错误
 
 **上下文**:
 
@@ -1254,6 +1254,55 @@ sink 已 sequenced(policy/runtime 接线待实现);§3 parity 流式文本行改
   - `cargo test -p agent-lib external_capabilities_roundtrip`
   - `cargo test -p agent-lib external_error_roundtrips`
 - 完整验证序列 1-6 全过。
+
+**完成记录**:
+
+*前置结构修复*:上一 commit `69a0060 [M4-1]` 在插入 M4-1 完成记录时误删了本任务标题
+`### [TODO] M4-2 …`,使 M4-2 的 body 变成 M4-1 的孤儿续写。本轮先以独立 commit
+`c9df411 [M4-2] Restore lost M4-2 task heading` 恢复标题(结构性修复,未拆分/改动任务内容),
+再实现本任务。
+
+*方案*:新增独立 `src/agent/external/capability.rs` 模块(里程碑表已规划「新 capability 模块」)。
+能力集采用 TODO body 的粗粒度 8 项(`streaming/resume/permission_bridge/host_tools/host_subagents/
+artifacts/usage/graceful_shutdown`),与 M4-4 review 清单逐项一致;docs §15 初稿的细粒度字段是
+「拟新增」草图,以 TODO body(权威)为准并在 §15 就地标注差异。保守基线 = 全 `false`,未探测不假装
+支持(PLAN 非目标「能力差异显式暴露、不静默假装支持」)。
+
+*改动*:
+
+- `src/agent/external/capability.rs`(新增):
+  - `ExternalCapability` enum(8 变体,`#[serde(rename_all="snake_case")]`,`Copy`+`Hash`,
+    `as_str`/`Display` 稳定标签,`ALL` 常量供穷举迭代)。
+  - `ExternalRuntimeCapabilities`(`runtime` + 8 `bool`,serde):`none(runtime)` 保守构造、
+    `supports(cap)`、`unsupported(cap, detail) -> ExternalAgentError`(构造 classified error **值**——
+    external error 在本 crate 里作为值载入 `ExternalSessionResult::Failed`/cursor,不作为 `Result` err
+    返回;避免 `clippy::result_large_err` 且与既有约定一致)。
+  - `impl ExternalRuntimeKind { conservative_capabilities() }` 保守 helper。
+- `src/agent/external/mod.rs`:`mod capability;` + `pub use capability::{ExternalCapability,
+  ExternalRuntimeCapabilities};`;`ExternalAgentError` 新增
+  `UnsupportedCapability { runtime, capability: ExternalCapability, detail }`
+  (`#[error("{runtime:?} runtime does not support {capability}: {detail}")]`,字段不含 prompt/tool input)。
+- `src/agent/mod.rs`:re-export `ExternalCapability` / `ExternalRuntimeCapabilities`。
+- 测试:`capability.rs` 内 `external_capabilities_roundtrip`(serde round-trip + `none`/`supports`/`ALL`)、
+  `unsupported_builds_classified_capability_error`;`mod.rs` 内 `external_error_roundtrips`(全 8 个 error
+  变体 round-trip + snake_case tag)、`unsupported_capability_display_does_not_leak_prompt_or_tool_input`
+  (断言 `Display` 只含 runtime+capability+detail,不含注入的 secret prompt / tool input)。
+
+*文档同步*(`docs/managed-external-agent.md`,markdown-only):§15 由「拟新增」改为「已落地(M4-2)」,
+更新为实际落地的 8 项能力集、`capability: ExternalCapability`(非 `String`)、`none`/`supports`/
+`unsupported`/`conservative_capabilities` 与 `Display` 不泄漏说明;§21 前言执行进度补 M4-1 sequenced sink、
+M4-2 capability model。
+
+*验证*(完整序列 1-6 全过):
+
+- `cargo fmt --all -- --check` clean。
+- 聚焦:`cargo test -p agent-lib external_capabilities_roundtrip`(1 passed)、
+  `cargo test -p agent-lib external_error_roundtrips`(1 passed);capability 模块 7 passed。
+- `cargo clippy --all-targets -- -D warnings` 0 warning(`unsupported` 返回 error 值而非 `Result`,
+  规避 `result_large_err`)。
+- `cargo test --all --all-targets` 全绿(exit 0)。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
+- `git diff --check` clean。
 
 ### [TODO] M4-3 扩展 `ExternalSessionPolicy` / `ExternalAgentSpec` 支持 managed mode 配置
 

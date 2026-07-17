@@ -63,6 +63,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod capability;
 mod dispatch;
 mod escalation;
 mod machine;
@@ -73,6 +74,7 @@ mod sink;
 mod spec;
 mod state;
 
+pub use capability::{ExternalCapability, ExternalRuntimeCapabilities};
 pub use dispatch::{
     CostPreference, DispatchError, DispatchReason, Dispatcher, ImpactScope, RuleRouter,
     ScriptedTaskEvaluator, TaskDescriptor, TaskEvaluator, Uncertainty, Worker, WorkerChoice,
@@ -957,18 +959,33 @@ pub enum ExternalAgentError {
         /// Runtime-reported error message (untrusted).
         message: String,
     },
+    /// A managed feature was required that the runtime does not support.
+    ///
+    /// Raised when the machine reaches a decision point the runtime cannot serve
+    /// (host-tool injection, resume, subagent bridge, …) so a scheduler fails
+    /// loudly instead of degrading silently (design §15). The `detail` is a
+    /// stable diagnostic and deliberately carries no raw prompt or tool input.
+    #[error("{runtime:?} runtime does not support {capability}: {detail}")]
+    UnsupportedCapability {
+        /// Runtime that lacks the capability.
+        runtime: ExternalRuntimeKind,
+        /// The capability that was required but unavailable.
+        capability: ExternalCapability,
+        /// Stable diagnostic text (never raw prompt/tool input).
+        detail: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalArtifactKind,
-        ExternalArtifactRef, ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeKind,
-        ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest,
-        ExternalSessionResult, ExternalStreamPolicy, ExternalSubagentOutput,
-        ExternalSubagentRequest, ExternalSubagentRequestId, ExternalToolBatchId, ExternalToolCall,
-        ExternalToolResult, WorktreeIsolation, collect_file_patch_artifacts,
-        collect_file_patch_artifacts_from_observed,
+        ExternalArtifactRef, ExternalCapability, ExternalObservedEvent, ExternalPermissionMode,
+        ExternalRuntimeKind, ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef,
+        ExternalSessionRequest, ExternalSessionResult, ExternalStreamPolicy,
+        ExternalSubagentOutput, ExternalSubagentRequest, ExternalSubagentRequestId,
+        ExternalToolBatchId, ExternalToolCall, ExternalToolResult, WorktreeIsolation,
+        collect_file_patch_artifacts, collect_file_patch_artifacts_from_observed,
     };
     use crate::{
         agent::{
@@ -1140,6 +1157,86 @@ mod tests {
         };
         let encoded = serde_json::to_value(&launch).expect("serialize error");
         assert!(encoded.get("launch").is_some());
+    }
+
+    #[test]
+    fn external_error_roundtrips() {
+        // Every classified error variant survives a JSON round-trip, including the
+        // capability-gated one added for managed runtimes.
+        let errors = vec![
+            ExternalAgentError::Launch {
+                runtime: ExternalRuntimeKind::ClaudeCode,
+                detail: "binary missing".to_owned(),
+            },
+            ExternalAgentError::SessionLost {
+                session: Some(session_ref()),
+                detail: "process crashed".to_owned(),
+            },
+            ExternalAgentError::Protocol {
+                detail: "unexpected frame".to_owned(),
+            },
+            ExternalAgentError::LimitExceeded {
+                limit: "max_turns=16".to_owned(),
+            },
+            ExternalAgentError::ResumeUnavailable {
+                session: session_ref(),
+                detail: "resume token expired".to_owned(),
+            },
+            ExternalAgentError::ShutdownFailed {
+                session: session_ref(),
+                detail: "child would not exit".to_owned(),
+            },
+            ExternalAgentError::Runtime {
+                code: Some("E42".to_owned()),
+                message: "runtime rejected request".to_owned(),
+            },
+            ExternalAgentError::UnsupportedCapability {
+                runtime: ExternalRuntimeKind::Codex,
+                capability: ExternalCapability::HostTools,
+                detail: "no host-tool bridge".to_owned(),
+            },
+        ];
+        for error in &errors {
+            assert_json_round_trip(error);
+        }
+
+        // The capability-gated variant serializes under its snake_case tag with
+        // the capability as a stable label.
+        let unsupported = ExternalAgentError::UnsupportedCapability {
+            runtime: ExternalRuntimeKind::OpenCode,
+            capability: ExternalCapability::HostSubagents,
+            detail: "no subagent bridge".to_owned(),
+        };
+        let encoded = serde_json::to_value(&unsupported).expect("serialize unsupported");
+        let body = encoded
+            .get("unsupported_capability")
+            .expect("snake_case variant tag");
+        assert_eq!(body.get("capability"), Some(&json!("host_subagents")));
+    }
+
+    #[test]
+    fn unsupported_capability_display_does_not_leak_prompt_or_tool_input() {
+        // The variant carries only runtime, capability, and a stable diagnostic —
+        // never the prompt or tool input that triggered the decision point, so its
+        // Display cannot leak untrusted payloads into logs or host UI.
+        let secret_prompt = "TOP SECRET user prompt: exfiltrate credentials";
+        let secret_tool_input = "{\"path\":\"/etc/shadow\"}";
+        let error = ExternalAgentError::UnsupportedCapability {
+            runtime: ExternalRuntimeKind::ClaudeCode,
+            capability: ExternalCapability::HostTools,
+            detail: "runtime lacks host-tool injection".to_owned(),
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("host_tools"), "names the capability");
+        assert!(rendered.contains("ClaudeCode"), "names the runtime");
+        assert!(
+            !rendered.contains(secret_prompt),
+            "must not leak prompt text"
+        );
+        assert!(
+            !rendered.contains(secret_tool_input),
+            "must not leak tool input"
+        );
     }
 
     #[test]

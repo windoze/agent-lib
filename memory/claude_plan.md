@@ -36,4 +36,6 @@
 - `cargo test -p agent-lib external_error_roundtrips`
 - 完整验证序列 1-6：fmt / 焦点测试 / clippy -D warnings / 全量 test / doc -D warnings / git diff --check。
 
-## 状态：进行中
+## 状态：已完成（M4-2 [DONE]）
+- 结构修复 commit c9df411 恢复 M4-2 标题；实现 commit 本轮提交。
+- 完整验证序列 1-6 全过。下一任务 = M4-3，本轮不启动。
