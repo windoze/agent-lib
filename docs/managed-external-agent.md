@@ -107,23 +107,31 @@ scope wiring 决定 attended / headless 行为。
 
 ## 3. 能力 parity 表
 
-| 内部 agent 能力 | `DefaultAgentMachine` | Managed external agent 目标 | 备注 |
+> **落地状态（截至 M9-5）**:下表「备注」列记录 *as-built* 状态而非目标。managed 路径已整链
+> 打通——`ExternalAgentMachine`(sans-io)+ registry-backed `ExternalSessionHandler`(M5)+ 三个
+> feature-gated runtime adapter(Claude Code M6 / Codex M7 / OpenCode M8)——离线由
+> scripted/cassette handler 验证,真实 CLI 由 `#[ignore]` e2e 覆盖。可运行的 scoped-effect wiring
+> 见 `examples/managed_claude_code.rs`、`examples/managed_codex.rs`、`examples/managed_opencode.rs`、
+> `examples/managed_mixed.rs`(共享装配 `examples/support/managed.rs`)。**真实能力仍以 ignored e2e
+> 跑绿为准**;能力矩阵的保守默认与门控见 [`capability-matrix.md`](./capability-matrix.md)。
+
+| 内部 agent 能力 | `DefaultAgentMachine` | Managed external agent | 备注 |
 |---|---|---|---|
-| 文本 turn | `NeedLlm` -> assistant `Response` | `NeedExternalSession` -> `Completed.output` | 已有基础 |
-| 多轮会话 | Conversation + model history | `ExternalSessionRef` + runtime resume/continue | runtime-dependent |
-| 流式文本 | `StreamEvent` / `Notification::Llm` | `ExternalAgentEvent::TextDelta` / live sink | seq 已落地(M1),`ExternalEventSink` 已 sequenced(M4-1);runtime 接线待实现 |
-| tool call | `ContentBlock::ToolUse` -> `NeedTool` | runtime tool call -> `NeedTool` -> `RespondToolResults` | machine 已实现,runtime handler 待实现 |
-| tool approval | `NeedInteraction(Approval)` | runtime permission 或 host tool approval -> `NeedInteraction` | machine 已实现(interaction 校验),runtime handler 待实现 |
-| user question | `NeedInteraction(Question)` | runtime question -> `NeedInteraction(Question)` | machine 已实现(`NeedInteraction`),runtime handler 待实现 |
-| subagent | `NeedSubagent` | runtime spawn request -> `NeedSubagent` | machine 已实现,runtime handler 待实现 |
+| 文本 turn | `NeedLlm` -> assistant `Response` | `NeedExternalSession` -> `Completed.output` | 已落地:machine 折 `RuntimeDecisionPoint::Completed.output` 进 Conversation(M2/M5),三 adapter 解结构化流 |
+| 多轮会话 | Conversation + model history | `ExternalSessionRef` + runtime resume/continue | 已落地:registry `get_or_start` 首轮 start、后续 reattach;跨进程 `resume` 按 adapter capability 门控(runtime-dependent) |
+| 流式文本 | `StreamEvent` / `Notification::Llm` | `ExternalAgentEvent::TextDelta` / live sink | 已落地:`ExternalEventSink` sequenced(M4-1),三 adapter 把解码帧镜像到 live sink;handler 经 `get_or_start(.., Some(sink))` 接线(M6–M8) |
+| tool call | `ContentBlock::ToolUse` -> `NeedTool` | runtime tool call -> `NeedTool` -> `RespondToolResults` | 已落地:machine external tool phase(M2)+ registry-backed handler(M5)。**host custom-tool 注入**仍 capability-gated 关(`host_tools=false`,§12.3),对声明工具的请求以 `UnsupportedCapability{HostTools}` 拒绝 |
+| tool approval | `NeedInteraction(Approval)` | runtime permission 或 host tool approval -> `NeedInteraction` | 已落地:runtime permission pause(`PausedForInteraction`)→ `NeedInteraction`,由 scope interaction handler 就地批准(M3;real e2e M9-4;examples 用 `approve_all`) |
+| user question | `NeedInteraction(Question)` | runtime question -> `NeedInteraction(Question)` | 已落地:runtime question/choice → `NeedInteraction`(M3-2) |
+| subagent | `NeedSubagent` | runtime spawn request -> `NeedSubagent` | 已落地:`PausedForSubagent`→`NeedSubagent`(M3-1)+ `spawn_agent` tool-bridge 特判(M3-3);real DeepSeek 协调器派生 Claude/Codex child(M9-4) |
 | tool failure policy | `ToolFailurePolicy` | external tool result error 回灌或 fail turn | 已落地(M4-3):`ExternalToolFailurePolicy`(`ReturnErrorToRuntime` 默认 / `StopRun`) |
-| cancel | `StepInput::Abandon` closes pending | abandon marks cleanup + handler kills session | machine 已有,handler 待实现 |
-| budget | handler/driver charge tokens/cost | runtime usage/cost event charge | 拟新增 |
-| trace | requirement + tool + subagent nodes | external events + shutdown + artifacts | 部分已有 |
-| artifact | tool/model output | patch/diff/test/file artifact refs | 部分已有 |
+| cancel | `StepInput::Abandon` closes pending | abandon marks cleanup + handler kills session | 已落地:registry `cleanup`/`cleanup_agent` 强制关 live session 并返回 `ExternalSessionShutdown` disposition(M5);adapter `kill_on_drop` 兜底 |
+| budget | handler/driver charge tokens/cost | runtime usage/cost event charge | 已落地(M9-2):`ExternalUsageChargingHandler` 把 runtime usage/cost 计入 run budget,见 §17 |
+| trace | requirement + tool + subagent nodes | external events + shutdown + artifacts | 部分已有:requirement/subagent/shutdown 节点已接;artifact 追踪见下 |
+| artifact | tool/model output | patch/diff/test/file artifact refs | 部分已有:见 §18 |
 | worktree isolation | `WorktreeRef` | shared / per-agent / ephemeral worktree manager | 已落地(M9-1):`WorktreeManager`/`GitWorktreeManager`(prepare/cleanup + residual 标记),见 §16 |
 | reconfig | queued tool set swap | boundary-level tool bridge reconfigure | 已落地(M9-3):`ExternalAgentMachine::reconfigure` + `ExternalReconfigTiming`/`ExternalReconfigOutcome`(boundary 应用/排队;in-flight `Hot`→`UnsupportedCapability{Reconfigure}`),见 §19 |
-| snapshot/restore | `AgentState` + Conversation snapshot | `ExternalAgentState` + `ExternalSessionRef` resume | state 已有,handler 待实现 |
+| snapshot/restore | `AgentState` + Conversation snapshot | `ExternalAgentState` + `ExternalSessionRef` resume | 已落地:`ExternalAgentState` 持久化 spec/session/cursor/conversation,registry 依 `ExternalSessionRef` reattach/`resume`(capability-gated),未知不可 resume 的 session 以 `ResumeUnavailable` 显式失败 |
 
 ## 4. 架构总览
 
@@ -1553,13 +1561,18 @@ cargo test --test agent_external_real_e2e -- --ignored --nocapture
 
 ### M9: docs/examples/capability matrix
 
-- 更新 [`capability-matrix.md`](./capability-matrix.md)。
-- examples:
-  - Claude Code managed。
-  - Codex managed。
-  - OpenCode managed。
-  - mixed external agents。
-- 安全说明:权限、worktree、secret redaction、ignored tests。
+- 更新 [`capability-matrix.md`](./capability-matrix.md)。**已落地(M9-5)**:补齐 Codex/OpenCode adapter 的
+  probe/decoder/adapter 落地状态与 examples 指针。
+- examples(**已落地 M9-5**,均为 scoped-effect wiring,经 `ExternalAgentMachine` + 作用域
+  `ExternalSessionHandler` 驱动,不直接调 adapter):
+  - Claude Code managed — [`examples/managed_claude_code.rs`](../examples/managed_claude_code.rs)。
+  - Codex managed — [`examples/managed_codex.rs`](../examples/managed_codex.rs)。
+  - OpenCode managed — [`examples/managed_opencode.rs`](../examples/managed_opencode.rs)。
+  - mixed external agents — [`examples/managed_mixed.rs`](../examples/managed_mixed.rs)。
+  - 共享装配 [`examples/support/managed.rs`](../examples/support/managed.rs);每个 example 用
+    `required-features` 门控,CLI 缺失/probe 失败即打印非密 skip 并 exit 0。
+- 安全说明:权限、worktree、secret redaction、ignored tests。运行说明另见根目录
+  [`AGENTS.md`](../AGENTS.md)。
 
 ## 22. 关键风险
 

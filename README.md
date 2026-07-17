@@ -322,6 +322,16 @@ Agent 端到端示例(交互式对话 + 需审批的 mock 工具)用同一组环
 cargo run --example agent_chat
 ```
 
+受管外部 agent 示例(经 `ExternalAgentMachine` + 作用域 `ExternalSessionHandler` 驱动真实
+coding-agent CLI)按各自的 feature flag 门控，缺 CLI/probe 失败即打印非密提示并 skip：
+
+```bash
+cargo run --example managed_claude_code --features external-claude-code
+cargo run --example managed_codex        --features external-codex
+cargo run --example managed_opencode     --features external-opencode
+cargo run --example managed_mixed        --features "external-claude-code external-codex"
+```
+
 - `non_streaming`：通过 `Box<dyn LlmClient>` 获取完整的 normalized `Response`。
 - `streaming_typewriter`：收到 `Delta::Text` 即刷新 stdout，同时把事件送入公共 `Accumulator`
   校验可折叠的完整响应。
@@ -332,6 +342,9 @@ cargo run --example agent_chat
 - `agent_chat`：接真实 provider 的 `AgentMachine` + 自定义 scoped-effect driver 端到端演示——
   行输入的多轮对话、mock 的 `get_weather` 工具、逐次审批(stdin 放行/拒绝的 `InteractionHandler`),
   输入 `/quit` 退出并打印整段会话的 token 统计。
+- `managed_claude_code` / `managed_codex` / `managed_opencode` / `managed_mixed`：受管外部 agent
+  的 scoped-effect wiring(共享装配 `examples/support/managed.rs`)。运行说明、env、worktree 隔离与
+  secret 处理见 [`AGENTS.md`](AGENTS.md) 与 [`docs/capability-matrix.md`](docs/capability-matrix.md)。
 
 每个 endpoint 示例为单次 HTTP 操作配置 45 秒 timeout，缺少变量或 provider 非法时会给出
 不含 secret 的明确错误。
@@ -386,8 +399,10 @@ cargo test --test agent_complex_cancel     # cancel never-resume、approval vs c
 
 ## 参考文档
 
+- [`AGENTS.md`](AGENTS.md) —— 构建 / 测试 / 运行(含受管外部 agent)的操作指南。
 - [`DESIGN.md`](DESIGN.md) —— 完整设计。
 - [`docs/conversation-core.md`](docs/conversation-core.md) —— Conversation 层设计。
 - [`docs/agent-layer.md`](docs/agent-layer.md)、[`docs/agent-effect-model.md`](docs/agent-effect-model.md)
   —— Agent 层 sans-io + effect-handler 模型。
+- [`docs/managed-external-agent.md`](docs/managed-external-agent.md) —— 受管外部 agent 设计与能力 parity。
 - [`docs/capability-matrix.md`](docs/capability-matrix.md) —— provider 能力差异与实测范围。

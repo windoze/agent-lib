@@ -1,0 +1,131 @@
+# AGENTS.md
+
+Operational guide for working in **agent-lib**. It complements the design docs
+under [`docs/`](docs/) and the task ledgers ([`PLAN.md`](PLAN.md),
+[`TODO.md`](TODO.md)); read those for architecture and roadmap. This file is the
+short "how to build, test, and run things" reference.
+
+## Repository layout
+
+- `src/` — the `agent-lib` crate: `client/` (LLM wire adapters), `conversation/`
+  (Conversation core), `model/` (normalized data model + escape hatches), and
+  `agent/` (sans-io machines + effect handlers, including
+  `agent/external/` for the managed external-runtime stack).
+- `crates/agent-testkit/` — dev-only test harness (`TestScope`, `SeqIds`,
+  scripted/cassette handlers, fixtures, assertions). It is a dev-dependency, so
+  it is available to tests, benches, and **examples** but never to the library
+  build.
+- `examples/` — runnable examples; shared example-only helpers live in
+  `examples/support/`.
+- `tests/` — integration tests. Real endpoint / real CLI tests are `#[ignore]`
+  and skip cleanly when unconfigured.
+- `docs/` — design and reference docs. `docs/managed-external-agent.md` and
+  `docs/capability-matrix.md` are the sources of truth for the managed external
+  agent.
+
+## Build, lint, and test
+
+Run these before finishing a change, in this order (cheap → expensive):
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+cargo test --all --all-targets
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+```
+
+The default build pulls in **no** CLI-adapter machinery: the three managed
+runtime adapters are behind off-by-default features, so run their clippy pass
+separately when you touch them:
+
+```bash
+cargo clippy --all-targets \
+  --features "external-claude-code external-codex external-opencode" -- -D warnings
+```
+
+Every test must finish in well under a minute; a test that hangs is a bug to fix
+immediately, not to wait out.
+
+## Feature flags
+
+| Feature | Enables |
+|---|---|
+| `external-claude-code` | Managed Claude Code adapter (config + probe + decoder + live session) |
+| `external-codex` | Managed Codex adapter |
+| `external-opencode` | Managed OpenCode adapter |
+
+All three are **off by default**. Enabling them adds no heavy dependency (the
+probes reuse tokio's process support).
+
+## Managed external agents
+
+The managed path drives a real coding-agent CLI through an
+`ExternalAgentMachine` (sans-io) and a scoped, registry-backed
+`ExternalSessionHandler` — never by calling the adapter directly. See
+`docs/managed-external-agent.md` for the design and `docs/capability-matrix.md`
+for the capability model.
+
+### Examples
+
+Each example is gated by `required-features`, so the default
+`cargo check --examples` skips them:
+
+```bash
+cargo run --example managed_claude_code --features external-claude-code
+cargo run --example managed_codex        --features external-codex
+cargo run --example managed_opencode     --features external-opencode
+cargo run --example managed_mixed        --features "external-claude-code external-codex"
+```
+
+Shared wiring: [`examples/support/managed.rs`](examples/support/managed.rs).
+
+### Required environment
+
+The managed examples need **no** secrets: each spawned CLI uses its own stored
+login, inherited from the process environment. Only optional overrides are read
+(and never printed):
+
+| Variable | Effect | Default |
+|---|---|---|
+| `CLAUDE_CODE_BIN` / `CODEX_BIN` / `OPENCODE_BIN` | Path to the CLI binary | `claude` / `codex` / `opencode` on `PATH` |
+| `CLAUDE_CODE_MODEL` / `CODEX_MODEL` / `OPENCODE_MODEL` | Pin a cheaper model | adapter default |
+
+The mixed multi-agent e2e additionally needs a `DEEPSEEK_API_KEY` (optional
+`DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL`) for its coordinator LLM; it is read from
+the environment or a `.envrc` and never logged.
+
+### Ignored real e2e commands
+
+Structured real-CLI regressions are `#[ignore]` and skip when the binary/login
+is absent:
+
+```bash
+cargo test --features external-claude-code --test external_claude_code -- --ignored --nocapture
+cargo test --features external-codex        --test external_codex        -- --ignored --nocapture
+cargo test --features external-opencode     --test external_opencode     -- --ignored --nocapture
+
+# Multi-agent managed path: DeepSeek coordinator fans out to Claude Code + Codex children.
+cargo test --features "external-claude-code external-codex" \
+  --test agent_external_managed_real_e2e -- --ignored --nocapture
+```
+
+### Safety properties
+
+- **Worktree isolation** — every managed child runs in a throwaway `git init`
+  worktree under the OS temp dir, removed when the drive finishes, so a child
+  that writes files never touches the checkout it launched from
+  (`docs/managed-external-agent.md` §16).
+- **Secret redaction** — credentials are never read into logs or printed; cassette
+  fixtures are scrubbed and asserted secret-free.
+- **Unsupported-capability fallback** — a missing CLI or a failed capability
+  probe becomes a non-secret **skip** (exit 0), and a request for a capability
+  the runtime has not opted into (for example host tools) is rejected with an
+  explicit `UnsupportedCapability{..}` error rather than silently degraded.
+
+## Conventions
+
+- Keep `ExternalAgentMachine` (and the other machines) sans-io: all IO lives in
+  handlers/adapters.
+- Prefer small, targeted patches; re-read a section between edits.
+- Update the doc that owns a behavior when you change it; the managed docs above
+  are kept in sync with the code as of milestone M9-5.

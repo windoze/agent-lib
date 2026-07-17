@@ -2936,7 +2936,7 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
   `cargo test --all --all-targets`（默认）47 个 test 二进制全 `ok`、0 failed（新测 cfg 掉=空 crate，真实 e2e 不跑）;
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净;`git diff --check` 干净。
 
-### [TODO] M9-5 更新 docs/examples/capability matrix
+### [DONE] M9-5 更新 docs/examples/capability matrix
 
 **上下文**:
 
@@ -2970,6 +2970,54 @@ OpenCode adapter 完成后三个目标 runtime 都有统一接入路径。
 - examples 如可编译,运行 `cargo check --examples` 或等价命令。
 - `git diff --check`
 - 完成记录中列出文档和 example 路径。
+
+**完成记录**:
+
+- **新增 4 个受管外部 agent examples（scoped-effect wiring，经 `ExternalAgentMachine` + 作用域
+  registry-backed `ExternalSessionHandler` 驱动真实 CLI，绝不直接调 adapter 绕过 machine）**:
+  - [`examples/managed_claude_code.rs`](examples/managed_claude_code.rs)（`required-features =
+    ["external-claude-code"]`）
+  - [`examples/managed_codex.rs`](examples/managed_codex.rs)（`external-codex`）
+  - [`examples/managed_opencode.rs`](examples/managed_opencode.rs)（`external-opencode`）
+  - [`examples/managed_mixed.rs`](examples/managed_mixed.rs)（`external-claude-code` +
+    `external-codex`，顺序驱动 Claude Code 与 Codex 两个 child，演示 mixed external agents）
+  - 共享装配 [`examples/support/managed.rs`](examples/support/managed.rs)：runtime-agnostic
+    `RegistryHandler`（`get_or_start`→`advance`→折 `ExternalSessionResult`）、`CountingSink`（live
+    sink 观测计数）、`ObservationLog`、cfg-gated per-runtime `build_registry`（config→probe→
+    `with_probed_capabilities`→`ExternalSessionRegistry`）、`drive_managed_child`（建临时 `git init`
+    worktree + machine + `TestScope`(external + `approve_all` interaction) + `drain`，结束
+    `cleanup_agent` + 删 worktree）。CLI 缺失/probe 失败即打印**非密** skip 并 exit 0。
+  - **门控**:每个 example 经 `Cargo.toml` `[[example]] required-features` 门控，默认
+    `cargo check --examples` / `cargo test --all --all-targets` 跳过它们（不引入任何 CLI-adapter 机制）。
+    examples 使用 dev-dep `agent-testkit`（Cargo 允许 examples 用 dev-dependencies）。
+- **更新 `Cargo.toml`**:新增 4 个 `[[example]]` + `required-features` 条目（附说明注释）。
+- **更新 [`docs/managed-external-agent.md`](docs/managed-external-agent.md)**:§3 能力 parity 表由「目标 +
+  待实现」翻新为 *as-built*（文本/多轮/流式/tool/approval/question/subagent/cancel/budget/snapshot 均标注
+  M2–M9 已落地，host custom-tool 注入诚实标注 capability-gated `false`），表头加 M9-5 落地状态与 examples
+  指针；§21 M9 里程碑条目补 as-built + 4 个 example 路径 + 指向 `AGENTS.md`。
+- **更新 [`docs/capability-matrix.md`](docs/capability-matrix.md)**:新增「可运行示例与真机验证入口（M9-5）」
+  一节——example 表、`cargo run` 命令、feature flags / required env / ignored e2e 命令（含
+  `agent_external_managed_real_e2e`）/ worktree isolation / secret redaction / unsupported-capability
+  fallback 全部写清。（Codex/OpenCode adapter 的 probe/decoder/adapter 落地表 M7/M8 已在文内，本次不重复。）
+- **新增 [`AGENTS.md`](AGENTS.md)**（根目录）:仓库布局、build/lint/test 命令序列、feature flags 表、受管外部
+  agent 运行说明（examples 命令、required env 覆盖表、ignored real e2e 命令、worktree isolation / secret
+  redaction / unsupported-capability fallback 三条安全属性）、约定。
+- **更新 [`README.md`](README.md)**:「可运行示例」补 4 个 managed example 命令与条目；「参考文档」补
+  `AGENTS.md` 与 `managed-external-agent.md`。
+- **无 `src/` 改动**（纯文档 + feature-gated examples + Cargo 元数据）。
+- **验证序列（全过）**:
+  `cargo fmt --all -- --check` 干净;
+  `cargo clippy --all-targets -- -D warnings`（默认）0 warning;
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D
+  warnings` 0 warning（含单 feature `external-opencode` 亦 0 warning，验证 cfg + catch-all 无 unreachable/unused）;
+  `cargo check --examples`（默认，managed examples 被 required-features 跳过）干净;
+  `cargo check --examples --features "external-claude-code external-codex external-opencode"` 干净;
+  `cargo test --all --all-targets`（默认）47 个 test 二进制全 `ok`、0 failed;
+  `cargo test --all --all-targets --features "external-claude-code external-codex external-opencode"`
+  51 个 test 二进制全 `ok`、0 failed（managed examples 作为 `--all-targets` 目标编译通过；真机 e2e `#[ignore]`）;
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 干净;`git diff --check` 干净。
+- **本机限制**:无 `claude`/`codex`/`opencode` CLI 与登录，`cargo run --example managed_*` 会走
+  非密 skip 分支（打印缺失提示、exit 0）；真机运行需在具备对应 CLI 的环境按 `AGENTS.md` 命令执行。
 
 ### [TODO] M9-6 Review：Managed External Agent 总体验收
 

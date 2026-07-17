@@ -44,3 +44,24 @@ uuid = { version = "1", features = ["serde"] }
 # through a dev-dependency (agent-testkit -> agent-lib), which Cargo permits
 # because dev-dependencies are excluded from the normal library build.
 agent-testkit = { path = "crates/agent-testkit" }
+
+# Managed-external examples. Each drives a real coding-agent CLI the managed way
+# (ExternalAgentMachine + scoped ExternalSessionHandler), so it is gated behind
+# the matching adapter feature; without it Cargo skips the target, keeping the
+# default `cargo check --examples` / `cargo test --all --all-targets` free of any
+# CLI-adapter machinery. The shared wiring lives in `examples/support/managed.rs`.
+[[example]]
+name = "managed_claude_code"
+required-features = ["external-claude-code"]
+
+[[example]]
+name = "managed_codex"
+required-features = ["external-codex"]
+
+[[example]]
+name = "managed_opencode"
+required-features = ["external-opencode"]
+
+[[example]]
+name = "managed_mixed"
+required-features = ["external-claude-code", "external-codex"]
