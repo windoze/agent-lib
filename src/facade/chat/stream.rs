@@ -41,6 +41,11 @@ use crate::stream::accumulator::{Accumulator, AccumulatorError};
 /// [`RunEvent::RawStream`] escape hatch; the stream ends with exactly one
 /// [`RunEvent::Done`] carrying the complete [`RunOutput`].
 ///
+/// Committing the assistant turn happens only when that terminal `Done` is
+/// reached. If the stream is dropped before then — including before it is ever
+/// polled — its [`Drop`] implementation discards the in-flight pending turn, so
+/// the backing session stays at its last committed point and remains usable.
+///
 /// [`ChatSession::stream`]: super::ChatSession::stream
 pub struct RunStream<'a> {
     /// The session Conversation whose pending turn this stream will commit.
@@ -98,11 +103,21 @@ impl<'a> RunStream<'a> {
         StreamExt::next(self).await
     }
 
-    /// Discards the in-flight pending turn so the session stays consistent.
-    fn rollback(&mut self) {
-        let _ = self
-            .conversation
-            .cancel_pending(CancelDisposition::DiscardTurn);
+    /// Discards any in-flight pending turn and marks the drive terminal.
+    ///
+    /// This is the single rollback path shared by the streaming error branches
+    /// and the [`Drop`] guard, so the two never diverge. It is idempotent: once
+    /// the drive is terminal — because it committed a `Done`, surfaced an error,
+    /// or was already abandoned — `state` is [`State::Done`] and the pending
+    /// turn is gone, so calling it again is a no-op that never rolls back an
+    /// already-committed turn.
+    fn abandon(&mut self) {
+        if self.state != State::Done {
+            let _ = self
+                .conversation
+                .cancel_pending(CancelDisposition::DiscardTurn);
+            self.state = State::Done;
+        }
     }
 
     /// Folds one source event into the accumulator and buffers its `RunEvent`s.
@@ -125,7 +140,7 @@ impl<'a> RunStream<'a> {
             .as_mut()
             .expect("accumulator present while streaming");
         if let Err(error) = accumulator.push(event) {
-            self.rollback();
+            self.abandon();
             return Err(map_accumulator_error(error));
         }
         Ok(())
@@ -135,12 +150,12 @@ impl<'a> RunStream<'a> {
     ///
     /// This mirrors the non-streaming `drive_pending` tail exactly so the
     /// resulting [`RunOutput`] matches turn for turn. Any failure rolls the
-    /// pending turn back.
+    /// pending turn back via [`abandon`](Self::abandon).
     fn finish(&mut self) -> Result<RunEvent, FacadeError> {
         match self.finish_inner() {
             Ok(done) => Ok(done),
             Err(error) => {
-                self.rollback();
+                self.abandon();
                 Err(error)
             }
         }
@@ -185,18 +200,20 @@ impl Stream for RunStream<'_> {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Some(Ok(event))) => {
                         if let Err(error) = this.absorb(event) {
-                            this.state = State::Done;
+                            // `absorb` already abandoned the pending turn.
                             return Poll::Ready(Some(Err(error)));
                         }
                     }
                     Poll::Ready(Some(Err(error))) => {
-                        this.rollback();
-                        this.state = State::Done;
+                        this.abandon();
                         return Poll::Ready(Some(Err(FacadeError::from(error))));
                     }
                     Poll::Ready(None) => this.state = State::Finishing,
                 },
                 State::Finishing => {
+                    // On success `finish` commits the turn; mark the drive
+                    // terminal so the drop guard does not roll the commit back.
+                    // On failure `finish` already abandoned it.
                     let result = this.finish();
                     this.state = State::Done;
                     return Poll::Ready(Some(result));
@@ -204,6 +221,21 @@ impl Stream for RunStream<'_> {
                 State::Done => return Poll::Ready(None),
             }
         }
+    }
+}
+
+impl Drop for RunStream<'_> {
+    /// Discards any pending turn left open when the stream is dropped early.
+    ///
+    /// [`ChatSession::stream`](super::ChatSession::stream) opens a pending turn
+    /// before returning this stream, and the turn is only committed once the
+    /// terminal [`RunEvent::Done`] is reached. A caller that drops the stream
+    /// before then would otherwise strand that pending turn, breaking the next
+    /// `snapshot`, `send`, or `stream`. `abandon` rolls it back and is
+    /// idempotent, so a stream dropped after a committed `Done` or an error is
+    /// left untouched.
+    fn drop(&mut self) {
+        self.abandon();
     }
 }
 

@@ -77,6 +77,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - `Agent::stream`：等待 tool / approval 时 drop，下一次 `run` 成功。
 - 若 external delegate streaming 支持中途 drop，补 external cleanup marker / session cleanup 断言。
 
+修复状态（更新）：
+
+- `ChatSession::stream` 的 `RunStream` 已在 M1-1 修复：新增 `Drop` guard，非
+  terminal `Done` 状态被 drop 时通过统一的 `abandon()`（`cancel_pending(DiscardTurn)`
+  + 标记 terminal，幂等）回滚 pending turn；错误路径与 drop 路径收敛到同一 helper。
+  已补 drop-before-poll、收到 text delta 后 drop、正常读完后 drop 三个离线回归测试。
+- `AgentRunStream` 的同类风险仍未修复，由 M1-2 处理。
+
 ### 2. 协作状态运行时可用，但 snapshot/restore 仍丢弃数据
 
 严重度：高 / 中。

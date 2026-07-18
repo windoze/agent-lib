@@ -12,7 +12,7 @@
 
 ## M1：流式生命周期恢复
 
-### M1-1 [TODO] 修复 `ChatSession::stream` 提前 drop 后遗留 pending turn
+### M1-1 [DONE] 修复 `ChatSession::stream` 提前 drop 后遗留 pending turn
 
 上下文：
 
@@ -38,6 +38,32 @@
 ```bash
 cargo test -p agent-lib --lib facade::chat::
 ```
+
+完成记录：
+
+- 实现（`src/facade/chat/stream.rs`）：
+  - 把原来的 `rollback()` 收敛为单一幂等 helper `abandon()`：仅当 `state != Done`
+    时调用 `conversation.cancel_pending(CancelDisposition::DiscardTurn)` 并把 `state`
+    置为 `Done`。错误路径（`absorb`/`finish`/流式传输错误）与 drop 路径都走这一 helper，
+    避免行为分叉。
+  - 新增 `impl Drop for RunStream`，drop 时调用 `abandon()`：未完成状态回滚 pending
+    turn；正常完成（已提交 `Done`）或已出错状态因 `state == Done` 而是 no-op，不会二次
+    回滚已提交的 assistant turn。
+  - 更新 `RunStream`/`ChatSession::stream` 文档以匹配“提前 drop 自动 discard 半截
+    turn，session 回到上一 committed 一致点”的承诺（此前文档已这样描述，但实现缺 `Drop`）。
+- 测试（`src/facade/chat/tests.rs`）：新增 `DualFakeClient`（同时脚本化 `chat` 与
+  `chat_stream`）与三条离线回归：
+  - `stream_dropped_before_polling_leaves_session_usable`：未 poll 就 drop，随后 `send` 成功。
+  - `stream_dropped_after_delta_does_not_commit_partial_turn`：收到 text delta 后 drop，
+    `snapshot` 成功且未提交半截 assistant turn，下一次 `send` 只带 1 条消息。
+  - `stream_dropped_after_completion_keeps_committed_turn`：正常读完 `Done` 后 drop，
+    已提交的 [user, assistant] 保留，后续 `send` 回放 3 条消息。
+- 文档：同步 `docs/refine.md` 问题 #1 的修复状态（ChatSession 侧 M1-1 已修，
+  `AgentRunStream` 留待 M1-2）。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
+  `cargo test -p agent-lib --lib facade::chat::`（19 passed）、
+  `cargo test --all --all-targets`（全绿，0 failed）、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
 ### M1-2 [TODO] 修复 `AgentRunStream` 提前 drop 后遗留未完成 run
 

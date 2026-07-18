@@ -346,6 +346,59 @@ impl LlmClient for StreamingFakeClient {
     }
 }
 
+/// A scripted client that serves both `chat` (a fixed [`Response`]) and
+/// `chat_stream` (a fixed normalized event sequence), recording every request.
+///
+/// It lets a test open a stream, drop it early, and then keep driving the same
+/// session with a non-streaming `send`, all offline.
+#[derive(Debug)]
+struct DualFakeClient {
+    response: Response,
+    events: Vec<StreamEvent>,
+    requests: Mutex<Vec<ChatRequest>>,
+}
+
+impl DualFakeClient {
+    fn new(response: Response, events: Vec<StreamEvent>) -> Self {
+        Self {
+            response,
+            events,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Returns the number of messages sent on each recorded request, in order.
+    fn request_message_counts(&self) -> Vec<usize> {
+        self.requests
+            .lock()
+            .expect("requests mutex")
+            .iter()
+            .map(|request| request.messages.len())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl LlmClient for DualFakeClient {
+    fn capability(&self) -> &Capability {
+        &crate::client::ANTHROPIC_DEFAULT_CAPABILITY
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<Response, ClientError> {
+        self.requests.lock().expect("requests mutex").push(request);
+        Ok(self.response.clone())
+    }
+
+    async fn chat_stream(
+        &self,
+        request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError> {
+        self.requests.lock().expect("requests mutex").push(request);
+        let events = self.events.clone();
+        Ok(futures::stream::iter(events.into_iter().map(Ok::<_, ClientError>)).boxed())
+    }
+}
+
 /// A stop reason shared by every text stream fixture and its expected response.
 fn end_turn() -> Normalized<StopReason> {
     Normalized::from_mapped(StopReason::EndTurn, "end_turn")
@@ -551,4 +604,113 @@ async fn consecutive_streams_accumulate_history() {
     // The effective view exposes [user, assistant, user, assistant].
     let (_system, messages) = session.conversation().effective_view().into_parts();
     assert_eq!(messages.len(), 4);
+}
+
+#[tokio::test]
+async fn stream_dropped_before_polling_leaves_session_usable() {
+    let client = Arc::new(DualFakeClient::new(
+        text_response("recovered"),
+        text_stream_events(&["ignored"], Usage::default()),
+    ));
+    let chat = chat_with(client.clone());
+    let mut session = chat.session().build().expect("build session");
+
+    // Open a stream but drop it before polling a single event. The pending turn
+    // opened by `stream` must be rolled back by the drop guard.
+    {
+        let _stream = session.stream("first").await.expect("open stream");
+    }
+
+    // The abandoned turn left no committed history and no stranded pending turn,
+    // so a subsequent non-streaming `send` succeeds and starts from scratch.
+    let reply = session.send("second").await.expect("send after early drop");
+    assert_eq!(reply.text(), "recovered");
+
+    // The dropped stream contributed nothing: only the committed [user, assistant]
+    // pair from the successful `send` remains.
+    let (_system, messages) = session.conversation().effective_view().into_parts();
+    assert_eq!(messages.len(), 2);
+}
+
+#[tokio::test]
+async fn stream_dropped_after_delta_does_not_commit_partial_turn() {
+    let client = Arc::new(DualFakeClient::new(
+        text_response("recovered"),
+        text_stream_events(&["Hel", "lo"], Usage::default()),
+    ));
+    let chat = chat_with(client.clone());
+    let mut session = chat.session().build().expect("build session");
+
+    // Read at least one text delta, then drop the stream mid-flight.
+    {
+        let mut stream = session.stream("first").await.expect("open stream");
+        let mut saw_delta = false;
+        while let Some(item) = stream.next().await {
+            if matches!(item.expect("stream item ok"), RunEvent::TextDelta(_)) {
+                saw_delta = true;
+                break;
+            }
+        }
+        assert!(saw_delta, "stream should yield at least one text delta");
+    }
+
+    // `snapshot` requires a committed consistency point: it only succeeds if the
+    // drop guard rolled the half-streamed pending turn back.
+    let _snapshot = session.snapshot().expect("snapshot after mid-stream drop");
+    let (_system, messages) = session.conversation().effective_view().into_parts();
+    assert!(
+        messages.is_empty(),
+        "no half assistant turn should have been committed",
+    );
+
+    // The next `send` replays no uncommitted assistant turn: with no committed
+    // history the recorded request carries exactly the single new user message.
+    let reply = session
+        .send("second")
+        .await
+        .expect("send after mid-stream drop");
+    assert_eq!(reply.text(), "recovered");
+    assert_eq!(
+        client
+            .request_message_counts()
+            .last()
+            .copied()
+            .expect("a send was recorded"),
+        1,
+    );
+}
+
+#[tokio::test]
+async fn stream_dropped_after_completion_keeps_committed_turn() {
+    let client = Arc::new(DualFakeClient::new(
+        text_response("recovered"),
+        text_stream_events(&["all ", "done"], Usage::default()),
+    ));
+    let chat = chat_with(client.clone());
+    let mut session = chat.session().build().expect("build session");
+
+    // Drain the stream to its terminal `Done`, then drop it. The commit that the
+    // terminal `Done` performed must survive the drop.
+    {
+        let mut stream = session.stream("first").await.expect("open stream");
+        let mut saw_done = false;
+        while let Some(item) = stream.next().await {
+            if matches!(item.expect("stream item ok"), RunEvent::Done(_)) {
+                saw_done = true;
+            }
+        }
+        assert!(saw_done, "stream should reach a terminal Done");
+    }
+
+    // The committed [user, assistant] pair is still present right after the drop.
+    let (_system, messages) = session.conversation().effective_view().into_parts();
+    assert_eq!(messages.len(), 2);
+
+    // A follow-up send replays the committed pair plus the new user message,
+    // proving the completed turn was not rolled back on drop.
+    session
+        .send("second")
+        .await
+        .expect("send after completed drop");
+    assert_eq!(client.request_message_counts(), vec![1, 3]);
 }
