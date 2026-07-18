@@ -65,7 +65,7 @@ cargo test -p agent-lib --lib facade::chat::
   `cargo test --all --all-targets`（全绿，0 failed）、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
-### M1-2 [TODO] 修复 `AgentRunStream` 提前 drop 后遗留未完成 run
+### M1-2 [DONE] 修复 `AgentRunStream` 提前 drop 后遗留未完成 run
 
 上下文：
 
@@ -96,6 +96,53 @@ cargo test -p agent-lib --lib facade::chat::
 cargo test -p agent-lib --lib facade::agent::stream
 cargo test -p agent-lib --lib facade::agent::
 ```
+
+完成记录：
+
+- 实现（`src/facade/agent/stream.rs`）：
+  - 新增共享 machine 句柄 `type MachineCell<'a> = Rc<RefCell<&'a mut DefaultAgentMachine>>`：
+    drive future 与 `AgentRunStream` 各持一份 `Rc` clone，使 drop 路径不再把
+    `&mut agent.machine` 埋进 opaque future，而能同步触达 machine。
+  - 把原来 `drain(machine, ...)` 的驱动逻辑复刻为 `async fn drive_streamed(...)`：
+    与 `drain` 的循环逐字段等价（`fulfill_batch` → 按 resolution `Resume` → 记录
+    trace → 直到 terminal cursor），但只在同步 `step` 前后借用 `MachineCell`，每次
+    `await` 前释放借用，因此 park 时不持有任何 `RefCell` 借用，drop 的
+    `try_borrow_mut` 必成功。三个 `start*` 入口改为构造并保存 `MachineCell`。
+  - `AgentRunStream` 结构体新增 `machine: MachineCell<'a>` 字段与幂等
+    `abandon(&mut self)`：仅当 `state != Done` 时，`try_borrow_mut` machine 后取
+    `cursor().pending_requirement_ids()` 的首个 id 喂 `StepInput::Abandon(id)`——
+    这是 machine 现有的 sans-io never-resume 输入，不直接篡改底层 conversation。
+    LLM 步（`StreamingStep`）丢弃 pending turn；tool / approval 阶段
+    （`AwaitingTool` / `AwaitingApproval`）对未决调用折叠 `Cancelled` 结果；两者都
+    把 cursor 归位到可继续的 `Idle`。
+  - 新增 `impl Drop for AgentRunStream` 调用 `abandon()`：正常读完 `Done`、错误
+    完成、或已 abandon（`state == Done`）时为 no-op，不回滚已提交 turn；非流式
+    `Agent::run` / `run_full` 外部行为不变。
+  - 更新 `AgentRunStream` / `Agent::stream` 文档以匹配“提前 drop 自动 abandon 在途
+    turn，agent 回到下一次 `run`/`stream` 可继续的一致点”。
+- 支撑改动（`src/agent/drive.rs`）：把 `fulfill_batch`、`Resolved`（含
+  `resolution` / `resolved_at_scope` 两字段）、`record_requirement`、
+  `record_requirement_resolution`、`is_terminal` 提升为 `pub(crate)`，供
+  `drive_streamed` 复用，保证与 `run_full` 的逐字段等价。
+- 测试（`src/facade/agent/tests.rs`）：新增 `DropTestClient`（同时脚本化 `chat`
+  恢复回合与 `chat_stream` 流式回合，并记录每次 `chat` 请求的消息条数）、
+  `partial_text_head`、`ParkingInteractionHandler`、`parking_weather_tool`，及四条
+  离线回归：
+  - `dropping_never_polled_stream_leaves_agent_runnable`：未 poll 就 drop，随后同一
+    `Agent` `run` 成功，恢复回合仅 1 条消息。
+  - `dropping_partially_streamed_run_discards_it_and_leaves_agent_runnable`：收到部分
+    text delta 后 drop（drive park 在 LLM fold），随后 `run` 成功且半成品 turn 未进入
+    committed history（恢复回合仅 1 条消息）。
+  - `dropping_approval_gated_stream_leaves_agent_runnable`：等待审批时 drop，随后
+    `run` 成功，被 gate 的工具未执行，无残留。
+  - `dropping_tool_awaiting_stream_leaves_agent_runnable`：等待工具结果时 drop（park 在
+    永不返回的工具里），随后 `run` 成功，无残留。
+- 文档：同步 `docs/refine.md` 问题 #1 的修复状态（`AgentRunStream` 侧 M1-2 已修）。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D warnings`（clean）、
+  `cargo test -p agent-lib --lib facade::agent::`（30 passed，含 4 条新回归）、
+  `cargo test --all --all-targets`（全绿，841 lib + 集成全部通过，0 failed）、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
 ### M1-3 [TODO] Review：流式生命周期恢复
 

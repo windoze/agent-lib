@@ -442,7 +442,7 @@ where
 ///
 /// The trace node id reuses the host-minted requirement id, keeping the library
 /// out of the id-minting business (mirroring every other Agent identity).
-fn record_requirement(
+pub(crate) fn record_requirement(
     ctx: &RunContext,
     requirement: &Requirement,
     resolved_at_scope: u32,
@@ -458,7 +458,7 @@ fn record_requirement(
 }
 
 /// Records a settled requirement identified by its [`RequirementResolution`].
-fn record_requirement_resolution(
+pub(crate) fn record_requirement_resolution(
     ctx: &RunContext,
     resolution: &RequirementResolution,
     resolved_at_scope: u32,
@@ -494,7 +494,7 @@ fn record_requirement_node(
 }
 
 /// Returns whether `cursor` marks the end of a turn.
-fn is_terminal(cursor: &LoopCursor) -> bool {
+pub(crate) fn is_terminal(cursor: &LoopCursor) -> bool {
     matches!(cursor.kind(), LoopCursorKind::Done | LoopCursorKind::Error)
 }
 
@@ -568,9 +568,9 @@ async fn resolve_requirement(
 /// `resolved_at_scope` is the pop hop count from the layer that performed the
 /// requirement (`0` = the emitting scope settled it in place); [`drain`] records
 /// it on the requirement's trace node (migration doc §8).
-struct Resolved {
-    resolution: RequirementResolution,
-    resolved_at_scope: u32,
+pub(crate) struct Resolved {
+    pub(crate) resolution: RequirementResolution,
+    pub(crate) resolved_at_scope: u32,
 }
 
 /// Fulfills a batch of requirements against `scope`, popping the rest.
@@ -585,7 +585,7 @@ struct Resolved {
 /// Each resolution carries the `resolved_at_scope` hop distance: the concurrent
 /// local set is always settled in place (`0`), while a serially resolved
 /// requirement reports how many scopes out it was popped to.
-async fn fulfill_batch(
+pub(crate) async fn fulfill_batch(
     requirements: &[Requirement],
     scope: &dyn HandlerScope,
     mut parent: Option<&mut (dyn Pop + '_)>,

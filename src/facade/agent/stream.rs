@@ -29,9 +29,11 @@
 //! is surfaced as an `Err` stream item, leaving the agent's committed history
 //! unchanged.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -39,11 +41,15 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 
+use crate::agent::drive::{
+    Resolved, fulfill_batch, is_terminal, record_requirement, record_requirement_resolution,
+};
 use crate::agent::interaction::{Interaction, InteractionKind};
 use crate::agent::{
-    AgentError, AgentInput, BudgetLimits, HandlerScope, InteractionHandler, LlmHandler,
-    LlmStepMode, LoopCursor, RequirementResult, RunContext, ToolHandler, ToolRegistry,
-    ToolRegistryHandler, drain,
+    AgentError, AgentInput, AgentMachine, BudgetLimits, DefaultAgentMachine, HandlerScope,
+    InteractionHandler, LlmHandler, LlmStepMode, LoopCursor, RequirementDisposition,
+    RequirementResult, RunContext, StepInput, ToolHandler, ToolRegistry, ToolRegistryHandler,
+    TurnDone,
 };
 use crate::client::{ChatRequest, ClientError, LlmClient, Response};
 use crate::conversation::ToolCallId;
@@ -78,6 +84,93 @@ fn emit(sink: &EventSink, event: RunEvent) {
 /// Pops the next buffered event from the shared sink, if any.
 fn pop(sink: &EventSink) -> Option<RunEvent> {
     sink.lock().expect("stream event sink poisoned").pop_front()
+}
+
+/// A shared, interior-mutable handle to the agent's held machine.
+///
+/// The drive future and the [`AgentRunStream`]'s [`Drop`] guard both hold a clone.
+/// [`drive_streamed`] borrows the cell only for the synchronous
+/// [`AgentMachine::step`](crate::agent::AgentMachine::step) calls and releases it
+/// before every `await`, so a drop that lands while the drive is parked can
+/// [`try_borrow_mut`](RefCell::try_borrow_mut) the same machine to abandon the
+/// stranded turn (see [`AgentRunStream::abandon`]).
+type MachineCell<'a> = Rc<RefCell<&'a mut DefaultAgentMachine>>;
+
+/// Drives the held machine from a fresh `input` to the end of one streamed turn.
+///
+/// This mirrors [`drain`](crate::agent::drain)'s reference loop exactly (fulfill a
+/// batch of requirements through `scope`, resume the machine per resolution, record
+/// each on the trace, and repeat until a terminal cursor), but reaches the machine
+/// through a shared [`MachineCell`] instead of an exclusive `&mut`. The cell is
+/// borrowed only across the synchronous `step` calls and dropped before
+/// [`fulfill_batch`] is awaited, which is what lets the stream's [`Drop`] abandon a
+/// parked drive without racing the future. Because the loop is otherwise identical
+/// to `drain`, the resulting [`TurnDone`] matches what
+/// [`Agent::run_full`](super::Agent::run_full) would produce for the same turn.
+async fn drive_streamed(
+    machine: &MachineCell<'_>,
+    input: AgentInput,
+    scope: &dyn HandlerScope,
+    ctx: &RunContext,
+) -> Result<TurnDone, AgentError> {
+    let mut notifications = Vec::new();
+
+    let mut pending = {
+        let mut guard = machine.borrow_mut();
+        let mut outcome = guard.step(StepInput::External(input));
+        notifications.append(&mut outcome.notifications);
+        outcome.requirements
+    };
+
+    loop {
+        if pending.is_empty() {
+            if is_terminal(machine.borrow().cursor()) {
+                break;
+            }
+            let kind = machine.borrow().cursor().kind();
+            return Err(AgentError::Other(format!(
+                "machine quiesced without a terminal cursor or outstanding requirement \
+                 (cursor: {kind:?})"
+            )));
+        }
+
+        // Cancellation is a downward "should stop" signal (migration doc §7): abandon
+        // the whole in-flight turn through the machine's never-resume path and stop
+        // driving. The streaming drop path abandons synchronously instead (see
+        // [`AgentRunStream::abandon`]); this mirrors `drain` for a cancelled `ctx`.
+        if ctx.is_cancelled() {
+            if let Some(requirement) = pending.first() {
+                record_requirement(ctx, requirement, 0, RequirementDisposition::NeverResumed)?;
+                let mut guard = machine.borrow_mut();
+                let mut outcome = guard.step(StepInput::Abandon(requirement.id));
+                notifications.append(&mut outcome.notifications);
+            }
+            break;
+        }
+
+        let resolutions = fulfill_batch(&pending, scope, None, ctx).await?;
+
+        pending = Vec::new();
+        for Resolved {
+            resolution,
+            resolved_at_scope,
+        } in resolutions
+        {
+            record_requirement_resolution(
+                ctx,
+                &resolution,
+                resolved_at_scope,
+                RequirementDisposition::Resumed,
+            )?;
+            let mut guard = machine.borrow_mut();
+            let mut outcome = guard.step(StepInput::Resume(resolution));
+            notifications.append(&mut outcome.notifications);
+            pending.extend(outcome.requirements);
+        }
+    }
+
+    let cursor = machine.borrow().cursor().clone();
+    Ok(TurnDone::new(notifications, cursor))
 }
 
 /// Opens one streamed agent turn over `agent`, returning an [`AgentRunStream`].
@@ -168,19 +261,24 @@ pub(super) fn start(
         },
     };
 
-    let machine = &mut agent.machine;
+    // Share the held machine so the drive future and the stream's `Drop` both reach
+    // it: the future steps it through `drive_streamed`, and an early drop abandons
+    // any stranded turn synchronously (see `AgentRunStream::abandon`).
+    let machine: MachineCell = Rc::new(RefCell::new(&mut agent.machine));
+    let machine_for_future = machine.clone();
     let future = Box::pin(async move {
-        let done = drain(machine, agent_input, &scope, None, &ctx).await?;
+        let done = drive_streamed(&machine_for_future, agent_input, &scope, &ctx).await?;
         let collected = collect_traces(done.notifications(), &recorder);
         // A denied external delegate surfaces as a run-level error, matching
         // `run_full` (§9.2). Retention of external session facts is not possible
-        // on the streaming path (the future holds `&mut machine` for the stream's
+        // on the streaming path (the future holds the machine for the stream's
         // lifetime), so a snapshot is taken between runs via `run_full`.
         if collected.external_approval_denied {
             return Err(FacadeError::ApprovalDenied);
         }
         match done.cursor() {
             LoopCursor::Done(_) => {
+                let machine = machine_for_future.borrow();
                 let (text, usage, stop_reason) = final_turn_summary(machine.state().conversation());
                 let mut usage_summary = UsageSummary::from_supervisor(usage.clone());
                 usage_summary.add_subagent(collected.subagent_usage);
@@ -208,6 +306,7 @@ pub(super) fn start(
         sink,
         output: None,
         state: DriveState::Driving,
+        machine,
     })
 }
 
@@ -249,11 +348,16 @@ fn start_rules_routed(
         Ok(drive.output)
     });
 
+    // The routed drive never steps the held machine, so its cursor stays `Idle` and
+    // the stream's `Drop` finds no stranded turn to abandon; the cell is held only to
+    // keep the `AgentRunStream` shape uniform across start paths.
+    let machine: MachineCell = Rc::new(RefCell::new(&mut agent.machine));
     Ok(AgentRunStream {
         future,
         sink,
         output: None,
         state: DriveState::Driving,
+        machine,
     })
 }
 
@@ -308,11 +412,15 @@ fn start_dispatcher_routed(
         Ok(drive.output)
     });
 
+    // As with the rules-routed path, the dispatcher drive never steps the held
+    // machine, so `Drop` finds no stranded turn; the cell keeps the shape uniform.
+    let machine: MachineCell = Rc::new(RefCell::new(&mut agent.machine));
     Ok(AgentRunStream {
         future,
         sink,
         output: None,
         state: DriveState::Driving,
+        machine,
     })
 }
 
@@ -327,6 +435,13 @@ fn start_dispatcher_routed(
 /// drive reaches it, then ends with exactly one [`RunEvent::Done`] carrying the
 /// complete [`RunOutput`]. On failure it yields a single `Err` and then ends.
 ///
+/// The turn is committed to the agent's [`Conversation`](crate::conversation::Conversation)
+/// only when the drive reaches its terminal `Done`. If the stream is dropped before
+/// then — including before it is ever polled — its [`Drop`] implementation abandons
+/// the in-flight turn through the machine's sans-io never-resume input, so the agent
+/// is left at a consistent point where the next
+/// [`run`](super::Agent::run) or [`stream`](super::Agent::stream) can continue.
+///
 /// [`Agent::stream`]: super::Agent::stream
 pub struct AgentRunStream<'a> {
     /// The deferred machine drive; resolves to the terminal [`RunOutput`].
@@ -338,6 +453,11 @@ pub struct AgentRunStream<'a> {
     output: Option<RunOutput>,
     /// Lifecycle of the fold-and-finish drive.
     state: DriveState,
+    /// Shared handle to the agent's held machine, cloned by the drive future.
+    ///
+    /// The [`Drop`] guard uses it to abandon a stranded turn when the stream is
+    /// dropped before the drive reaches a terminal cursor.
+    machine: MachineCell<'a>,
 }
 
 /// Lifecycle of an [`AgentRunStream`]'s drive.
@@ -359,6 +479,47 @@ impl AgentRunStream<'_> {
     /// `stream.next().await` without importing [`futures::StreamExt`].
     pub async fn next(&mut self) -> Option<Result<RunEvent, FacadeError>> {
         StreamExt::next(self).await
+    }
+
+    /// Abandons any in-flight turn left open when the drive is not terminal.
+    ///
+    /// This is the single cleanup path shared by the [`Drop`] guard. It is
+    /// idempotent: once the drive is terminal — because it yielded a `Done`,
+    /// surfaced an error, or was already abandoned — `state` is [`DriveState::Done`]
+    /// and the call is a no-op that never rolls back an already-committed turn.
+    ///
+    /// When the drive is *not* terminal the turn is closed through the machine's
+    /// sans-io never-resume input ([`StepInput::Abandon`]): the loop cursor still
+    /// carries the outstanding requirement id(s) even though the parked drive future
+    /// no longer holds the machine, so feeding `Abandon` for the first of them
+    /// discards (or, for a tool phase, cancels) the pending turn and settles the
+    /// cursor back to a feedable `Idle`. A cursor with no outstanding requirement
+    /// (never stepped, or already terminal) yields nothing to abandon.
+    fn abandon(&mut self) {
+        if self.state == DriveState::Done {
+            return;
+        }
+        self.state = DriveState::Done;
+
+        // The drive future releases its machine borrow before every `await`, so a
+        // drop that lands while it is parked can take the machine here. `try` keeps
+        // the guard defensive: a failed borrow simply skips cleanup rather than
+        // panicking inside `drop`.
+        let Ok(mut guard) = self.machine.try_borrow_mut() else {
+            return;
+        };
+        let machine = &mut **guard;
+        if let Some(id) = machine
+            .cursor()
+            .pending_requirement_ids()
+            .into_iter()
+            .next()
+        {
+            // Abandoning any one outstanding requirement closes the whole in-flight
+            // turn: an LLM step discards its pending turn, and a tool phase folds
+            // `Cancelled` results for every still-open call, both settling to `Idle`.
+            let _ = machine.step(StepInput::Abandon(id));
+        }
     }
 }
 
@@ -406,6 +567,20 @@ impl Stream for AgentRunStream<'_> {
                 DriveState::Done => return Poll::Ready(None),
             }
         }
+    }
+}
+
+impl Drop for AgentRunStream<'_> {
+    /// Abandons any in-flight turn left open when the stream is dropped early.
+    ///
+    /// [`Agent::stream`](super::Agent::stream) commits its turn only when the drive
+    /// reaches a terminal `Done`; a caller that drops the stream before then would
+    /// otherwise strand the machine's pending turn, breaking the next `run` or
+    /// `stream`. `abandon` closes it through the machine's sans-io
+    /// never-resume input and is idempotent, so a stream dropped after a committed
+    /// `Done` or an error is left untouched.
+    fn drop(&mut self) {
+        self.abandon();
     }
 }
 

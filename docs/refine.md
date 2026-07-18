@@ -83,7 +83,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   terminal `Done` 状态被 drop 时通过统一的 `abandon()`（`cancel_pending(DiscardTurn)`
   + 标记 terminal，幂等）回滚 pending turn；错误路径与 drop 路径收敛到同一 helper。
   已补 drop-before-poll、收到 text delta 后 drop、正常读完后 drop 三个离线回归测试。
-- `AgentRunStream` 的同类风险仍未修复，由 M1-2 处理。
+- `AgentRunStream` 的同类风险已在 M1-2 修复：新增 `Drop` guard，通过共享的
+  `Rc<RefCell<&mut DefaultAgentMachine>>` 让 drop 路径能同步访问持有的 machine，
+  在非 terminal 状态被 drop 时用现有 sans-io 输入 `StepInput::Abandon`（machine
+  的 never-resume 路径）关闭在途 turn：LLM 步丢弃 pending turn，tool / approval
+  阶段对未决调用折叠 `Cancelled` 结果，二者都把 cursor 归位到可继续的 `Idle`。
+  `abandon()` 幂等（terminal `Done` / 错误 / 已 abandon 时为 no-op，不回滚已提交
+  turn）。已补 未 poll 就 drop、收到部分事件后 drop、等待 approval 时 drop、等待
+  tool 结果时 drop 四个离线回归测试，均验证随后同一 `Agent` 可成功 `run` 且丢弃的
+  半成品 turn 不进入 committed history。
 
 ### 2. 协作状态运行时可用，但 snapshot/restore 仍丢弃数据
 

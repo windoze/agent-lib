@@ -1246,3 +1246,285 @@ async fn restored_without_handler_falls_back_to_facade_approval() {
         "a restored agent with no injected handler denies the gated tool via FacadeApproval"
     );
 }
+
+// --- Milestone 1-2: AgentRunStream drop-time cleanup -----------------------
+
+/// A client that scripts one streamed turn (served by `chat_stream`) and a
+/// text-only recovery turn (served by `chat`).
+///
+/// It records the message count of every `chat` request so a test can prove that
+/// a stream dropped mid-turn left no stranded turn in committed history: the
+/// recovery `run` must see only its own user message.
+#[derive(Debug)]
+struct DropTestClient {
+    /// Events the single streamed turn replays through `chat_stream`.
+    stream_events: Vec<StreamEvent>,
+    /// When set, `chat_stream` parks (never completes) after the scripted events,
+    /// stranding the turn mid-fold so a drop has an open turn to abandon.
+    park_stream: bool,
+    /// The text response every recovery `chat` serves.
+    chat_response: Response,
+    /// The `messages.len()` recorded for each `chat` request, in order.
+    chat_request_lens: Mutex<Vec<usize>>,
+}
+
+impl DropTestClient {
+    fn new(
+        stream_events: Vec<StreamEvent>,
+        park_stream: bool,
+        chat_response: Response,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            stream_events,
+            park_stream,
+            chat_response,
+            chat_request_lens: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn chat_request_lens(&self) -> Vec<usize> {
+        self.chat_request_lens.lock().expect("lens mutex").clone()
+    }
+}
+
+#[async_trait]
+impl LlmClient for DropTestClient {
+    fn capability(&self) -> &Capability {
+        &crate::client::ANTHROPIC_DEFAULT_CAPABILITY
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<Response, ClientError> {
+        self.chat_request_lens
+            .lock()
+            .expect("lens mutex")
+            .push(request.messages.len());
+        Ok(self.chat_response.clone())
+    }
+
+    async fn chat_stream(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError> {
+        let events = self.stream_events.clone();
+        let base = futures::stream::iter(events.into_iter().map(Ok::<_, ClientError>));
+        if self.park_stream {
+            Ok(base
+                .chain(futures::stream::pending::<Result<StreamEvent, ClientError>>())
+                .boxed())
+        } else {
+            Ok(base.boxed())
+        }
+    }
+}
+
+/// A partial text stream head: message start, a text block start, and exactly one
+/// text delta — no block stop, usage, or message stop. Chained with `pending()`
+/// (via [`DropTestClient::park_stream`]) it emits one live [`RunEvent::TextDelta`]
+/// and then parks the turn mid-fold.
+fn partial_text_head(chunk: &str) -> Vec<StreamEvent> {
+    let id = BlockId::new("text-1");
+    vec![
+        StreamEvent::MessageStart {
+            role: Role::Assistant,
+        },
+        StreamEvent::BlockStart {
+            id: id.clone(),
+            kind: BlockKind::Text,
+        },
+        StreamEvent::BlockDelta {
+            id,
+            delta: Delta::Text(chunk.to_owned()),
+        },
+    ]
+}
+
+/// An interaction handler that never resolves, used to park a streamed turn at
+/// the approval gate so a test can drop the stream while a turn is still open.
+#[derive(Debug)]
+struct ParkingInteractionHandler;
+
+#[async_trait]
+impl InteractionHandler for ParkingInteractionHandler {
+    async fn fulfill(&self, _request: &Interaction, _ctx: &RunContext) -> RequirementResult {
+        std::future::pending().await
+    }
+}
+
+/// A `get_weather` tool whose execution never returns, used to park a streamed
+/// turn while it is awaiting a tool result so a test can drop it mid-flight.
+fn parking_weather_tool() -> Tool {
+    Tool::function_with_schema(
+        "get_weather",
+        "Look up the current weather for a city.",
+        json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"]
+        }),
+        move |_ctx: ToolContext, _args: Value| async move {
+            std::future::pending::<Result<String, Infallible>>().await
+        },
+    )
+}
+
+/// Dropping a stream that was never polled leaves the machine untouched, so the
+/// same agent can immediately `run` again.
+#[tokio::test]
+async fn dropping_never_polled_stream_leaves_agent_runnable() {
+    let client = DropTestClient::new(
+        text_stream(&["streamed."], Usage::default()),
+        false,
+        text_response("recovered."),
+    );
+    let mut agent = AgentBuilder::default()
+        .client(client.clone())
+        .model("test-model")
+        .tool(counting_weather_tool(Arc::new(AtomicUsize::new(0))))
+        .approval(Approval::auto_allow())
+        .build()
+        .expect("build agent");
+
+    // Open a stream and drop it without ever polling it.
+    {
+        let _stream = agent.stream("weather?").await.expect("open stream");
+    }
+
+    let reply = agent.run("again").await.expect("run after early drop");
+    assert_eq!(reply.text(), "recovered.");
+    assert_eq!(
+        client.chat_request_lens(),
+        vec![1],
+        "the never-polled stream touched no state; the recovery turn is clean"
+    );
+}
+
+/// Dropping a stream parked mid-turn inside the LLM fold abandons the in-flight
+/// turn: the agent runs again cleanly and the partially streamed turn leaves no
+/// residue in committed history.
+#[tokio::test]
+async fn dropping_partially_streamed_run_discards_it_and_leaves_agent_runnable() {
+    let client = DropTestClient::new(partial_text_head("It "), true, text_response("recovered."));
+    let mut agent = AgentBuilder::default()
+        .client(client.clone())
+        .model("test-model")
+        .tool(counting_weather_tool(Arc::new(AtomicUsize::new(0))))
+        .approval(Approval::auto_allow())
+        .build()
+        .expect("build agent");
+
+    {
+        let mut stream = agent.stream("weather?").await.expect("open stream");
+        let first = stream
+            .next()
+            .await
+            .expect("a first event")
+            .expect("event ok");
+        assert!(
+            matches!(&first, RunEvent::TextDelta(text) if text == "It "),
+            "the first streamed event is the partial text delta, got {first:?}"
+        );
+        // Drop the stream while its turn is still open (parked in the LLM fold).
+    }
+
+    let reply = agent.run("again").await.expect("run after early drop");
+    assert_eq!(reply.text(), "recovered.");
+    assert_eq!(
+        client.chat_request_lens(),
+        vec![1],
+        "the recovery turn carried only its own user message; the dropped turn left no residue"
+    );
+}
+
+/// Dropping a stream parked at the approval gate abandons the gated turn: no tool
+/// ran, and the agent runs again cleanly with no residue.
+#[tokio::test]
+async fn dropping_approval_gated_stream_leaves_agent_runnable() {
+    let client = DropTestClient::new(tool_stream(), false, text_response("recovered."));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut agent = AgentBuilder::default()
+        .client(client.clone())
+        .model("test-model")
+        .tool(counting_weather_tool(executions.clone()))
+        .approval(Approval::auto_deny())
+        .interaction_handler(Arc::new(ParkingInteractionHandler))
+        .build()
+        .expect("build agent");
+
+    {
+        let mut stream = agent.stream("weather?").await.expect("open stream");
+        let first = stream
+            .next()
+            .await
+            .expect("a first event")
+            .expect("event ok");
+        assert!(
+            matches!(
+                &first,
+                RunEvent::ApprovalRequested(request) if request.tool_name == "get_weather"
+            ),
+            "the first streamed event is the approval request, got {first:?}"
+        );
+        // Drop the stream while it is parked awaiting the approval decision.
+    }
+
+    let reply = agent.run("again").await.expect("run after early drop");
+    assert_eq!(reply.text(), "recovered.");
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "the gated tool never executed for the dropped turn"
+    );
+    assert_eq!(
+        client.chat_request_lens(),
+        vec![1],
+        "the recovery turn carried only its own user message; the dropped turn left no residue"
+    );
+}
+
+/// Dropping a stream parked while awaiting a tool result abandons the tool phase:
+/// the agent runs again cleanly with no residue in committed history.
+#[tokio::test]
+async fn dropping_tool_awaiting_stream_leaves_agent_runnable() {
+    let client = DropTestClient::new(tool_stream(), false, text_response("recovered."));
+    let mut agent = AgentBuilder::default()
+        .client(client.clone())
+        .model("test-model")
+        .tool(parking_weather_tool())
+        .approval(Approval::auto_allow())
+        .build()
+        .expect("build agent");
+
+    {
+        let mut stream = agent.stream("weather?").await.expect("open stream");
+        // Drain the events buffered up to the tool call, then stop once the drive
+        // parks inside the never-returning tool.
+        let mut saw_tool_started = false;
+        for _ in 0..1000 {
+            let mut next = std::pin::pin!(stream.next());
+            match futures::poll!(next.as_mut()) {
+                Poll::Ready(Some(item)) => {
+                    let event = item.expect("event ok");
+                    if matches!(&event, RunEvent::ToolStarted(trace) if trace.name == "get_weather")
+                    {
+                        saw_tool_started = true;
+                    }
+                }
+                Poll::Ready(None) => break,
+                Poll::Pending => break,
+            }
+        }
+        assert!(
+            saw_tool_started,
+            "the streamed turn reached the tool call before parking"
+        );
+        // Drop the stream while it is parked awaiting the tool result.
+    }
+
+    let reply = agent.run("again").await.expect("run after early drop");
+    assert_eq!(reply.text(), "recovered.");
+    assert_eq!(
+        client.chat_request_lens(),
+        vec![1],
+        "the recovery turn carried only its own user message; the dropped turn left no residue"
+    );
+}
