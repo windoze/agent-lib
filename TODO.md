@@ -144,7 +144,7 @@ cargo test -p agent-lib --lib facade::agent::
   `cargo test --all --all-targets`（全绿，841 lib + 集成全部通过，0 failed）、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
-### M1-3 [TODO] Review：流式生命周期恢复
+### M1-3 [DONE] Review：流式生命周期恢复
 
 检查范围：
 
@@ -165,6 +165,39 @@ cargo test -p agent-lib --lib facade::agent::
 ```
 
 - 手工复核 `docs/refine.md` 中 “stream 提前 drop 遗留 pending turn” 条目的状态，必要时补充当前修复说明。
+
+完成记录：
+
+- 复核 `ChatSession::stream` / `RunStream`（`src/facade/chat.rs`、
+  `src/facade/chat/stream.rs`）：正常完成经 `State::Finishing` → `finish()` 提交后置
+  `State::Done`；错误路径（`absorb` 累加错误、流式传输错误、`finish` 失败、tool-use
+  拒绝）与 `Drop` 都收敛到同一幂等 `abandon()`（`state != Done` 时
+  `cancel_pending(DiscardTurn)` + 置 `Done`）。已提交 / 已出错的 stream 因 `state == Done`
+  在 drop 时为 no-op，不回滚已提交 turn。逻辑正确、无分叉。
+- 复核 `Agent::stream` / `AgentRunStream`（`src/facade/agent.rs`、
+  `src/facade/agent/stream.rs`）：drive future 与 `Drop` 共享
+  `Rc<RefCell<&mut DefaultAgentMachine>>`，`drive_streamed` 仅在同步 `step` 前后借用、
+  每次 `await` 前释放，故 park 时 drop 的 `try_borrow_mut` 必成功。`abandon()` 仅在
+  `state != Done` 且 cursor 存在 outstanding requirement 时喂 `StepInput::Abandon(首个 id)`，
+  LLM 步丢弃 pending turn、tool/approval 阶段折叠 `Cancelled`，均归位到可继续的 `Idle`；
+  正常 / 错误 / 已 abandon 状态均为 no-op。rules-routed、dispatcher-routed 起步路径不 step
+  machine（cursor 恒 `Idle`），drop 找不到在途 turn，仅保持结构形状统一——已核对无遗漏。
+- 其他 facade stream 类型排查：全仓仅 `RunStream` 与 `AgentRunStream` 两个 facade 层
+  stream 会打开 conversation / machine 的 pending state，二者均已有 `Drop`。adapter /
+  client 层的 `chat_stream` 只是纯 wire 事件流，不打开 facade pending state，无需 cleanup。
+- 测试离线性核对：chat 侧新增回归依赖 `DualFakeClient`（脚本化 `chat` + `chat_stream`）；
+  agent 侧依赖 `DropTestClient`（可 `park_stream`）、`ParkingInteractionHandler`、
+  `parking_weather_tool`，全部为 fake client / scripted handler，无真实 provider、CLI、
+  网络或本机配置依赖。
+- 文档核对：`RunStream`、`AgentRunStream`、`ChatSession::stream`、`Agent::stream` 的
+  doc 均已明确“提前 drop 自动 discard / abandon 在途 turn，session/agent 回到上一
+  committed 一致点”。`docs/refine.md` 问题 #1 的“修复状态（更新）”已覆盖 M1-1 与 M1-2，
+  R-1 草案与优先级一致，无需再补写。
+- 验证：`cargo fmt --all`（无源码改动）、`cargo clippy --all-targets -- -D warnings`（clean）、
+  `cargo test -p agent-lib --lib facade::chat::`（19 passed）、
+  `cargo test -p agent-lib --lib facade::agent::`（30 passed，含 4 条 drop 回归）。
+  本次仅改动 TODO.md / 计划文档，未改动编译产物，复用 M1-2 的全量绿测结果，未重跑
+  `cargo test --all --all-targets`。
 
 ## M2：非流式事件一致性
 
