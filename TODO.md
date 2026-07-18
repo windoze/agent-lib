@@ -328,7 +328,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `cargo test -p agent-lib --lib`（848 passed）、`cargo test --all --all-targets`（全绿，
   0 failed）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
-### M2-3 [TODO] Review：非流式事件一致性
+### M2-3 [DONE] Review：非流式事件一致性
 
 检查范围：
 
@@ -349,6 +349,36 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 ```
 
 - 手工复核 `docs/refine.md` 中 “非流式 RunOutput.events 缺少审批请求” 条目的状态，必要时补充当前修复说明。
+
+完成记录：
+
+- 代码复核（无需改动，行为符合规范）：
+  - 事件语义清晰：`src/facade/run.rs` 的 `RunEvent` 枚举与 `RunOutput::events`
+    rustdoc 明确「生命周期变体两路一致；`TextDelta` / `Done` 只属流式」；非流式
+    `run_full`（`src/facade/agent.rs`）经 `collect_traces` + `weave_approval_events`
+    产出生命周期事件，`run` 返回精简 `Reply`（不承诺事件面），`stream` 通过
+    `TapToolHandler` / `TapInteractionHandler` 实时 emit。三者语义与文档一致。
+  - approve / deny / fallback 三条路径均有审批事件：`RecordingInteractionHandler`
+    包裹 `interaction_handler()` 解析出的真实 handler（注入 handler 或 `FacadeApproval`
+    fallback），在委派前记录 `ApprovalRequest`；`weave_approval_events` 对 approved
+    审批锚定在其 `ToolStarted` 前，对 denied / headless（无工具锚点）在尾部或下一锚点前
+    flush，保证每个暂停审批均可见。
+  - 文档明确非流式不产 token delta：`run.rs`、`docs/facade-api.md` §6.2.1、`README.md`
+    §3 均写明 `TextDelta` 为流式独有；4 条 parity 回归额外断言 `run_full` 绝不含
+    `TextDelta`。
+  - recorder 不改变执行顺序：`RecordingInteractionHandler::fulfill` 先记录再
+    `self.inner.fulfill(...).await`，**仅观察不决策**，approve / deny / fallback
+    优先级完全由真实 handler 决定；富化字段与流式共用 `enriched_approval_request`
+    helper（`src/facade/approval.rs`，peek 不消费 pending map）。
+- 文档复核并补充：`docs/refine.md` §3「非流式 `Agent::run_full` 的 `RunOutput.events`
+  不包含审批请求」补入「修复状态（更新）」块，记录 M2-1（run-scoped recorder +
+  weave）、M2-2（对齐被拒工具幽灵 `ToolFinished` + parity 回归 + 文档边界）与 M2-3
+  复核结论，标注该问题已解决（与 §1 的 M1 修复状态注记格式一致）。
+- 验证：`cargo fmt --all`（clean）、`cargo clippy --all-targets -- -D warnings`（clean）、
+  `cargo test -p agent-lib --lib facade::agent::`（37 passed，含 4 条 parity 回归）、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。本任务仅改动
+  `docs/refine.md`（文档），代码自 M2-2 全量 `cargo test --all --all-targets` 全绿以来
+  未变更，故复用该绿测结果、未重跑全量套件。
 
 ## M3：协作状态 snapshot 和 restore
 
