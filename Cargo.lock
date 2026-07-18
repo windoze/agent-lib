@@ -61,6 +61,7 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "httpdate",
+ "libc",
  "reqwest",
  "schemars 1.2.1",
  "serde",

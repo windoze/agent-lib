@@ -65,6 +65,7 @@ use crate::agent::id::StepId;
 use crate::agent::interaction::InteractionResponse;
 use crate::agent::permission::PermissionDecision;
 
+use crate::agent::external::process_group;
 use crate::agent::external::{
     ExternalAgentError, ExternalCapability, ExternalEventSink, ExternalObservedEvent,
     ExternalRuntimeAdapter, ExternalRuntimeCapabilities, ExternalRuntimeKind,
@@ -111,7 +112,9 @@ trait ClaudeSessionIo: Send {
 /// with the configured read-idle timeout, and — on
 /// [`close`](ClaudeSessionIo::close) — drops stdin so the CLI sees EOF, waits
 /// for the exit within the shutdown grace (classifying it by status: zero →
-/// graceful, non-zero → failed), and force-kills on overrun.
+/// graceful, non-zero → failed), and on overrun force-kills the child's whole
+/// process group (unix; the direct child only on Windows) so CLI-spawned
+/// grandchildren cannot outlive the session (H-EXT-2).
 /// stderr is discarded so no raw runtime text can leak into a diagnostic.
 struct ClaudeProcessIo {
     child: Child,
@@ -153,6 +156,9 @@ impl ClaudeProcessIo {
         for (key, value) in config.env() {
             command.env(key, value);
         }
+        // The child leads its own process group on unix so a force-close can
+        // signal the whole group, grandchildren included (H-EXT-2).
+        process_group::configure_managed_command(&mut command);
 
         let mut child = command.spawn()?;
         let stdin = child.stdin.take();
@@ -202,11 +208,8 @@ impl ClaudeSessionIo for ClaudeProcessIo {
             // side effects cannot be trusted as clean (H-EXT-3).
             Ok(Ok(_status)) => ExternalSessionShutdown::Failed,
             Ok(Err(_error)) => ExternalSessionShutdown::Failed,
-            Err(_elapsed) => match self.child.start_kill() {
-                Ok(()) => {
-                    let _ = self.child.wait().await;
-                    ExternalSessionShutdown::ForcedKill
-                }
+            Err(_elapsed) => match process_group::force_kill(&mut self.child).await {
+                Ok(()) => ExternalSessionShutdown::ForcedKill,
                 Err(_error) => ExternalSessionShutdown::Failed,
             },
         }
@@ -1280,22 +1283,24 @@ mod tests {
     /// wired exactly like the production transport.
     mod close_classification {
         use super::super::{ClaudeProcessIo, ClaudeSessionIo};
-        use crate::agent::external::ExternalSessionShutdown;
+        use crate::agent::external::{ExternalSessionShutdown, process_group};
         use std::time::Duration;
         use tokio::io::{AsyncBufReadExt, BufReader};
         use tokio::process::Command;
 
         /// Spawns a real `sh -c <script>` child with piped stdio.
         fn spawn_sh(script: &str) -> ClaudeProcessIo {
-            let mut child = Command::new("sh")
+            let mut command = Command::new("sh");
+            command
                 .arg("-c")
                 .arg(script)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .expect("spawn sh");
+                .kill_on_drop(true);
+            // Mirror the production spawn: the child leads its own process group.
+            process_group::configure_managed_command(&mut command);
+            let mut child = command.spawn().expect("spawn sh");
             let stdin = child.stdin.take();
             let stdout = child.stdout.take().expect("stdout is piped");
             ClaudeProcessIo {
@@ -1326,6 +1331,18 @@ mod tests {
         async fn grace_overrun_is_forced_kill() {
             let mut io = spawn_sh("sleep 30");
             assert_eq!(io.close().await, ExternalSessionShutdown::ForcedKill);
+        }
+
+        /// H-EXT-2: a force-close kills the whole process group, so
+        /// grandchildren the CLI spawned (builds, dev servers, ...) cannot
+        /// outlive the session.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn force_close_kills_the_whole_process_group() {
+            let mut io = spawn_sh("sleep 300 & sleep 300");
+            let pgid = io.child.id().expect("child id") as i32;
+            assert_eq!(io.close().await, ExternalSessionShutdown::ForcedKill);
+            process_group::assert_process_group_reaped(pgid).await;
         }
     }
 }

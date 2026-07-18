@@ -77,6 +77,7 @@ use tokio::time::timeout;
 
 use crate::agent::RunContext;
 
+use crate::agent::external::process_group;
 use crate::agent::external::{
     ExternalAgentError, ExternalCapability, ExternalEventSink, ExternalObservedEvent,
     ExternalRuntimeAdapter, ExternalRuntimeCapabilities, ExternalRuntimeKind,
@@ -208,6 +209,9 @@ impl CodexLauncher for SystemCodexLauncher {
         for (key, value) in self.config.env() {
             command.env(key, value);
         }
+        // The child leads its own process group on unix so a force-close can
+        // signal the whole group, grandchildren included (H-EXT-2).
+        process_group::configure_managed_command(&mut command);
 
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().ok_or_else(|| {
@@ -231,7 +235,9 @@ impl CodexLauncher for SystemCodexLauncher {
 /// the configured read-idle timeout, and — on [`close`](CodexTurnStream::close)
 /// — waits for the one-shot process to exit within the shutdown grace (a
 /// settled turn has already exited), classifies the exit by status (zero →
-/// graceful, non-zero → failed), and force-kills on overrun.
+/// graceful, non-zero → failed), and on overrun force-kills the child's whole
+/// process group (unix; the direct child only on Windows) so CLI-spawned
+/// grandchildren cannot outlive the turn (H-EXT-2).
 struct CodexProcessTurn {
     child: Child,
     stdout: Lines<BufReader<ChildStdout>>,
@@ -261,11 +267,8 @@ impl CodexTurnStream for CodexProcessTurn {
             // effects cannot be trusted as clean (H-EXT-3).
             Ok(Ok(_status)) => ExternalSessionShutdown::Failed,
             Ok(Err(_error)) => ExternalSessionShutdown::Failed,
-            Err(_elapsed) => match self.child.start_kill() {
-                Ok(()) => {
-                    let _ = self.child.wait().await;
-                    ExternalSessionShutdown::ForcedKill
-                }
+            Err(_elapsed) => match process_group::force_kill(&mut self.child).await {
+                Ok(()) => ExternalSessionShutdown::ForcedKill,
                 Err(_error) => ExternalSessionShutdown::Failed,
             },
         }
@@ -1472,22 +1475,24 @@ mod tests {
     /// child wired exactly like the production turn stream.
     mod close_classification {
         use super::super::{CodexProcessTurn, CodexTurnStream};
-        use crate::agent::external::ExternalSessionShutdown;
+        use crate::agent::external::{ExternalSessionShutdown, process_group};
         use std::time::Duration;
         use tokio::io::{AsyncBufReadExt, BufReader};
         use tokio::process::Command;
 
         /// Spawns a real `sh -c <script>` child with piped stdout.
         fn spawn_sh(script: &str) -> CodexProcessTurn {
-            let mut child = Command::new("sh")
+            let mut command = Command::new("sh");
+            command
                 .arg("-c")
                 .arg(script)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .expect("spawn sh");
+                .kill_on_drop(true);
+            // Mirror the production spawn: the child leads its own process group.
+            process_group::configure_managed_command(&mut command);
+            let mut child = command.spawn().expect("spawn sh");
             let stdout = child.stdout.take().expect("stdout is piped");
             CodexProcessTurn {
                 child,
@@ -1516,6 +1521,18 @@ mod tests {
         async fn grace_overrun_is_forced_kill() {
             let mut turn = spawn_sh("sleep 30");
             assert_eq!(turn.close().await, ExternalSessionShutdown::ForcedKill);
+        }
+
+        /// H-EXT-2: a force-close kills the whole process group, so
+        /// grandchildren the CLI spawned (builds, dev servers, ...) cannot
+        /// outlive the turn.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn force_close_kills_the_whole_process_group() {
+            let mut turn = spawn_sh("sleep 300 & sleep 300");
+            let pgid = turn.child.id().expect("child id") as i32;
+            assert_eq!(turn.close().await, ExternalSessionShutdown::ForcedKill);
+            process_group::assert_process_group_reaped(pgid).await;
         }
     }
 }

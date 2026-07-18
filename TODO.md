@@ -225,7 +225,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M2：external 子进程生命周期正确性
 
-### M2-1 [TODO] kill 升级为进程组级，消除孙进程泄漏（H-EXT-2）
+### M2-1 [DONE] kill 升级为进程组级，消除孙进程泄漏（H-EXT-2）
 
 上下文：
 
@@ -243,6 +243,17 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 集成测试（可 `#[ignore]` 之外的离线形态）：spawn 一个会再 fork 子进程的 shell 脚本（如 `sh -c 'sleep 300 & sleep 300'`），走 force-close 路径后断言进程组内无存活进程（用 `kill(-pgid, 0)` 或 `/proc`/`ps` 检查，注意 macOS/Linux 兼容）。
 - external feature 测试与 clippy 全过。
+
+完成记录：
+
+- 方案选型：spawn 侧用 `tokio::process::Command::process_group(0)`（tokio 1.52 自带，无新依赖）；信号侧用 `unsafe libc::kill(-pgid, sig)`。`libc` 新增为 **unix-only optional 依赖**（`[target.'cfg(unix)'.dependencies]`，`default-features = false`），仅被四个 `external-*` feature 经 `dep:libc` 启用——默认构建不编译它（已在 Cargo.lock 中经 tokio 传递存在，非重依赖）；`nix` 未引入（其 signal 模块同样只是 `kill(2)` 封装，收益不抵新依赖）。AGENTS.md「Build, lint, and test」段的依赖表述同步更新。
+- 新增 crate 私有模块 `src/agent/external/process_group.rs`（M8-2 收敛时并入共享 process 模块）：`configure_managed_command()`（unix 下 `process_group(0)`，非 unix no-op）与 `force_kill()`——unix 下先向整个进程组发 SIGTERM，2s 固定升级窗口（`SIGTERM_ESCALATION_GRACE`，独立于已耗尽的 shutdown_grace，使 force-close 有界）内未退出再发 SIGKILL；`ESRCH`（leader 已在超时瞬间退出）直接落回收割；信号投递失败（如 EPERM）回退 `start_kill` 保证 leader 必死。非 unix（Windows 无进程组语义）保持 `start_kill` 只杀直接子进程，平台差异写入模块 rustdoc 与 `docs/managed-external-agent.md` §16。
+- 四个点行为一致：三 CLI adapter 的 spawn（`ClaudeProcessIo::spawn`、`SystemCodexLauncher::launch`、`SystemOpenCodeLauncher::launch`）与 ACP `TokioProcessLauncher::launch` 统一调 `configure_managed_command`；四个 close 的 `start_kill` 阶梯统一换成 `process_group::force_kill(...).await`，`ForcedKill`/`Failed` 分类（M1-6）不变。
+- 测试：`process_group::tests` 3 条 unix 单测（configured child 是进程组 leader；`sleep 300 & sleep 300` force_kill 后组内无存活；`trap '' TERM` 的 leader 经 SIGKILL 升级收割）；四个 `close_classification` 模块各新增 `force_close_kills_the_whole_process_group`——`sh -c 'sleep 300 & sleep 300'` 走 250ms grace 超时 close，断言 `ForcedKill` 且 `kill(-pgid, 0)` 返回 `ESRCH`（共享断言 `assert_process_group_reaped`，20ms×100 重试吸收 init 异步收割延迟，macOS/Linux 均用 `kill(2)` 无 `/proc` 依赖）；四个 spawn_sh 测试 helper 同步接上 `configure_managed_command` 与生产一致。全部离线、秒级完成。
+- 范围说明：三个 probe（`wait_with_output` 有界一次性进程）与 `kill_on_drop` 兑底路径不在本任务范围——后者只杀直接子进程的限制已写入模块 rustdoc 与 §16 文档。
+- 文档：`docs/managed-external-agent.md` §16 新增「进程组级 kill（M2-1 / H-EXT-2）」节（含 Windows 平台差异、close 路径覆盖范围），「三类超时」段与 §12 shutdown 段的 `start_kill` 措辞改为进程组级强杀，§能力矩阵 cancel 行同步；`docs/review-2026-07.md` H-EXT-2 已标注 `✅ 已修复（M2-1）`；AGENTS.md Safety properties 新增 Process-group kill 条目。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 无 breaking change（仅进程管理内部行为收紧；feature 新增 unix-only `libc` optional 依赖）。
 
 ### M2-2 [TODO] resume 时用持久化高水位播种 decoder seq（M-EXT-1）
 

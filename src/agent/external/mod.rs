@@ -79,6 +79,13 @@ mod handler;
 mod machine;
 #[cfg(feature = "external-opencode")]
 mod opencode;
+#[cfg(any(
+    feature = "external-acp",
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
+mod process_group;
 mod profile;
 mod registry;
 mod runtime;

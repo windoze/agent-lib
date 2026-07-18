@@ -125,7 +125,7 @@ scope wiring 决定 attended / headless 行为。
 | user question | `NeedInteraction(Question)` | runtime question -> `NeedInteraction(Question)` | 已落地:runtime question/choice → `NeedInteraction`(M3-2) |
 | subagent | `NeedSubagent` | runtime spawn request -> `NeedSubagent` | 已落地:`PausedForSubagent`→`NeedSubagent`(M3-1)+ `spawn_agent` tool-bridge 特判(M3-3);real DeepSeek 协调器派生 Claude/Codex child(M9-4) |
 | tool failure policy | `ToolFailurePolicy` | external tool result error 回灌或 fail turn | 已落地(M4-3):`ExternalToolFailurePolicy`(`ReturnErrorToRuntime` 默认 / `StopRun`) |
-| cancel | `StepInput::Abandon` closes pending | abandon marks cleanup + handler kills session | 已落地:registry `cleanup`/`cleanup_agent` 强制关 live session 并返回 `ExternalSessionShutdown` disposition(M5);adapter `kill_on_drop` 兜底 |
+| cancel | `StepInput::Abandon` closes pending | abandon marks cleanup + handler kills session | 已落地:registry `cleanup`/`cleanup_agent` 强制关 live session 并返回 `ExternalSessionShutdown` disposition(M5);force-close 为进程组级 SIGTERM→SIGKILL(M2-1,unix),adapter `kill_on_drop` 兜底 |
 | budget | handler/driver charge tokens/cost | runtime usage/cost event charge | 已落地(M9-2):`ExternalUsageChargingHandler` 把 runtime usage/cost 计入 run budget,见 §17 |
 | trace | requirement + tool + subagent nodes | external events + shutdown + artifacts | 部分已有:requirement/subagent/shutdown 节点已接;artifact 追踪见下 |
 | artifact | tool/model output | patch/diff/test/file artifact refs | 部分已有:见 §18 |
@@ -922,8 +922,9 @@ live session，见 M6-2/M6-3）：
 - `read_idle_timeout`（默认 10 min）：live session 的**每行 stdout 空闲上限**。CLI 跑长静默命令
   （构建/测试套件）数分钟无帧属正常，绝不复用 30s 的 launch 超时，否则长静默 turn 会被误判
   `SessionLost` 杀掉。
-- `shutdown_grace`（默认 30s）：close 时丢弃 stdin 发 EOF 后等待 CLI 自行退出的上限，超时
-  `start_kill` → `ForcedKill`。
+- `shutdown_grace`（默认 30s）：close 时丢弃 stdin 发 EOF 后等待 CLI 自行退出的上限，超时后
+  进入进程组级强杀（unix 下先向**整个进程组**发 SIGTERM、2s 升级窗口后 SIGKILL，见 §16
+  「进程组级 kill」）→ `ForcedKill`。
 
 Claude Code 是单条长驻进程，该空闲上限跨整个 session 逐行生效；Codex/OpenCode 是每 turn 一个
 一次性进程（见 §13/§14），同一上限在单个 turn 进程内逐行生效——语义相同，只是作用域是一个
@@ -990,7 +991,7 @@ decoder 必须:
   `allow`/`deny` 帧),再逐行读 stdout 喂 decoder、把观测镜像到 live sink,直到 decoder 落定一个
   `RuntimeDecisionPoint`;stdout 提前 EOF→`SessionLost`,非法帧→`Protocol`。`shutdown` 丢弃 stdin 让 CLI
   见 EOF,在 shutdown grace 内等待退出并按退出码分类(0 → `Graceful`,非 0 → `Failed`;超时则
-  `start_kill` → `ForcedKill`)。
+  进程组级强杀 → `ForcedKill`,见 §16「进程组级 kill」)。
 - IO 经私有 `ClaudeSessionIo` trait 注入:生产用 `ClaudeProcessIo`(`tokio::process`,stderr 丢弃、
   `kill_on_drop`、每读空闲超时 `read_idle_timeout`),单测注入 fake transport 回放固定帧并捕获 stdin,**离线**跑通
   start/advance/resume/shutdown 全状态机,无需真实 binary、无网络。
@@ -1371,6 +1372,21 @@ git 操作走 `WorktreeGitExec` hook(生产实现 `SystemGit` shell out `git wor
 registry 的 `cleanup` / `cleanup_agent` 返回 `ExternalSessionShutdown`;scheduler 把该 disposition
 既喂给 `TraceHandle::record_external_shutdown`(审计),又喂给 `WorktreeManager::cleanup`
 (决定删除/保留/标记),二者用同一 disposition 保持一致。
+
+### 进程组级 kill（M2-1 / H-EXT-2）
+
+CLI 经其 shell 工具拉起的孙进程（构建、测试、dev server）若只杀直接子进程会变成孤儿，可能继续写
+已被删除/复用的 worktree。因此三个 CLI adapter 与 ACP connection 统一收口在
+`agent::external::process_group`（crate 私有，M8-2 将并入共享 process 模块）：
+
+- **spawn**：unix 上 `Command::process_group(0)` 使子进程自成进程组（pgid == pid）。
+- **force-close**（shutdown grace 超时后）：先向**整个进程组**发 SIGTERM，2s 升级窗口内未退出
+  再发 SIGKILL；组信号投递失败（如 EPERM）回退 `start_kill` 至少杀掉 leader。`ForcedKill`/
+  `Failed` 分类不变。
+- **平台差异**：Windows 无 POSIX 进程组语义，保持 `start_kill` 只杀直接子进程（本文上述
+  force-close 保证仅限 unix）。
+- 该保证覆盖协作式 `close` 路径；transport 未经 `close` 直接 drop 时仍只有 `kill_on_drop`
+  兑底（只杀直接子进程）。capability probe 是 `wait_with_output` 有界的一次性进程，不在此列。
 
 ## 17. budget / usage / cost
 

@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+use crate::agent::external::process_group;
 use crate::agent::external::{ExternalAgentError, ExternalSessionShutdown};
 
 use super::{AcpConfig, acp_runtime_kind};
@@ -173,7 +174,9 @@ impl SpawnedAcpAgent {
     /// Drops stdin so the agent observes EOF (the graceful stop signal), then, for
     /// a real child, waits up to `grace` for the exit and classifies it by status
     /// (zero → [`Graceful`](ExternalSessionShutdown::Graceful), non-zero →
-    /// [`Failed`](ExternalSessionShutdown::Failed)), force-killing on overrun. A
+    /// [`Failed`](ExternalSessionShutdown::Failed)), on overrun force-killing the
+    /// child's whole process group (unix; the direct child only on Windows) so
+    /// agent-spawned grandchildren cannot outlive the session (H-EXT-2). A
     /// childless (fake) transport reports the injected
     /// [`with_shutdown_disposition`](Self::with_shutdown_disposition) value,
     /// defaulting to [`Graceful`](ExternalSessionShutdown::Graceful).
@@ -193,11 +196,8 @@ impl SpawnedAcpAgent {
             // effects cannot be trusted as clean (H-EXT-3).
             Ok(Ok(_status)) => ExternalSessionShutdown::Failed,
             Ok(Err(_error)) => ExternalSessionShutdown::Failed,
-            Err(_elapsed) => match child.start_kill() {
-                Ok(()) => {
-                    let _ = child.wait().await;
-                    ExternalSessionShutdown::ForcedKill
-                }
+            Err(_elapsed) => match process_group::force_kill(child).await {
+                Ok(()) => ExternalSessionShutdown::ForcedKill,
                 Err(_error) => ExternalSessionShutdown::Failed,
             },
         }
@@ -229,6 +229,9 @@ impl AcpLauncher for TokioProcessLauncher {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        // The child leads its own process group on unix so a force-close can
+        // signal the whole group, grandchildren included (H-EXT-2).
+        process_group::configure_managed_command(&mut command);
 
         let mut child = command
             .spawn()
@@ -424,21 +427,23 @@ mod tests {
     /// real short-lived `sh` child wired exactly like the production transport.
     mod close_classification {
         use super::super::SpawnedAcpAgent;
-        use crate::agent::external::ExternalSessionShutdown;
+        use crate::agent::external::{ExternalSessionShutdown, process_group};
         use std::time::Duration;
         use tokio::process::Command;
 
         /// Spawns a real `sh -c <script>` child with piped stdio.
         fn spawn_sh(script: &str) -> SpawnedAcpAgent {
-            let mut child = Command::new("sh")
+            let mut command = Command::new("sh");
+            command
                 .arg("-c")
                 .arg(script)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .expect("spawn sh");
+                .kill_on_drop(true);
+            // Mirror the production spawn: the child leads its own process group.
+            process_group::configure_managed_command(&mut command);
+            let mut child = command.spawn().expect("spawn sh");
             let stdin = child.stdin.take().expect("stdin is piped");
             let stdout = child.stdout.take().expect("stdout is piped");
             SpawnedAcpAgent::from_child(child, stdin, stdout, Duration::from_secs(1))
@@ -472,6 +477,24 @@ mod tests {
                 agent.close(Duration::from_millis(250)).await,
                 ExternalSessionShutdown::ForcedKill
             );
+        }
+
+        /// H-EXT-2: a force-close kills the whole process group, so
+        /// grandchildren the agent spawned cannot outlive the session.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn force_close_kills_the_whole_process_group() {
+            let mut agent = spawn_sh("sleep 300 & sleep 300");
+            let pgid = agent
+                .child
+                .as_ref()
+                .and_then(tokio::process::Child::id)
+                .expect("child id") as i32;
+            assert_eq!(
+                agent.close(Duration::from_millis(250)).await,
+                ExternalSessionShutdown::ForcedKill
+            );
+            process_group::assert_process_group_reaped(pgid).await;
         }
     }
 }

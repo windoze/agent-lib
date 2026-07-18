@@ -11,21 +11,21 @@ edition = "2024"
 # Enables the managed Claude Code runtime adapter (launch config + capability
 # probe, with the stream decoder and live session added in later milestones).
 # Off by default so the core crate pulls in no CLI-adapter machinery unless a
-# host opts in; the probe reuses tokio's process support, so enabling it adds no
-# new heavy dependency.
-external-claude-code = []
+# host opts in; the probe reuses tokio's process support, so the only added
+# dependency is the unix-only `libc` used for process-group signalling.
+external-claude-code = ["dep:libc"]
 # Enables the managed Codex runtime adapter (launch config + capability probe;
 # the stream decoder and live session follow in later milestones). Off by
 # default so the core crate pulls in no CLI-adapter machinery unless a host opts
-# in; the probe reuses tokio's process support, so enabling it adds no new heavy
-# dependency.
-external-codex = []
+# in; the probe reuses tokio's process support, so the only added dependency is
+# the unix-only `libc` used for process-group signalling.
+external-codex = ["dep:libc"]
 # Enables the managed OpenCode runtime adapter (launch config + capability probe;
 # the stream decoder and live session follow in later milestones). Off by
 # default so the core crate pulls in no CLI-adapter machinery unless a host opts
-# in; the probe reuses tokio's process support, so enabling it adds no new heavy
-# dependency.
-external-opencode = []
+# in; the probe reuses tokio's process support, so the only added dependency is
+# the unix-only `libc` used for process-group signalling.
+external-opencode = ["dep:libc"]
 # Enables the managed ACP (Agent Client Protocol) runtime adapter. Unlike the
 # three CLI adapters above (which are empty features that only reuse tokio's
 # process support), this one is **off by default and pulls in real optional
@@ -34,7 +34,7 @@ external-opencode = []
 # feature via `dep:`. A default `cargo build` therefore links neither crate. The
 # ACP wire version negotiated by these crate versions is recorded as
 # `agent::external::ACP_WIRE_VERSION`.
-external-acp = ["dep:agent-client-protocol", "dep:agent-client-protocol-schema"]
+external-acp = ["dep:agent-client-protocol", "dep:agent-client-protocol-schema", "dep:libc"]
 # Enables typed-function tool JSON-schema derivation in the Chat/Agent facade
 # (`facade::Tool::function`, which requires `Args: schemars::JsonSchema`). Off by
 # default so the core crate never links `schemars`; without this feature callers
@@ -64,6 +64,13 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["serde"] }
+
+[target.'cfg(unix)'.dependencies]
+# Raw `kill(2)` for process-group signalling (SIGTERM/SIGKILL to `-pgid`) in the
+# managed external adapters' force-close path (H-EXT-2). Optional, unix-only,
+# and enabled exclusively by the `external-*` features, so the default build
+# never compiles it. `libc` is already in the lock tree transitively via tokio.
+libc = { version = "0.2", optional = true, default-features = false }
 
 [dev-dependencies]
 # Dev-only agent-effect test infrastructure. This forms a dependency cycle

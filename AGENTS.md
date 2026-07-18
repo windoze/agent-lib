@@ -35,7 +35,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 ```
 
 The default build pulls in **no** CLI-adapter machinery: the three managed
-runtime adapters are behind off-by-default features, so run their clippy pass
+runtime adapters are behind off-by-default features (on unix they add only the
+`libc` crate, used for process-group signalling), so run their clippy pass
 separately when you touch them:
 
 ```bash
@@ -115,6 +116,11 @@ cargo test --features "external-claude-code external-codex" \
   worktree under the OS temp dir, removed when the drive finishes, so a child
   that writes files never touches the checkout it launched from
   (`docs/managed-external-agent.md` §16).
+- **Process-group kill** — on unix every managed child leads its own process
+  group, and a force-close signals the whole group (SIGTERM, then SIGKILL), so
+  grandchildren a CLI spawned (builds, dev servers) cannot outlive the session
+  (`docs/managed-external-agent.md` §16). Windows has no process-group
+  semantics and kills only the direct child.
 - **Secret redaction** — credentials are never read into logs or printed; cassette
   fixtures are scrubbed and asserted secret-free.
 - **Unsupported-capability fallback** — a missing CLI or a failed capability
