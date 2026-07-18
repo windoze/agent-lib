@@ -204,7 +204,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 文档：`docs/managed-external-agent.md` §12（claude shutdown 段）与 §16（residual side-effect 策略）改为按退出码分类口径；`docs/external-agent.md` §6.4 补记非零退出 → `Failed`；`docs/review-2026-07.md` H-EXT-3 已标注 `✅ 已修复（M1-6）`。三处 struct/trait doc comment（`ClaudeProcessIo`、`CodexProcessTurn`、`OpenCodeProcessTurn`、acp `close`）同步。
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo clippy --all-targets -- -D warnings`、`cargo test --features "external-claude-code external-codex external-opencode" --all-targets`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。无 breaking change（enum 形状与 serde wire 未变）。
 
-### M1-7 [TODO] M1 review：安全与崩溃级修复收口
+### M1-7 [DONE] M1 review：安全与崩溃级修复收口
 
 检查项：
 
@@ -212,6 +212,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 无新增 unwrap/panic；无 secret 进入 Debug/错误消息/日志的回归（grep `REDACTED` 相关测试全过）。
 - 全量门禁命令通过（见任务单头部）。
 - `README.md`、`docs/managed-external-agent.md`、`docs/capability-matrix.md` 如需更新已更新。
+
+完成记录：
+
+- 条目核对：`docs/review-2026-07.md` 六条均已标注 `✅ 已修复（M1-1..M1-6）`；代码点位抽查确认修复在场——`AuthScheme`/`EndpointConfig` 手写脱敏 Debug（`src/client/config.rs`，`[REDACTED]` 共 23 处分布 4 文件）、`src/adapter/http.rs` 共享超时/错误 body 上限/query 脱敏、`src/model/usage.rs` 7 处 `saturating_add`、三 config 的 `read_idle_timeout`/`shutdown_grace` 字段、四处 close 站点 `status.success()` guard 分类。
+- 回归扫描：M1 触及文件无新增生产路径 `unwrap()`/`panic!`（`src/adapter/http.rs` 仅测试断言内 2 处 `panic!`）；usage 溢出 panic helper 已删除；secret 脱敏测试随全量套件通过。
+- 文档核对：`docs/managed-external-agent.md`（M1-5 超时拆分、M1-6 关闭分类）与 `docs/external-agent.md` §6.4 已随对应任务同步；`README.md` 与 `docs/capability-matrix.md` 不覆盖 M1 修复的内部行为面（超时默认值、脱敏、关闭分类），无需更新。
+- 全量门禁：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0，约 35s，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 本任务纯审查，无代码改动，无 breaking change。
 
 ---
 
