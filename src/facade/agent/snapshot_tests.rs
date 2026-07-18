@@ -1,5 +1,5 @@
 //! Round-trip tests for the collaboration slices of an [`AgentSnapshot`] (M3-2,
-//! M3-3).
+//! M3-3) and for the reserved top-level `artifacts` field (M3-4).
 //!
 //! These tests assert that [`Agent::snapshot`](crate::facade::Agent::snapshot)
 //! captures the *live* mailbox / blackboard / plan substrate an agent has
@@ -22,9 +22,9 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 
 use crate::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
-use crate::facade::AgentSnapshot;
 use crate::facade::agent::{Agent, AgentBuilder};
 use crate::facade::delegate::Delegation;
+use crate::facade::{AgentSnapshot, ArtifactRef, Collaboration};
 use crate::stream::StreamEvent;
 
 /// A never-driven client, so the builder / restore builder have a runtime handle
@@ -347,4 +347,74 @@ fn legacy_snapshot_without_collaboration_fields_restores_bare() {
     );
     assert!(restored.blackboard().is_none());
     assert!(restored.plan().is_none());
+}
+
+#[test]
+fn top_level_artifacts_is_reserved_empty_even_when_store_enabled() {
+    // The top-level `artifacts` slice is a reserved compatibility field: capture
+    // leaves it empty even when the delegate artifact store is explicitly
+    // enabled, because there is no stable facade-level artifact store to
+    // aggregate (M3-4). It also survives a serde round-trip as a present, empty
+    // array.
+    let agent = AgentBuilder::default()
+        .client(Arc::new(StubClient))
+        .model("supervisor-model")
+        .collaboration(Collaboration::new().artifacts())
+        .build()
+        .expect("build agent");
+    assert!(
+        agent.collaboration().artifacts_enabled(),
+        "the artifact store flag is enabled on this agent"
+    );
+
+    let snapshot = agent.snapshot().expect("snapshot at a committed point");
+    assert!(
+        snapshot.artifacts.is_empty(),
+        "capture leaves the reserved top-level artifacts slice empty"
+    );
+
+    let value = serde_json::to_value(&snapshot).expect("encode snapshot");
+    assert_eq!(
+        value.get("artifacts"),
+        Some(&serde_json::json!([])),
+        "the reserved artifacts field serializes as a present, empty array"
+    );
+
+    let decoded: AgentSnapshot = serde_json::from_value(value).expect("decode snapshot");
+    assert!(
+        decoded.artifacts.is_empty(),
+        "the reserved artifacts field round-trips empty"
+    );
+}
+
+#[test]
+fn top_level_artifacts_are_ignored_on_restore() {
+    // Graft non-empty artifacts onto the reserved top-level slice, as a stale or
+    // hand-written blob might carry, then confirm restore ignores them: it
+    // neither fails nor carries them into the restored agent's state, so
+    // re-snapshotting the restored agent yields an empty slice again.
+    let agent = mailbox_supervisor();
+    let mut snapshot = agent.snapshot().expect("snapshot at a committed point");
+    snapshot.artifacts = vec![
+        ArtifactRef {
+            path: "out/report.md".to_owned(),
+        },
+        ArtifactRef {
+            path: "out/data.csv".to_owned(),
+        },
+    ];
+
+    let restored = restore(snapshot);
+    let re_snapshot = restored.snapshot().expect("re-snapshot restored agent");
+    assert!(
+        re_snapshot.artifacts.is_empty(),
+        "restore ignores the reserved top-level artifacts slice; it is never \
+         carried into restored state"
+    );
+    // The rest of the restored state is unaffected: the two-delegate topology
+    // still re-provisions an (empty) mailbox.
+    assert!(
+        restored.mailbox().is_some(),
+        "grafted top-level artifacts do not disturb the restored topology"
+    );
 }

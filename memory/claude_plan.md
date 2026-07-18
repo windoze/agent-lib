@@ -49,3 +49,51 @@ M3-3 完成：`CollabState::restore` 改为 snapshot 权威（topology 仅作 pr
 拓宽 config 保持一致；facade-api.md §15.2 写入冲突策略与旧格式兼容说明；新增 4 个测试
 （2 facade::agent::snapshot 冲突/旧格式，2 facade::collab restore 语义）。fmt/clippy/targeted/
 full/doc 全绿，TODO.md 标记 [DONE]。
+
+---
+
+# M3-4：明确并实现顶层 artifact snapshot 策略
+
+## 分析
+- `AgentSnapshot.artifacts: Vec<ArtifactRef>` 顶层字段，capture 时恒写 `Vec::new()`（snapshot.rs:173）。
+- restore 路径从不读取 `snapshot.artifacts`（只读 per-delegate `ExternalDelegateSnapshot.artifacts`）。
+- `CollabState` 无独立 artifact store（collab.rs:236-239 明确：artifact store 只是 config flag，
+  delegate artifact refs 已收进 `RunOutput.artifacts`）。artifact 现有真实来源：
+  1. per-run：`RunOutput.artifacts`（瞬时，每次 run 后 surface）；
+  2. per-external-delegate：`ExternalDelegateSnapshot.artifacts`（来自 `RetainedExternalSession.artifacts`，
+     持久化进 snapshot 且 restore 时按 delegate 恢复）。
+- 结论：无稳定 facade-level artifact store，不应伪造聚合语义 → 采用 **选项 2：保留兼容字段**。
+
+## 决策：顶层 artifacts = 保留兼容字段（reserved compatibility field）
+- 字段保留在 `AgentSnapshot`，带 `#[serde(default)]`，capture 恒为空，restore 完全忽略。
+- 权威 artifact 来源明确为 per-run `RunOutput.artifacts` 与 per-external-delegate
+  `ExternalDelegateSnapshot.artifacts`；顶层字段不作为行为来源。
+
+## 实现步骤
+1. `src/facade/agent/snapshot.rs`：
+   - 更新模块级 doc（第 22-24 行“reserved for a later milestone”）与 struct/字段 doc（73-74、115-118），
+     明确改为“保留兼容字段，非行为来源，artifacts 现由 RunOutput + ExternalDelegateSnapshot 持有，
+     restore 忽略顶层字段”。
+   - 更新 `capture` doc 说明 artifacts 恒空且为何（无稳定聚合 store）。
+2. `docs/facade-api.md` §15.2 第 1016 行：把“见后续里程碑”改为定稿：明确顶层 artifacts 为保留兼容字段，
+   调用方应从 `RunOutput.artifacts`（per-run）与 external delegate snapshot（持久 per-delegate）读取 artifacts，
+   restore 不读取顶层字段。
+3. `docs/refine.md` 条目 2：把 artifact 数据来源三问（127-130、137）标注为已决策：顶层 artifacts 保留兼容字段、
+   不聚合，权威来源为 RunOutput + external delegate snapshot。
+4. 测试（`src/facade/agent/snapshot_tests.rs` 追加 2 个）：
+   - 序列化兼容：capture 得到的顶层 artifacts 为空，serde round-trip 后字段仍存在且为空。
+   - restore 独立性：手工把非空 artifacts 嫁接到 snapshot（伪造旧/外部写入），restore 成功且顶层
+     artifacts 不泄漏进行为（restored agent 无处可查询到它；per-delegate 语义不受影响）。
+
+## 验证
+- cargo fmt --all
+- cargo clippy --all-targets -- -D warnings
+- cargo test -p agent-lib --lib facade::agent::snapshot
+- cargo test -p agent-lib --lib facade::collab（回归）
+- RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+- （仅文档 + 测试改动，若无编译产物行为变化仍跑上述目标验证）
+
+## 状态：完成
+M3-4 完成：顶层 artifacts 定为保留兼容字段（capture 恒空、restore 忽略），文档定稿真实 artifact
+来源（RunOutput + external delegate snapshot），新增 2 个测试。fmt/clippy/targeted/doc 全绿，
+TODO.md 标记 [DONE]。

@@ -1013,7 +1013,15 @@ snapshot 的 provision hint** 的冲突策略：
   `Agent::collaboration()` 广告的 flag 与 `mailbox()` / `blackboard()` / `plan()` 访问器返回的
   live 原语始终一致。
 
-顶层 `artifacts` 目前为保留字段（见 §15 后续里程碑），restore 不依赖它。
+顶层 `artifacts` 是**保留兼容字段**，不是行为来源：capture 恒写空、restore 不读取它。之所以不聚合，是
+因为当前没有稳定的 facade-level artifact store（`CollabState` 的 artifact store 只是 config flag，delegate
+artifact refs 已收进 `RunOutput.artifacts`）。调用方应从两处读取 artifacts：
+
+- per-run：`RunOutput.artifacts`（每次 run 后 surface 的瞬时视图）；
+- per-external-delegate：external delegate snapshot 的 `artifacts`（随每个 delegate 的会话事实持久化并在
+  restore 时按 delegate 恢复）。
+
+保留该字段（带 `#[serde(default)]`）只为持久化 shape 稳定与向前兼容，不会伪造聚合语义。
 
 Local subagent:
 

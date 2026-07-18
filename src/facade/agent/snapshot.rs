@@ -20,8 +20,13 @@
 //! blackboard, and plan slices carry the live collaboration substrate's data-only
 //! snapshot when the agent has them provisioned, so a restored agent resumes on
 //! the same shared inbox / board / plan; a disabled substrate is `None`. The
-//! artifact slice is reserved for a later milestone and is empty on the base
-//! path.
+//! top-level artifact slice is a **reserved compatibility field**, not a
+//! behavior source: it is always empty on capture and ignored on restore.
+//! Artifacts live where they are actually produced — per run in
+//! [`RunOutput::artifacts`](crate::facade::RunOutput) and, for managed external
+//! delegates, per delegate in [`ExternalDelegateSnapshot::artifacts`] (persisted
+//! and restored with each delegate's session facts) — because there is no
+//! stable facade-level artifact store to aggregate (`docs/facade-api.md` §15.2).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,8 +75,9 @@ use super::{Agent, assemble_machine, build_facade_approval};
 /// never rests with a child in flight at a committed snapshot point, so it is
 /// empty in ordinary capture (see [`DelegationSnapshot`]). The mailbox,
 /// blackboard, and plan slices carry the provisioned collaboration substrate's
-/// data-only snapshot (each `None` when its substrate is disabled); the artifact
-/// slice is reserved for a later milestone and is empty here.
+/// data-only snapshot (each `None` when its substrate is disabled); the top-level
+/// artifact slice is a reserved compatibility field (always empty, not read on
+/// restore — see [`artifacts`](Self::artifacts)).
 ///
 /// The type is `Clone`/`PartialEq`/`Serialize`/`Deserialize` but deliberately not
 /// `Eq`: [`AgentStateSnapshot`] and [`DelegateSnapshot`] capture model settings
@@ -112,8 +118,17 @@ pub struct AgentSnapshot {
     /// plan substrate is disabled.
     #[serde(default)]
     pub plan: Option<PlanSnapshot>,
-    /// Artifact references produced by delegates (reserved; empty on the base
-    /// path).
+    /// Reserved compatibility field, kept so the serialized shape is stable and
+    /// forward-compatible. It is **not** a behavior source: capture always writes
+    /// it empty and restore never reads it. Artifacts are produced and surfaced
+    /// elsewhere — per run in
+    /// [`RunOutput::artifacts`](crate::facade::RunOutput) and, for managed
+    /// external delegates, per delegate in
+    /// [`ExternalDelegateSnapshot::artifacts`] (persisted and restored with each
+    /// delegate's session facts). There is no stable facade-level artifact store
+    /// to aggregate here, so this slice deliberately stays empty rather than
+    /// faking aggregation semantics (`docs/facade-api.md` §15.2). `#[serde(default)]`
+    /// keeps older snapshots that predate the field readable.
     #[serde(default)]
     pub artifacts: Vec<ArtifactRef>,
 }
@@ -139,6 +154,10 @@ impl AgentSnapshot {
     /// [`MailboxSnapshot`] / [`BlackboardSnapshot`] / [`PlanSnapshot`], while a
     /// disabled substrate stays `None`, so a restored agent re-provisions exactly
     /// the substrates the original had — never an unconfigured one.
+    ///
+    /// The top-level [`artifacts`](Self::artifacts) slice is always written empty:
+    /// it is a reserved compatibility field, not a behavior source. Per-delegate
+    /// artifacts are captured on each [`ExternalDelegateSnapshot`] instead.
     pub(super) fn capture(
         state: &AgentState,
         delegates: &[LocalSubagent],
@@ -170,6 +189,9 @@ impl AgentSnapshot {
                 .as_ref()
                 .map(|blackboard| blackboard.snapshot_all()),
             plan: collab.plan.as_ref().map(|plan| plan.snapshot()),
+            // Reserved compatibility field: kept empty on purpose (no stable
+            // facade-level artifact store to aggregate; artifacts live in
+            // `RunOutput` and per-delegate `ExternalDelegateSnapshot`).
             artifacts: Vec::new(),
         })
     }

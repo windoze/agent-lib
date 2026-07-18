@@ -574,7 +574,7 @@ cargo test -p agent-lib --lib facade::agent::snapshot
   `cargo test --all --all-targets`（全绿）、`cargo test --all --doc`（全绿）、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
-### M3-4 [TODO] 明确并实现顶层 artifact snapshot 策略
+### M3-4 [DONE] 明确并实现顶层 artifact snapshot 策略
 
 上下文：
 
@@ -602,6 +602,43 @@ cargo test -p agent-lib --lib facade::agent::snapshot
 cargo test -p agent-lib --lib facade::agent::snapshot
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 ```
+
+完成记录（M3-4）：
+
+- 决策：采用**选项 2（保留兼容字段）**。核实无稳定 facade-level artifact store——
+  `CollabState` 的 artifact store 只是 `config` 上的 flag（`src/facade/collab.rs`
+  的 `CollabState` doc 已说明 delegate artifact refs 已收进 `RunOutput.artifacts`），
+  且 restore 路径从不读取顶层 `AgentSnapshot.artifacts`。故按“如果没有稳定 artifact
+  store 就不要伪造聚合语义”把顶层字段定为**保留兼容字段**：capture 恒写空、restore
+  忽略。权威 artifact 来源明确为两处：per-run 的 `RunOutput.artifacts`（瞬时视图）与
+  per-external-delegate 的 `ExternalDelegateSnapshot.artifacts`（随会话事实持久化并按
+  delegate 恢复）。
+- 实现（`src/facade/agent/snapshot.rs`，仅文档语义定稿，无行为改动）：
+  - 更新模块级 doc、`AgentSnapshot` struct doc、`artifacts` 字段 doc 与 `capture` doc，
+    明确顶层 artifacts 为保留兼容字段（非行为来源、恒空、restore 忽略），并指明真实
+    artifact 来源。`capture` 的 `artifacts: Vec::new()` 处加注释说明恒空原因。字段仍带
+    `#[serde(default)]` 以保持持久化 shape 稳定与旧 snapshot 可读。
+- 文档：
+  - `docs/facade-api.md` §15.2：把原“顶层 artifacts 为保留字段（见后续里程碑）”一句
+    定稿为完整段落，说明保留兼容字段语义、不聚合的原因，以及调用方应从
+    `RunOutput.artifacts`（per-run）与 external delegate snapshot（per-delegate 持久）读取
+    artifacts。
+  - `docs/refine.md` 条目 2：把 artifact 数据来源三问标注为“已决策（M3-4）”，明确顶层字段
+    为保留兼容字段、不聚合；并把归属一致的建议测试项改写为三者语义不冲突的结论。
+- 测试（`src/facade/agent/snapshot_tests.rs`，`facade::agent::snapshot::tests`，新增 2 个）：
+  - `top_level_artifacts_is_reserved_empty_even_when_store_enabled`：显式
+    `Collaboration::new().artifacts()` 启用 artifact store flag 后 snapshot，顶层 artifacts
+    仍为空；serde 往返后字段仍为 present 的空数组（`"artifacts": []`）。
+  - `top_level_artifacts_are_ignored_on_restore`：把非空 `ArtifactRef` 嫁接到顶层 artifacts
+    后 restore 成功，re-snapshot 恢复出的 agent 顶层 artifacts 仍为空（证明 restore 不读取、
+    不携带该字段），且 restored 拓扑不受影响（两 delegate 仍重建空 mailbox）。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
+  `cargo test -p agent-lib --lib facade::agent::snapshot`（8 passed）、
+  `cargo test -p agent-lib --lib facade::collab`（19 passed，回归）、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
+  说明：本任务仅改文档注释、文档文件与新增测试，未改动库的非测试编译产物行为，故未重跑
+  全量 `cargo test --all --all-targets`（clippy `--all-targets` 已成功编译含新测试的全部
+  target，targeted 测试全绿）。
 
 ### M3-5 [TODO] Review：协作状态 snapshot 和 restore
 
