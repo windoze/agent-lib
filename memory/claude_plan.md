@@ -97,3 +97,38 @@ full/doc 全绿，TODO.md 标记 [DONE]。
 M3-4 完成：顶层 artifacts 定为保留兼容字段（capture 恒空、restore 忽略），文档定稿真实 artifact
 来源（RunOutput + external delegate snapshot），新增 2 个测试。fmt/clippy/targeted/doc 全绿，
 TODO.md 标记 [DONE]。
+
+---
+
+# M3-5 执行计划：Review 协作状态 snapshot 和 restore
+
+## 任务（TODO.md M3-5）
+Review 任务，检查范围：
+- mailbox/blackboard/plan snapshot 类型是否 data-only、serde、兼容旧格式。
+- `AgentSnapshot::capture` 是否读 live 状态而非 topology 默认值。
+- `AgentRestoreBuilder` 是否优先用 snapshot 内容。
+- artifact 策略在代码/文档是否一致。
+- retained external session snapshot 是否未被本阶段改坏。
+- 手工复核 docs/refine.md “协作状态 snapshot/restore” 条目状态，补充修复说明。
+
+## 代码复核结论（已读源码确认）
+- MailboxSnapshot/BlackboardSnapshot/PlanSnapshot 均 data-only（无 lock/handle）、
+  derive Serialize/Deserialize；facade 层 AgentSnapshot.mailbox/blackboard/plan/artifacts
+  带 #[serde(default)]，旧格式反序列化安全。✓
+- capture 从 collab.mailbox/blackboard/plan 读 live snapshot()，artifacts 恒空（保留兼容字段）。✓
+- CollabState::restore = snapshot 权威 + topology provision hint，恢复后拓宽 config。✓
+- AgentRestoreBuilder::build 把 snapshot slices 传给 restore；external session 用
+  snap.session/artifacts/status，未被改坏。✓
+- 代码与文档 artifact 策略一致（顶层保留字段，权威来源 RunOutput + ExternalDelegateSnapshot）。✓
+
+## 待办
+1. 更新 docs/refine.md §2：把“协作状态运行时可用但 snapshot/restore 仍丢弃数据”条目状态
+   标注为“已修复（M3-1..M3-4）”，补充当前修复说明（capture 读 live、restore snapshot 权威、
+   artifact 保留字段策略），保持问题描述历史但明确现状。
+2. 运行验证命令：fmt / clippy --all-targets -D warnings / 三个 targeted lib 测试 / cargo doc。
+3. TODO.md 标记 M3-5 [DONE] 并填完成记录。
+4. commit。
+
+## 状态：完成
+M3-5 完成：代码逐项复核（M3-1..M3-4 一致落地）+ 更新 docs/refine.md §2 标注已修复并补充修复结果
+小节；fmt/clippy/三 targeted 测试/doc 全绿；TODO.md 标记 [DONE]。

@@ -640,7 +640,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   全量 `cargo test --all --all-targets`（clippy `--all-targets` 已成功编译含新测试的全部
   target，targeted 测试全绿）。
 
-### M3-5 [TODO] Review：协作状态 snapshot 和 restore
+### M3-5 [DONE] Review：协作状态 snapshot 和 restore
 
 检查范围：
 
@@ -664,6 +664,40 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 ```
 
 - 手工复核 `docs/refine.md` 中 “协作状态 snapshot/restore 缺失” 条目的状态，必要时补充当前修复说明。
+
+完成记录（M3-5）：
+
+- 代码复核（逐项确认 M3-1 ~ M3-4 落地且一致）：
+  - **data-only / serde / 兼容旧格式**：`MailboxSnapshot`（`src/agent/collab/mailbox.rs`）、
+    `BlackboardSnapshot`（`blackboard.rs`）、`PlanSnapshot`（`plan.rs`）均为纯数据（无
+    `Mutex`/`Arc`/runtime handle），derive `Serialize`/`Deserialize`；facade 层
+    `AgentSnapshot.{mailbox,blackboard,plan,artifacts}`（`src/facade/agent/snapshot.rs`）
+    均带 `#[serde(default)]`，缺字段的旧 JSON 可安全反序列化。`Mailbox::from_snapshot`
+    还把 `next_seq` reconcile 到 `max(seq)+1`，防止手写/旧快照发出冲突序号。
+  - **capture 读 live 状态**：`AgentSnapshot::capture` 从 `collab.mailbox/blackboard/plan`
+    调 `snapshot()`/`snapshot_all()`，非 topology 默认；`artifacts` 恒空（保留兼容字段）。
+  - **restore 优先 snapshot**：`CollabState::restore` = snapshot 权威 + topology provision
+    hint；捕获切片即使拓扑未启用也恢复内容，之后拓宽 effective `config` 保证
+    `collaboration()` 与访问器一致；缺内容但拓扑启用才建空底座。`AgentRestoreBuilder::build`
+    以 `resolve(None, ..)` 派生 topology hint 并把 snapshot 三切片交给 `restore`。
+  - **artifact 策略一致**：顶层 `artifacts` 在模块 doc、struct/字段 doc、`capture` 注释与
+    `docs/facade-api.md` §15.2 一致定为保留兼容字段（恒空、restore 忽略），权威来源为
+    `RunOutput.artifacts` 与 `ExternalDelegateSnapshot.artifacts`。
+  - **retained external session 未被改坏**：restore 仍按 `restore_external`
+    （MarkInterrupted / RestartFromBrief / AttachOrFail）从 `snap.session`/`snap.artifacts`/
+    `snap.status` 重建 `RetainedExternalSession`，本阶段未触碰该路径逻辑。
+- 文档：更新 `docs/refine.md` §2「协作状态运行时可用，但 snapshot/restore 仍丢弃数据」——
+  在标题下标注**状态：已修复（M3-1 ~ M3-4，M3-5 复核通过）**，保留原始缺口描述作为背景，
+  并在条目末尾新增「修复结果」小节，逐条说明 capture 读 live、restore snapshot 权威、
+  serde 兼容、artifact 保留字段策略与 external session 未受影响，附 M3-5 验证结果。
+- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
+  `cargo test -p agent-lib --lib agent::collab`（28 passed）；
+  `cargo test -p agent-lib --lib facade::agent::snapshot`（8 passed）；
+  `cargo test -p agent-lib --lib facade::collab`（19 passed）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
+  说明：本任务为 Review + 文档修订，未改动任何库/测试的编译产物代码（仅 `docs/refine.md`、
+  `TODO.md`、`memory/claude_plan.md`），且 clippy `--all-targets` 已成功编译含全部测试的
+  target、targeted 测试全绿，故未重跑全量 `cargo test --all --all-targets`。
 
 ## M4：managed external 可用性和 capability 来源
 
