@@ -42,4 +42,4 @@
 - [x] 全量测试：`cargo test --all --all-targets` 与 external features 全量均 exit 0、无失败。
 - [x] rustdoc 门禁通过。
 - [x] TODO.md 标记 [DONE] + 完成记录；review 文档 H-EXT-2 已标注。
-- [ ] commit 并停止。
+- [x] commit `887c089` 完成，任务停止。下一任务为 M2-2（resume 时用持久化高水位播种 decoder seq）。
