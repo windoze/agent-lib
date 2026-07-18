@@ -693,10 +693,13 @@ Managed external agent 不是普通 tool。它是外部 coding-agent runtime 的
 external delegate:
 
 ```rust
+// build_with_default_session_handler 在构造时一步装配 runtime session handler；默认 crate build
+// 不含 CLI adapter，未开启对应 external-* feature 时 fail-fast(非密),开启后探测本机已登录 CLI。
 let codex = ManagedExternalAgent::codex()
     .worktree("/home/chenxu/repos/my-app")
     .mode(ExternalRunMode::Managed)
-    .build()?;
+    .build_with_default_session_handler()
+    .await?;
 
 let mut agent = Agent::builder()
     .provider(ProviderConfig::openai_from_env()?)
@@ -765,7 +768,9 @@ pub async fn default_external_session_handler(
   point(`Completed` / `Paused*` / `Failed`),复用既有 capability-gated resume 与 worktree cleanup;launch
   失败与 advance 失败都折叠为 `ExternalSessionResult::Failed`,绝不串到别的 requirement family。
 - 宿主 `.session_handler(default_external_session_handler(&agent).await?)` 直接注入;返回具体类型以保留
-  `.registry()`(宿主用 `cleanup_agent` / `cleanup` 强制关闭)。
+  `.registry()`(宿主用 `cleanup_agent` / `cleanup` 强制关闭)。更顺手的一步式装配是
+  `ManagedExternalAgentBuilder::build_with_default_session_handler().await?`,它在 build 时探测本机
+  runtime 并接上同一个 registry-backed handler(已手工 `.session_handler(..)` 时短路 probe、honor 自定义 handler)。
 - 缺二进制 / 未登录 / 能力不支持时走既有保守路径(probe fail-fast → `FacadeError::ExternalAgent` 或
   `UnsupportedCapability` / skip),**不静默降级**;未编入对应 feature 的 runtime 显式 fail-fast(消息点名要开的 feature)。
 
@@ -1162,7 +1167,8 @@ let reviewer = Agent::worker()
 let codex = ManagedExternalAgent::codex()
     .worktree("/home/chenxu/repos/my-app")
     .mode(ExternalRunMode::Managed)
-    .build()?;
+    .build_with_default_session_handler()
+    .await?;
 
 let mut agent = Agent::builder()
     .provider(ProviderConfig::openai_from_env()?)

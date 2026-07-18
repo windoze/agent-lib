@@ -148,10 +148,14 @@ use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // `build_with_default_session_handler` 一步装配好 runtime session handler：默认 crate build
+    // 不含任何 CLI adapter，所以未开启对应 `external-*` feature 时它会 fail-fast（非密错误，点名
+    // 要开的 feature），开启后则探测本机已登录的 CLI 并接上官方 registry-backed handler。
     let codex = ManagedExternalAgent::codex()
         .worktree("/home/me/repos/my-app")
         .mode(ExternalRunMode::Managed)
-        .build()?;
+        .build_with_default_session_handler()
+        .await?;
 
     let mut agent = Agent::builder()
         .provider(ProviderConfig::openai_from_env()?)
@@ -172,8 +176,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
-要为宿主注入生产级 live-adapter handler，可用 `default_external_session_handler(&agent)`（feature-gated）
-接 `.session_handler(..)`；跑通真机 CLI 的完整示例见下方[可运行示例](#可运行示例)。
+上面的 `build_with_default_session_handler()` 是推荐的一步式装配。若要注入**自定义** handler，仍可用
+`ManagedExternalAgent::codex()...session_handler(my_handler).build()?` 手工路径（此时不会触发 probe）；
+底层便捷构造是 `default_external_session_handler(&agent)`（feature-gated）。运行 managed external
+需要开启对应 `external-*` feature 且本机对应 CLI 已登录，否则装配会 fail-fast（非密）；跑通真机 CLI
+的完整可运行装配示例见下方[可运行示例](#可运行示例)（`examples/support/managed.rs` 展示全手工 scoped-effect wiring）。
 
 `use agent_lib::prelude::*;` 可一次性重导最常用的 facade 入口（`Chat` / `ChatSession` / `Agent` /
 `Tool` / `Approval` / `Delegation` / `ManagedExternalAgent` / `ProviderConfig` / `Reply` /

@@ -1571,6 +1571,15 @@ cargo test --test agent_external_real_e2e -- --ignored --nocapture
   - mixed external agents — [`examples/managed_mixed.rs`](../examples/managed_mixed.rs)。
   - 共享装配 [`examples/support/managed.rs`](../examples/support/managed.rs);每个 example 用
     `required-features` 门控,CLI 缺失/probe 失败即打印非密 skip 并 exit 0。
+- **facade 构造(快速上手)**:examples 展示的是全手工 scoped-effect wiring(probe → registry →
+  `ExternalSessionHandler`),推荐给需要完全掌控装配的宿主。若只想快速拿到一个带 handler、可直接
+  委托的受管 agent,用 facade 的一步式构造
+  `ManagedExternalAgent::codex()...build_with_default_session_handler().await?`
+  (见 [`README.md`](../README.md) quick start 与 [`facade-api.md`](./facade-api.md) §11):它在 build 时
+  探测本机已登录 CLI 并接上官方 registry-backed handler。默认 crate build 不含任何 CLI adapter,
+  未开启对应 `external-*` feature(或 CLI 未登录)时该装配 **fail-fast**(非密错误,点名要开的 feature),
+  绝不产出「build 后即可 run 但缺 session handler」的 agent。手工自定义 handler 仍走
+  `.session_handler(..).build()`(短路 probe)。
 - 安全说明:权限、worktree、secret redaction、ignored tests。运行说明另见根目录
   [`AGENTS.md`](../AGENTS.md)。
 

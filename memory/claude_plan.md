@@ -178,3 +178,46 @@ session handler，取代“先 build 再回填 builder”的绕路。
 
 ## 状态：完成
 M4-1 完成：新增 `build_with_default_session_handler` 一步式 builder API（手工 handler 短路、否则 probe 装配默认 handler），3 个测试全绿，fmt/clippy(默认+全 feature)/doc/full 全绿，TODO.md 标记 [DONE]。
+
+---
+
+# M4-2 执行计划：修正 README managed external quick start
+
+## 任务（TODO.md M4-2）
+文档任务：让 external quick start 示例不再构造出「没有 session handler、build 后即可 run」的
+`ManagedExternalAgent`，改用 M4-1 新增的 `build_with_default_session_handler().await?`。
+
+## 现状调研
+- `README.md` §4（143-176）：`ManagedExternalAgent::codex()...build()?` → `.external_agent(..)`
+  → `agent.run_full(..)`，是「build 后即可 run 但无 handler」示例（会在运行时 fail）。
+  尾注 175-176 提示手工 `default_external_session_handler(&agent)` 接 `.session_handler(..)`。
+- `docs/facade-api.md`：§11.1（696-708）与 §17.3（1156-1198）同样 `.build()?` 后挂 external
+  并 run_full，属同类违规示例。§11.2（751-770）已解释 handler 注入与 default handler。
+- `docs/managed-external-agent.md`：设计文档，无 facade 构造 snippet；§21 M9（1562-1575）
+  指向 `examples/support/managed.rs` 手工 scoped wiring（推荐的 managed 全手工路径）。
+- 新 API：`ManagedExternalAgentBuilder::build_with_default_session_handler(self) -> Result<..>`
+  （async，始终编译；默认 feature 下 fail-fast 非 secret 「enable external-* feature」错误）。
+
+## 编辑计划
+1. README.md §4 quick start：`.build()?` → `.build_with_default_session_handler().await?`；
+   示例旁补说明：默认 crate build 不启用 CLI adapter，此调用需对应 `external-*` feature +
+   本机 CLI login，否则 fail-fast（非 secret）；指向可运行示例。更新尾注保留手工
+   `.session_handler(..)` 自定义 handler 路径说明。
+2. docs/facade-api.md §11.1、§17.3：外部构造 `.build()?` → `.build_with_default_session_handler().await?`，
+   保证不再出现 build 后即可 run 但无 handler 装配示例；§11.2 default handler 说明补一句
+   指向 ergonomic 一步式 API。
+3. docs/managed-external-agent.md：加简短「facade 构造」说明（在 §21 M9 examples 或 §1 附近），
+   指出 ergonomic `build_with_default_session_handler()` 构造 + 需要 handler/feature/CLI login，
+   与 README 一致；examples 仍是推荐的手工 scoped-wiring 路径，术语对齐。
+4. 检查 examples/ managed examples 仍是推荐路径（手工 scoped wiring），术语一致，无需改代码。
+
+## 验证
+- cargo fmt --all（仅文档改动，无代码，但保持流程）
+- cargo check --examples
+- cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
+- grep 复核：docs 中不再有 build-then-run-without-handler 外部示例。
+- 仅文档改动、无编译产物行为变化 → 不重跑全量 test 套件（复用上次绿）。
+
+## 状态：完成
+M4-2 完成：README / facade-api.md / managed-external-agent.md 的 external quick start 改用一步式
+`build_with_default_session_handler().await?`，消除「build 后即可 run 但无 handler」示例并补默认 build/feature/CLI login 说明；examples 手工 scoped wiring 仍为推荐路径。fmt/check --examples/feature clippy 全绿，仅文档改动复用上次 full test 绿，TODO.md 标记 [DONE]。

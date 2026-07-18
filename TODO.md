@@ -762,7 +762,7 @@ cargo clippy --all-targets -- -D warnings
   external-acp" -- -D warnings`（clean）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
   --workspace`（clean，新方法 intra-doc 链接解析通过）。
 
-### M4-2 [TODO] 修正 README managed external quick start
+### M4-2 [DONE] 修正 README managed external quick start
 
 上下文：
 
@@ -787,6 +787,31 @@ cargo clippy --all-targets \
 ```
 
 - 文档中不能出现“build 后即可 run external agent”但没有 handler 装配的示例。
+
+完成记录（M4-2）：
+
+- `README.md` §4 external quick start：codex 构造从 `.build()?` 改为 M4-1 的
+  `.build_with_default_session_handler().await?`（`#[tokio::main]` async main 下），示例内加注释说明
+  默认 crate build 不含 CLI adapter、未开启对应 `external-*` feature 时该装配 fail-fast（非密、点名 feature），
+  开启后探测本机已登录 CLI 并接官方 registry-backed handler。更新尾注：保留手工自定义 handler 的
+  `.session_handler(..).build()?` 路径（短路 probe）、指明运行 managed external 需要 feature + 本机 CLI login，
+  并指向[可运行示例]（`examples/support/managed.rs` 全手工 scoped-effect wiring）。
+- `docs/facade-api.md`：§11.1 与 §17.3 两处 external delegate 构造同样从 `.build()?` 改为
+  `.build_with_default_session_handler().await?`（消除「build 后即可 run 但无 handler」示例）；§11.2
+  default handler 说明补一句指向 ergonomic 一步式 `build_with_default_session_handler().await?`（手工 handler 短路 probe）。
+- `docs/managed-external-agent.md` §21 M9 examples：新增「facade 构造（快速上手）」说明段，指出 examples 展示
+  全手工 scoped-effect wiring（推荐给需完全掌控装配的宿主），快速上手用 facade 一步式
+  `ManagedExternalAgent::codex()...build_with_default_session_handler().await?`（默认 build 无 CLI adapter、
+  缺 feature/CLI login 时 fail-fast，绝不产出缺 handler 的 agent），与 README / facade-api.md §11 一致。
+- examples 检查：`examples/support/managed.rs` 的手工 probe→registry→`ExternalSessionHandler` scoped wiring
+  仍是推荐的「managed 全手工」路径（与 AGENTS.md、design doc 一致），术语已对齐（ergonomic 一步式 vs 全手工 wiring），
+  无需改代码。
+- refine.md §5 的「问题现状」代码块是 bug 复现描述（非推荐示例），其状态标注归属后续 M6-1（同步 refine.md
+  问题状态），本任务不改。
+- 验证：`cargo fmt --all`（clean）；`cargo check --examples`（Finished，exit 0）；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`（clean）。
+  README/facade-api.md/managed-external-agent.md 均非 doctest（`src/` 无 `include_str!(README)`），rust 块不参与编译。
+  本任务仅改动 `*.md` 文档、无 `.rs` 代码或编译产物变化，故复用上次全量 `cargo test --all --all-targets` 绿结果，不重跑全量套件。
 
 ### M4-3 [TODO] 为 external capability 增加来源模型
 
