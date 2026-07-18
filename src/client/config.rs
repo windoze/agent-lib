@@ -80,6 +80,11 @@ pub struct EndpointConfig {
     /// Authentication scheme required by this endpoint.
     pub auth: AuthScheme,
     /// Query parameters appended to every request.
+    ///
+    /// Do not place secrets here: query strings are visible to proxies and
+    /// appear in server logs. Transport error messages replace the entire
+    /// query with `[REDACTED]` before surfacing a URL, but that redaction is
+    /// a mitigation for error output, not a credential-protection mechanism.
     #[serde(default)]
     pub query_params: Vec<(String, String)>,
     /// Additional endpoint-specific headers appended to every request.

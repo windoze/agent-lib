@@ -44,6 +44,12 @@ pub(crate) const ERROR_BODY_MAX_BYTES: usize = 1024 * 1024;
 /// Suffix appended to an error body that hit [`ERROR_BODY_MAX_BYTES`].
 pub(crate) const TRUNCATED_SUFFIX: &str = "[truncated]";
 
+/// Replacement for the entire query string of a URL embedded in a transport
+/// error message. Query parameters are where deployments most often stash
+/// credentials (`?key=...`), so the whole query is hidden rather than trying
+/// to pick out individual sensitive values.
+pub(crate) const REDACTED_QUERY: &str = "[REDACTED]";
+
 /// Builds the default reusable HTTP client for `Adapter::new`.
 ///
 /// Only the connect timeout is set here; per-request phase timeouts are
@@ -53,6 +59,60 @@ pub(crate) fn default_http_client() -> reqwest::Client {
         .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
         .build()
         .expect("default reqwest client (connect timeout only) must build")
+}
+
+/// Maps reqwest failures into retry-relevant client error classes.
+///
+/// Shared by every adapter transport path so the classification and the
+/// redaction behavior stay identical across all four call sites. Timeouts map
+/// to [`ClientError::Timeout`]; everything else becomes
+/// [`ClientError::Network`] with the error's Display text.
+///
+/// reqwest embeds the full request URL in that Display text, and
+/// [`crate::client::EndpointConfig::query_params`] may carry credentials such
+/// as `?key=...`, so when the error knows its URL the embedded copy has its
+/// entire query string replaced with [`REDACTED_QUERY`]. When the error
+/// carries no URL the message is used verbatim.
+pub(crate) fn map_transport_error(error: reqwest::Error) -> ClientError {
+    if error.is_timeout() {
+        return ClientError::Timeout;
+    }
+
+    let message = match error.url() {
+        Some(url) => {
+            let redacted = redact_url_query(url.as_str());
+            if redacted == url.as_str() {
+                error.to_string()
+            } else {
+                // The query string can only leak through the embedded URL
+                // text; if the Display text does not contain the URL verbatim
+                // the replacement is a harmless no-op.
+                error.to_string().replace(url.as_str(), &redacted)
+            }
+        }
+        None => error.to_string(),
+    };
+    ClientError::Network(message)
+}
+
+/// Returns `url` with its entire query string replaced by [`REDACTED_QUERY`],
+/// keeping any trailing fragment. URLs without a query are returned unchanged.
+fn redact_url_query(url: &str) -> String {
+    let Some(query_start) = url.find('?') else {
+        return url.to_owned();
+    };
+    // A fragment can only appear after the query, so look for it there.
+    let fragment = url[query_start..]
+        .find('#')
+        .map(|offset| &url[query_start + offset..]);
+
+    let mut redacted = String::with_capacity(query_start + 1 + REDACTED_QUERY.len());
+    redacted.push_str(&url[..=query_start]);
+    redacted.push_str(REDACTED_QUERY);
+    if let Some(fragment) = fragment {
+        redacted.push_str(fragment);
+    }
+    redacted
 }
 
 /// Reads a non-2xx error body with the default size cap and read timeout.
@@ -87,7 +147,7 @@ where
 {
     match tokio::time::timeout(timeout, collect_bounded(body, max_bytes)).await {
         Ok(Ok(text)) => Ok(text),
-        Ok(Err(error)) => Err(ClientError::Network(error.to_string())),
+        Ok(Err(error)) => Err(map_transport_error(error)),
         Err(_elapsed) => Err(ClientError::Timeout),
     }
 }
@@ -171,5 +231,74 @@ mod tests {
     #[test]
     fn default_client_builds() {
         let _client = default_http_client();
+    }
+
+    /// A URL with a query string keeps path and fragment but loses the query.
+    #[test]
+    fn redact_url_query_replaces_entire_query() {
+        assert_eq!(
+            redact_url_query("https://example.test/v1/chat?api-key=secret&api-version=1"),
+            "https://example.test/v1/chat?[REDACTED]"
+        );
+        assert_eq!(
+            redact_url_query("https://example.test/v1/chat?key=secret#frag"),
+            "https://example.test/v1/chat?[REDACTED]#frag"
+        );
+    }
+
+    /// URLs without a query string pass through unchanged.
+    #[test]
+    fn redact_url_query_leaves_queryless_urls_untouched() {
+        assert_eq!(
+            redact_url_query("https://example.test/v1/chat"),
+            "https://example.test/v1/chat"
+        );
+        assert_eq!(
+            redact_url_query("https://example.test/v1/chat#frag"),
+            "https://example.test/v1/chat#frag"
+        );
+    }
+
+    /// A real transport failure against an unreachable loopback address keeps
+    /// the host visible but never leaks the query string into the message.
+    #[tokio::test]
+    async fn transport_error_message_redacts_url_query() {
+        let error = default_http_client()
+            .get("http://127.0.0.1:1/v1/chat?api-key=secret")
+            .send()
+            .await
+            .expect_err("loopback port 1 must refuse the connection");
+
+        let mapped = map_transport_error(error);
+        let ClientError::Network(message) = mapped else {
+            panic!("connect failure must map to Network, got {mapped:?}");
+        };
+        assert!(!message.contains("secret"), "query leaked: {message}");
+        assert!(!message.contains("api-key"), "query leaked: {message}");
+        assert!(
+            message.contains("127.0.0.1:1"),
+            "URL context should survive redaction: {message}"
+        );
+        assert!(message.contains("[REDACTED]"), "missing marker: {message}");
+    }
+
+    /// Queryless transport errors keep their original message verbatim.
+    #[tokio::test]
+    async fn transport_error_without_query_keeps_message() {
+        let error = default_http_client()
+            .get("http://127.0.0.1:1/v1/chat")
+            .send()
+            .await
+            .expect_err("loopback port 1 must refuse the connection");
+
+        let mapped = map_transport_error(error);
+        let ClientError::Network(message) = mapped else {
+            panic!("connect failure must map to Network, got {mapped:?}");
+        };
+        assert!(
+            message.contains("http://127.0.0.1:1/v1/chat"),
+            "queryless URL must stay visible: {message}"
+        );
+        assert!(!message.contains("[REDACTED]"));
     }
 }

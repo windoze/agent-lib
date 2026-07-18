@@ -117,7 +117,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo test -p agent-lib --lib -- model::usage stream::accumulator` 25 条全过；全量门禁 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - `docs/review-2026-07.md` H-SEC-3 已标注 `✅ 已修复（M1-3）`。无 breaking change（仅消除 panic，正常值域行为不变）。
 
-### M1-4 [TODO] `ClientError::Network` 中 URL query 脱敏（H-SEC-4）
+### M1-4 [DONE] `ClientError::Network` 中 URL query 脱敏（H-SEC-4）
 
 上下文：
 
@@ -134,6 +134,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：模拟带 `?api-key=secret` 的 transport 错误，断言错误消息不含 `secret`。
 - `cargo test -p agent-lib --lib adapter::` 通过。
+
+完成记录：
+
+- 选型：4 份 `map_transport_error` 副本收敛为 `src/adapter/http.rs` 的单一 `pub(crate) fn map_transport_error`（M1-2 已建共享模块，M8 收敛时自然并入公共传输模块）。`is_timeout()` → `ClientError::Timeout` 不变；其余取 `reqwest::Error::url()`，有 query 时把 URL 中 `?` 之后整体替换为 `[REDACTED]`（保留 `#fragment`，不用 `Url::set_query` 以免百分号编码占位符），再在 Display 消息中替换原 URL 子串；query 只能经 URL 文本泄露，故消息不含 URL 原文时 no-op 也安全；无 URL 时回退原文。
+- 同类修复：`read_error_body_bounded`（M1-2 新增）内部 bytes_stream chunk 错误的 `Network(error.to_string())` 同样改走 `map_transport_error`，错误 body 读取路径不再可能泄露 URL query。
+- 4 处调用点（两个 `stream/mod.rs` 的 `map_err` + 传给 `normalize_sse` 的回调、两个 `response.rs` 的 `map_err`）统一改 `http::map_transport_error`，本地副本删除——行为一致由单一实现保证。
+- `EndpointConfig.query_params` rustdoc 补充：禁止放置 secret；错误消息中的 query 会被脱敏，但那是错误输出的缓解措施而非凭据保护手段。
+- 测试（`adapter::http::tests`）：`redact_url_query_replaces_entire_query`（含 fragment 保留）、`redact_url_query_leaves_queryless_urls_untouched`、`transport_error_message_redacts_url_query`（真实 connect 失败 `http://127.0.0.1:1/?api-key=secret`，离线瞬时，断言消息不含 `secret`/`api-key`、含 `[REDACTED]` 与 host 上下文）、`transport_error_without_query_keeps_message`（无 query 时消息原文保留、无标记）。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（含 77 条 adapter 测试、8 条 http 测试全过）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- `docs/review-2026-07.md` H-SEC-4 已标注 `✅ 已修复（M1-4）`。无 breaking change（错误消息措辞变化不计入 API 稳定性承诺）。
 
 ### M1-5 [TODO] external 流读取超时与 launch 超时拆分（H-EXT-1）
 

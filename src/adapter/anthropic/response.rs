@@ -70,7 +70,7 @@ impl AnthropicAdapter {
             .http_client
             .execute(request)
             .await
-            .map_err(map_transport_error)?;
+            .map_err(http::map_transport_error)?;
         let status = response.status();
         let retry_after = response
             .headers()
@@ -87,7 +87,7 @@ impl AnthropicAdapter {
             ));
         }
 
-        let body = response.bytes().await.map_err(map_transport_error)?;
+        let body = response.bytes().await.map_err(http::map_transport_error)?;
         Self::parse_response(&body)
     }
 }
@@ -180,15 +180,6 @@ impl From<AnthropicContentBlock> for ContentBlock {
                 extra,
             },
         }
-    }
-}
-
-/// Maps reqwest failures into retry-relevant client error classes.
-fn map_transport_error(error: reqwest::Error) -> ClientError {
-    if error.is_timeout() {
-        ClientError::Timeout
-    } else {
-        ClientError::Network(error.to_string())
     }
 }
 

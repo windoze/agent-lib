@@ -42,7 +42,7 @@ impl OpenAiRespAdapter {
         )
         .await
         .map_err(|_elapsed| ClientError::Timeout)?
-        .map_err(map_transport_error)?;
+        .map_err(http::map_transport_error)?;
         let status = response.status();
         let retry_after = response
             .headers()
@@ -60,7 +60,10 @@ impl OpenAiRespAdapter {
         }
 
         validate_event_stream_content_type(response.headers().get(CONTENT_TYPE))?;
-        Ok(normalize_sse(response.bytes_stream(), map_transport_error))
+        Ok(normalize_sse(
+            response.bytes_stream(),
+            http::map_transport_error,
+        ))
     }
 }
 
@@ -89,15 +92,6 @@ fn validate_event_stream_content_type(
     }
 
     Ok(())
-}
-
-/// Maps reqwest failures into retry-relevant client error classes.
-fn map_transport_error(error: reqwest::Error) -> ClientError {
-    if error.is_timeout() {
-        ClientError::Timeout
-    } else {
-        ClientError::Network(error.to_string())
-    }
 }
 
 /// Adds Responses stream context to protocol conversion failures.
