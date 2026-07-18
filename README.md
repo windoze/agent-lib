@@ -186,6 +186,78 @@ async fn main() -> Result<(), Box<dyn Error>> {
 `Tool` / `Approval` / `Delegation` / `ManagedExternalAgent` / `ProviderConfig` / `Reply` /
 `RunOutput`，以及宿主嵌入用的 `ApprovalRequest` / `WireRunEvent` / `WireRunOutput`）。
 
+### 5. ACP external agent —— interaction / permission bridge
+
+ACP（Agent Client Protocol）是唯一带 **permission bridge** 的受管 runtime：当子 agent 想执行受管
+动作（跑 shell、写文件、开网络、拉起子 agent…）时，它会通过 ACP 的 `session/request_permission`
+把动作 **暂停** 成一次 interaction 交回宿主裁决——这是 Claude Code / Codex adapter 所没有的能力。
+在 facade 层，用 `ApprovalPolicy::on_permission(..)` 挂一个 decider 即可逐条应答这些 permission
+请求（返回 `PermissionResponse::approve` / `deny` / `cancel`）；**不挂 decider 时 facade 默认拒绝
+所有 permission 请求**。
+
+**依赖**：ACP 需要一个 ACP-speaking 的 agent 可执行文件。这里用 Zed 的 Claude 桥 `claude-agent-acp`
+（预设 `ManagedExternalAgent::claude_agent_acp()` 会 spawn 名为 `claude-agent-acp` 的二进制）：
+
+```bash
+npm install -g @agentclientprotocol/claude-agent-acp
+```
+
+**需要开启 `external-acp` feature**（它会拉入 `agent-client-protocol` 运行时依赖）。
+
+```rust
+use agent_lib::agent::{PermissionCategory, PermissionResponse, PermissionRisk};
+use agent_lib::facade::{
+    Agent, ApprovalPolicy, Delegation, ExternalRunMode, ManagedExternalAgent, ProviderConfig,
+};
+use std::error::Error;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    // claude_agent_acp() 预设 spawn `claude-agent-acp`，能力经 ACP `initialize` 握手协商。
+    let acp = ManagedExternalAgent::claude_agent_acp()
+        .worktree("/home/me/repos/my-app")
+        .mode(ExternalRunMode::Managed)
+        .build_with_default_session_handler()
+        .await?;
+
+    // interaction 用法：逐条裁决子 agent 暂停上来的 permission 请求。
+    // 只批准低风险的读操作，写/shell/网络一律拒绝——这段逻辑只有 ACP runtime 会触发。
+    let approval = ApprovalPolicy::default().on_permission(|request| {
+        let allow = matches!(request.category(), PermissionCategory::FileRead)
+            && request.risk() <= PermissionRisk::Low;
+        println!(
+            "permission ask: category={} risk={} summary={:?}",
+            request.category(),
+            request.risk(),
+            request.summary,
+        );
+        if allow {
+            PermissionResponse::approve(request.action_id().to_owned())
+        } else {
+            PermissionResponse::deny(request.action_id().to_owned(), Some("policy: read-only".into()))
+        }
+    });
+
+    let mut agent = Agent::builder()
+        .provider(ProviderConfig::openai_from_env()?)
+        .model("gpt-5.5")
+        .system("你是主 coding agent，需要改代码时委托 coder。")
+        .external_agent("coder", acp)
+        .delegation(Delegation::model_routed().expose_external_agents_as_tools())
+        .approval(approval)
+        .build()?;
+
+    let output = agent.run_full("检查仓库里的 README 并总结它的结构。").await?;
+    println!("{}", output.reply.text());
+    Ok(())
+}
+```
+
+> decider 只在 **未** 通过 `AgentBuilder::interaction_handler` 注入整体 interaction handler 时生效；
+> 一旦注入后者，它就是所有暂停 interaction（含 permission）的唯一裁决方。若要更细粒度的
+> `PausedForInteraction` → `RespondInteraction` 底层用法，见 `docs/managed-external-agent.md` 的
+> permission bridge 一节与 `tests/external_acp.rs`。
+
 ## Facade 与下层高级接口
 
 Facade 是**装配层**，把 identity、pending 事务、`AgentMachine`、`HandlerScope` 与 driver 封装成
