@@ -385,7 +385,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   cargo doc --no-deps --workspace` 全部通过。
 - `docs/review-2026-07.md` M-EXT-4 已标注 `✅ 已修复（M2-4）`。无 breaking change（仅 argv 形状加固）。
 
-### M2-5 [TODO] 决策点后 reap 子进程 + prelude 总时限与取消（M-EXT-5、M-EXT-6）
+### M2-5 [DONE] 决策点后 reap 子进程 + prelude 总时限与取消（M-EXT-5、M-EXT-6）
 
 上下文：
 
@@ -403,6 +403,51 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：fake CLI 持续吐非 init 帧时 `begin()` 在 deadline 内返回错误而非挂起。
 - 单元测试：close 超时被强杀的场景 disposition 被观测到（断言 trace 或返回值包含 ForcedKill）。
 - external feature 测试与 clippy 全过。
+
+完成记录：
+
+- **M-EXT-6（prelude 总时限 + 取消）**：三个 adapter 的 `begin()` 统一增加 `ctx: &RunContext` 与
+  `prelude_timeout: Duration` 两参（adapter `start`/`resume` 传 `config.timeout()`，即 M1-5 的
+  launch 语义）。prelude 循环每轮先查 `ctx.is_cancelled()`（取消 → `SessionLost`，与 `advance`
+  循环口径一致），再查显式 wall-clock deadline，并以 `timeout_at(deadline, read_line)` 约束单次
+  读；超时按 fresh/resume 分类轴分别报 `Launch` / `ResumeUnavailable`（claude 的 prelude 只走
+  fresh，恒 `Launch`）。**显式 deadline 检查是必要的**：`timeout_at` 只在被 await 的 future
+  yield 时才有机会触发，瞬时 ready 的 transport（如单测 fake）会让循环忙转饿死 timer——首次
+  实现因此挂起测试进程（500% CPU 热转 15 分钟），补显式检查后修复。生产 read 总是真实 IO
+  await，双保险不改变其行为。
+- **M-EXT-5（close disposition 不丢）**：codex/opencode session 新增 `worst_close` +
+  `close_trace_seq` 字段与 `note_close(ctx, disposition)`；`spawn_follow_up_turn` 收 `ctx`，上一
+  turn 进程的 close disposition 不再 `let _ =` 丢弃——best-effort 记入 trace
+  （`record_external_shutdown`，node id 按 budget.rs 先例由 run_id + 每 session 计数器铸造）并
+  折叠进 `worst_close`；`shutdown()` 返回 `worst_close` 与当前 close 的 merge，使中途被强杀/
+  关闭失败的 turn 进程经 registry `cleanup`/`cleanup_agent` 流入 worktree 残余副作用判定
+  （与 M1-6 分类联动）。`ExternalSessionShutdown` 新增共享 `merge()`（severity
+  `Graceful < Failed < ForcedKill`，文档注明 force-kill 是最强残余信号）。reap 时机不变
+  （decision 后进程留到下轮 spawn / shutdown 才 close）——任务范围只修 disposition 通道。
+  claude 单进程跨 turn 无 mid-turn close，ACP 亦无处可合并，两者仅共享 prelude 修复。
+- 三个 adapter 行为一致：prelude deadline/取消三份同构；mid-turn close 两份（codex/opencode）同构。
+- 测试（全部离线、秒级）：
+  - 每 adapter 一条 `*_begin_times_out_when_*_never_arrives`（fake 无限重放被容忍的
+    `{"type":"ping"}` 帧 + 50ms prelude_timeout → 限时内返回 `Launch` 且 detail 含
+    "launch timeout"）；codex/opencode 各加一条 resume 路径同类断言（→ `ResumeUnavailable`）。
+  - 每 adapter 一条 `*_begin_honours_cancellation`（预取消 ctx → `SessionLost` 含 "cancelled"）。
+  - codex/opencode 各一条 `*_mid_turn_close_is_traced_and_marks_the_session_dirty`：per-turn close
+    序列 [ForcedKill, Graceful]，断言 trace 恰含一个 `ExternalShutdown{ForcedKill}` 节点、且
+    `shutdown()` 返回 merge 后的 `ForcedKill`（turn 2 自身 Graceful 也盖不掉）。
+  - `shutdown.rs` 新增 `merge_keeps_the_more_severe_disposition` 九组真值表。
+  - 既有测试接线：三 adapter 共 ~30 处 `begin` 调用点补 `ctx`/prelude_timeout 实参；FakeIo/
+    FakeTurn 加无限重放模式，FakeLauncher 加 default_close + per-turn close 序列。
+- 文档：`docs/managed-external-agent.md` §12「三类超时」的 `timeout` 口径补 prelude 总时限、
+  §13 新增「prelude 总时限与取消」「mid-turn close disposition 不丢」两条、§14 补同口径条目、
+  §16 residual side-effect 策略补 `shutdown()` 折叠语义；`docs/external-agent.md` §6.4 补
+  mid-turn close 记录；`docs/review-2026-07.md` M-EXT-5/M-EXT-6 已标注 `✅ 已修复（M2-5）`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets
+  --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、
+  `cargo test --all --all-targets`、`cargo test --features "external-claude-code external-codex
+  external-opencode external-acp" --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --workspace` 全部通过。
+- 无 breaking change（私有 session/方法签名变化；pub 类型仅 `ExternalSessionShutdown::merge`
+  纯增量）。
 
 ### M2-6 [TODO] worktree cleanup 使用记录的 base repo（M-EXT-7）
 

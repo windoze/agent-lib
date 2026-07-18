@@ -58,7 +58,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout, Command};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::agent::RunContext;
 use crate::agent::id::StepId;
@@ -296,16 +296,25 @@ impl<Io: ClaudeSessionIo> ClaudeCodeSession<Io> {
     ///   `advance` writes its continuation turn and reads the fresh `init` frame
     ///   normally.
     ///
+    /// The fresh-start prelude is bounded twice (review M-EXT-6): the whole loop
+    /// must finish within `prelude_timeout` (the config's launch timeout — the
+    /// per-line read-idle timeout resets every line, so a CLI babbling non-init
+    /// frames would otherwise loop forever), and every iteration honours
+    /// `ctx.is_cancelled()` like the `advance` loop does.
+    ///
     /// # Errors
     ///
     /// Returns [`ExternalAgentError::Protocol`] for a corrupt prelude frame,
-    /// [`SessionLost`](ExternalAgentError::SessionLost) on a read failure, or
-    /// [`Launch`](ExternalAgentError::Launch) when a fresh session never reports
-    /// an id.
+    /// [`SessionLost`](ExternalAgentError::SessionLost) on a read failure or a
+    /// cancellation, or [`Launch`](ExternalAgentError::Launch) when a fresh
+    /// session never reports an id — including when `prelude_timeout` expires
+    /// first.
     async fn begin(
         &mut self,
         first_input: Option<&ExternalSessionInput>,
         requested: Option<String>,
+        ctx: &RunContext,
+        prelude_timeout: Duration,
     ) -> Result<(), ExternalAgentError> {
         if let Some(session_id) = requested {
             // Resume: the id is already known; defer all IO to the first advance.
@@ -319,8 +328,35 @@ impl<Io: ClaudeSessionIo> ClaudeCodeSession<Io> {
         self.write_input(input).await?;
         self.first_turn_pending = true;
 
+        let deadline = Instant::now() + prelude_timeout;
         while self.decoder.session_id().is_none() {
-            match self.read_line().await? {
+            if ctx.is_cancelled() {
+                return Err(ExternalAgentError::SessionLost {
+                    session: self.maybe_session_ref(),
+                    detail: "claude code session begin was cancelled".to_owned(),
+                });
+            }
+            // The `timeout_at` below only fires while the runtime is polled; a
+            // transport whose reads resolve instantly would starve the timer, so
+            // the deadline is also enforced by this explicit wall-clock check.
+            if Instant::now() >= deadline {
+                return Err(ExternalAgentError::Launch {
+                    runtime: ExternalRuntimeKind::ClaudeCode,
+                    detail:
+                        "claude code session did not report a session id within the launch timeout"
+                            .to_owned(),
+                });
+            }
+            let line = match timeout_at(deadline, self.read_line()).await {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    return Err(ExternalAgentError::Launch {
+                        runtime: ExternalRuntimeKind::ClaudeCode,
+                        detail: "claude code session did not report a session id within the launch timeout".to_owned(),
+                    });
+                }
+            };
+            match line {
                 Some(line) => {
                     let decision = self.decoder.push_line(&line)?;
                     let observed = self.drain_and_emit();
@@ -640,7 +676,9 @@ impl ExternalRuntimeAdapter for ClaudeCodeAdapter {
             sink,
             self.capabilities.clone(),
         );
-        session.begin(Some(&request.input), None).await?;
+        session
+            .begin(Some(&request.input), None, ctx, self.config.timeout())
+            .await?;
         Ok(Box::new(session))
     }
 
@@ -673,7 +711,8 @@ impl ExternalRuntimeAdapter for ClaudeCodeAdapter {
             self.capabilities.clone(),
         )
         .with_resume_high_water(session.last_event_seq);
-        live.begin(None, Some(session_id)).await?;
+        live.begin(None, Some(session_id), ctx, self.config.timeout())
+            .await?;
         Ok(Box::new(live))
     }
 }
@@ -812,6 +851,8 @@ mod tests {
     const SESSION_ID: &str = "claude-sess-1";
     const RUN_UUID: &str = "018f0d9c-7b6a-7c12-8f31-1234567890e0";
     const AGENT_UUID: &str = "018f0d9c-7b6a-7c12-8f31-1234567890f0";
+    /// Generous prelude bound for tests that never exercise the deadline.
+    const PRELUDE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     fn agent_id() -> AgentId {
         AGENT_UUID.parse().expect("agent id parses")
@@ -855,6 +896,8 @@ mod tests {
         written: Arc<Mutex<Vec<String>>>,
         close_disposition: ExternalSessionShutdown,
         closed: Arc<Mutex<Option<ExternalSessionShutdown>>>,
+        /// Line replayed forever once `lines` drains (prelude-deadline tests).
+        repeat: Option<String>,
     }
 
     impl FakeIo {
@@ -865,12 +908,20 @@ mod tests {
                 written: Arc::clone(&written),
                 close_disposition: ExternalSessionShutdown::Graceful,
                 closed: Arc::new(Mutex::new(None)),
+                repeat: None,
             };
             (io, written)
         }
 
         fn with_close(mut self, disposition: ExternalSessionShutdown) -> Self {
             self.close_disposition = disposition;
+            self
+        }
+
+        /// Replays `line` forever once the canned lines drain, so a prelude that
+        /// never sees its `init` frame can only end on the launch deadline.
+        fn repeating(mut self, line: String) -> Self {
+            self.repeat = Some(line);
             self
         }
     }
@@ -883,7 +934,10 @@ mod tests {
         }
 
         async fn read_frame(&mut self) -> std::io::Result<Option<String>> {
-            Ok(self.lines.pop_front())
+            match self.lines.pop_front() {
+                Some(line) => Ok(Some(line)),
+                None => Ok(self.repeat.clone()),
+            }
         }
 
         async fn close(&mut self) -> ExternalSessionShutdown {
@@ -949,7 +1003,12 @@ mod tests {
         );
 
         session
-            .begin(Some(&start_request(Vec::new()).input), None)
+            .begin(
+                Some(&start_request(Vec::new()).input),
+                None,
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("start writes the first turn and reads the init frame");
         assert_eq!(
@@ -1019,7 +1078,12 @@ mod tests {
     async fn claude_code_adapter_advance_reports_session_lost_on_early_eof() {
         let (mut session, _written) = session_over(vec![init_frame()], None);
         session
-            .begin(Some(&start_request(Vec::new()).input), None)
+            .begin(
+                Some(&start_request(Vec::new()).input),
+                None,
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("start prelude");
         let ctx = run_context();
@@ -1044,7 +1108,12 @@ mod tests {
         let (mut session, _written) =
             session_over(vec![init_frame(), "{ not json".to_owned()], None);
         session
-            .begin(Some(&start_request(Vec::new()).input), None)
+            .begin(
+                Some(&start_request(Vec::new()).input),
+                None,
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("start prelude");
         let ctx = run_context();
@@ -1062,7 +1131,12 @@ mod tests {
         let context = ClaudeCodeAdapter::decode_context(&run_context(), &start_request(Vec::new()));
         let mut session = ClaudeCodeSession::new(io, context, None, implemented_capabilities());
         session
-            .begin(Some(&start_request(Vec::new()).input), None)
+            .begin(
+                Some(&start_request(Vec::new()).input),
+                None,
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("start prelude");
         assert_eq!(
@@ -1072,12 +1146,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_code_adapter_begin_times_out_when_init_never_arrives() {
+        // A CLI babbling tolerated non-init frames would loop the prelude forever
+        // on the per-line read timeout alone (each line resets it); the launch
+        // deadline caps the whole prelude (review M-EXT-6).
+        let (io, _written) = FakeIo::new(Vec::new());
+        let io = io.repeating(r#"{"type":"ping"}"#.to_owned());
+        let context = ClaudeCodeAdapter::decode_context(&run_context(), &start_request(Vec::new()));
+        let mut session = ClaudeCodeSession::new(io, context, None, implemented_capabilities());
+        let started = std::time::Instant::now();
+        let error = session
+            .begin(
+                Some(&start_request(Vec::new()).input),
+                None,
+                &run_context(),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect_err("a prelude that never reports an id hits the launch deadline");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the prelude deadline fires promptly"
+        );
+        match error {
+            ExternalAgentError::Launch { runtime, detail } => {
+                assert_eq!(runtime, ExternalRuntimeKind::ClaudeCode);
+                assert!(detail.contains("launch timeout"), "detail: {detail}");
+            }
+            other => panic!("expected Launch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_code_adapter_begin_honours_cancellation() {
+        // The prelude checks `ctx.is_cancelled()` per iteration, just like the
+        // advance loop (review M-EXT-6).
+        let (mut session, _written) = session_over(vec![init_frame()], None);
+        let ctx = run_context();
+        ctx.cancellation().cancel();
+        let error = session
+            .begin(
+                Some(&start_request(Vec::new()).input),
+                None,
+                &ctx,
+                PRELUDE_TIMEOUT,
+            )
+            .await
+            .expect_err("a cancelled run aborts the prelude");
+        match error {
+            ExternalAgentError::SessionLost { detail, .. } => {
+                assert!(detail.contains("cancelled"), "detail: {detail}");
+            }
+            other => panic!("expected SessionLost, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn claude_code_adapter_respond_tool_results_is_unsupported() {
         // Resume-style begin: the session id is already known and no first turn is
         // pending, so the advance below reaches the input's capability check.
         let (mut session, _written) = session_over(vec![init_frame()], None);
         session
-            .begin(None, Some(SESSION_ID.to_owned()))
+            .begin(
+                None,
+                Some(SESSION_ID.to_owned()),
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("resume prelude");
         let ctx = run_context();
@@ -1108,7 +1243,7 @@ mod tests {
         );
         let input = start_request(Vec::new()).input;
         session
-            .begin(Some(&input), None)
+            .begin(Some(&input), None, &run_context(), PRELUDE_TIMEOUT)
             .await
             .expect("start prelude");
 
@@ -1147,7 +1282,12 @@ mod tests {
             None,
         );
         session
-            .begin(None, Some(SESSION_ID.to_owned()))
+            .begin(
+                None,
+                Some(SESSION_ID.to_owned()),
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("resume prelude");
         assert_eq!(
@@ -1186,7 +1326,12 @@ mod tests {
         );
         let mut session = session.with_resume_high_water(Some(50));
         session
-            .begin(None, Some(SESSION_ID.to_owned()))
+            .begin(
+                None,
+                Some(SESSION_ID.to_owned()),
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("resume prelude");
         // The restored water mark is reported even before any fresh event.

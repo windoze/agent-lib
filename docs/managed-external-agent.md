@@ -924,7 +924,10 @@ live session，见 M6-2/M6-3）：
 
 **三类超时（M1-5 拆分，三个 CLI adapter 口径一致）**：
 
-- `timeout`（默认 30s）：只管一次性控制操作——capability probe 与 launch 握手。
+- `timeout`（默认 30s）：只管一次性控制操作——capability probe、launch 握手，以及 `begin()`
+  startup prelude 的**总时限**（M2-5：prelude 循环逐行重置的 `read_idle_timeout` 无法约束
+  持续吐非 init 帧的 CLI，故整个 prelude 另受 launch timeout 的总 deadline 约束，且每轮迭代
+  检查 `ctx.is_cancelled()`，与 `advance` 循环口径一致）。
 - `read_idle_timeout`（默认 10 min）：live session 的**每行 stdout 空闲上限**。CLI 跑长静默命令
   （构建/测试套件）数分钟无帧属正常，绝不复用 30s 的 launch 超时，否则长静默 turn 会被误判
   `SessionLost` 杀掉。
@@ -1164,6 +1167,15 @@ decoder 接进 milestone-5 的 `ExternalRuntimeAdapter` / `ExternalRuntimeSessio
   一个进程并读到 `thread.started` 帧拿到真实 thread id(作为 registry key、resume token),该 turn 其余帧
   (`item.*`/`turn.completed`)留给第一次 `advance` 续读;此后每个 `Continue` follow-up 在 `advance` 里 spawn
   一个新的 `exec resume` 进程。整段 session 共用一个跨全程单调 `seq` 的 `CodexStreamDecoder`。
+- **prelude 总时限与取消（M2-5）**:`begin` 的 prelude 循环在 launch timeout(`timeout`)的总
+  deadline 内完成,逐轮检查 `ctx.is_cancelled()`;超时按 fresh/resume 分别归类 `Launch` /
+  `ResumeUnavailable`,取消归类 `SessionLost`(与 `advance` 循环口径一致),不再可能因持续吐非
+  init 帧的 CLI 永久挂起 `start()`/`resume()`。
+- **mid-turn close disposition 不丢（M2-5）**:follow-up spawn 前关闭上一 turn 进程的 disposition
+  不再被丢弃——它 best-effort 记入 trace(`record_external_shutdown`)并折叠进 session 的
+  `worst_close`;`shutdown()` 返回折叠后的最坏值(severity `Graceful < Failed < ForcedKill`),故
+  中途被强杀的 turn 进程会让 registry `cleanup`/`cleanup_agent` 的最终 disposition 保持
+  `ForcedKill`/`Failed`,worktree 残余副作用判定(§16)不会漏掉它。
 - **参数顺序**:`resume` 子命令**不接受** `-s/--sandbox`、`-p/--profile`(实测当前 CLI),故新增
   `CodexConfig::base_resume_args(session_id)` 把 sandbox/model/profile 上提到顶层
   (`codex -a <approval> -s <sandbox> [--model M][--profile P] exec resume --json --skip-git-repo-check
@@ -1238,6 +1250,10 @@ OpenCode 需要先做 capability probe,因为部署形态可能更多。
 >   `advance` spawn 一个新的 `run --session` 进程,整段 session 共用一个跨全程单调 `seq` 的 decoder。生产进程
 >   **stdin=null**(否则 `run` 阻塞在从 stdin 读消息)、**stderr 丢弃**(防原始文本泄漏)、stdout piped 逐行喂
 >   decoder,`kill_on_drop`、每读空闲超时 `read_idle_timeout`。
+> - **prelude 总时限与取消 + mid-turn close disposition（M2-5）**:与 Codex 同口径——`begin` 的
+>   prelude 循环受 launch timeout 总 deadline 约束并逐轮检查取消;follow-up spawn 前关闭上一 turn
+>   进程的 disposition 记入 trace 并折叠进 `worst_close`,`shutdown()` 返回折叠后的最坏值,中途
+>   强杀的 turn 进程不再被吞（见 §13 同名条目）。
 > - 能力(诚实按 M8-2 结论):`run --format json` **自主运行**,流里没有 host 可暂停的 tool-call/approval 帧,
 >   一个 turn 只会 `Completed`/`Failed`。故 `implemented_capabilities()` 报 `host_tools=false` /
 >   `host_subagents=false` / **`permission_bridge=false`**,`streaming`/`resume`/`artifacts`/`usage`/
@@ -1381,7 +1397,11 @@ git 操作走 `WorktreeGitExec` hook(生产实现 `SystemGit` shell out `git wor
 
 registry 的 `cleanup` / `cleanup_agent` 返回 `ExternalSessionShutdown`;scheduler 把该 disposition
 既喂给 `TraceHandle::record_external_shutdown`(审计),又喂给 `WorktreeManager::cleanup`
-(决定删除/保留/标记),二者用同一 disposition 保持一致。
+(决定删除/保留/标记),二者用同一 disposition 保持一致。Codex/OpenCode session 的 `shutdown()`
+会把 session 期间每次 mid-turn close(follow-up spawn 前关闭上一 turn 进程)的 disposition 折叠进
+最终报告(M2-5):severity `Graceful < Failed < ForcedKill`,中途被强杀/关闭失败的 turn 进程同样
+使最终 disposition 保持非 `Graceful`;这些 mid-turn close 同时以 `record_external_shutdown`
+节点记入 trace。
 
 ### 进程组级 kill（M2-1 / H-EXT-2）
 

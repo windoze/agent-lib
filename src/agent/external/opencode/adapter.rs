@@ -81,9 +81,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout, Command};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 
-use crate::agent::RunContext;
+use crate::agent::{RunContext, TraceNodeId};
 
 use crate::agent::external::process_group;
 use crate::agent::external::{
@@ -339,6 +339,13 @@ struct OpenCodeSession<L: OpenCodeLauncher> {
     /// the prompt as a launch argument), so the first `advance` — which carries
     /// the same input — continues that in-flight turn instead of spawning another.
     first_turn_pending: bool,
+    /// The most severe disposition seen closing a mid-session turn process,
+    /// folded into [`shutdown`](ExternalRuntimeSession::shutdown) so a
+    /// force-killed turn still marks the session as leaving residual side
+    /// effects (review M-EXT-5).
+    worst_close: Option<ExternalSessionShutdown>,
+    /// Per-session counter for minting trace node ids of mid-session closes.
+    close_trace_seq: u64,
 }
 
 impl<L: OpenCodeLauncher> OpenCodeSession<L> {
@@ -361,6 +368,8 @@ impl<L: OpenCodeLauncher> OpenCodeSession<L> {
             carried: Vec::new(),
             carried_decision: None,
             first_turn_pending: false,
+            worst_close: None,
+            close_trace_seq: 0,
         }
     }
 
@@ -393,18 +402,27 @@ impl<L: OpenCodeLauncher> OpenCodeSession<L> {
     /// from the persisted [`ExternalSessionRef`], so that id is pre-seeded and the
     /// prelude only refreshes it.
     ///
+    /// The prelude is bounded twice (review M-EXT-6): the whole loop must finish
+    /// within `prelude_timeout` (the config's launch timeout — the per-line
+    /// read-idle timeout resets every line, so a CLI babbling non-init frames
+    /// would otherwise loop forever), and every iteration honours
+    /// `ctx.is_cancelled()` like the `advance` loop does.
+    ///
     /// # Errors
     ///
     /// Returns [`Launch`](ExternalAgentError::Launch) /
     /// [`ResumeUnavailable`](ExternalAgentError::ResumeUnavailable) when the turn
-    /// process cannot be spawned, [`Protocol`](ExternalAgentError::Protocol) for a
-    /// corrupt prelude frame, [`SessionLost`](ExternalAgentError::SessionLost) on
-    /// a read failure, or `Launch` when a fresh session never reports a session
+    /// process cannot be spawned or the prelude misses its launch deadline,
+    /// [`Protocol`](ExternalAgentError::Protocol) for a corrupt prelude frame,
+    /// [`SessionLost`](ExternalAgentError::SessionLost) on a read failure or a
+    /// cancellation, or `Launch` when a fresh session never reports a session
     /// id.
     async fn begin(
         &mut self,
         spec: &OpenCodeTurnSpec,
         first: FirstLaunch,
+        ctx: &RunContext,
+        prelude_timeout: Duration,
     ) -> Result<(), ExternalAgentError> {
         let stream = self
             .launcher
@@ -432,8 +450,39 @@ impl<L: OpenCodeLauncher> OpenCodeSession<L> {
             self.session_id = id.clone();
         }
 
+        let deadline = Instant::now() + prelude_timeout;
+        // Fresh vs resume classification axis, shared by both deadline guards.
+        let deadline_error = || match &first {
+            FirstLaunch::Fresh => ExternalAgentError::Launch {
+                runtime: ExternalRuntimeKind::OpenCode,
+                detail: "opencode run did not report a session id within the launch timeout"
+                    .to_owned(),
+            },
+            FirstLaunch::Resume(session) => ExternalAgentError::ResumeUnavailable {
+                session: session.clone(),
+                detail:
+                    "resumed opencode run did not report a session id within the launch timeout"
+                        .to_owned(),
+            },
+        };
         while self.decoder.session_id().is_none() {
-            match self.read_line().await? {
+            if ctx.is_cancelled() {
+                return Err(ExternalAgentError::SessionLost {
+                    session: self.maybe_session_ref(),
+                    detail: "opencode session begin was cancelled".to_owned(),
+                });
+            }
+            // The `timeout_at` below only fires while the runtime is polled; a
+            // transport whose reads resolve instantly would starve the timer, so
+            // the deadline is also enforced by this explicit wall-clock check.
+            if Instant::now() >= deadline {
+                return Err(deadline_error());
+            }
+            let line = match timeout_at(deadline, self.read_line()).await {
+                Ok(result) => result?,
+                Err(_elapsed) => return Err(deadline_error()),
+            };
+            match line {
                 Some(line) => {
                     let decision = self.decoder.push_line(&line)?;
                     let observed = self.drain_and_emit();
@@ -493,11 +542,35 @@ impl<L: OpenCodeLauncher> OpenCodeSession<L> {
         observed
     }
 
+    /// Records the disposition of a mid-session turn-process close.
+    ///
+    /// The close is written to the trace (best effort — a trace hiccup never
+    /// masks the advance) and folded into [`worst_close`](Self::worst_close), so
+    /// the session's final [`shutdown`](ExternalRuntimeSession::shutdown) still
+    /// reports residual side effects when an earlier turn had to be force-killed
+    /// (review M-EXT-5, design §6.4). The trace node id is minted from the run id
+    /// plus a per-session counter (the crate mints no other ids), keeping it
+    /// deterministic and collision-free.
+    fn note_close(&mut self, ctx: &RunContext, disposition: ExternalSessionShutdown) {
+        let seq = self.close_trace_seq;
+        self.close_trace_seq += 1;
+        let id = TraceNodeId::new(format!("external-shutdown/{}/{seq}", ctx.run_id()));
+        let _ = ctx.trace().record_external_shutdown(id, disposition);
+        self.worst_close = Some(match self.worst_close {
+            Some(worst) => worst.merge(disposition),
+            None => disposition,
+        });
+    }
+
     /// Spawns the follow-up turn process for `input`, or refuses an unsupported
     /// one.
     ///
     /// The previous (already-exited) turn process is closed before the new one is
-    /// spawned so no zombie lingers between turns.
+    /// spawned so no zombie lingers between turns. That close's disposition is
+    /// **not** dropped (review M-EXT-5): it is recorded to the trace and folded
+    /// into [`worst_close`](Self::worst_close), so a force-killed turn process
+    /// still marks the session as leaving residual side effects at
+    /// [`shutdown`](ExternalRuntimeSession::shutdown).
     ///
     /// # Errors
     ///
@@ -509,11 +582,13 @@ impl<L: OpenCodeLauncher> OpenCodeSession<L> {
     async fn spawn_follow_up_turn(
         &mut self,
         input: &ExternalSessionInput,
+        ctx: &RunContext,
     ) -> Result<(), ExternalAgentError> {
         let message = turn_message(&self.capabilities, input)?;
 
         if let Some(mut old) = self.current.take() {
-            let _ = old.close().await;
+            let disposition = old.close().await;
+            self.note_close(ctx, disposition);
         }
 
         let spec = OpenCodeTurnSpec::Resume {
@@ -595,7 +670,7 @@ impl<L: OpenCodeLauncher> ExternalRuntimeSession for OpenCodeSession<L> {
         }
 
         if !already_spawned {
-            self.spawn_follow_up_turn(input).await?;
+            self.spawn_follow_up_turn(input, ctx).await?;
         }
 
         loop {
@@ -625,11 +700,18 @@ impl<L: OpenCodeLauncher> ExternalRuntimeSession for OpenCodeSession<L> {
     }
 
     async fn shutdown(&mut self) -> ExternalSessionShutdown {
-        match self.current.as_mut() {
+        let current = match self.current.as_mut() {
             Some(stream) => stream.close().await,
             // Between turns the session holds no live process, so there is nothing
             // to close.
             None => ExternalSessionShutdown::Graceful,
+        };
+        // A mid-session turn process that had to be force-killed (or failed to
+        // close) marks the whole session as leaving residual side effects, even
+        // when the final close itself was clean (review M-EXT-5).
+        match self.worst_close {
+            Some(worst) => worst.merge(current),
+            None => current,
         }
     }
 }
@@ -736,7 +818,7 @@ impl ExternalRuntimeAdapter for OpenCodeAdapter {
     async fn start(
         &self,
         request: &ExternalSessionRequest,
-        _ctx: &RunContext,
+        ctx: &RunContext,
         sink: Option<Arc<dyn ExternalEventSink>>,
     ) -> Result<Box<dyn ExternalRuntimeSession>, ExternalAgentError> {
         self.reject_unsupported_tools(request)?;
@@ -757,7 +839,9 @@ impl ExternalRuntimeAdapter for OpenCodeAdapter {
             sink,
             self.capabilities.clone(),
         );
-        session.begin(&spec, FirstLaunch::Fresh).await?;
+        session
+            .begin(&spec, FirstLaunch::Fresh, ctx, self.config.timeout())
+            .await?;
         Ok(Box::new(session))
     }
 
@@ -765,7 +849,7 @@ impl ExternalRuntimeAdapter for OpenCodeAdapter {
         &self,
         session: &ExternalSessionRef,
         request: &ExternalSessionRequest,
-        _ctx: &RunContext,
+        ctx: &RunContext,
         sink: Option<Arc<dyn ExternalEventSink>>,
     ) -> Result<Box<dyn ExternalRuntimeSession>, ExternalAgentError> {
         self.reject_unsupported_tools(request)?;
@@ -790,8 +874,13 @@ impl ExternalRuntimeAdapter for OpenCodeAdapter {
             self.capabilities.clone(),
         )
         .with_resume_high_water(session.last_event_seq);
-        live.begin(&spec, FirstLaunch::Resume(session.clone()))
-            .await?;
+        live.begin(
+            &spec,
+            FirstLaunch::Resume(session.clone()),
+            ctx,
+            self.config.timeout(),
+        )
+        .await?;
         Ok(Box::new(live))
     }
 }
@@ -893,7 +982,7 @@ mod tests {
         ExternalToolBatchId, RuntimeDecisionPoint, WorktreeIsolation,
     };
     use crate::agent::spec::WorktreeRef;
-    use crate::agent::{AgentId, BudgetLimits, RunContext, RunId, TraceNodeId};
+    use crate::agent::{AgentId, BudgetLimits, RunContext, RunId, TraceNodeId, TraceNodeKind};
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -901,6 +990,8 @@ mod tests {
     const SESSION_ID: &str = "ses_8b1f7a2c9d3e4f50";
     const RUN_UUID: &str = "018f0d9c-7b6a-7c12-8f31-1234567890e0";
     const AGENT_UUID: &str = "018f0d9c-7b6a-7c12-8f31-1234567890f0";
+    /// Generous prelude bound for tests that never exercise the deadline.
+    const PRELUDE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     fn agent_id() -> AgentId {
         AGENT_UUID.parse().expect("agent id parses")
@@ -979,12 +1070,17 @@ mod tests {
     struct FakeTurn {
         lines: VecDeque<String>,
         close_disposition: ExternalSessionShutdown,
+        /// Line replayed forever once `lines` drains (prelude-deadline tests).
+        repeat: Option<String>,
     }
 
     #[async_trait]
     impl OpenCodeTurnStream for FakeTurn {
         async fn read_frame(&mut self) -> std::io::Result<Option<String>> {
-            Ok(self.lines.pop_front())
+            match self.lines.pop_front() {
+                Some(line) => Ok(Some(line)),
+                None => Ok(self.repeat.clone()),
+            }
         }
 
         async fn close(&mut self) -> ExternalSessionShutdown {
@@ -999,7 +1095,12 @@ mod tests {
     struct FakeLauncher {
         turns: Mutex<VecDeque<Vec<String>>>,
         specs: RecordedSpecs,
-        close_disposition: ExternalSessionShutdown,
+        /// Close disposition for turns without a queued per-turn entry.
+        default_close: ExternalSessionShutdown,
+        /// Per-turn close dispositions, popped one per launch.
+        close_sequence: Mutex<VecDeque<ExternalSessionShutdown>>,
+        /// Line replayed forever by every spawned turn (prelude-deadline tests).
+        repeat: Option<String>,
         fail_kind: Option<std::io::ErrorKind>,
     }
 
@@ -1008,7 +1109,9 @@ mod tests {
             Self {
                 turns: Mutex::new(turns.into_iter().collect()),
                 specs: Arc::new(Mutex::new(Vec::new())),
-                close_disposition: ExternalSessionShutdown::Graceful,
+                default_close: ExternalSessionShutdown::Graceful,
+                close_sequence: Mutex::new(VecDeque::new()),
+                repeat: None,
                 fail_kind: None,
             }
         }
@@ -1017,8 +1120,22 @@ mod tests {
             Arc::clone(&self.specs)
         }
 
+        /// Closes every spawned turn with `disposition`.
         fn with_close(mut self, disposition: ExternalSessionShutdown) -> Self {
-            self.close_disposition = disposition;
+            self.default_close = disposition;
+            self
+        }
+
+        /// Closes the Nth spawned turn with the Nth entry (later turns fall back
+        /// to the default).
+        fn with_close_sequence(self, dispositions: &[ExternalSessionShutdown]) -> Self {
+            *self.close_sequence.lock().unwrap() = dispositions.iter().copied().collect();
+            self
+        }
+
+        /// Every spawned turn replays `line` forever once its canned lines drain.
+        fn repeating(mut self, line: String) -> Self {
+            self.repeat = Some(line);
             self
         }
 
@@ -1040,9 +1157,16 @@ mod tests {
                 return Err(std::io::Error::new(kind, "fake launch failure"));
             }
             let lines = self.turns.lock().unwrap().pop_front().unwrap_or_default();
+            let close_disposition = self
+                .close_sequence
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(self.default_close);
             Ok(Box::new(FakeTurn {
                 lines: lines.into_iter().collect(),
-                close_disposition: self.close_disposition,
+                close_disposition,
+                repeat: self.repeat.clone(),
             }))
         }
     }
@@ -1092,6 +1216,8 @@ mod tests {
             .begin(
                 &fresh_spec("investigate the failing test"),
                 FirstLaunch::Fresh,
+                &run_context(),
+                PRELUDE_TIMEOUT,
             )
             .await
             .expect("begin launches the first turn and captures the session id");
@@ -1151,7 +1277,12 @@ mod tests {
         let specs = launcher.recorded_specs();
         let mut session = session_over(launcher, None);
         session
-            .begin(&fresh_spec("start"), FirstLaunch::Fresh)
+            .begin(
+                &fresh_spec("start"),
+                FirstLaunch::Fresh,
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("begin");
 
@@ -1195,7 +1326,12 @@ mod tests {
         let launcher = FakeLauncher::new(vec![vec![step_start(SESSION_ID)]]);
         let mut session = session_over(launcher, None);
         session
-            .begin(&fresh_spec("start"), FirstLaunch::Fresh)
+            .begin(
+                &fresh_spec("start"),
+                FirstLaunch::Fresh,
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("begin");
 
@@ -1222,7 +1358,12 @@ mod tests {
             FakeLauncher::new(vec![vec![step_start(SESSION_ID), "{ not json".to_owned()]]);
         let mut session = session_over(launcher, None);
         session
-            .begin(&fresh_spec("start"), FirstLaunch::Fresh)
+            .begin(
+                &fresh_spec("start"),
+                FirstLaunch::Fresh,
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("begin");
 
@@ -1240,7 +1381,12 @@ mod tests {
             FakeLauncher::new(vec![vec![step_start(SESSION_ID), error_frame(SESSION_ID)]]);
         let mut session = session_over(launcher, None);
         session
-            .begin(&fresh_spec("start"), FirstLaunch::Fresh)
+            .begin(
+                &fresh_spec("start"),
+                FirstLaunch::Fresh,
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("begin");
 
@@ -1258,9 +1404,167 @@ mod tests {
             .with_close(ExternalSessionShutdown::ForcedKill);
         let mut session = session_over(launcher, None);
         session
-            .begin(&fresh_spec("start"), FirstLaunch::Fresh)
+            .begin(
+                &fresh_spec("start"),
+                FirstLaunch::Fresh,
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("begin");
+        assert_eq!(
+            session.shutdown().await,
+            ExternalSessionShutdown::ForcedKill
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_adapter_begin_times_out_when_session_id_never_arrives() {
+        // A CLI babbling tolerated frames that carry no `sessionID` would loop
+        // the prelude forever on the per-line read timeout alone (each line
+        // resets it); the launch deadline caps the whole prelude (review
+        // M-EXT-6).
+        let launcher = FakeLauncher::new(Vec::new()).repeating(r#"{"type":"ping"}"#.to_owned());
+        let mut session = session_over(launcher, None);
+        let started = std::time::Instant::now();
+        let error = session
+            .begin(
+                &fresh_spec("start"),
+                FirstLaunch::Fresh,
+                &run_context(),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect_err("a prelude that never reports a session id hits the launch deadline");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the prelude deadline fires promptly"
+        );
+        match error {
+            ExternalAgentError::Launch { runtime, detail } => {
+                assert_eq!(runtime, ExternalRuntimeKind::OpenCode);
+                assert!(detail.contains("launch timeout"), "detail: {detail}");
+            }
+            other => panic!("expected Launch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_adapter_begin_resume_times_out_when_session_id_never_arrives() {
+        // The same prelude deadline on the resume path is classified as
+        // `ResumeUnavailable`, matching the spawn-failure classification axis.
+        let launcher = FakeLauncher::new(Vec::new()).repeating(r#"{"type":"ping"}"#.to_owned());
+        let mut session = session_over(launcher, None);
+        let spec = OpenCodeTurnSpec::Resume {
+            session_id: SESSION_ID.to_owned(),
+            message: "continue".to_owned(),
+        };
+        let error = session
+            .begin(
+                &spec,
+                FirstLaunch::Resume(resume_ref()),
+                &run_context(),
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect_err("a resumed prelude that never re-reports its id hits the deadline");
+        match error {
+            ExternalAgentError::ResumeUnavailable { session, detail } => {
+                assert_eq!(session.session_id.as_deref(), Some(SESSION_ID));
+                assert!(detail.contains("launch timeout"), "detail: {detail}");
+            }
+            other => panic!("expected ResumeUnavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_adapter_begin_honours_cancellation() {
+        // The prelude checks `ctx.is_cancelled()` per iteration, just like the
+        // advance loop (review M-EXT-6).
+        let launcher = FakeLauncher::new(vec![vec![step_start(SESSION_ID)]]);
+        let mut session = session_over(launcher, None);
+        let ctx = run_context();
+        ctx.cancellation().cancel();
+        let error = session
+            .begin(
+                &fresh_spec("start"),
+                FirstLaunch::Fresh,
+                &ctx,
+                PRELUDE_TIMEOUT,
+            )
+            .await
+            .expect_err("a cancelled run aborts the prelude");
+        match error {
+            ExternalAgentError::SessionLost { detail, .. } => {
+                assert!(detail.contains("cancelled"), "detail: {detail}");
+            }
+            other => panic!("expected SessionLost, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_adapter_mid_turn_close_is_traced_and_marks_the_session_dirty() {
+        // Turn 1's process has to be force-killed when turn 2 spawns; that
+        // disposition must reach the trace and the session's final shutdown
+        // report instead of being dropped (review M-EXT-5).
+        let launcher = FakeLauncher::new(vec![
+            vec![
+                step_start(SESSION_ID),
+                text(SESSION_ID, "first"),
+                step_finish_stop(SESSION_ID),
+            ],
+            vec![
+                step_start(SESSION_ID),
+                text(SESSION_ID, "second"),
+                step_finish_stop(SESSION_ID),
+            ],
+        ])
+        .with_close_sequence(&[
+            ExternalSessionShutdown::ForcedKill,
+            ExternalSessionShutdown::Graceful,
+        ]);
+        let mut session = session_over(launcher, None);
+        session
+            .begin(
+                &fresh_spec("start"),
+                FirstLaunch::Fresh,
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
+            .await
+            .expect("begin");
+
+        let ctx = run_context();
+        session
+            .advance(&start_request(Vec::new()).input, &ctx)
+            .await
+            .expect("first completion");
+        let follow_up = ExternalSessionInput::Continue {
+            message: "keep going".to_owned(),
+        };
+        session
+            .advance(&follow_up, &ctx)
+            .await
+            .expect("second completion");
+
+        // The mid-turn close disposition was recorded to the trace.
+        let shutdowns: Vec<TraceNodeKind> = ctx
+            .trace()
+            .records()
+            .into_iter()
+            .map(|record| record.kind())
+            .filter(|kind| matches!(kind, TraceNodeKind::ExternalShutdown { .. }))
+            .collect();
+        assert_eq!(
+            shutdowns,
+            vec![TraceNodeKind::ExternalShutdown {
+                disposition: ExternalSessionShutdown::ForcedKill,
+            }],
+            "the force-killed turn process is traced"
+        );
+
+        // ...and folded into the final shutdown even though turn 2's own close
+        // was graceful, so the worktree is judged as potentially dirty.
         assert_eq!(
             session.shutdown().await,
             ExternalSessionShutdown::ForcedKill
@@ -1282,7 +1586,12 @@ mod tests {
             message: "continue".to_owned(),
         };
         session
-            .begin(&spec, FirstLaunch::Resume(resume_ref()))
+            .begin(
+                &spec,
+                FirstLaunch::Resume(resume_ref()),
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("resume begin");
         assert_eq!(
@@ -1320,7 +1629,12 @@ mod tests {
             message: "continue".to_owned(),
         };
         session
-            .begin(&spec, FirstLaunch::Resume(resume_ref()))
+            .begin(
+                &spec,
+                FirstLaunch::Resume(resume_ref()),
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("resume begin");
         // The prelude already emitted its first observations past the mark.
@@ -1369,7 +1683,12 @@ mod tests {
             message: "continue".to_owned(),
         };
         session
-            .begin(&spec, FirstLaunch::Resume(resume_ref()))
+            .begin(
+                &spec,
+                FirstLaunch::Resume(resume_ref()),
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("resume begin pre-seeds the id");
         assert_eq!(
@@ -1399,7 +1718,12 @@ mod tests {
         ]]);
         let mut session = session_over(launcher, None);
         session
-            .begin(&fresh_spec("start"), FirstLaunch::Fresh)
+            .begin(
+                &fresh_spec("start"),
+                FirstLaunch::Fresh,
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect("begin");
 
@@ -1431,7 +1755,12 @@ mod tests {
         let launcher = FakeLauncher::failing(std::io::ErrorKind::NotFound);
         let mut session = session_over(launcher, None);
         let error = session
-            .begin(&fresh_spec("start"), FirstLaunch::Fresh)
+            .begin(
+                &fresh_spec("start"),
+                FirstLaunch::Fresh,
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect_err("a spawn failure is a launch error");
         assert!(matches!(
@@ -1452,7 +1781,12 @@ mod tests {
             message: "continue".to_owned(),
         };
         let error = session
-            .begin(&spec, FirstLaunch::Resume(resume_ref()))
+            .begin(
+                &spec,
+                FirstLaunch::Resume(resume_ref()),
+                &run_context(),
+                PRELUDE_TIMEOUT,
+            )
             .await
             .expect_err("a resume spawn failure is unavailable");
         assert!(matches!(

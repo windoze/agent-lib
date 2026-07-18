@@ -77,6 +77,25 @@ impl ExternalSessionShutdown {
             Self::Failed => "failed",
         }
     }
+
+    /// Folds two close dispositions into the more severe one.
+    ///
+    /// A session that closes several processes over its lifetime (Codex/OpenCode
+    /// spawn one CLI process per turn) reports a single disposition at
+    /// [`shutdown`](super::ExternalRuntimeSession::shutdown); this fold keeps the
+    /// strongest residual signal seen along the way so a mid-session
+    /// [`ForcedKill`](Self::ForcedKill) or [`Failed`](Self::Failed) close still
+    /// marks the session as leaving residual side effects (review M-EXT-5).
+    /// Severity order: `Graceful < Failed < ForcedKill` — a force-kill is the
+    /// strongest signal of unrollbackable side effects.
+    #[must_use]
+    pub const fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::ForcedKill, _) | (_, Self::ForcedKill) => Self::ForcedKill,
+            (Self::Failed, _) | (_, Self::Failed) => Self::Failed,
+            (Self::Graceful, Self::Graceful) => Self::Graceful,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -96,6 +115,24 @@ mod tests {
         assert_eq!(ExternalSessionShutdown::Graceful.label(), "graceful");
         assert_eq!(ExternalSessionShutdown::ForcedKill.label(), "forced_kill");
         assert_eq!(ExternalSessionShutdown::Failed.label(), "failed");
+    }
+
+    #[test]
+    fn merge_keeps_the_more_severe_disposition() {
+        use ExternalSessionShutdown::{Failed, ForcedKill, Graceful};
+        for (left, right, expected) in [
+            (Graceful, Graceful, Graceful),
+            (Graceful, Failed, Failed),
+            (Failed, Graceful, Failed),
+            (Graceful, ForcedKill, ForcedKill),
+            (ForcedKill, Graceful, ForcedKill),
+            (Failed, ForcedKill, ForcedKill),
+            (ForcedKill, Failed, ForcedKill),
+            (Failed, Failed, Failed),
+            (ForcedKill, ForcedKill, ForcedKill),
+        ] {
+            assert_eq!(left.merge(right), expected, "{left:?} merge {right:?}");
+        }
     }
 
     #[test]
