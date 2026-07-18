@@ -1,12 +1,36 @@
 //! Serializable endpoint transport configuration.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
+
+/// Placeholder substituted for every credential value in [`Debug`] output.
+const REDACTED: &str = "[REDACTED]";
+
+/// Lowercase header-name fragments that mark an extra header as
+/// credential-bearing, so its value is redacted in [`Debug`] output. Kept
+/// deliberately broad: an over-redacted header list is safe, an under-redacted
+/// one leaks secrets.
+const SENSITIVE_HEADER_FRAGMENTS: &[&str] =
+    &["key", "token", "secret", "auth", "password", "credential"];
+
+/// Returns whether `header_name` looks credential-bearing (for example
+/// `api-key`, `x-api-key`, or `authorization`).
+fn is_sensitive_header(header_name: &str) -> bool {
+    let lower = header_name.to_ascii_lowercase();
+    SENSITIVE_HEADER_FRAGMENTS
+        .iter()
+        .any(|fragment| lower.contains(fragment))
+}
 
 /// Authentication applied when sending requests to an LLM endpoint.
 ///
 /// [`AuthScheme::Header`] covers provider-specific names such as `api-key`
 /// and `x-api-key` without coupling endpoint configuration to a wire protocol.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The [`Debug`] implementation redacts every credential value to
+/// `[REDACTED]`, so a formatted value is safe to log.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum AuthScheme {
     /// Sends the value as an `Authorization: Bearer <token>` header.
@@ -22,6 +46,19 @@ pub enum AuthScheme {
     None,
 }
 
+impl fmt::Debug for AuthScheme {
+    /// Prints the scheme name while redacting every credential value.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bearer(_) => write!(formatter, "Bearer({REDACTED})"),
+            Self::Header { name, .. } => {
+                write!(formatter, "Header {{ name: {name:?}, value: {REDACTED} }}")
+            }
+            Self::None => formatter.write_str("None"),
+        }
+    }
+}
+
 /// Transport details for one concrete LLM endpoint.
 ///
 /// This configuration is independent of the endpoint's Anthropic Messages or
@@ -32,8 +69,11 @@ pub enum AuthScheme {
 ///
 /// Although this type supports serde for application configuration, `auth`
 /// contains credentials. Do not log or persist a serialized value unless the
-/// destination is explicitly approved for secrets.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// destination is explicitly approved for secrets. The [`Debug`]
+/// implementation, by contrast, is redaction-safe: [`EndpointConfig::auth`]
+/// values and credential-looking [`EndpointConfig::extra_headers`] values are
+/// replaced with `[REDACTED]`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointConfig {
     /// Base URL to which an adapter appends its protocol-specific path.
     pub base_url: String,
@@ -43,8 +83,42 @@ pub struct EndpointConfig {
     #[serde(default)]
     pub query_params: Vec<(String, String)>,
     /// Additional endpoint-specific headers appended to every request.
+    ///
+    /// Values of credential-looking headers (names containing fragments like
+    /// `key`, `token`, `secret`, `auth`, `password`, or `credential`) are
+    /// redacted in [`Debug`] output.
     #[serde(default)]
     pub extra_headers: Vec<(String, String)>,
+}
+
+impl fmt::Debug for EndpointConfig {
+    /// Prints structural fields while redacting every credential-bearing value.
+    ///
+    /// `base_url` and `query_params` are shown verbatim; `auth` goes through
+    /// the redacting [`AuthScheme`] [`Debug`]; `extra_headers` show header
+    /// names with only non-sensitive values visible.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let extra_headers: Vec<(&str, &str)> = self
+            .extra_headers
+            .iter()
+            .map(|(name, value)| {
+                let value = if is_sensitive_header(name) {
+                    REDACTED
+                } else {
+                    value.as_str()
+                };
+                (name.as_str(), value)
+            })
+            .collect();
+
+        formatter
+            .debug_struct("EndpointConfig")
+            .field("base_url", &self.base_url)
+            .field("auth", &self.auth)
+            .field("query_params", &self.query_params)
+            .field("extra_headers", &extra_headers)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -131,5 +205,76 @@ mod tests {
             serde_json::from_value::<AuthScheme>(none_json).expect("deserialize no auth"),
             AuthScheme::None
         );
+    }
+
+    #[test]
+    fn auth_scheme_debug_redacts_every_credential_value() {
+        let bearer = format!("{:?}", AuthScheme::Bearer("sk-ant-secret".to_owned()));
+        assert!(
+            !bearer.contains("sk-ant-secret"),
+            "bearer token leaked: {bearer}"
+        );
+        assert_eq!(bearer, "Bearer([REDACTED])");
+
+        let header = format!(
+            "{:?}",
+            AuthScheme::Header {
+                name: "api-key".to_owned(),
+                value: "sk-ant-secret".to_owned(),
+            }
+        );
+        assert!(
+            !header.contains("sk-ant-secret"),
+            "header value leaked: {header}"
+        );
+        assert_eq!(header, "Header { name: \"api-key\", value: [REDACTED] }");
+
+        assert_eq!(format!("{:?}", AuthScheme::None), "None");
+    }
+
+    #[test]
+    fn endpoint_config_debug_redacts_auth_and_sensitive_extra_headers() {
+        let config = EndpointConfig {
+            base_url: "https://anthropic.example.test".to_owned(),
+            auth: AuthScheme::Bearer("sk-ant-secret".to_owned()),
+            query_params: vec![("api-version".to_owned(), "2025-04-01-preview".to_owned())],
+            extra_headers: vec![
+                ("api-key".to_owned(), "sk-ant-secret".to_owned()),
+                ("x-api-key".to_owned(), "sk-ant-secret".to_owned()),
+                ("authorization".to_owned(), "sk-ant-secret".to_owned()),
+                ("anthropic-version".to_owned(), "2023-06-01".to_owned()),
+            ],
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("sk-ant-secret"),
+            "secret leaked: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "missing placeholder: {rendered}"
+        );
+        // Structural fields stay visible for debuggability.
+        assert!(rendered.contains("https://anthropic.example.test"));
+        assert!(rendered.contains("api-version"));
+        assert!(rendered.contains("2023-06-01"));
+        // Header names survive even when their values are redacted.
+        assert!(rendered.contains("api-key"));
+    }
+
+    #[test]
+    fn endpoint_config_debug_preserves_serde_and_equality_behavior() {
+        let config = EndpointConfig {
+            base_url: "https://openai.example.test".to_owned(),
+            auth: AuthScheme::Header {
+                name: "api-key".to_owned(),
+                value: "sk-ant-secret".to_owned(),
+            },
+            query_params: Vec::new(),
+            extra_headers: Vec::new(),
+        };
+
+        assert_round_trip(config);
     }
 }

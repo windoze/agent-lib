@@ -29,4 +29,5 @@
 8. 提交：`[M1-1] Redact secrets in EndpointConfig/AuthScheme Debug output`，然后停止。
 
 ## 变更记录
-- （执行中更新）
+- 2026-07-19：完成任务单重生成文件的初始提交（da851c0）。
+- 2026-07-19：M1-1 完成。手写 `AuthScheme`/`EndpointConfig` 脱敏 Debug（占位符 `[REDACTED]`，认证类 extra header 值脱敏），两个 adapter 继承 derive；新增 5 条测试；`docs/review-2026-07.md` H-SEC-1 标注 ✅；TODO.md 标记 [DONE]。fmt/clippy/全量测试/doc 全绿。准备提交并停止。

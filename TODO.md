@@ -27,7 +27,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M1：安全与崩溃级修复
 
-### M1-1 [TODO] `EndpointConfig`/`AuthScheme`/两个 LLM adapter 手写脱敏 Debug（H-SEC-1）
+### M1-1 [DONE] `EndpointConfig`/`AuthScheme`/两个 LLM adapter 手写脱敏 Debug（H-SEC-1）
 
 上下文：
 
@@ -46,6 +46,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 新增单元测试：构造含 `"sk-ant-secret"` 的 `EndpointConfig`，断言 `format!("{:?}")` 不含该子串、含 `[REDACTED]`；两个 adapter 各一条同样的断言。
 - `cargo test -p agent-lib --lib client::` 通过；`cargo clippy --all-targets -- -D warnings` 通过。
+
+完成记录：
+
+- `src/client/config.rs`：`AuthScheme` 与 `EndpointConfig` 去掉 derive Debug，改为手写。`AuthScheme` 只显示 scheme 名（`Bearer([REDACTED])` / `Header { name, value: [REDACTED] }` / `None`）；`EndpointConfig` 的 `base_url`/`query_params` 原样可见，`auth` 走脱敏 Debug，`extra_headers` 头名可见、认证类头（`key`/`token`/`secret`/`auth`/`password`/`credential` 大小写不敏感子串）的值显示 `[REDACTED]`，其余值可见。占位符按任务规格用 `[REDACTED]`（facade 既有的 `<redacted>` 风格不动，`ProviderConfig` 保持其自有 Debug）。serde 行为不变（明文 round-trip 仍为有意设计，rustdoc 警告补充了 Debug 脱敏说明）。
+- 两个 adapter（`anthropic/mod.rs`、`openai_resp/mod.rs`）保持 derive Debug，自动继承脱敏；各新增 `adapter_debug_redacts_endpoint_credentials` 测试。
+- 测试：`auth_scheme_debug_redacts_every_credential_value`、`endpoint_config_debug_redacts_auth_and_sensitive_extra_headers`、`endpoint_config_debug_preserves_serde_and_equality_behavior` + 两个 adapter 断言，全部通过。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`（883 lib 测试在内全部通过）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- `docs/review-2026-07.md` H-SEC-1 已标注 `✅ 已修复（M1-1）`。无 breaking change（Debug 输出格式变化不计入 API 稳定性承诺）。
 
 ### M1-2 [TODO] 默认 HTTP 超时 + 错误路径 body 读取上限（H-SEC-2）
 

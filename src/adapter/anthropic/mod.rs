@@ -69,3 +69,29 @@ impl LlmClient for AnthropicAdapter {
         AnthropicAdapter::chat_stream(self, request).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::AuthScheme;
+
+    #[test]
+    fn adapter_debug_redacts_endpoint_credentials() {
+        let adapter = AnthropicAdapter::new(EndpointConfig {
+            base_url: "https://anthropic.example.test".to_owned(),
+            auth: AuthScheme::Bearer("sk-ant-secret".to_owned()),
+            query_params: Vec::new(),
+            extra_headers: vec![("x-api-key".to_owned(), "sk-ant-secret".to_owned())],
+        });
+
+        let rendered = format!("{adapter:?}");
+        assert!(
+            !rendered.contains("sk-ant-secret"),
+            "secret leaked through adapter Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "missing redaction placeholder: {rendered}"
+        );
+    }
+}
