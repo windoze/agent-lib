@@ -500,6 +500,23 @@ impl AgentBuilder {
 }
 ```
 
+`snapshot` / `restore` / `into_parts` / `builder` 用途各异,文档不暗示它们可互相替代:
+
+- **需要持久化恢复**用 `snapshot` + `restore`:`snapshot()` 产出 **data-only** 的
+  `AgentSnapshot`(会话 + 可序列化 `AgentState` + 协作快照 + delegate recipe),**不**含 client、
+  凭据、tool 闭包、approval / interaction handler 等运行期句柄,可安全持久化;`restore()` 经
+  `AgentRestoreBuilder` 重注入这些句柄后续跑同一会话(§15.2)。
+- **需要接管 live handles**用 `into_parts`:它消费 agent 并把已装配的运行部件按原样交给高级调用方,
+  用于直接驱动下层或接管仍存活的句柄。`AgentParts` 交出:`AgentState`(持有 live `Conversation`)、
+  `LlmClient`、typed tools 与逃生舱声明、共享 approval bridge 与被注入的 `InteractionHandler`、
+  identity source、已注册的 local subagent 与 managed external delegates、`Delegation` 路由模式、
+  每个 external delegate 的最近一次 data-only 会话事实(`retained_external_sessions`,不含进程句柄 /
+  凭据),以及 live 协作底座(`Collaboration` config + 共享 `Mailbox` / `Blackboard` / `Plan` 句柄)。
+  它**不会**静默 drop 任何仍有语义价值的字段。它是**拆解逃生舱、不是 restore API**——按原样交出
+  live/owned 部件,**不**提供 `AgentParts -> Agent` 的重建 helper;持久化恢复请用 snapshot / restore。
+- **需要常规构造**用 `builder`:`Agent::builder()`(或 `Agent::worker()` 构 subagent 模板)从零装配
+  一个新 agent,这是默认入口。
+
 ### 8.3 内部映射
 
 Agent facade 内部负责装配:

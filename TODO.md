@@ -1111,7 +1111,7 @@ cargo test -p agent-lib --lib facade::agent::
   `cargo test -p agent-lib --lib`（878 passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
   --workspace`（clean）。
 
-### M5-2 [TODO] 对齐 `into_parts`、snapshot 和 builder 文档
+### M5-2 [DONE] 对齐 `into_parts`、snapshot 和 builder 文档
 
 上下文：
 
@@ -1140,6 +1140,34 @@ cargo test -p agent-lib --lib facade::agent::
 ```
 
 - 文档中不能继续说 `into_parts` 覆盖完整状态但实际字段缺失。
+
+完成记录（M5-2）：
+
+- 文档改动：
+  - **`docs/facade-api.md` §8.2**：在 Agent facade API 形状块后新增 prose，写清
+    `snapshot` / `restore` / `into_parts` / `builder` 四者用途不可互替——持久化恢复用
+    snapshot+restore（data-only，不含 client/凭据/闭包/handler），接管 live handles 用
+    `into_parts`（并逐项列出交出的部件：`AgentState`+live `Conversation`、client、tools+逃生舱
+    声明、approval bridge+`InteractionHandler`、identity source、local subagent+managed external
+    delegates、`Delegation`、`retained_external_sessions`（data-only，不含进程句柄/凭据）、
+    `Collaboration` config+live `Mailbox`/`Blackboard`/`Plan` 句柄），常规构造用 builder；并明确
+    `into_parts` 是拆解逃生舱、**非** restore API（无 `AgentParts -> Agent` 重建 helper）。
+  - **`src/facade/agent.rs`**：`Agent::into_parts` rustdoc 补 [`builder`] 交叉引用，凑齐
+    snapshot/restore、into_parts、builder 三向对齐（资源范围与不保证事项 M5-1 已写清）。
+  - **`docs/refine.md` §6**：加「状态：**已修复（M5-1 扩展；M5-2 文档对齐；M5-3 复核待进行）**」
+    状态行 + 末尾「修复结果（M5-1 扩展，M5-2 文档对齐）」块，镜像 §2/§4/§5 体例，列出 M5-1 的
+    `AgentParts` +7 字段扩展、`into_parts` 不再静默 drop、`RetainedExternalSession` 提升 pub、
+    snapshot 仍保持 data-only 未破坏原则，以及 M5-2 文档对齐结果；至此无文档再声称 `into_parts`
+    覆盖不完整或缺字段。
+  - **`README.md`**：README 无 `into_parts` 代码示例，故无引用 `AgentParts` 字段的示例需更新；
+    在能力速览表补一行「逃生舱」入口（`Agent::into_parts() -> AgentParts`，接管 live/owned 部件、
+    非 restore API），保持速览表对逃生出口诚实。
+- rustdoc（`AgentParts` 结构体，`src/facade/agent/snapshot.rs`）与 `Agent::into_parts` 均已在 M5-1
+  写清各字段与「非 restore API」保证，M5-2 仅补 builder 交叉引用与外部文档对齐，未改字段语义。
+- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean，无 intra-doc link 破坏）；
+  `cargo test -p agent-lib --lib facade::agent::`（49 passed，含 M5-1 的 5 个 `into_parts_*`）。
+  本任务仅改文档 + rustdoc 注释（不影响编译产物），未改运行期代码路径，故未重跑全量测试套件。
 
 ### M5-3 [TODO] Review：完整逃生出口
 

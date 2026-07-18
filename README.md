@@ -202,6 +202,7 @@ Facade 是**装配层**，把 identity、pending 事务、`AgentMachine`、`Hand
 | 路由 / 升级 | `Delegation::dispatcher()`、`Dispatcher` / `Escalator`、verifier 闭环 |
 | 协作底座 | 按 delegate 拓扑自动启用的 `Collaboration`（plan / blackboard / mailbox / artifacts） |
 | snapshot / restore | data-only 快照，不含凭据 / 闭包 / client / live handle |
+| 逃生舱 | `Agent::into_parts() -> AgentParts`：接管 live/owned 部件（含 external delegates、协作句柄、interaction handler），非 restore API |
 | 宿主嵌入注入口（M7） | `Agent::interaction_handler`、`RunEvent::to_wire()`→`WireRunEvent`、富化 `ApprovalRequest`、`default_external_session_handler`、`Delegation::dispatcher_evaluator/verifier`、`ApprovalPolicy::on_permission` |
 
 设计详见 [`docs/facade-api.md`](docs/facade-api.md)。

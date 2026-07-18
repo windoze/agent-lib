@@ -821,7 +821,10 @@ impl Agent {
     /// state after this call. This is a decomposition hatch, **not** a restore
     /// API: it returns the live parts as-is and offers no helper to reassemble an
     /// [`Agent`] from them. Use [`snapshot`](Agent::snapshot) /
-    /// [`restore`](Agent::restore) for data-only persistence and rebuild.
+    /// [`restore`](Agent::restore) for data-only persistence and rebuild, and
+    /// [`builder`](Agent::builder) for ordinary construction; reach for
+    /// `into_parts` only when a caller must take ownership of the live handles
+    /// themselves (`docs/facade-api.md` §8.2).
     #[must_use]
     pub fn into_parts(self) -> AgentParts {
         let collab = self.collab;

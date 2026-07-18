@@ -359,6 +359,8 @@ let codex = codex_builder.session_handler(handler).build()?;
 
 严重度：低。
 
+状态：**已修复（M5-1 扩展；M5-2 文档对齐；M5-3 复核待进行）**。下文保留原始缺口描述作为背景，当前实现说明见本条末尾“修复结果”。
+
 `Agent::into_parts` 目前只返回：
 
 - `AgentState`
@@ -386,6 +388,28 @@ let codex = codex_builder.session_handler(handler).build()?;
 - 扩展 `AgentParts`，补齐后续 milestone 增加的组成。
 - 或把 `AgentParts` 明确文档化为 base-agent-only escape hatch，并提供新的 `AgentFullParts` / `into_full_parts`。
 - 注意保持 snapshot 原则：runtime handles 可以作为 escape hatch 交出，但不能进入 data-only snapshot。
+
+修复结果（M5-1 扩展，M5-2 文档对齐）：
+
+- `AgentParts`（`src/facade/agent/snapshot.rs`）在原有 state / client / tools / custom_registry /
+  extra_declarations / approval / ids / delegates / delegation 基础上，新增 7 个 public 字段：
+  `interaction_handler`、`external_agents`（managed external delegates）、`retained_external_sessions`
+  （每个 external delegate 的 data-only 会话事实，不含进程句柄 / SDK client / 凭据）、`collaboration`
+  （config），以及 live `mailbox` / `blackboard` / `plan` 句柄。采用「扩展 `AgentParts`」路线，未新增
+  `AgentFullParts` / `into_full_parts`（M5-1）。
+- `Agent::into_parts`（`src/facade/agent.rs`）析构 `self.collab` 后把 config 与三个 live 句柄分别搬出，
+  并搬出 interaction handler / external delegates / retained sessions，不再静默 drop 任何仍有语义价值的
+  字段（M5-1）。runtime handles 仅经此逃生舱交出，`AgentSnapshot` 仍保持 data-only、不含句柄，snapshot
+  原则未被破坏。
+- 内部类型 `RetainedExternalSession` 由 `pub(crate)` 提升为 `pub` 并在 `facade` 重导出，使 `AgentParts`
+  的 public 字段类型可达（M5-1）。
+- 文档对齐（M5-2）：`docs/facade-api.md` §8.2 写清 snapshot / `into_parts` / builder 三者的用途边界
+  （持久化恢复 / 接管 live handle / 常规构造），并列出 `into_parts` 交出的部件与「非 restore API」保证；
+  `Agent::into_parts` 与 `AgentParts` 的 rustdoc 逐项说明资源范围与不保证事项。至此不再有文档声称
+  `into_parts` 覆盖不完整或缺失字段。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）、
+  `cargo test -p agent-lib --lib facade::agent::`（全绿，含 M5-1 新增 5 个 `into_parts_*` 测试）。
 
 ## 建议优先级
 
