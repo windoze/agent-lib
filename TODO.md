@@ -2163,3 +2163,47 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
   4) `cargo test --all --all-targets`（exit 0，全绿）；5) `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（洁净）；
   6) `cargo test --doc -p agent-lib`（12 passed）；7) `git diff --check` 干净。
 - **收官**：M7-R 为 `TODO.md` 最后一个任务，至此全部任务 `[DONE]`；按 Completion & Release 打 `endtag`。
+
+---
+
+## Milestone 7 后续（宿主集成暴露的缺口）
+
+> 首个真实宿主（`mag`，Tauri/web/ACP 编码 agent app）集成 M7 注入口时暴露的一个残留缺口。M7-1 让
+> `AgentBuilder` 能注入自定义 async `InteractionHandler`，但 **`Agent::restore()` 路径没有对应注入口**，
+> 使得恢复出的会话无法用宿主的跨进程审批 handler——对任何需要"持久化会话 + 交互式审批"的宿主是硬伤。
+
+### [TODO] M7-F1 `AgentRestoreBuilder::interaction_handler(..)` 注入口（与 `AgentBuilder` 对齐）
+
+**上下文**：
+
+- 缺口：`AgentRestoreBuilder`（`src/facade/agent/snapshot.rs:435` 一带）**没有** `interaction_handler`
+  字段/方法，`build()` 硬编码 `interaction_handler: None`（`snapshot.rs:753` 一带），恢复出的 `Agent`
+  始终回落到同步 `FacadeApproval`。而 `AgentBuilder::interaction_handler(Arc<dyn InteractionHandler>)`
+  （M7-1，`src/facade/agent.rs:1015`）已提供该注入口。二者不对齐。
+- 影响：宿主（如 mag）用自定义异步 `InteractionHandler`（跨进程审批 gate）时，**snapshot/restore 后的会话
+  无法恢复该 handler**——需审批的会话一旦恢复就退化为同步默认审批，破坏"发前端 → await → 折回"的往返。
+- 这与 M7-1 是同一能力在 restore 路径的自然延伸，属 M7「宿主嵌入接入面」的收尾。
+
+**做什么**：
+
+- 给 `AgentRestoreBuilder` 增加 `interaction_handler(self, handler: Arc<dyn InteractionHandler>) -> Self`
+  （签名、语义、与 `.approval(..)` 的优先级均与 `AgentBuilder::interaction_handler` 一致）。
+- `build()` 把注入的 handler 装进恢复出的 `Agent`（替换硬编码的 `None`）；未注入时保持现有回落到
+  `FacadeApproval` 的行为（向后兼容）。
+- 恢复出的 `Agent` 的同步 `run`/`run_full` 与流式 `stream` 两路都经该 handler，与 M7-1 主路径一致。
+- rustdoc 写清：restore 与 build 的注入口对齐；handler 不在 snapshot 内（本就是运行时依赖，须重注入）。
+
+**验证条件**：
+
+- 离线单元测试：snapshot 一个会话 → `Agent::restore().interaction_handler(scripted).build()` → 恢复出的
+  agent 驱动一个需审批 turn，断言 machine 在脚本化 handler resolve **前不前进**（与 M7-1 的暂停语义测试
+  对称）；未注入时回落到 `FacadeApproval` 的既有行为不变。
+- 聚焦：`cargo test -p agent-lib facade::agent`（或 snapshot/restore 所在过滤名，含新用例）。
+- 完整验证序列 1–6（+ 若涉及则全 external features clippy）。
+
+### [TODO] M7-F-R Review：restore 注入口对齐核对
+
+**做什么**：核对 `AgentRestoreBuilder` 与 `AgentBuilder` 的 `interaction_handler` 注入口完全对齐（签名/
+优先级/两路生效）；未注入向后兼容；handler 不入 snapshot（§15.2）。确认无未调度失败测试。
+
+**验证条件**：完整验证序列 1–6 全绿；restore 注入口对称性对照说明。

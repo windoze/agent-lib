@@ -104,14 +104,21 @@ agent_lib::prelude
 
 ```rust
 pub use agent_lib::facade::{
-    Agent, AgentSession, Approval, ApprovalPolicy, Chat, ChatSession, Delegation,
+    Agent, AgentSession, Approval, ApprovalPolicy, ApprovalRequest, Chat, ChatSession, Delegation,
     ManagedExternalAgent, ModelConfig, ProviderConfig, Reply, RunEvent, RunOutput, RunStream,
-    Tool, ToolContext,
+    Tool, ToolContext, WireRunEvent, WireRunOutput,
 };
 ```
 
 不建议把 `AgentMachine`、`Requirement`、`Boundary`、adapter 细节放进 prelude。需要这些能力的用户,
 应显式从原模块导入。
+
+> **Milestone 7 补充**:`prelude` 追加了宿主跨进程嵌入直接会用到的三个 path-friendly facade 类型——
+> `ApprovalRequest`(富化后的审批载荷)、`WireRunEvent` / `WireRunOutput`(`RunEvent` / `RunOutput`
+> 的可序列化投影)。M7 的注入口本身是 builder 方法(`Agent::interaction_handler`、
+> `ManagedExternalAgent` 的 `session_handler`、`Delegation::dispatcher_evaluator/verifier`、
+> `ApprovalPolicy::on_permission`),经已在 prelude 的 `Agent` / `ApprovalPolicy` / `Delegation` 到达,
+> 无需额外透出类型。feature-gated 的 external handler 类型按设计不入 prelude。
 
 Facade 分三层能力:
 
@@ -332,6 +339,29 @@ pub enum RunEvent {
 
 Raw variants 是逃生舱,不应成为简单示例的主路径。
 
+**可序列化投影(Milestone 7)**:`RunEvent` 本身仍只 `derive(Clone, Debug, PartialEq, Eq)`,不派生
+serde(逃生舱 `RawStream` / `RawNotification` 的序列化不作为稳定契约,见 §19)。为让跨进程宿主把事件投给
+前端,facade 提供官方的**显式、单向、有损**投影:
+
+```rust
+impl RunEvent {
+    pub fn to_wire(&self) -> WireRunEvent;
+}
+impl RunOutput {
+    pub fn to_wire(&self) -> WireRunOutput;
+}
+```
+
+- `WireRunEvent` / `WireRunOutput` 均 `Serialize + Deserialize`(adjacently-tagged
+  `{"type":.., "data":..}` 的 snake_case 线格式,与 `agent::Notification` 一致)。
+- 归一化变体(`TextDelta` / `ToolStarted` / `ToolFinished` / `ApprovalRequested` /
+  `Delegation*` / `Escalated` / `Done`)**如实转发**各自本已 serde 友好的 payload,无损。
+- `Done` 内嵌的 `RunOutput` 投影为 `WireRunOutput`,其中 `events` 递归投影为 `Vec<WireRunEvent>`。
+- 两个 Raw 逃生舱**降级**为 opaque 标记 `WireRunEvent::Raw(RawEventKind::{Stream, Notification})`——
+  只记录哪种逃生舱触发,不承载底层不可序列化载荷,故不把逃生舱序列化提升为稳定契约。
+
+`ApprovalRequest` 也在 M7 富化(见 §9.3),`ApprovalRequested` 投影因此自动携带富化字段。
+
 ## 7. Tool Facade
 
 ### 7.1 Typed function tool
@@ -434,6 +464,15 @@ impl Agent {
 `Agent::worker()` 用于构造 local subagent 模板。它可以要求更少 provider 配置,允许继承 supervisor
 的 provider/model/client,也可以显式指定自己的 model。
 
+`AgentBuilder` 另有若干**依赖注入口**(Milestone 7,详见 §21):
+
+```rust
+impl AgentBuilder {
+    // 注入自定义 async InteractionHandler,可在 fulfill 内「发前端 -> await -> 折回」。
+    pub fn interaction_handler(self, handler: Arc<dyn InteractionHandler>) -> Self;
+}
+```
+
 ### 8.3 内部映射
 
 Agent facade 内部负责装配:
@@ -518,7 +557,41 @@ ApprovalPolicy::default()
 理由:local subagent 仍在同一 effect 模型内,权限会沿工具/interaction 继续受控;managed external agent
 可能启动外部 runtime、写文件、运行命令或消耗大量资源,默认必须更保守。
 
-## 10. Subagent 集成
+### 9.3 富化 ApprovalRequest(Milestone 7)
+
+早期 `ApprovalRequest` 只有 `tool_name`,UI 无法渲染有意义的审批框。M7 借其 `#[non_exhaustive]` **纯加
+字段**补齐渲染所需信息:
+
+```rust
+#[non_exhaustive]
+pub struct ApprovalRequest {
+    pub tool_name: String,
+    pub call_id: String,
+    pub reason: Option<String>,
+    pub input: Option<String>,
+}
+```
+
+- `input` 用 `Option<String>`(脱敏、限长的紧凑摘要)而非 `serde_json::Value`,以保住整条投影链的 `Eq`
+  并天然 redaction 友好:凭据样式 key(`token`/`secret`/`password`/`api_key`/`auth`/… 大小写不敏感子串)
+  的值替换为 `<redacted>`,渲染后按 UTF-8 边界截断到上限;`None` 表示无参数。
+- 流式路径的 `TapInteractionHandler` 从底层 `InteractionKind::Approval` 的 `call_id` + `ApprovalRequirement`
+  填充字段后再 emit `RunEvent::ApprovalRequested`,同步 external-start 路径用便捷构造 `ApprovalRequest::for_tool(name)`。
+
+### 9.4 自定义 permission decider(Milestone 7)
+
+`InteractionKind::Permission` 的裁决默认**一律 deny**。`ApprovalPolicy` 提供注入钩子,让调用方接 AI-based
+permission 或自定义逻辑,未注入时保持默认 deny:
+
+```rust
+ApprovalPolicy::default()
+    .on_permission(|req: &PermissionRequest| -> PermissionResponse {
+        // 例如按 req.risk() 决定 allow / deny;返回时以 req.action_id() 盖章。
+    })
+```
+
+优先级:当经 `Agent::interaction_handler`(§8.2 / §21)注入整体 `InteractionHandler` 时,后者是唯一权威,
+decider 仅在无整体 handler 时生效。**facade 只开放注入口,不实现任何 AI 逻辑。**
 
 ### 10.1 Local delegate
 
@@ -647,6 +720,27 @@ crate,以一个标准 ACP client 对接任意 ACP agent——Gemini/OpenCode 原
 如果 external agent 作为 child agent 挂载,推荐仍通过 `NeedSubagent` 进入 `ExternalAgentMachine`。
 `ExternalAgentMachine` 内部再发 `NeedExternalSession` 推进真实 runtime。这样它与 local subagent
 共享同一套 scope 派生、cancel、budget、trace 与 pop 语义。
+
+**生产级 registry-backed handler(Milestone 7,feature-gated)**:跑真实本地 CLI agent 需要注入
+`Arc<dyn ExternalSessionHandler>`,但早期全库只有 test double。M7 提供官方的最后一公里:
+
+```rust
+// runtime 无关(不带 feature gate):registry-backed handler,只持有 registry(+ 可选 sink),不持机器状态。
+pub struct RegistryExternalSessionHandler { /* Arc<ExternalSessionRegistry> + Option<Arc<dyn ExternalEventSink>> */ }
+
+// feature-gated 便捷构造:按 agent.runtime() 探测 live CLI 并 wire 匹配 adapter 到 registry。
+pub async fn default_external_session_handler(
+    agent: &ManagedExternalAgent,
+) -> Result<Arc<RegistryExternalSessionHandler>, FacadeError>;
+```
+
+- `fulfill` 每次 `registry.get_or_start(..)` 解析 live handle → `handle.advance(..)` 推进一个 decision
+  point(`Completed` / `Paused*` / `Failed`),复用既有 capability-gated resume 与 worktree cleanup;launch
+  失败与 advance 失败都折叠为 `ExternalSessionResult::Failed`,绝不串到别的 requirement family。
+- 宿主 `.session_handler(default_external_session_handler(&agent).await?)` 直接注入;返回具体类型以保留
+  `.registry()`(宿主用 `cleanup_agent` / `cleanup` 强制关闭)。
+- 缺二进制 / 未登录 / 能力不支持时走既有保守路径(probe fail-fast → `FacadeError::ExternalAgent` 或
+  `UnsupportedCapability` / skip),**不静默降级**;未编入对应 feature 的 runtime 显式 fail-fast(消息点名要开的 feature)。
 
 ### 11.3 能力分级
 
@@ -784,6 +878,25 @@ verifier 检查产物
 
 Dispatcher-routed 不应成为第一版默认值。它适合 coding task、长任务、cost-aware 调度和 verifier
 闭环。
+
+**注入自定义 evaluator / verifier(Milestone 7)**:早期 dispatcher 把 AI-based routing / verification
+接缝写死(`Escalator::new(ScriptedVerifier::passing())` + keyword/`ESCALATE` token)。M7 让 `Delegation`
+接受调用方注入的 `TaskEvaluator` / `Verifier`,未注入时**逐字节还原 M5 行为**:
+
+```rust
+Delegation::dispatcher()
+    .primary("cheap-coder")
+    .escalate_to("strong-coder")
+    .dispatcher_evaluator(Arc::new(my_task_evaluator)) // 选升级目标
+    .dispatcher_verifier(Arc::new(my_verifier))        // 裁决产物是否升级
+```
+
+- 注入的 `Verifier` 既回填 `Escalator`(替换写死的 `ScriptedVerifier::passing()`),又作为额外裁决源合流:
+  `worker_failed || run_verifier(ESCALATE token) || 注入 verifier 拒绝`,任一为真即升级。
+- 注入的 `TaskEvaluator` 从 dispatcher roster(primary + escalate_to)选升级目标;`None` / 选中自身 /
+  未注册 delegate 均视为「不升级」。
+- 两个钩子存于 `Delegation` 的 `#[serde(skip)]` 运行时字段(配置身份忽略钩子),快照丢弃、回落内置默认,
+  与 §19「snapshot 不存闭包/handler」一致。**facade 只开放注入口,不实现任何 AI 逻辑。**
 
 ## 14. Collaboration primitives
 
@@ -1027,7 +1140,7 @@ println!("{}", output.reply.text());
 for delegation in output.delegations {
     println!(
         "{}: {:?}, usage={:?}",
-        delegation.worker,
+        delegation.delegate,
         delegation.status,
         delegation.usage,
     );
@@ -1077,6 +1190,11 @@ let mut agent = Agent::builder()
 6. **Collaboration convenience**
    根据 delegate 拓扑自动启用 mailbox / blackboard / plan / artifact store,并提供显式配置。
 
+7. **宿主嵌入接入面(Milestone 7)**
+   在装配层补齐依赖注入口(interaction handler、`RunEvent` 可序列化投影、富化 `ApprovalRequest`、
+   生产级 registry-backed `ExternalSessionHandler`、dispatcher evaluator/verifier 与 permission decider),
+   让跨进程宿主无需下沉到 agent 层自组 scope。**只开注入口,不实现 AI 逻辑**(详见 §21)。
+
 ## 19. 关键设计约束
 
 - Facade 是装配层,不是第二套 runtime。
@@ -1089,6 +1207,9 @@ let mut agent = Agent::builder()
 - Managed external agent 默认比 local subagent 更保守,启动/resume/write 需要审批或显式 opt-in。
 - `RunOutput` 必须能同时表达 LLM response、tool trace、delegation trace、artifact 与 raw events。
 - 所有 provider-specific 行为继续通过 provider extras / capability model 显式表达。
+- 宿主嵌入注入口(Milestone 7)只在装配层加**依赖注入**:未新增 effect family、未改底层状态机语义,
+  注入的 handler/evaluator/verifier/decider 都喂给既有 `InteractionHandler` / `TaskEvaluator` / `Verifier` /
+  `InteractionKind::Permission` 接缝;运行时钩子经 `#[serde(skip)]` 在快照中丢弃并回落内置默认。
 
 ## 20. 未定问题
 
@@ -1115,4 +1236,29 @@ let mut agent = Agent::builder()
 7. `RunEvent` 是否应该保证可序列化。
    UI 进程与测试 cassette 会受益,但 raw notification 中可能包含不易序列化的 source。
 
+   **已定(Milestone 7)**:`RunEvent` 本体**不**派生 serde(保持逃生舱序列化不作为稳定契约,§19),
+   改由显式、单向、有损的投影 `RunEvent::to_wire() -> WireRunEvent` / `RunOutput::to_wire() -> WireRunOutput`
+   满足跨进程宿主;归一化变体无损,`RawStream` / `RawNotification` 降级为 opaque `RawEventKind` 标记(见 §6.3)。
+
 这些问题不阻塞第一版 Chat/Agent facade,但会影响 public API 一旦稳定后的演进空间。
+
+## 21. 宿主嵌入接入面(Milestone 7)
+
+M7 在 facade 装配层补齐**宿主跨进程嵌入的依赖注入口**,让宿主(如把 agent 嵌入前端/服务的进程)无需
+下沉到 agent 层自组 `HandlerScope` + `drain`。核心原则:**只开注入口,零 AI 逻辑**;每个注入口默认值保持
+M1–M6 行为,未注入即向后兼容(公开类型均 `#[non_exhaustive]` 加字段)。
+
+对照 PLAN §「Milestone 7」识别的 5 个 facade 写死缺口:
+
+| # | 缺口(facade 写死项) | facade 注入接缝 | 未注入默认(保持 M1–M6) |
+|---|---|---|---|
+| 1 | 审批 handler 硬编码同步 `FacadeApproval`,宿主无法「发前端→await→折回」 | `Agent::interaction_handler(Arc<dyn InteractionHandler>)`(同步 + 流式两路,§8.2 / §9) | 回退到共享 `FacadeApproval`;与 `.approval(..)` 优先级已写清 |
+| 2 | `RunEvent` 整体不可序列化,宿主无法把事件投给前端 | `RunEvent::to_wire()` → `WireRunEvent`、`RunOutput::to_wire()` → `WireRunOutput`(§6.3) | R7 不变:`RunEvent` 本体仍不 serde;`Raw*` 降级为 opaque `RawEventKind` |
+| 3 | `ApprovalRequest` 只有 tool name,UI 无法渲染有意义审批框 | 富化 `ApprovalRequest{ tool_name, call_id, reason, input }`(§9.3) | 加字段兼容;`for_tool()` 保留同步 external-start 路径 |
+| 4 | 无生产级 live-adapter-backed `ExternalSessionHandler`(全库仅 test double) | `default_external_session_handler()` + `RegistryExternalSessionHandler`(§11.2,feature-gated) | feature 关闭时不透出;宿主 `.session_handler(default_..)` 直接用 |
+| 5 | AI 路由/权限接缝写死(`ScriptedVerifier::passing()` / 权限默认 deny) | `Delegation::dispatcher_evaluator/verifier(..)`(§13.3)+ `ApprovalPolicy::on_permission(..)`(§9.4) | 未注入逐字节还原 M5 dispatcher 与「权限默认 deny」 |
+
+一致性:M7 触碰到的每条 §19 约束均成立——仍是装配层、无新 effect family、不改底层语义;运行时钩子
+(dispatcher hooks、permission decider、interaction handler)经 `#[serde(skip)]` 在快照中丢弃并回落内置
+默认,与「snapshot 不存闭包/handler」一致。`prelude` 追加 `ApprovalRequest` / `WireRunEvent` / `WireRunOutput`
+(见 §3)。
