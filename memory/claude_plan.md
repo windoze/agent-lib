@@ -1,36 +1,33 @@
-# M6-1 执行计划：同步 docs/refine.md 的问题状态和剩余风险
+# M6-2 执行计划：全量验证默认构建、测试、文档和 external feature clippy
 
 ## 任务性质
-纯文档任务（TODO.md M6-1）。把 `docs/refine.md` 从「问题清单」收敛为
-「已修复项 + 剩余风险记录」，确保六类问题都有明确状态，且与 PLAN.md / TODO.md 不冲突。
+验收/验证任务（TODO.md M6-2）。按 cheap→expensive 顺序运行完整验证命令，
+确认默认构建、clippy、test、rustdoc、以及 external feature clippy 全部通过。
+若失败，回到对应 milestone 修正（不只记录失败）。ignored real e2e 不强制运行，
+但确认未配置时干净跳过（保持 #[ignore]）。
 
-## 现状分析
-- 问题 #2、#4、#5、#6 已有顶部「状态：**已修复（… 复核通过）**」行 —— 达标。
-- 问题 #1（stream drop）、#3（非流式审批事件）只有末尾「修复状态（更新）」，
-  缺少与 2/4/5/6 一致的顶部状态行，且缺 M1-3 / M2-3 review 的关键文件与验证命令。
-- 「总体判断」尾部仍把六类问题列为「剩余问题」，与 M1–M5 全部完成的实际状态冲突。
+## 验证命令（全部必须通过）
+1. cargo fmt --all
+2. cargo clippy --all-targets -- -D warnings
+3. cargo test --all --all-targets
+4. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+5. cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
 
-## 变更清单（仅改 docs/refine.md）
-1. 更新「总体判断」尾部：把六类缺口标注为已经过 M1–M5 收口，逐条映射 milestone；
-   说明 M6 负责最终收口（M6-1 文档同步 / M6-2 全量验证 / M6-3 验收）。
-2. 问题 #1 顶部补「状态：**已修复（M1-1、M1-2；M1-3 复核通过）**」行。
-3. 问题 #3 顶部补「状态：**已修复（M2-1、M2-2；M2-3 复核通过）**」行。
-4. 问题 #1「修复状态（更新）」补 M1-3 复核条：关键文件 + 验证命令
-   （chat:: 19 passed / agent:: 30 passed）。
-5. 问题 #3「修复状态（更新）」M2-3 条补关键文件 + 验证命令
-   （agent:: 37 passed / doc clean）。
-
-## 验证
-- 手工确认六类问题都有顶部明确状态行。
-- `git diff --check`（无空白错误）。
-- 仅文档改动：复用上次全量绿测结果，不重跑 cargo test --all。
+## 执行顺序（先便宜后昂贵，避免 fmt/clippy 修改后重跑 test）
+- [x] 1. cargo fmt --all（无代码改动）
+- [x] 2. default clippy -D warnings（EXIT=0）
+- [x] 3. external feature clippy -D warnings（EXIT=0）
+- [x] 4. rustdoc -D warnings（EXIT=0）
+- [x] 5. cargo test --all --all-targets（EXIT=0，0 failed，10 ignored）
 
 ## 完成后
-- TODO.md 标记 M6-1 [DONE] + 完成记录。
-- 提交，停止（不进入 M6-2）。
+- TODO.md 标记 M6-2 [DONE]，完成记录写明各命令结果。
+- 提交，停止（不进入 M6-3）。
 
 ## 进度
-- [x] 编辑 docs/refine.md
-- [x] git diff --check（clean）
-- [x] TODO.md [DONE] + 记录
-- [x] commit
+- [x] fmt
+- [x] default clippy
+- [x] external clippy
+- [x] rustdoc
+- [x] test suite（878 lib passed，全库 0 failed，10 ignored real e2e）
+- [x] TODO.md [DONE] + commit

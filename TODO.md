@@ -1282,7 +1282,7 @@ git diff --check
   本任务仅改动 `docs/refine.md`（文档）与 `memory/claude_plan.md`（计划），未改动编译产物，
   复用 M5-3 以来的全量绿测结果，未重跑 `cargo test --all --all-targets`。
 
-### M6-2 [TODO] 全量验证默认构建、测试、文档和 external feature clippy
+### M6-2 [DONE] 全量验证默认构建、测试、文档和 external feature clippy
 
 上下文：
 
@@ -1309,6 +1309,31 @@ cargo clippy --all-targets \
 ```
 
 - 任务完成记录中写明命令结果。
+
+完成记录：
+
+- 按 AGENTS.md 要求以 cheap→expensive 顺序运行全部收尾验证命令，全部通过：
+  1. `cargo fmt --all` —— 无代码改动（仅 `memory/claude_plan.md` 计划文件被本任务编辑），
+     格式已符合规范。
+  2. `cargo clippy --all-targets -- -D warnings` —— EXIT=0，无 warning；`agent-lib` 与
+     `agent-testkit` 均 clean。
+  3. `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
+     —— EXIT=0，无 warning；启用四个 managed external adapter feature（含拉入真实可选依赖
+     `agent-client-protocol` / `agent-client-protocol-schema` 的 `external-acp`）后仍 clean。
+  4. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` —— EXIT=0，无 rustdoc
+     warning，成功生成 `agent-lib` 与 `agent-testkit` 文档。
+  5. `cargo test --all --all-targets` —— EXIT=0；汇总所有测试二进制：878 passed（lib 单测）
+     + 各集成测试用例，全库 **0 failed**；共 10 个 `#[ignore]` real e2e 用例（external
+     claude-code / codex / opencode 结构化回归 3+3+3、以及 mixed managed 多智能体 1）在默认
+     未配置 CLI/login 时保持 ignored 干净跳过，未强制运行。
+- 顺序选择：先 `fmt`→`clippy`(default)→`clippy`(external)→`rustdoc`，最后才跑最昂贵的全量
+  `cargo test`，避免格式/lint 修改后重跑测试；实际 `fmt` 未产生代码改动，故无需回退到任何
+  milestone 修正。
+- ignored real e2e 处理：未做默认强制运行；确认它们仍标注 `#[ignore]`，在无 `CLAUDE_CODE_BIN`
+  / `CODEX_BIN` / `OPENCODE_BIN` / `DEEPSEEK_API_KEY` 等配置时属于干净跳过（default 运行中计入
+  `10 ignored`），符合验证要求。
+- 本任务未改动任何编译产物（仅 `TODO.md` 完成记录与 `memory/claude_plan.md` 计划文件），全量
+  绿测结果即为本次实跑结果。
 
 ### M6-3 [TODO] Review：最终正确性和完整性验收
 
