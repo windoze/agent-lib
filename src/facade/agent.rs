@@ -39,22 +39,24 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
 
 use crate::agent::requirement::AgentSpecRef;
 use crate::agent::{
     AgentError, AgentInput, AgentSpec, AgentState, Blackboard, BudgetLimits, Capability, CostTier,
     DefaultAgentMachine, EscalationError, EscalationOutcome, EscalationRules, EscalationTrigger,
-    Escalator, HandlerScope, HumanGate, ImpactScope, InteractionHandler, LlmClientHandler,
-    LlmHandler, LlmStepMode, LoopCursor, LoopPolicy, Mailbox, ModelRef, Notification,
-    PermissionRisk, Plan, RequirementIds, RequirementResult, RunContext, RunId, ScriptedVerifier,
-    TaskDescriptor, TaskEvaluator, ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy,
-    ToolHandler, ToolRegistry, ToolRegistryHandler, ToolSetRef, Uncertainty, Verifier,
-    WorkerProfile, WorkerProfileRef, WorkerReport, WorkerRoster, WorktreeRef, drain,
+    Escalator, HandlerScope, HumanGate, ImpactScope, Interaction, InteractionHandler,
+    InteractionKind, LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor, LoopPolicy, Mailbox,
+    ModelRef, Notification, PermissionRisk, Plan, RequirementIds, RequirementResult, RunContext,
+    RunId, ScriptedVerifier, TaskDescriptor, TaskEvaluator, ToolApprovalPolicy, ToolExecutionIds,
+    ToolFailurePolicy, ToolHandler, ToolRegistry, ToolRegistryHandler, ToolSetRef, Uncertainty,
+    Verifier, WorkerProfile, WorkerProfileRef, WorkerReport, WorkerRoster, WorktreeRef, drain,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig};
-use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
+use crate::facade::approval::{ApprovalPolicy, FacadeApproval, enriched_approval_request};
 use crate::facade::chat::client_for_provider;
 use crate::facade::collab::{CollabBridge, CollabState, Collaboration, resolve};
 use crate::facade::config::{ModelConfig, ProviderConfig};
@@ -69,8 +71,8 @@ use crate::facade::external::{
 };
 use crate::facade::ids::FacadeIds;
 use crate::facade::run::{
-    ArtifactRef, DelegationStatus, DelegationTrace, EscalationTrace, IntoUserMessage, Reply,
-    RunEvent, RunOutput, ToolTrace, UsageSummary,
+    ApprovalRequest, ArtifactRef, DelegationStatus, DelegationTrace, EscalationTrace,
+    IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary,
 };
 use crate::facade::tool::{
     FacadeToolRegistry, Tool, ToolContextParts, ensure_unique_declaration_names,
@@ -318,6 +320,10 @@ impl Agent {
         let registry: Arc<dyn ToolRegistry> = Arc::new(registry);
 
         let recorder = new_delegation_recorder();
+        // Records each approval the drive pauses on so the non-streaming
+        // `RunOutput.events` can surface an `ApprovalRequested`, matching what
+        // the streaming path emits live (M2-1).
+        let approvals: ApprovalRecorder = Arc::new(Mutex::new(Vec::new()));
         let scope = FacadeAgentScope {
             llm: LlmClientHandler::new(self.client.clone()),
             tool: DelegationToolHandler::new(
@@ -330,7 +336,11 @@ impl Agent {
                 self.approval.clone(),
                 self.collab_bridge(),
             ),
-            interaction: self.interaction_handler(),
+            interaction: Arc::new(RecordingInteractionHandler {
+                approval: self.approval.clone(),
+                inner: self.interaction_handler(),
+                recorder: approvals.clone(),
+            }),
         };
 
         let agent_input = AgentInput::user_message(
@@ -343,6 +353,12 @@ impl Agent {
 
         let done = drain(&mut self.machine, agent_input, &scope, None, &ctx).await?;
         let collected = collect_traces(done.notifications(), &recorder);
+        // Recovered in fulfill order so a paused approval sits before the tool
+        // lifecycle it gated (or at the tail when the tool never started).
+        let recorded_approvals = approvals
+            .lock()
+            .expect("approval recorder poisoned")
+            .clone();
 
         // Refresh the retained per-delegate external session facts so a later
         // snapshot can persist them (§15.2), then surface an external-delegate
@@ -368,7 +384,7 @@ impl Agent {
                     tool_calls: collected.tool_calls,
                     delegations: collected.delegations,
                     artifacts: collected.artifacts,
-                    events: collected.events,
+                    events: weave_approval_events(collected.events, recorded_approvals),
                 })
             }
             LoopCursor::Error(error) => Err(classify_error(error.message())),
@@ -1373,6 +1389,104 @@ impl HandlerScope for FacadeAgentScope {
 
     fn interaction(&self) -> Option<&dyn InteractionHandler> {
         Some(self.interaction.as_ref())
+    }
+}
+
+/// An ordered, interior-mutable log of the approval requests a non-streaming
+/// [`Agent::run_full`] drive paused on, filled in fulfill order by
+/// [`RecordingInteractionHandler`].
+type ApprovalRecorder = Arc<Mutex<Vec<ApprovalRequest>>>;
+
+/// Wraps the resolved [`InteractionHandler`] for a non-streaming
+/// [`Agent::run_full`] drive, recording each paused approval as an
+/// [`ApprovalRequest`] before delegating so the terminal [`RunOutput::events`]
+/// can surface a [`RunEvent::ApprovalRequested`] the streaming path emits live
+/// through its `TapInteractionHandler` (M2-1).
+///
+/// The delegate `inner` is the host-injected handler when one was supplied to
+/// [`AgentBuilder::interaction_handler`], otherwise the shared [`FacadeApproval`]
+/// fallback, so this never changes which handler decides approve / deny /
+/// fallback — it only *observes* the request on the way through. The enriched
+/// request is built by [`enriched_approval_request`], the same helper the
+/// streaming tap handler uses, so both paths map the `FacadeApproval` fields
+/// identically.
+struct RecordingInteractionHandler {
+    approval: Arc<FacadeApproval>,
+    inner: Arc<dyn InteractionHandler>,
+    recorder: ApprovalRecorder,
+}
+
+#[async_trait]
+impl InteractionHandler for RecordingInteractionHandler {
+    async fn fulfill(&self, request: &Interaction, ctx: &RunContext) -> RequirementResult {
+        if let InteractionKind::Approval {
+            call_id,
+            requirement,
+        } = request.kind()
+        {
+            let approval_request = enriched_approval_request(&self.approval, *call_id, requirement);
+            self.recorder
+                .lock()
+                .expect("approval recorder poisoned")
+                .push(approval_request);
+        }
+        self.inner.fulfill(request, ctx).await
+    }
+}
+
+/// Weaves the recorded [`ApprovalRequest`]s of a non-streaming drive into the
+/// projected tool/delegation `events`, mirroring the order the streaming path
+/// emits them live: a [`RunEvent::ApprovalRequested`] lands immediately before
+/// the tool lifecycle of the call it gated.
+///
+/// Approvals are matched to tool events by `call_id` and anchored before the
+/// first [`RunEvent::ToolStarted`] or [`RunEvent::ToolFinished`] bearing that
+/// id — an approved call surfaces both (the approval precedes the `ToolStarted`),
+/// while a denied call surfaces only a `ToolFinished` (the approval still
+/// precedes it). Any approval whose call left no tool event at all (for example
+/// a headless deny that never reached the executor) is flushed in recorded
+/// order at the point its decision was made: just before the next anchored call
+/// it precedes, or at the tail. This guarantees every paused approval stays
+/// observable even when the tool never executed.
+fn weave_approval_events(events: Vec<RunEvent>, approvals: Vec<ApprovalRequest>) -> Vec<RunEvent> {
+    if approvals.is_empty() {
+        return events;
+    }
+    let mut merged = Vec::with_capacity(events.len() + approvals.len());
+    let mut next = 0usize;
+    for event in events {
+        if let Some(call_id) = tool_event_call_id(&event) {
+            // Flush pending approvals up to and including the one that gated this
+            // call, so any earlier denied approvals keep their relative order.
+            if let Some(offset) = approvals[next..]
+                .iter()
+                .position(|approval| approval.call_id == call_id)
+            {
+                let through = next + offset;
+                for approval in &approvals[next..=through] {
+                    merged.push(RunEvent::ApprovalRequested(approval.clone()));
+                }
+                next = through + 1;
+            }
+        }
+        merged.push(event);
+    }
+    for approval in &approvals[next..] {
+        merged.push(RunEvent::ApprovalRequested(approval.clone()));
+    }
+    merged
+}
+
+/// Returns the framework `call_id` a tool-lifecycle [`RunEvent`] addresses, used
+/// by [`weave_approval_events`] to anchor an approval before the call it gated.
+///
+/// Only [`RunEvent::ToolStarted`] / [`RunEvent::ToolFinished`] carry a `call_id`
+/// (delegation traces do not), and both an approved call's `ToolStarted` and a
+/// denied call's `ToolFinished` are valid anchors for the same gating approval.
+fn tool_event_call_id(event: &RunEvent) -> Option<&str> {
+    match event {
+        RunEvent::ToolStarted(trace) | RunEvent::ToolFinished(trace) => Some(&trace.call_id),
+        _ => None,
     }
 }
 

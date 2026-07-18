@@ -201,7 +201,7 @@ cargo test -p agent-lib --lib facade::agent::
 
 ## M2：非流式事件一致性
 
-### M2-1 [TODO] 在 `Agent::run_full` 中记录 `ApprovalRequested` 事件
+### M2-1 [DONE] 在 `Agent::run_full` 中记录 `ApprovalRequested` 事件
 
 上下文：
 
@@ -229,6 +229,37 @@ cargo test -p agent-lib --lib facade::agent::
 ```bash
 cargo test -p agent-lib --lib facade::agent::
 ```
+
+完成记录：
+
+- 抽取共享 helper `enriched_approval_request(approval, call_id, requirement)`
+  到 `src/facade/approval.rs`：peek `FacadeApproval::pending_request`（不消费，
+  fallback handler 仍可 remove）取 tool name + 脱敏 input 摘要，再用机器携带的
+  interaction 重绑 `call_id` 与 `reason`。流式路径 `TapInteractionHandler`
+  （`src/facade/agent/stream.rs`）改为复用该 helper，消除 `FacadeApproval`
+  字段映射重复。
+- 非流式路径新增 `RecordingInteractionHandler`（`src/facade/agent.rs`）：包裹
+  `interaction_handler()` 解析出的 handler（注入的 handler 或 `FacadeApproval`
+  fallback），在 approval interaction 传给真实 handler *之前* 按 fulfill 顺序把
+  `ApprovalRequest` 记录进 `Arc<Mutex<Vec<..>>>`。仅观察不决策，approve / deny /
+  fallback 优先级完全不变。
+- 新增 `weave_approval_events(events, approvals)`：把记录的审批按 `call_id`
+  编织进 `collect_traces` 产出的事件流——审批落在其 gated 调用的首个
+  `ToolStarted`/`ToolFinished`（approved 走 `ToolStarted`，denied 只有
+  `ToolFinished`）之前；无任何工具事件的审批（headless deny 等）按记录顺序在下一
+  个锚点前或队尾 flush，保证每个暂停审批可见。流式路径不受影响（审批实时 emit，
+  `collect_traces` 仍不产审批事件）。
+- `run_full` 主 supervisor drive 装配 recorder 并包裹 `scope.interaction`，
+  drain 后 `events: weave_approval_events(collected.events, recorded_approvals)`。
+- 新增 3 条离线回归（`src/facade/agent/tests.rs`）：`ask` approve 经 fallback →
+  `ApprovalRequested` 先于 `ToolStarted`/`ToolFinished` 且带 call id / reason /
+  脱敏 input；注入 handler deny → 仍记录 `ApprovalRequested` 且先于 denied
+  `ToolFinished`、无 `ToolStarted`；headless `ask`（`ApprovalPolicy::ask_tool`
+  无 handler）→ 仍记录 `ApprovalRequested`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
+  `cargo test -p agent-lib --lib facade::agent::`（33 passed，含 3 条新回归）、
+  `cargo test -p agent-lib --lib`（844 passed）、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
 ### M2-2 [TODO] 对齐非流式和流式事件契约文档与回归测试
 

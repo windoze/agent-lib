@@ -23,7 +23,7 @@ use crate::agent::{
     RequirementResult, RunContext,
 };
 use crate::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
-use crate::facade::approval::{Approval, ApprovalDecision};
+use crate::facade::approval::{Approval, ApprovalDecision, ApprovalPolicy};
 use crate::facade::collab::Collaboration;
 use crate::facade::delegate::Delegation;
 use crate::facade::error::FacadeError;
@@ -296,6 +296,198 @@ async fn auto_deny_skips_tool_execution() {
         "a denied tool never executes"
     );
     assert_eq!(reply.text(), "I could not run that tool.");
+}
+
+/// The non-streaming `run_full` records `ApprovalRequested` for an `ask`-tier
+/// tool answered through the shared `FacadeApproval` fallback, and the event
+/// precedes the tool lifecycle it gated with the same enriched fields the
+/// streaming path emits (M2-1).
+#[tokio::test]
+async fn run_full_records_ask_approval_then_tool_lifecycle() {
+    let client = ScriptedClient::new(vec![tool_use_response(), text_response("It is sunny.")]);
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut agent = agent_with(
+        client,
+        counting_weather_tool(executions.clone()),
+        Approval::ask(|_request| ApprovalDecision::Approve),
+    );
+
+    let output = agent.run_full("weather?").await.unwrap();
+
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        1,
+        "an approved tool runs exactly once"
+    );
+
+    let approval_pos = output.events.iter().position(|event| {
+        matches!(event, RunEvent::ApprovalRequested(request) if request.tool_name == "get_weather")
+    });
+    let started_pos = output.events.iter().position(
+        |event| matches!(event, RunEvent::ToolStarted(trace) if trace.name == "get_weather"),
+    );
+    let finished_pos = output.events.iter().position(
+        |event| matches!(event, RunEvent::ToolFinished(trace) if trace.name == "get_weather"),
+    );
+    let (Some(approval_pos), Some(started_pos), Some(finished_pos)) =
+        (approval_pos, started_pos, finished_pos)
+    else {
+        panic!(
+            "expected approval + tool lifecycle events, got {:?}",
+            output.events
+        );
+    };
+    assert!(
+        approval_pos < started_pos && started_pos < finished_pos,
+        "ApprovalRequested precedes ToolStarted precedes ToolFinished, got {:?}",
+        output.events
+    );
+
+    let RunEvent::ApprovalRequested(request) = &output.events[approval_pos] else {
+        unreachable!("indexed an ApprovalRequested position");
+    };
+    assert!(
+        !request.call_id.is_empty(),
+        "the approval carries the pending call id, got {request:?}"
+    );
+    assert_eq!(
+        request.reason.as_deref(),
+        Some("approve execution of tool `get_weather`"),
+        "the approval carries the requirement reason, got {request:?}"
+    );
+    assert_eq!(
+        request.input.as_deref(),
+        Some("{\"city\":\"Shanghai\"}"),
+        "the approval carries a redacted input summary, got {request:?}"
+    );
+
+    let RunEvent::ToolStarted(started) = &output.events[started_pos] else {
+        unreachable!("indexed a ToolStarted position");
+    };
+    assert_eq!(
+        started.call_id, request.call_id,
+        "the approval gates the same call that started"
+    );
+}
+
+/// A caller-injected handler that denies still leaves the paused approval in
+/// `RunOutput.events`, and the denied tool emits no lifecycle events (M2-1).
+#[tokio::test]
+async fn run_full_records_approval_when_injected_handler_denies() {
+    let client = ScriptedClient::new(vec![
+        tool_use_response(),
+        text_response("I could not run that tool."),
+    ]);
+    let executions = Arc::new(AtomicUsize::new(0));
+    let handler = Arc::new(FixedInteractionHandler {
+        decision: ApprovalDecision::Deny,
+    });
+    let mut agent = AgentBuilder::default()
+        .client(client)
+        .model("test-model")
+        .tool(counting_weather_tool(executions.clone()))
+        .approval(Approval::auto_deny())
+        .interaction_handler(handler)
+        .build()
+        .expect("build agent");
+
+    let output = agent.run_full("weather?").await.unwrap();
+
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "a denied tool never executes"
+    );
+    assert_eq!(output.reply.text(), "I could not run that tool.");
+
+    let approval = output.events.iter().find_map(|event| match event {
+        RunEvent::ApprovalRequested(request) => Some(request.clone()),
+        _ => None,
+    });
+    let Some(approval) = approval else {
+        panic!(
+            "a denied run still records ApprovalRequested, got {:?}",
+            output.events
+        );
+    };
+    assert_eq!(
+        approval.tool_name, "get_weather",
+        "the approval names the denied tool"
+    );
+    assert!(
+        !approval.call_id.is_empty(),
+        "the approval carries the pending call id, got {approval:?}"
+    );
+    // A denied tool never starts, so it emits no `ToolStarted`; the approval
+    // still precedes any (denied) `ToolFinished` the drive projects for the call.
+    assert!(
+        !output
+            .events
+            .iter()
+            .any(|event| matches!(event, RunEvent::ToolStarted(_))),
+        "a denied tool never starts, got {:?}",
+        output.events
+    );
+    let approval_pos = output.events.iter().position(|event| {
+        matches!(event, RunEvent::ApprovalRequested(request) if request.call_id == approval.call_id)
+    });
+    let finished_pos = output.events.iter().position(
+        |event| matches!(event, RunEvent::ToolFinished(trace) if trace.call_id == approval.call_id),
+    );
+    if let (Some(approval_pos), Some(finished_pos)) = (approval_pos, finished_pos) {
+        assert!(
+            approval_pos < finished_pos,
+            "ApprovalRequested precedes the denied ToolFinished, got {:?}",
+            output.events
+        );
+    }
+}
+
+/// A headless `ask` tier (no injected handler, no `ask` closure) is denied by
+/// `FacadeApproval` without blocking, yet the paused approval is still recorded
+/// into `RunOutput.events` (M2-1).
+#[tokio::test]
+async fn run_full_records_approval_for_headless_ask_without_handler() {
+    let client = ScriptedClient::new(vec![
+        tool_use_response(),
+        text_response("I could not run that tool."),
+    ]);
+    let executions = Arc::new(AtomicUsize::new(0));
+    let policy = ApprovalPolicy::new(Approval::auto_allow()).ask_tool("get_weather");
+    let mut agent = AgentBuilder::default()
+        .client(client)
+        .model("test-model")
+        .tool(counting_weather_tool(executions.clone()))
+        .approval(policy)
+        .build()
+        .expect("build agent");
+
+    let output = agent.run_full("weather?").await.unwrap();
+
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "a headless-denied tool never executes"
+    );
+
+    let approval = output.events.iter().find_map(|event| match event {
+        RunEvent::ApprovalRequested(request) => Some(request.clone()),
+        _ => None,
+    });
+    let Some(approval) = approval else {
+        panic!(
+            "a headless ask still records ApprovalRequested, got {:?}",
+            output.events
+        );
+    };
+    assert_eq!(
+        approval.tool_name, "get_weather",
+        "the approval names the pending tool"
+    );
+    assert!(
+        !approval.call_id.is_empty(),
+        "the approval carries the pending call id, got {approval:?}"
+    );
 }
 
 #[tokio::test]

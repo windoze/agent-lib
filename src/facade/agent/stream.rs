@@ -53,12 +53,10 @@ use crate::agent::{
 };
 use crate::client::{ChatRequest, ClientError, LlmClient, Response};
 use crate::conversation::ToolCallId;
-use crate::facade::approval::FacadeApproval;
+use crate::facade::approval::{FacadeApproval, enriched_approval_request};
 use crate::facade::delegate::{DelegationRecorder, DelegationToolHandler, new_delegation_recorder};
 use crate::facade::error::FacadeError;
-use crate::facade::run::{
-    ApprovalRequest, DelegationStatus, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary,
-};
+use crate::facade::run::{DelegationStatus, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary};
 use crate::facade::tool::{FacadeToolRegistry, ToolContextParts};
 use crate::model::message::Message;
 use crate::model::tool::ToolCall;
@@ -751,12 +749,7 @@ impl InteractionHandler for TapInteractionHandler {
             // `call_id` and `reason` are re-bound from the machine-carried
             // interaction so the emit reflects exactly what the machine paused
             // on, even under an injected handler.
-            let mut approval_request = self
-                .approval
-                .pending_request(*call_id)
-                .unwrap_or_else(|| ApprovalRequest::for_tool(String::new()));
-            approval_request.call_id = call_id.to_string();
-            approval_request.reason = requirement.reason().map(ToOwned::to_owned);
+            let approval_request = enriched_approval_request(&self.approval, *call_id, requirement);
             emit(&self.sink, RunEvent::ApprovalRequested(approval_request));
         }
         self.inner.fulfill(request, ctx).await

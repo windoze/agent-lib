@@ -682,6 +682,33 @@ impl FacadeApproval {
     }
 }
 
+/// Builds the enriched [`ApprovalRequest`] a paused approval interaction should
+/// surface, shared by the Agent facade's streaming tap handler and its
+/// non-streaming approval recorder so the `call_id` / `reason` field mapping
+/// lives in exactly one place (§9).
+///
+/// The tool name and redacted input summary are recovered from the pending
+/// decision the [`ToolApprovalPolicy`] already recorded — peeked via
+/// [`pending_request`](FacadeApproval::pending_request), *not* consumed, so the
+/// fallback [`InteractionHandler`] can still remove it — while the `call_id` and
+/// `reason` are re-bound from the machine-carried interaction so the request
+/// reflects exactly what the machine paused on. This holds even under a
+/// host-injected handler that never touches the pending map, because the machine
+/// gate stays [`FacadeApproval`] and records the decision regardless of which
+/// handler answers.
+pub(crate) fn enriched_approval_request(
+    approval: &FacadeApproval,
+    call_id: ToolCallId,
+    requirement: &ApprovalRequirement,
+) -> ApprovalRequest {
+    let mut request = approval
+        .pending_request(call_id)
+        .unwrap_or_else(|| ApprovalRequest::for_tool(String::new()));
+    request.call_id = call_id.to_string();
+    request.reason = requirement.reason().map(ToOwned::to_owned);
+    request
+}
+
 impl fmt::Debug for FacadeApproval {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
