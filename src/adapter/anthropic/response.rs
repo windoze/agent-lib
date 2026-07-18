@@ -2,6 +2,7 @@
 
 use super::AnthropicAdapter;
 use crate::{
+    adapter::http,
     client::{ChatRequest, ClientError, Response},
     model::{
         content::ContentBlock,
@@ -45,7 +46,19 @@ impl AnthropicAdapter {
     /// Callers must set [`ChatRequest::stream`] to `false`; streaming requests
     /// are handled by the separate streaming path so a successful SSE body can
     /// never be mistaken for complete response JSON.
+    ///
+    /// The whole request is bounded by a 10-minute total timeout; the connect
+    /// phase and non-2xx error bodies have their own tighter limits (see
+    /// [`AnthropicAdapter::new`]).
     pub async fn chat(&self, request: ChatRequest) -> Result<Response, ClientError> {
+        match tokio::time::timeout(http::DEFAULT_REQUEST_TIMEOUT, self.chat_inner(request)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(ClientError::Timeout),
+        }
+    }
+
+    /// Executes the unbounded body of [`AnthropicAdapter::chat`].
+    async fn chat_inner(&self, request: ChatRequest) -> Result<Response, ClientError> {
         if request.stream {
             return Err(invalid_response(
                 "non-streaming chat requires ChatRequest.stream to be false".to_owned(),
@@ -64,16 +77,17 @@ impl AnthropicAdapter {
             .get(RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let body = response.bytes().await.map_err(map_transport_error)?;
 
         if !status.is_success() {
+            let body = http::read_error_body(response).await?;
             return Err(ClientError::from_http_response(
                 status.as_u16(),
-                String::from_utf8_lossy(&body),
+                body,
                 retry_after.as_deref(),
             ));
         }
 
+        let body = response.bytes().await.map_err(map_transport_error)?;
         Self::parse_response(&body)
     }
 }

@@ -29,16 +29,28 @@ pub struct OpenAiRespAdapter {
 }
 
 impl OpenAiRespAdapter {
-    /// Creates an adapter with reqwest's default reusable HTTP client.
+    /// Creates an adapter with a default reusable HTTP client.
+    ///
+    /// Default transport limits (regardless of the constructor used):
+    ///
+    /// - connect timeout: 10s (built into the default client),
+    /// - `chat()`: 10min total per request,
+    /// - `chat_stream()`: 10min for connect + response headers; the SSE body
+    ///   itself has no total timeout so long streams are never killed,
+    /// - non-2xx error bodies: 30s read timeout, truncated at 1 MiB.
+    ///
+    /// Use [`OpenAiRespAdapter::with_http_client`] to supply stricter
+    /// client-level timeouts, proxies, or connection-pool settings.
     pub fn new(endpoint: EndpointConfig) -> Self {
-        Self::with_http_client(endpoint, reqwest::Client::new())
+        Self::with_http_client(endpoint, super::http::default_http_client())
     }
 
     /// Creates an adapter with a caller-configured reusable HTTP client.
     ///
     /// Applications can use the supplied client to configure timeouts,
     /// proxies, and connection pooling without putting runtime resources in
-    /// [`EndpointConfig`].
+    /// [`EndpointConfig`]. The per-request phase limits documented on
+    /// [`OpenAiRespAdapter::new`] still apply on top of the supplied client.
     pub fn with_http_client(endpoint: EndpointConfig, http_client: reqwest::Client) -> Self {
         Self {
             http_client,

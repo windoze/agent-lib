@@ -2,6 +2,7 @@
 
 use super::AnthropicAdapter;
 use crate::{
+    adapter::http,
     client::{ChatRequest, ClientError},
     stream::StreamEvent,
 };
@@ -21,6 +22,10 @@ impl AnthropicAdapter {
     /// The returned stream owns the HTTP response and normalizes each provider
     /// event lazily. Callers must set [`ChatRequest::stream`] to `true` so an
     /// accidental non-streaming JSON response cannot enter the SSE decoder.
+    ///
+    /// Only the connect + response-headers phase is bounded (10 minutes);
+    /// the SSE body itself has no total timeout because long-lived streams are
+    /// the normal case.
     pub async fn chat_stream(
         &self,
         request: ChatRequest,
@@ -32,11 +37,13 @@ impl AnthropicAdapter {
         }
 
         let request = self.build_request(&request)?;
-        let response = self
-            .http_client
-            .execute(request)
-            .await
-            .map_err(map_transport_error)?;
+        let response = tokio::time::timeout(
+            http::DEFAULT_REQUEST_TIMEOUT,
+            self.http_client.execute(request),
+        )
+        .await
+        .map_err(|_elapsed| ClientError::Timeout)?
+        .map_err(map_transport_error)?;
         let status = response.status();
         let retry_after = response
             .headers()
@@ -45,10 +52,10 @@ impl AnthropicAdapter {
             .map(str::to_owned);
 
         if !status.is_success() {
-            let body = response.bytes().await.map_err(map_transport_error)?;
+            let body = http::read_error_body(response).await?;
             return Err(ClientError::from_http_response(
                 status.as_u16(),
-                String::from_utf8_lossy(&body),
+                body,
                 retry_after.as_deref(),
             ));
         }

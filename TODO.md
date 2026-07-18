@@ -55,7 +55,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`（883 lib 测试在内全部通过）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - `docs/review-2026-07.md` H-SEC-1 已标注 `✅ 已修复（M1-1）`。无 breaking change（Debug 输出格式变化不计入 API 稳定性承诺）。
 
-### M1-2 [TODO] 默认 HTTP 超时 + 错误路径 body 读取上限（H-SEC-2）
+### M1-2 [DONE] 默认 HTTP 超时 + 错误路径 body 读取上限（H-SEC-2）
 
 上下文：
 
@@ -77,6 +77,19 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：错误 body 读取 helper 输入超长流时返回截断结果且带标注（离线，用内存 stream 即可）。
 - 现有全部测试通过：`cargo test --all --all-targets`。
 - 无挂起的测试（AGENTS.md：任何测试必须远小于一分钟完成）。
+
+完成记录：
+
+- 新增 `src/adapter/http.rs`（crate 私有模块）：集中定义默认限值常量 `DEFAULT_CONNECT_TIMEOUT = 10s`、`DEFAULT_REQUEST_TIMEOUT = 10min`、`ERROR_BODY_READ_TIMEOUT = 30s`、`ERROR_BODY_MAX_BYTES = 1 MiB`、`TRUNCATED_SUFFIX = "[truncated]"`，以及 `default_http_client()`（builder 只设 connect_timeout，`build()` 失败仅可能为 TLS 初始化异常，选型为 `expect` 带说明，已在代码注释记录）和 `read_error_body()`。helper 是**新增共享代码**而非搬迁既有重复实现，四处调用同一实现保证行为一致；M8 收敛时可直接并入公共传输模块。
+- 错误 body 读取核心 `read_error_body_bounded(stream, timeout, cap)` 对 stream 泛型化（chunk `AsRef<[u8]>`），生产调 `response.bytes_stream()`，测试用内存 stream + 小超时，无需网络。分块读到上限即停（不 drain 剩余 body），截断后追加 `[truncated]`；超时映射 `ClientError::Timeout`，传输错误映射 `Network`（与既有 `map_transport_error` 口径一致）。
+- `AnthropicAdapter::new()` / `OpenAiRespAdapter::new()` 改用 `default_http_client()`（10s connect timeout）；**不**用 `Client::timeout()`（会误杀长 SSE 流）。
+- 非流式 `chat()`：拆出 `chat_inner`，外层 `tokio::time::timeout(10min)` 包裹整个请求，超时映射 `ClientError::Timeout`。
+- 流式 `chat_stream()`：只对 `execute()`（建连 + 响应头）包 10min 超时；返回的 SSE body 流不设总超时。
+- 4 处错误路径（两个 `stream/mod.rs` + 两个 `response.rs`）统一改调 `http::read_error_body()`；错误分类仍走 `ClientError::from_http_response`，截断标注随 body 进入错误消息。
+- 文档：两个 adapter 的 `new()` rustdoc 写明四项默认限值与 `with_http_client` 覆盖方式（调用方 client 上更严的超时先生效；10min 相位上限为 adapter 层固定策略，文档如实说明）。
+- 测试：`adapter::http::tests` 4 条——超限截断 + `[truncated]` 标注、恰好在 cap 不标注、stalled stream 以 `Timeout` 返回（注入 10ms 超时，瞬完）、默认 client 可构建。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets` 全过（含 73 条 adapter 测试，无挂起）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 初报私有 intra-doc link 错误，已将 4 处指向 crate 私有常量的链接改为明文后通过。
+- `docs/review-2026-07.md` H-SEC-2 已标注 `✅ 已修复（M1-2）`。无 breaking change（`new()` 行为仅增加超时防护）。
 
 ### M1-3 [TODO] `Usage` 算术溢出改饱和/错误化（H-SEC-3、facade 报告 M2）
 
