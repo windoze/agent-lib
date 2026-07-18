@@ -2172,7 +2172,7 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
 > `AgentBuilder` 能注入自定义 async `InteractionHandler`，但 **`Agent::restore()` 路径没有对应注入口**，
 > 使得恢复出的会话无法用宿主的跨进程审批 handler——对任何需要"持久化会话 + 交互式审批"的宿主是硬伤。
 
-### [TODO] M7-F1 `AgentRestoreBuilder::interaction_handler(..)` 注入口（与 `AgentBuilder` 对齐）
+### [DONE] M7-F1 `AgentRestoreBuilder::interaction_handler(..)` 注入口(与 `AgentBuilder` 对齐）
 
 **上下文**：
 
@@ -2200,6 +2200,35 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
   对称）；未注入时回落到 `FacadeApproval` 的既有行为不变。
 - 聚焦：`cargo test -p agent-lib facade::agent`（或 snapshot/restore 所在过滤名，含新用例）。
 - 完整验证序列 1–6（+ 若涉及则全 external features clippy）。
+
+**完成记录（M7-F1）**：
+
+- **实现**（`src/facade/agent/snapshot.rs`）：给 `AgentRestoreBuilder` 补齐与 `AgentBuilder` 对齐的
+  interaction-handler 注入口。
+  - 新增字段 `interaction_handler: Option<Arc<dyn InteractionHandler>>`（`#[derive(Default)]` 下默认 `None`），
+    并把 `crate::agent::InteractionHandler` 加入 import。
+  - 新增 builder 方法 `pub fn interaction_handler(self, handler: Arc<dyn InteractionHandler>) -> Self`，
+    签名/语义/与 `.approval(..)` 的优先级（handler 是「回答」paused interaction 的唯一权威;policy 仍决定哪些
+    tool call 在 gate 处暂停;同步 `run`/`run_full` 与流式 `stream` 两路都经该 handler）rustdoc 与
+    `AgentBuilder::interaction_handler`（M7-1)逐条对齐,并写清 handler 不入 snapshot、须重注入(§15.2)。
+  - `build()` 把硬编码的 `interaction_handler: None` 替换为 `self.interaction_handler`;未注入时保持回落到
+    `FacadeApproval` 的既有行为(向后兼容)。`Debug` impl 加 `has_interaction_handler`(不渲染句柄本体)。
+- **文档**：`docs/facade-api.md` §21 增补「restore 路径对齐(M7-F1)」段,说明缺口 1 的注入口在 `Agent::restore()`
+  路径同样开放且与 build 路径完全对齐,未重注入即回落同步 `FacadeApproval`。
+- **测试**（`src/facade/agent/tests.rs`,与 M7-1 暂停语义对称）：
+  - `restored_interaction_handler_pauses_until_approved`:snapshot 一个已提交 turn → `Agent::restore()`
+    重注入 `GatedInteractionHandler` + `auto_deny` → 驱动一个需审批 turn,断言脚本化 handler resolve **前** run
+    始终 `Poll::Pending` 且 gated tool 零执行;`approve` 后 run 完成、tool 恰执行一次。
+  - `restored_without_handler_falls_back_to_facade_approval`:未重注入 handler 时 `auto_deny` gate 下 gated tool
+    零执行,锁定回落到同步 `FacadeApproval` 的既有行为。
+  - `cargo test -p agent-lib --lib facade::agent`:26 passed(含 2 新用例),0 failed。
+- **验证序列全绿**:1) `cargo fmt --all`;2) `cargo clippy --all-targets -- -D warnings`(洁净);
+  3) `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D warnings`
+  (洁净);4) `cargo test --all --all-targets`(全绿,无 failed);
+  5) `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`(洁净);6) `cargo test --doc -p agent-lib`(12 passed);
+  7) `git diff --check` 干净。
+- **Test Failure Policy**:无新观察到的未调度失败测试;real-CLI e2e 仍 `#[ignore]` 且无 binary/login 时干净 skip
+  (既有调度)。
 
 ### [TODO] M7-F-R Review：restore 注入口对齐核对
 

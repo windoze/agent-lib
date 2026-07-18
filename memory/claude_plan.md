@@ -1,46 +1,44 @@
-# M7-R — Review: host-embedding surface correctness + doc consistency
+# M7-F1 — `AgentRestoreBuilder::interaction_handler(..)` injection seam
 
-TODO.md first incomplete task = **M7-R** (line 2110). M7-1..M7-5 are `[DONE]`.
-M7-R is the LAST task → on completion, all tasks done → final review + `endtag`.
+TODO.md first incomplete task = **M7-F1** (line 2175). Everything M1–M7-R is `[DONE]`.
+M7-F1 aligns the restore path with `AgentBuilder::interaction_handler` (M7-1).
 
-## What M7-R requires
-1. Verify consistency with docs/facade-api.md §19 + PLAN.md Milestone 7:
-   - still assembly layer, NO new effect family, no change to lower-layer semantics.
-   - each injection seam has a default preserving M1–M6 behavior; no compat break
-     (`#[non_exhaustive]` add-field, un-injected fallback).
-2. Access-surface acceptance: confirm each of the "5 gaps" (= M7-1..M7-5 subgoals) is
-   solvable **via facade injection**, host never descends to agent layer to self-assemble
-   a HandlerScope+drain. Check whether `prelude` needs new public types (WireRunEvent etc.).
-3. Summarize leftover gaps as follow-up tasks; confirm NO unscheduled failing tests.
+## Gap
+- `AgentRestoreBuilder` (`src/facade/agent/snapshot.rs`) has no `interaction_handler`
+  field/method; `build()` hardcodes `interaction_handler: None` (snapshot.rs:753),
+  so a restored `Agent` always falls back to the synchronous `FacadeApproval`.
+- `AgentBuilder::interaction_handler(Arc<dyn InteractionHandler>)` (agent.rs:1015)
+  already provides the injection seam. The two are misaligned.
+
+## Plan
+1. `src/facade/agent/snapshot.rs`:
+   - import `InteractionHandler` from `crate::agent`.
+   - add field `interaction_handler: Option<Arc<dyn InteractionHandler>>` to
+     `AgentRestoreBuilder` (derives `Default`, Option → None OK).
+   - add `has_interaction_handler` to its `Debug` impl.
+   - add builder method `interaction_handler(self, handler) -> Self` with rustdoc
+     mirroring `AgentBuilder::interaction_handler` (priority vs `.approval`,
+     both run + stream routed through it, not carried in snapshot / must re-inject).
+   - in `build()`, replace hardcoded `interaction_handler: None` with
+     `self.interaction_handler` (keep the comment: un-injected → FacadeApproval).
+2. `src/facade/agent/tests.rs`: add offline test symmetric to M7-1's
+   `injected_interaction_handler_pauses_until_approved` but driving a *restored*
+   agent: snapshot a committed turn → `Agent::restore()...interaction_handler(gated)
+   .build()` → drive an approval-gated turn → assert machine does not advance until
+   the scripted handler resolves; approve → tool runs exactly once. Plus assert the
+   un-injected restore still falls back (existing `snapshot_then_restore_continues_history`
+   already covers default fallback behavior).
 
 ## Validation
-- Full sequence 1–6 all green + all-external-features clippy.
-- Produce comparison table: 5 gaps vs M7 impl (solved via facade / needs descent + reason).
+1. `cargo fmt --all`
+2. `cargo clippy --all-targets -- -D warnings`
+3. all-external-features clippy (touch facade only; run to be safe)
+4. `cargo test -p agent-lib facade::agent` (focused) then `cargo test --all --all-targets`
+5. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+6. `cargo test --doc -p agent-lib`
 
-## Findings / actions
-- prelude.rs currently exports NO M7 host-embedding types. facade::mod re-exports
-  WireRunEvent/WireRunOutput/ApprovalRequest but prelude omits them.
-  → ACTION: add host-embedding types to prelude (WireRunEvent, WireRunOutput,
-    ApprovalRequest) + update prelude rustdoc mentioning M7.
-- §19 design constraints: M7-5 hooks are #[serde(skip)] (dropped on snapshot) → consistent
-  with "Snapshot 不保存 secret、闭包、client". No new effect family. Verify in code.
-
-## Progress
-- [ ] Verify each of 5 gaps in code (interaction_handler / WireRunEvent / ApprovalRequest /
-      external session handler / dispatcher+permission seams)
-- [ ] Decide + apply prelude additions
-- [ ] Run validation sequence 1–6 + external clippy
-- [ ] Fill completion record (comparison table), mark M7-R [DONE]
-- [ ] Final review + git tag endtag (all tasks done)
-
-## Progress (updated — M7-R COMPLETE)
-- [x] Verified all 5 gaps solved via facade injection (interaction_handler / to_wire /
-      enriched ApprovalRequest / default_external_session_handler / dispatcher+on_permission)
-- [x] §19 constraints all hold (assembly layer, no new effect family, snapshot drops hooks,
-      non_exhaustive add-field compat)
-- [x] prelude fix: added WireRunEvent, WireRunOutput, ApprovalRequest + refreshed rustdoc
-- [x] Validation 1–7 green: fmt / clippy default / clippy all-external-features /
-      test --all --all-targets (exit 0) / doc -D warnings / doctest (12) / git diff --check
-- [x] No leftover gaps, no unscheduled failing tests
-- [x] Completion record + comparison table in TODO.md, M7-R [DONE]
-- [ ] Commit + git tag endtag (all tasks done → project complete)
+## Status
+- [x] implement snapshot.rs
+- [x] add test
+- [x] validate (all 6 steps + all-external clippy green)
+- [x] mark M7-F1 [DONE] in TODO.md + commit

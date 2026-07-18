@@ -27,7 +27,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::external::{ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionRef};
-use crate::agent::{AgentSpec, AgentState, PlanSnapshot, ToolRegistry, ToolSetRef, WorktreeRef};
+use crate::agent::{
+    AgentSpec, AgentState, InteractionHandler, PlanSnapshot, ToolRegistry, ToolSetRef, WorktreeRef,
+};
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationSnapshot};
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
@@ -440,6 +442,14 @@ pub struct AgentRestoreBuilder {
     custom_registry: Option<Arc<dyn ToolRegistry>>,
     extra_declarations: Vec<ToolDecl>,
     approval: Option<ApprovalPolicy>,
+    /// An optional host-supplied interaction handler re-injected on restore.
+    ///
+    /// A snapshot is data-only and never carries this runtime handle, so the
+    /// caller must re-supply it here to keep a restored session on the host's
+    /// async approval path; when absent the rebuilt agent falls back to the
+    /// conservative [`FacadeApproval`] behavior (§19). Symmetric with
+    /// [`AgentBuilder::interaction_handler`](super::AgentBuilder::interaction_handler).
+    interaction_handler: Option<Arc<dyn InteractionHandler>>,
     ids: Option<FacadeIds>,
     subagent_overrides: Vec<LocalSubagent>,
     external_overrides: Vec<ManagedExternalDelegate>,
@@ -460,6 +470,10 @@ impl std::fmt::Debug for AgentRestoreBuilder {
             )
             .field("has_custom_registry", &self.custom_registry.is_some())
             .field("approval", &self.approval)
+            .field(
+                "has_interaction_handler",
+                &self.interaction_handler.is_some(),
+            )
             .field(
                 "subagent_overrides",
                 &self
@@ -537,6 +551,37 @@ impl AgentRestoreBuilder {
     #[must_use]
     pub fn approval(mut self, approval: impl Into<ApprovalPolicy>) -> Self {
         self.approval = Some(approval.into());
+        self
+    }
+
+    /// Re-injects a custom async [`InteractionHandler`] for the restored agent,
+    /// the restore-path counterpart of
+    /// [`AgentBuilder::interaction_handler`](super::AgentBuilder::interaction_handler)
+    /// (M7-1).
+    ///
+    /// A snapshot is data-only and deliberately omits this runtime handle (§15.2):
+    /// a restored agent therefore defaults to the conservative synchronous
+    /// [`FacadeApproval`] path until a handler is re-supplied here. Re-inject the
+    /// host's handler so a restored session keeps answering paused interactions —
+    /// chiefly tool-call approvals — by `await`ing a cross-process decision
+    /// instead of resolving synchronously.
+    ///
+    /// # Priority relative to [`approval`](Self::approval)
+    ///
+    /// Identical to the build path: an injected handler becomes the **sole
+    /// authority** for *answering* a paused interaction, overriding the
+    /// [`ApprovalPolicy`]'s per-decision `ask`/`deny` logic. The policy still
+    /// governs the machine **gate** — which tool calls pause at all — so pair the
+    /// handler with an ask/deny default (for example
+    /// [`Approval::auto_deny`](crate::facade::Approval::auto_deny)) to route every
+    /// tool call through it. Both the blocking [`run`](super::Agent::run) path and
+    /// the incremental [`stream`](super::Agent::stream) path of the restored agent
+    /// route their paused interactions through the injected handler, mirroring the
+    /// build path. When no handler is injected the restored agent behaves exactly
+    /// as before (falls back to [`FacadeApproval`]).
+    #[must_use]
+    pub fn interaction_handler(mut self, handler: Arc<dyn InteractionHandler>) -> Self {
+        self.interaction_handler = Some(handler);
         self
     }
 
@@ -747,10 +792,13 @@ impl AgentRestoreBuilder {
             extra_declarations: self.extra_declarations,
             approval,
             // A snapshot is data-only: a host-injected interaction handler is a
-            // runtime handle it never carries, so a restored agent falls back to
-            // the conservative `FacadeApproval` path until the caller re-injects
-            // one on the rebuild.
-            interaction_handler: None,
+            // runtime handle it never carries (§15.2), so it must be re-injected
+            // on the rebuild through
+            // [`interaction_handler`](AgentRestoreBuilder::interaction_handler).
+            // When the caller supplies one the restored agent stays on the host's
+            // async approval path (symmetric with `AgentBuilder`); when absent it
+            // falls back to the conservative `FacadeApproval` behavior.
+            interaction_handler: self.interaction_handler,
             ids,
             delegates,
             // External delegates are a runtime attachment (their session handler
