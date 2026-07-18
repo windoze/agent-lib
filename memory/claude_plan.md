@@ -1,48 +1,42 @@
-# M5-2 执行计划：对齐 `into_parts`、snapshot 和 builder 文档
+# M5-3 执行计划：Review 完整逃生出口
 
 ## 任务性质
-文档对齐任务。M5-1 已扩展 `AgentParts` 覆盖 external/协作/交互状态并更新了
-Rust rustdoc。M5-2 负责把三条 API（snapshot=持久化、into_parts=接管 live
-handles、builder=常规构造）的用途边界在文档层写清，并让 `docs/refine.md` §6
-反映 M5-1 的修复，避免任何文档继续声称 `into_parts` 覆盖不完整。
+Review 任务。复核 M5-1（扩展 `AgentParts` 覆盖 external/协作/交互状态）与
+M5-2（into_parts/snapshot/builder 文档对齐）的落地是否正确、一致、无回归。
+非纯文档任务：若发现代码/文档缺口须修复并可能重跑测试。
 
-## 现状分析（已 code walk）
-- `src/facade/agent.rs` `into_parts` rustdoc：M5-1 已写清资源范围与「非 restore
-  API」，但只交叉引用 snapshot/restore，未提 builder。
-- `src/facade/agent/snapshot.rs` `AgentParts` rustdoc：已完整（M5-1）。
-- `docs/facade-api.md` §8.2：仅在 API 形状里列出 `into_parts`，无任何 prose 说明
-  三者用途区别 → 需要新增。
-- `docs/refine.md` §6：仍把 into_parts 描述为「不完整、丢失 external/collab/
-  interaction」，未标注 M5-1 已修复 → 需补状态行 + 修复结果块（镜像 §2/§4/§5）。
-- README：无 into_parts 示例，故无字段示例需更新；可选补 capability 表一行。
+## 检查范围（来自 TODO M5-3）
+1. `AgentParts` 是否覆盖当前 `Agent` 中所有有语义的字段。
+2. 是否有 public API 泄漏了不该稳定承诺的内部实现细节。
+3. `into_parts`、snapshot、builder 的用途边界是否清楚。
+4. M3 协作 snapshot 修复与本阶段 `into_parts` 扩展是否互相一致。
 
-## 编辑计划
-1. `docs/facade-api.md` §8.2：在 API 形状块后新增 prose，说明 `into_parts` 交出的
-   live/owned 部件清单，且它是拆解逃生舱、非 restore；给出三向选择准则
-   （snapshot→持久化恢复，into_parts→接管 live handle，builder→常规构造）。
-2. `src/facade/agent.rs` `into_parts` rustdoc：补 builder 交叉引用，凑齐三向对齐。
-3. `docs/refine.md` §6：加「状态：已修复（M5-1；M5-2 文档对齐；M5-3 复核待进行）」
-   状态行 + 末尾「修复结果」块，列 M5-1 实际改动。
-4. README：确认无 into_parts 示例需改；在 capability 表补一行逃生舱入口（保持诚实）。
-
-## 验证命令
+## 验证命令（TODO M5-3）
 - cargo fmt --all
 - cargo clippy --all-targets -- -D warnings
-- RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - cargo test -p agent-lib --lib facade::agent::
-（本任务仅改文档 + rustdoc；facade::agent 测试用于确认 rustdoc doctest 无破坏。）
+- RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+- 手工复核 docs/refine.md "Agent::into_parts 状态覆盖不完整" 条目状态。
+
+## 步骤
+- [ ] 读 `src/facade/agent.rs` 的 `Agent` 结构体字段全集，逐字段核对是否被 into_parts 交出或有意省略。
+- [ ] 读 `src/facade/agent/snapshot.rs` 的 `AgentParts` + into_parts 实现 + Debug。
+- [ ] 核对 public 泄漏（RetainedExternalSession 等 data-only 保证）。
+- [ ] 核对 into_parts vs snapshot/restore 语义一致（M3 协作）。
+- [ ] 复核 docs/refine.md §6 状态。
+- [ ] 运行验证命令。
+- [ ] 若无代码改动仅文档：可复用上次全绿测试。
+- [ ] 标记 M5-3 [DONE] + 完成记录；提交。
 
 ## 进度
-- [x] facade-api.md §8.2 prose（snapshot/restore/into_parts/builder 四向用途边界）
-- [x] agent.rs into_parts rustdoc 补 builder 交叉引用
-- [x] refine.md §6 状态行 + 修复结果块（M5-1 扩展、M5-2 对齐）
-- [x] README 能力表补逃生舱行（无 into_parts 示例需改字段）
-- [x] fmt/clippy(default clean)/doc(clean)/test(facade::agent 49 passed) 全绿
-- [x] TODO.md M5-2 标 [DONE] + 完成记录
-- [ ] commit（待执行）
+（待填）
 
-## 结论
-纯文档 + rustdoc 对齐任务，无 spec 偏差、无新增前置任务、无失败测试。
-snapshot=持久化恢复、into_parts=接管 live handle、builder=常规构造 的用途边界已在
-facade-api.md §8.2 / agent.rs rustdoc / refine.md §6 写清；无文档再声称 into_parts
-覆盖不完整。仅改文档与注释，未改编译产物，故未重跑全量套件。
+## 进度（M5-3 完成）
+- [x] 核对 Agent 13 字段全部被 into_parts 交出（无静默 drop）。
+- [x] 核对 public 无泄漏：CollabState(pub(crate)) 未泄漏；RetainedExternalSession pub data-only；clippy -D warnings 佐证无 private-in-public。
+- [x] 核对 into_parts/snapshot/builder 用途边界文档一致（rustdoc + facade-api.md §8.2）。
+- [x] 核对 M3 协作 snapshot(data-only) 与 into_parts(live 句柄) 互补一致，测试双侧全绿。
+- [x] 复核 docs/refine.md §6：状态行更新为「M5-3 复核通过」，修复结果块与实现一致。
+- [x] 验证全绿：fmt(无源码改)/clippy(clean)/facade::agent(49 passed)/doc(clean)。
+- [x] 仅文档改动，复用 M5-1 全量测试绿结果。
+- [x] TODO.md 标记 M5-3 [DONE] + 完成记录。

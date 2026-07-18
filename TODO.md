@@ -1169,7 +1169,7 @@ cargo test -p agent-lib --lib facade::agent::
   `cargo test -p agent-lib --lib facade::agent::`（49 passed，含 M5-1 的 5 个 `into_parts_*`）。
   本任务仅改文档 + rustdoc 注释（不影响编译产物），未改运行期代码路径，故未重跑全量测试套件。
 
-### M5-3 [TODO] Review：完整逃生出口
+### M5-3 [DONE] Review：完整逃生出口
 
 检查范围：
 
@@ -1190,6 +1190,45 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 ```
 
 - 手工复核 `docs/refine.md` 中 “Agent::into_parts 状态覆盖不完整” 条目的状态，必要时补充当前修复说明。
+
+完成记录（M5-3）：
+
+- 代码复核（逐项确认 M5-1 ~ M5-2 落地且一致）：
+  - **`AgentParts` 覆盖 `Agent` 全部有语义字段**：逐字段核对 `src/facade/agent.rs` 的
+    `Agent` 结构体（13 个字段）与 `Agent::into_parts` 的搬运——`machine`→`state`
+    （`machine.into_state()`）、`client`、`tools`、`custom_registry`、`extra_declarations`、
+    `approval`、`interaction_handler`、`ids`、`delegates`、`external_agents`、`delegation`、
+    `last_external_sessions`→`retained_external_sessions`，以及 `collab: CollabState` 析构为
+    `collaboration`(config) + `mailbox` / `blackboard` / `plan` 三个 live 句柄。无任何字段被静默
+    drop；`AgentParts` 无多余/幻想字段。
+  - **无 public API 泄漏内部细节**：`AgentParts` 的 public 字段类型全部是 facade 别处已稳定暴露的
+    公开类型（`AgentState` / `Arc<dyn LlmClient>` / `Tool` / `ToolDecl` / `Arc<dyn ToolRegistry>` /
+    `Arc<FacadeApproval>` / `Arc<dyn InteractionHandler>` / `FacadeIds` / `LocalSubagent` /
+    `ManagedExternalDelegate` / `Delegation` / `RetainedExternalSession` / `Collaboration` /
+    `Arc<Mailbox>` / `Arc<Blackboard>` / `Arc<Plan>`）。内部 `pub(crate) struct CollabState`
+    及其 `provision` / `restore` 构造方法**未**泄漏——只交出被析构后的 config + 三个句柄，镜像
+    `Agent` 的访问器。`RetainedExternalSession` 为 `pub`、data-only（`status` / `session` /
+    `artifacts`），rustdoc 保证不含进程句柄 / SDK client / 凭据，且已在 `facade::mod` 重导出。
+    `cargo clippy --all-targets -- -D warnings`（含 `private_interfaces` 等 lint）clean 由编译器
+    佐证不存在 private-in-public 泄漏。
+  - **用途边界清楚**：`Agent::into_parts` 与 `AgentParts` 的 rustdoc 均标注「拆解逃生舱、**非**
+    restore API、无 `AgentParts -> Agent` 重建 helper」，并三向交叉引用 snapshot/restore（持久化恢复）
+    与 builder（常规构造）；`docs/facade-api.md` §8.2 prose 一致。`AgentParts`/`Agent` 的 `Debug`
+    impl 均把 runtime 句柄当作不透明（仅打印结构信息 + `is_some()`/`len()`），不渲染凭据。
+  - **M3 协作 snapshot 与 into_parts 一致**：`Agent::snapshot`（`AgentSnapshot::capture`）从
+    `&self.collab` 捕获 **data-only** 协作内容（不持 `Arc` 句柄），而 `into_parts` 交出 **live**
+    `Arc<Mailbox/Blackboard/Plan>` 句柄——两条路径互补而不矛盾：snapshot 用于持久化恢复、into_parts
+    用于接管在世句柄。`facade::agent::snapshot::tests` 的 collab 往返测试（mailbox/blackboard/plan
+    capture&restore）与 `into_parts_carries_live_collaboration_state` 同时全绿，证明两侧语义并存。
+- 文档：`docs/refine.md` §6「`Agent::into_parts` 逃生舱没有覆盖后续 milestone 的运行组成」状态行由
+  「M5-3 复核待进行」更新为**「M5-3 复核通过」**，末尾「修复结果（M5-1 扩展，M5-2 文档对齐）」块经复核
+  与实现一致（含「采用扩展 `AgentParts` 路线、未新增 `AgentFullParts` / `into_full_parts`」的准确记述）。
+  其余 §2/§4/§5 状态体例保持一致，无与 `PLAN.md`/`TODO.md` 冲突。
+- 验证（全绿）：`cargo fmt --all`（无源码改动）；`cargo clippy --all-targets -- -D warnings`（clean）；
+  `cargo test -p agent-lib --lib facade::agent::`（49 passed，含 M5-1 的 `into_parts_*` 与 collab
+  snapshot 往返测试）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。说明：
+  本任务为 Review + 文档状态修订，仅改动 `docs/refine.md`、`TODO.md`、`memory/claude_plan.md`，未触碰
+  任何库/测试编译产物代码，故未重跑全量 `cargo test --all --all-targets`（上次 M5-1 全绿结果仍有效）。
 
 ## M6：最终收口
 
