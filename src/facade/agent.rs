@@ -807,12 +807,24 @@ impl Agent {
     ///
     /// This hands ownership of the underlying [`AgentState`] (which owns the live
     /// [`Conversation`]), the LLM client, the registered tools and escape-hatch
-    /// declarations, the shared approval bridge, and the identity source to an
-    /// advanced caller who needs to drive the layers directly
-    /// (`docs/facade-api.md` §8.2). The facade never reclaims these parts, so the
-    /// caller owns the assembled state after this call.
+    /// declarations, the shared approval bridge, any injected
+    /// [`InteractionHandler`], the identity source, the registered local
+    /// subagent and managed external delegates, the delegation routing mode, the
+    /// last-known external session facts, and the live collaboration substrate
+    /// (config plus the shared mailbox / blackboard / plan handles) to an
+    /// advanced caller who needs to drive the layers directly or take over the
+    /// still-live handles (`docs/facade-api.md` §8.2). No semantically meaningful
+    /// state is silently dropped: every field the agent held is surfaced on the
+    /// returned [`AgentParts`].
+    ///
+    /// The facade never reclaims these parts, so the caller owns the assembled
+    /// state after this call. This is a decomposition hatch, **not** a restore
+    /// API: it returns the live parts as-is and offers no helper to reassemble an
+    /// [`Agent`] from them. Use [`snapshot`](Agent::snapshot) /
+    /// [`restore`](Agent::restore) for data-only persistence and rebuild.
     #[must_use]
     pub fn into_parts(self) -> AgentParts {
+        let collab = self.collab;
         AgentParts {
             state: self.machine.into_state(),
             client: self.client,
@@ -820,9 +832,16 @@ impl Agent {
             custom_registry: self.custom_registry,
             extra_declarations: self.extra_declarations,
             approval: self.approval,
+            interaction_handler: self.interaction_handler,
             ids: self.ids,
             delegates: self.delegates,
+            external_agents: self.external_agents,
             delegation: self.delegation,
+            retained_external_sessions: self.last_external_sessions,
+            collaboration: collab.config,
+            mailbox: collab.mailbox,
+            blackboard: collab.blackboard,
+            plan: collab.plan,
         }
     }
 }

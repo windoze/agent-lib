@@ -1442,7 +1442,7 @@ impl std::fmt::Display for ExternalDelegateStatus {
 /// reported [`ArtifactRef`]s). It never holds a process handle, SDK client, or
 /// credential.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct RetainedExternalSession {
+pub struct RetainedExternalSession {
     /// The delegate's last-known coarse status.
     pub status: ExternalDelegateStatus,
     /// The resumable session facts reported by the last drive, if any.

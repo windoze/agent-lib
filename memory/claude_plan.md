@@ -1,37 +1,45 @@
-# M4-5 执行计划：Review — managed external 可用性和 capability 来源
+# M5-1 执行计划：扩展 `AgentParts` 覆盖 external、协作和交互状态
 
 ## 任务性质
-Review 任务，复核 M4-1 ~ M4-4 落地，并按需更新 docs/refine.md 两个条目状态。
-不新增功能代码（除非发现真实 bug/spec 偏差 → 走 roadblock 流程新增前置任务）。
+功能任务。当前 `Agent::into_parts` / `AgentParts` 丢失了 interaction handler、
+external delegates、retained external sessions、collaboration 配置与 live state。
+需要扩展 `AgentParts` 让 `into_parts` 不再静默 drop 这些仍有语义价值的状态。
 
-## 检查范围（TODO.md M4-5）
-1. README 和 managed external docs 是否给出可工作的 handler 装配路径。
-2. 默认 feature 下是否仍不拉入 CLI adapter。
-3. capability source 是否覆盖 declared / supplied / probed / negotiated。
-4. unsupported capability fallback 是否基于真实 capability view。
-5. 错误和测试 fixture 是否不含 secret。
+## 现状分析（已完成 code walk）
+- `Agent` (src/facade/agent.rs:133) 缺失字段：interaction_handler / external_agents /
+  last_external_sessions / collab(CollabState: config + live Arc<Mailbox/Blackboard/Plan>)。
+- `RetainedExternalSession` 目前 `pub(crate)`，data-only 无句柄/凭据。
+- `Mailbox`/`Blackboard`/`Plan`/`Collaboration`/`InteractionHandler`/`ManagedExternalDelegate` 均 public。
+
+## 设计
+1. `RetainedExternalSession` 改 `pub` + 在 facade/mod.rs 重导出。
+2. `AgentParts` 新增 public 字段：interaction_handler / external_agents /
+   retained_external_sessions / collaboration / mailbox / blackboard / plan。
+   （collab 用 config + 三个 live 句柄暴露，镜像 Agent 访问器，不泄漏 pub(crate) CollabState。）
+3. `Agent::into_parts` 填充新字段（析构 self.collab）。
+4. snapshot.rs 补 imports；更新 AgentParts rustdoc + Debug；说明 into_parts 非完整 restore API。
+
+## 测试（src/facade/agent/tests.rs）
+- into_parts_carries_interaction_handler
+- into_parts_carries_collaboration_state（dispatcher topology）
+- into_parts_carries_external_delegates（claude_code）
+- retained sessions：字段存在、fresh 为空；live 填充需真实 drive → 记录验证边界
 
 ## 验证命令
 - cargo fmt --all
 - cargo clippy --all-targets -- -D warnings
-- cargo test -p agent-lib --lib facade::external
-- cargo check --examples
-- cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
+- cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D warnings
+- cargo test -p agent-lib --lib facade::agent::
 - RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
-## 手工复核
-docs/refine.md 中：
-- "managed external capability 混淆声明和验证"
-- "README quick start 缺少 session handler"
-两条目状态，必要时补充当前修复说明。
-
 ## 进度
-- [x] 代码/文档复核（M4-1~M4-4 逐项确认一致）
-- [x] 运行全部验证命令（fmt/clippy/test facade::external 22pass/check examples/feature clippy/doc 全绿）
-- [x] 更新 docs/refine.md §4 §5 状态=已修复 + 修复结果
-- [x] 标记 TODO.md M4-5 [DONE] + 完成记录
+- [x] 实现代码改动（RetainedExternalSession pub + 重导出；AgentParts +7 字段；into_parts 填充；rustdoc/Debug）
+- [x] 新增测试（5 个 into_parts_* 全绿）
+- [x] fmt/clippy(default+external)/test(facade::agent 49、lib 878)/doc 全绿
+- [x] TODO.md M5-1 标 [DONE] + 完成记录
 - [x] commit（待执行）
 
 ## 结论
-Review 通过：handler 装配路径可工作、默认 build 不拉 CLI adapter、capability source 四值齐全、
-unsupported fallback 基于 agent 当前持有视图、错误与测试 fixture 无 secret。无 spec 偏差，无新增前置任务。
+into_parts 不再静默 drop interaction handler / external delegates / retained sessions / collab；
+collab 以 config+live 句柄暴露可接管；retained session 非空内容需真实 drive，单测覆盖字段搬移与空态，
+验证边界已记录。无 spec 偏差，无新增前置任务。

@@ -35,7 +35,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::external::{ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionRef};
 use crate::agent::{
-    AgentSpec, AgentState, InteractionHandler, PlanSnapshot, ToolRegistry, ToolSetRef, WorktreeRef,
+    AgentSpec, AgentState, Blackboard, InteractionHandler, Mailbox, Plan, PlanSnapshot,
+    ToolRegistry, ToolSetRef, WorktreeRef,
 };
 // Re-export the real, data-only collaboration snapshot types (M3-1) so the
 // facade snapshot surface (`AgentSnapshot::mailbox` / `blackboard`) speaks the
@@ -46,7 +47,7 @@ use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationSnapshot};
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
 use crate::facade::chat::client_for_provider;
-use crate::facade::collab::{CollabState, resolve};
+use crate::facade::collab::{CollabState, Collaboration, resolve};
 use crate::facade::config::ProviderConfig;
 use crate::facade::delegate::{Delegation, LocalSubagent};
 use crate::facade::error::FacadeError;
@@ -419,8 +420,21 @@ impl DelegationSnapshot {
 /// This is an advanced escape hatch: it gives a caller ownership of the
 /// assembled [`AgentState`] (which owns the live
 /// [`Conversation`](crate::conversation::Conversation)), the LLM client, the
-/// registered tools and escape-hatch declarations, the shared approval bridge,
-/// and the identity source, so the caller can drive the sans-io layers directly.
+/// registered tools and escape-hatch declarations, the shared approval bridge
+/// and any injected [`InteractionHandler`], the identity source, the registered
+/// local subagent and managed external delegates, the delegation routing mode,
+/// the last-known external session facts, and the live collaboration substrate
+/// (config plus the shared mailbox / blackboard / plan handles), so the caller
+/// can drive the sans-io layers directly and take over the still-live handles
+/// (`docs/facade-api.md` §8.2).
+///
+/// It is a *decomposition* hatch, not a restore API: it hands out the live,
+/// owned parts as they are and provides **no** helper to reassemble an
+/// [`Agent`] from them. Reach for [`Agent::snapshot`](super::Agent::snapshot) +
+/// [`Agent::restore`](super::Agent::restore) when the goal is data-only
+/// persistence and rebuild, and for [`Agent::builder`](super::Agent::builder)
+/// when the goal is ordinary construction; use `into_parts` only when a caller
+/// must take ownership of the assembled runtime handles themselves.
 pub struct AgentParts {
     /// The assembled agent state, owning the live conversation.
     pub state: AgentState,
@@ -432,14 +446,40 @@ pub struct AgentParts {
     pub custom_registry: Option<Arc<dyn ToolRegistry>>,
     /// Extra tool declarations advertised but executed elsewhere.
     pub extra_declarations: Vec<ToolDecl>,
-    /// The shared approval bridge (policy plus interaction handler).
+    /// The shared approval bridge (policy plus fallback interaction handler).
     pub approval: Arc<FacadeApproval>,
+    /// The host-supplied [`InteractionHandler`] that overrode the approval
+    /// bridge as the run's interaction answerer, when one was injected through
+    /// [`AgentBuilder::interaction_handler`](super::AgentBuilder::interaction_handler);
+    /// `None` when the agent fell back to [`approval`](Self::approval) (§19).
+    pub interaction_handler: Option<Arc<dyn InteractionHandler>>,
     /// The identity source the agent mints run/turn/message ids from.
     pub ids: FacadeIds,
     /// The registered local subagent delegates (data-first recipes).
     pub delegates: Vec<LocalSubagent>,
+    /// The registered managed external delegates (data-first recipes; each
+    /// carries its runtime session handler when one was attached).
+    pub external_agents: Vec<ManagedExternalDelegate>,
     /// The delegation routing strategy configured on the agent.
     pub delegation: Delegation,
+    /// The last-known data-only session facts for each managed external
+    /// delegate, keyed by delegate name, refreshed after every `run_full`
+    /// drive. Empty until a delegation has actually driven an external runtime;
+    /// it never holds a process handle, SDK client, or credential (§15.2).
+    pub retained_external_sessions: HashMap<String, RetainedExternalSession>,
+    /// The resolved collaboration substrate flags for this agent (§14). The
+    /// live primitives each enabled flag provisioned are handed out separately
+    /// as [`mailbox`](Self::mailbox), [`blackboard`](Self::blackboard), and
+    /// [`plan`](Self::plan).
+    pub collaboration: Collaboration,
+    /// The shared [`Mailbox`] handle when the collaboration set enabled it, so
+    /// the caller can keep messaging through the same live inbox layer; `None`
+    /// when the mailbox substrate is disabled.
+    pub mailbox: Option<Arc<Mailbox>>,
+    /// The shared [`Blackboard`] handle when enabled; `None` otherwise.
+    pub blackboard: Option<Arc<Blackboard>>,
+    /// The shared [`Plan`] board handle when enabled; `None` otherwise.
+    pub plan: Option<Arc<Plan>>,
 }
 
 impl std::fmt::Debug for AgentParts {
@@ -454,6 +494,34 @@ impl std::fmt::Debug for AgentParts {
             )
             .field("has_custom_registry", &self.custom_registry.is_some())
             .field("extra_declarations", &self.extra_declarations.len())
+            .field(
+                "has_interaction_handler",
+                &self.interaction_handler.is_some(),
+            )
+            .field(
+                "delegates",
+                &self
+                    .delegates
+                    .iter()
+                    .map(LocalSubagent::name)
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "external_agents",
+                &self
+                    .external_agents
+                    .iter()
+                    .map(ManagedExternalDelegate::name)
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "retained_external_sessions",
+                &self.retained_external_sessions.len(),
+            )
+            .field("collaboration", &self.collaboration)
+            .field("has_mailbox", &self.mailbox.is_some())
+            .field("has_blackboard", &self.blackboard.is_some())
+            .field("has_plan", &self.plan.is_some())
             .finish_non_exhaustive()
     }
 }

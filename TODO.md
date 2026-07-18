@@ -1031,7 +1031,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M5：完整逃生出口
 
-### M5-1 [TODO] 扩展 `AgentParts` 覆盖 external、协作和交互状态
+### M5-1 [DONE] 扩展 `AgentParts` 覆盖 external、协作和交互状态
 
 上下文：
 
@@ -1062,6 +1062,54 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 ```bash
 cargo test -p agent-lib --lib facade::agent::
 ```
+
+完成记录（M5-1）：
+
+- 代码改动：
+  - **`AgentParts` 扩展**（`src/facade/agent/snapshot.rs`）：在原有 state/client/tools/
+    custom_registry/extra_declarations/approval/ids/delegates/delegation 基础上新增 7 个 public
+    字段——`interaction_handler: Option<Arc<dyn InteractionHandler>>`、`external_agents:
+    Vec<ManagedExternalDelegate>`、`retained_external_sessions: HashMap<String,
+    RetainedExternalSession>`、`collaboration: Collaboration`、`mailbox: Option<Arc<Mailbox>>`、
+    `blackboard: Option<Arc<Blackboard>>`、`plan: Option<Arc<Plan>>`。collab 以「config + 三个
+    live `Arc` 句柄」形式暴露，镜像 `Agent::collaboration/mailbox/blackboard/plan` 访问器，既交出
+    可继续接管的 live handle，又不泄漏 `pub(crate) CollabState` 的内部构造方法（`provision`/
+    `restore`）。
+  - **`Agent::into_parts` 填充新字段**（`src/facade/agent.rs`）：析构 `self.collab` 后把 config 与
+    三个句柄分别搬出，并搬出 `interaction_handler`、`external_agents`、`last_external_sessions`
+    （→ `retained_external_sessions`）。不再静默 drop 任何仍有语义价值的字段。
+  - **内部类型 data-only 暴露**：`RetainedExternalSession` 由 `pub(crate)` 提升为 `pub`（其文档已
+    保证不含 process handle / SDK client / credential，字段类型 `ExternalDelegateStatus` /
+    `ExternalSessionRef` / `ArtifactRef` 均已 public），并在 `src/facade/mod.rs` 的
+    `pub use external::{...}` 重导出，使 `AgentParts` 的 public 字段类型可达。
+  - **rustdoc**：改写 `AgentParts` 与 `Agent::into_parts` 文档，逐项说明交出的资源范围，并明确
+    `into_parts` 是**拆解逃生出口、不是完整 restore API**——它按原样交出 live/owned 部件、不提供
+    `AgentParts -> Agent` 的重建 helper；持久化恢复用 `snapshot`/`restore`，常规构造用 `builder`。
+    同步更新 `AgentParts` 的 `Debug` impl（新增 has_interaction_handler / delegates /
+    external_agents / retained_external_sessions / collaboration / has_mailbox/blackboard/plan，
+    句柄仍不透明）。
+- 新增测试（`src/facade/agent/tests.rs`，5 个，全绿）：
+  - `into_parts_carries_the_injected_interaction_handler`：注入 `FixedInteractionHandler` →
+    `parts.interaction_handler.is_some()`，且 `retained_external_sessions` 为空。
+  - `into_parts_without_a_handler_leaves_the_slot_empty`：无注入 handler → slot 为 `None`
+    （fallback 仍可经 `parts.approval` 取得）。
+  - `into_parts_carries_live_collaboration_state`：dispatcher topology → `parts.collaboration`
+    plan/blackboard/mailbox 全开；通过 `parts.mailbox` 发信并读回，验证句柄仍 live 可接管；
+    blackboard/plan 句柄也在。
+  - `into_parts_carries_registered_external_delegates`：注册
+    `ManagedExternalAgent::claude_code()` → `parts.external_agents` 名称保留、
+    `collaboration.artifacts_enabled()` 为真（§14 external delegate 开 artifact store）、
+    `retained_external_sessions` 为空。
+- 验证边界（retained external session）：`Agent.last_external_sessions` 仅在真实 `run_full` 驱动
+  external delegation 后写入，facade 无 public setter 可伪造非空 map，且真实 CLI 驱动需
+  binary/login（属 `#[ignore]` e2e 范畴）。因此单测覆盖的是「字段被正确 move 且对未驱动 agent 为
+  空」这一类不变量；非空内容的持久化另由 `ExternalDelegateSnapshot` 的 snapshot 路径测试覆盖。
+- 是否提供 `AgentParts -> Agent` helper：不提供（rustdoc 已明确 `into_parts` 只是拆解出口）。
+- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode"
+  -- -D warnings`（clean）；`cargo test -p agent-lib --lib facade::agent::`（49 passed，含 5 新增）；
+  `cargo test -p agent-lib --lib`（878 passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --workspace`（clean）。
 
 ### M5-2 [TODO] 对齐 `into_parts`、snapshot 和 builder 文档
 
