@@ -31,5 +31,5 @@
   `cargo clippy --all-targets --features "external-... external-acp" -- -D warnings` 通过
 - [x] 文档：`docs/managed-external-agent.md` §12 新增「三类超时」段落并改述旧措辞；
   `docs/review-2026-07.md` H-EXT-1 标注 ✅；TODO.md 标记 M1-5 [DONE] + 完成记录
-- [ ] 全量门禁（clippy 默认 feature + 全量测试 + rustdoc）后台运行中，待确认
-- [ ] git commit 并停止
+- [x] 全量门禁（clippy 默认 feature + 全量测试 + rustdoc）全部通过
+- [x] git commit `4fe86f6` 并停止。M1-5 完成。
