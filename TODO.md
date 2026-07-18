@@ -1,1421 +1,1050 @@
-# TODO：Refine 修正任务单
+# TODO：2026-07 审查收口任务单
 
-本任务单对应 [PLAN.md](PLAN.md) 和 [docs/refine.md](docs/refine.md)。旧任务单已归档到 [docs/archive/2026-07-18-facade-api/TODO.md](docs/archive/2026-07-18-facade-api/TODO.md)。
+本任务单对应 [PLAN.md](PLAN.md) 和 [docs/review-2026-07.md](docs/review-2026-07.md)。旧任务单已归档到 [docs/archive/2026-07-19-refine/TODO.md](docs/archive/2026-07-19-refine/TODO.md)。
 
 执行规则：
 
 - 严格按编号顺序实现，除非当前任务明确要求先补充前置信息。
-- 每个标题中的 `[TODO]` 表示尚未完成。完成后把 `[TODO]` 改成 `[DONE]`，并在任务下方记录关键实现和验证结果。
+- 每个标题中的 `[TODO]` 表示尚未完成。完成后把 `[TODO]` 改成 `[DONE]`，并在任务下方追加"完成记录"，写明关键实现决策、验证结果和（如有）breaking change。
 - 不要跳过每个 milestone 末尾的 review 任务。
-- 修改行为时同步修改拥有该行为的文档，至少检查 `README.md`、`docs/facade-api.md`、`docs/managed-external-agent.md`、`docs/capability-matrix.md` 和 `docs/refine.md` 中是否需要更新。
+- 审查条目编号（H-SEC-1 等）定义见 [docs/review-2026-07.md](docs/review-2026-07.md)；修复后在该文档对应条目上标注 `✅ 已修复（M*-*)` 或 `📄 已降级（文档承认现状，M*-*）`。
+- 修改行为时同步修改拥有该行为的文档，至少检查 `README.md`、`AGENTS.md`、`docs/facade-api.md`、`docs/managed-external-agent.md`、`docs/capability-matrix.md`、`docs/conversation-core.md`、`docs/agent-effect-model.md`、`docs/agent-layer.md`。
 - 默认测试必须离线可跑，不依赖真实 provider、真实 CLI login、网络或用户本机配置。
+- 行号引用自审查时点（2026-07-19），随后续修复可能漂移，以符号名为准。
 
-## M1：流式生命周期恢复
-
-### M1-1 [DONE] 修复 `ChatSession::stream` 提前 drop 后遗留 pending turn
-
-上下文：
-
-- `ChatSession::stream` 在返回 `RunStream` 前已经打开 pending turn，入口在 `src/facade/chat.rs`。
-- `RunStream` 的错误路径已有 rollback 逻辑，实现在 `src/facade/chat/stream.rs`，但结构体没有 `Drop`，调用方提前丢弃 stream 时不会回滚。
-- 直接后果是后续 `send`、`stream` 或 `snapshot` 可能遇到仍未完成的 pending turn。
-
-实现要求：
-
-- 在 `src/facade/chat/stream.rs` 中为 `RunStream` 增加 drop-time cleanup。未完成状态被 drop 时必须回滚当前 pending turn。
-- 把现有错误路径 rollback 和 drop rollback 收敛到同一个小 helper，避免两条路径行为分叉。
-- 正常完成的 stream 必须标记为 terminal，drop 时不能再次 rollback。
-- 发生流式错误时，现有错误语义保持不变，同时不能因为随后 drop 再次改变 conversation。
-- 确认 `ChatSession::snapshot`、`ChatSession::send` 和下一次 `ChatSession::stream` 在提前 drop 后都能继续工作。
-
-验证条件：
-
-- 增加单元测试覆盖：stream 创建后未 poll 就 drop，随后 `send` 成功。
-- 增加单元测试覆盖：stream 读到至少一个 delta 后 drop，随后 `snapshot` 成功，下一次 `send` 不包含未提交的半截 assistant turn。
-- 增加单元测试覆盖：stream 正常读完后 drop，不回滚已经提交的 assistant turn。
-- 运行：
-
-```bash
-cargo test -p agent-lib --lib facade::chat::
-```
-
-完成记录：
-
-- 实现（`src/facade/chat/stream.rs`）：
-  - 把原来的 `rollback()` 收敛为单一幂等 helper `abandon()`：仅当 `state != Done`
-    时调用 `conversation.cancel_pending(CancelDisposition::DiscardTurn)` 并把 `state`
-    置为 `Done`。错误路径（`absorb`/`finish`/流式传输错误）与 drop 路径都走这一 helper，
-    避免行为分叉。
-  - 新增 `impl Drop for RunStream`，drop 时调用 `abandon()`：未完成状态回滚 pending
-    turn；正常完成（已提交 `Done`）或已出错状态因 `state == Done` 而是 no-op，不会二次
-    回滚已提交的 assistant turn。
-  - 更新 `RunStream`/`ChatSession::stream` 文档以匹配“提前 drop 自动 discard 半截
-    turn，session 回到上一 committed 一致点”的承诺（此前文档已这样描述，但实现缺 `Drop`）。
-- 测试（`src/facade/chat/tests.rs`）：新增 `DualFakeClient`（同时脚本化 `chat` 与
-  `chat_stream`）与三条离线回归：
-  - `stream_dropped_before_polling_leaves_session_usable`：未 poll 就 drop，随后 `send` 成功。
-  - `stream_dropped_after_delta_does_not_commit_partial_turn`：收到 text delta 后 drop，
-    `snapshot` 成功且未提交半截 assistant turn，下一次 `send` 只带 1 条消息。
-  - `stream_dropped_after_completion_keeps_committed_turn`：正常读完 `Done` 后 drop，
-    已提交的 [user, assistant] 保留，后续 `send` 回放 3 条消息。
-- 文档：同步 `docs/refine.md` 问题 #1 的修复状态（ChatSession 侧 M1-1 已修，
-  `AgentRunStream` 留待 M1-2）。
-- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
-  `cargo test -p agent-lib --lib facade::chat::`（19 passed）、
-  `cargo test --all --all-targets`（全绿，0 failed）、
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
-
-### M1-2 [DONE] 修复 `AgentRunStream` 提前 drop 后遗留未完成 run
-
-上下文：
-
-- `Agent::stream` 的 facade 入口在 `src/facade/agent.rs`。
-- `AgentRunStream` 和流式驱动逻辑在 `src/facade/agent/stream.rs`。
-- 当前实现把 `drain(machine, ...)` 包进 opaque future，结构体本身没有 drop-time abandon 或 rollback 能力。
-- 风险场景包括：模型还在产出、等待工具结果、等待审批、或 run 已打开 pending conversation 但 stream 被调用方丢弃。
-
-实现要求：
-
-- 重构 `AgentRunStream` 的内部状态，让 drop 路径能识别 run 是否已经 terminal。
-- 未完成状态被 drop 时，必须让 agent 回到下一次 `run` 或 `stream` 可继续执行的状态。
-- 如果当前 `AgentMachine` 已经暴露 pending requirement，drop 路径应使用现有 sans-io 输入执行 abandon 或等价清理，而不是直接篡改底层 conversation。
-- 如果没有 pending requirement 但 conversation 已经处于 pending turn，也必须通过 machine 或 facade 提供的受控路径清理。
-- 正常完成、错误完成和显式 close 后的 drop 都必须是幂等的。
-- 如果需要新增 `AgentRunStream::close` 或类似 API，只能作为显式收尾能力；drop 本身仍必须保证不会留下不可继续运行的 agent。
-- 不改变默认非流式 `Agent::run`、`Agent::run_full` 的外部行为。
-
-验证条件：
-
-- 增加测试覆盖：stream 创建后未 poll 就 drop，随后同一个 `Agent` 可以成功 `run`。
-- 增加测试覆盖：stream 读到部分事件后 drop，随后同一个 `Agent` 可以成功 `run`，且前一次半成品 run 没有进入 committed history。
-- 增加测试覆盖：stream 等待审批时 drop，随后同一个 `Agent` 可以成功 `run`。
-- 如果存在工具等待场景的 testkit 支持，增加测试覆盖：stream 等待工具结果时 drop，随后同一个 `Agent` 可以成功 `run`。
-- 运行：
-
-```bash
-cargo test -p agent-lib --lib facade::agent::stream
-cargo test -p agent-lib --lib facade::agent::
-```
-
-完成记录：
-
-- 实现（`src/facade/agent/stream.rs`）：
-  - 新增共享 machine 句柄 `type MachineCell<'a> = Rc<RefCell<&'a mut DefaultAgentMachine>>`：
-    drive future 与 `AgentRunStream` 各持一份 `Rc` clone，使 drop 路径不再把
-    `&mut agent.machine` 埋进 opaque future，而能同步触达 machine。
-  - 把原来 `drain(machine, ...)` 的驱动逻辑复刻为 `async fn drive_streamed(...)`：
-    与 `drain` 的循环逐字段等价（`fulfill_batch` → 按 resolution `Resume` → 记录
-    trace → 直到 terminal cursor），但只在同步 `step` 前后借用 `MachineCell`，每次
-    `await` 前释放借用，因此 park 时不持有任何 `RefCell` 借用，drop 的
-    `try_borrow_mut` 必成功。三个 `start*` 入口改为构造并保存 `MachineCell`。
-  - `AgentRunStream` 结构体新增 `machine: MachineCell<'a>` 字段与幂等
-    `abandon(&mut self)`：仅当 `state != Done` 时，`try_borrow_mut` machine 后取
-    `cursor().pending_requirement_ids()` 的首个 id 喂 `StepInput::Abandon(id)`——
-    这是 machine 现有的 sans-io never-resume 输入，不直接篡改底层 conversation。
-    LLM 步（`StreamingStep`）丢弃 pending turn；tool / approval 阶段
-    （`AwaitingTool` / `AwaitingApproval`）对未决调用折叠 `Cancelled` 结果；两者都
-    把 cursor 归位到可继续的 `Idle`。
-  - 新增 `impl Drop for AgentRunStream` 调用 `abandon()`：正常读完 `Done`、错误
-    完成、或已 abandon（`state == Done`）时为 no-op，不回滚已提交 turn；非流式
-    `Agent::run` / `run_full` 外部行为不变。
-  - 更新 `AgentRunStream` / `Agent::stream` 文档以匹配“提前 drop 自动 abandon 在途
-    turn，agent 回到下一次 `run`/`stream` 可继续的一致点”。
-- 支撑改动（`src/agent/drive.rs`）：把 `fulfill_batch`、`Resolved`（含
-  `resolution` / `resolved_at_scope` 两字段）、`record_requirement`、
-  `record_requirement_resolution`、`is_terminal` 提升为 `pub(crate)`，供
-  `drive_streamed` 复用，保证与 `run_full` 的逐字段等价。
-- 测试（`src/facade/agent/tests.rs`）：新增 `DropTestClient`（同时脚本化 `chat`
-  恢复回合与 `chat_stream` 流式回合，并记录每次 `chat` 请求的消息条数）、
-  `partial_text_head`、`ParkingInteractionHandler`、`parking_weather_tool`，及四条
-  离线回归：
-  - `dropping_never_polled_stream_leaves_agent_runnable`：未 poll 就 drop，随后同一
-    `Agent` `run` 成功，恢复回合仅 1 条消息。
-  - `dropping_partially_streamed_run_discards_it_and_leaves_agent_runnable`：收到部分
-    text delta 后 drop（drive park 在 LLM fold），随后 `run` 成功且半成品 turn 未进入
-    committed history（恢复回合仅 1 条消息）。
-  - `dropping_approval_gated_stream_leaves_agent_runnable`：等待审批时 drop，随后
-    `run` 成功，被 gate 的工具未执行，无残留。
-  - `dropping_tool_awaiting_stream_leaves_agent_runnable`：等待工具结果时 drop（park 在
-    永不返回的工具里），随后 `run` 成功，无残留。
-- 文档：同步 `docs/refine.md` 问题 #1 的修复状态（`AgentRunStream` 侧 M1-2 已修）。
-- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
-  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D warnings`（clean）、
-  `cargo test -p agent-lib --lib facade::agent::`（30 passed，含 4 条新回归）、
-  `cargo test --all --all-targets`（全绿，841 lib + 集成全部通过，0 failed）、
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
-
-### M1-3 [DONE] Review：流式生命周期恢复
-
-检查范围：
-
-- `ChatSession::stream`、`Agent::stream`、`RunStream`、`AgentRunStream` 的正常完成、错误完成和提前 drop 路径。
-- 是否还有其他 facade stream 类型打开 pending state 但没有 drop cleanup。
-- 新增测试是否只依赖 fake client、scripted handler 或 testkit。
-- 文档是否需要说明 drop/close 行为。
-
-验证条件：
-
-- 运行：
+全量门禁命令（每个 milestone review 必跑）：
 
 ```bash
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
-cargo test -p agent-lib --lib facade::chat::
-cargo test -p agent-lib --lib facade::agent::
-```
-
-- 手工复核 `docs/refine.md` 中 “stream 提前 drop 遗留 pending turn” 条目的状态，必要时补充当前修复说明。
-
-完成记录：
-
-- 复核 `ChatSession::stream` / `RunStream`（`src/facade/chat.rs`、
-  `src/facade/chat/stream.rs`）：正常完成经 `State::Finishing` → `finish()` 提交后置
-  `State::Done`；错误路径（`absorb` 累加错误、流式传输错误、`finish` 失败、tool-use
-  拒绝）与 `Drop` 都收敛到同一幂等 `abandon()`（`state != Done` 时
-  `cancel_pending(DiscardTurn)` + 置 `Done`）。已提交 / 已出错的 stream 因 `state == Done`
-  在 drop 时为 no-op，不回滚已提交 turn。逻辑正确、无分叉。
-- 复核 `Agent::stream` / `AgentRunStream`（`src/facade/agent.rs`、
-  `src/facade/agent/stream.rs`）：drive future 与 `Drop` 共享
-  `Rc<RefCell<&mut DefaultAgentMachine>>`，`drive_streamed` 仅在同步 `step` 前后借用、
-  每次 `await` 前释放，故 park 时 drop 的 `try_borrow_mut` 必成功。`abandon()` 仅在
-  `state != Done` 且 cursor 存在 outstanding requirement 时喂 `StepInput::Abandon(首个 id)`，
-  LLM 步丢弃 pending turn、tool/approval 阶段折叠 `Cancelled`，均归位到可继续的 `Idle`；
-  正常 / 错误 / 已 abandon 状态均为 no-op。rules-routed、dispatcher-routed 起步路径不 step
-  machine（cursor 恒 `Idle`），drop 找不到在途 turn，仅保持结构形状统一——已核对无遗漏。
-- 其他 facade stream 类型排查：全仓仅 `RunStream` 与 `AgentRunStream` 两个 facade 层
-  stream 会打开 conversation / machine 的 pending state，二者均已有 `Drop`。adapter /
-  client 层的 `chat_stream` 只是纯 wire 事件流，不打开 facade pending state，无需 cleanup。
-- 测试离线性核对：chat 侧新增回归依赖 `DualFakeClient`（脚本化 `chat` + `chat_stream`）；
-  agent 侧依赖 `DropTestClient`（可 `park_stream`）、`ParkingInteractionHandler`、
-  `parking_weather_tool`，全部为 fake client / scripted handler，无真实 provider、CLI、
-  网络或本机配置依赖。
-- 文档核对：`RunStream`、`AgentRunStream`、`ChatSession::stream`、`Agent::stream` 的
-  doc 均已明确“提前 drop 自动 discard / abandon 在途 turn，session/agent 回到上一
-  committed 一致点”。`docs/refine.md` 问题 #1 的“修复状态（更新）”已覆盖 M1-1 与 M1-2，
-  R-1 草案与优先级一致，无需再补写。
-- 验证：`cargo fmt --all`（无源码改动）、`cargo clippy --all-targets -- -D warnings`（clean）、
-  `cargo test -p agent-lib --lib facade::chat::`（19 passed）、
-  `cargo test -p agent-lib --lib facade::agent::`（30 passed，含 4 条 drop 回归）。
-  本次仅改动 TODO.md / 计划文档，未改动编译产物，复用 M1-2 的全量绿测结果，未重跑
-  `cargo test --all --all-targets`。
-
-## M2：非流式事件一致性
-
-### M2-1 [DONE] 在 `Agent::run_full` 中记录 `ApprovalRequested` 事件
-
-上下文：
-
-- `Agent::run_full` 的主体在 `src/facade/agent.rs`。
-- 当前 `RunOutput.events` 来自 `collect_traces(done.notifications(), &recorder)`，只覆盖 tool started、tool finished、delegation 等 notification。
-- 流式路径通过 `TapInteractionHandler` 在 `src/facade/agent/stream.rs` 中发出 `RunEvent::ApprovalRequested`。
-- 非流式路径缺少对应 recorder，导致调用方无法从 `RunOutput.events` 观察审批请求。
-
-实现要求：
-
-- 为非流式路径增加审批事件 recorder。可以复用流式路径中的事件构造逻辑，也可以抽取共享 helper，避免 `FacadeApproval` 字段映射重复。
-- 在 `Agent::run_full` 中包装当前 interaction handler，使任何审批请求在传给真实 handler 前或同时被记录。
-- 保持现有 interaction handler 优先级：调用方注入的 handler 仍然决定 approve、deny 或 fallback 行为。
-- `RunEvent::ApprovalRequested` 必须包含 call id、tool name、reason、policy action、input 摘要等现有流式事件中可见的字段。
-- 审批被拒绝、headless fallback、或审批后工具未真正启动时，也必须保留审批请求事件。
-- 不要把 secret 或完整大输入无控制地塞进事件；沿用现有 facade approval 的 redaction 和 preview 策略。
-
-验证条件：
-
-- 增加测试覆盖：`Agent::run_full` 触发 ask approval 并 approve，`RunOutput.events` 中出现 `ApprovalRequested`，随后出现对应 tool lifecycle 事件。
-- 增加测试覆盖：调用方注入 interaction handler 并 deny，`RunOutput.events` 仍出现 `ApprovalRequested`，错误或输出行为与现有语义一致。
-- 增加测试覆盖：headless fallback 或无 handler 场景仍记录审批请求。
-- 运行：
-
-```bash
-cargo test -p agent-lib --lib facade::agent::
-```
-
-完成记录：
-
-- 抽取共享 helper `enriched_approval_request(approval, call_id, requirement)`
-  到 `src/facade/approval.rs`：peek `FacadeApproval::pending_request`（不消费，
-  fallback handler 仍可 remove）取 tool name + 脱敏 input 摘要，再用机器携带的
-  interaction 重绑 `call_id` 与 `reason`。流式路径 `TapInteractionHandler`
-  （`src/facade/agent/stream.rs`）改为复用该 helper，消除 `FacadeApproval`
-  字段映射重复。
-- 非流式路径新增 `RecordingInteractionHandler`（`src/facade/agent.rs`）：包裹
-  `interaction_handler()` 解析出的 handler（注入的 handler 或 `FacadeApproval`
-  fallback），在 approval interaction 传给真实 handler *之前* 按 fulfill 顺序把
-  `ApprovalRequest` 记录进 `Arc<Mutex<Vec<..>>>`。仅观察不决策，approve / deny /
-  fallback 优先级完全不变。
-- 新增 `weave_approval_events(events, approvals)`：把记录的审批按 `call_id`
-  编织进 `collect_traces` 产出的事件流——审批落在其 gated 调用的首个
-  `ToolStarted`/`ToolFinished`（approved 走 `ToolStarted`，denied 只有
-  `ToolFinished`）之前；无任何工具事件的审批（headless deny 等）按记录顺序在下一
-  个锚点前或队尾 flush，保证每个暂停审批可见。流式路径不受影响（审批实时 emit，
-  `collect_traces` 仍不产审批事件）。
-- `run_full` 主 supervisor drive 装配 recorder 并包裹 `scope.interaction`，
-  drain 后 `events: weave_approval_events(collected.events, recorded_approvals)`。
-- 新增 3 条离线回归（`src/facade/agent/tests.rs`）：`ask` approve 经 fallback →
-  `ApprovalRequested` 先于 `ToolStarted`/`ToolFinished` 且带 call id / reason /
-  脱敏 input；注入 handler deny → 仍记录 `ApprovalRequested` 且先于 denied
-  `ToolFinished`、无 `ToolStarted`；headless `ask`（`ApprovalPolicy::ask_tool`
-  无 handler）→ 仍记录 `ApprovalRequested`。
-- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
-  `cargo test -p agent-lib --lib facade::agent::`（33 passed，含 3 条新回归）、
-  `cargo test -p agent-lib --lib`（844 passed）、
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
-
-### M2-2 [DONE] 对齐非流式和流式事件契约文档与回归测试
-
-上下文：
-
-- 流式路径天然可以产生 token 级 `TextDelta`。
-- 非流式 `run_full` 不应该伪造 token delta，但必须记录 approval、tool、delegation 等结构化生命周期事件。
-- 事件类型定义和输出结构位于 `src/facade/run.rs` 及相关 facade 模块。
-
-实现要求：
-
-- 增加一组对比测试：同一个 scripted 场景分别通过 `Agent::stream` 和 `Agent::run_full` 执行，比较 approval、tool、delegation 事件的规范化序列。
-- 文档说明非流式和流式路径的事件一致性边界：生命周期事件一致，token delta 只属于流式路径。
-- 检查 `README.md` 和 `docs/facade-api.md` 中对 `RunOutput.events` 的描述是否需要更新。
-- 如果新增 helper 或 recorder 类型，补充 rustdoc，说明它是 facade 内部的事件采集机制。
-
-验证条件：
-
-- 对比测试必须稳定，不依赖真实 provider。
-- 运行：
-
-```bash
-cargo test -p agent-lib --lib facade::agent::
-cargo test -p agent-lib --lib facade::run
-```
-
-- 运行：
-
-```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-```
-
-完成记录：
-
-- 发现并修复一处真实的事件契约分歧（M2-2 的核心）：非流式 `collect_traces`
-  （`src/facade/agent.rs`）对**被拒工具**的 `Notification::ToolCallFinished`
-  （无对应 `ToolCallStarted`，name 查不到）也会投出一个 name 为空的幽灵
-  `ToolFinished`，而流式路径（`TapToolHandler` 仅在工具真正执行时 emit）不产任何
-  tool 生命周期事件。对齐决策：被拒工具从未执行 → 两条路径都只保留
-  `ApprovalRequested`，不产 `ToolStarted`/`ToolFinished`。修正 `collect_traces` 在
-  `names` 无该 call id（且非 delegation）时跳过 `ToolFinished`；`weave_approval_events`
-  的尾部 flush 已保证被拒审批仍可见。同步更新 `collect_traces` /
-  `weave_approval_events` / `tool_event_call_id` 的 rustdoc（删除"denied → ToolFinished"
-  旧说法），并收紧 M2-1 denied 回归 `run_full_records_approval_when_injected_handler_denies`
-  为断言"被拒工具既无 `ToolStarted` 也无 `ToolFinished`"。
-- 新增 parity 回归（`src/facade/agent/tests.rs`）：`lifecycle_signature` /
-  `canonical_lifecycle_event` helper 把一次 run 的事件归一化为可比较的生命周期子序列
-  （丢弃流式独有的 `TextDelta`、终态 `Done` 与 raw 逃生舱）。四条对比测试对同一 scripted
-  场景分别走 `run_full` 与 `stream` 并断言归一化序列**逐项相等**：
-  - `stream_and_run_full_agree_on_plain_tool_lifecycle`（auto_allow）；
-  - `stream_and_run_full_agree_on_approved_tool_lifecycle`（ask approve，含富化审批的
-    tool/call_id/reason/脱敏 input 全字段一致）；
-  - `stream_and_run_full_agree_on_denied_tool_lifecycle`（auto_deny，验证对齐后两路都只
-    剩 `ApprovalRequested`）；
-  - `stream_and_run_full_agree_on_delegation_lifecycle`（新增 dual-mode `MarkerRoutingClient`：
-    流式 supervisor + 非流式 child，断言两路 `DelegationStarted`/`DelegationFinished` 一致）。
-  每条测试均额外断言 token-delta 边界：`stream` 含 `TextDelta`，`run_full` 绝不含。
-- 文档：`docs/facade-api.md` 新增 §6.2.1「事件一致性边界」明确生命周期事件一致、token
-  delta 只属流式、`Done` 只由 stream yield、两路共享 `collect_traces` +
-  `weave_approval_events` / `TapToolHandler` + `TapInteractionHandler` 采集机制；
-  `README.md` §3 补一句同义说明；`src/facade/run.rs` 的 `RunEvent` 枚举、`TextDelta`
-  变体、`RunOutput::events` 字段 rustdoc 补充边界说明。
-- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
-  `cargo test -p agent-lib --lib facade::agent::`（37 passed，含 4 条新 parity）、
-  `cargo test -p agent-lib --lib facade::run`（9 passed）、
-  `cargo test -p agent-lib --lib`（848 passed）、`cargo test --all --all-targets`（全绿，
-  0 failed）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
-
-### M2-3 [DONE] Review：非流式事件一致性
-
-检查范围：
-
-- `run_full`、`run`、`stream` 的事件语义是否清楚。
-- approval 被 approve、deny、fallback 的路径是否都有事件。
-- 文档是否明确非流式不产生 token delta。
-- 新增 recorder 是否不会改变真实 handler 的执行顺序。
-
-验证条件：
-
-- 运行：
-
-```bash
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo test -p agent-lib --lib facade::agent::
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-```
-
-- 手工复核 `docs/refine.md` 中 “非流式 RunOutput.events 缺少审批请求” 条目的状态，必要时补充当前修复说明。
-
-完成记录：
-
-- 代码复核（无需改动，行为符合规范）：
-  - 事件语义清晰：`src/facade/run.rs` 的 `RunEvent` 枚举与 `RunOutput::events`
-    rustdoc 明确「生命周期变体两路一致；`TextDelta` / `Done` 只属流式」；非流式
-    `run_full`（`src/facade/agent.rs`）经 `collect_traces` + `weave_approval_events`
-    产出生命周期事件，`run` 返回精简 `Reply`（不承诺事件面），`stream` 通过
-    `TapToolHandler` / `TapInteractionHandler` 实时 emit。三者语义与文档一致。
-  - approve / deny / fallback 三条路径均有审批事件：`RecordingInteractionHandler`
-    包裹 `interaction_handler()` 解析出的真实 handler（注入 handler 或 `FacadeApproval`
-    fallback），在委派前记录 `ApprovalRequest`；`weave_approval_events` 对 approved
-    审批锚定在其 `ToolStarted` 前，对 denied / headless（无工具锚点）在尾部或下一锚点前
-    flush，保证每个暂停审批均可见。
-  - 文档明确非流式不产 token delta：`run.rs`、`docs/facade-api.md` §6.2.1、`README.md`
-    §3 均写明 `TextDelta` 为流式独有；4 条 parity 回归额外断言 `run_full` 绝不含
-    `TextDelta`。
-  - recorder 不改变执行顺序：`RecordingInteractionHandler::fulfill` 先记录再
-    `self.inner.fulfill(...).await`，**仅观察不决策**，approve / deny / fallback
-    优先级完全由真实 handler 决定；富化字段与流式共用 `enriched_approval_request`
-    helper（`src/facade/approval.rs`，peek 不消费 pending map）。
-- 文档复核并补充：`docs/refine.md` §3「非流式 `Agent::run_full` 的 `RunOutput.events`
-  不包含审批请求」补入「修复状态（更新）」块，记录 M2-1（run-scoped recorder +
-  weave）、M2-2（对齐被拒工具幽灵 `ToolFinished` + parity 回归 + 文档边界）与 M2-3
-  复核结论，标注该问题已解决（与 §1 的 M1 修复状态注记格式一致）。
-- 验证：`cargo fmt --all`（clean）、`cargo clippy --all-targets -- -D warnings`（clean）、
-  `cargo test -p agent-lib --lib facade::agent::`（37 passed，含 4 条 parity 回归）、
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。本任务仅改动
-  `docs/refine.md`（文档），代码自 M2-2 全量 `cargo test --all --all-targets` 全绿以来
-  未变更，故复用该绿测结果、未重跑全量套件。
-
-## M3：协作状态 snapshot 和 restore
-
-### M3-1 [DONE] 为 mailbox、blackboard、plan 补齐 data-only snapshot API
-
-上下文：
-
-- `Mailbox` 在 `src/agent/collab/mailbox.rs`，内部状态包含 `next_seq` 和按 recipient 组织的 inbox。
-- `Blackboard` 在 `src/agent/collab/blackboard.rs`，已有按 channel 读取 snapshot 的能力，但缺少一次性保存和精确恢复全部 channel 的 API。
-- `Plan` 在 `src/agent/collab/plan.rs`，已有或接近已有可序列化 snapshot，需要确认是否能被 facade restore 直接使用。
-- `src/facade/agent/snapshot.rs` 中已有 `MailboxSnapshot`、`BlackboardSnapshot`、`PlanSnapshot` 字段概念，但当前 capture 写入的是空值。
-
-实现要求：
-
-- 为 mailbox 增加完整 snapshot 和 restore API，保留 message seq 的单调性，恢复后发送新消息不能复用旧 seq。
-- 为 blackboard 增加完整 snapshot 和 restore API，保留 board id、channel 列表、每个 channel 的消息顺序和 offset 语义。
-- 确认 plan 的 snapshot 能覆盖当前 plan state；如果不能，补齐缺失字段。
-- snapshot 类型必须是 data-only，支持 serde，不暴露内部锁或运行时句柄。
-- 旧 snapshot 兼容性要通过 `#[serde(default)]` 或等价方式保证。
-
-验证条件：
-
-- 增加 mailbox round-trip 测试：发送多 recipient 消息，snapshot 后 restore，`read_from` 返回一致内容，新发送消息 seq 继续递增。
-- 增加 blackboard round-trip 测试：多个 channel、多条消息，snapshot 后 restore，channel 列表和每个 channel snapshot 一致。
-- 增加 plan round-trip 测试或确认已有测试覆盖；如果已有测试覆盖，在任务完成记录中写明测试名。
-- 运行：
-
-```bash
-cargo test -p agent-lib --lib agent::collab
-```
-
-完成记录（M3-1）：
-
-- 实现：
-  - `src/agent/collab/mailbox.rs`：新增 data-only `MailboxSnapshot { next_seq, inboxes }`
-    （`Serialize`/`Deserialize`，字段带 `#[serde(default)]` 保兼容），并加
-    `Mailbox::snapshot()` 与 `Mailbox::from_snapshot()`。restore 时把 `next_seq`
-    防御性 reconcile 到 `max(seq)+1`，保证恢复后新发送消息 seq 严格递增、不复用旧 seq。
-  - `src/agent/collab/blackboard.rs`：新增 data-only `BlackboardSnapshot { id, channels }`
-    （`channels` 带 `#[serde(default)]`），并加 `Blackboard::snapshot_all()`（整板快照，
-    与已有 per-channel `snapshot(channel)` 区分）与 `Blackboard::from_snapshot()`，保留
-    board id、channel 列表与每条消息的 offset 顺序；恢复后 `post` 从 channel 现长度续 offset。
-  - `src/agent/collab/plan.rs`：`PlanSnapshot { id, version, task_order, tasks }` 已覆盖
-    全部 plan 状态，无需补字段；新增 `Plan::from_snapshot(PlanSnapshot)` 直接 rehydrate，
-    恢复后保留 version，使后续 CAS `claim` 仍需匹配 `expected_version`。
-  - 导出：`src/agent/collab/mod.rs` 与 `src/agent/mod.rs` 追加导出 `MailboxSnapshot`、
-    `BlackboardSnapshot`（与既有 `PlanSnapshot`/`TaskSnapshot` 对齐）。
-  - 说明：`src/facade/agent/snapshot.rs` 中的占位 `MailboxSnapshot{}`/`BlackboardSnapshot{}`
-    属 M3-2/M3-3 的 facade 接线范围，本任务未改动。
-- 测试（`src/agent/collab/tests.rs`，新增 4 个）：
-  - `mailbox_snapshot_round_trip_preserves_inboxes_and_seq`：多 recipient 发送后 snapshot→
-    serde 往返→restore，`read_from` 每个 recipient 内容一致，新发送 seq 续增到 3。
-  - `mailbox_from_snapshot_reconciles_stale_next_seq`：手写 next_seq 落后于已投递 seq=7 的
-    snapshot，restore 后下一条 send 得到 8，不复用旧 seq。
-  - `blackboard_snapshot_all_round_trip_preserves_channels_and_offsets`：多 channel 多消息
-    snapshot→serde 往返→restore，id、channel 列表与每 channel 内容一致，新 post offset 续。
-  - `plan_snapshot_round_trip_preserves_state_and_resumes_operations`：snapshot→serde 往返→
-    restore，id/version/task_order/tasks 一致；旧 version claim 被 `VersionConflict` 拒；
-    补齐依赖后可继续 claim。
-- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
-  `cargo test -p agent-lib --lib agent::collab`（28 passed）、
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
-
-### M3-2 [DONE] 让 `AgentSnapshot::capture` 保存 live 协作内容
-
-上下文：
-
-- `AgentSnapshot::capture` 位于 `src/facade/agent/snapshot.rs`。
-- 当前实现把 `mailbox`、`blackboard`、`plan` 写成空值或默认值，只保存了 topology。
-- `Agent` 持有的协作底座和配置在 `src/facade/agent.rs`、`src/facade/collab.rs` 中。
-
-实现要求：
-
-- 修改 `AgentSnapshot::capture` 的调用链，让 capture 能访问 live `CollabState`。
-- 当 mailbox、blackboard、plan 已启用时，写入对应 data-only snapshot。
-- 当某个协作组件未启用时，snapshot 字段保持 `None` 或明确的空状态，restore 时不能意外启用未配置组件。
-- 保持旧 snapshot 可读。旧 snapshot 没有协作内容时，restore 应按 topology 创建空协作底座。
-- 不改变普通 conversation snapshot、delegate snapshot 和 retained external session snapshot 的现有语义。
-
-验证条件：
-
-- 增加 facade snapshot 测试：agent 运行或手工写入 mailbox 后 snapshot，restore 后 mailbox 内容仍可读。
-- 增加 facade snapshot 测试：blackboard 多 channel 内容在 restore 后保留。
-- 增加 facade snapshot 测试：未启用协作组件时 snapshot 和 restore 不创建额外组件。
-- 运行：
-
-```bash
-cargo test -p agent-lib --lib facade::agent::snapshot
-cargo test -p agent-lib --lib facade::collab
-```
-
-完成记录（M3-2）：
-
-- 实现：
-  - `src/facade/agent/snapshot.rs`：删除占位空类型 `MailboxSnapshot{}`/`BlackboardSnapshot{}`，
-    改为 `pub use crate::agent::{BlackboardSnapshot, MailboxSnapshot}`（复用 M3-1 落地的真实
-    data-only 类型），保持 `agent_lib::facade::{MailboxSnapshot, BlackboardSnapshot}` 公有路径
-    不变。`AgentSnapshot` 的 `mailbox`/`blackboard`/`plan`/`artifacts` 加 `#[serde(default)]`
-    以保持旧 snapshot 可读。
-  - `AgentSnapshot::capture` 增参 `collab: &CollabState`：mailbox 启用时写
-    `mailbox.snapshot()`、blackboard 启用时写 `blackboard.snapshot_all()`、plan 启用时写
-    `plan.snapshot()`；未启用保持 `None`。`src/facade/agent.rs` 的 `Agent::snapshot()` 传
-    `&self.collab`，并更新其 doc（不再说这些 slice 为空）。
-  - `src/facade/collab.rs`：新增 `CollabState::restore(config, ids, mailbox, blackboard, plan)`：
-    由 topology 决定“是否”建 substrate（未启用保持 `None`，restore 不会意外启用未配置组件），
-    启用时若 snapshot 带内容则 `from_snapshot` rehydrate（mailbox 续 seq、blackboard/plan 保
-    id 与消息/任务历史），无内容则从 `ids` mint 新身份建空底座（兼容旧 snapshot）。
-  - `AgentRestoreBuilder::build`（snapshot.rs）改用 `CollabState::restore(...)` 取代
-    `provision(...)`，并更新注释。
-  - 说明：本任务按“topology 决定是否建、snapshot 决定内容”的稳妥策略打通同拓扑 round-trip。
-    “snapshot 内容对 topology 具有权威性、topology 仅作旧 snapshot 的 provision hint”这一冲突
-    策略（例如无 delegate 却显式启用 mailbox 的 agent）及其文档、旧格式无字段兼容测试，仍归属
-    M3-3，本任务未提前实现。
-- 测试（`src/facade/agent/snapshot_tests.rs`，模块 `facade::agent::snapshot::tests`，新增 4 个，
-  自带 offline `StubClient`）：
-  - `capture_and_restore_preserve_live_mailbox_contents`：双 delegate 拓扑（§14 自动 mailbox），
-    写多 recipient→snapshot（next_seq/inbox 一致）→restore，`read_from` 内容与顺序一致，
-    restore 后新 send 续 seq=3。
-  - `capture_and_restore_preserve_blackboard_channels`：dispatcher 拓扑（plan+blackboard+
-    mailbox），多 channel post→snapshot→restore，board id/channel 列表/每 channel 顺序一致，
-    新 post offset 续。
-  - `capture_and_restore_preserve_plan_state`：dispatcher 拓扑，add_task→snapshot→restore，
-    id/version/task_order 一致（version 保留使后续 CAS claim 仍需匹配）。
-  - `disabled_collaboration_leaves_snapshot_and_restore_bare`：base agent（无 delegate）
-    snapshot 三个 slice 均 `None`，restore 不建任何 substrate。
-- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
-  `cargo test -p agent-lib --lib facade::agent::snapshot`（4 passed）、
-  `cargo test -p agent-lib --lib facade::collab`（17 passed）、
-  `cargo test -p agent-lib --lib agent::collab`（28 passed，回归）、
-  `cargo test --all --all-targets`（全绿）、`cargo test --all --doc`（全绿）、
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
-
-### M3-3 [DONE] 让 restore 优先使用 snapshot 中的协作内容
-
-上下文：
-
-- restore builder 在 `src/facade/agent/snapshot.rs`。
-- 当前 restore 会根据 topology 重新 provision 空 mailbox、blackboard、plan。
-- 修复 capture 后，如果 restore 仍忽略内容，round-trip 仍然不完整。
-
-实现要求：
-
-- 更新 `AgentRestoreBuilder::build` 或相关 helper：当 snapshot 中存在 mailbox、blackboard、plan 内容时，优先从 snapshot 恢复。
-- 当 snapshot 中缺失内容但 topology 要求启用组件时，才创建空组件。
-- 当 snapshot 内容和 topology 明显冲突时，选择一个可解释策略并写入文档。推荐策略是 snapshot 内容为准，topology 只作为兼容旧 snapshot 的 provision hint。
-- 确认恢复后的 agent 能继续执行协作相关工具或 delegate workflow。
-
-验证条件：
-
-- 增加 round-trip 测试：snapshot 前已有 mailbox seq，restore 后继续发送消息，seq 不冲突。
-- 增加 round-trip 测试：snapshot 前已有 blackboard channel，restore 后追加消息，旧消息仍在且新 offset 正确。
-- 增加兼容性测试：构造没有协作内容字段的旧格式 snapshot，restore 成功并得到空协作底座。
-- 运行：
-
-```bash
-cargo test -p agent-lib --lib facade::agent::snapshot
-```
-
-完成记录（M3-3）：
-
-- 实现：
-  - `src/facade/collab.rs`：重写 `CollabState::restore`，把冲突策略从「topology 权威」改为
-    **「snapshot 内容为准，topology 只作旧 snapshot 的 provision hint」**。每个协作原语：
-    snapshot 有内容 → `from_snapshot`（即使 topology 未启用也恢复）；无内容 → 回落到
-    `config.*_enabled()` 空建（旧 snapshot 兼容）；两者皆无 → 保持 `None`。恢复后把 effective
-    `config` 拓宽以覆盖任何由 snapshot 恢复的原语，使 `Agent::collaboration()` 广告的 flag 与
-    `mailbox()`/`blackboard()`/`plan()` 访问器返回的 live 原语始终一致（不再出现「访问器 Some 但
-    config 说 disabled」的不一致）。更新该函数 doc 注释说明冲突规则。
-  - `src/facade/agent/snapshot.rs`：更新 `AgentRestoreBuilder::build` 中 `resolve(...)` 前的注释，
-    说明 topology 派生的 `Collaboration` 现在仅作 provision hint，snapshot 的 mailbox/blackboard/
-    plan slice 具权威性。
-  - `docs/facade-api.md` §15.2：新增段落，明确协作 restore 的冲突策略、旧格式（缺字段）兼容行为，
-    以及顶层 `artifacts` 目前为保留字段、restore 不依赖它。
-- 测试：
-  - `src/facade/agent/snapshot_tests.rs`（`facade::agent::snapshot::tests`，新增 2 个）：
-    - `snapshot_content_overrides_disabled_restore_topology`：把已填充的 mailbox snapshot 嫁接到
-      无 delegate（topology 派生空底座）的 base agent snapshot 上，restore 后 mailbox 被恢复、
-      `collaboration().mailbox_enabled()` 为真、内容按序可读、续 seq=2；未携带的 blackboard/plan
-      仍为 `None`。
-    - `legacy_snapshot_without_collaboration_fields_restores_bare`：把真实 snapshot 编码为 JSON、
-      删除 `mailbox`/`blackboard`/`plan`/`artifacts` 键，经 `#[serde(default)]` 反序列化为空，
-      restore 成功并由 topology 派生空 mailbox（内容为空），blackboard/plan 为 `None`。
-    - 既有 M3-2 round-trip 续操作测试（mailbox 续 seq、blackboard 续 offset）保留并回归。
-  - `src/facade/collab.rs`（`facade::collab::tests`，新增 2 个）：
-    - `restore_without_snapshot_falls_back_to_topology_hint`：无 slice 时 restore 退化为按 config
-      空建（等价 provision）。
-    - `restore_snapshot_content_overrides_disabled_config`：空 config + 带内容 mailbox snapshot →
-      恢复 mailbox 且 config 拓宽、续 seq。
-- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
-  `cargo test -p agent-lib --lib facade::agent::snapshot`（6 passed）、
-  `cargo test -p agent-lib --lib facade::collab`（19 passed）、
-  `cargo test -p agent-lib --lib agent::collab`（28 passed，回归）、
-  `cargo test --all --all-targets`（全绿）、`cargo test --all --doc`（全绿）、
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
-
-### M3-4 [DONE] 明确并实现顶层 artifact snapshot 策略
-
-上下文：
-
-- `AgentSnapshot` 顶层存在 `artifacts` 字段，但当前 capture 写入空数组。
-- external delegate 或 retained session 可能已经有自己的 artifact snapshot。
-- 如果顶层字段长期为空但文档暗示可用，会误导调用方。
-
-实现要求：
-
-- 在 `src/facade/agent/snapshot.rs` 中明确顶层 `artifacts` 的语义。
-- 二选一实现：
-  - 保存聚合后的 facade-level artifact view，并保证 restore 后可查询。
-  - 或将字段标记为保留兼容字段，并在文档中说明 artifact 当前由 external session snapshot 持有，顶层字段不作为行为来源。
-- 推荐优先选择最小可维护策略。如果没有稳定 artifact store，就不要伪造聚合语义。
-- 更新 `docs/refine.md`、`docs/facade-api.md` 或 `docs/managed-external-agent.md` 中相关说明。
-
-验证条件：
-
-- 若实现聚合保存：增加 snapshot round-trip 测试，验证 artifact view 恢复一致。
-- 若选择保留字段策略：增加序列化兼容测试，验证空字段存在且 restore 不依赖它。
-- 文档必须明确调用方应从哪里读取 restored artifacts。
-- 运行：
-
-```bash
-cargo test -p agent-lib --lib facade::agent::snapshot
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-```
-
-完成记录（M3-4）：
-
-- 决策：采用**选项 2（保留兼容字段）**。核实无稳定 facade-level artifact store——
-  `CollabState` 的 artifact store 只是 `config` 上的 flag（`src/facade/collab.rs`
-  的 `CollabState` doc 已说明 delegate artifact refs 已收进 `RunOutput.artifacts`），
-  且 restore 路径从不读取顶层 `AgentSnapshot.artifacts`。故按“如果没有稳定 artifact
-  store 就不要伪造聚合语义”把顶层字段定为**保留兼容字段**：capture 恒写空、restore
-  忽略。权威 artifact 来源明确为两处：per-run 的 `RunOutput.artifacts`（瞬时视图）与
-  per-external-delegate 的 `ExternalDelegateSnapshot.artifacts`（随会话事实持久化并按
-  delegate 恢复）。
-- 实现（`src/facade/agent/snapshot.rs`，仅文档语义定稿，无行为改动）：
-  - 更新模块级 doc、`AgentSnapshot` struct doc、`artifacts` 字段 doc 与 `capture` doc，
-    明确顶层 artifacts 为保留兼容字段（非行为来源、恒空、restore 忽略），并指明真实
-    artifact 来源。`capture` 的 `artifacts: Vec::new()` 处加注释说明恒空原因。字段仍带
-    `#[serde(default)]` 以保持持久化 shape 稳定与旧 snapshot 可读。
-- 文档：
-  - `docs/facade-api.md` §15.2：把原“顶层 artifacts 为保留字段（见后续里程碑）”一句
-    定稿为完整段落，说明保留兼容字段语义、不聚合的原因，以及调用方应从
-    `RunOutput.artifacts`（per-run）与 external delegate snapshot（per-delegate 持久）读取
-    artifacts。
-  - `docs/refine.md` 条目 2：把 artifact 数据来源三问标注为“已决策（M3-4）”，明确顶层字段
-    为保留兼容字段、不聚合；并把归属一致的建议测试项改写为三者语义不冲突的结论。
-- 测试（`src/facade/agent/snapshot_tests.rs`，`facade::agent::snapshot::tests`，新增 2 个）：
-  - `top_level_artifacts_is_reserved_empty_even_when_store_enabled`：显式
-    `Collaboration::new().artifacts()` 启用 artifact store flag 后 snapshot，顶层 artifacts
-    仍为空；serde 往返后字段仍为 present 的空数组（`"artifacts": []`）。
-  - `top_level_artifacts_are_ignored_on_restore`：把非空 `ArtifactRef` 嫁接到顶层 artifacts
-    后 restore 成功，re-snapshot 恢复出的 agent 顶层 artifacts 仍为空（证明 restore 不读取、
-    不携带该字段），且 restored 拓扑不受影响（两 delegate 仍重建空 mailbox）。
-- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
-  `cargo test -p agent-lib --lib facade::agent::snapshot`（8 passed）、
-  `cargo test -p agent-lib --lib facade::collab`（19 passed，回归）、
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
-  说明：本任务仅改文档注释、文档文件与新增测试，未改动库的非测试编译产物行为，故未重跑
-  全量 `cargo test --all --all-targets`（clippy `--all-targets` 已成功编译含新测试的全部
-  target，targeted 测试全绿）。
-
-### M3-5 [DONE] Review：协作状态 snapshot 和 restore
-
-检查范围：
-
-- mailbox、blackboard、plan 的 snapshot 类型是否 data-only、可 serde、可兼容旧格式。
-- `AgentSnapshot::capture` 是否真的读取 live 状态，而不是 topology 默认值。
-- `AgentRestoreBuilder` 是否优先使用 snapshot 内容。
-- artifact 策略是否在代码和文档中一致。
-- retained external session snapshot 是否没有被本阶段改坏。
-
-验证条件：
-
-- 运行：
-
-```bash
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo test -p agent-lib --lib agent::collab
-cargo test -p agent-lib --lib facade::agent::snapshot
-cargo test -p agent-lib --lib facade::collab
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-```
-
-- 手工复核 `docs/refine.md` 中 “协作状态 snapshot/restore 缺失” 条目的状态，必要时补充当前修复说明。
-
-完成记录（M3-5）：
-
-- 代码复核（逐项确认 M3-1 ~ M3-4 落地且一致）：
-  - **data-only / serde / 兼容旧格式**：`MailboxSnapshot`（`src/agent/collab/mailbox.rs`）、
-    `BlackboardSnapshot`（`blackboard.rs`）、`PlanSnapshot`（`plan.rs`）均为纯数据（无
-    `Mutex`/`Arc`/runtime handle），derive `Serialize`/`Deserialize`；facade 层
-    `AgentSnapshot.{mailbox,blackboard,plan,artifacts}`（`src/facade/agent/snapshot.rs`）
-    均带 `#[serde(default)]`，缺字段的旧 JSON 可安全反序列化。`Mailbox::from_snapshot`
-    还把 `next_seq` reconcile 到 `max(seq)+1`，防止手写/旧快照发出冲突序号。
-  - **capture 读 live 状态**：`AgentSnapshot::capture` 从 `collab.mailbox/blackboard/plan`
-    调 `snapshot()`/`snapshot_all()`，非 topology 默认；`artifacts` 恒空（保留兼容字段）。
-  - **restore 优先 snapshot**：`CollabState::restore` = snapshot 权威 + topology provision
-    hint；捕获切片即使拓扑未启用也恢复内容，之后拓宽 effective `config` 保证
-    `collaboration()` 与访问器一致；缺内容但拓扑启用才建空底座。`AgentRestoreBuilder::build`
-    以 `resolve(None, ..)` 派生 topology hint 并把 snapshot 三切片交给 `restore`。
-  - **artifact 策略一致**：顶层 `artifacts` 在模块 doc、struct/字段 doc、`capture` 注释与
-    `docs/facade-api.md` §15.2 一致定为保留兼容字段（恒空、restore 忽略），权威来源为
-    `RunOutput.artifacts` 与 `ExternalDelegateSnapshot.artifacts`。
-  - **retained external session 未被改坏**：restore 仍按 `restore_external`
-    （MarkInterrupted / RestartFromBrief / AttachOrFail）从 `snap.session`/`snap.artifacts`/
-    `snap.status` 重建 `RetainedExternalSession`，本阶段未触碰该路径逻辑。
-- 文档：更新 `docs/refine.md` §2「协作状态运行时可用，但 snapshot/restore 仍丢弃数据」——
-  在标题下标注**状态：已修复（M3-1 ~ M3-4，M3-5 复核通过）**，保留原始缺口描述作为背景，
-  并在条目末尾新增「修复结果」小节，逐条说明 capture 读 live、restore snapshot 权威、
-  serde 兼容、artifact 保留字段策略与 external session 未受影响，附 M3-5 验证结果。
-- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
-  `cargo test -p agent-lib --lib agent::collab`（28 passed）；
-  `cargo test -p agent-lib --lib facade::agent::snapshot`（8 passed）；
-  `cargo test -p agent-lib --lib facade::collab`（19 passed）；
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
-  说明：本任务为 Review + 文档修订，未改动任何库/测试的编译产物代码（仅 `docs/refine.md`、
-  `TODO.md`、`memory/claude_plan.md`），且 clippy `--all-targets` 已成功编译含全部测试的
-  target、targeted 测试全绿，故未重跑全量 `cargo test --all --all-targets`。
-
-## M4：managed external 可用性和 capability 来源
-
-### M4-1 [DONE] 提供可直接装配默认 session handler 的 builder API
-
-上下文：
-
-- `ManagedExternalAgent` 和 builder 在 `src/facade/external.rs`。
-- 当前 README quick start 展示 `ManagedExternalAgent::builder(...).build()`，但 managed external run 需要 session handler，否则 `drive_external` 会返回缺少 handler 的错误。
-- 现有 `default_external_session_handler` 需要先拿到已构造的 `ManagedExternalAgent`，再回填 builder，调用体验绕。
-
-实现要求：
-
-- 在 `ManagedExternalAgentBuilder` 上增加清晰 API，用于构造 agent 并自动装配默认 session handler。
-- API 名称应直接表达语义，例如 `build_with_default_session_handler` 或等价命名。
-- 默认 feature 下不能引入 CLI adapter 依赖；未启用相关 feature 时，错误行为应与现有 default handler 保持一致。
-- 启用对应 external feature 时，该 API 应执行现有 probe 和 registry-backed handler 装配。
-- 保持现有手工 `.session_handler(...)` 路径可用，不能破坏调用方自定义 handler。
-
-验证条件：
-
-- 增加测试覆盖：默认 feature 下调用新 API 得到明确错误，且错误不包含 secret。
-- 增加测试覆盖：手工 `.session_handler(...)` 路径仍可 build。
-- 如果可以用 fake registry 或 fake handler 覆盖启用 feature 路径，增加测试；否则在任务记录中说明为什么只能通过 feature clippy 验证。
-- 运行：
-
-```bash
-cargo test -p agent-lib --lib facade::external
-cargo clippy --all-targets -- -D warnings
-```
-
-完成记录（M4-1）：
-
-- 实现：在 `ManagedExternalAgentBuilder` 上新增异步一步式 API
-  `build_with_default_session_handler(self) -> Result<ManagedExternalAgent, FacadeError>`
-  （`src/facade/external.rs`，紧接 `build()`）：
-  - 若已通过 `.session_handler(..)` 手工提供 handler → 直接 `self.build()`，honor 自定义
-    handler 并**短路** probe（与 feature 无关），保证既有手工路径不被破坏。
-  - 否则 `build()` 校验 mode 后调用现有 `default_external_session_handler(&agent)`，把返回的
-    registry-backed handler 装到 agent 上返回，取代旧的“先 build、再回填 builder”绕路。
-  - 默认 feature 下不引入 CLI adapter：未启用对应 `external-*` feature 时，装配走
-    `build_default_registry` 的 catch-all，返回与现有 `default_external_session_handler`
-    完全一致的非 secret fail-fast「rebuild with the matching external-* feature」错误。
-  - 启用对应 feature 时复用现有 probe + registry 装配路径（`build_claude_code_registry` 等）。
-  - capability 的 `Probed` 视图留待 M4-4（本任务只做 handler 装配，不改 capability 来源）。
-- 测试（`facade::external` tests，3 个新增）：
-  - `build_with_default_session_handler_fails_fast_when_feature_disabled`
-    （`#[cfg(not(feature = "external-codex"))]`）：默认 feature 下调用新 API 得到
-    `ExternalAgent{name:"codex", message contains "external-codex"}`，并断言 message 不含
-    `KEY`/`TOKEN` 等 secret 片段。
-  - `build_with_default_session_handler_honors_supplied_handler`：手工注入的 scripted
-    handler 短路 probe（handler 的 `fulfill` panic 保证 probe 未跑），build 成功且
-    `session_handler().is_some()`；该分支与 feature 无关，覆盖“启用/未启用 feature 均可用”的
-    手工路径。
-  - `manual_session_handler_path_still_builds`：`.session_handler(..).build()` 旧路径仍可 build。
-  - 说明：启用 feature 的真实 probe 装配路径需本机 CLI + login（`probe()` 真起进程），无法离线
-    单测；靠 feature clippy（`--features "external-claude-code external-codex external-opencode
-    external-acp"`）覆盖该分支的编译正确性。
-- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
-  `cargo test -p agent-lib --lib facade::external`（13 passed，含 3 新增）；
-  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode
-  external-acp" -- -D warnings`（clean）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-  --workspace`（clean，新方法 intra-doc 链接解析通过）。
-
-### M4-2 [DONE] 修正 README managed external quick start
-
-上下文：
-
-- `README.md` 的 external quick start 当前示例容易构造出没有 session handler 的 `ManagedExternalAgent`。
-- `docs/managed-external-agent.md` 是 managed external 设计说明来源之一。
-
-实现要求：
-
-- 更新 `README.md` 示例，使用 M4-1 中新增的默认 handler builder API。
-- 在示例旁说明：默认 crate build 不启用 CLI adapter；运行 managed external 示例需要对应 feature 和本机 CLI login。
-- 更新 `docs/managed-external-agent.md` 中的 quick start 或构造说明，确保它和 README 一致。
-- 检查 `examples/` 中 managed examples 是否仍是推荐路径；如有重复描述，保持术语一致。
-
-验证条件：
-
-- 运行 README 中示例对应的编译检查。如果示例不是 doc test，至少运行：
-
-```bash
-cargo check --examples
 cargo clippy --all-targets \
   --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
-```
-
-- 文档中不能出现“build 后即可 run external agent”但没有 handler 装配的示例。
-
-完成记录（M4-2）：
-
-- `README.md` §4 external quick start：codex 构造从 `.build()?` 改为 M4-1 的
-  `.build_with_default_session_handler().await?`（`#[tokio::main]` async main 下），示例内加注释说明
-  默认 crate build 不含 CLI adapter、未开启对应 `external-*` feature 时该装配 fail-fast（非密、点名 feature），
-  开启后探测本机已登录 CLI 并接官方 registry-backed handler。更新尾注：保留手工自定义 handler 的
-  `.session_handler(..).build()?` 路径（短路 probe）、指明运行 managed external 需要 feature + 本机 CLI login，
-  并指向[可运行示例]（`examples/support/managed.rs` 全手工 scoped-effect wiring）。
-- `docs/facade-api.md`：§11.1 与 §17.3 两处 external delegate 构造同样从 `.build()?` 改为
-  `.build_with_default_session_handler().await?`（消除「build 后即可 run 但无 handler」示例）；§11.2
-  default handler 说明补一句指向 ergonomic 一步式 `build_with_default_session_handler().await?`（手工 handler 短路 probe）。
-- `docs/managed-external-agent.md` §21 M9 examples：新增「facade 构造（快速上手）」说明段，指出 examples 展示
-  全手工 scoped-effect wiring（推荐给需完全掌控装配的宿主），快速上手用 facade 一步式
-  `ManagedExternalAgent::codex()...build_with_default_session_handler().await?`（默认 build 无 CLI adapter、
-  缺 feature/CLI login 时 fail-fast，绝不产出缺 handler 的 agent），与 README / facade-api.md §11 一致。
-- examples 检查：`examples/support/managed.rs` 的手工 probe→registry→`ExternalSessionHandler` scoped wiring
-  仍是推荐的「managed 全手工」路径（与 AGENTS.md、design doc 一致），术语已对齐（ergonomic 一步式 vs 全手工 wiring），
-  无需改代码。
-- refine.md §5 的「问题现状」代码块是 bug 复现描述（非推荐示例），其状态标注归属后续 M6-1（同步 refine.md
-  问题状态），本任务不改。
-- 验证：`cargo fmt --all`（clean）；`cargo check --examples`（Finished，exit 0）；
-  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`（clean）。
-  README/facade-api.md/managed-external-agent.md 均非 doctest（`src/` 无 `include_str!(README)`），rust 块不参与编译。
-  本任务仅改动 `*.md` 文档、无 `.rs` 代码或编译产物变化，故复用上次全量 `cargo test --all --all-targets` 绿结果，不重跑全量套件。
-
-### M4-3 [DONE] 为 external capability 增加来源模型
-
-上下文：
-
-- `ExternalAgentCapabilities` 和 preset builder 在 `src/facade/external.rs`。
-- 当前 preset 构造时使用 `declared_capabilities`，builder 校验和 `Agent` 后续能力判断也读取这个 capability view。
-- declared capability 是静态声明，不等同于真实 CLI probe 或 ACP negotiation 结果。
-
-实现要求：
-
-- 增加 capability source 模型，至少覆盖：
-  - `Declared`：adapter 或 preset 的静态声明。
-  - `Supplied`：调用方手工提供。
-  - `Probed`：通过 CLI probe 或 registry handler 得到。
-  - `Negotiated`：通过 ACP negotiation 得到。
-- 为 `ExternalAgentCapabilities` 或等价 wrapper 提供 `source()` accessor。
-- 更新 builder 的 capability 校验和错误信息，使调用方能看出当前判断来自哪个 source。
-- 保持常见现有调用可编译。若必须调整构造函数，提供兼容 helper 或清晰迁移路径。
-- 确认 serde、Debug、Clone、PartialEq 等 trait 行为符合现有测试期望。
-
-验证条件：
-
-- 增加测试覆盖：preset capability source 为 `Declared`。
-- 增加测试覆盖：调用方手工 `.capabilities(...)` 的 source 为 `Supplied`。
-- 增加测试覆盖：ACP negotiation 结果 source 为 `Negotiated`。
-- 若 M4-1 能拿到 probe capability，增加测试覆盖：默认 handler API 得到的 source 为 `Probed`。
-- 运行：
-
-```bash
-cargo test -p agent-lib --lib facade::external
-```
-
-完成记录（M4-3）：
-
-- 实现（`src/facade/external.rs`）：
-  - 新增 pub `CapabilitySource` 枚举，覆盖 `Declared` / `Supplied` / `Probed` /
-    `Negotiated`，derive `Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize,
-    Deserialize`，`#[serde(rename_all="snake_case")]`，`Default = Declared`，
-    带非 secret `as_str()` + `Display`。从 `facade::mod` re-export。
-  - `ExternalAgentCapabilities` 增加 `source: CapabilitySource` 字段（`#[serde(default)]`，
-    旧数据缺字段回落到保守的 `Declared`），新增 `source()` const accessor。
-  - provenance-tagged 构造函数：`declared(inner)` / `supplied(inner)` / `probed(inner)`
-    （私有 `with_source` 复用）；`from_runtime_capabilities(inner)` 语义改为“调用方提供”=
-    `Supplied`（通用 pub wrapper，向后兼容——仍可编译、旧调用方拿到 Supplied provenance）；
-    `from_acp_negotiation(negotiated)` 标记 `Negotiated`（cfg external-acp）。
-  - 内部构造点改为 provenance 正确：preset `for_runtime` 与 `from_restored_parts` 用
-    `declared(..)`；ACP preset baseline `from_acp_config` 改为
-    `declared(capabilities_from_initialize(&none()))`（pre-negotiation 静态 floor = Declared，
-    区别于真实 `.acp_negotiated(..)` 的 Negotiated）。
-  - `.capabilities(caps)` setter 保留“存储调用方 caps provenance”语义（调用方用
-    `supplied(..)`/`from_runtime_capabilities(..)` → Supplied），不强制覆盖，便于 M4-4 传入
-    Probed view。
-- 校验与错误信息（`src/facade/error.rs`）：`FacadeError::UnsupportedExternalMode` 增加
-  `capability_source: &'static str` 字段（字段名避开 thiserror 对 `source` 的特殊处理），
-  `#[error]` 文案追加 `capability source: {capability_source}`；`build()` 失败时填
-  `self.capabilities.source().as_str()`，让调用方看出当前 mode 判断基于哪种 provenance。
-- 测试（`facade::external` tests，新增 6 + 更新 2）：
-  - `preset_capabilities_are_declared`：codex preset `source()==Declared`。
-  - `from_runtime_capabilities_is_supplied` / `supplied_capabilities_flow_through_builder`：
-    `from_runtime_capabilities`/`supplied` = Supplied，且经 `.capabilities(..)` build 后保留。
-  - `probed_capabilities_are_probed`：`probed(..)` = Probed（供 M4-4 装配用）。
-  - `capability_source_labels_match_serde`：4 变体 serde/label/Default 一致。
-  - `capabilities_source_defaults_when_absent_from_serde`：删掉 `source` 字段后反序列化回落 Declared。
-  - 更新 `unsupported_mode_fails_fast_with_missing_capabilities` 断言 `capability_source=="declared"`；
-    更新 `acp_presets_map_negotiated_capabilities` 断言 baseline source==Declared、错误
-    `capability_source:"declared"`、negotiated 结果 source==Negotiated。
-  - Probed 的真实 probe 装配需本机 CLI + login（`probe()` 真起进程），离线无法单测；靠
-    `probed(..)` 构造函数单测 + 后续 M4-4（默认 handler API 折入 Probed view）+ feature clippy
-    覆盖该分支编译正确性。
-- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
-  `cargo test -p agent-lib --lib facade::external`（19 passed 默认 feature / 21 passed 含
-  external-acp，含全部新增）；`cargo clippy --all-targets --features "external-claude-code
-  external-codex external-opencode external-acp" -- -D warnings`（clean）；
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）；
-  `cargo test --all --all-targets`（全绿，50 个 test binary，无 failure）。
-
-### M4-4 [DONE] 让 probed capability 成为 managed external agent 的真实能力视图
-
-上下文：
-
-- `drive_external` 和 unsupported capability fallback 依赖 agent 持有的 capability view。
-- 如果 agent 只持有 declared capability，即使 default handler probe 已经发现缺失能力，后续判断也可能误导。
-
-实现要求：
-
-- 更新 M4-1 的默认 handler builder API：probe 成功后，返回的 agent 必须持有 source 为 `Probed` 的 capability view。
-- 如果现有 `default_external_session_handler` 只返回 handler，增加一个不会破坏旧 API 的 helper，返回 handler 和 probed capabilities，或在 builder 内部完成等价逻辑。
-- `UnsupportedCapability` 判断必须基于 agent 当前持有的 capability view。
-- probe 失败仍然走现有非 secret skip 或错误路径，不把命令行、环境变量 secret 或 provider token 写入错误。
-- 更新 `docs/capability-matrix.md`，明确 declared 和 probed 的区别。
-
-验证条件：
-
-- 增加测试覆盖：当 probed capability 缺少某能力时，请求该能力返回 `UnsupportedCapability`，错误信息包含 capability 名称和 source，但不包含 secret。
-- 增加测试覆盖：declared capability 支持但 probed capability 不支持时，以 probed 结果为准。
-- 运行：
-
-```bash
-cargo test -p agent-lib --lib facade::external
-cargo clippy --all-targets \
-  --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
-```
-
-完成记录（M4-4）：
-
-- 实现（`src/facade/external.rs`）：
-  - `build_default_registry` 改为返回 `(ExternalSessionRegistry, Option<ExternalRuntimeCapabilities>)`：
-    三个 CLI arm（claude_code/codex/opencode）返回 `Some(probed)`（各 `build_*_registry` 现返回
-    `(registry, probed)` 元组，probe 结果既 wire 进 adapter 又回传）；ACP arm 返回 `None`（能力经 live
-    `initialize` 每会话协商，无离线 probe）；feature-disabled catch-all 仍走非 secret fail-fast Err。
-  - 新增 pub helper `default_external_session_handler_with_capabilities(agent)
-    -> Result<(Arc<RegistryExternalSessionHandler>, Option<ExternalAgentCapabilities>), FacadeError>`：把
-    probed 包成 `ExternalAgentCapabilities::probed(..)`（source=`Probed`）随 handler 一并返回。
-    `default_external_session_handler` 保留旧签名，改为薄封装（丢弃 capabilities），向后兼容。
-  - `build_with_default_session_handler`：改用新 helper，attach handler 后若 `Some(probed_view)` 则把
-    `agent.capabilities` 覆盖为 probed 视图（source=Probed），取代 build 时的 Declared 基线；因 probed 可能
-    比 declared 窄，抽出的 `validate_external_mode(runtime, mode, caps)` 会**再次**按 probed 视图校验
-    `ExternalRunMode`（缺能力则 `UnsupportedExternalMode`，source 标 `probed`）。`build()` 复用同一 helper。
-    已手工 `.session_handler(..)` 时仍短路 probe、honor 自定义 handler（不覆盖能力视图）。
-  - 新增 `ManagedExternalAgent::require_capability(cap) -> Result<(), FacadeError>`：基于 agent **当前持有**的
-    `self.capabilities` 判断，缺失时返回新变体 `FacadeError::UnsupportedExternalCapability
-    { runtime, capability, capability_source }`。
-- 错误类型（`src/facade/error.rs`）：新增 `#[non_exhaustive]` 变体 `UnsupportedExternalCapability`
-  （`runtime: String` / `capability: &'static str` / `capability_source: &'static str`），`#[error]` 文案点名
-  runtime、capability、capability source，稳定字符串、绝不含 runtime 输出或凭据。
-- re-export（`src/facade/mod.rs`）：导出 `default_external_session_handler_with_capabilities`。
-- 文档：
-  - `docs/capability-matrix.md` 新增「能力来源：declared vs probed（facade §11.3）」小节：`CapabilitySource`
-    四值表 + declared 是保守猜测/probed 是验证真相、一步式装配折入 probed、probed 比 declared 窄时以 probed
-    为准、ACP 无离线 probe、来源标签进错误信息且不含 secret。
-  - `docs/facade-api.md` §11.2 补 `default_external_session_handler_with_capabilities` 签名与「probe 结果折入
-    真实能力视图」说明；§11.3 补 `CapabilitySource` 来源模型与 `require_capability(..)`/
-    `UnsupportedExternalCapability` 门禁说明。
-- 测试（`facade::external` tests，新增 3）：
-  - `require_capability_gates_against_probed_view`：构造持 `Probed` 视图（claude_code declared 广告
-    permission_bridge，模拟 probe 未证实 → 关掉 permission_bridge/host_tools）的 BlackBox agent；断言
-    `source()==Probed`、supported 能力放行、`require_capability(PermissionBridge)`→
-    `UnsupportedExternalCapability{runtime:"claude_code",capability:"permission_bridge",source:"probed"}`（证明
-    probed 覆盖 declared）、rendered 错误含 `host_tools`/`probed` 且不含 `KEY`/`TOKEN`。
-  - `require_capability_reports_declared_provenance_for_a_preset`：declared preset(codex) 缺 host_tools 时错误
-    source=`declared`，与 probed 对照。
-  - `default_handler_with_capabilities_fails_fast_when_feature_disabled`（`cfg(not(external-codex))`）：新 helper
-    feature 关时同样非 secret fail-fast、点名 `external-codex`、不漏 secret。
-  - 说明：真实 probe 折入 Probed 需本机 CLI + login（`probe()` 真起进程），离线无法单测该端到端路径；靠
-    `probed(..)` 构造 + 上述门禁测试覆盖逻辑，feature clippy 覆盖 feature-gated 装配分支编译正确性。
-- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
-  `cargo test -p agent-lib --lib facade::external`（22 passed 默认 feature / 22 passed 含全部 external
-  feature，含 3 新增）；`cargo clippy --all-targets --features "external-claude-code external-codex
-  external-opencode external-acp" -- -D warnings`（clean）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-  --workspace`（clean，默认 + 全 external feature 均通过）；`cargo check --examples --features "…"`（clean）；
-  `cargo test --all --all-targets`（全绿，无 failure）。
-
-### M4-5 [DONE] Review：managed external 可用性和 capability 来源
-
-检查范围：
-
-- README 和 managed external docs 是否都给出了可工作的 handler 装配路径。
-- 默认 feature 下是否仍不拉入 CLI adapter。
-- capability source 是否覆盖 declared、supplied、probed、negotiated。
-- unsupported capability fallback 是否基于真实 capability view。
-- 错误和测试 fixture 是否不包含 secret。
-
-验证条件：
-
-- 运行：
-
-```bash
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo test -p agent-lib --lib facade::external
-cargo check --examples
-cargo clippy --all-targets \
-  --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-```
-
-- 手工复核 `docs/refine.md` 中 “managed external capability 混淆声明和验证” 与 “README quick start 缺少 session handler” 两个条目的状态，必要时补充当前修复说明。
-
-完成记录（M4-5）：
-
-- 代码复核（逐项确认 M4-1 ~ M4-4 落地且一致）：
-  - **handler 装配路径可工作**：README managed external quick start（`README.md` §Managed
-    external）用一步式 `ManagedExternalAgent::codex()…build_with_default_session_handler().await?`
-    直接产出已挂 handler 的 agent，并说明自定义 handler 的手工 `.session_handler(..).build()`
-    路径与底层 `default_external_session_handler(&agent)`；`docs/facade-api.md` §11.2 与
-    `docs/managed-external-agent.md` 描述同一 seam。`examples/support/managed.rs` 的全手工
-    scoped-effect wiring `cargo check --examples` 通过。
-  - **默认 feature 不拉入 CLI adapter**：`build_default_registry` 每个 runtime arm 均
-    `#[cfg(feature = "external-*")]` 门控，feature 关时走 catch-all `runtime_feature_disabled`
-    非密 fail-fast；`Cargo.toml` 三个 CLI feature 为空 feature（仅复用 tokio），ACP feature 才引
-    真实 optional deps。默认 `cargo clippy --all-targets`（clean）与 `cargo check --examples`
-    （clean）证明默认 build 不链接任何 adapter 机制。
-  - **capability source 覆盖四值**：`CapabilitySource` 枚举含 `Declared` / `Supplied` /
-    `Probed` / `Negotiated`，`ExternalAgentCapabilities::source()` 暴露 provenance，构造函数
-    `declared`/`supplied`/`probed`/`from_acp_negotiation` 一一对应；serde 缺字段回落 `Declared`。
-  - **unsupported capability fallback 基于真实能力视图**：`require_capability` 读
-    `self.capabilities`（agent 当前持有的视图），`build_with_default_session_handler` probe 成功后
-    把 `Probed` 视图折回 agent 并用共享的 `validate_external_mode` 按 probed 重新校验
-    `ExternalRunMode`（probed 比 declared 窄时以 probed 为准）；ACP 无离线 probe，保留视图。
-  - **错误与测试 fixture 无 secret**：`FacadeError::{UnsupportedExternalMode,
-    UnsupportedExternalCapability}` 仅用 `&'static str` 标签 + 稳定 runtime label + 能力名列表，
-    `capability_source` 为稳定字符串；`ExternalAgent.message` 来自不含凭据的 classified
-    `ExternalAgentError`。`facade::external` 测试断言 rendered 错误含能力名/来源但不含 `KEY`/`TOKEN`。
-- 文档：`docs/refine.md` §4「Managed external capability 的 declared / verified 语义边界」与
-  §5「External quick start 文档和 handler 注入 API」各在标题下标注**状态：已修复**（§4：M4-3,
-  M4-4；§5：M4-1, M4-2；均 M4-5 复核通过），保留原始缺口描述作为背景，条目末尾新增「修复结果」
-  小节逐条说明来源模型、probed 折入/优先、一步式装配 API、README 改写与 secret-free 保证及 M4-5
-  验证结果。顶层「总体判断」剩余问题清单沿用 M3-5 约定不改（以各条目状态标注为准）。
-- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
-  `cargo test -p agent-lib --lib facade::external`（22 passed）；`cargo check --examples`（clean）；
-  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode
-  external-acp" -- -D warnings`（clean）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-  --workspace`（clean）。说明：本任务为 Review + 文档修订，仅改动 `docs/refine.md`、`TODO.md`、
-  `memory/claude_plan.md`，未触碰任何库/测试编译产物代码，故未重跑全量 `cargo test --all
-  --all-targets`（上次 M4-4 全绿结果仍有效）。
-
-## M5：完整逃生出口
-
-### M5-1 [DONE] 扩展 `AgentParts` 覆盖 external、协作和交互状态
-
-上下文：
-
-- `Agent::into_parts` 和 `AgentParts` 在 `src/facade/agent.rs` 附近。
-- 当前拆解结果覆盖 LLM、conversation、tools、instructions、policy 等核心字段，但会丢失 external delegates、retained external sessions、协作状态和 interaction handler。
-- `src/facade/agent/snapshot.rs` 中已有部分 snapshot/restore 相关状态，需要避免 `into_parts` 和 snapshot 的语义互相矛盾。
-
-实现要求：
-
-- 扩展 `AgentParts`，至少覆盖：
-  - external agents 或 delegate registry 配置。
-  - retained external sessions 或等价 data-only handle。
-  - collaboration 配置和当前 live collab state。
-  - interaction handler。
-  - 已有 LLM、conversation、tools、instructions、policies、delegates 字段。
-- 如果某些内部类型不适合作为 public API 直接暴露，设计封装类型或只读/data-only view，并在 rustdoc 说明限制。
-- `Agent::into_parts` 不得静默 drop 仍然有语义价值的状态。
-- 检查是否需要提供从 `AgentParts` 重新构造 `Agent` 的 helper。如果不提供，rustdoc 必须说明 `into_parts` 只是拆解出口，不是完整 restore API。
-
-验证条件：
-
-- 增加测试覆盖：构造带 interaction handler 的 agent，`into_parts` 后 handler 仍存在。
-- 增加测试覆盖：构造带 collaboration 的 agent，`into_parts` 后 collab 配置和当前状态可见或可继续接管。
-- 增加测试覆盖：构造带 external delegate 的 agent，`into_parts` 后 external 配置没有丢失。
-- 如果 retained external session 可在单元测试中伪造，增加测试覆盖；如果不可伪造，在任务记录中说明当前验证边界。
-- 运行：
-
-```bash
-cargo test -p agent-lib --lib facade::agent::
-```
-
-完成记录（M5-1）：
-
-- 代码改动：
-  - **`AgentParts` 扩展**（`src/facade/agent/snapshot.rs`）：在原有 state/client/tools/
-    custom_registry/extra_declarations/approval/ids/delegates/delegation 基础上新增 7 个 public
-    字段——`interaction_handler: Option<Arc<dyn InteractionHandler>>`、`external_agents:
-    Vec<ManagedExternalDelegate>`、`retained_external_sessions: HashMap<String,
-    RetainedExternalSession>`、`collaboration: Collaboration`、`mailbox: Option<Arc<Mailbox>>`、
-    `blackboard: Option<Arc<Blackboard>>`、`plan: Option<Arc<Plan>>`。collab 以「config + 三个
-    live `Arc` 句柄」形式暴露，镜像 `Agent::collaboration/mailbox/blackboard/plan` 访问器，既交出
-    可继续接管的 live handle，又不泄漏 `pub(crate) CollabState` 的内部构造方法（`provision`/
-    `restore`）。
-  - **`Agent::into_parts` 填充新字段**（`src/facade/agent.rs`）：析构 `self.collab` 后把 config 与
-    三个句柄分别搬出，并搬出 `interaction_handler`、`external_agents`、`last_external_sessions`
-    （→ `retained_external_sessions`）。不再静默 drop 任何仍有语义价值的字段。
-  - **内部类型 data-only 暴露**：`RetainedExternalSession` 由 `pub(crate)` 提升为 `pub`（其文档已
-    保证不含 process handle / SDK client / credential，字段类型 `ExternalDelegateStatus` /
-    `ExternalSessionRef` / `ArtifactRef` 均已 public），并在 `src/facade/mod.rs` 的
-    `pub use external::{...}` 重导出，使 `AgentParts` 的 public 字段类型可达。
-  - **rustdoc**：改写 `AgentParts` 与 `Agent::into_parts` 文档，逐项说明交出的资源范围，并明确
-    `into_parts` 是**拆解逃生出口、不是完整 restore API**——它按原样交出 live/owned 部件、不提供
-    `AgentParts -> Agent` 的重建 helper；持久化恢复用 `snapshot`/`restore`，常规构造用 `builder`。
-    同步更新 `AgentParts` 的 `Debug` impl（新增 has_interaction_handler / delegates /
-    external_agents / retained_external_sessions / collaboration / has_mailbox/blackboard/plan，
-    句柄仍不透明）。
-- 新增测试（`src/facade/agent/tests.rs`，5 个，全绿）：
-  - `into_parts_carries_the_injected_interaction_handler`：注入 `FixedInteractionHandler` →
-    `parts.interaction_handler.is_some()`，且 `retained_external_sessions` 为空。
-  - `into_parts_without_a_handler_leaves_the_slot_empty`：无注入 handler → slot 为 `None`
-    （fallback 仍可经 `parts.approval` 取得）。
-  - `into_parts_carries_live_collaboration_state`：dispatcher topology → `parts.collaboration`
-    plan/blackboard/mailbox 全开；通过 `parts.mailbox` 发信并读回，验证句柄仍 live 可接管；
-    blackboard/plan 句柄也在。
-  - `into_parts_carries_registered_external_delegates`：注册
-    `ManagedExternalAgent::claude_code()` → `parts.external_agents` 名称保留、
-    `collaboration.artifacts_enabled()` 为真（§14 external delegate 开 artifact store）、
-    `retained_external_sessions` 为空。
-- 验证边界（retained external session）：`Agent.last_external_sessions` 仅在真实 `run_full` 驱动
-  external delegation 后写入，facade 无 public setter 可伪造非空 map，且真实 CLI 驱动需
-  binary/login（属 `#[ignore]` e2e 范畴）。因此单测覆盖的是「字段被正确 move 且对未驱动 agent 为
-  空」这一类不变量；非空内容的持久化另由 `ExternalDelegateSnapshot` 的 snapshot 路径测试覆盖。
-- 是否提供 `AgentParts -> Agent` helper：不提供（rustdoc 已明确 `into_parts` 只是拆解出口）。
-- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
-  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode"
-  -- -D warnings`（clean）；`cargo test -p agent-lib --lib facade::agent::`（49 passed，含 5 新增）；
-  `cargo test -p agent-lib --lib`（878 passed）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-  --workspace`（clean）。
-
-### M5-2 [DONE] 对齐 `into_parts`、snapshot 和 builder 文档
-
-上下文：
-
-- `AgentParts` 是高级调用方逃生出口。
-- `AgentSnapshot` 是持久化和恢复 API。
-- Builder 是常规构造 API。
-- 三者都能表达一部分 agent 状态，但用途不同，文档必须避免暗示它们可互相替代。
-
-实现要求：
-
-- 在 `src/facade/agent.rs` 的 rustdoc 中说明 `Agent::into_parts` 拆出的资源范围和不保证事项。
-- 在 `docs/facade-api.md` 中说明：
-  - 需要持久化恢复时使用 snapshot。
-  - 需要接管 live handles 时使用 `into_parts`。
-  - 需要常规构造时使用 builder。
-- 如果 `AgentParts` 新增 public 字段，检查 README 示例是否需要更新。
-- 确认 `docs/refine.md` 中关于逃生出口的条目反映新行为。
-
-验证条件：
-
-- 运行：
-
-```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-cargo test -p agent-lib --lib facade::agent::
-```
-
-- 文档中不能继续说 `into_parts` 覆盖完整状态但实际字段缺失。
-
-完成记录（M5-2）：
-
-- 文档改动：
-  - **`docs/facade-api.md` §8.2**：在 Agent facade API 形状块后新增 prose，写清
-    `snapshot` / `restore` / `into_parts` / `builder` 四者用途不可互替——持久化恢复用
-    snapshot+restore（data-only，不含 client/凭据/闭包/handler），接管 live handles 用
-    `into_parts`（并逐项列出交出的部件：`AgentState`+live `Conversation`、client、tools+逃生舱
-    声明、approval bridge+`InteractionHandler`、identity source、local subagent+managed external
-    delegates、`Delegation`、`retained_external_sessions`（data-only，不含进程句柄/凭据）、
-    `Collaboration` config+live `Mailbox`/`Blackboard`/`Plan` 句柄），常规构造用 builder；并明确
-    `into_parts` 是拆解逃生舱、**非** restore API（无 `AgentParts -> Agent` 重建 helper）。
-  - **`src/facade/agent.rs`**：`Agent::into_parts` rustdoc 补 [`builder`] 交叉引用，凑齐
-    snapshot/restore、into_parts、builder 三向对齐（资源范围与不保证事项 M5-1 已写清）。
-  - **`docs/refine.md` §6**：加「状态：**已修复（M5-1 扩展；M5-2 文档对齐；M5-3 复核待进行）**」
-    状态行 + 末尾「修复结果（M5-1 扩展，M5-2 文档对齐）」块，镜像 §2/§4/§5 体例，列出 M5-1 的
-    `AgentParts` +7 字段扩展、`into_parts` 不再静默 drop、`RetainedExternalSession` 提升 pub、
-    snapshot 仍保持 data-only 未破坏原则，以及 M5-2 文档对齐结果；至此无文档再声称 `into_parts`
-    覆盖不完整或缺字段。
-  - **`README.md`**：README 无 `into_parts` 代码示例，故无引用 `AgentParts` 字段的示例需更新；
-    在能力速览表补一行「逃生舱」入口（`Agent::into_parts() -> AgentParts`，接管 live/owned 部件、
-    非 restore API），保持速览表对逃生出口诚实。
-- rustdoc（`AgentParts` 结构体，`src/facade/agent/snapshot.rs`）与 `Agent::into_parts` 均已在 M5-1
-  写清各字段与「非 restore API」保证，M5-2 仅补 builder 交叉引用与外部文档对齐，未改字段语义。
-- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
-  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean，无 intra-doc link 破坏）；
-  `cargo test -p agent-lib --lib facade::agent::`（49 passed，含 M5-1 的 5 个 `into_parts_*`）。
-  本任务仅改文档 + rustdoc 注释（不影响编译产物），未改运行期代码路径，故未重跑全量测试套件。
-
-### M5-3 [DONE] Review：完整逃生出口
-
-检查范围：
-
-- `AgentParts` 是否覆盖当前 `Agent` 中所有有语义的字段。
-- 是否有 public API 泄漏了不该稳定承诺的内部实现细节。
-- `into_parts`、snapshot、builder 的用途边界是否清楚。
-- M3 的协作 snapshot 修复和本阶段 `into_parts` 扩展是否互相一致。
-
-验证条件：
-
-- 运行：
-
-```bash
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo test -p agent-lib --lib facade::agent::
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-```
-
-- 手工复核 `docs/refine.md` 中 “Agent::into_parts 状态覆盖不完整” 条目的状态，必要时补充当前修复说明。
-
-完成记录（M5-3）：
-
-- 代码复核（逐项确认 M5-1 ~ M5-2 落地且一致）：
-  - **`AgentParts` 覆盖 `Agent` 全部有语义字段**：逐字段核对 `src/facade/agent.rs` 的
-    `Agent` 结构体（13 个字段）与 `Agent::into_parts` 的搬运——`machine`→`state`
-    （`machine.into_state()`）、`client`、`tools`、`custom_registry`、`extra_declarations`、
-    `approval`、`interaction_handler`、`ids`、`delegates`、`external_agents`、`delegation`、
-    `last_external_sessions`→`retained_external_sessions`，以及 `collab: CollabState` 析构为
-    `collaboration`(config) + `mailbox` / `blackboard` / `plan` 三个 live 句柄。无任何字段被静默
-    drop；`AgentParts` 无多余/幻想字段。
-  - **无 public API 泄漏内部细节**：`AgentParts` 的 public 字段类型全部是 facade 别处已稳定暴露的
-    公开类型（`AgentState` / `Arc<dyn LlmClient>` / `Tool` / `ToolDecl` / `Arc<dyn ToolRegistry>` /
-    `Arc<FacadeApproval>` / `Arc<dyn InteractionHandler>` / `FacadeIds` / `LocalSubagent` /
-    `ManagedExternalDelegate` / `Delegation` / `RetainedExternalSession` / `Collaboration` /
-    `Arc<Mailbox>` / `Arc<Blackboard>` / `Arc<Plan>`）。内部 `pub(crate) struct CollabState`
-    及其 `provision` / `restore` 构造方法**未**泄漏——只交出被析构后的 config + 三个句柄，镜像
-    `Agent` 的访问器。`RetainedExternalSession` 为 `pub`、data-only（`status` / `session` /
-    `artifacts`），rustdoc 保证不含进程句柄 / SDK client / 凭据，且已在 `facade::mod` 重导出。
-    `cargo clippy --all-targets -- -D warnings`（含 `private_interfaces` 等 lint）clean 由编译器
-    佐证不存在 private-in-public 泄漏。
-  - **用途边界清楚**：`Agent::into_parts` 与 `AgentParts` 的 rustdoc 均标注「拆解逃生舱、**非**
-    restore API、无 `AgentParts -> Agent` 重建 helper」，并三向交叉引用 snapshot/restore（持久化恢复）
-    与 builder（常规构造）；`docs/facade-api.md` §8.2 prose 一致。`AgentParts`/`Agent` 的 `Debug`
-    impl 均把 runtime 句柄当作不透明（仅打印结构信息 + `is_some()`/`len()`），不渲染凭据。
-  - **M3 协作 snapshot 与 into_parts 一致**：`Agent::snapshot`（`AgentSnapshot::capture`）从
-    `&self.collab` 捕获 **data-only** 协作内容（不持 `Arc` 句柄），而 `into_parts` 交出 **live**
-    `Arc<Mailbox/Blackboard/Plan>` 句柄——两条路径互补而不矛盾：snapshot 用于持久化恢复、into_parts
-    用于接管在世句柄。`facade::agent::snapshot::tests` 的 collab 往返测试（mailbox/blackboard/plan
-    capture&restore）与 `into_parts_carries_live_collaboration_state` 同时全绿，证明两侧语义并存。
-- 文档：`docs/refine.md` §6「`Agent::into_parts` 逃生舱没有覆盖后续 milestone 的运行组成」状态行由
-  「M5-3 复核待进行」更新为**「M5-3 复核通过」**，末尾「修复结果（M5-1 扩展，M5-2 文档对齐）」块经复核
-  与实现一致（含「采用扩展 `AgentParts` 路线、未新增 `AgentFullParts` / `into_full_parts`」的准确记述）。
-  其余 §2/§4/§5 状态体例保持一致，无与 `PLAN.md`/`TODO.md` 冲突。
-- 验证（全绿）：`cargo fmt --all`（无源码改动）；`cargo clippy --all-targets -- -D warnings`（clean）；
-  `cargo test -p agent-lib --lib facade::agent::`（49 passed，含 M5-1 的 `into_parts_*` 与 collab
-  snapshot 往返测试）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。说明：
-  本任务为 Review + 文档状态修订，仅改动 `docs/refine.md`、`TODO.md`、`memory/claude_plan.md`，未触碰
-  任何库/测试编译产物代码，故未重跑全量 `cargo test --all --all-targets`（上次 M5-1 全绿结果仍有效）。
-
-## M6：最终收口
-
-### M6-1 [DONE] 同步 `docs/refine.md` 的问题状态和剩余风险
-
-上下文：
-
-- `docs/refine.md` 是本轮 refine 的起点。
-- 每个 milestone 完成后，它应该从“问题清单”逐步变成“已修复项和剩余风险记录”。
-
-实现要求：
-
-- 为每个已完成问题补充修复摘要、关键文件和测试命令。
-- 对仍未完全修复的问题保留明确状态，不要把风险删除。
-- 如果某个问题在实现中被拆成更细问题，把拆分原因写清楚。
-- 确认 `docs/refine.md` 不再和 `PLAN.md`、`TODO.md` 的状态冲突。
-
-验证条件：
-
-- 手工检查 `docs/refine.md` 中六类问题都有明确状态。
-- 运行：
-
-```bash
-git diff --check
-```
-
-完成记录：
-
-- 六类问题状态统一：问题 #2 / #4 / #5 / #6 原已有顶部「状态：**已修复（… 复核通过）**」
-  行；本次为问题 #1（stream drop）补「状态：**已修复（M1-1、M1-2；M1-3 复核通过）**」、
-  为问题 #3（非流式审批事件）补「状态：**已修复（M2-1、M2-2；M2-3 复核通过）**」，使
-  `docs/refine.md` 六类问题在条目开头均有明确状态行。
-- 补齐修复摘要 / 关键文件 / 测试命令：问题 #1「修复状态（更新）」新增 M1-3 复核条，
-  列出关键文件（`src/facade/chat.rs`、`src/facade/chat/stream.rs`、`src/facade/agent.rs`、
-  `src/facade/agent/stream.rs`）、离线测试基座（`DualFakeClient`、`DropTestClient`、
-  `ParkingInteractionHandler`、`parking_weather_tool`）与验证命令（fmt / clippy /
-  `facade::chat::` 19 passed / `facade::agent::` 30 passed）；问题 #3 的 M2-3 复核条补
-  关键文件（`src/facade/run.rs`、`src/facade/agent.rs`、`src/facade/approval.rs`）与验证
-  命令（fmt / clippy / `facade::agent::` 37 passed / rustdoc clean）。问题 #2 / #4 / #5 / #6
-  的「修复结果」块原已含关键文件与各自 review 验证命令，无需重写。
-- 「总体判断」尾部由「剩余问题清单」改写为「已收口 + 逐条 milestone 映射」，六类缺口分别
-  指向问题 #1(M1)、#3(M2)、#2(M3)、#4/#5(M4)、#6(M5)，并说明 M6 负责最终收口
-  （M6-1 文档同步 / M6-2 全量验证 / M6-3 验收），显式声明与 `PLAN.md`（M1–M6 里程碑）、
-  `TODO.md`（M1-1 ~ M5-3 均 `[DONE]`，M6-1 ~ M6-3 收尾）状态一致，无冲突。
-- 拆分说明：本轮各问题均按 milestone 内既有子任务推进，未在实现中把某个问题临时拆成更细
-  问题（拆分皆已在 TODO.md 的 M*-x 任务与各问题「修复结果 / 修复状态」块内记录），故无额外
-  拆分原因需补写。
-- 「剩余风险」：无已知未排期的阻断风险；M6-2 全量验证与 M6-3 最终验收作为收尾任务保留在
-  `TODO.md`。`验证结果` 一节明确标注为「审查未修改代码前」的历史基线，不与已修复状态冲突。
-- 验证：手工核对 `docs/refine.md` 六类问题均有条目开头状态行；`git diff --check`（clean）。
-  本任务仅改动 `docs/refine.md`（文档）与 `memory/claude_plan.md`（计划），未改动编译产物，
-  复用 M5-3 以来的全量绿测结果，未重跑 `cargo test --all --all-targets`。
-
-### M6-2 [DONE] 全量验证默认构建、测试、文档和 external feature clippy
-
-上下文：
-
-- AGENTS.md 要求收尾时按 cheap 到 expensive 顺序运行格式、clippy、test、doc。
-- managed external adapter feature 默认关闭，但相关代码被本计划触及后必须单独 clippy。
-
-实现要求：
-
-- 运行完整验证命令。
-- 如有失败，回到对应 milestone 修正，不要只记录失败。
-- 对 ignored real e2e 不做默认强制运行，但确认它们仍然保持 ignored 或未配置时干净跳过。
-
-验证条件：
-
-- 以下命令全部通过：
-
-```bash
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
 cargo test --all --all-targets
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-cargo clippy --all-targets \
-  --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
 ```
 
-- 任务完成记录中写明命令结果。
+---
 
-完成记录：
+## M1：安全与崩溃级修复
 
-- 按 AGENTS.md 要求以 cheap→expensive 顺序运行全部收尾验证命令，全部通过：
-  1. `cargo fmt --all` —— 无代码改动（仅 `memory/claude_plan.md` 计划文件被本任务编辑），
-     格式已符合规范。
-  2. `cargo clippy --all-targets -- -D warnings` —— EXIT=0，无 warning；`agent-lib` 与
-     `agent-testkit` 均 clean。
-  3. `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
-     —— EXIT=0，无 warning；启用四个 managed external adapter feature（含拉入真实可选依赖
-     `agent-client-protocol` / `agent-client-protocol-schema` 的 `external-acp`）后仍 clean。
-  4. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` —— EXIT=0，无 rustdoc
-     warning，成功生成 `agent-lib` 与 `agent-testkit` 文档。
-  5. `cargo test --all --all-targets` —— EXIT=0；汇总所有测试二进制：878 passed（lib 单测）
-     + 各集成测试用例，全库 **0 failed**；共 10 个 `#[ignore]` real e2e 用例（external
-     claude-code / codex / opencode 结构化回归 3+3+3、以及 mixed managed 多智能体 1）在默认
-     未配置 CLI/login 时保持 ignored 干净跳过，未强制运行。
-- 顺序选择：先 `fmt`→`clippy`(default)→`clippy`(external)→`rustdoc`，最后才跑最昂贵的全量
-  `cargo test`，避免格式/lint 修改后重跑测试；实际 `fmt` 未产生代码改动，故无需回退到任何
-  milestone 修正。
-- ignored real e2e 处理：未做默认强制运行；确认它们仍标注 `#[ignore]`，在无 `CLAUDE_CODE_BIN`
-  / `CODEX_BIN` / `OPENCODE_BIN` / `DEEPSEEK_API_KEY` 等配置时属于干净跳过（default 运行中计入
-  `10 ignored`），符合验证要求。
-- 本任务未改动任何编译产物（仅 `TODO.md` 完成记录与 `memory/claude_plan.md` 计划文件），全量
-  绿测结果即为本次实跑结果。
+### M1-1 [TODO] `EndpointConfig`/`AuthScheme`/两个 LLM adapter 手写脱敏 Debug（H-SEC-1）
 
-### M6-3 [DONE] Review：最终正确性和完整性验收
+上下文：
 
-检查范围：
+- `src/client/config.rs:9` `EndpointConfig` 与 `src/client/config.rs:36` `AuthScheme` 均 `#[derive(Debug)]`；`AuthScheme::Bearer(String)` / `AuthScheme::Header { value }` 含明文密钥。
+- `src/adapter/anthropic/mod.rs:22-26` 与 `src/adapter/openai_resp/mod.rs:25-29` 均 `#[derive(Clone, Debug)]` 且内嵌 `endpoint: EndpointConfig`——`format!("{adapter:?}")` 会原样打印密钥。
+- 参照：`src/facade/` 的 `ProviderConfig` 已做脱敏 Debug（可 grep `REDACTED` 找先例），HTTP 侧认证头已 `set_sensitive(true)`（`src/adapter/anthropic/request.rs:292`、`src/adapter/openai_resp/request.rs:161`）。
 
-- 所有 milestone 的 review 任务是否已完成。
-- `PLAN.md`、`TODO.md`、`docs/refine.md` 是否一致。
-- README quick start 是否能让新调用方避开已知坑。
-- 默认测试、feature clippy、rustdoc 是否都通过。
-- 是否还有必须在本轮修复但未排入任务的设计目标缺口。
+实现要求：
+
+- 为 `AuthScheme` 手写 `impl Debug`：scheme 名可见，密钥一律显示 `[REDACTED]`。
+- 为 `EndpointConfig` 手写 `impl Debug`：`base_url`/`query_params`/`extra_headers` 可见，`auth` 走脱敏后的 `AuthScheme` Debug。`extra_headers` 若含认证类头（如 `api-key`）也应脱敏，至少对值为 secret 的头做处理或整体标注。
+- 两个 adapter 保持 derive 即可（自动继承脱敏后的 `EndpointConfig` Debug）。
+- 保留 serde 行为不变（serde 明文 round-trip 是有意设计，`config.rs:33-35` 已有文档警告）。
 
 验证条件：
 
-- `rg "\[TODO\]" TODO.md` 只应命中本任务本身尚未执行时的标记；当全部完成后不应再有未完成任务标记。
-- `git diff --check` 通过。
-- 最终完成记录必须列出：
-  - 修复的设计目标差距。
-  - 仍保留的非阻断风险。
-  - 已运行的验证命令。
+- 新增单元测试：构造含 `"sk-ant-secret"` 的 `EndpointConfig`，断言 `format!("{:?}")` 不含该子串、含 `[REDACTED]`；两个 adapter 各一条同样的断言。
+- `cargo test -p agent-lib --lib client::` 通过；`cargo clippy --all-targets -- -D warnings` 通过。
 
-完成记录：
+### M1-2 [TODO] 默认 HTTP 超时 + 错误路径 body 读取上限（H-SEC-2）
 
-**检查范围结论**
+上下文：
 
-- **所有 milestone review 已完成**：`TODO.md` 中 M1-3、M2-3、M3-5、M4-5、M5-3 五个
-  review 任务标题均为 `[DONE]`；实现任务 M1-1 ~ M5-2 亦全部 `[DONE]`。剩余仅 M6 收尾
-  链（M6-1、M6-2 已 `[DONE]`，本任务 M6-3 为最后一项）。
-- **PLAN.md / TODO.md / docs/refine.md 一致**：`docs/refine.md` 六类问题的状态行逐条标注
-  「已修复」并注明对应 milestone（#1→M1-1/M1-2/M1-3、#2→M3-1~M3-4/M3-5、#3→M2-1/M2-2/M2-3、
-  #4→M4-3/M4-4/M4-5、#5→M4-1/M4-2/M4-5、#6→M5-1/M5-2/M5-3），与 `PLAN.md`（M1–M6 里程碑
-  设计要求）和 `TODO.md` 任务编号完全对应，无互相矛盾的遗留描述。
-- **README quick start 能避开已知坑**：`README.md` §4 external quick start 使用
-  M4-1 新增的一步式 `build_with_default_session_handler()`（避开原 quick start「构造后没有
-  session handler」的坑，即问题 #5），并写明默认 build 不含 CLI adapter、未开启对应
-  `external-*` feature 时 fail-fast（非密错误）、每个子 agent 在隔离临时 worktree 运行、
-  自定义 handler 的手工路径与 `default_external_session_handler` 便捷构造，与
-  `docs/managed-external-agent.md` / `docs/capability-matrix.md` 一致。
-- **默认测试 / feature clippy / rustdoc 全通过**：见下方验证命令。
-- **无未排期的必修设计目标缺口**：`PLAN.md` 七项目标（stream 生命周期恢复、非流式事件一致性、
-  协作 snapshot/restore、managed external 可用性、capability 来源模型、完整 `into_parts`
-  逃生舱、文档/测试同步）均已由 M1–M5 落地并各自通过 review；未发现必须本轮修复却未进入任务
-  列表的缺口。
+- `src/adapter/anthropic/mod.rs:31`、`src/adapter/openai_resp/mod.rs:34`：`reqwest::Client::new()` 无任何超时，文档把超时推给 `with_http_client` 调用方。
+- 错误路径 4 处无条件 `response.bytes().await`：`src/adapter/anthropic/stream/mod.rs:48`、`src/adapter/openai_resp/stream/mod.rs:47`、`src/adapter/anthropic/response.rs:67`、`src/adapter/openai_resp/response.rs:67`。对端保持连接不关闭时永久挂起。
+- 注意：reqwest 的 `Client::timeout()` 覆盖整个响应 body 读取，直接设总超时会误杀正常的长 SSE 流，设计时要区分。
 
-**修复的设计目标差距（M1–M5 汇总）**
+实现要求：
 
-1. 流式 facade 提前 drop 的一致性恢复：`RunStream` / `AgentRunStream` 均新增幂等
-   `Drop` guard（`abandon()` = discard pending turn / `StepInput::Abandon`），drop 后
-   session/agent 可继续使用（问题 #1）。
-2. 非流式事件一致性：`Agent::run_full` 的 `RunOutput.events` 现包含富化
-   `ApprovalRequested`，与 stream 路径 parity（问题 #3）。
-3. 协作状态 snapshot/restore：mailbox/blackboard/plan 补齐 data-only snapshot API，
-   `AgentSnapshot::capture` 持久化 live 协作内容，restore 优先用 snapshot 内容，顶层
-   artifact 策略明确（问题 #2）。
-4. managed external 可用性：新增 `build_with_default_session_handler` 一步装配 API 并修正
-   README quick start（问题 #5）。
-5. capability 来源模型：区分 declared / supplied / probed / negotiated，`UnsupportedCapability`
-   基于真实 capability view 判定（问题 #4）。
-6. 完整逃生舱：`AgentParts` / `into_parts` 覆盖 external delegate、保留会话、协作底座与
-   交互处理器，rustdoc 明确适用边界（问题 #6）。
+- `new()` 构造的默认 client 至少带 `connect_timeout`（建议 10s）；整体读超时通过以下方式实现而非 `Client::timeout()`：
+  - 非流式 `chat()`：请求 future 整体包一个默认总超时（建议 10 min，可经 `with_http_client` 覆盖后由调用方自定）。
+  - 流式 `chat_stream()`：只对"建立连接 + 收到响应头"阶段设超时，body 流不设总超时。
+- 错误 body 读取（非 2xx）加大小上限（建议 1 MiB 截断）和独立超时（建议 30s）：用 `bytes_stream()` 分块读到上限即停，或先 `tokio::time::timeout` 包 `bytes()` 再截断。截断后在 body 末尾标注 `[truncated]`。
+- 4 处错误路径行为一致（M8 才做代码收敛，本任务先各自修）。
+- 在 `EndpointConfig` 或 adapter 文档中写明默认超时值与覆盖方式。
 
-**仍保留的非阻断风险**
+验证条件：
 
-- managed external 真机 e2e（external claude-code / codex / opencode 结构化回归 3+3+3、
-  mixed managed 多智能体 1，共 10 个 `#[ignore]`）在默认无 CLI/login 配置时干净跳过，未在
-  默认套件中执行；这是设计上的非目标（不把 ignored real e2e 变成默认必跑），非阻断。
-- snapshot 顶层 artifact 采用「保留兼容字段 + 由 external session snapshot 持有明细」的策略
-  （M3-4 已明确并文档化），非缺陷。
-- 三个 `external-*` CLI adapter 与 `external-acp` 默认关闭；启用时才拉入可选依赖，属既定
-  feature 边界，非阻断。
+- 单元测试：错误 body 读取 helper 输入超长流时返回截断结果且带标注（离线，用内存 stream 即可）。
+- 现有全部测试通过：`cargo test --all --all-targets`。
+- 无挂起的测试（AGENTS.md：任何测试必须远小于一分钟完成）。
 
-**已运行的验证命令（本次实跑，cheap→expensive 顺序）**
+### M1-3 [TODO] `Usage` 算术溢出改饱和/错误化（H-SEC-3、facade 报告 M2）
 
-1. `cargo fmt --all` —— 无源码改动（本任务仅改 `TODO.md` 与 `memory/claude_plan.md`）。
-2. `cargo clippy --all-targets -- -D warnings` —— EXIT=0，clean。
-3. `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
-   —— EXIT=0，clean。
-4. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` —— EXIT=0，无 rustdoc warning。
-5. `cargo test --all --all-targets` —— EXIT=0，全库 0 failed（含 lib 单测 878、testkit 153
-   及各集成/replay/cassette/smoke 二进制），10 个 real e2e 保持 `#[ignore]` 干净跳过。
-6. `git diff --check` —— EXIT=0（无行尾/空白冲突标记）。
-7. `rg "\[TODO\]" TODO.md` —— 标记 M6-3 `[DONE]` 后仅命中顶部图例说明行（文档说明，非任务
-   标题），无剩余未完成任务标记。
+上下文：
 
-本任务仅改动文档/记录文件（`TODO.md`、`memory/claude_plan.md`），未改动任何编译产物；上述全量
-绿测即为本次实跑结果。至此 M1–M6 全部任务完成，项目达成 `PLAN.md` 全部设计目标。
+- `src/model/usage.rs:138-141`：`checked_add(...).unwrap_or_else(|| panic!(...))`；调用点为 `Usage::merge`（usage.rs:34-46）与 `total_computed`（usage.rs:49-59）。
+- 触发链：wire 数据 → `Accumulator::push` 对每条 `StreamEvent::Usage` 调 `merge`（`src/stream/accumulator/mod.rs:146`）；facade `UsageSummary::add_*`（`src/facade/run.rs:249-269`）层层聚合。伪造大计数即可 panic 宿主进程。
+
+实现要求：
+
+- 把 u32 字段加法改为 `saturating_add`（token 计数语义上饱和优于失败），并在文档注明饱和行为。若选择返回 `Result`，需同步改 `Accumulator`/`UsageSummary` 全部调用链——优先选 saturating 以控制爆炸半径。
+- `extra` 数值合并（如有同样 panic 路径）一并处理。
+
+验证条件：
+
+- 单元测试：`merge` 两个 `u32::MAX` 级 usage 不 panic，结果为 `u32::MAX`。
+- 单元测试：`Accumulator` 连续 push 伪造大计数 Usage 事件，`collect` 正常返回。
+- `cargo test -p agent-lib --lib model::usage stream::accumulator` 通过。
+
+### M1-4 [TODO] `ClientError::Network` 中 URL query 脱敏（H-SEC-4）
+
+上下文：
+
+- 4 份 `map_transport_error` 副本：`src/adapter/anthropic/stream/mod.rs:89`、`src/adapter/anthropic/response.rs:173`、`src/adapter/openai_resp/stream/mod.rs:88`、`src/adapter/openai_resp/response.rs:163`，均为 `ClientError::Network(error.to_string())`。
+- reqwest 错误 Display 含完整 URL；`EndpointConfig.query_params`（`src/client/config.rs:44`）可能被部署方放 `?key=` 类凭据。
+
+实现要求：
+
+- 构造 Network 错误时从 `reqwest::Error::url()` 取 URL，把 query 整体替换为 `[REDACTED]`（或仅对 query 值脱敏）后拼进消息；无法取 URL 时回退原文。
+- 同时在 `EndpointConfig.query_params` 文档中明确"禁止放置 secret，错误消息中的 query 会被脱敏但不作为凭据保护手段"。
+- 4 处行为一致。
+
+验证条件：
+
+- 单元测试：模拟带 `?api-key=secret` 的 transport 错误，断言错误消息不含 `secret`。
+- `cargo test -p agent-lib --lib adapter::` 通过。
+
+### M1-5 [TODO] external 流读取超时与 launch 超时拆分（H-EXT-1）
+
+上下文：
+
+- 三个 adapter 把 `config.timeout()`（默认 30s，本为 probe/launch 设计）同时用作每行 stdout 读取超时：`src/agent/external/claude_code/adapter.rs:168-169`、`src/agent/external/codex/adapter.rs:222-223`、`src/agent/external/opencode/adapter.rs:236-237`（`read_timeout: config.timeout(), shutdown_grace: config.timeout()`）。
+- 读超时实现如 `claude_code/adapter.rs:185-193`：`timeout(self.read_timeout, self.stdout.next_line())` 超时即 `TimedOut` → `SessionLost`。CLI 跑长静默命令（构建/测试）30s 无输出即被误杀。
+- 默认常量如 `claude_code/config.rs:34`：`const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30)`。
+
+实现要求：
+
+- 三个 config 各新增独立字段（建议 `read_idle_timeout: Duration`，默认 10 min；`shutdown_grace` 也可独立，默认保持 30s），`timeout()` 保留为 probe/launch 语义。serde 兼容：新字段 `#[serde(default = ...)]`，旧配置可反序列化。
+- 三个 adapter 的 session 构造改用新字段。
+- 同步 `docs/managed-external-agent.md` 与对应 config 文档，明确三个超时的语义口径。
+- codex `exec` one-shot 与 claude/opencode 长会话的静默上限语义如有差异，在文档中说明。
+
+验证条件：
+
+- 单元测试：config 默认值与 serde round-trip（含缺字段旧 JSON 反序列化）。
+- 现有 external 测试全过：`cargo test --features "external-claude-code external-codex external-opencode" --all-targets`。
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D warnings`。
+
+### M1-6 [TODO] `close()` 按退出码分类 Graceful/Failed（H-EXT-3）
+
+上下文：
+
+- `src/agent/external/claude_code/adapter.rs:198-199`、`codex/adapter.rs:257-258`、`opencode/adapter.rs:271-272`、`acp/connection.rs:188-189`：`Ok(Ok(_status)) => ExternalSessionShutdown::Graceful`，忽略退出码。
+- 下游 `src/agent/external/worktree.rs:470` 用 `disposition.leaves_residual_side_effects()` 决定 ephemeral worktree 是否删除/复用——崩溃 session 会把写了一半的 worktree 判为干净。
+
+实现要求：
+
+- 四处统一改为：`status.success()` → `Graceful`；否则 → 表示失败的变体（查看 `ExternalSessionShutdown` 现有变体选合适的，必要时新增带 exit code 的变体，注意其 serde 兼容与 `leaves_residual_side_effects()` 语义）。
+- 检查 `ExternalSessionShutdown` 的全部 match 点，确认新分类不破坏现有穷尽匹配。
+- 同步 `docs/managed-external-agent.md` §6.4 的关闭分类描述。
+
+验证条件：
+
+- 单元测试（可用 testkit 的 scripted/cassette handler 或 fake 进程）：子进程 exit 0 → Graceful；exit 1 → Failed 类；grace 超时 → ForcedKill 不变。
+- external feature 测试与 clippy 全过（命令同 M1-5）。
+
+### M1-7 [TODO] M1 review：安全与崩溃级修复收口
+
+检查项：
+
+- 逐条核对 H-SEC-1/2/3/4、H-EXT-1、H-EXT-3 已修复，`docs/review-2026-07.md` 对应条目已标注。
+- 无新增 unwrap/panic；无 secret 进入 Debug/错误消息/日志的回归（grep `REDACTED` 相关测试全过）。
+- 全量门禁命令通过（见任务单头部）。
+- `README.md`、`docs/managed-external-agent.md`、`docs/capability-matrix.md` 如需更新已更新。
+
+---
+
+## M2：external 子进程生命周期正确性
+
+### M2-1 [TODO] kill 升级为进程组级，消除孙进程泄漏（H-EXT-2）
+
+上下文：
+
+- 全部进程管理只有 `start_kill()` / `kill_on_drop(true)`；`grep -rn "process_group\|setsid\|killpg" src/` 零命中。
+- 典型位置：`src/agent/external/claude_code/adapter.rs:201-204`（`start_kill` + `wait`）。CLI 经 Bash 工具拉起的孙进程（构建/测试/dev server）kill 后成孤儿，可能继续写已被删除的 worktree。
+
+实现要求：
+
+- spawn 时在 unix 上 `process_group(0)` 使子进程自成进程组（tokio `Command::process_group`，或 `pre_exec` + `setsid`）；kill 路径先向进程组发 SIGTERM、grace 后 SIGKILL（可用 `nix`？——注意非目标"不引入新的默认依赖"：优先考虑 `std::process::Command` 无法做，则只在使用 tokio 的 unix 路径用 `unsafe` libc kill 或现有依赖传递；方案选型写入完成记录）。
+- Windows 无进程组语义：保持 `start_kill` 现状并在文档注明平台差异。
+- 三 CLI adapter + ACP connection 行为一致。
+- 同步 `docs/managed-external-agent.md` §16/§6.4 的清理保证描述。
+
+验证条件：
+
+- 集成测试（可 `#[ignore]` 之外的离线形态）：spawn 一个会再 fork 子进程的 shell 脚本（如 `sh -c 'sleep 300 & sleep 300'`），走 force-close 路径后断言进程组内无存活进程（用 `kill(-pgid, 0)` 或 `/proc`/`ps` 检查，注意 macOS/Linux 兼容）。
+- external feature 测试与 clippy 全过。
+
+### M2-2 [TODO] resume 时用持久化高水位播种 decoder seq（M-EXT-1）
+
+上下文：
+
+- resume 路径构造全新 decoder（`src/agent/external/claude_code/adapter.rs:645-651`，`ClaudeCodeSession::new` → `next_seq = 0`）；codex/opencode 同构。
+- machine 去重用持久化旧高水位：`src/agent/external/machine.rs:732-741` `observe()`：`observed.seq > consumed` 才保留。恢复后 seq 从 0 重启 → 全部 observation 被静默丢弃直到爬过旧水位。
+- 设计要求见 `docs/managed-external-agent.md` §5.5（"seq spans the whole session"）。
+
+实现要求：
+
+- decoder（或 session）提供以指定 `next_seq` 起始的构造方式；adapter resume 时用 `ExternalSessionRef.last_event_seq`（或等价持久化字段）播种。
+- 三个 adapter 行为一致；补注释说明 seq 单调性依赖。
+- 若 ACP 路径有同类问题一并修。
+
+验证条件：
+
+- 单元测试：模拟"已消费到 seq=50 → resume → 新事件"场景，断言 resume 后第一个 observation 不被 `observe()` 丢弃（machine 层测试，参考 `src/agent/external/machine/tests.rs` 现有模式）。
+- external feature 测试与 clippy 全过。
+
+### M2-3 [TODO] decoder 错误消息与"不折叠原文"承诺对齐（M-EXT-3）
+
+上下文：
+
+- 三个 decoder 文档承诺（`src/agent/external/claude_code/decoder.rs:48-49`）："Every diagnostic is a fixed string; no prompt text, tool input, or credential is ever folded into an error message."
+- 实现违背：`claude_code/decoder.rs:517-521` 把 `frame.get("result").and_then(Value::as_str)` 原文塞进 `ExternalAgentError::Runtime.message`；`codex/decoder.rs:446-453`（`turn.failed` 的 `error.message`）、`opencode/decoder.rs:496-509`（`error.data.message`）同构。该文本受模型输出影响，可含模型读到的任意文件内容。
+
+实现要求：
+
+- 选定方案（写入完成记录）：(a) `message` 固定字符串 + 把原文放入一个单独的、标注"may contain runtime output, do not log blindly"的字段；(b) 截断 + 脱敏后保留。推荐 (a)，与文档承诺一致。
+- 检查 `error.to_string()` 的 Display 实现与 `machine.rs:713` 的使用点，确认敏感原文不会经 Display 进入 cursor/日志。
+- 同步 decoder 模块文档。
+
+验证条件：
+
+- 单元测试：构造含敏感字样（如 `API_KEY=...`）的 runtime error frame，断言 `error.to_string()` 不含该字样。
+- external feature 测试与 clippy 全过。
+
+### M2-4 [TODO] Codex/OpenCode prompt 传参加固（M-EXT-4）
+
+上下文：
+
+- `src/agent/external/codex/adapter.rs:121-124`：`args.push(prompt.clone())` 作为最后位置参数，前无 `--`；`opencode/adapter.rs:127-143` 同。`-` 开头的用户消息会被 clap 当 flag；prompt 对本机 `ps` 可见。Claude Code 走 stdin frame 无此问题。
+
+实现要求：
+
+- 在 prompt 前插入 `"--"` 分隔符（先用 `codex exec --help` / `opencode --help` 或文档确认两 CLI 支持 `--`；记录确认结果）。若某 CLI 不支持，改为其支持的等价机制（如 stdin）并在代码注释说明。
+- `ps` 可见性问题：评估 stdin 传 prompt 的可行性；若维持 argv，在 `docs/managed-external-agent.md` 安全节明确记载该暴露面与理由。
+
+验证条件：
+
+- 单元测试：构造以 `--model` 开头的 prompt，断言生成的 argv 含 `--` 分隔且 prompt 原样位于其后。
+- external feature 测试与 clippy 全过；`#[ignore]` real e2e 手工抽查一次（如环境允许）。
+
+### M2-5 [TODO] 决策点后 reap 子进程 + prelude 总时限与取消（M-EXT-5、M-EXT-6）
+
+上下文：
+
+- `codex/adapter.rs:559-561`：decoder 在 `turn.completed` 行即返回 decision，不读到 EOF；`codex/adapter.rs:462-464`（opencode 同）：`let _ = old.close().await;` 丢弃 disposition——ForcedKill 被吞，不进 trace 也不影响 worktree 判定。
+- `claude_code/adapter.rs:298-311`（codex/opencode 同）：`begin()` 的 prelude 循环 `while self.decoder.session_id().is_none()`，per-line timeout 每行重置、无取消检查、无总 deadline；`advance()` 循环反而有 `ctx.is_cancelled()`（adapter.rs:482）。
+
+实现要求：
+
+- close disposition 不再 `let _ =` 丢弃：记录进 trace/日志，并在判断 worktree 残余副作用时纳入（与 M1-6 的分类联动）。
+- prelude 循环加总 deadline（用 M1-5 的 launch timeout）与 `ctx.is_cancelled()` 检查；超时/取消走正常错误路径。
+- 三个 adapter 行为一致。
+
+验证条件：
+
+- 单元测试：fake CLI 持续吐非 init 帧时 `begin()` 在 deadline 内返回错误而非挂起。
+- 单元测试：close 超时被强杀的场景 disposition 被观测到（断言 trace 或返回值包含 ForcedKill）。
+- external feature 测试与 clippy 全过。
+
+### M2-6 [TODO] worktree cleanup 使用记录的 base repo（M-EXT-7）
+
+上下文：
+
+- `src/agent/external/worktree.rs:477-485`：`self.git.remove_worktree(prepared.worktree.path(), prepared.worktree.path())`——`PreparedWorktree` 不保存 base repo 路径，cleanup 把 worktree 自己当 `-C` 目录（靠 git 向上发现 gitdir），目录部分损坏/被移动时失败。
+
+实现要求：
+
+- `PreparedWorktree` 增加 base repo 路径字段（创建时已知），cleanup 用它作为 `-C`。
+- serde 兼容：`PreparedWorktree` 若参与持久化，新字段 `#[serde(default)]` 并在缺省时回退旧行为。
+
+验证条件：
+
+- 单元测试：创建 worktree 后将其 `.git` 文件/目录模拟损坏（或移动），cleanup 仍能经 base repo 完成 `git worktree remove`（离线临时目录即可）。
+- external feature 测试与 clippy 全过。
+
+### M2-7 [TODO] `ExternalSessionPolicy` 与 `WorktreeManager` 接入（M-PROM-5）
+
+上下文：
+
+- `src/agent/external/machine.rs:584-585` 每请求携带 `policy: *spec.session_policy()`，但 `grep request.policy src/agent/external` 只命中测试——请求级 `permission_mode`/`max_turns` 静默失效。
+- `GitWorktreeManager`（worktree.rs）在 `src/` 生产路径无人调用；AGENTS.md 宣称的 worktree 隔离只存在于 `examples/support/managed.rs:367-394`。
+- `opencode/config.rs:254-257` 注释承认漏传 `--dir` 会写进启动 checkout。
+- 适配器当前从构造期 `config.working_dir()`（`claude_code/adapter.rs:149-150`）取工作目录，而非 `request.worktree`；隔离要生效必须把 `WorktreeManager::prepare` 产出的路径喂给会话工作目录。
+
+决策（已定）：`isolation` 采用**库内接线**方案——把 `GitWorktreeManager` 接进 `src/` 生产路径，让 policy 的 `isolation` 字段真正生效，而非退回"隔离是宿主责任"。`permission_mode`/`max_turns` 两字段仍按原口径处理（请求级覆盖 / CLI flag 或 machine 强制），未接入部分显式拒绝或文档标注未实现，不允许继续静默忽略。
+
+实现要求：
+
+- **接入点选定 registry 层**（`ExternalSessionRegistry`，`src/agent/external/registry.rs`）：它是持有 adapter、统一驱动 `start`/`resume`/`cleanup` 的唯一 choke point。
+  - `ExternalSessionRegistry` 持有一个 `Arc<dyn WorktreeManager>`（构造时注入，默认 `GitWorktreeManager::new()`）。
+  - `get_or_start`（registry.rs:184）在 `adapter.start` 之前先按 `request.policy().isolation` 调 `WorktreeManager::prepare(agent_id, &request.worktree, isolation)`，把产出的 `PreparedWorktree` 路径作为该会话的工作目录传给 adapter（贯通到 `config.working_dir()` / opencode 的 `--dir`，一并修掉 `opencode/config.rs:254-257` 的漏传）。
+  - `cleanup`/`cleanup_agent`（registry.rs:255、279）在会话关闭后按 `ExternalSessionShutdown` 调 `WorktreeManager::cleanup(prepared, disposition)`；registry 需记住每个 live session 对应的 `PreparedWorktree`。
+- `permission_mode`：请求级覆盖 adapter 构造期 config；`max_turns`：传 CLI flag 或 machine 强制。未接入的字段必须使 machine/adapter 显式拒绝或在文档标注未实现。
+- 更新 AGENTS.md 与 `docs/managed-external-agent.md`：worktree 隔离改为库级保证的准确描述（示例 `examples/support/managed.rs` 不再是唯一来源）。
+- 同步 `docs/capability-matrix.md`。
+
+验证条件：
+
+- 决策与理由写入完成记录；文档措辞与实现一致。
+- 单元测试覆盖：请求级 permission_mode 覆盖生效；registry 在 start 前调 `prepare`、在 cleanup 时按 disposition 调 `cleanup`（可用现有 `ScriptedGit`/`MockAdapter` 测试替身，见 worktree.rs:532、registry.rs:479）。
+- external feature 测试与 clippy 全过。
+
+### M2-8 [TODO] M2 review：external 生命周期收口
+
+检查项：
+
+- 逐条核对 H-EXT-2、M-EXT-1~7、M-PROM-5 状态，`docs/review-2026-07.md` 已标注。
+- 重点复验：force-close 后无存活孙进程；resume 后事件流无缺口；崩溃 session 不再判 Graceful。
+- 全量门禁命令通过（含 external-acp feature 的 clippy）。
+- `docs/managed-external-agent.md`、`docs/capability-matrix.md`、`AGENTS.md` 与实现一致。
+
+---
+
+## M3：Conversation 正确性
+
+### M3-1 [TODO] 禁止在 reverted head 上 compaction（H-STATE-1）
+
+上下文：
+
+- `src/conversation/projection/compaction.rs:251-258`：`apply_compaction` 只校验 `plan.head_turn_count == active_len`，不校验 head 是否等于 lineage 上限。`source_spans()`（compaction.rs:296-312）与 `build_replacement_spans()`（compaction.rs:474-480）只取到 `active_len`。
+- 破坏路径：revert_to(3) → compact(head=3) → 新投影只覆盖 0..3 → redo revert_to(5) 成功（`boundary/head.rs:89-91` 不触碰投影）→ `effective_view()`（`projection/mod.rs:485-507`）静默丢 turn 3..5；且无法自愈（再 compact 报 `IncompleteProjection`，snapshot restore 报 `SpanGap`）。
+
+实现要求：
+
+- 在 `validate_compaction_plan_header`（或 `apply_compaction` 入口）增加校验：`active_len == lineage_len`（即 head 在 lineage 末尾）才允许 compaction；否则返回明确错误（新增或复用合适的 `CompactionError` 变体）。
+- 错误消息说明"reverted head 上不可 compaction，先 redo 到 lineage 末尾"。
+
+验证条件：
+
+- 回归测试（精确复现报告路径）：5 turn + compact 0..5 → revert_to(3) → apply_compaction 返回新错误而非成功；redo revert_to(5) 后 `effective_view()` 仍含全部 5 turn。
+- 现有 projection/compaction 测试全过：`cargo test -p agent-lib --lib conversation::projection`。
+- `docs/conversation-core.md` compaction 节补充该约束。
+
+### M3-2 [TODO] `MessageRecord` 增加 `meta` 字段（H-STATE-2）
+
+上下文：
+
+- `src/conversation/persistence/rows.rs:123-133`：`MessageRecord` 只有 `payload: Message`；`rows.rs:351-356` 分解时 `payload: message.payload().clone()` 丢弃 envelope meta。
+- meta 来源：`src/conversation/message.rs:70-75` `new_with_meta`，由 `inject_user_message`（`pending/turn.rs:328-332`）写入。
+- 现有 e2e 断言（`persistence/tests/e2e.rs:44-47` `assert_eq!(rebuilt_snapshot, snapshot)`）因夹具未用 `inject_user_message` 从未覆盖。
+
+实现要求：
+
+- `MessageRecord` 增加 `meta: Option<MessageMeta>`，serde `#[serde(default)]` 保持旧行数据可反序列化。
+- `to_rows`/`into_snapshot` 双向携带 meta；`ConversationMessage` 构造走 `new_with_meta`。
+- 检查 `ConversationRows` 文档（rows.rs:3-5）恢复"与 snapshot 描述同一一致点"的承诺。
+
+验证条件：
+
+- e2e 夹具增加一条经 `inject_user_message` 注入的消息（带 source meta），断言 `to_rows → into_snapshot` round-trip 相等。
+- `cargo test -p agent-lib --lib conversation::persistence` 与 `cargo test --test conversation_persistence*`（按现有测试目标名）全过。
+
+### M3-3 [TODO] 修复 restore 派生索引的空校验（M-CONV-1）
+
+上下文：
+
+- `src/conversation/persistence/snapshot.rs:566-575`：`ToolCallIndex::rebuild(turns, None)` 同一纯函数调两次再比较，`RestoreError::DerivedIndexMismatch` 不可达。
+
+实现要求：
+
+- 二选一（记录选型）：(a) 删除该校验与不可达错误变体，restore 直接 `rebuild`；(b) 改为真实校验：用 `push_committed_turn` 逐 turn 增量推进一个 index，与全量 `rebuild` 比较。推荐 (a)——纯函数重建本身无校验价值；若选 (b) 需说明增量路径是生产实际使用的路径。
+- 若删除变体注意 `RestoreError` 的 `#[non_exhaustive]` 状态与文档。
+
+验证条件：
+
+- 现有 restore 测试全过；若保留 (b)，新增一条"增量与全量不一致"的构造性测试（可通过测试专用 hook 注入）。
+- `cargo test -p agent-lib --lib conversation::persistence` 通过。
+
+### M3-4 [TODO] 消除长链递归（restore 校验 + History drop）（M-CONV-2）
+
+上下文：
+
+- `src/conversation/persistence/snapshot.rs:415-440` `visit_parent`：restore 时对不可信快照做环检测，递归深度 = 父链长。
+- `src/conversation/history.rs:359-378` `build_restored_node`：restore 重建节点，同样递归。
+- `src/conversation/history.rs:352-356`：`RawEntry` cons 链表与 `HistoryNode.parent` 链递归 drop——长会话（数万 turn）析构 `History` 时逐层递归 drop `Arc`，经典栈溢出。
+
+实现要求：
+
+- 两处 restore 递归改迭代（显式栈）。
+- 为 `History`（或 cons 链表节点类型）实现手工 `Drop`：循环 `Arc::try_unwrap` 摘链，遇共享引用即停。
+- 不改变任何可观察行为。
+
+验证条件：
+
+- 单元测试：构造 100_000+ turn 的链（可用最小 payload），restore 校验与 drop 均正常完成不溢出（注意测试时长 < 1 min，payload 尽量小）。
+- `cargo test -p agent-lib --lib conversation::` 全过。
+
+### M3-5 [TODO] rows 引入代次（generation）键支持会话演进（M-CONV-3，方案 b）
+
+上下文：
+
+- `src/conversation/persistence/rows.rs:1077-1092` `diff_single_conversation()`：同 conversation 第二次导出必然 `InsertConflict`（commit/revert 改 `head_turn_count`/`structural_version`；lineage/span 行同序号内容变化）。
+- 冲突面精确清单（`insert_set_against`，rows.rs:527-594 的 diff key）：
+  - `ConversationRecord`（key = `conversation_id`）：任何 commit/revert 都改 `structural_version`/`head_turn_count` → 冲突。
+  - `ConversationLineageTurnRecord`（key = `conversation_id#lineage_sequence`，rows.rs:549）：revert 后新分支在同一序号引用不同 turn → 冲突。
+  - `ProjectionSpanRecord`（key = `conversation_id#span_sequence`，rows.rs:584）：compaction 重写 span → 冲突。
+  - 不冲突的表：`ConversationTurnRecord`（raw 成员，append-only）、`TurnRecord`/`MessageRecord`/`ToolPairingRecord`/`ArtifactRecord`（不可变事实）、`ProjectionRecord`（内容仅 schema_version）。
+
+决策（已定，方案 b）：为**会演进的三类行**（conversation、lineage 关联、projection span）引入代次键 `generation: u64`，主键变为 `(原 key, generation)`；演进 = 插入新一代行而非更新，保持 insert-only 前提成立。代次直接复用 `ConversationRecord.structural_version`（每次结构性变更递增，天然是代次计数器）。事实表保持原样（不可变、insert-only）。
+
+拆解为 M3-5-1 ~ M3-5-4，按序实施。
+
+#### M3-5-1 [TODO] schema 变更：三类行增加 `generation` 字段 + `to_rows` 写入
+
+实现要求：
+
+- `ConversationRecord`、`ConversationLineageTurnRecord`、`ProjectionSpanRecord` 各增加 `generation: u64`；`ConversationRecord.generation` 恒等于 `structural_version`（在 `to_rows` 构造点断言或直接用其填充）。
+- `ConversationLineageTurnRecord`/`ProjectionSpanRecord` 的 `generation` = 该关联/span 生效时的 conversation structural_version（即导出快照时刻的 version——导出走 `Conversation::snapshot` 的一致点语义，直接用当前 version 即可）。
+- `CONVERSATION_ROW_SCHEMA_VERSION` 递增；`validate_schema_versions`（rows.rs:597-613）只接受新版本。旧版本行数据的策略：显式报错"schema 过旧，需迁移"（pre-1.0 不提供迁移路径，写入完成记录）；新字段**不要**加 `#[serde(default)]` 静默吞旧数据。
+- `to_rows`（`ConversationRowInsertSet::from_snapshot` 路径，rows.rs:320 附近）填充 generation。
+
+验证条件：
+
+- 现有 persistence 测试按新 schema 更新后全过（允许本任务阶段 `into_snapshot`/diff 暂时沿用旧行为，由 M3-5-2/3 完成语义切换——若中间态难以编译，可与 M3-5-2 合并提交）。
+- 单元测试：旧 schema_version 的行集反序列化/`into_snapshot` 报明确错误。
+
+#### M3-5-2 [TODO] `into_snapshot` 重组：按最大代次选取演进行
+
+实现要求：
+
+- `ConversationRowInsertSet::into_snapshot`（rows.rs:438 附近）重组规则改为：
+  - conversation 行：取 `generation` 最大者；行集必须恰好含该 conversation 至少一行，多行时代次必须可确定唯一最大值。
+  - lineage 关联/projection span：只取 `generation == conversation 行最大代次` 的行，按 `lineage_sequence`/`span_sequence` 排序重组；低代次行忽略（它们是历史版本）。
+  - 校验：选中代次的 lineage/span 序列必须稠密从 0 开始（复用或扩展现有 `validate_row_owners` 类校验，rows.rs:616-651），owner 校验不变。
+- 顺带评估放宽 `insert_set_against` 对 existing 的限制（审查 L-3：existing 必须恰好是单一 conversation 完整行集）：重组改为按 owner 过滤后，existing 可以是多 conversation 行集的子集查询结果。若改动超范围，记录为后续项。
+
+验证条件：
+
+- 单元测试：同一 conversation 两个代次的行混合的行集，`into_snapshot` 选取最大代次重组出正确 snapshot。
+- 单元测试：代次稀疏/缺行（如只有 gen 1,3 无 2 的当前代次行）报明确 `InvalidRow`。
+
+#### M3-5-3 [TODO] `insert_set_against` 代次键 diff + 演进场景测试
+
+实现要求：
+
+- `diff_single_conversation`（rows.rs:1077-1092）：key 改为 `(conversation_id, generation)`——同 conversation 不同代次不再冲突，作为新行插入；同代次内容不同仍 `InsertConflict`。
+- `diff_rows` 的 lineage/span key 闭包（rows.rs:549、584）加入 generation：`conversation_id#generation#lineage_sequence` / `conversation_id#generation#span_sequence`。
+- 事实表 diff key 不变。
+
+验证条件（每条一个测试）：
+
+- commit 演进：导出 gen N → 再 commit → 导出 gen N+1 → `insert_set_against` 成功，insert set 只含新 conversation 行 + 新 lineage 行 + 新 turn/message 事实行。
+- revert 演进：导出 → revert → 导出 → 不冲突，新 lineage 行以新代次共存。
+- compaction 演进：导出 → apply_compaction → 导出 → 不冲突，新 span 行以新代次共存。
+- 同代次篡改：手工改同 generation 行的内容 → 仍 `InsertConflict`。
+- round-trip：两次导出的行集合并后 `into_snapshot` 得到最新状态（与 M3-5-2 联动）。
+- `cargo test -p agent-lib --lib conversation::persistence` 全过。
+
+#### M3-5-4 [TODO] rows 代次模型文档同步
+
+实现要求：
+
+- `rows.rs` 模块文档（rows.rs:1-40 附近）与 `ConversationRowInsertSet` 文档（rows.rs:233-237）：改写为代次模型描述——事实表 insert-only；演进表按代次版本化；"当前状态 = 最大代次"；`structural_version` 即代次。
+- `docs/conversation-core.md` 持久化节同步；DESIGN.md §10 如有相关描述一并核对。
+- 文档中给出演进时序示例：commit → gen 1 行集；revert → gen 2 行集；查询当前状态取 gen 2。
+
+验证条件：
+
+- 文档与 M3-5-1~3 实现一致；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
+
+### M3-6 [TODO] `finish_assistant` 前置块级校验（M-CONV-5）
+
+上下文：
+
+- `src/conversation/pending/turn.rs:195-239` `finish_assistant` 只抽 tool_use id，不检查：同一 assistant 消息内重复 tool_use id（→ `register_tool_calls` 恒 `DuplicateProviderCallId`，`pending/turn/tool.rs:126-138`，永久卡死只能 cancel）；assistant 消息含 Image/ToolResult 块（→ commit 时 `validate_role_sequence` 的 `InvalidRoleBlock`，`validation/sequence.rs:179-197`），而 `ReadyToCommit` 态禁止 `ResumeTurn`/`CommitTurn` cancel（`pending/cancel/prepare.rs:189-193`），只剩 DiscardTurn，整轮作废。
+
+实现要求：
+
+- `finish_assistant` 增加与 commit 同级的块级预检：拒绝 assistant 消息中的非法块类型、重复 tool_use id，尽早返回明确错误（复用或新增合适错误变体）。
+- 预检规则与 `validation/sequence.rs` 保持单一来源（抽公共函数或调用同一 validator 的部分），避免两处规则漂移。
+
+验证条件：
+
+- 单元测试：含重复 tool_use id 的 assistant 响应在 `finish_assistant` 即报错；含 Image 块的 assistant 响应同样即时报错；报错后 pending turn 可正常 DiscardTurn 并继续 feed。
+- `cargo test -p agent-lib --lib conversation::pending` 全过。
+
+### M3-7 [TODO] `resolved_provider_call_id` 按 claimed 排除语义重推导（M-CONV-6）
+
+上下文：
+
+- `src/conversation/history/index.rs:413-433`：按内容顺序取候选，validation（`validation/pairing.rs:135-163`）保证的是"未被 claimed 的 provider id 中唯一"。构造场景：同一 call_msg 含 ToolUse A、B + 同一 result_msg 含 A、B result + 一个 pairing 显式声明 B、另一个为 None → index 重推导候选 {A,B}，release 下 `expect` 通过但可能取错，debug 下 `debug_assert!` panic。
+- 本 crate pending 路径总写 `Some`（`pending/turn/tool.rs:272-282`），但 restore 接受外部快照的 `None` pairing。
+
+实现要求：
+
+- index 重推导实现与 validation 相同的 claimed 排除逻辑：先处理显式 `Some` 的 pairing 并标记 claimed，再推导 `None` 的。
+- 或在 restore 时把 `None` 规范化为解析后的 `Some`（单点修复，推荐评估此方案）。
+- 消除该路径上的 `expect`/`debug_assert!` 差异行为。
+
+验证条件：
+
+- 单元测试：用上述 A/B 构造场景（手工快照数据）restore，断言解析结果与 validation 语义一致且 debug 构建不 panic。
+- `cargo test -p agent-lib --lib conversation::history` 全过。
+
+### M3-8 [TODO] fork 不继承 compaction projection 的文档化（M-CONV-7，方案 a）
+
+上下文：
+
+- `src/conversation/boundary/fork.rs:92-95`：child 无条件 `Projection::raw_for_active_turns`，父已压缩区间回退 raw——compaction 成果（已付费 summary artifact）不随 fork 继承。
+
+决策（已定，方案 a）：fork **不继承** compaction projection，child 前缀一律回退 raw 渲染。本任务为纯文档任务，不改行为。
+
+实现要求：
+
+- `src/conversation/boundary/fork.rs` 文档（fork.rs:40-47 及 `fork_at` 的 doc comment）：明确写出取舍——fork 不继承父的 compacted span 与 artifact，已压缩区间在 child 中回退为 raw 渲染；说明理由（child 有独立 owner/version 身份，compacted span 的 `CheckedTurnRange` anchor 跨 conversation 重验证成本高，raw 回退语义永远正确）；并指出影响（child 首 token 成本可能高于父的投影视图，如需压缩应对 child 重新 compact）。
+- `docs/conversation-core.md` §7（compaction/projection 相关节）补同一说明。
+- 若 DESIGN.md 的 fork 段落（§Revert / Fork）需要一句交叉引用，一并补上。
+
+验证条件：
+
+- 文档措辞与 `fork.rs:92-95` 实现一致（人工核对）。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
+- `cargo test -p agent-lib --lib conversation::boundary` 全过（无行为变化，原样通过）。
+
+### M3-9 [TODO] M3 review：Conversation 正确性收口
+
+检查项：
+
+- 逐条核对 H-STATE-1/2、M-CONV-1/2/3/5/6/7 状态，`docs/review-2026-07.md` 已标注（M-CONV-3 以 M3-5-1~4 全部落地为准，重点复验演进场景二次导出不冲突）。
+- 重点复验：M3-1 回归测试（revert→compact→redo→effective_view 完整）；rows round-trip 含 meta；10 万级链不栈溢出。
+- `docs/conversation-core.md` 与实现一致。
+- 全量门禁命令通过。
+
+---
+
+## M4：Agent 状态机与 drive 语义
+
+### M4-1 [TODO] 修复 `blackboard_read` 丢弃正文 + 补 mailbox 读工具（H-STATE-6）
+
+上下文：
+
+- `src/agent/collab/tools.rs:587-598`：`blackboard_read` 读出 `messages` 后只 `messages.len()` 计数即丢弃，黑板对模型只写不读。
+- mailbox 工具面只有 `send_message`，无读收件箱工具（collab/tools.rs 全文无 mailbox_read）。
+- 对照：`plan_read`（tools.rs:511-525）返回了状态摘要（但也缺 owner/depends_on，可一并补齐）。
+
+实现要求：
+
+- `blackboard_read` 返回消息正文（含 author/seq/内容），注意输出长度控制（截断或分页参数），与现有工具的输出风格一致。
+- 新增 mailbox 读工具（收件箱读取，语义与 `Mailbox` API 对齐），注册进同一工具组。
+- 评估 `plan_read` 是否补 owner/depends_on 字段（低成本则一并做）。
+
+验证条件：
+
+- 单元测试：post 两条消息后 `blackboard_read` 返回内容包含两条正文；mailbox send 后读工具能取到。
+- `cargo test -p agent-lib --lib agent::collab` 全过。
+- `docs/agent-layer.md` §6.4 如需更新则同步。
+
+### M4-2 [TODO] `AwaitingReconfig` 期间的新 reconfigure 不再静默丢失（H-STATE-5）
+
+上下文：
+
+- `src/agent/machine/default/mod.rs:314-319` `reconfigure` 无 cursor 守卫，随时可入队。
+- resume 路径 `mod.rs:890-899`：`PendingReconfig::Commit { application, .. } => finalize_text_commit(step_id, Some((application, records)))` 应用 park 时预 plan 的 application；`apply_reconfig_application`（`src/agent/state.rs:200-208`）无条件 `queued_reconfigs.clear()`。
+- 场景：队列 [R1] → park → `reconfigure(R2)` 校验通过入队 [R1,R2] → resume 只应用 A1 并清空队列 → R2 静默丢失。
+
+实现要求：
+
+- 二选一（记录选型）：(a) `reconfigure` 在 `AwaitingReconfig` cursor 下拒绝（返回明确错误，调用方可重试）；(b) resume 时重新 plan 整个队列而非用预存的 application。推荐 (a)，改动小且语义清晰。
+- 选 (a) 时注意与 M4-4 软拒绝出口的衔接（若 M4-4 先落地，复用其非破坏性错误通道）。
+
+验证条件：
+
+- 单元测试：复现上述场景，R2 不再静默丢失（被拒绝并可在 resume 后重新提交，或被一并应用）。
+- `cargo test -p agent-lib --lib agent::machine` 全过。
+
+### M4-3 [TODO] pivot 重发的 requirement id 与 trace 去重解耦（H-STATE-4）
+
+上下文：
+
+- `src/agent/machine/default/mod.rs:614-623`：pivot 路径用同一 requirement id 重发 LLM 请求（注释明确 "re-emitted under the *same* requirement id"）。
+- `src/agent/drive.rs:445-494`：drain 把 requirement id 直接当 trace node id；`TraceHandle::record_node` 对重复 id 返回 `TraceError::DuplicateNodeId`（`src/agent/context/trace.rs:379-382`），经 `?` 中止整个 drain（`drive.rs:425-430`）。
+- 广义问题：观测侧（trace）失败杀死实际驱动。
+
+实现要求：
+
+- trace 记录改 best-effort：`record_node` 失败（含 DuplicateNodeId）记录 warning 类痕迹但不中止 drain；或 drain 对 pivot 重发生成派生 node id（如 `<id>#attempt-2`）。选型写入完成记录——注意 effect-model 文档对 trace 完整性的承诺需同步修订。
+- 检查 `NeverResumed` 等其他 trace 失败点同样不致命。
+
+验证条件：
+
+- 单元测试：手写 driver 触发 pivot 重发同 id requirement + 开启 trace，drain 不再因 DuplicateNodeId 失败，turn 正常完成。
+- `cargo test -p agent-lib --lib agent::` 全过。
+
+### M4-4 [TODO] 引入非破坏性 step 错误出口（软拒绝）（M-ERR-1 及连带项）
+
+上下文：
+
+- `src/agent/machine/default/mod.rs:1048-1058`：任何 `StepError` → `fail_from` → `fail` → `cancel_pending(DiscardTurn)` + Error cursor。stale resume id（mod.rs:706-713）、不合法边界 pivot（mod.rs:576-588）、turn 中途第二条 UserMessage 都会销毁整个 pending turn。
+- `fail()` 自身吞错（mod.rs:1021-1030）：转移表（`src/agent/state/cursor.rs:308-344`）无 `(Done|Error) → Error` 边，机器停在 Done/Error 时 fail 的转移静默失败，错误消息丢失。
+- `NestedMachine::route_by_id` fallback（`src/agent/machine/nested.rs:266-272`）：未知 id 的 Resume/Abandon 转发给根机 → 走破坏性 fail。
+- 步数上限误用终态：`machine/default/tools.rs:593-604` 达 `max_steps` 走 `LoopCursor::Error`，而 `LoopDoneReason::StepLimitReached`（cursor.rs:650）是死变体。
+- during-turn reconfig abandon 用 DiscardTurn（mod.rs:978-986），而 tool abandon 用 ResumeTurn 保全工作（tools.rs:701-716）。
+
+实现要求：
+
+- `StepOutcome` 增加软拒绝表达（如 `rejected: Option<StepRejectReason>` 或专用 outcome 变体）：协议违规类输入（stale id、非法边界 pivot、turn 中重复 UserMessage、未知路由 id）被拒绝但机器状态不变。
+- `fail()` 的 cancel_pending 与 cursor 转移失败必须显式处理（至少日志 + outcome 标注），不再 `let _ =`。
+- 步数上限改用 `LoopDoneReason::StepLimitReached` 正常终态（保留已完成 tool 结果的提交路径，与文本提交一致）。
+- during-turn reconfig abandon 与 tool abandon 对齐（优先 ResumeTurn 保全文本响应）。
+- 该任务触及 `AgentMachine` trait 的公共契约，属 breaking change，完成记录注明。
+
+验证条件：
+
+- 单元测试：上述四类协议违规输入各自被软拒绝、cursor 不变、pending turn 完好、后续正常输入可继续。
+- 单元测试：max_steps 到达后 cursor 为 Done(StepLimitReached) 且已冻结的 tool 结果不丢。
+- `cargo test -p agent-lib --lib agent::machine` 与 nested 测试全过。
+- `docs/agent-effect-model.md` 的 step 契约节同步。
+
+### M4-5 [TODO] 取消语义：延迟有界 + `TurnDone` 契约修正（M-ERR-2）
+
+上下文：
+
+- `src/agent/drive.rs:405`：只在每批之间检查 `ctx.is_cancelled()`；批次 fulfill 完成后 resume 循环前不复查（drive.rs:414-434）。参考 handler 全部忽略 ctx（`src/agent/drive/reference.rs:91,153` 的 `_ctx`）。
+- `drive.rs:405-412`：取消时只对 `pending.first()` 记录 `NeverResumed` 并 abandon，批次其余 requirement 无 trace 记录，违反 effect-model §8 "每个 requirement 恰好以一种方式 settle 并记录"。
+- `drive.rs:236-240`：`TurnDone` 文档声称 cursor 是 terminal `Done|Error`，实际取消落点是 `Idle`（`finish_cancel`，`machine/default/mod.rs:991-1004`）；调用方无法用 `is_terminal`（drive.rs:497-499）区分取消与自然结束。
+
+实现要求：
+
+- drain 在 fulfill_batch 返回后、resume 前增加取消复查；参考实现的 handler 把 ctx 传入 LLM 调用（至少支持在等待响应期间被取消，可配合 M1-2 的超时设施）。
+- 取消时对批次内全部 outstanding requirement 逐一记录 `NeverResumed` 并 abandon。
+- 修正 `TurnDone` 契约：增加 `cancelled: bool`（或独立 outcome 变体），文档与 `is_terminal` 行为一致。
+- 评估 `CancelRecovery` cursor 的 restore 坑（`mod.rs:501-508` 的重置只覆盖 Done|Error）：要么纳入重置，要么从 serde 形状排除。
+
+验证条件：
+
+- 单元测试：飞行中的 LLM requirement 期间触发取消，drain 在当前批次 settle 后立即停，不再推进下一批；全部 outstanding requirement 有 trace 记录。
+- 单元测试：取消路径返回的 outcome 可与自然结束区分。
+- `cargo test -p agent-lib --lib agent::drive` 全过；`docs/agent-effect-model.md` §8 同步。
+
+### M4-6 [TODO] 统一 reconfig 的 resolver 来源，修复默认 resolver footgun（M-ERR-3）
+
+上下文：
+
+- queue 时机器用 `self.tool_registry_resolver` 校验（`machine/default/mod.rs:327-346`），apply 时 driver 用 scope 的 resolver（`drive/reference.rs:183-195`）——两个不同对象，queue 通过 apply 失败 → 已完成 turn 被销毁 + reconfig 留队列下轮再失败。
+- 默认 `DeclaredOnlyToolRegistryResolver`（`src/agent/tool.rs:143-152`）对任何 tool set "解析成功"但 `execute` 恒 `UnknownTool`（tool.rs:207-220），且 declarations 由请求集构造使匹配检查恒真——全链路"成功"后每个工具调用开始失败。
+
+实现要求：
+
+- queue 与 apply 使用同一 resolver 实例（或 apply 时由机器持有的 resolver 重新解析），消除"两处决议"窗口。
+- 默认 resolver 改为保守失败（未显式配置 resolver 时 reconfig tool set 报错），或在文档显著位置标注其 declared-only 语义；推荐前者。
+
+验证条件：
+
+- 单元测试：配置"queue 通过 apply 失败"的 resolver 组合不再可能（单一来源）；默认接线下 tool-set reconfig 给出显式错误而非假成功。
+- `cargo test -p agent-lib --lib agent::` 全过。
+
+### M4-7 [TODO] M4 review：Agent 语义收口
+
+检查项：
+
+- 逐条核对 H-STATE-4/5/6、M-ERR-1/2/3 状态，`docs/review-2026-07.md` 已标注。
+- 重点复验：协议违规软拒绝后 turn 完好；取消延迟有界且 trace 完整；协作工具双向可用。
+- `docs/agent-effect-model.md`、`docs/agent-layer.md` 同步。
+- 全量门禁命令通过。
+
+---
+
+## M5：facade 承诺对齐
+
+### M5-1 [TODO] `run_full` 增加 drop/timeout 安全防护（H-STATE-3）
+
+上下文：
+
+- `src/facade/agent.rs:354`：非流式路径直接 `drain(&mut self.machine, agent_input, &scope, None, &ctx).await?`，无 Drop 守卫。`tokio::time::timeout`/`select!` 包裹 `agent.run(..)` 超时后 machine cursor 停在携带 outstanding requirement 的中间态，下一次 run 以 protocol error 失败——Agent 被一次超时永久毒化。
+- 流式路径已有参照：`AgentRunStream::abandon`（`src/facade/agent/stream.rs:496-521`）通过 `StepInput::Abandon` 回收滞留 turn。
+- facade 文档声称 "A failed turn discards its uncommitted work inside the machine, so the `Agent` stays usable"（agent.rs:268-269）——只对 `Err` 返回成立。
+
+实现要求：
+
+- 为 `run_full`/`run` 增加 guard：future 被 drop（含 timeout）时通过 RAII guard 或显式 abandon 步骤把 machine 恢复到一致状态（参考 `AgentRunStream::abandon` 的 Abandon 驱动方式；注意 async cleanup 的限制——可能需要同步 best-effort abandon 或下次 run 前的惰性恢复，选型写入完成记录）。
+- 文档更新：明确 timeout/drop 后 Agent 仍可用。
+
+验证条件：
+
+- 单元测试：`timeout(short, agent.run(..))` 超时后，下一次 `run` 正常完成；`snapshot` 一致。
+- `cargo test -p agent-lib --lib facade::agent` 全过。
+
+### M5-2 [TODO] 审批行为与文档对齐 + 流式 `Done.events` 审批事件补齐（M-PROM-4、M-ADP-3）
+
+上下文：
+
+- 文档承诺 deny 时 run 抛 `FacadeError::ApprovalDenied`（`src/facade/approval.rs:190-193`、`src/facade/error.rs:71-80`）；实际 typed tool 被拒绝时 machine 合成 `ToolStatus::Denied` 回灌模型、run 正常 `Ok`（`src/agent/machine/default/tools.rs:535-542`；测试 `auto_deny_skips_tool_execution` 断言成功）。`ApprovalDenied` 只在 external delegate 路径抛出（agent.rs:369-371）。
+- 非流式用 `weave_approval_events(collected.events, recorded_approvals)`（agent.rs:387）织入审批事件；流式终止输出直接 `events: collected.events`（`src/facade/agent/stream.rs:291`），缺审批事件。`RunOutput.events` 文档承诺跨路径一致（`src/facade/run.rs:144-148`）；现有 parity 测试（`facade/agent/tests.rs:1919-2047`）比较的是流 yield 序列而非 `Done.events`。
+
+实现要求：
+
+- 审批：二选一（记录选型）——(a) 改文档，明确 typed tool deny = 合成 Denied result 回灌、`ApprovalDenied` 仅 external delegate 路径；(b) 增加配置让 deny 可中断 run。推荐 (a)（行为本身合理且被测试钉住），同时给 `FacadeError::ApprovalDenied` 文档标注触发范围。
+- 事件：流式 `Done.events` 用与非流式相同的 `weave_approval_events` 织入审批事件。
+- parity 测试扩展为同时比较 `Done.events`。
+
+验证条件：
+
+- 单元测试：带审批的 run，流式 `Done.events` 含 `ApprovalRequested`，与非流式逐条相等。
+- `cargo test -p agent-lib --lib facade::` 全过；`docs/facade-api.md` 审批节同步。
+
+### M5-3 [TODO] 结构化错误 kind 替代字符串匹配分类（M-ERR-5）
+
+上下文：
+
+- `src/facade/agent.rs:1546-1552` `classify_error`：`message.contains("loop step limit")` → `LoopLimitExceeded`，依赖 `src/agent/machine/default/tools.rs:601` 的字面量措辞；同时服务 run_full 与 stream 两条路径（`agent/stream.rs:294`）。
+
+实现要求：
+
+- `LoopCursor::Error`（或机器错误出口）携带结构化 kind（枚举），facade 按 kind 分类。M4-4 落地后基于其错误形状实现。
+- 保留 message 作为人类可读补充，但不再参与分类。
+
+验证条件：
+
+- 单元测试：触发步数上限，facade 错误为 `LoopLimitExceeded`；修改内部措辞不影响分类（通过构造直接验证 kind 路径）。
+- `cargo test -p agent-lib --lib facade::agent` 全过。
+
+### M5-4 [TODO] facade 暴露 cancel 与 pivot 入口（M-PROM-2 cancel/pivot 部分）
+
+上下文：
+
+- 每次 run 新建私有 `CancellationToken`：`src/facade/agent.rs:298-303, 599-603, 681-685` 的 `RunContext::new_root(...)`；facade 无 `cancel()` 方法、不保留 token、无 pivot 入口。`ToolContext.cancel`（`src/facade/tool.rs:70`）因此永不被取消。
+- `docs/facade-api.md` §13 草拟了 cancel API 形态但未实现。
+- 注意与 M4-3/M4-4 的衔接：pivot 注入依赖下层 `inject_pivot`（M4-4 落地软拒绝后，不合法边界注入不再杀 turn）。
+
+实现要求：
+
+- facade 提供 run 级取消句柄：`Agent::run`/`stream` 返回或接受一个 `CancelHandle`（或 `Agent::cancel()` 取消当前活动 run），内部接到 `RunContext` 的 token；`ToolContext.cancel` 接同一 token。
+- 提供 pivot 注入入口（如 `Agent::interject(PivotMessage)`），经 drain/机器路径在 step 边界生效；若当前 drain 架构不支持中途喂输入（`drive.rs:369-438` 单输入一路跑到 terminal），先实现 stream 路径的 pivot，非流式标注限制。
+- 同步 `docs/facade-api.md` §13。
+
+验证条件：
+
+- 单元测试：run 进行中调 cancel，run 以取消语义结束，Agent 后续可用。
+- 单元测试：stream 路径 pivot 注入在下个 step 边界生效（事件序列可见注入消息）。
+- `cargo test -p agent-lib --lib facade::` 全过。
+
+### M5-5 [TODO] builder 暴露 `provider_extras`（M-PROM-6）
+
+上下文：
+
+- `ModelConfig::provider_extras(...)` 存在且 `apply_to_request` 会传递（`src/facade/config.rs:400-405`），但 `ChatBuilder`/`AgentBuilder`/`AgentWorkerBuilder`/`AgentRestoreBuilder` 无一暴露它，`build_request` 恒为 `provider_extras: None`（`src/facade/chat.rs:235`）。
+
+实现要求：
+
+- 各 builder 增加 `provider_extras`（或接受整个 `ModelConfig` 的入口）并贯通到 `build_request`。
+- 校验 `ProviderExtras` 的 `ProviderId` 与 builder 的 provider 一致（不一致报错或丢弃，按 `model/extras.rs` 既有语义）。
+
+验证条件：
+
+- 单元测试：builder 设置 extras 后，fake client 收到的 `ChatRequest.provider_extras` 与设置一致。
+- `cargo test -p agent-lib --lib facade::` 全过；`docs/facade-api.md` §7.1 附近同步。
+
+### M5-6 [TODO] restore 路径补齐 build 同级校验（M-ADP-5）
+
+上下文：
+
+- `src/facade/agent.rs:1280-1291`：`AgentBuilder::build` 对 typed tools + extra + custom registry + delegation 合成工具做 `ensure_unique_declaration_names` 全量校验，并对 rules/dispatcher 引用未注册 delegate 报错。
+- `src/facade/agent/snapshot.rs:758-853`：`AgentRestoreBuilder::build` 只调 `ensure_unique_tool_names`（snapshot.rs:772-776），不把 restored `snapshot.delegation` 合成的 `ask_<name>` 声明与重新注入的 typed tool 名对撞检查。
+
+实现要求：
+
+- restore 路径复用 build 路径的同一段校验逻辑（抽公共函数），覆盖 delegation 合成声明对撞与 delegate 引用校验。
+
+验证条件：
+
+- 单元测试：restore 一个带 delegation 的 agent 再 `.tool(..)` 注入同名 `ask_<name>` 工具，`build` 报错而非带病上线。
+- `cargo test -p agent-lib --lib facade::agent` 全过。
+
+### M5-7 [TODO] M5 review：facade 承诺收口
+
+检查项：
+
+- 逐条核对 H-STATE-3、M-PROM-2（cancel/pivot）、M-PROM-4、M-PROM-6、M-ERR-5、M-ADP-3、M-ADP-5 状态，`docs/review-2026-07.md` 已标注。
+- 重点复验：timeout 后 Agent 可用；流式/非流式事件 parity（含 `Done.events`）；cancel/pivot/provider_extras 实际可达。
+- `docs/facade-api.md` 同步；`README.md` 如需更新已更新。
+- 全量门禁命令通过。
+
+---
+
+## M6：预算端到端接线
+
+### M6-1 [TODO] drain/drive_turn 接入预算记账（M-PROM-1 核心）
+
+上下文：
+
+- `charge_step`/`charge_usage`/`charge_tokens`/`charge_cost_micros`（`src/agent/context/budget.rs`）在默认路径零调用，只有 external/ 和测试在用。
+- LLM `Response` 的 usage 被 fold 后未计费；`CancelRecoveryReason::BudgetExceeded`、`LoopDoneReason::BudgetExhausted`（`src/agent/state/cursor.rs:615,654`）是死变体。
+- 设计要求：`docs/agent-layer.md` §1.4 "每步检查，超限中止"；`docs/agent-effect-model.md` §0 "预算统一成 effect"。
+
+实现要求：
+
+- drain 在 StepBoundary（每批 requirement settle 后 / LLM response fold 后）调用 `charge_step` 与 `charge_usage`；超限时按既有 cursor 语义走 `BudgetExhausted`/`BudgetExceeded` 路径（M4-4 已激活这些变体的产生路径后接线）。
+- 预算预检与 charge 的非原子窗口（审查 L-8）：保持现状但文档化，或评估在 `BudgetHandle` 内加原子预扣（选型记录）。
+- 同步 effect-model 文档的预算节。
+
+验证条件：
+
+- 单元测试：配置小额 token 预算的 run 在超限后以 BudgetExhausted 终止，conversation 状态一致（已 committed 部分完好）。
+- 单元测试：预算充足时记账值与各步 usage 之和一致。
+- `cargo test -p agent-lib --lib agent::` 全过。
+
+### M6-2 [TODO] facade budget 旋钮 + dispatch 预算硬出口（M-PROM-2 budget 部分、L-9）
+
+上下文：
+
+- facade 恒 `BudgetLimits::unbounded()`（`src/facade/agent/stream.rs:203-207`），无任何 builder 旋钮。
+- `src/agent/external/dispatch.rs:585-587, 654-659`：预算完全耗尽时 dispatch 仍降级派 cheapest worker（`saturating_sub` 为 0 → low → downgrade），无"预算尽 → 停止"硬出口。
+
+实现要求：
+
+- builder 增加 `budget(BudgetLimits)` 入口，贯通到每次 run 的 `RunContext`；预算耗尽的终态以结构化错误/事件暴露给 facade 用户（与 M5-3 的 kind 设施对齐）。
+- dispatch 增加预算耗尽硬出口：可用预算为 0 时不再派工，返回显式 BudgetExhausted 类结果。
+
+验证条件：
+
+- 单元测试：facade 设置小预算 → run 超限终止且错误可识别；dispatch 在零预算下不派工。
+- `cargo test -p agent-lib --lib facade:: agent::external::dispatch` 全过（dispatch 部分带 external features）。
+- `docs/facade-api.md`、`docs/agent-layer.md` §1.4 同步。
+
+### M6-3 [TODO] M6 review：预算接线收口
+
+检查项：
+
+- 核对 M-PROM-1、L-8、L-9 状态，`docs/review-2026-07.md` 已标注。
+- 确认 `BudgetExhausted`/`BudgetExceeded` 变体不再是死代码（grep 有生产路径构造点）。
+- 全量门禁命令通过。
+
+---
+
+## M7：adapter 健壮性与协议契约
+
+### M7-1 [TODO] HTTP 错误分类顺序修正（M-ERR-4）
+
+上下文：
+
+- `src/client/error.rs:90-99`：任意状态码先做 body 子串匹配再判 401/403。403 body 含 "content policy" 误报 `ContentFiltered`；500 body 回声含 "too many tokens" 误报 `ContextLengthExceeded`。
+
+实现要求：
+
+- marker 匹配限定在 4xx 且排除 401/403（401/403 优先判 `Auth`）；5xx 不做内容猜测分类。
+- 检查 `client/error/tests.rs` 现有分类测试，补充误分类场景。
+
+验证条件：
+
+- 单元测试：403 + "content policy" body → `Auth`；500 + "too many tokens" body → 非 `ContextLengthExceeded`；413/真实 context 超限 body 仍正确分类。
+- `cargo test -p agent-lib --lib client::error` 全过。
+
+### M7-2 [TODO] `StreamEvent::Usage` 语义契约文档化并断言（M-ADP-1）
+
+上下文：
+
+- `src/stream/mod.rs:144-148` 只说 "intermediate or final token-usage update"。实际：Anthropic 发增量段（`src/adapter/anthropic/stream/usage.rs:17-35` `UsageTracker::incremental`），OpenAI 终态一次性发完整累计（`src/adapter/openai_resp/stream/normalizer/terminal.rs:35`）。`Accumulator` 靠 `merge` 加法碰巧都正确（`src/stream/accumulator/mod.rs:146`），但直接消费事件流的上层无法知道该求和还是取最新。
+
+实现要求：
+
+- 统一为"所有 Usage 事件均为可累加增量"语义：OpenAI 侧若历史上会发多条（如中途 usage），改为相对上一条的增量；或在文档明确"每条事件都是对之前所有事件的替换/增量"二选一并让两 adapter 一致。选型记录。
+- `StreamEvent::Usage` 文档写明语义与推荐消费方式。
+
+验证条件：
+
+- 单元测试：两个 adapter 的 cassette/fixture 流，按文档语义消费得到与 `collect` 相同的最终 usage。
+- `cargo test -p agent-lib --lib adapter:: stream::` 全过。
+
+### M7-3 [TODO] openai_resp `sequence_number` 校验对兼容端点降级（M-ADP-2）
+
+上下文：
+
+- `src/adapter/openai_resp/stream/normalizer/mod.rs:333-345`：要求 sequence_number 从 0 严格连续；wire 结构体 `sequence_number: u64` 必填（`openai_resp/stream/wire.rs:98,109,124,143,162,177,190,197`）。第三方 OpenAI 兼容端点常省略或不保证连续，整个流以 protocol error 终止。
+
+实现要求：
+
+- wire 字段改 `Option<u64>`（`#[serde(default)]`）；缺失时跳过连续性校验，存在时保持严格校验。乱序仍报错。
+- 文档注明对兼容端点的降级行为。
+
+验证条件：
+
+- 单元测试：无 sequence_number 的事件流正常归一化；有号但跳号仍报错。
+- `cargo test -p agent-lib --lib adapter::openai_resp` 全过。
+
+### M7-4 [TODO] 线缆容错批量修复（adapter L2/L3、external L-1、facade L1）
+
+上下文：
+
+- 空 `arguments`：`src/adapter/openai_resp/stream/normalizer/item.rs:350` `serde_json::from_str(&complete)` 对空串报错；非流式 `convert.rs:172` 同。
+- Anthropic 必填字段脆：`src/adapter/anthropic/stream/wire.rs:40` `MessageDelta.usage` 无 `#[serde(default)]`；`normalizer.rs:126-128` 要求 `message_stop` 前必有 `stop_reason`。
+- CLI decoder：`src/agent/external/claude_code/decoder.rs:206-207` 非 JSON 行直接 Protocol 错误杀 session（codex/opencode 同构）。
+- `src/model/usage.rs:158-162`：非对象 details 字段（如 `"prompt_tokens_details": null`）使整个 usage 解析失败。
+
+实现要求：
+
+- 空 `arguments` 按 `{}` 处理。
+- Anthropic wire 可选字段补 `#[serde(default)]`；缺 `stop_reason` 的 message_stop 给 `Normalized` 的 Unknown/缺省值而非报错（保持 raw 证据）。
+- CLI decoder 容忍连续 N 个（建议 ≤8）非 JSON 行并计数，超过才 Protocol 错误；容忍的行记录到诊断/日志（不含行内容或截断）。
+- usage details 非对象时跳过而非报错。
+
+验证条件：
+
+- 每处一条单元测试（空 arguments 流/响应正常、缺 usage 的 message_delta 正常、N 行 noise 后 session 存活、null details 解析成功）。
+- `cargo test -p agent-lib --lib` 与 external feature 测试全过。
+
+### M7-5 [TODO] `ContentBlock` 增加反序列化兜底 variant（facade 报告 M8，单向兼容）
+
+上下文：
+
+- `src/model/content.rs:16-77` + `content/serialization.rs:10-49`：`#[serde(tag = "type")]` 封闭枚举，provider 新增 block 类型（如 `redacted_thinking`、新 server tool block）导致整个 Response 反序列化失败。与 lib.rs:246-251 的前向兼容承诺冲突；flatten `extra` 只保已知 variant 内的未知字段。
+
+决策（已定）：增加 `Unknown` 兜底 variant，但**只做单向兼容**：新版代码必须能反序列化包含未知 block 类型的旧数据/新 provider 响应；反向不要求——`Unknown` 的序列化不要求 round-trip 保真（收到什么发回什么不做保证）。
+
+实现要求：
+
+- `ContentBlock` 增加 `Unknown` variant：反序列化时捕获未识别的 `type` 标签，保留 `raw: Value`（整个 block JSON）与（如可取）原始 type 字符串。serde 实现：内部 tag 枚举的兜底可用 `#[serde(untagged)]` 外层或手写 `Deserialize`（参照 `content/serialization.rs` 现有结构选型，写入完成记录）。
+- `Serialize`：允许直接把 `raw` 原样写出（实现成本低、多数情况保真），但**文档明确不保证** round-trip；不为保真做额外机制。
+- 排查所有 `match ContentBlock` 穷尽点（`grep -rn "ContentBlock::" src/`），`Unknown` 的处理原则：conversation validator 对 assistant 消息中的 Unknown 放行（作为 provider 输出证据保留）；request 构造侧（`adapter/*/request/`）序列化直接透传 `raw`；不新增报错路径。
+- 更新 lib.rs:246-251 前向兼容承诺措辞：未知 block 类型由 `Unknown` 保留，序列化保真为 best-effort。
+
+验证条件：
+
+- 单元测试：含伪造未知 block 类型（如 `{"type": "future_block", "data": ...}`）的 fixture 响应，两个 adapter 的非流式与流式路径均解析成功，block 进入 `ContentBlock::Unknown` 且 `raw` 可读。
+- 单元测试：`Unknown` 序列化输出 JSON 可再次被解析为 `Unknown`。
+- `cargo test -p agent-lib --lib model:: adapter:: conversation::` 全过（validator 相关既有测试不受影响）。
+
+### M7-6 [TODO] M7 review：adapter 收口
+
+检查项：
+
+- 逐条核对 M-ERR-4、M-ADP-1、M-ADP-2、M7-4/M7-5 覆盖项状态，`docs/review-2026-07.md` 已标注。
+- 全量门禁命令通过。
+
+---
+
+## M8：复制代码收敛
+
+### M8-1 [TODO] 两个 LLM adapter 收敛公共传输/解码模块（adapter 报告 M4）
+
+上下文：
+
+- 逐字重复清单：整个 SSE decoder（`src/adapter/anthropic/stream/decoder.rs` 与 `src/adapter/openai_resp/stream/decoder.rs`，87/88 行仅注释不同，已对 `S/B/E/F` 泛型）；`validate_event_stream_content_type` + `map_transport_error`（两个 `stream/mod.rs:61-95` 附近）；`chat()`/`chat_stream()` HTTP 传输样板（两个 `response.rs:48-78`、两个 `stream/mod.rs:23-58`）；`endpoint_headers`/`append_header`/URL 拼接（`anthropic/request.rs:229-296` vs `openai_resp/request.rs:98-165`）；`insert_preserving_collision`（`openai_resp/stream/normalizer/terminal.rs:217-223` vs `openai_resp/response.rs:154-160`，同 crate 内已重复）。
+
+实现要求：
+
+- 新增 `src/adapter/common/`（或并入 `src/client/`）承载：泛型 SSE decoder、HTTP 传输样板（execute→status→retry_after→body 读取→错误映射，含 M1-2 的超时/上限设施单一实现）、`map_transport_error`（含 M1-4 脱敏单一实现）、header/URL 工具。
+- 两 adapter 改为调用公共模块；行为零变化（M1–M7 修复后的行为为准）。
+- 纯移动重构，不改公共 API。
+
+验证条件：
+
+- 全部现有 adapter 测试原样通过（不重写断言）：`cargo test -p agent-lib --lib adapter::` 与 `cargo test --all --all-targets`。
+- `cargo clippy --all-targets -- -D warnings`；无重复实现残留（人工 diff 两 adapter 目录）。
+
+### M8-2 [TODO] 三个 CLI adapter 收敛共享 child-process 模块（external 报告 L-12）
+
+上下文：
+
+- 每个 adapter 复制约 200 行同构代码：`ProcessTurn`/`ProcessIo`（spawn/close/kill/wait）、`drain_and_emit`、`maybe_session_ref`、`intersect_capabilities`（`claude_code/adapter.rs:677-693` / `codex/adapter.rs:806-822` / opencode 同）、`reject_unsupported_tools`、`turn_message`。M1-5/M1-6/M2-1/M2-5 的修复已在三份中各做一遍。
+
+实现要求：
+
+- 新增 `src/agent/external/process/`：共享的 line-oriented 子进程管理（spawn + 进程组、read line + idle 超时、grace close + 退出码分类 + kill 兜底、prelude 循环 + deadline + 取消）、`intersect_capabilities` 等纯函数。
+- 三 adapter 改为薄封装（只保留各自 argv 构造与 decoder 接线）；ACP 能复用的部分一并复用。
+- 行为零变化（以 M1/M2 修复后为准）。
+
+验证条件：
+
+- 全部 external feature 测试原样通过。
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`。
+- 三 adapter 目录行数显著下降（完成记录给出 before/after）。
+
+### M8-3 [TODO] M8 review：收敛收口
+
+检查项：
+
+- 确认两份收敛无行为回归（全量测试 + 人工抽查关键路径 diff）。
+- `docs/managed-external-agent.md`、AGENTS.md 的模块描述同步（新增公共模块的位置）。
+- 全量门禁命令通过。
+
+---
+
+## M9：低严重度清扫与文档收尾
+
+### M9-1 [TODO] panic/poison 策略统一
+
+上下文：
+
+- 同 crate 两种中毒策略并存：collab 做恢复（`src/agent/collab/mailbox.rs:110-114`、`plan.rs:343-347`、`blackboard.rs:110-113`），trace/budget/facade 十余处 `.expect("… poisoned")`（如 `src/agent/context/trace.rs:213,234,379`、`budget.rs:235,247,322`、`src/facade/approval.rs:646,662,679,751`、`src/facade/agent/stream.rs:78,84`、`src/agent/drive/reference.rs:143,193`）。
+- 其他生产 expect：`src/agent/drive.rs:603`（manifest 不变量）、`src/conversation/persistence/rows.rs:1` 等少量点。
+
+实现要求：
+
+- 统一为中毒恢复（`unwrap_or_else(|e| e.into_inner())`）或文档化的显式 panic 策略——库代码推荐恢复；写入贡献约定（AGENTS.md Conventions）。
+- `drive.rs:603` 类不变量 expect 保留但改为带上下文的 panic 消息或 debug_assert + 防御分支。
+
+验证条件：
+
+- `grep -rn 'expect("' src/ | grep -i poison` 清零（或仅剩文档化例外）。
+- 全量测试通过。
+
+### M9-2 [TODO] API 打磨批
+
+上下文（逐项小改，逐一勾选）：
+
+- `src/facade/run.rs:494-498,513-521`：`ApprovalRequest::call_id` 空串哨兵 → `Option<String>`（字段已 `#[non_exhaustive]`，成本低）。
+- `src/model/normalized.rs:8-14`：`Normalized` 字段全 pub 可构造 value/raw 矛盾值 → 构造器私有化 + 只读访问器（评估 breaking 面）。
+- `src/prelude.rs:23-27`：补 `FacadeError` 与高频 model 类型导出（或 `model/mod.rs` 根级 re-export）。
+- 配置校验缺口：`ChatBuilder::model("")`/`AgentBuilder::model("")` 空白通过（`src/facade/chat.rs:327-356`、`agent.rs:1206-1218`）；`ModelConfig::temperature` 接受 NaN/无穷（`facade/config.rs:348-352`）；空 delegate 工具名/空 keywords（`facade/delegate.rs:799-813`）。
+- `src/facade/approval.rs:482,644-647`：`FacadeApproval.pending` 跨 run 泄漏，run 收尾清理。
+- `src/facade/chat.rs:639-643`：`ChatSessionBuilder` 无法把继承 system prompt 清为 None。
+- `src/facade/agent.rs:1800,1977-1981`：`Some(Usage::default())` 与 `None` 语义含混，统一。
+- `src/facade/ids.rs:26-34`：`FacadeIds` "globally unique" 文档措辞过强，修正。
+- `src/agent/state/queue.rs:232`：`pub type QueuedReconfig = ReconfigRequest` 兼容别名删除（pre-1.0）。
+- 命名/动词一致性（`ask`/`send`/`run`、`Agent` vs `AgentSession`、lib.rs 未提 facade、`facade/mod.rs` milestone 叙事、不存在的 `AgentSession`）：统一或文档说明现状，0.1.x 窗口内决策。
+- `src/model/tool.rs:19-27`：`ToolCall` 补 `extra` 逃生舱，与 `ContentBlock::ToolUse` 对齐（评估）。
+- `RunEvent` 从不产生的 variant 与 "shape stable" 承诺矛盾（`src/facade/run.rs:282-285,298,417`）：加 `#[non_exhaustive]` 或收回承诺。
+
+实现要求：
+
+- 逐项实现或显式记录"不做"及理由；公共 API breaking 项在完成记录汇总。
+
+验证条件：
+
+- 每项至少一条测试或编译期保证；`cargo test --all --all-targets` 通过；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
+
+### M9-3 [TODO] 性能小项批
+
+上下文：
+
+- `src/agent/context/trace.rs:380`：`record_node` 每次 O(n) 全表扫重 → O(n²)。
+- `src/agent/collab/plan.rs:399`：`add_task` 为环检测整表 clone。
+- `src/facade/agent.rs:314-319`：每 run 深拷贝 `self.tools` 与 `extra_declarations`（整棵 JSON schema 树）→ `Arc` 化。
+- `src/conversation/history.rs:211-217`：`contains_message_id` 每次 O(全量历史)，被各 pending 操作调用（M-CONV-4）——增量 id 索引。
+- `src/conversation/persistence/rows.rs:531-532,1130`：`insert_set_against` 双份深拷贝校验。
+- `src/adapter/openai_resp/stream/normalizer/`：`raw.clone()`、`done_item` 保留、`unmodeled_events` 堆积（内存 2–3 倍放大，M-ADP 报告 M7）。
+
+实现要求：
+
+- 逐项优化或记录"暂不优化"理由；优化项附简单 bench 或计数断言（不要求正式 benchmark 设施）。
+- conversation id 索引改动较大，若插入此处影响 M9 进度可单列子任务。
+
+验证条件：
+
+- 全量测试通过；优化点无行为变化（现有断言原样通过）。
+
+### M9-4 [TODO] 文档同步与审查报告勾销
+
+实现要求：
+
+- `src/lib.rs` crate 文档补 facade 层描述（README.md:41-45 已把 facade 定位为推荐入口，docs.rs 首页应一致）。
+- `docs/review-2026-07.md` 全部条目标注最终状态（已修复/已降级/不做+理由）；全文移入 `docs/archive/2026-07-review/`（或保留在 docs/ 并标注已收口，二选一记录）。
+- `AGENTS.md`、`README.md`、`docs/facade-api.md`、`docs/managed-external-agent.md`、`docs/capability-matrix.md`、`docs/conversation-core.md`、`docs/agent-effect-model.md`、`docs/agent-layer.md` 全面过一遍与现状的一致性。
+
+验证条件：
+
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
+- 抽查 10 条文档声明与代码行为一致（人工）。
+
+### M9-5 [TODO] 终审 review：全计划收口
+
+检查项：
+
+- `docs/review-2026-07.md` 无未标注条目。
+- PLAN.md 五个目标逐条核对达成情况，写入收尾结论。
+- 全量门禁命令通过（含全部 external features）。
+- `cargo test --all --all-targets` 无挂起、无 ignore 泄漏（默认离线）。
+- 收尾：PLAN.md/TODO.md 归档到 `docs/archive/2026-07-19-review-fixes/`（本计划完成后）。

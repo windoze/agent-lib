@@ -1,30 +1,32 @@
-# M6-3 执行计划：Review 最终正确性和完整性验收
+# 执行计划：M1-1 `EndpointConfig`/`AuthScheme` 手写脱敏 Debug（H-SEC-1）
 
-## 任务性质
-最终验收/复核任务（TODO.md M6-3）。这是项目最后一个任务；完成后需打 `endtag` tag。
+## 任务来源
+- `TODO.md` 第一个未完成任务：**M1-1**（安全与崩溃级修复，H-SEC-1）。
+- 审查条目：`docs/review-2026-07.md` 的 H-SEC-1，修复后需在该条目标注 `✅ 已修复（M1-1）`。
 
-## 检查范围
-1. 所有 milestone review 任务是否完成（M1-3、M2-3、M3-5、M4-5、M5-3）。
-2. PLAN.md / TODO.md / docs/refine.md 是否一致。
-3. README quick start 是否能让新调用方避开已知坑。
-4. 默认测试、feature clippy、rustdoc 是否都通过。
-5. 是否还有必须本轮修复但未排入任务的设计目标缺口。
+## 现状
+- `src/client/config.rs`：`AuthScheme`（第 9 行）与 `EndpointConfig`（第 36 行）均 `#[derive(Debug)]`，`Bearer(String)`/`Header{value}` 含明文密钥。
+- `src/adapter/anthropic/mod.rs:22`、`src/adapter/openai_resp/mod.rs:25`：derive Debug 内嵌 `EndpointConfig`。
+- 先例：`src/facade/config.rs` `ProviderConfig` 手写 Debug（`RedactedAuth`/`RedactedPairs`，用 `<redacted>`）；facade `approval.rs` 有 `is_sensitive_key`（子串匹配敏感 key）。
+- TODO 明确要求占位符为 `[REDACTED]`（与 facade 的 `<redacted>` 不同，按 TODO 规格实现，facade 不动）。
 
-## 验证条件
-- `rg "\[TODO\]" TODO.md` 完成后不应再有未完成任务标记（仅剩 legend 说明行）。
-- `git diff --check` 通过。
-- 完成记录列出：修复的设计目标差距、仍保留的非阻断风险、已运行的验证命令。
+## 步骤
+1. 提交当前未提交的任务单重生成文件（PLAN.md/TODO.md rename + 新 PLAN.md/TODO.md/docs/review-2026-07.md），保持历史清晰。
+2. `src/client/config.rs`：
+   - `AuthScheme` 去掉 derive Debug，手写：scheme 名可见，密钥一律 `[REDACTED]`。
+   - `EndpointConfig` 去掉 derive Debug，手写：`base_url`/`query_params` 可见；`auth` 用脱敏 Debug；`extra_headers` 头名可见，认证类头名（子串匹配 key/token/secret/auth/password/credential，大小写不敏感）值显示 `[REDACTED]`，其余值可见。
+   - serde 行为不变（保留 derive Serialize/Deserialize + 既有 round-trip 测试）。
+3. 新增单元测试（config.rs tests）：
+   - 含 `"sk-ant-secret"` 的 `EndpointConfig`：`format!("{:?}")` 不含该子串、含 `[REDACTED]`。
+   - Bearer/Header/None 各 variant 形态；认证类 extra header 脱敏、普通 header 值可见。
+4. 两个 adapter 各加一条断言（各自 mod.rs 新增 `#[cfg(test)]` 小测试模块）：`format!("{adapter:?}")` 不含密钥、含 `[REDACTED]`。
+5. 验证：`cargo fmt --all` → `cargo clippy --all-targets -- -D warnings` → `cargo test -p agent-lib --lib client::` → 全量 `cargo test --all --all-targets`（代码有改动，需要跑）。
+6. 文档：
+   - `docs/review-2026-07.md` H-SEC-1 标注 `✅ 已修复（M1-1）`。
+   - rustdoc 中补充 Debug 脱敏说明（config.rs 既有警告段落附近）。
+   - 检查 README/AGENTS 等是否需要同步（预计不需要行为级文档更新）。
+7. `TODO.md`：M1-1 标题加 `[DONE]`，追加完成记录。
+8. 提交：`[M1-1] Redact secrets in EndpointConfig/AuthScheme Debug output`，然后停止。
 
-## 验证命令
-1. cargo fmt --all
-2. cargo clippy --all-targets -- -D warnings
-3. cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
-4. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-5. cargo test --all --all-targets
-
-## 进度
-- [x] 读取 TODO/PLAN/refine，确认一致
-- [x] 审阅 README quick start（build_with_default_session_handler，避开 handler 坑）
-- [x] 运行全量验证（fmt/clippy x2/rustdoc/test 全 EXIT=0）
-- [x] TODO.md 标记 M6-3 [DONE] + 完成记录
-- [ ] commit + 打 endtag tag
+## 变更记录
+- （执行中更新）

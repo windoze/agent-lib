@@ -1,177 +1,161 @@
-# 实施计划：Refine 修正
+# 实施计划：2026-07 审查收口
 
-本计划以 [docs/refine.md](docs/refine.md) 为唯一输入，目标是把当前 facade 与 managed external agent 实现中已经识别出的差距收口到可验证、可维护的状态。
+本计划以 [docs/review-2026-07.md](docs/review-2026-07.md) 为唯一输入，目标是把全库审查发现的问题按依赖顺序落地修复，并在过程中保持测试、文档与实现同步。
 
 旧版计划和任务单已归档到：
 
-- [docs/archive/2026-07-18-facade-api/PLAN.md](docs/archive/2026-07-18-facade-api/PLAN.md)
-- [docs/archive/2026-07-18-facade-api/TODO.md](docs/archive/2026-07-18-facade-api/TODO.md)
+- [docs/archive/2026-07-19-refine/PLAN.md](docs/archive/2026-07-19-refine/PLAN.md)
+- [docs/archive/2026-07-19-refine/TODO.md](docs/archive/2026-07-19-refine/TODO.md)
+
+审查发现按编号引用（如 H-SEC-1、M-CONV-3），定义见 [docs/review-2026-07.md](docs/review-2026-07.md)。
 
 ## 目标
 
-1. 流式运行在被提前丢弃时必须能恢复到一致状态，不留下无法继续使用的 pending turn。
-2. 非流式 `Agent::run_full` 的 `RunOutput.events` 必须覆盖审批请求等关键运行事件，与流式路径保持语义一致。
-3. `AgentSnapshot` 必须完整保存和恢复协作底座中的 mailbox、blackboard、plan，以及明确 artifact 的保存策略。
-4. managed external agent 的 quick start 必须可直接运行，默认 session handler 的装配方式要清晰。
-5. external capability 必须区分声明值、用户提供值、探测值和协商值，避免把静态声明误认为运行时验证结果。
-6. `Agent::into_parts` 必须成为完整的逃生出口，不能静默丢掉 external delegate、保留会话、协作状态或交互处理器。
-7. 文档、测试和实现必须同步，默认测试不依赖真实 CLI 或真实 provider。
+1. 消除全部 🔴 高严重度问题：凭证泄露、可 panic 的 wire 数据处理、无超时挂起、子进程误杀/泄漏、状态一致性破坏（compaction 投影空洞、Agent 毒化、静默丢数据）。
+2. 收口设计承诺与实现的脱节：预算、取消、pivot、审批、session policy、provider_extras——要么补实现，要么改文档明确降级，二者必须一致。
+3. 修正错误与取消语义：软拒绝与硬失败分离、取消延迟有界、错误分类可靠。
+4. 收敛复制代码：两个 LLM adapter 之间、三个 CLI adapter 之间的逐字重复收敛为共享模块，同一缺陷不再需要修 N 遍。
+5. 每个行为变更同步更新拥有该行为的文档；默认测试保持离线可跑。
 
 ## 非目标
 
-1. 不重写 `Conversation`、`AgentMachine` 或 managed external runtime 的核心架构。
-2. 不引入新的默认依赖或默认启用任何 external CLI feature。
-3. 不把 ignored real e2e 测试改成默认必跑测试。
-4. 不改变 secret 处理策略，不在日志、snapshot 或 fixture 中保存凭据。
-5. 不顺手做无关重构，除非它是完成本计划的必要前置。
+1. 不重写 Conversation、AgentMachine 或 external runtime 的核心架构（sans-io、committed log + pending + projection 保持不变）。
+2. 不引入新的默认依赖，不改变 external-* feature 默认关闭的现状。
+3. 不把 ignored real e2e 测试改成默认必跑。
+4. 不改变 secret 处理的基本策略（脱敏方向只允许收紧，不允许放松）。
+5. 不做审查清单之外的无关重构；低严重度项只在 M9 批量清扫，不顺手做。
+6. 1.0 前的 API 稳定性不作为约束，但 breaking change 必须在任务完成记录中显式注明。
+
+## 排序原则
+
+1. **先小后大**：安全/崩溃级修复（M1）改动小、独立、收益高，最先落地。
+2. **先下后上**：conversation（M3）→ agent 状态机（M4）→ facade（M5）→ 预算横切（M6），上层修复依赖下层语义先稳定。
+3. **先行为后结构**：复制代码收敛（M8）放在行为修复之后——每个修复先用现有测试钉住行为，再移动代码，避免在未钉住行为的代码上做大重构。代价是 H-EXT 类缺陷要按现状修三遍，可接受（单点修复小且机械）。
+4. **external 栈独立成里程碑**（M2、M7 部分），可以用 feature-gated 测试独立验证，不阻塞主线。
 
 ## 里程碑
 
-### M1：流式生命周期恢复
+### M1：安全与崩溃级修复
 
-修正 `ChatSession::stream` 和 `Agent::stream` 在提前 drop 时的状态恢复问题。完成后，任何未自然结束的 stream 都不能让会话或 agent 留在不可继续运行的 pending 状态。
+消除审查 🔴 安全组与 external 两个真机必踩项。全部是小型、相互独立的修复。
 
-重点文件：
-
-- `src/facade/chat.rs`
-- `src/facade/chat/stream.rs`
-- `src/facade/agent.rs`
-- `src/facade/agent/stream.rs`
-- 相关 facade 单元测试和 testkit fake client
-
-设计要求：
-
-- `RunStream` drop 必须回滚 chat pending turn。
-- `AgentRunStream` drop 或 close 路径必须清理未完成 run 的 pending requirement。
-- 已完成的 stream 不能被重复回滚。
-- 回滚后下一次 `send`、`run`、`snapshot` 必须可用。
-
-### M2：非流式事件一致性
-
-修正 `Agent::run_full` 对审批事件的遗漏。完成后，非流式和流式路径对于 approval、tool、delegation 这类结构化事件要有同等可观察性。
+覆盖：H-SEC-1（Debug 泄 key）、H-SEC-2（无超时 + 错误 body 无界）、H-SEC-3（Usage 溢出 panic）、H-SEC-4（URL 泄凭据）、H-EXT-1（30s 读超时误杀）、H-EXT-3（退出码误分类）。
 
 重点文件：
 
-- `src/facade/agent.rs`
-- `src/facade/agent/stream.rs`
-- `src/facade/run.rs`
-- `src/facade/tool.rs`
-- 相关 facade tests
+- `src/client/config.rs`、`src/client/error.rs`
+- `src/adapter/anthropic/`、`src/adapter/openai_resp/`（mod.rs、request.rs、response.rs、stream/mod.rs）
+- `src/model/usage.rs`、`src/stream/accumulator/mod.rs`
+- `src/agent/external/{claude_code,codex,opencode}/adapter.rs`、`acp/connection.rs`、对应 `config.rs`
 
-设计要求：
+### M2：external 子进程生命周期正确性
 
-- `run_full` 的 `RunOutput.events` 包含 `ApprovalRequested`。
-- 注入的 `InteractionHandler` 仍然按原有优先级工作。
-- 审批被拒绝或 headless fallback 时也要记录审批请求事件。
-- 文档明确非流式不会产出 token 级 text delta，但会产出关键生命周期事件。
+修复子进程管理的边角语义：孙进程泄漏、resume 事件吞没、decoder 错误带原文、prompt 进 argv、不 reap、prelude 无界循环、worktree repo 参数错误；并决定 `ExternalSessionPolicy`/`WorktreeManager` 的接入方式。
 
-### M3：协作状态 snapshot 和 restore
-
-修正 `AgentSnapshot` 当前只记录协作拓扑、不记录协作内容的问题。完成后，恢复后的 agent 必须保留 mailbox、blackboard、plan 中的可序列化状态。
+覆盖：H-EXT-2、M-EXT-1、M-EXT-2（评估项）、M-EXT-3、M-EXT-4、M-EXT-5、M-EXT-6、M-EXT-7、M-PROM-5。
 
 重点文件：
 
-- `src/agent/collab/mailbox.rs`
-- `src/agent/collab/blackboard.rs`
-- `src/agent/collab/plan.rs`
-- `src/facade/agent/snapshot.rs`
-- `src/facade/collab.rs`
-- 相关 snapshot tests
+- `src/agent/external/{claude_code,codex,opencode}/{adapter,decoder,config}.rs`
+- `src/agent/external/acp/connection.rs`、`src/agent/external/worktree.rs`、`src/agent/external/machine.rs`
+- `docs/managed-external-agent.md`、`docs/capability-matrix.md`
 
-设计要求：
+### M3：Conversation 正确性
 
-- 新增或完善 mailbox、blackboard、plan 的 data-only snapshot API。
-- `AgentSnapshot::capture` 必须从 live `CollabState` 捕获内容。
-- restore 优先使用 snapshot 中保存的协作内容，缺失时才按 topology 建立空底座。
-- artifact 的顶层 snapshot 策略必须明确：要么保存聚合视图，要么文档说明只由 external session snapshot 持有。
+修复状态一致性问题，每项补回归测试。
 
-### M4：managed external 可用性和 capability 来源
-
-修正 README quick start 中构造 external agent 后没有 session handler 的问题，并让 capability 的来源可见。
+覆盖：H-STATE-1（compaction 投影空洞）、H-STATE-2（MessageMeta 丢失）、M-CONV-1（空校验）、M-CONV-2（递归栈溢出）、M-CONV-3（insert-only 矛盾）、M-CONV-5（迟校验）、M-CONV-6（provider id 重推导）、M-CONV-7（fork 丢 projection）。
 
 重点文件：
 
-- `src/facade/external.rs`
-- `src/facade/agent.rs`
-- `README.md`
-- `docs/managed-external-agent.md`
-- `docs/capability-matrix.md`
-- external facade tests
+- `src/conversation/projection/compaction.rs`、`src/conversation/boundary/{head,fork}.rs`
+- `src/conversation/persistence/{rows,snapshot}.rs`、`src/conversation/history.rs`、`src/conversation/history/index.rs`
+- `src/conversation/pending/turn.rs`
+- `docs/conversation-core.md`
 
-设计要求：
+### M4：Agent 状态机与 drive 语义
 
-- 提供清晰的默认 session handler 装配 API，README 示例能按文档直接运行。
-- 默认 feature 下仍不拉入 CLI adapter。
-- 启用 external features 时，probe 得到的 capability 必须能标记为 probed。
-- capability 来源至少能区分 declared、supplied、probed、negotiated。
-- `UnsupportedCapability` 判断必须基于当前 agent 真正持有的 capability view。
+修正错误语义（软拒绝 vs 硬失败）、取消语义（延迟有界、契约一致）、协作工具断裂、pivot/trace 冲突、reconfig 静默丢失、resolver 不一致。
 
-### M5：完整逃生出口
-
-修正 `Agent::into_parts` 和 `AgentParts` 丢失状态的问题。完成后，高级调用方能安全拆解 `Agent` 并重新接管重要资源。
+覆盖：H-STATE-4、H-STATE-5、H-STATE-6、M-ERR-1、M-ERR-2、M-ERR-3。
 
 重点文件：
 
-- `src/facade/agent.rs`
-- `src/facade/agent/snapshot.rs`
-- `src/facade/external.rs`
-- 相关 facade tests
+- `src/agent/machine/default/{mod,tools}.rs`、`src/agent/machine/nested.rs`、`src/agent/state/{cursor,queue}.rs`、`src/agent/state.rs`
+- `src/agent/drive.rs`、`src/agent/drive/reference.rs`
+- `src/agent/collab/tools.rs`、`src/agent/context/trace.rs`
+- `docs/agent-effect-model.md`、`docs/agent-layer.md`
 
-设计要求：
+### M5：facade 承诺对齐
 
-- `AgentParts` 覆盖 LLM、conversation、tools、instructions、policies、delegate config、external agents、保留 external sessions、协作底座和交互处理器。
-- 不泄漏内部不应公开的可变实现细节；如果某些状态不能直接公开，必须提供等价的 data-only 或 handle 形式。
-- rustdoc 明确 `into_parts` 的适用边界。
+修复 facade 对外承诺的正确性：run_full 毒化、审批文档与行为相反、流式事件缺审批、字符串匹配错误分类、cancel/pivot/provider_extras 不可达、restore 校验缺失。
 
-### M6：最终收口
-
-完成文档同步、全量验证和残留风险复核。
+覆盖：H-STATE-3、M-PROM-2（cancel/pivot 部分）、M-PROM-4、M-PROM-6、M-ERR-5、M-ADP-3、M-ADP-5。
 
 重点文件：
 
-- [docs/refine.md](docs/refine.md)
-- [README.md](README.md)
-- [docs/facade-api.md](docs/facade-api.md)
-- [docs/managed-external-agent.md](docs/managed-external-agent.md)
-- [docs/capability-matrix.md](docs/capability-matrix.md)
-- [PLAN.md](PLAN.md)
-- [TODO.md](TODO.md)
+- `src/facade/agent.rs`、`src/facade/agent/stream.rs`、`src/facade/agent/snapshot.rs`
+- `src/facade/{chat,config,run,error,approval}.rs`
+- `docs/facade-api.md`
 
-设计要求：
+### M6：预算端到端接线
 
-- `docs/refine.md` 中的问题状态与实现保持一致。
-- quick start、capability、snapshot、stream lifecycle 的文档不互相矛盾。
-- 所有默认验证命令通过。
-- 启用 external feature 的 clippy 通过。
+把 BudgetHandle 记账接入 drain/drive_turn 与 facade，激活 BudgetExhausted/BudgetExceeded 路径。
 
-## 验证策略
+覆盖：M-PROM-1、M-PROM-2（budget 部分）、L-8/L-9（预算预检原子性与 dispatch 硬出口，评估后一并收口）。
 
-每个任务在本地完成后至少运行对应的 focused test。每个里程碑 review 任务必须运行该阶段声明的验证命令。最终验收必须运行：
+重点文件：
+
+- `src/agent/drive.rs`、`src/agent/drive/reference.rs`、`src/agent/context/budget.rs`
+- `src/agent/machine/default/`、`src/facade/agent/stream.rs`、`src/facade/config.rs`
+- `docs/agent-layer.md` §1.4
+
+### M7：adapter 健壮性与协议契约
+
+修正错误分类顺序、Usage 事件语义契约、兼容端点容错（sequence_number、空 arguments、serde default、非 JSON 行容忍），并决定 ContentBlock 未知类型的前向兼容策略。
+
+覆盖：M-ERR-4、M-ADP-1、M-ADP-2、facade 报告 M8、adapter 报告 L1/L2/L3、external 报告 L-1。
+
+重点文件：
+
+- `src/client/error.rs`、`src/stream/mod.rs`
+- `src/adapter/openai_resp/stream/normalizer/`、`src/adapter/anthropic/stream/`
+- `src/agent/external/{claude_code,codex,opencode}/decoder.rs`
+- `src/model/content.rs`
+
+### M8：复制代码收敛
+
+行为已被 M1–M7 修复并由测试钉住后，收敛两份大复制：LLM adapter 公共模块、CLI adapter 共享 child-process 模块。
+
+覆盖：adapter 报告 M4、external 报告 L-12。
+
+重点文件：
+
+- 新增 `src/adapter/common/`（或并入 `src/client/`）
+- 新增 `src/agent/external/process/`（共享 spawn/close/kill/read 模块）
+- `src/adapter/{anthropic,openai_resp}/`、`src/agent/external/{claude_code,codex,opencode}/`
+
+### M9：低严重度清扫与文档收尾
+
+批量处理审查 🟢 项：panic/poison 策略统一、API 打磨、性能小项、文档同步；最终全面 review 并勾销审查报告。
+
+覆盖：审查报告全部 🟢 节剩余项、M10（lib.rs 文档）、M-CONV-4（id 索引，若 M3 未做）。
+
+## 完成定义
+
+每个里程碑的 review 任务必须确认：
+
+1. 该里程碑覆盖的审查条目逐条核实已修复或明确降级（降级 = 文档与实现一致地承认现状）。
+2. 全部门禁通过：
 
 ```bash
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
-cargo test --all --all-targets
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 cargo clippy --all-targets \
   --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
+cargo test --all --all-targets
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 ```
 
-默认测试不得要求真实 LLM provider、真实 CLI login 或网络。真实 provider 和真实 CLI 相关测试继续保持 `#[ignore]`，并且在未配置环境时必须干净跳过。
-
-## 风险和处理原则
-
-1. **Drop 中不能 await**
-   stream drop 修复要优先使用同步状态回滚。如果需要异步收尾，公开 close API 只能作为补充，不能替代 drop 后 agent/chat 可继续使用的基本保证。
-
-2. **snapshot 兼容性**
-   新增 snapshot 字段要使用 `#[serde(default)]` 或等价兼容策略，旧 snapshot 必须仍可反序列化并恢复为空协作底座。
-
-3. **capability API 兼容性**
-   capability 来源模型要尽量保持现有构造和 accessors 可用。新增 source 信息时，避免让常见调用方必须重写代码。
-
-4. **公开类型边界**
-   `AgentParts` 可以扩展，但不能把内部锁、registry 或 runtime 细节变成无法演进的公开承诺。必要时使用封装类型或 data-only view。
-
-5. **测试稳定性**
-   对 stream cancellation、approval、snapshot 的测试必须使用 fake client、scripted handler 或 testkit，不依赖 sleep 的时序运气。
+3. 拥有该行为的文档已同步（至少检查 `README.md`、`AGENTS.md`、`docs/facade-api.md`、`docs/managed-external-agent.md`、`docs/capability-matrix.md`、`docs/conversation-core.md`、`docs/agent-effect-model.md`、`docs/agent-layer.md`）。
+4. `docs/review-2026-07.md` 中对应条目已标注修复状态。
