@@ -261,7 +261,7 @@ cargo test -p agent-lib --lib facade::agent::
   `cargo test -p agent-lib --lib`（844 passed）、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
-### M2-2 [TODO] 对齐非流式和流式事件契约文档与回归测试
+### M2-2 [DONE] 对齐非流式和流式事件契约文档与回归测试
 
 上下文：
 
@@ -291,6 +291,42 @@ cargo test -p agent-lib --lib facade::run
 ```bash
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 ```
+
+完成记录：
+
+- 发现并修复一处真实的事件契约分歧（M2-2 的核心）：非流式 `collect_traces`
+  （`src/facade/agent.rs`）对**被拒工具**的 `Notification::ToolCallFinished`
+  （无对应 `ToolCallStarted`，name 查不到）也会投出一个 name 为空的幽灵
+  `ToolFinished`，而流式路径（`TapToolHandler` 仅在工具真正执行时 emit）不产任何
+  tool 生命周期事件。对齐决策：被拒工具从未执行 → 两条路径都只保留
+  `ApprovalRequested`，不产 `ToolStarted`/`ToolFinished`。修正 `collect_traces` 在
+  `names` 无该 call id（且非 delegation）时跳过 `ToolFinished`；`weave_approval_events`
+  的尾部 flush 已保证被拒审批仍可见。同步更新 `collect_traces` /
+  `weave_approval_events` / `tool_event_call_id` 的 rustdoc（删除"denied → ToolFinished"
+  旧说法），并收紧 M2-1 denied 回归 `run_full_records_approval_when_injected_handler_denies`
+  为断言"被拒工具既无 `ToolStarted` 也无 `ToolFinished`"。
+- 新增 parity 回归（`src/facade/agent/tests.rs`）：`lifecycle_signature` /
+  `canonical_lifecycle_event` helper 把一次 run 的事件归一化为可比较的生命周期子序列
+  （丢弃流式独有的 `TextDelta`、终态 `Done` 与 raw 逃生舱）。四条对比测试对同一 scripted
+  场景分别走 `run_full` 与 `stream` 并断言归一化序列**逐项相等**：
+  - `stream_and_run_full_agree_on_plain_tool_lifecycle`（auto_allow）；
+  - `stream_and_run_full_agree_on_approved_tool_lifecycle`（ask approve，含富化审批的
+    tool/call_id/reason/脱敏 input 全字段一致）；
+  - `stream_and_run_full_agree_on_denied_tool_lifecycle`（auto_deny，验证对齐后两路都只
+    剩 `ApprovalRequested`）；
+  - `stream_and_run_full_agree_on_delegation_lifecycle`（新增 dual-mode `MarkerRoutingClient`：
+    流式 supervisor + 非流式 child，断言两路 `DelegationStarted`/`DelegationFinished` 一致）。
+  每条测试均额外断言 token-delta 边界：`stream` 含 `TextDelta`，`run_full` 绝不含。
+- 文档：`docs/facade-api.md` 新增 §6.2.1「事件一致性边界」明确生命周期事件一致、token
+  delta 只属流式、`Done` 只由 stream yield、两路共享 `collect_traces` +
+  `weave_approval_events` / `TapToolHandler` + `TapInteractionHandler` 采集机制；
+  `README.md` §3 补一句同义说明；`src/facade/run.rs` 的 `RunEvent` 枚举、`TextDelta`
+  变体、`RunOutput::events` 字段 rustdoc 补充边界说明。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
+  `cargo test -p agent-lib --lib facade::agent::`（37 passed，含 4 条新 parity）、
+  `cargo test -p agent-lib --lib facade::run`（9 passed）、
+  `cargo test -p agent-lib --lib`（848 passed）、`cargo test --all --all-targets`（全绿，
+  0 failed）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
 ### M2-3 [TODO] Review：非流式事件一致性
 

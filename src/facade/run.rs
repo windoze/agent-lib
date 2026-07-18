@@ -138,6 +138,15 @@ pub struct RunOutput {
     /// Artifacts produced by delegates during the run (populated from Milestone 4).
     pub artifacts: Vec<ArtifactRef>,
     /// The ordered normalized events observed during the run.
+    ///
+    /// These are the lifecycle events — [`RunEvent::ApprovalRequested`],
+    /// [`RunEvent::ToolStarted`]/[`RunEvent::ToolFinished`], and the
+    /// `Delegation*` family — in drive order. They are contracted to match the
+    /// events [`Agent::stream`](crate::facade::Agent::stream) yields for the
+    /// same run, **except** that this non-streaming vector never contains the
+    /// streaming-only token [`RunEvent::TextDelta`]s or the terminal
+    /// [`RunEvent::Done`] (see `docs/facade-api.md` §6.2.1). A denied tool call
+    /// leaves no `ToolStarted`/`ToolFinished` here, matching the streaming path.
     pub events: Vec<RunEvent>,
 }
 
@@ -274,9 +283,25 @@ impl UsageSummary {
 /// [`RunEvent::RawStream`], and [`RunEvent::RawNotification`]. The remaining
 /// tool- and delegation-related variants are defined now so the enum shape is
 /// stable, and are produced by later milestones.
+///
+/// # Streaming vs non-streaming
+///
+/// The lifecycle variants ([`ApprovalRequested`](RunEvent::ApprovalRequested),
+/// [`ToolStarted`](RunEvent::ToolStarted)/[`ToolFinished`](RunEvent::ToolFinished),
+/// and the `Delegation*` family) are emitted identically by the streaming path
+/// ([`Agent::stream`](crate::facade::Agent::stream)) and folded into
+/// [`RunOutput::events`] by the non-streaming path
+/// ([`Agent::run_full`](crate::facade::Agent::run_full)). The token-level
+/// [`TextDelta`](RunEvent::TextDelta) and the terminal
+/// [`Done`](RunEvent::Done) are **streaming-only**; the non-streaming path never
+/// fabricates token deltas (see `docs/facade-api.md` §6.2.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunEvent {
     /// An incremental chunk of assistant text.
+    ///
+    /// Streaming-only: yielded by [`Agent::stream`](crate::facade::Agent::stream)
+    /// as tokens arrive. The non-streaming [`RunOutput::events`] never contains
+    /// this variant.
     TextDelta(String),
     /// A tool invocation has started (populated from Milestone 2).
     ToolStarted(ToolTrace),

@@ -313,6 +313,33 @@ pub struct RunOutput {
   `artifacts` 与 events。
 - `UsageSummary` 可以聚合 supervisor、local subagent、external runtime 报告的 usage。
 
+#### 6.2.1 事件一致性边界(non-streaming 与 streaming)
+
+`RunOutput.events`(由 `run_full` 返回,或流式路径终态 `Done` 内嵌)与 `stream` 逐个
+yield 的事件遵循同一条**生命周期事件契约**:
+
+- **生命周期事件一致**:approval、tool、delegation 三类归一化事件
+  (`ApprovalRequested` / `ToolStarted` / `ToolFinished` /
+  `DelegationStarted` / `DelegationArtifact` / `DelegationFinished` /
+  `DelegationFailed`)在两条路径上产出**相同的归一化序列**——同样的顺序、同样的
+  `tool_name` / `call_id` / `reason` / 脱敏 `input` / `delegate` / `status`。
+  - 一次被批准的工具调用:`ApprovalRequested`(若被 gate)紧接其
+    `ToolStarted` → `ToolFinished`。
+  - 一次**被拒**的工具调用从未执行,因此**两条路径都不产** `ToolStarted` 或
+    `ToolFinished`,只保留 `ApprovalRequested`。non-streaming 路径过去会为被拒调用
+    投出一个 name 为空的幽灵 `ToolFinished`,M2-2 已将其对齐删除。
+  - 一次委派:`DelegationStarted` →(每个 artifact 一条 `DelegationArtifact`)→
+    `DelegationFinished`(或失败时 `DelegationFailed`)。
+- **token delta 只属于 streaming 路径**:`RunEvent::TextDelta` 是流式路径逐 token
+  产出的增量文本;non-streaming `run_full` **绝不伪造** token delta,其
+  `RunOutput.events` 不含任何 `TextDelta`(最终文本从 `reply.text()` 读取)。
+- 终态 `RunEvent::Done` 仅由 `stream` 作为最后一个事件 yield;`run_full` 直接返回
+  `RunOutput`,其 `events` 不含 `Done`。
+- 两条路径共享同一套事件采集机制:non-streaming 由 facade 内部的
+  `collect_traces` + `weave_approval_events`(把审批记录编织回工具/委派事件流)产出,
+  streaming 由 `TapToolHandler` / `TapInteractionHandler` 实时 emit;二者被上述契约
+  与 `facade::agent` 的 parity 回归测试锁定一致。
+
 ### 6.3 RunEvent
 
 Facade 事件应比底层 `Notification` 更贴近 UI/CLI:

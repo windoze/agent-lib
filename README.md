@@ -99,6 +99,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 开 `facade-schema` 后可用自动派生 schema 的 `Tool::function`），用三档 `Approval`
 （`auto_allow` / `auto_deny` / `ask`）控制权限。`run` 返回 `Reply`，`run_full` 返回携带
 `response` / `usage` / `tool_calls` / `delegations` / `artifacts` / `events` 的 `RunOutput`。
+`run_full` 的 `events` 与 `stream` 逐个 yield 的事件共享同一条生命周期契约（approval / tool /
+delegation 事件序列一致）；token 级 `TextDelta` 只属于流式路径，`run_full` 不伪造（见
+`docs/facade-api.md` §6.2.1）。
 
 ```rust
 use agent_lib::facade::tool::{Tool, ToolContext};

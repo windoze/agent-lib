@@ -1440,14 +1440,13 @@ impl InteractionHandler for RecordingInteractionHandler {
 /// the tool lifecycle of the call it gated.
 ///
 /// Approvals are matched to tool events by `call_id` and anchored before the
-/// first [`RunEvent::ToolStarted`] or [`RunEvent::ToolFinished`] bearing that
-/// id — an approved call surfaces both (the approval precedes the `ToolStarted`),
-/// while a denied call surfaces only a `ToolFinished` (the approval still
-/// precedes it). Any approval whose call left no tool event at all (for example
-/// a headless deny that never reached the executor) is flushed in recorded
-/// order at the point its decision was made: just before the next anchored call
-/// it precedes, or at the tail. This guarantees every paused approval stays
-/// observable even when the tool never executed.
+/// first [`RunEvent::ToolStarted`] bearing that id, so an approved call surfaces
+/// the approval immediately before its `ToolStarted`/`ToolFinished` pair. A
+/// denied call never starts and therefore leaves *no* tool lifecycle event
+/// (matching the streaming path); its approval has no tool-event anchor and is
+/// flushed in recorded order at the point its decision was made — just before
+/// the next anchored call it precedes, or at the tail. This guarantees every
+/// paused approval stays observable even when the tool never executed.
 fn weave_approval_events(events: Vec<RunEvent>, approvals: Vec<ApprovalRequest>) -> Vec<RunEvent> {
     if approvals.is_empty() {
         return events;
@@ -1481,8 +1480,10 @@ fn weave_approval_events(events: Vec<RunEvent>, approvals: Vec<ApprovalRequest>)
 /// by [`weave_approval_events`] to anchor an approval before the call it gated.
 ///
 /// Only [`RunEvent::ToolStarted`] / [`RunEvent::ToolFinished`] carry a `call_id`
-/// (delegation traces do not), and both an approved call's `ToolStarted` and a
-/// denied call's `ToolFinished` are valid anchors for the same gating approval.
+/// (delegation traces do not). An approved call's `ToolStarted` is the anchor
+/// for its gating approval; a denied call emits no tool event at all, so its
+/// approval is instead flushed by [`weave_approval_events`] at the tail or
+/// before the next anchored call.
 fn tool_event_call_id(event: &RunEvent) -> Option<&str> {
     match event {
         RunEvent::ToolStarted(trace) | RunEvent::ToolFinished(trace) => Some(&trace.call_id),
@@ -1562,6 +1563,13 @@ pub(crate) struct CollectedTraces {
 /// emit the matching finished (or failed) event; an external delegation that
 /// completed also emits one [`RunEvent::DelegationArtifact`] per reported
 /// artifact and folds those artifacts into the run output.
+///
+/// A `ToolCallFinished` whose call id was never seen as a `ToolCallStarted`
+/// (and is not a delegation) is a call the approval gate denied before it ever
+/// started: it emits **no** `ToolFinished`, so a denied tool leaves no tool
+/// lifecycle event on the non-streaming path — exactly as on the streaming path,
+/// where a denied call never reaches the tool handler. The paused approval is
+/// still surfaced separately by [`weave_approval_events`].
 pub(crate) fn collect_traces(
     notifications: &[Notification],
     recorder: &DelegationRecorder,
@@ -1636,10 +1644,16 @@ pub(crate) fn collect_traces(
                             events.push(RunEvent::DelegationFailed(record.trace.clone()));
                         }
                     }
-                } else {
-                    let name = names.get(&call_id).cloned().unwrap_or_default();
+                } else if let Some(name) = names.get(&call_id).cloned() {
                     events.push(RunEvent::ToolFinished(ToolTrace { name, call_id }));
                 }
+                // A `ToolCallFinished` with no recorded `ToolCallStarted` name
+                // (and no delegation record) belongs to a call the approval gate
+                // denied before it ever started: it produced no `ToolStarted`, so
+                // it emits no `ToolFinished` either, keeping the non-streaming
+                // path's tool lifecycle identical to the streaming path (which
+                // never invokes the tool handler for a denied call). The paused
+                // approval itself is still surfaced by `weave_approval_events`.
             }
             _ => {}
         }
