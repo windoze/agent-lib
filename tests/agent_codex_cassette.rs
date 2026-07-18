@@ -260,7 +260,8 @@ fn turn_two() -> CassetteTurn {
     CassetteTurn::new(CassetteDecision::Failed {
         error: ExternalAgentError::Runtime {
             code: None,
-            message: "turn aborted: sandbox denied network access".to_owned(),
+            message: "codex turn failed".to_owned(),
+            runtime_output: Some("turn aborted: sandbox denied network access".to_owned()),
         },
     })
     .expecting(CassetteInputKind::Continue)
@@ -476,10 +477,16 @@ fn codex_cassette_decodes_turn_failed_as_failed() {
     .to_string();
     match decoder.push_line(&failed) {
         Ok(Some(CodexDecision::Failed {
-            error: ExternalAgentError::Runtime { code, message },
+            error:
+                ExternalAgentError::Runtime {
+                    code,
+                    message,
+                    runtime_output,
+                },
         })) => {
             assert_eq!(code, None);
-            assert_eq!(message, "usage limit reached");
+            assert_eq!(message, "codex turn failed");
+            assert_eq!(runtime_output.as_deref(), Some("usage limit reached"));
         }
         other => panic!("expected a Runtime failure, got {other:?}"),
     }
@@ -487,4 +494,43 @@ fn codex_cassette_decodes_turn_failed_as_failed() {
         decoder.take_observations().is_empty(),
         "a failed turn must not emit a SessionCompleted observation",
     );
+}
+
+/// The reported message of a `turn.failed` frame is model-influenced output; it
+/// is preserved in `runtime_output` but never folded into the `Display`
+/// rendering (M-EXT-3).
+#[test]
+fn codex_cassette_turn_failed_keeps_runtime_text_out_of_display() {
+    let secret = "API_KEY=sk-secret-123";
+    let mut decoder = CodexStreamDecoder::new(decode_context());
+    let failed = json!({
+        "type": "turn.failed",
+        "error": { "message": format!("request aborted after reading .env: {secret}") },
+    })
+    .to_string();
+    match decoder.push_line(&failed) {
+        Ok(Some(CodexDecision::Failed { error })) => {
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains(secret),
+                "Display must not leak runtime output: {rendered}"
+            );
+            let ExternalAgentError::Runtime {
+                message,
+                runtime_output,
+                ..
+            } = error
+            else {
+                unreachable!("matched Failed above");
+            };
+            assert_eq!(message, "codex turn failed");
+            assert!(
+                runtime_output
+                    .as_deref()
+                    .is_some_and(|text| text.contains(secret)),
+                "raw runtime text is preserved separately"
+            );
+        }
+        other => panic!("expected a Runtime failure, got {other:?}"),
+    }
 }

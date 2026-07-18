@@ -181,7 +181,8 @@
         "kind": "failed",
         "error": {
           "runtime": {
-            "message": "turn aborted: sandbox denied network access"
+            "message": "codex turn failed",
+            "runtime_output": "turn aborted: sandbox denied network access"
           }
         }
       }

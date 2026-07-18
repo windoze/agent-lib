@@ -586,10 +586,58 @@ fn claude_code_cassette_decodes_error_result_as_failed() {
     .to_string();
     match decoder.push_line(&execution_error) {
         Ok(Some(ClaudeDecision::Failed {
-            error: ExternalAgentError::Runtime { code, message },
+            error:
+                ExternalAgentError::Runtime {
+                    code,
+                    message,
+                    runtime_output,
+                },
         })) => {
             assert_eq!(code.as_deref(), Some("error_during_execution"));
-            assert_eq!(message, "the sandbox crashed");
+            assert_eq!(message, "claude code runtime error");
+            assert_eq!(runtime_output.as_deref(), Some("the sandbox crashed"));
+        }
+        other => panic!("expected a Runtime failure, got {other:?}"),
+    }
+}
+
+/// The raw text of a failed `result` frame is model-influenced output; it is
+/// preserved in `runtime_output` but never folded into the `Display` rendering
+/// (M-EXT-3).
+#[test]
+fn claude_code_cassette_error_result_keeps_runtime_text_out_of_display() {
+    let secret = "API_KEY=sk-ant-secret-123";
+    let mut decoder = ClaudeStreamDecoder::new(decode_context());
+    let execution_error = json!({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "result": format!("command failed while reading .env: {secret}"),
+        "session_id": SESSION_ID,
+    })
+    .to_string();
+    match decoder.push_line(&execution_error) {
+        Ok(Some(ClaudeDecision::Failed { error })) => {
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains(secret),
+                "Display must not leak runtime output: {rendered}"
+            );
+            let ExternalAgentError::Runtime {
+                message,
+                runtime_output,
+                ..
+            } = error
+            else {
+                unreachable!("matched Failed above");
+            };
+            assert_eq!(message, "claude code runtime error");
+            assert!(
+                runtime_output
+                    .as_deref()
+                    .is_some_and(|text| text.contains(secret)),
+                "raw runtime text is preserved separately"
+            );
         }
         other => panic!("expected a Runtime failure, got {other:?}"),
     }

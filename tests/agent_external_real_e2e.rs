@@ -729,12 +729,14 @@ async fn run_command(
     if !output.status.success() {
         return Err(Box::new(ExternalAgentError::Runtime {
             code: output.status.code().map(|code| code.to_string()),
-            message: format!(
-                "{} exited unsuccessfully; stdout tail: {}; stderr tail: {}",
-                runtime_label(&runtime),
+            message: format!("{} exited unsuccessfully", runtime_label(&runtime)),
+            // Raw CLI output is runtime-controlled text; per the error contract
+            // it lives in `runtime_output`, outside the Display rendering.
+            runtime_output: Some(format!(
+                "stdout tail: {}; stderr tail: {}",
                 tail(&stdout, 1_000),
                 tail(&stderr, 1_000)
-            ),
+            )),
         }));
     }
     Ok(CommandOutput { stdout })

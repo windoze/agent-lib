@@ -38,7 +38,10 @@
 //!   violation and returns [`ExternalAgentError::Protocol`].
 //!
 //! Every diagnostic is a fixed string; no prompt text, tool input, or credential
-//! is ever folded into an error message.
+//! is ever folded into an error message. The raw agent-reported text of a
+//! JSON-RPC error response is preserved separately in
+//! [`ExternalAgentError::Runtime::runtime_output`], outside the `Display`
+//! rendering.
 
 // The decoder's fallible entry returns the external adapter's canonical
 // `ExternalAgentError`, matching the unboxed error contract used across the rest
@@ -375,7 +378,10 @@ impl AcpStreamDecoder {
         None
     }
 
-    /// Classifies a JSON-RPC error response as a failed turn.
+    /// Classifies a JSON-RPC error response as a failed turn. The reported
+    /// message is agent-controlled text, so it is preserved in
+    /// [`ExternalAgentError::Runtime::runtime_output`] while `message` stays a
+    /// fixed diagnostic.
     fn handle_error(&mut self, error: &serde_json::Map<String, Value>) -> AcpDecision {
         self.active_tools.clear();
         self.agent_text.clear();
@@ -383,13 +389,16 @@ impl AcpStreamDecoder {
             .get("code")
             .and_then(Value::as_i64)
             .map(|code| code.to_string());
-        let message = error
+        let runtime_output = error
             .get("message")
             .and_then(Value::as_str)
-            .unwrap_or("acp agent reported an error")
-            .to_owned();
+            .map(str::to_owned);
         AcpDecision::Failed {
-            error: ExternalAgentError::Runtime { code, message },
+            error: ExternalAgentError::Runtime {
+                code,
+                message: "acp agent reported an error".to_owned(),
+                runtime_output,
+            },
         }
     }
 
@@ -1036,10 +1045,57 @@ mod tests {
             .expect("error response settles the turn");
         match decision {
             AcpDecision::Failed {
-                error: ExternalAgentError::Runtime { code, message },
+                error:
+                    ExternalAgentError::Runtime {
+                        code,
+                        message,
+                        runtime_output,
+                    },
             } => {
                 assert_eq!(code.as_deref(), Some("-32000"));
-                assert_eq!(message, "usage limit reached");
+                assert_eq!(message, "acp agent reported an error");
+                assert_eq!(runtime_output.as_deref(), Some("usage limit reached"));
+            }
+            other => panic!("expected a Runtime failure, got {other:?}"),
+        }
+    }
+
+    /// The agent-reported error message is untrusted text; it is preserved in
+    /// `runtime_output` but never folded into the `Display` rendering (M-EXT-3).
+    #[test]
+    fn acp_error_response_keeps_runtime_text_out_of_display() {
+        let secret = "API_KEY=sk-secret-123";
+        let mut decoder = AcpStreamDecoder::new();
+        let decision = decoder
+            .push_jsonrpc_line(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "error": {
+                        "code": -32000,
+                        "message": format!("request failed after reading .env: {secret}"),
+                    },
+                })
+                .to_string(),
+            )
+            .expect("error response decodes")
+            .expect("error response settles the turn");
+        match decision {
+            AcpDecision::Failed { error } => {
+                let rendered = error.to_string();
+                assert!(
+                    !rendered.contains(secret),
+                    "Display must not leak runtime output: {rendered}"
+                );
+                let ExternalAgentError::Runtime { runtime_output, .. } = error else {
+                    unreachable!("matched Failed above");
+                };
+                assert!(
+                    runtime_output
+                        .as_deref()
+                        .is_some_and(|text| text.contains(secret)),
+                    "raw runtime text is preserved separately"
+                );
             }
             other => panic!("expected a Runtime failure, got {other:?}"),
         }

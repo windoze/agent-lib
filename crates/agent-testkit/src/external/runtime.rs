@@ -363,6 +363,7 @@ impl ExternalRuntimeSession for ScriptedExternalRuntimeSession {
             return Err(ExternalAgentError::Runtime {
                 code: None,
                 message: "scripted external runtime session advanced past its script".to_owned(),
+                runtime_output: None,
             });
         };
 

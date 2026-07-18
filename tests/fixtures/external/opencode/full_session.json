@@ -207,7 +207,8 @@
         "kind": "failed",
         "error": {
           "runtime": {
-            "message": "model request failed: network unreachable"
+            "message": "opencode session failed",
+            "runtime_output": "model request failed: network unreachable"
           }
         }
       }

@@ -285,7 +285,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 文档：`docs/managed-external-agent.md` §5.4 后新增 M2-2 实现注记（seq 线跨进程连续的播种机制）；`docs/review-2026-07.md` M-EXT-1 已标注 `✅ 已修复（M2-2）`。
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（48 个测试目标全 ok）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。无 breaking change（纯增量 API + resume 行为修复）。
 
-### M2-3 [TODO] decoder 错误消息与"不折叠原文"承诺对齐（M-EXT-3）
+### M2-3 [DONE] decoder 错误消息与"不折叠原文"承诺对齐（M-EXT-3）
 
 上下文：
 
@@ -302,6 +302,44 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：构造含敏感字样（如 `API_KEY=...`）的 runtime error frame，断言 `error.to_string()` 不含该字样。
 - external feature 测试与 clippy 全过。
+
+完成记录：
+
+- 选型：方案 (a)。`ExternalAgentError::Runtime`（`src/agent/external/mod.rs`）新增字段
+  `runtime_output: Option<String>`（`#[serde(default, skip_serializing_if = "Option::is_none")]`，
+  rustdoc 明确标注 "may contain arbitrary runtime output, do not log or display blindly"）；
+  `message` 改为各 runtime 固定字符串。Display 模板 `external runtime error: {message}` 形状不变，
+  但 message 已固定 → `to_string()` 结构性不可能再泄露运行时原文。旧 serde 数据缺新字段反序列化为
+  `None`，wire 兼容。
+- 构造点修复（原文全部移入 `runtime_output`，`message` 固定）：`claude_code/decoder.rs` `handle_result`
+  （"claude code runtime error"，`frame.result` 原文入 `runtime_output`；`code` 仍记 subtype，不进 Display）、
+  `codex/decoder.rs` `handle_turn_failed`（"codex turn failed"）、`opencode/decoder.rs` `decode_error`
+  （"opencode session failed"；`error.name` 回退同样视为不可信远端文本入 `runtime_output`）、
+  `acp/decoder.rs` `handle_error` 与 `acp/adapter.rs` `classify_error`（"acp agent reported an error"；
+  JSON-RPC 数值 code 仍入 `code`）。同类修复覆盖 ACP 两处（探索中发现 acp decoder 同样折叠原文）。
+- Display/使用点核查：泄露链 decoder → `ExternalSessionResult::Failed` → `machine.rs:713`
+  `error.to_string()` → `fail_with` 写入两个可持久化 cursor（`ExternalAgentCursor::Error` /
+  `LoopCursor::Error`）→ facade 错误。修 Display 一处即切断全链；cursor 消息恢复 "stable failure
+  description" 语义。facade `classify_error` 的字符串匹配不受影响（只匹配 loop step limit 字面量，
+  不依赖 Runtime 文本）。
+- testkit 四处固定诊断构造（cassette.rs、runtime.rs、mod.rs、assertions/external.rs）补
+  `runtime_output: None`，固定文本留 `message`；`tests/agent_external_real_e2e.rs` 的 CLI 失败
+  stdout/stderr tail 移入 `runtime_output`（同为运行时原文）。
+- 测试更新与新增：三个 cassette decoder 断言改验 `runtime_output`；codex/opencode committed fixture
+  经 `AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1` 再生成（decision error 嵌入了新形状）；acp decoder 内联断言
+  同步。新增 5 条泄露测试：mod.rs `runtime_display_does_not_leak_runtime_output` + 三 cassette
+  `*_keeps_runtime_text_out_of_display` + acp decoder 内联同名测试——均构造含 `API_KEY=sk-...` 的
+  runtime error 帧，断言 `error.to_string()` 不含敏感字样且原文保留在 `runtime_output`。
+- 文档：四个 decoder 模块文档补充 "raw runtime-reported text 保留在 `Runtime::runtime_output`，不进
+  Display"；`docs/managed-external-agent.md` claude/codex 两节的容忍策略段同步；
+  `docs/review-2026-07.md` M-EXT-3 已标注 `✅ 已修复（M2-3）`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets
+  --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、
+  `cargo test --all --all-targets`（exit 0，无挂起）、`cargo test --features "external-claude-code
+  external-codex external-opencode external-acp" --all-targets`（无 FAILED）、`RUSTDOCFLAGS="-D warnings"
+  cargo doc --no-deps --workspace`（默认与 external features 各一遍）全部通过。
+- 无 breaking change（enum 新增字段带 serde default，旧数据可读；Debug/Display 输出变化不计入 API
+  稳定性承诺）。
 
 ### M2-4 [TODO] Codex/OpenCode prompt 传参加固（M-EXT-4）
 

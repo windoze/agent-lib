@@ -71,7 +71,10 @@
 //!   [`ExternalAgentError::Protocol`].
 //!
 //! Every diagnostic is a fixed string; no prompt text, command line, tool output,
-//! or credential is ever folded into an error message.
+//! or credential is ever folded into an error message. The raw runtime-reported
+//! text of an `error` frame is preserved separately in
+//! [`ExternalAgentError::Runtime::runtime_output`], outside the `Display`
+//! rendering.
 
 // The decoder's fallible helpers return the external adapter's canonical
 // `ExternalAgentError`, matching the unboxed error contract used across
@@ -509,10 +512,13 @@ impl OpenCodeStreamDecoder {
 
 /// Handles a top-level `error` frame, decoding the reported error into a
 /// classified [`Failed`](OpenCodeDecision::Failed) decision. Kept free-standing
-/// because it borrows the frame immutably and returns a value.
+/// because it borrows the frame immutably and returns a value. The reported
+/// `data.message` / `name` text is model-influenced output, so it is preserved
+/// in [`ExternalAgentError::Runtime::runtime_output`] while `message` stays a
+/// fixed diagnostic.
 fn decode_error(frame: &Map<String, Value>) -> OpenCodeDecision {
     let error = frame.get("error").and_then(Value::as_object);
-    let message = error
+    let runtime_output = error
         .and_then(|error| error.get("data"))
         .and_then(Value::as_object)
         .and_then(|data| data.get("message"))
@@ -522,12 +528,12 @@ fn decode_error(frame: &Map<String, Value>) -> OpenCodeDecision {
                 .and_then(|error| error.get("name"))
                 .and_then(Value::as_str)
         })
-        .unwrap_or("opencode session failed")
-        .to_owned();
+        .map(str::to_owned);
     OpenCodeDecision::Failed {
         error: ExternalAgentError::Runtime {
             code: None,
-            message,
+            message: "opencode session failed".to_owned(),
+            runtime_output,
         },
     }
 }

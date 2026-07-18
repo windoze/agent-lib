@@ -996,19 +996,23 @@ fn negotiated_from_initialize(
 }
 
 /// Classifies a JSON-RPC error object as a [`Runtime`](ExternalAgentError::Runtime)
-/// failure. The message is the agent's own (untrusted) text; no secret is folded
-/// in by this crate.
+/// failure. The agent-reported message is untrusted text, so it is preserved in
+/// `runtime_output` while `message` stays a fixed diagnostic that cannot leak it
+/// via `Display`.
 fn classify_error(error: &serde_json::Map<String, Value>) -> ExternalAgentError {
     let code = error
         .get("code")
         .and_then(Value::as_i64)
         .map(|code| code.to_string());
-    let message = error
+    let runtime_output = error
         .get("message")
         .and_then(Value::as_str)
-        .unwrap_or("acp agent reported an error")
-        .to_owned();
-    ExternalAgentError::Runtime { code, message }
+        .map(str::to_owned);
+    ExternalAgentError::Runtime {
+        code,
+        message: "acp agent reported an error".to_owned(),
+        runtime_output,
+    }
 }
 
 /// Re-tags a transport [`SessionLost`](ExternalAgentError::SessionLost) with the

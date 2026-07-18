@@ -213,6 +213,7 @@ mod tests {
             error: ExternalAgentError::Runtime {
                 code: None,
                 message: "boom".to_owned(),
+                runtime_output: None,
             },
             observations: Vec::new(),
         }))

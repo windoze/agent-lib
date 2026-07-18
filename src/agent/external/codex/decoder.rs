@@ -63,7 +63,10 @@
 //!   [`ExternalAgentError::Protocol`].
 //!
 //! Every diagnostic is a fixed string; no prompt text, command line, tool output,
-//! or credential is ever folded into an error message.
+//! or credential is ever folded into an error message. The raw runtime-reported
+//! text of a `turn.failed` frame is preserved separately in
+//! [`ExternalAgentError::Runtime::runtime_output`], outside the `Display`
+//! rendering.
 
 // The decoder's fallible helpers return the external adapter's canonical
 // `ExternalAgentError`, matching the unboxed error contract used across
@@ -459,19 +462,22 @@ impl CodexStreamDecoder {
     }
 
     /// Handles a `turn.failed` frame, decoding the reported error into a
-    /// classified [`Failed`](CodexDecision::Failed) decision.
+    /// classified [`Failed`](CodexDecision::Failed) decision. The reported
+    /// message is model-influenced output, so it is preserved in
+    /// [`ExternalAgentError::Runtime::runtime_output`] while `message` stays a
+    /// fixed diagnostic.
     fn handle_turn_failed(&mut self, frame: &Map<String, Value>) -> CodexDecision {
-        let message = frame
+        let runtime_output = frame
             .get("error")
             .and_then(Value::as_object)
             .and_then(|error| error.get("message"))
             .and_then(Value::as_str)
-            .unwrap_or("codex turn failed")
-            .to_owned();
+            .map(str::to_owned);
         CodexDecision::Failed {
             error: ExternalAgentError::Runtime {
                 code: None,
-                message,
+                message: "codex turn failed".to_owned(),
+                runtime_output,
             },
         }
     }

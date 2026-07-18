@@ -181,6 +181,7 @@ impl ExternalSessionHandler for ScriptedExternalSessionHandler {
                     error: ExternalAgentError::Runtime {
                         code: None,
                         message: error.to_string(),
+                        runtime_output: None,
                     },
                     observations: Vec::new(),
                 }))

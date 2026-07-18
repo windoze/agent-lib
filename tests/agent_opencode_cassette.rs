@@ -395,7 +395,8 @@ fn turn_two() -> CassetteTurn {
     CassetteTurn::new(CassetteDecision::Failed {
         error: ExternalAgentError::Runtime {
             code: None,
-            message: "model request failed: network unreachable".to_owned(),
+            message: "opencode session failed".to_owned(),
+            runtime_output: Some("model request failed: network unreachable".to_owned()),
         },
     })
     .expecting(CassetteInputKind::Continue)
@@ -633,10 +634,16 @@ fn opencode_cassette_decodes_error_as_failed() {
     .to_string();
     match decoder.push_line(&failed) {
         Ok(Some(OpenCodeDecision::Failed {
-            error: ExternalAgentError::Runtime { code, message },
+            error:
+                ExternalAgentError::Runtime {
+                    code,
+                    message,
+                    runtime_output,
+                },
         })) => {
             assert_eq!(code, None);
-            assert_eq!(message, "usage limit reached");
+            assert_eq!(message, "opencode session failed");
+            assert_eq!(runtime_output.as_deref(), Some("usage limit reached"));
         }
         other => panic!("expected a Runtime failure, got {other:?}"),
     }
@@ -644,4 +651,46 @@ fn opencode_cassette_decodes_error_as_failed() {
         decoder.take_observations().is_empty(),
         "a failed turn must not emit a SessionCompleted observation",
     );
+}
+
+/// The reported text of an `error` frame is model-influenced output; it is
+/// preserved in `runtime_output` but never folded into the `Display` rendering
+/// (M-EXT-3).
+#[test]
+fn opencode_cassette_error_keeps_runtime_text_out_of_display() {
+    let secret = "API_KEY=sk-secret-123";
+    let mut decoder = OpenCodeStreamDecoder::new(decode_context());
+    let failed = json!({
+        "type": "error",
+        "error": {
+            "name": "ProviderError",
+            "data": { "message": format!("request failed after reading .env: {secret}") },
+        },
+    })
+    .to_string();
+    match decoder.push_line(&failed) {
+        Ok(Some(OpenCodeDecision::Failed { error })) => {
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains(secret),
+                "Display must not leak runtime output: {rendered}"
+            );
+            let ExternalAgentError::Runtime {
+                message,
+                runtime_output,
+                ..
+            } = error
+            else {
+                unreachable!("matched Failed above");
+            };
+            assert_eq!(message, "opencode session failed");
+            assert!(
+                runtime_output
+                    .as_deref()
+                    .is_some_and(|text| text.contains(secret)),
+                "raw runtime text is preserved separately"
+            );
+        }
+        other => panic!("expected a Runtime failure, got {other:?}"),
+    }
 }

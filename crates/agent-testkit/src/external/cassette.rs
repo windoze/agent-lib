@@ -786,6 +786,7 @@ impl ExternalRuntimeSession for CassetteExternalRuntimeSession {
                 code: None,
                 message: "cassette external runtime session advanced past its recorded turns"
                     .to_owned(),
+                runtime_output: None,
             });
         };
 

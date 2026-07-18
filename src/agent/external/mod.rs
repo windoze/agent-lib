@@ -1035,13 +1035,28 @@ pub enum ExternalAgentError {
         detail: String,
     },
     /// The runtime itself reported an error.
+    ///
+    /// `message` is a fixed, per-runtime diagnostic; the raw runtime-reported
+    /// text, when one was captured, is preserved separately in
+    /// `runtime_output` so the `Display` rendering can never fold untrusted
+    /// output into cursors or logs.
     #[error("external runtime error: {message}")]
     Runtime {
         /// Runtime-specific error code, when one was reported.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<String>,
-        /// Runtime-reported error message (untrusted).
+        /// Stable, fixed diagnostic text (never folds in runtime output).
         message: String,
+        /// Raw runtime-reported error text, when one was captured.
+        ///
+        /// This may contain arbitrary runtime output — including file contents
+        /// the model read or tool output it produced — so it must not be
+        /// logged or displayed blindly. It is deliberately excluded from the
+        /// `Display` rendering (and therefore from any cursor or log built
+        /// via `to_string()`); hosts that surface it must treat it as
+        /// untrusted content.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_output: Option<String>,
     },
     /// A managed feature was required that the runtime does not support.
     ///
@@ -1273,6 +1288,7 @@ mod tests {
             ExternalAgentError::Runtime {
                 code: Some("E42".to_owned()),
                 message: "runtime rejected request".to_owned(),
+                runtime_output: Some("raw runtime output".to_owned()),
             },
             ExternalAgentError::UnsupportedCapability {
                 runtime: ExternalRuntimeKind::Codex,
@@ -1320,6 +1336,28 @@ mod tests {
         assert!(
             !rendered.contains(secret_tool_input),
             "must not leak tool input"
+        );
+    }
+
+    #[test]
+    fn runtime_display_does_not_leak_runtime_output() {
+        // `runtime_output` preserves the raw runtime-reported text for hosts
+        // that explicitly opt into showing it, but it is untrusted (it can
+        // contain anything the model read or produced) and must never reach
+        // the `Display` rendering — cursors and facade errors are built via
+        // `to_string()`.
+        let secret = "API_KEY=sk-ant-secret-123";
+        let error = ExternalAgentError::Runtime {
+            code: Some("error_during_execution".to_owned()),
+            message: "claude code runtime error".to_owned(),
+            runtime_output: Some(format!("command failed while reading .env: {secret}")),
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("claude code runtime error"));
+        assert!(!rendered.contains(secret), "must not leak runtime output");
+        assert!(
+            !rendered.contains("reading .env"),
+            "must not fold any runtime output text into Display"
         );
     }
 

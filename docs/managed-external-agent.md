@@ -972,7 +972,8 @@ decoder 必须:
   error 子类型→`Failed`(`error_max_turns`→`LimitExceeded`,其余→`Runtime`)。
 - 容忍策略(稳定):空行 / `stream_event` 部分帧 / 未知 `type` / 未知 content block / 未关联的 `tool_result`
   → 容忍(无观测、无错);非法 JSON / 非对象 / 缺字符串 `type` / 已知帧缺必需内层对象 → `ExternalAgentError::Protocol`。
-  所有诊断均为固定字符串,永不夹带 prompt/tool input/凭据。
+  所有诊断均为固定字符串,永不夹带 prompt/tool input/凭据;error `result` 帧的运行时原文(模型可影响)保留在
+  `ExternalAgentError::Runtime::runtime_output` 字段,不进入 `Display`(M2-3)。
 - 回归:committed cassette `tests/fixtures/external/claude_code/full_session.json`(三 turn,覆盖 text /
   command / patch / 宿主 tool / permission / completion)经 `tests/agent_claude_code_cassette.rs` 用同一
   decoder 回放全程,断言观测流与每 turn 决策;另有内联 raw-frame 单测覆盖容忍 / `Protocol` / error-result 分类。
@@ -1127,7 +1128,8 @@ fallback:
 - 容忍策略(稳定):空行 / `turn.started` / 顶层 `error` / `item.updated` / 未知顶层 type / 未知或缺失
   item `type`(`reasoning`/`web_search`/`todo_list`/`collab_tool_call`/error item…)→容忍(`Ok(None)`,无观测);
   非法 JSON / 非对象帧 / 缺字符串 `type` / `thread.started` 缺 `thread_id` / `item.*` 缺 `item` 对象或 item 非对象
-  →`ExternalAgentError::Protocol`。所有诊断均为固定字符串,永不夹带 prompt/命令/输出/凭据。
+  →`ExternalAgentError::Protocol`。所有诊断均为固定字符串,永不夹带 prompt/命令/输出/凭据;`turn.failed` 报告的运行时原文
+  保留在 `ExternalAgentError::Runtime::runtime_output` 字段,不进入 `Display`(M2-3)。
 - committed cassette `tests/fixtures/external/codex/full_session.json`:两 turn(turn1 = text/command/patch/
   MCP tool/declined 命令 → `Completed`,含 usage;turn2 = text/顶层 error/`turn.failed` → `Failed`)。由 in-code
   builder 经 `AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1` 再生成;`assert_no_secrets` 保证无凭据。测试放

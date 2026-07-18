@@ -46,7 +46,10 @@
 //!   protocol violation and returns [`ExternalAgentError::Protocol`].
 //!
 //! Every diagnostic is a fixed string; no prompt text, tool input, or credential
-//! is ever folded into an error message.
+//! is ever folded into an error message. The raw runtime-reported text of a
+//! failed `result` frame is preserved separately in
+//! [`ExternalAgentError::Runtime::runtime_output`], outside the `Display`
+//! rendering.
 
 // The decoder's fallible helpers return the external adapter's canonical
 // `ExternalAgentError`, matching the unboxed error contract used across
@@ -531,11 +534,13 @@ impl ClaudeStreamDecoder {
                 },
                 other => ExternalAgentError::Runtime {
                     code: Some(other.to_owned()),
-                    message: frame
+                    message: "claude code runtime error".to_owned(),
+                    // The `result` text is model-influenced output; keep it out
+                    // of the fixed diagnostic so `Display` cannot leak it.
+                    runtime_output: frame
                         .get("result")
                         .and_then(Value::as_str)
-                        .unwrap_or("claude code runtime error")
-                        .to_owned(),
+                        .map(str::to_owned),
                 },
             };
             return Ok(ClaudeDecision::Failed { error });
