@@ -42,3 +42,50 @@ M7-F1 aligns the restore path with `AgentBuilder::interaction_handler` (M7-1).
 - [x] add test
 - [x] validate (all 6 steps + all-external clippy green)
 - [x] mark M7-F1 [DONE] in TODO.md + commit
+
+---
+
+# Task: M7-F-R Review — restore 注入口对齐核对 (current)
+
+## Goal
+Review-only task. Verify `AgentRestoreBuilder::interaction_handler` is fully
+aligned with `AgentBuilder::interaction_handler` (signature / priority vs
+`.approval` / both run+stream paths effective); un-injected → backward-compatible
+`FacadeApproval` fallback; handler is a runtime handle NOT carried in the snapshot
+(§15.2). Confirm no unscheduled failing tests. Run validation sequence 1–6.
+
+## Findings (code inspection)
+- Signature parity: both are `pub fn interaction_handler(mut self, handler:
+  Arc<dyn InteractionHandler>) -> Self`, `#[must_use]`. ✓
+  (snapshot.rs:583, agent.rs:1015)
+- Field parity: both store `interaction_handler: Option<Arc<dyn InteractionHandler>>`;
+  `Debug` shows `has_interaction_handler` (never the handle). ✓
+  (snapshot.rs:452/474, agent.rs:145/173)
+- build() threads `self.interaction_handler` into the restored `Agent`
+  (snapshot.rs:801), replacing the old hardcoded `None`. ✓
+- Both run & stream resolve via `Agent::interaction_handler()` (agent.rs:504):
+  run scope agent.rs:333; stream wraps `agent.interaction_handler()` in
+  `TapInteractionHandler` (stream.rs). Restore populates the same field, so both
+  paths honor it. ✓
+- Priority-vs-approval doc mirrored (handler = sole answer authority; policy still
+  governs the gate). ✓
+- Un-injected → `None` → falls back to shared `FacadeApproval` (agent.rs:505-508). ✓
+- §15.2: snapshot is data-only; handler must be re-injected. Documented in the
+  builder rustdoc + build() comment. ✓
+- Tests present & symmetric: `restored_interaction_handler_pauses_until_approved`,
+  `restored_without_handler_falls_back_to_facade_approval` (tests.rs:1137/1214). ✓
+
+## Validation (sequence 1–6 + all-external clippy)
+- [x] 1. cargo fmt --all --check (clean)
+- [x] 2. cargo clippy --all-targets -- -D warnings (clean)
+- [x] 3. all-external-features clippy (clean)
+- [x] 4. cargo test --all --all-targets (all green, 0 failed)
+- [x] 5. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace (clean)
+- [x] 6. cargo test --doc -p agent-lib (12 passed)
+- [x] git diff --check (clean)
+
+## Status
+- [x] code review complete
+- [x] validation green (seq 1-6 + all-external clippy)
+- [x] mark M7-F-R [DONE] + commit
+- [x] all 34 TODO tasks DONE -> final review passed -> tag `endtag`

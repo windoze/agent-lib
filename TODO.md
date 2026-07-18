@@ -2230,9 +2230,46 @@ web 编码 agent app）能留在 facade 里嵌入，而非被迫下沉到 agent 
 - **Test Failure Policy**:无新观察到的未调度失败测试;real-CLI e2e 仍 `#[ignore]` 且无 binary/login 时干净 skip
   (既有调度)。
 
-### [TODO] M7-F-R Review：restore 注入口对齐核对
+### [DONE] M7-F-R Review：restore 注入口对齐核对
 
 **做什么**：核对 `AgentRestoreBuilder` 与 `AgentBuilder` 的 `interaction_handler` 注入口完全对齐（签名/
 优先级/两路生效）；未注入向后兼容；handler 不入 snapshot（§15.2）。确认无未调度失败测试。
 
 **验证条件**：完整验证序列 1–6 全绿；restore 注入口对称性对照说明。
+
+**完成记录（M7-F-R）**：
+
+- **对称性对照（逐条核对，均一致）**：
+  - *签名*：`AgentRestoreBuilder::interaction_handler`（`src/facade/agent/snapshot.rs:583`）与
+    `AgentBuilder::interaction_handler`（`src/facade/agent.rs:1015`）都是
+    `#[must_use] pub fn interaction_handler(mut self, handler: Arc<dyn InteractionHandler>) -> Self`，
+    签名、`#[must_use]`、消费式 builder 语义完全一致。
+  - *字段/Debug*：两者都以 `interaction_handler: Option<Arc<dyn InteractionHandler>>` 存储
+    （snapshot.rs:452 / agent.rs:145），`Debug` 只渲染布尔 `has_interaction_handler`、绝不打印句柄本体
+    （snapshot.rs:474 / agent.rs:173）。
+  - *优先级 vs `.approval`*：两处 rustdoc 逐条对齐——注入的 handler 是「回答」paused interaction 的
+    **唯一权威**，覆盖 `ApprovalPolicy` 的 per-decision `ask`/`deny`；policy 仍决定机器 **gate**（哪些 tool
+    call 暂停），故需与 `Approval::auto_deny()` 之类 ask/deny 默认配对才会把每个 tool call 都路由到 handler。
+  - *两路生效*：恢复出的 `Agent` 与 build 路径共用同一解析器 `Agent::interaction_handler()`
+    （agent.rs:504-509）：同步 `run`/`run_full` 经 `FacadeAgentScope { interaction: self.interaction_handler() }`
+    （agent.rs:333），流式 `stream` 经 `TapInteractionHandler { inner: agent.interaction_handler() }`
+    （`src/facade/agent/stream.rs`）。`build()` 已把 `self.interaction_handler` 装入该字段（snapshot.rs:801，
+    替换原硬编码 `None`），故两路都尊重重注入的 handler。
+  - *未注入向后兼容*：字段为 `None` 时解析器回落到共享 `FacadeApproval`（agent.rs:505-508），与 M2 既有行为一致。
+  - *§15.2 不入 snapshot*：snapshot 为 data-only，handler 是运行时句柄不被序列化；builder rustdoc
+    （snapshot.rs:562-567）与 `build()` 注释（snapshot.rs:794-800）均写清须重注入，`docs/facade-api.md` §21
+    有「restore 路径对齐（M7-F1）」段落。
+- **测试对称性**：`restored_interaction_handler_pauses_until_approved`（tests.rs:1137，断言脚本化 handler
+  resolve 前 run 恒 `Poll::Pending` 且 gated tool 零执行，`approve` 后恰执行一次）与
+  `restored_without_handler_falls_back_to_facade_approval`（tests.rs:1214，未注入时 `auto_deny` gate 下 gated
+  tool 零执行）与 M7-1 build 路径的暂停语义测试对称。
+- **验证序列全绿**（本任务仅审阅，未改动编译产物；仍完整重跑）：1) `cargo fmt --all --check`（洁净）；
+  2) `cargo clippy --all-targets -- -D warnings`（洁净）；
+  3) `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D warnings`
+  （洁净）；4) `cargo test --all --all-targets`（全绿，无 failed）；
+  5) `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（洁净）；6) `cargo test --doc -p agent-lib`
+  （12 passed）；另 `git diff --check` 干净。
+- **Test Failure Policy**：全套测试无 failed，无新观察到的未调度失败测试；real-CLI e2e 仍 `#[ignore]` 且无
+  binary/login 时干净 skip（既有调度）。
+- **结论**：`AgentRestoreBuilder` 与 `AgentBuilder` 的 `interaction_handler` 注入口在签名/优先级/两路生效/
+  向后兼容/§15.2 语义上完全对齐，M7-F1 达标，M7「宿主嵌入接入面」收尾完成。
