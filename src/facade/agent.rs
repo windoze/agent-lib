@@ -762,9 +762,12 @@ impl Agent {
     /// serializable [`AgentState`] (spec, active tool-set declarations, model,
     /// loop policy, and loop cursor). It never contains the LLM client, provider
     /// credentials, tool closures, or the approval handler, so it is safe to
-    /// persist and later feed to [`Agent::restore`]. Delegate, mailbox,
-    /// blackboard, plan, and artifact slices are reserved for later milestones
-    /// and are empty here (`docs/facade-api.md` §15.2).
+    /// persist and later feed to [`Agent::restore`]. When the agent has a
+    /// collaboration substrate provisioned, the mailbox, blackboard, and plan
+    /// slices carry that substrate's data-only snapshot (each `None` when its
+    /// substrate is disabled); the delegate slice carries the registered subagent
+    /// recipes, and the artifact slice is reserved for a later milestone
+    /// (`docs/facade-api.md` §15.2).
     ///
     /// # Errors
     ///
@@ -780,6 +783,7 @@ impl Agent {
             &self.external_agents,
             &self.last_external_sessions,
             &self.delegation,
+            &self.collab,
         )
     }
 

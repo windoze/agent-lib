@@ -17,9 +17,11 @@
 //! The delegate slice of an [`AgentSnapshot`] carries the registered local
 //! subagents as data-only recipes and the delegation routing mode, so a restored
 //! agent re-advertises and re-routes to the same subagents. The mailbox,
-//! blackboard, plan, and artifact slices are reserved for later milestones; the
-//! base agent path produces empty slices there so the struct shape is stable
-//! now.
+//! blackboard, and plan slices carry the live collaboration substrate's data-only
+//! snapshot when the agent has them provisioned, so a restored agent resumes on
+//! the same shared inbox / board / plan; a disabled substrate is `None`. The
+//! artifact slice is reserved for a later milestone and is empty on the base
+//! path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,6 +32,11 @@ use crate::agent::external::{ExternalPermissionMode, ExternalRuntimeKind, Extern
 use crate::agent::{
     AgentSpec, AgentState, InteractionHandler, PlanSnapshot, ToolRegistry, ToolSetRef, WorktreeRef,
 };
+// Re-export the real, data-only collaboration snapshot types (M3-1) so the
+// facade snapshot surface (`AgentSnapshot::mailbox` / `blackboard`) speaks the
+// same types callers reach through `agent::collab`, and so
+// `agent_lib::facade::{MailboxSnapshot, BlackboardSnapshot}` keep resolving.
+pub use crate::agent::{BlackboardSnapshot, MailboxSnapshot};
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationSnapshot};
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
@@ -62,8 +69,9 @@ use super::{Agent, assemble_machine, build_facade_approval};
 /// any in-progress child conversation; the synchronous one-shot delegation drive
 /// never rests with a child in flight at a committed snapshot point, so it is
 /// empty in ordinary capture (see [`DelegationSnapshot`]). The mailbox,
-/// blackboard, plan, and artifact slices are reserved for later milestones and
-/// are empty here.
+/// blackboard, and plan slices carry the provisioned collaboration substrate's
+/// data-only snapshot (each `None` when its substrate is disabled); the artifact
+/// slice is reserved for a later milestone and is empty here.
 ///
 /// The type is `Clone`/`PartialEq`/`Serialize`/`Deserialize` but deliberately not
 /// `Eq`: [`AgentStateSnapshot`] and [`DelegateSnapshot`] capture model settings
@@ -91,14 +99,22 @@ pub struct AgentSnapshot {
     /// In-flight delegation snapshots (empty in ordinary capture; see
     /// [`DelegationSnapshot`]).
     pub pending_delegations: Vec<DelegationSnapshot>,
-    /// Shared mailbox snapshot (reserved; `None` on the base path).
+    /// Shared mailbox snapshot when the agent has a mailbox provisioned; `None`
+    /// when the mailbox substrate is disabled. `#[serde(default)]` keeps older
+    /// snapshots that predate the field readable.
+    #[serde(default)]
     pub mailbox: Option<MailboxSnapshot>,
-    /// Shared blackboard snapshot (reserved; `None` on the base path).
+    /// Shared blackboard snapshot when the agent has a blackboard provisioned;
+    /// `None` when the blackboard substrate is disabled.
+    #[serde(default)]
     pub blackboard: Option<BlackboardSnapshot>,
-    /// Plan-board snapshot (reserved; `None` on the base path).
+    /// Plan-board snapshot when the agent has a plan provisioned; `None` when the
+    /// plan substrate is disabled.
+    #[serde(default)]
     pub plan: Option<PlanSnapshot>,
     /// Artifact references produced by delegates (reserved; empty on the base
     /// path).
+    #[serde(default)]
     pub artifacts: Vec<ArtifactRef>,
 }
 
@@ -117,12 +133,19 @@ impl AgentSnapshot {
     /// delegation is driven to completion within one supervisor turn, so no child
     /// is in flight at the committed point a snapshot requires. No task brief is
     /// written to the snapshot (`PLAN.md` R5).
+    ///
+    /// The provisioned `collab` substrate is captured as data-only snapshots: an
+    /// enabled mailbox / blackboard / plan yields its
+    /// [`MailboxSnapshot`] / [`BlackboardSnapshot`] / [`PlanSnapshot`], while a
+    /// disabled substrate stays `None`, so a restored agent re-provisions exactly
+    /// the substrates the original had — never an unconfigured one.
     pub(super) fn capture(
         state: &AgentState,
         delegates: &[LocalSubagent],
         external: &[ManagedExternalDelegate],
         external_sessions: &HashMap<String, RetainedExternalSession>,
         delegation: &Delegation,
+        collab: &CollabState,
     ) -> Result<Self, FacadeError> {
         let supervisor = state.conversation().snapshot()?;
         let agent_state = AgentStateSnapshot::capture(state)?;
@@ -141,9 +164,12 @@ impl AgentSnapshot {
                 .collect(),
             delegation: delegation.clone(),
             pending_delegations: Vec::new(),
-            mailbox: None,
-            blackboard: None,
-            plan: None,
+            mailbox: collab.mailbox.as_ref().map(|mailbox| mailbox.snapshot()),
+            blackboard: collab
+                .blackboard
+                .as_ref()
+                .map(|blackboard| blackboard.snapshot_all()),
+            plan: collab.plan.as_ref().map(|plan| plan.snapshot()),
             artifacts: Vec::new(),
         })
     }
@@ -364,22 +390,6 @@ impl DelegationSnapshot {
         })
     }
 }
-
-/// Placeholder snapshot for the shared mailbox.
-///
-/// Reserved for the collaboration milestone; the base agent path never produces
-/// one. The field set is empty for now (the type is `#[non_exhaustive]`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct MailboxSnapshot {}
-
-/// Placeholder snapshot for the shared blackboard.
-///
-/// Reserved for the collaboration milestone; the base agent path never produces
-/// one. The field set is empty for now (the type is `#[non_exhaustive]`).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct BlackboardSnapshot {}
 
 /// The internal parts of an [`Agent`], handed out by
 /// [`Agent::into_parts`](super::Agent::into_parts).
@@ -774,15 +784,25 @@ impl AgentRestoreBuilder {
 
         // Re-derive the collaboration substrate from the restored topology (§14).
         // A snapshot carries no explicit `Collaboration` (§15.2), so restore
-        // reconstructs the default set the same delegate topology would enable
-        // and re-provisions fresh shared primitives.
+        // reconstructs the default set the same delegate topology would enable.
+        // The substrate flags decide *which* primitives exist; the snapshot's
+        // mailbox / blackboard / plan slices supply their *contents*, so a
+        // restored agent resumes on the same shared inbox / board / plan. An
+        // enabled substrate with no captured slice (an older snapshot) provisions
+        // an empty primitive, and a disabled substrate stays absent.
         let collaboration = resolve(
             None,
             &snapshot.delegation,
             delegates.len(),
             external_agents.len(),
         );
-        let collab = CollabState::provision(collaboration, &ids);
+        let collab = CollabState::restore(
+            collaboration,
+            &ids,
+            snapshot.mailbox,
+            snapshot.blackboard,
+            snapshot.plan,
+        );
 
         Ok(Agent {
             machine,
@@ -814,3 +834,7 @@ impl AgentRestoreBuilder {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "snapshot_tests.rs"]
+mod tests;

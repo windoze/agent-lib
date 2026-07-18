@@ -72,7 +72,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::collab::TaskStatus;
 use crate::agent::external::ExternalAgentEvent;
-use crate::agent::{Blackboard, Mailbox, Notification, Plan};
+use crate::agent::{
+    Blackboard, BlackboardSnapshot, Mailbox, MailboxSnapshot, Notification, Plan, PlanSnapshot,
+};
 use crate::facade::delegate::Delegation;
 use crate::facade::ids::FacadeIds;
 
@@ -260,6 +262,43 @@ impl CollabState {
             plan: config
                 .plan_enabled()
                 .then(|| Arc::new(Plan::new(ids.plan_id()))),
+        }
+    }
+
+    /// Provisions the live primitives `config` enables, rehydrating each enabled
+    /// substrate from its snapshot when one is present and falling back to a fresh
+    /// empty primitive otherwise (`docs/facade-api.md` §15.2).
+    ///
+    /// `config` decides *whether* a substrate exists — a substrate the restored
+    /// topology does not enable stays `None`, so restore never resurrects an
+    /// unconfigured primitive even if a stray snapshot slice is supplied. When a
+    /// substrate is enabled, its snapshot (if any) supplies the *contents*: the
+    /// mailbox resumes its inboxes and sequence cursor, and the blackboard / plan
+    /// keep their captured identity and message / task history. An enabled
+    /// substrate with no snapshot slice (for example an older snapshot that
+    /// predates collaboration capture) provisions an empty primitive, minting its
+    /// identity from `ids`.
+    pub(crate) fn restore(
+        config: Collaboration,
+        ids: &FacadeIds,
+        mailbox: Option<MailboxSnapshot>,
+        blackboard: Option<BlackboardSnapshot>,
+        plan: Option<PlanSnapshot>,
+    ) -> Self {
+        Self {
+            config,
+            mailbox: config
+                .mailbox_enabled()
+                .then(|| Arc::new(mailbox.map_or_else(Mailbox::new, Mailbox::from_snapshot))),
+            blackboard: config.blackboard_enabled().then(|| {
+                Arc::new(blackboard.map_or_else(
+                    || Blackboard::new(ids.blackboard_id()),
+                    Blackboard::from_snapshot,
+                ))
+            }),
+            plan: config.plan_enabled().then(|| {
+                Arc::new(plan.map_or_else(|| Plan::new(ids.plan_id()), Plan::from_snapshot))
+            }),
         }
     }
 }

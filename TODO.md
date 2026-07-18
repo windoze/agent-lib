@@ -442,7 +442,7 @@ cargo test -p agent-lib --lib agent::collab
   `cargo test -p agent-lib --lib agent::collab`（28 passed）、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
-### M3-2 [TODO] 让 `AgentSnapshot::capture` 保存 live 协作内容
+### M3-2 [DONE] 让 `AgentSnapshot::capture` 保存 live 协作内容
 
 上下文：
 
@@ -469,6 +469,47 @@ cargo test -p agent-lib --lib agent::collab
 cargo test -p agent-lib --lib facade::agent::snapshot
 cargo test -p agent-lib --lib facade::collab
 ```
+
+完成记录（M3-2）：
+
+- 实现：
+  - `src/facade/agent/snapshot.rs`：删除占位空类型 `MailboxSnapshot{}`/`BlackboardSnapshot{}`，
+    改为 `pub use crate::agent::{BlackboardSnapshot, MailboxSnapshot}`（复用 M3-1 落地的真实
+    data-only 类型），保持 `agent_lib::facade::{MailboxSnapshot, BlackboardSnapshot}` 公有路径
+    不变。`AgentSnapshot` 的 `mailbox`/`blackboard`/`plan`/`artifacts` 加 `#[serde(default)]`
+    以保持旧 snapshot 可读。
+  - `AgentSnapshot::capture` 增参 `collab: &CollabState`：mailbox 启用时写
+    `mailbox.snapshot()`、blackboard 启用时写 `blackboard.snapshot_all()`、plan 启用时写
+    `plan.snapshot()`；未启用保持 `None`。`src/facade/agent.rs` 的 `Agent::snapshot()` 传
+    `&self.collab`，并更新其 doc（不再说这些 slice 为空）。
+  - `src/facade/collab.rs`：新增 `CollabState::restore(config, ids, mailbox, blackboard, plan)`：
+    由 topology 决定“是否”建 substrate（未启用保持 `None`，restore 不会意外启用未配置组件），
+    启用时若 snapshot 带内容则 `from_snapshot` rehydrate（mailbox 续 seq、blackboard/plan 保
+    id 与消息/任务历史），无内容则从 `ids` mint 新身份建空底座（兼容旧 snapshot）。
+  - `AgentRestoreBuilder::build`（snapshot.rs）改用 `CollabState::restore(...)` 取代
+    `provision(...)`，并更新注释。
+  - 说明：本任务按“topology 决定是否建、snapshot 决定内容”的稳妥策略打通同拓扑 round-trip。
+    “snapshot 内容对 topology 具有权威性、topology 仅作旧 snapshot 的 provision hint”这一冲突
+    策略（例如无 delegate 却显式启用 mailbox 的 agent）及其文档、旧格式无字段兼容测试，仍归属
+    M3-3，本任务未提前实现。
+- 测试（`src/facade/agent/snapshot_tests.rs`，模块 `facade::agent::snapshot::tests`，新增 4 个，
+  自带 offline `StubClient`）：
+  - `capture_and_restore_preserve_live_mailbox_contents`：双 delegate 拓扑（§14 自动 mailbox），
+    写多 recipient→snapshot（next_seq/inbox 一致）→restore，`read_from` 内容与顺序一致，
+    restore 后新 send 续 seq=3。
+  - `capture_and_restore_preserve_blackboard_channels`：dispatcher 拓扑（plan+blackboard+
+    mailbox），多 channel post→snapshot→restore，board id/channel 列表/每 channel 顺序一致，
+    新 post offset 续。
+  - `capture_and_restore_preserve_plan_state`：dispatcher 拓扑，add_task→snapshot→restore，
+    id/version/task_order 一致（version 保留使后续 CAS claim 仍需匹配）。
+  - `disabled_collaboration_leaves_snapshot_and_restore_bare`：base agent（无 delegate）
+    snapshot 三个 slice 均 `None`，restore 不建任何 substrate。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
+  `cargo test -p agent-lib --lib facade::agent::snapshot`（4 passed）、
+  `cargo test -p agent-lib --lib facade::collab`（17 passed）、
+  `cargo test -p agent-lib --lib agent::collab`（28 passed，回归）、
+  `cargo test --all --all-targets`（全绿）、`cargo test --all --doc`（全绿）、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
 ### M3-3 [TODO] 让 restore 优先使用 snapshot 中的协作内容
 
