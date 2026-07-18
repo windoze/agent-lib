@@ -1358,6 +1358,13 @@ ExternalAgentError::UnsupportedCapability {
 | `PerAgentWorktree` | `<root>/agent-<agent_id>` 固定 linked git worktree,已存在则幂等复用 | 持久保留(跨 session 复用),从不删除;dirty close 标 residual |
 | `EphemeralGitWorktree` | `<root>/ephemeral/<agent_id>-<n>` 每 session 新建 linked git worktree | graceful → `git worktree remove --force` 删除;forced/failed → **保留** 并标 residual |
 
+`PreparedWorktree` 记录 prepare 时的 base repo(`with_base_repo`);cleanup 以 base repo 作为
+`git -C` 目录而非 worktree 自身——worktree 的 `.git` 链接损坏或目录被移动后 git 无法从
+worktree 向上发现 gitdir。此时 `SystemGit` 对 remove 失败的树做兜底：`worktree/.git` 已不
+存在时先 `git worktree prune` 清掉 stale admin entry 再直接删除残留目录；`.git` 仍在的
+其他失败(如 locked)原样报错，不强行删除。手工构造、未记录 base repo 的 `PreparedWorktree`
+回退到以 worktree 自身作 `-C` 的旧行为。
+
 `root` 默认 `std::env::temp_dir()/agent-lib-worktrees`,置于 base checkout 之外避免 git worktree
 嵌套;`with_root` 可覆盖。ephemeral 路径用 per-manager 单调计数器(非随机/时钟),遵循本 crate
 “nondeterminism 由 caller 掌控” 约束,并对已存在(retained)目录做 existence 跳过。
@@ -1383,7 +1390,8 @@ pub trait WorktreeManager: Send + Sync {
 ```
 
 git 操作走 `WorktreeGitExec` hook(生产实现 `SystemGit` shell out `git worktree add --detach` /
-`git worktree remove --force`),因此 placement/teardown 策略在无真实仓库下即可单测。
+`git worktree remove --force`,并对损坏/被移动的树走 prune + 目录删除兜底),因此
+placement/teardown 策略在无真实仓库下即可单测。
 
 ### residual side-effect 策略(design §6.4/§16)
 

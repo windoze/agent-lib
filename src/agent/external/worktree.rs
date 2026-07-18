@@ -62,11 +62,18 @@ pub struct PreparedWorktree {
     agent_id: AgentId,
     isolation: WorktreeIsolation,
     worktree: WorktreeRef,
+    base_repo: Option<WorktreeRef>,
     ephemeral: bool,
 }
 
 impl PreparedWorktree {
     /// Builds a prepared worktree from its parts.
+    ///
+    /// The built value carries no [`base_repo`](Self::base_repo) record, so a
+    /// later cleanup falls back to using the worktree itself as the git `-C`
+    /// directory (the pre-base-repo-record behavior). Prefer
+    /// [`with_base_repo`](Self::with_base_repo) whenever the base repository is
+    /// known — it always is for worktrees a [`WorktreeManager`] prepared.
     #[must_use]
     pub const fn new(
         agent_id: AgentId,
@@ -78,8 +85,27 @@ impl PreparedWorktree {
             agent_id,
             isolation,
             worktree,
+            base_repo: None,
             ephemeral,
         }
+    }
+
+    /// Records the base repository the worktree was linked from.
+    ///
+    /// Cleanup runs `git worktree` with the base repo as `-C` instead of the
+    /// worktree itself, so teardown still works when the worktree's own `.git`
+    /// link is damaged or the directory was moved (git can no longer discover
+    /// the gitdir by walking up from the worktree).
+    #[must_use]
+    pub fn with_base_repo(mut self, base_repo: WorktreeRef) -> Self {
+        self.base_repo = Some(base_repo);
+        self
+    }
+
+    /// Returns the base repository recorded at preparation time, if any.
+    #[must_use]
+    pub const fn base_repo(&self) -> Option<&WorktreeRef> {
+        self.base_repo.as_ref()
     }
 
     /// Returns the agent this worktree was prepared for.
@@ -214,6 +240,11 @@ pub trait WorktreeGitExec: Send + Sync {
 
     /// Removes the linked worktree at `worktree`.
     ///
+    /// `repo` must be the base repository the worktree was linked from (see
+    /// [`PreparedWorktree::with_base_repo`]); the implementation may also rely
+    /// on it to recover from a partially damaged or moved worktree that plain
+    /// `git worktree remove` refuses to touch.
+    ///
     /// # Errors
     ///
     /// Returns a diagnostic string when `git worktree remove` fails.
@@ -228,6 +259,14 @@ pub trait WorktreeGitExec: Send + Sync {
 /// `git -C <repo> worktree remove --force <path>`, discarding the ephemeral tree
 /// even when it carries uncommitted edits (the session's results are captured as
 /// artifacts before a graceful close).
+///
+/// Removal also tolerates a worktree that was partially damaged (its `.git`
+/// link deleted) or moved away: plain `git worktree remove` refuses such a tree
+/// even from the base repo, so when the tree's `.git` link is gone the
+/// implementation falls back to `git -C <repo> worktree prune` (which drops the
+/// stale administrative entry) plus a direct deletion of any leftover
+/// directory. A removal that fails for any other reason — the `.git` link is
+/// intact, for example a locked tree — is reported as-is rather than forced.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemGit;
 
@@ -248,7 +287,7 @@ impl WorktreeGitExec for SystemGit {
     }
 
     async fn remove_worktree(&self, repo: &Path, worktree: &Path) -> Result<(), String> {
-        run_git(
+        let remove = run_git(
             repo,
             &[
                 "worktree".as_ref(),
@@ -257,7 +296,27 @@ impl WorktreeGitExec for SystemGit {
                 worktree.as_os_str(),
             ],
         )
-        .await
+        .await;
+        let Err(remove_err) = remove else {
+            return Ok(());
+        };
+        // Fall back only for a tree git can no longer validate: its `.git`
+        // link is gone (deleted, or the whole directory was moved away). Any
+        // other failure — the link is intact, e.g. a locked worktree — keeps
+        // the original error instead of being force-deleted behind git's back.
+        if worktree.join(".git").exists() {
+            return Err(remove_err);
+        }
+        run_git(repo, &["worktree".as_ref(), "prune".as_ref()]).await?;
+        match std::fs::remove_dir_all(worktree) {
+            Ok(()) => Ok(()),
+            // The tree was moved away: prune already dropped the admin entry.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!(
+                "{remove_err}; failed to remove leftover worktree dir {}: {err}",
+                worktree.display()
+            )),
+        }
     }
 }
 
@@ -415,12 +474,12 @@ where
         isolation: WorktreeIsolation,
     ) -> Result<PreparedWorktree, WorktreeError> {
         match isolation {
-            WorktreeIsolation::Shared => Ok(PreparedWorktree::new(
-                agent_id,
-                isolation,
-                base.clone(),
-                false,
-            )),
+            WorktreeIsolation::Shared => {
+                Ok(
+                    PreparedWorktree::new(agent_id, isolation, base.clone(), false)
+                        .with_base_repo(base.clone()),
+                )
+            }
             WorktreeIsolation::PerAgentWorktree => {
                 let path = self.per_agent_path(agent_id);
                 // A per-agent worktree is stable and reused across sessions, so
@@ -435,12 +494,10 @@ where
                             detail,
                         })?;
                 }
-                Ok(PreparedWorktree::new(
-                    agent_id,
-                    isolation,
-                    WorktreeRef::new(path),
-                    false,
-                ))
+                Ok(
+                    PreparedWorktree::new(agent_id, isolation, WorktreeRef::new(path), false)
+                        .with_base_repo(base.clone()),
+                )
             }
             WorktreeIsolation::EphemeralGitWorktree => {
                 let path = self.ephemeral_path(agent_id);
@@ -452,12 +509,10 @@ where
                         path: path.display().to_string(),
                         detail,
                     })?;
-                Ok(PreparedWorktree::new(
-                    agent_id,
-                    isolation,
-                    WorktreeRef::new(path),
-                    true,
-                ))
+                Ok(
+                    PreparedWorktree::new(agent_id, isolation, WorktreeRef::new(path), true)
+                        .with_base_repo(base.clone()),
+                )
             }
         }
     }
@@ -475,8 +530,16 @@ where
         // (forced kill / failed) retains even an ephemeral tree for inspection,
         // and shared / per-agent worktrees are never auto-removed.
         let removed = if prepared.ephemeral && !residual {
+            // Run git from the recorded base repo, not the worktree itself: a
+            // partially damaged or moved worktree no longer lets git discover
+            // the gitdir by walking up from it. A `PreparedWorktree` built by
+            // hand without a base repo record falls back to the old behavior.
+            let repo = prepared
+                .base_repo
+                .as_ref()
+                .map_or_else(|| prepared.worktree.path(), WorktreeRef::path);
             self.git
-                .remove_worktree(prepared.worktree.path(), prepared.worktree.path())
+                .remove_worktree(repo, prepared.worktree.path())
                 .await
                 .map_err(|detail| WorktreeError::Cleanup {
                     isolation,
@@ -524,6 +587,7 @@ mod tests {
     struct ScriptedGit {
         added: Mutex<Vec<PathBuf>>,
         removed: Mutex<Vec<PathBuf>>,
+        removed_repos: Mutex<Vec<PathBuf>>,
         fail_add: bool,
         fail_remove: bool,
     }
@@ -539,12 +603,13 @@ mod tests {
             Ok(())
         }
 
-        async fn remove_worktree(&self, _repo: &Path, worktree: &Path) -> Result<(), String> {
+        async fn remove_worktree(&self, repo: &Path, worktree: &Path) -> Result<(), String> {
             if self.fail_remove {
                 return Err("simulated remove failure".to_owned());
             }
             let _ = std::fs::remove_dir_all(worktree);
             self.removed.lock().unwrap().push(worktree.to_path_buf());
+            self.removed_repos.lock().unwrap().push(repo.to_path_buf());
             Ok(())
         }
     }
@@ -856,5 +921,172 @@ mod tests {
             // A clean close removes the ephemeral tree; a dirty one retains it.
             assert_eq!(outcome.removed(), !expect_residual);
         }
+    }
+
+    #[tokio::test]
+    async fn external_worktree_cleanup_runs_git_from_recorded_base_repo() {
+        let scratch = ScratchRoot::new();
+        let manager =
+            GitWorktreeManager::with_git_exec(ScriptedGit::default()).with_root(&scratch.path);
+        let prepared = manager
+            .prepare(agent_id(), &base(), WorktreeIsolation::EphemeralGitWorktree)
+            .await
+            .expect("prepare");
+        assert_eq!(prepared.base_repo(), Some(&base()));
+
+        manager
+            .cleanup(prepared, ExternalSessionShutdown::Graceful)
+            .await
+            .expect("cleanup");
+
+        // `-C` is the recorded base repo, not the worktree itself.
+        assert_eq!(
+            manager.git.removed_repos.lock().unwrap().as_slice(),
+            &[base().path().to_path_buf()]
+        );
+    }
+
+    #[tokio::test]
+    async fn external_worktree_cleanup_without_base_repo_falls_back_to_worktree() {
+        let scratch = ScratchRoot::new();
+        let manager =
+            GitWorktreeManager::with_git_exec(ScriptedGit::default()).with_root(&scratch.path);
+        // A hand-built `PreparedWorktree` carries no base repo record; cleanup
+        // keeps the pre-record behavior of using the worktree itself as `-C`.
+        let worktree = WorktreeRef::new(scratch.path.join("hand-built"));
+        let prepared = PreparedWorktree::new(
+            agent_id(),
+            WorktreeIsolation::EphemeralGitWorktree,
+            worktree.clone(),
+            true,
+        );
+        assert_eq!(prepared.base_repo(), None);
+
+        manager
+            .cleanup(prepared, ExternalSessionShutdown::Graceful)
+            .await
+            .expect("cleanup");
+
+        assert_eq!(
+            manager.git.removed_repos.lock().unwrap().as_slice(),
+            &[worktree.path().to_path_buf()]
+        );
+    }
+
+    /// Returns `true` when a `git` binary is on `PATH`; real-git tests skip
+    /// cleanly otherwise (they never touch the network or user config).
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    /// Runs `git -C <repo> <args...>` synchronously, panicking on failure.
+    fn git_in(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Initializes a real git repository with one commit under `scratch`.
+    fn init_real_repo(scratch: &Path) -> PathBuf {
+        let repo = scratch.join("base");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        git_in(&repo, &["init", "-q"]);
+        git_in(
+            &repo,
+            &["config", "user.email", "agent-lib@example.invalid"],
+        );
+        git_in(&repo, &["config", "user.name", "agent-lib tests"]);
+        std::fs::write(repo.join("file"), "contents").expect("seed file");
+        git_in(&repo, &["add", "file"]);
+        git_in(&repo, &["commit", "-qm", "init"]);
+        repo
+    }
+
+    /// Asserts the base repo no longer has an administrative entry for `path`.
+    fn assert_worktree_deregistered(repo: &Path, path: &Path) {
+        let list = git_in(repo, &["worktree", "list", "--porcelain"]);
+        assert!(
+            !list
+                .lines()
+                .any(|line| line == format!("worktree {}", path.display())),
+            "worktree {} still registered:\n{list}",
+            path.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn external_worktree_cleanup_survives_corrupt_git_link_via_base_repo() {
+        if !git_available() {
+            eprintln!("skipping: git binary not available");
+            return;
+        }
+        let scratch = ScratchRoot::new();
+        let repo = init_real_repo(&scratch.path);
+        let manager = GitWorktreeManager::new().with_root(scratch.path.join("wt"));
+        let prepared = manager
+            .prepare(
+                agent_id(),
+                &WorktreeRef::new(&repo),
+                WorktreeIsolation::EphemeralGitWorktree,
+            )
+            .await
+            .expect("prepare");
+        let worktree = prepared.worktree().path().to_path_buf();
+
+        // Simulate partial damage: the worktree's `.git` link is gone, so git
+        // can neither discover the gitdir from the worktree nor validate it for
+        // a plain `git worktree remove` (even from the base repo).
+        std::fs::remove_file(worktree.join(".git")).expect("corrupt git link");
+
+        let outcome = manager
+            .cleanup(prepared, ExternalSessionShutdown::Graceful)
+            .await
+            .expect("cleanup survives corrupt git link");
+        assert!(outcome.removed());
+        assert!(!worktree.exists(), "leftover directory removed");
+        assert_worktree_deregistered(&repo, &worktree);
+    }
+
+    #[tokio::test]
+    async fn external_worktree_cleanup_survives_moved_worktree_via_base_repo() {
+        if !git_available() {
+            eprintln!("skipping: git binary not available");
+            return;
+        }
+        let scratch = ScratchRoot::new();
+        let repo = init_real_repo(&scratch.path);
+        let manager = GitWorktreeManager::new().with_root(scratch.path.join("wt"));
+        let prepared = manager
+            .prepare(
+                agent_id(),
+                &WorktreeRef::new(&repo),
+                WorktreeIsolation::EphemeralGitWorktree,
+            )
+            .await
+            .expect("prepare");
+        let worktree = prepared.worktree().path().to_path_buf();
+
+        // Simulate the whole tree being moved away before cleanup.
+        let moved = scratch.path.join("moved-away");
+        std::fs::rename(&worktree, &moved).expect("move worktree");
+
+        let outcome = manager
+            .cleanup(prepared, ExternalSessionShutdown::Graceful)
+            .await
+            .expect("cleanup survives moved worktree");
+        assert!(outcome.removed());
+        assert_worktree_deregistered(&repo, &worktree);
     }
 }

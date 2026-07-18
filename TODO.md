@@ -449,7 +449,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 无 breaking change（私有 session/方法签名变化；pub 类型仅 `ExternalSessionShutdown::merge`
   纯增量）。
 
-### M2-6 [TODO] worktree cleanup 使用记录的 base repo（M-EXT-7）
+### M2-6 [DONE] worktree cleanup 使用记录的 base repo（M-EXT-7）
 
 上下文：
 
@@ -464,6 +464,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：创建 worktree 后将其 `.git` 文件/目录模拟损坏（或移动），cleanup 仍能经 base repo 完成 `git worktree remove`（离线临时目录即可）。
 - external feature 测试与 clippy 全过。
+
+完成记录：
+
+- 关键实验结论（真实 git，本地临时目录）：worktree 的 `.git` 链接被删后，`git -C <base> worktree remove --force` **仍失败**（"验证失败，无法删除工作区"，double `--force` 同）；`git worktree prune` 能清掉 stale admin entry。因此仅改 `-C` 不足以满足验证条件，修复 = 记录 base repo + 针对损坏/移动树的 prune 兜底。
+- `PreparedWorktree` 新增私有字段 `base_repo: Option<WorktreeRef>`。该类型不参与 serde 持久化（无 serde derive，仅内存传递），故无需 `#[serde(default)]`；为兼容既有 public `new()`（避免 breaking change），`new()` 签名不变、字段置 `None`，新增 `with_base_repo()` builder 与 `base_repo()` accessor；缺省时 cleanup 回退旧行为（以 worktree 自身作 `-C`），与任务规格一致。
+- `GitWorktreeManager::prepare` 三个分支（Shared/PerAgent/Ephemeral）均记录 base repo；cleanup 以记录的 base repo 作 `git -C`。
+- `SystemGit::remove_worktree` 加固：`worktree remove --force` 失败且 `worktree/.git` 已不存在（文件系统判定，非错误字符串匹配）时，回退 `git worktree prune` + best-effort `remove_dir_all`（NotFound 忽略——树被移动的情形）；`.git` 仍在的其他失败（如 locked tree）原样上抛，不在 git 背后强删。trait 方法与 `SystemGit` rustdoc 同步强化契约。
+- 测试：`ScriptedGit` 新增记录 remove 的 repo 参数。新增 4 条——`external_worktree_cleanup_runs_git_from_recorded_base_repo`（断言 `-C` == base repo）、`external_worktree_cleanup_without_base_repo_falls_back_to_worktree`（兼容回退）、`external_worktree_cleanup_survives_corrupt_git_link_via_base_repo` 与 `external_worktree_cleanup_survives_moved_worktree_via_base_repo`（真实 git + 临时目录，离线；git 缺失时优雅跳过；分别模拟删 `.git` 与移走目录，断言 cleanup 成功、残留目录删除、admin entry 注销）。worktree 模块 16 条全过。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 文档：`docs/managed-external-agent.md` §16 补充 base repo 记录与损坏树兜底描述；`docs/review-2026-07.md` M-EXT-7 已标注 `✅ 已修复（M2-6）`。无 breaking change（`new()` 签名不变）。
 
 ### M2-7 [TODO] `ExternalSessionPolicy` 与 `WorktreeManager` 接入（M-PROM-5）
 
