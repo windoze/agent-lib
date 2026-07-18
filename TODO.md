@@ -572,7 +572,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   默认接线 `GitWorktreeManager`——非 `Shared` isolation 的驱动现在会真实 prepare/cleanup
   worktree（facade 受管驱动声明的 `EphemeralGitWorktree` 从静默忽略变为实际生效）。
 
-### M2-8 [TODO] M2 review：external 生命周期收口
+### M2-8 [DONE] M2 review：external 生命周期收口
 
 检查项：
 
@@ -580,6 +580,17 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 重点复验：force-close 后无存活孙进程；resume 后事件流无缺口；崩溃 session 不再判 Graceful。
 - 全量门禁命令通过（含 external-acp feature 的 clippy）。
 - `docs/managed-external-agent.md`、`docs/capability-matrix.md`、`AGENTS.md` 与实现一致。
+
+完成记录：
+
+- 条目核对：`docs/review-2026-07.md` 九条均已标注 `✅ 已修复`——H-EXT-2（M2-1）、M-EXT-1（M2-2）、M-EXT-3（M2-3）、M-EXT-4（M2-4）、M-EXT-5/M-EXT-6（M2-5）、M-EXT-7（M2-6）、M-PROM-5（M2-7）；M-EXT-2（env 继承策略）不在 M2 收口清单内，仍待后续 milestone 处理。代码点位抽查确认修复在场：`process_group.rs`（`configure_managed_command`/`force_kill`，四 spawn/close 点接入）、四 decoder/session 的 `with_resume_high_water`/`with_next_seq`、四 adapter `session_config` 请求级覆盖、`runtime_output` 固定 message、codex/opencode `--` argv 分隔、prelude deadline/取消、worktree `base_repo` 兜底、registry `with_worktree_manager` 与 machine `max_turns` 强制。
+- 重点复验（external features 定向测试，全部通过）：
+  - force-close 无存活孙进程：四个 `close_classification::force_close_kills_the_whole_process_group`（claude/codex/opencode/acp，`sh -c 'sleep 300 & sleep 300'` 后 `kill(-pgid, 0)` 返回 ESRCH）。
+  - resume 无事件缺口：四个 `*_resume_continues_the_seq_line_past_the_high_water`（last_event_seq=50 播种，首观测 seq==51）+ machine 层 `restored_machine_dedups_against_the_persisted_high_water`（serde restore 后 ≤ 水位重放被 dedup、> 水位新观测全量 emit）。
+  - 崩溃不判 Graceful：四个 `close_classification` 模块 `zero_exit_is_graceful`/`nonzero_exit_is_failed`/`grace_overrun_is_forced_kill` 共 12 条全过。
+- 文档核对：`docs/managed-external-agent.md`（§16 进程组 kill、prompt argv 暴露面、M2-7 worktree 接线、base repo 兜底、三类超时）、`docs/capability-matrix.md`（policy 消费方、库内 WorktreeManager 接线）、AGENTS.md（Worktree isolation / Process-group kill / Prompt argv exposure 三条 Safety properties）与实现一致，无待更新项。
+- 全量门禁：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0，50 个测试目标，约 33s，无挂起）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（exit 0，48 个测试目标）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 本任务纯审查，无代码改动，无 breaking change。
 
 ---
 
