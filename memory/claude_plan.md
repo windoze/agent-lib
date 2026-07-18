@@ -1,42 +1,36 @@
-# M5-3 执行计划：Review 完整逃生出口
+# M6-1 执行计划：同步 docs/refine.md 的问题状态和剩余风险
 
 ## 任务性质
-Review 任务。复核 M5-1（扩展 `AgentParts` 覆盖 external/协作/交互状态）与
-M5-2（into_parts/snapshot/builder 文档对齐）的落地是否正确、一致、无回归。
-非纯文档任务：若发现代码/文档缺口须修复并可能重跑测试。
+纯文档任务（TODO.md M6-1）。把 `docs/refine.md` 从「问题清单」收敛为
+「已修复项 + 剩余风险记录」，确保六类问题都有明确状态，且与 PLAN.md / TODO.md 不冲突。
 
-## 检查范围（来自 TODO M5-3）
-1. `AgentParts` 是否覆盖当前 `Agent` 中所有有语义的字段。
-2. 是否有 public API 泄漏了不该稳定承诺的内部实现细节。
-3. `into_parts`、snapshot、builder 的用途边界是否清楚。
-4. M3 协作 snapshot 修复与本阶段 `into_parts` 扩展是否互相一致。
+## 现状分析
+- 问题 #2、#4、#5、#6 已有顶部「状态：**已修复（… 复核通过）**」行 —— 达标。
+- 问题 #1（stream drop）、#3（非流式审批事件）只有末尾「修复状态（更新）」，
+  缺少与 2/4/5/6 一致的顶部状态行，且缺 M1-3 / M2-3 review 的关键文件与验证命令。
+- 「总体判断」尾部仍把六类问题列为「剩余问题」，与 M1–M5 全部完成的实际状态冲突。
 
-## 验证命令（TODO M5-3）
-- cargo fmt --all
-- cargo clippy --all-targets -- -D warnings
-- cargo test -p agent-lib --lib facade::agent::
-- RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-- 手工复核 docs/refine.md "Agent::into_parts 状态覆盖不完整" 条目状态。
+## 变更清单（仅改 docs/refine.md）
+1. 更新「总体判断」尾部：把六类缺口标注为已经过 M1–M5 收口，逐条映射 milestone；
+   说明 M6 负责最终收口（M6-1 文档同步 / M6-2 全量验证 / M6-3 验收）。
+2. 问题 #1 顶部补「状态：**已修复（M1-1、M1-2；M1-3 复核通过）**」行。
+3. 问题 #3 顶部补「状态：**已修复（M2-1、M2-2；M2-3 复核通过）**」行。
+4. 问题 #1「修复状态（更新）」补 M1-3 复核条：关键文件 + 验证命令
+   （chat:: 19 passed / agent:: 30 passed）。
+5. 问题 #3「修复状态（更新）」M2-3 条补关键文件 + 验证命令
+   （agent:: 37 passed / doc clean）。
 
-## 步骤
-- [ ] 读 `src/facade/agent.rs` 的 `Agent` 结构体字段全集，逐字段核对是否被 into_parts 交出或有意省略。
-- [ ] 读 `src/facade/agent/snapshot.rs` 的 `AgentParts` + into_parts 实现 + Debug。
-- [ ] 核对 public 泄漏（RetainedExternalSession 等 data-only 保证）。
-- [ ] 核对 into_parts vs snapshot/restore 语义一致（M3 协作）。
-- [ ] 复核 docs/refine.md §6 状态。
-- [ ] 运行验证命令。
-- [ ] 若无代码改动仅文档：可复用上次全绿测试。
-- [ ] 标记 M5-3 [DONE] + 完成记录；提交。
+## 验证
+- 手工确认六类问题都有顶部明确状态行。
+- `git diff --check`（无空白错误）。
+- 仅文档改动：复用上次全量绿测结果，不重跑 cargo test --all。
+
+## 完成后
+- TODO.md 标记 M6-1 [DONE] + 完成记录。
+- 提交，停止（不进入 M6-2）。
 
 ## 进度
-（待填）
-
-## 进度（M5-3 完成）
-- [x] 核对 Agent 13 字段全部被 into_parts 交出（无静默 drop）。
-- [x] 核对 public 无泄漏：CollabState(pub(crate)) 未泄漏；RetainedExternalSession pub data-only；clippy -D warnings 佐证无 private-in-public。
-- [x] 核对 into_parts/snapshot/builder 用途边界文档一致（rustdoc + facade-api.md §8.2）。
-- [x] 核对 M3 协作 snapshot(data-only) 与 into_parts(live 句柄) 互补一致，测试双侧全绿。
-- [x] 复核 docs/refine.md §6：状态行更新为「M5-3 复核通过」，修复结果块与实现一致。
-- [x] 验证全绿：fmt(无源码改)/clippy(clean)/facade::agent(49 passed)/doc(clean)。
-- [x] 仅文档改动，复用 M5-1 全量测试绿结果。
-- [x] TODO.md 标记 M5-3 [DONE] + 完成记录。
+- [x] 编辑 docs/refine.md
+- [x] git diff --check（clean）
+- [x] TODO.md [DONE] + 记录
+- [x] commit

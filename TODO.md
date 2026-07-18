@@ -1232,7 +1232,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M6：最终收口
 
-### M6-1 [TODO] 同步 `docs/refine.md` 的问题状态和剩余风险
+### M6-1 [DONE] 同步 `docs/refine.md` 的问题状态和剩余风险
 
 上下文：
 
@@ -1254,6 +1254,33 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 ```bash
 git diff --check
 ```
+
+完成记录：
+
+- 六类问题状态统一：问题 #2 / #4 / #5 / #6 原已有顶部「状态：**已修复（… 复核通过）**」
+  行；本次为问题 #1（stream drop）补「状态：**已修复（M1-1、M1-2；M1-3 复核通过）**」、
+  为问题 #3（非流式审批事件）补「状态：**已修复（M2-1、M2-2；M2-3 复核通过）**」，使
+  `docs/refine.md` 六类问题在条目开头均有明确状态行。
+- 补齐修复摘要 / 关键文件 / 测试命令：问题 #1「修复状态（更新）」新增 M1-3 复核条，
+  列出关键文件（`src/facade/chat.rs`、`src/facade/chat/stream.rs`、`src/facade/agent.rs`、
+  `src/facade/agent/stream.rs`）、离线测试基座（`DualFakeClient`、`DropTestClient`、
+  `ParkingInteractionHandler`、`parking_weather_tool`）与验证命令（fmt / clippy /
+  `facade::chat::` 19 passed / `facade::agent::` 30 passed）；问题 #3 的 M2-3 复核条补
+  关键文件（`src/facade/run.rs`、`src/facade/agent.rs`、`src/facade/approval.rs`）与验证
+  命令（fmt / clippy / `facade::agent::` 37 passed / rustdoc clean）。问题 #2 / #4 / #5 / #6
+  的「修复结果」块原已含关键文件与各自 review 验证命令，无需重写。
+- 「总体判断」尾部由「剩余问题清单」改写为「已收口 + 逐条 milestone 映射」，六类缺口分别
+  指向问题 #1(M1)、#3(M2)、#2(M3)、#4/#5(M4)、#6(M5)，并说明 M6 负责最终收口
+  （M6-1 文档同步 / M6-2 全量验证 / M6-3 验收），显式声明与 `PLAN.md`（M1–M6 里程碑）、
+  `TODO.md`（M1-1 ~ M5-3 均 `[DONE]`，M6-1 ~ M6-3 收尾）状态一致，无冲突。
+- 拆分说明：本轮各问题均按 milestone 内既有子任务推进，未在实现中把某个问题临时拆成更细
+  问题（拆分皆已在 TODO.md 的 M*-x 任务与各问题「修复结果 / 修复状态」块内记录），故无额外
+  拆分原因需补写。
+- 「剩余风险」：无已知未排期的阻断风险；M6-2 全量验证与 M6-3 最终验收作为收尾任务保留在
+  `TODO.md`。`验证结果` 一节明确标注为「审查未修改代码前」的历史基线，不与已修复状态冲突。
+- 验证：手工核对 `docs/refine.md` 六类问题均有条目开头状态行；`git diff --check`（clean）。
+  本任务仅改动 `docs/refine.md`（文档）与 `memory/claude_plan.md`（计划），未改动编译产物，
+  复用 M5-3 以来的全量绿测结果，未重跑 `cargo test --all --all-targets`。
 
 ### M6-2 [TODO] 全量验证默认构建、测试、文档和 external feature clippy
 
