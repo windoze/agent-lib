@@ -91,7 +91,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets` 全过（含 73 条 adapter 测试，无挂起）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 初报私有 intra-doc link 错误，已将 4 处指向 crate 私有常量的链接改为明文后通过。
 - `docs/review-2026-07.md` H-SEC-2 已标注 `✅ 已修复（M1-2）`。无 breaking change（`new()` 行为仅增加超时防护）。
 
-### M1-3 [TODO] `Usage` 算术溢出改饱和/错误化（H-SEC-3、facade 报告 M2）
+### M1-3 [DONE] `Usage` 算术溢出改饱和/错误化（H-SEC-3、facade 报告 M2）
 
 上下文：
 
@@ -108,6 +108,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：`merge` 两个 `u32::MAX` 级 usage 不 panic，结果为 `u32::MAX`。
 - 单元测试：`Accumulator` 连续 push 伪造大计数 Usage 事件，`collect` 正常返回。
 - `cargo test -p agent-lib --lib model::usage stream::accumulator` 通过。
+
+完成记录：
+
+- 选型：按任务推荐采用 `saturating_add`（不返回 `Result`，爆炸半径最小，调用链零改动）。理由写入 `merge`/`total_computed` rustdoc：usage 计数来自不可信 wire 数据，伪造计数不得 panic 宿主；饱和方向是多报而非少报，对预算记账是安全失败方向。
+- `src/model/usage.rs`：`merge` 六个 u32 计数（input/output/cache_read/cache_write/reasoning/total）与 `total_computed` 的 fold 全部改 `saturating_add`；`checked_add` panic helper 删除。`extra` 合并经查为 `Map::extend` 覆盖语义，无数值加法路径，不存在同类 panic（已核实，无需处理）。
+- 测试：`model::usage::tests::merge_saturates_instead_of_panicking_on_overflow`（两个 u32::MAX 级 usage merge 全部饱和为 u32::MAX）、`total_computed_saturates_instead_of_panicking_on_overflow`；`stream::accumulator::tests::folding::forged_oversized_usage_counters_saturate_instead_of_panicking`（连续 push 3 条全 MAX usage 事件后 finish 正常返回饱和值）；`stream::accumulator::tests::collect::collect_saturates_forged_oversized_usage_counters`（异步 `collect` 路径同样正常返回）。
+- 验证：`cargo test -p agent-lib --lib -- model::usage stream::accumulator` 25 条全过；全量门禁 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- `docs/review-2026-07.md` H-SEC-3 已标注 `✅ 已修复（M1-3）`。无 breaking change（仅消除 panic，正常值域行为不变）。
 
 ### M1-4 [TODO] `ClientError::Network` 中 URL query 脱敏（H-SEC-4）
 

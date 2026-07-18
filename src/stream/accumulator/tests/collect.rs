@@ -56,3 +56,35 @@ async fn collect_preserves_source_stream_errors() {
 
     assert!(matches!(error, CollectError::Stream("network unavailable")));
 }
+
+#[tokio::test]
+async fn collect_saturates_forged_oversized_usage_counters() {
+    let oversized = || {
+        StreamEvent::Usage(crate::model::usage::Usage {
+            input: u32::MAX,
+            output: u32::MAX,
+            cache_read: u32::MAX,
+            cache_write: u32::MAX,
+            reasoning: u32::MAX,
+            total: Some(u32::MAX),
+            extra: Map::new(),
+        })
+    };
+    let events = vec![
+        StreamEvent::MessageStart {
+            role: Role::Assistant,
+        },
+        oversized(),
+        oversized(),
+        StreamEvent::MessageStop {
+            stop_reason: Normalized::from_mapped(StopReason::EndTurn, "end_turn"),
+        },
+    ];
+    let stream = stream::iter(events.into_iter().map(Ok::<_, Infallible>));
+
+    let response = collect(stream).await.expect("collect response");
+
+    assert_eq!(response.usage.input, u32::MAX);
+    assert_eq!(response.usage.output, u32::MAX);
+    assert_eq!(response.usage.total, Some(u32::MAX));
+}

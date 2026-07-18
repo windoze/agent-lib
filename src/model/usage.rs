@@ -31,14 +31,20 @@ pub struct Usage {
 
 impl Usage {
     /// Adds another usage record into this one for stream aggregation.
+    ///
+    /// Token columns saturate at [`u32::MAX`] instead of panicking: usage
+    /// counts originate from untrusted provider wire data, and a forged or
+    /// pathological counter must not be able to crash the host process. A
+    /// saturated count still over-reports (never under-reports) real usage,
+    /// which is the safe failure direction for budget accounting.
     pub fn merge(&mut self, other: Self) {
-        self.input = checked_add(self.input, other.input, "input");
-        self.output = checked_add(self.output, other.output, "output");
-        self.cache_read = checked_add(self.cache_read, other.cache_read, "cache_read");
-        self.cache_write = checked_add(self.cache_write, other.cache_write, "cache_write");
-        self.reasoning = checked_add(self.reasoning, other.reasoning, "reasoning");
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_write = self.cache_write.saturating_add(other.cache_write);
+        self.reasoning = self.reasoning.saturating_add(other.reasoning);
         self.total = match (self.total, other.total) {
-            (Some(left), Some(right)) => Some(checked_add(left, right, "total")),
+            (Some(left), Some(right)) => Some(left.saturating_add(right)),
             (Some(total), None) | (None, Some(total)) => Some(total),
             (None, None) => None,
         };
@@ -46,16 +52,20 @@ impl Usage {
     }
 
     /// Computes a total from the normalized token columns.
+    ///
+    /// The sum saturates at [`u32::MAX`] for the same reason as
+    /// [`merge`](Self::merge): overflowing counters saturate rather than
+    /// panic.
     pub fn total_computed(&self) -> u32 {
         [
-            ("input", self.input),
-            ("output", self.output),
-            ("cache_read", self.cache_read),
-            ("cache_write", self.cache_write),
-            ("reasoning", self.reasoning),
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_write,
+            self.reasoning,
         ]
         .into_iter()
-        .fold(0, |total, (field, value)| checked_add(total, value, field))
+        .fold(0u32, u32::saturating_add)
     }
 }
 
@@ -132,12 +142,6 @@ impl<'de> Deserialize<'de> for Usage {
 
         Ok(usage)
     }
-}
-
-/// Adds token counts while reporting the normalized field on overflow.
-fn checked_add(left: u32, right: u32, field: &str) -> u32 {
-    left.checked_add(right)
-        .unwrap_or_else(|| panic!("usage {field} token count overflowed u32"))
 }
 
 /// Extracts a normalized counter from a provider-specific nested details map.
@@ -400,6 +404,50 @@ mod tests {
         assert_eq!(usage.total, Some(165));
         assert_eq!(usage.extra.get("first"), Some(&json!(true)));
         assert_eq!(usage.extra.get("second"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn merge_saturates_instead_of_panicking_on_overflow() {
+        let mut usage = Usage {
+            input: u32::MAX,
+            output: u32::MAX - 1,
+            cache_read: u32::MAX,
+            cache_write: u32::MAX,
+            reasoning: u32::MAX,
+            total: Some(u32::MAX),
+            extra: Default::default(),
+        };
+        usage.merge(Usage {
+            input: u32::MAX,
+            output: u32::MAX,
+            cache_read: u32::MAX,
+            cache_write: u32::MAX,
+            reasoning: u32::MAX,
+            total: Some(u32::MAX),
+            extra: Default::default(),
+        });
+
+        assert_eq!(usage.input, u32::MAX);
+        assert_eq!(usage.output, u32::MAX);
+        assert_eq!(usage.cache_read, u32::MAX);
+        assert_eq!(usage.cache_write, u32::MAX);
+        assert_eq!(usage.reasoning, u32::MAX);
+        assert_eq!(usage.total, Some(u32::MAX));
+    }
+
+    #[test]
+    fn total_computed_saturates_instead_of_panicking_on_overflow() {
+        let usage = Usage {
+            input: u32::MAX,
+            output: u32::MAX,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+            total: None,
+            extra: Default::default(),
+        };
+
+        assert_eq!(usage.total_computed(), u32::MAX);
     }
 
     #[test]

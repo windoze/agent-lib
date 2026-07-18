@@ -257,3 +257,35 @@ fn response_metadata_merges_into_complete_response_with_later_values_winning() {
         ])
     );
 }
+
+#[test]
+fn forged_oversized_usage_counters_saturate_instead_of_panicking() {
+    let mut accumulator = Accumulator::new();
+    start_message(&mut accumulator);
+
+    for _ in 0..3 {
+        accumulator
+            .push(StreamEvent::Usage(Usage {
+                input: u32::MAX,
+                output: u32::MAX,
+                cache_read: u32::MAX,
+                cache_write: u32::MAX,
+                reasoning: u32::MAX,
+                total: Some(u32::MAX),
+                extra: Map::new(),
+            }))
+            .expect("fold oversized usage event");
+    }
+    stop_message(&mut accumulator, StopReason::EndTurn);
+
+    let response = accumulator
+        .finish()
+        .expect("finish saturated usage response");
+
+    assert_eq!(response.usage.input, u32::MAX);
+    assert_eq!(response.usage.output, u32::MAX);
+    assert_eq!(response.usage.cache_read, u32::MAX);
+    assert_eq!(response.usage.cache_write, u32::MAX);
+    assert_eq!(response.usage.reasoning, u32::MAX);
+    assert_eq!(response.usage.total, Some(u32::MAX));
+}
