@@ -132,3 +132,49 @@ Review 任务，检查范围：
 ## 状态：完成
 M3-5 完成：代码逐项复核（M3-1..M3-4 一致落地）+ 更新 docs/refine.md §2 标注已修复并补充修复结果
 小节；fmt/clippy/三 targeted 测试/doc 全绿；TODO.md 标记 [DONE]。
+
+---
+
+# M4-1 执行计划：提供可直接装配默认 session handler 的 builder API
+
+## 任务（TODO.md M4-1）
+在 `ManagedExternalAgentBuilder` 上增加清晰 API，用于构造 agent 并自动装配默认
+session handler，取代“先 build 再回填 builder”的绕路。
+
+## 现状（src/facade/external.rs）
+- `ManagedExternalAgentBuilder::build()`（681）校验 mode 后产出 `ManagedExternalAgent`，
+  handler 为 None。
+- `default_external_session_handler(&ManagedExternalAgent)`（809）异步 probe 并返回
+  `Arc<RegistryExternalSessionHandler>`，但需要一个已构造的 agent → 调用方还要再
+  `.session_handler(handler).build()`，体验绕。
+- `drive_external`（1382）无 handler 直接 fail。
+- 默认 feature 下 `build_default_registry` 命中 catch-all → fail-fast「enable feature」错误
+  （runtime_feature_disabled），不含 secret。
+
+## 设计
+新增 `ManagedExternalAgentBuilder::build_with_default_session_handler(self) -> Result<ManagedExternalAgent, FacadeError>`（async）：
+- 若 builder 已手工 `.session_handler(..)` → 直接 `self.build()`（honor 手工 handler，
+  不触发 probe），保证不破坏自定义 handler 路径。
+- 否则 `build()` 后调用 `default_external_session_handler(&agent)`，把返回 handler
+  装到 agent 上返回。probe/feature 错误行为与现有 default handler 完全一致（非 secret）。
+- capabilities 的 Probed 视图留给 M4-4（本任务只做 handler 装配）。
+
+## 测试（facade::external tests）
+1. 默认 feature（无 external-codex）：`codex().build_with_default_session_handler()`
+   → Err(ExternalAgent{name:"codex", message contains "external-codex"})，不含 secret。
+   （用 `#[cfg(not(feature="external-codex"))]` 守卫）
+2. 手工 handler：`codex().session_handler(fake).build_with_default_session_handler()`
+   → Ok，且 `session_handler().is_some()`；说明手工 handler 短路 probe、feature 无关。
+3. 手工 `.session_handler(..).build()` 仍可 build（回归，已有 drive_external 测试覆盖，
+   补一个直接断言）。
+4. 启用 feature 的 probe 装配路径需真实 CLI，无法离线单测 → 在任务记录说明，靠
+   feature clippy 覆盖编译。
+
+## 验证
+- cargo fmt --all
+- cargo clippy --all-targets -- -D warnings
+- cargo test -p agent-lib --lib facade::external
+- （feature 编译）cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
+
+## 状态：完成
+M4-1 完成：新增 `build_with_default_session_handler` 一步式 builder API（手工 handler 短路、否则 probe 装配默认 handler），3 个测试全绿，fmt/clippy(默认+全 feature)/doc/full 全绿，TODO.md 标记 [DONE]。

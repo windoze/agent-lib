@@ -706,6 +706,53 @@ impl ManagedExternalAgentBuilder {
             session_handler: self.session_handler,
         })
     }
+
+    /// Validates and builds the [`ManagedExternalAgent`], then ensures it carries
+    /// a runtime session handler so it is ready to drive without a second
+    /// assembly pass.
+    ///
+    /// This is the one-call ergonomic path that replaces the round-trip of
+    /// building an agent, handing it to [`default_external_session_handler`], and
+    /// then rebuilding the builder with [`session_handler`](Self::session_handler):
+    ///
+    /// - If a handler was already supplied with
+    ///   [`session_handler`](Self::session_handler), it is honored verbatim and no
+    ///   probe runs. This keeps the manual/custom-handler path intact and lets a
+    ///   host (or an offline test) inject a scripted handler through the same
+    ///   entry point.
+    /// - Otherwise the agent's runtime is probed and the official
+    ///   registry-backed handler is assembled via
+    ///   [`default_external_session_handler`] and attached to the returned agent.
+    ///
+    /// The default build pulls in **no** CLI-adapter machinery, so when the
+    /// matching `external-*` feature is not compiled in this fails fast with the
+    /// exact same non-secret [`FacadeError::ExternalAgent`] "enable the feature"
+    /// message the standalone [`default_external_session_handler`] returns —
+    /// never a silent no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacadeError::UnsupportedExternalMode`] when the requested mode is
+    /// not supported by the runtime's capabilities (as [`build`](Self::build)
+    /// does), or [`FacadeError::ExternalAgent`] when the default handler cannot be
+    /// assembled because the runtime's adapter feature is not compiled in or its
+    /// capability probe fails (missing binary, unauthenticated CLI). The probe
+    /// error carries no credentials, so a host can treat it as a conservative
+    /// skip rather than a crash.
+    pub async fn build_with_default_session_handler(
+        self,
+    ) -> Result<ManagedExternalAgent, FacadeError> {
+        // A caller-supplied handler wins: honor the custom/manual path and skip
+        // the probe entirely (the default is only assembled to fill the gap).
+        if self.session_handler.is_some() {
+            return self.build();
+        }
+        let mut agent = self.build()?;
+        let handler: Arc<dyn ExternalSessionHandler> =
+            default_external_session_handler(&agent).await?;
+        agent.session_handler = Some(handler);
+        Ok(agent)
+    }
 }
 
 /// Returns the stable, non-secret label for a runtime kind.
@@ -1750,6 +1797,98 @@ mod tests {
             Some("gemini".into())
         );
         assert_eq!(agent.args(), ["--experimental-acp"]);
+    }
+
+    // A runtime whose adapter feature is not compiled into this build fails fast
+    // with an explicit "enable the feature" message rather than degrading
+    // silently. Codex is used because this arm only runs when its feature is off.
+    #[cfg(not(feature = "external-codex"))]
+    #[tokio::test]
+    async fn build_with_default_session_handler_fails_fast_when_feature_disabled() {
+        let error = ManagedExternalAgent::codex()
+            .build_with_default_session_handler()
+            .await
+            .expect_err("a runtime with no compiled adapter must fail fast");
+        match error {
+            FacadeError::ExternalAgent { name, message } => {
+                assert_eq!(name, "codex");
+                assert!(
+                    message.contains("external-codex"),
+                    "the message must name the feature to enable, got: {message}"
+                );
+                // The fail-fast message names only the feature to enable — never a
+                // launch line, environment variable, or credential.
+                assert!(
+                    !message.contains("KEY") && !message.contains("TOKEN"),
+                    "the fail-fast message must not leak a secret, got: {message}"
+                );
+            }
+            other => panic!("expected a fail-fast ExternalAgent error, got {other:?}"),
+        }
+    }
+
+    // A caller-supplied handler is honored verbatim by the one-call build path:
+    // it short-circuits the probe, so the manual/custom-handler path keeps working
+    // regardless of which `external-*` features are compiled in.
+    #[tokio::test]
+    async fn build_with_default_session_handler_honors_supplied_handler() {
+        use crate::agent::{
+            ExternalSessionHandler, ExternalSessionRequest, RequirementResult, RunContext,
+        };
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        struct NeverInvokedHandler;
+
+        #[async_trait]
+        impl ExternalSessionHandler for NeverInvokedHandler {
+            async fn fulfill(
+                &self,
+                _request: &ExternalSessionRequest,
+                _ctx: &RunContext,
+            ) -> RequirementResult {
+                panic!("the supplied handler must not run during assembly");
+            }
+        }
+
+        let agent = ManagedExternalAgent::codex()
+            .session_handler(Arc::new(NeverInvokedHandler))
+            .build_with_default_session_handler()
+            .await
+            .expect("a supplied handler short-circuits the default assembly");
+        assert!(
+            agent.session_handler().is_some(),
+            "the supplied handler must flow through to the built agent"
+        );
+    }
+
+    // The manual `.session_handler(..).build()` path stays usable on its own.
+    #[test]
+    fn manual_session_handler_path_still_builds() {
+        use crate::agent::{
+            ExternalSessionHandler, ExternalSessionRequest, RequirementResult, RunContext,
+        };
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        struct NeverInvokedHandler;
+
+        #[async_trait]
+        impl ExternalSessionHandler for NeverInvokedHandler {
+            async fn fulfill(
+                &self,
+                _request: &ExternalSessionRequest,
+                _ctx: &RunContext,
+            ) -> RequirementResult {
+                unreachable!()
+            }
+        }
+
+        let agent = ManagedExternalAgent::codex()
+            .session_handler(Arc::new(NeverInvokedHandler))
+            .build()
+            .expect("the manual session-handler path still builds");
+        assert!(agent.session_handler().is_some());
     }
 
     // A runtime whose adapter feature is not compiled into this build fails fast

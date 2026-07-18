@@ -701,7 +701,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M4：managed external 可用性和 capability 来源
 
-### M4-1 [TODO] 提供可直接装配默认 session handler 的 builder API
+### M4-1 [DONE] 提供可直接装配默认 session handler 的 builder API
 
 上下文：
 
@@ -728,6 +728,39 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 cargo test -p agent-lib --lib facade::external
 cargo clippy --all-targets -- -D warnings
 ```
+
+完成记录（M4-1）：
+
+- 实现：在 `ManagedExternalAgentBuilder` 上新增异步一步式 API
+  `build_with_default_session_handler(self) -> Result<ManagedExternalAgent, FacadeError>`
+  （`src/facade/external.rs`，紧接 `build()`）：
+  - 若已通过 `.session_handler(..)` 手工提供 handler → 直接 `self.build()`，honor 自定义
+    handler 并**短路** probe（与 feature 无关），保证既有手工路径不被破坏。
+  - 否则 `build()` 校验 mode 后调用现有 `default_external_session_handler(&agent)`，把返回的
+    registry-backed handler 装到 agent 上返回，取代旧的“先 build、再回填 builder”绕路。
+  - 默认 feature 下不引入 CLI adapter：未启用对应 `external-*` feature 时，装配走
+    `build_default_registry` 的 catch-all，返回与现有 `default_external_session_handler`
+    完全一致的非 secret fail-fast「rebuild with the matching external-* feature」错误。
+  - 启用对应 feature 时复用现有 probe + registry 装配路径（`build_claude_code_registry` 等）。
+  - capability 的 `Probed` 视图留待 M4-4（本任务只做 handler 装配，不改 capability 来源）。
+- 测试（`facade::external` tests，3 个新增）：
+  - `build_with_default_session_handler_fails_fast_when_feature_disabled`
+    （`#[cfg(not(feature = "external-codex"))]`）：默认 feature 下调用新 API 得到
+    `ExternalAgent{name:"codex", message contains "external-codex"}`，并断言 message 不含
+    `KEY`/`TOKEN` 等 secret 片段。
+  - `build_with_default_session_handler_honors_supplied_handler`：手工注入的 scripted
+    handler 短路 probe（handler 的 `fulfill` panic 保证 probe 未跑），build 成功且
+    `session_handler().is_some()`；该分支与 feature 无关，覆盖“启用/未启用 feature 均可用”的
+    手工路径。
+  - `manual_session_handler_path_still_builds`：`.session_handler(..).build()` 旧路径仍可 build。
+  - 说明：启用 feature 的真实 probe 装配路径需本机 CLI + login（`probe()` 真起进程），无法离线
+    单测；靠 feature clippy（`--features "external-claude-code external-codex external-opencode
+    external-acp"`）覆盖该分支的编译正确性。
+- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
+  `cargo test -p agent-lib --lib facade::external`（13 passed，含 3 新增）；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode
+  external-acp" -- -D warnings`（clean）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --workspace`（clean，新方法 intra-doc 链接解析通过）。
 
 ### M4-2 [TODO] 修正 README managed external quick start
 
