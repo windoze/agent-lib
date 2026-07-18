@@ -87,7 +87,11 @@ input, or credential is ever folded into an error message."，但实现违背：
   不含敏感字样）
 - [x] cassette 测试全过（claude 8、codex 8、opencode 8、acp 4）
 - [x] fmt + 双 clippy 通过
-- [ ] 全量测试（后台运行中）
-- [ ] doc 构建
-- [ ] TODO 完成记录 + review 标注（review 已标）
-- [ ] 提交
+- [x] 全量测试（默认套件 exit 0 约 49s；external features 套件无 FAILED）
+- [x] doc 构建（默认 + external features 各一遍，-D warnings 通过）
+- [x] TODO 完成记录 + review 标注
+- [x] 提交：71cd824 [M2-3] Keep untrusted runtime error text out of ExternalAgentError Display
+
+## 任务完成
+
+M2-3 已落地并提交。下一任务为 M2-4（Codex/OpenCode prompt 传参加固），留待下次调用。
