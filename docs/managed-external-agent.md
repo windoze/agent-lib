@@ -353,6 +353,12 @@ pub struct ExternalObservedEvent {
 - cassette 可以稳定断言 event 顺序。
 - resume / duplicated decision point 不会重复通知 UI。
 
+> **实现注记（M2-2 / review M-EXT-1）**：seq 线必须**跨进程**连续。四个 adapter（claude_code /
+> codex / opencode / acp）的 `resume` 会用持久化 `ExternalSessionRef.last_event_seq` 播种新 session：
+> decoder 经 `with_next_seq(high_water + 1)` 从旧水位之后继续编号，session 自身的 `last_event_seq`
+> 也恢复为持久化值（`session_ref()` 永不回退水位）。若 seq 从 0 重启，machine 的
+> `seq > consumed` dedup 会把恢复后的全部观测误判为重复而静默丢弃。
+
 迁移策略:
 
 1. 保留当前 `ExternalAgentEvent` 作为 event payload。

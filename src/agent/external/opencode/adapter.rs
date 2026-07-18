@@ -354,6 +354,23 @@ impl<L: OpenCodeLauncher> OpenCodeSession<L> {
         }
     }
 
+    /// Seeds the session from the persisted high-water mark of a resumed
+    /// session.
+    ///
+    /// Continues the decoder's `seq` line past `high_water` and restores the
+    /// session's own water mark so [`session_ref`](ExternalRuntimeSession::session_ref)
+    /// never reports a regressed `last_event_seq`. See
+    /// [`OpenCodeStreamDecoder::with_next_seq`] for why a resume must not
+    /// restart the seq line at 0.
+    #[must_use]
+    fn with_resume_high_water(mut self, high_water: Option<u64>) -> Self {
+        if let Some(high_water) = high_water {
+            self.decoder = self.decoder.with_next_seq(high_water.saturating_add(1));
+            self.last_event_seq = Some(high_water);
+        }
+        self
+    }
+
     /// Launches the first turn's process and reads its prelude until the decoder
     /// captures the runtime session id.
     ///
@@ -761,7 +778,8 @@ impl ExternalRuntimeAdapter for OpenCodeAdapter {
             Self::decode_context(&self.config, request),
             sink,
             self.capabilities.clone(),
-        );
+        )
+        .with_resume_high_water(session.last_event_seq);
         live.begin(&spec, FirstLaunch::Resume(session.clone()))
             .await?;
         Ok(Box::new(live))
@@ -1272,6 +1290,59 @@ mod tests {
         // The one recorded spec is the resume turn carrying the session id.
         let recorded = specs.lock().unwrap().clone();
         assert_eq!(recorded, vec![spec]);
+    }
+
+    #[tokio::test]
+    async fn opencode_adapter_resume_continues_the_seq_line_past_the_high_water() {
+        // A resume must continue the decoder's seq line past the persisted
+        // `last_event_seq`: restarting at 0 would let the machine's replay dedup
+        // silently drop every post-resume observation (design §5.5, review
+        // M-EXT-1).
+        let launcher = FakeLauncher::new(vec![vec![
+            step_start(SESSION_ID),
+            text(SESSION_ID, "resumed"),
+            step_finish_stop(SESSION_ID),
+        ]]);
+        let mut session = session_over(launcher, None).with_resume_high_water(Some(50));
+
+        let spec = OpenCodeTurnSpec::Resume {
+            session_id: SESSION_ID.to_owned(),
+            message: "continue".to_owned(),
+        };
+        session
+            .begin(&spec, FirstLaunch::Resume(resume_ref()))
+            .await
+            .expect("resume begin");
+        // The prelude already emitted its first observations past the mark.
+        assert!(
+            session.session_ref().last_event_seq >= Some(50),
+            "the reported water mark never regresses below the persisted one"
+        );
+
+        let ctx = run_context();
+        let follow_up = ExternalSessionInput::Continue {
+            message: "continue".to_owned(),
+        };
+        let decision = session.advance(&follow_up, &ctx).await.expect("completion");
+        let RuntimeDecisionPoint::Completed { observations, .. } = decision else {
+            panic!("expected completion");
+        };
+        assert!(!observations.is_empty());
+        assert_eq!(
+            observations[0].seq, 51,
+            "the first post-resume observation continues past the high water"
+        );
+        assert!(
+            observations
+                .windows(2)
+                .all(|pair| pair[1].seq == pair[0].seq + 1),
+            "the seq line stays contiguous"
+        );
+        assert_eq!(
+            session.session_ref().last_event_seq,
+            Some(observations.last().expect("non-empty").seq),
+            "the reported water mark never regresses below the persisted one"
+        );
     }
 
     #[tokio::test]

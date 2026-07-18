@@ -262,6 +262,23 @@ impl<Io: ClaudeSessionIo> ClaudeCodeSession<Io> {
         }
     }
 
+    /// Seeds the session from the persisted high-water mark of a resumed
+    /// session.
+    ///
+    /// Continues the decoder's `seq` line past `high_water` and restores the
+    /// session's own water mark so [`session_ref`](ExternalRuntimeSession::session_ref)
+    /// never reports a regressed `last_event_seq`. See
+    /// [`ClaudeStreamDecoder::with_next_seq`] for why a resume must not restart
+    /// the seq line at 0.
+    #[must_use]
+    fn with_resume_high_water(mut self, high_water: Option<u64>) -> Self {
+        if let Some(high_water) = high_water {
+            self.decoder = self.decoder.with_next_seq(high_water.saturating_add(1));
+            self.last_event_seq = Some(high_water);
+        }
+        self
+    }
+
     /// Runs the startup prelude for a fresh or resumed session.
     ///
     /// Claude Code emits **no output at all** — not even its `system`/`init`
@@ -654,7 +671,8 @@ impl ExternalRuntimeAdapter for ClaudeCodeAdapter {
             Self::decode_context(ctx, request),
             sink,
             self.capabilities.clone(),
-        );
+        )
+        .with_resume_high_water(session.last_event_seq);
         live.begin(None, Some(session_id)).await?;
         Ok(Box::new(live))
     }
@@ -1150,6 +1168,54 @@ mod tests {
         let frames = written.lock().unwrap().clone();
         assert_eq!(frames.len(), 1, "the continuation turn is written once");
         assert!(frames[0].contains("keep going"));
+    }
+
+    #[tokio::test]
+    async fn claude_code_adapter_resume_continues_the_seq_line_past_the_high_water() {
+        // A resume must continue the decoder's seq line past the persisted
+        // `last_event_seq`: restarting at 0 would let the machine's replay dedup
+        // silently drop every post-resume observation (design §5.5, review
+        // M-EXT-1).
+        let (session, _written) = session_over(
+            vec![
+                init_frame(),
+                assistant_text_frame("resumed"),
+                result_frame(),
+            ],
+            None,
+        );
+        let mut session = session.with_resume_high_water(Some(50));
+        session
+            .begin(None, Some(SESSION_ID.to_owned()))
+            .await
+            .expect("resume prelude");
+        // The restored water mark is reported even before any fresh event.
+        assert_eq!(session.session_ref().last_event_seq, Some(50));
+
+        let ctx = run_context();
+        let input = ExternalSessionInput::Continue {
+            message: "keep going".to_owned(),
+        };
+        let decision = session.advance(&input, &ctx).await.expect("completion");
+        let RuntimeDecisionPoint::Completed { observations, .. } = decision else {
+            panic!("expected completion");
+        };
+        assert!(!observations.is_empty());
+        assert_eq!(
+            observations[0].seq, 51,
+            "the first post-resume observation continues past the high water"
+        );
+        assert!(
+            observations
+                .windows(2)
+                .all(|pair| pair[1].seq == pair[0].seq + 1),
+            "the seq line stays contiguous"
+        );
+        assert_eq!(
+            session.session_ref().last_event_seq,
+            Some(observations.last().expect("non-empty").seq),
+            "the reported water mark never regresses below the persisted one"
+        );
     }
 
     #[test]

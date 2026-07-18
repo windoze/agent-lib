@@ -255,7 +255,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - 无 breaking change（仅进程管理内部行为收紧；feature 新增 unix-only `libc` optional 依赖）。
 
-### M2-2 [TODO] resume 时用持久化高水位播种 decoder seq（M-EXT-1）
+### M2-2 [DONE] resume 时用持久化高水位播种 decoder seq（M-EXT-1）
 
 上下文：
 
@@ -273,6 +273,17 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：模拟"已消费到 seq=50 → resume → 新事件"场景，断言 resume 后第一个 observation 不被 `observe()` 丢弃（machine 层测试，参考 `src/agent/external/machine/tests.rs` 现有模式）。
 - external feature 测试与 clippy 全过。
+
+完成记录：
+
+- 选型：decoder 层新增 `with_next_seq(u64)` 播种构造（四个 decoder 各一，builder 风格与既有 `with_cwd` 一致）；session 层新增 `with_resume_high_water(Option<u64>)`，同时做两件事——decoder 从 `high_water + 1`（`saturating_add`）继续编号、session 自身 `last_event_seq` 恢复为持久化值（`session_ref()` 水位永不回退）。未改 `begin` 签名（claude/acp 的 begin 只收 session id，改签名爆炸半径大于 builder 接线）。
+- 四个 resume 调用点接线（`claude_code/adapter.rs`、`codex/adapter.rs`、`opencode/adapter.rs`、`acp/adapter.rs`），均传 `session.last_event_seq`；`None`（无旧水位）时 no-op，行为与 fresh start 一致。ACP 确认同病同修。
+- 单调性依赖注释写在 `with_next_seq` rustdoc（machine dedup 只保留 `seq > consumed`，seq 从 0 重启会把恢复后全部观测误判为重复静默丢弃）与 `with_resume_high_water` rustdoc；四个 decoder 注释口径一致。
+- 测试：
+  - 四个 adapter 各一条 `*_resume_continues_the_seq_line_past_the_high_water`：以 `last_event_seq=50` resume → 喂帧到 Completed → 断言首观测 seq==51、seq 线连续、最终水位不回退。claude 额外断言 begin 后水位 == Some(50)（其 resume begin 不读帧）；codex/opencode/acp 的 begin prelude/handshake 已发观测，断言水位 ≥ 50。
+  - machine 层 `restored_machine_dedups_against_the_persisted_high_water`：completed 到水位 50 → state snapshot/serde restore（PendingInteraction 有 pending turn 无法 snapshot，故取 Completed 后 Done 态的真实跨进程场景）→ 新 turn 的 `NeedExternalSession` 请求携带 `last_event_seq=Some(50)` → seq 51 起的新观测全量 emit（不被丢弃）→ 再验证 ≤ 水位的重放仍被 dedup（钉住 dedup 侧契约，即 M-EXT-1 报告的静默缺口形态）。
+- 文档：`docs/managed-external-agent.md` §5.4 后新增 M2-2 实现注记（seq 线跨进程连续的播种机制）；`docs/review-2026-07.md` M-EXT-1 已标注 `✅ 已修复（M2-2）`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（48 个测试目标全 ok）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。无 breaking change（纯增量 API + resume 行为修复）。
 
 ### M2-3 [TODO] decoder 错误消息与"不折叠原文"承诺对齐（M-EXT-3）
 

@@ -169,6 +169,23 @@ impl AcpSession {
         }
     }
 
+    /// Seeds the session from the persisted high-water mark of a resumed
+    /// session.
+    ///
+    /// Continues the decoder's `seq` line past `high_water` and restores the
+    /// session's own water mark so [`session_ref`](ExternalRuntimeSession::session_ref)
+    /// never reports a regressed `last_event_seq`. See
+    /// [`AcpStreamDecoder::with_next_seq`] for why a resume must not restart
+    /// the seq line at 0.
+    #[must_use]
+    fn with_resume_high_water(mut self, high_water: Option<u64>) -> Self {
+        if let Some(high_water) = high_water {
+            self.decoder = self.decoder.with_next_seq(high_water.saturating_add(1));
+            self.last_event_seq = Some(high_water);
+        }
+        self
+    }
+
     /// Runs the startup handshake for a fresh (`resume == None`) or resumed
     /// (`resume == Some(id)`) session.
     ///
@@ -910,7 +927,9 @@ impl ExternalRuntimeAdapter for AcpAdapter {
                 detail: format!("failed launching acp agent to resume: {error}"),
             }
         })?;
-        let mut live = self.session_over(transport, request, ctx, sink);
+        let mut live = self
+            .session_over(transport, request, ctx, sink)
+            .with_resume_high_water(session.last_event_seq);
         live.begin(Some(session_id)).await?;
         Ok(Box::new(live))
     }
@@ -1226,6 +1245,10 @@ mod tests {
     }
 
     fn new_session_line() -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}"}}}}"#)
+    }
+
+    fn load_session_line() -> String {
         format!(r#"{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}"}}}}"#)
     }
 
@@ -1615,6 +1638,63 @@ mod tests {
             outcome,
             Err(ExternalAgentError::ResumeUnavailable { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn acp_adapter_resume_continues_the_seq_line_past_the_high_water() {
+        // A resume must continue the decoder's seq line past the persisted
+        // `last_event_seq`: restarting at 0 would let the machine's replay dedup
+        // silently drop every post-resume observation (design §5.5, review
+        // M-EXT-1).
+        let launcher = Arc::new(FakeLauncher::new(&[
+            &init_line(true),
+            &load_session_line(),
+            &text_line("resumed"),
+            &prompt_result_line(),
+        ]));
+        let adapter =
+            AcpAdapter::with_launcher(AcpConfig::opencode_acp(), launcher as Arc<dyn AcpLauncher>);
+        let ctx = run_context();
+        let session_ref = ExternalSessionRef {
+            runtime: acp_runtime_kind(),
+            session_id: Some(SESSION_ID.to_owned()),
+            transcript_ref: None,
+            resume_token: Some(SESSION_ID.to_owned()),
+            last_event_seq: Some(50),
+        };
+        let mut session = adapter
+            .resume(&session_ref, &start_request(Vec::new()), &ctx, None)
+            .await
+            .expect("resume attaches via session/load");
+        // The handshake already emitted its first observations past the mark.
+        assert!(
+            session.session_ref().last_event_seq >= Some(50),
+            "the reported water mark never regresses below the persisted one"
+        );
+
+        let decision = session
+            .advance(&start_request(Vec::new()).input, &ctx)
+            .await
+            .expect("completion");
+        let RuntimeDecisionPoint::Completed { observations, .. } = decision else {
+            panic!("expected completion");
+        };
+        assert!(!observations.is_empty());
+        assert_eq!(
+            observations[0].seq, 51,
+            "the first post-resume observation continues past the high water"
+        );
+        assert!(
+            observations
+                .windows(2)
+                .all(|pair| pair[1].seq == pair[0].seq + 1),
+            "the seq line stays contiguous"
+        );
+        assert_eq!(
+            session.session_ref().last_event_seq,
+            Some(observations.last().expect("non-empty").seq),
+            "the reported water mark never regresses below the persisted one"
+        );
     }
 
     #[test]

@@ -172,6 +172,23 @@ impl ClaudeStreamDecoder {
         }
     }
 
+    /// Seeds the `seq` line at `next_seq`, for a session resumed across
+    /// processes.
+    ///
+    /// The machine's replay dedup keeps only observations with `seq` greater
+    /// than the persisted [`ExternalSessionRef::last_event_seq`] high-water
+    /// mark, so a resumed session must continue the seq line where the previous
+    /// process left off instead of restarting at 0 — otherwise every
+    /// post-resume observation would be silently dropped as a false duplicate
+    /// (design §5.5).
+    ///
+    /// [`ExternalSessionRef::last_event_seq`]: crate::agent::external::ExternalSessionRef::last_event_seq
+    #[must_use]
+    pub fn with_next_seq(mut self, next_seq: u64) -> Self {
+        self.next_seq = next_seq;
+        self
+    }
+
     /// Returns the runtime-assigned session id, once a `system`/`init` frame has
     /// reported one.
     #[must_use]

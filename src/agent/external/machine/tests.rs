@@ -1183,6 +1183,70 @@ fn external_agent_emits_observation_notifications() {
 }
 
 #[test]
+fn restored_machine_dedups_against_the_persisted_high_water() {
+    // Cross-process resume (review M-EXT-1): the dedup high-water mark lives in
+    // the persisted state, so it survives a snapshot restore. An adapter-side
+    // resume must continue the seq line past that mark (the adapter seeds its
+    // decoder from `ExternalSessionRef::last_event_seq`) — seqs continuing at
+    // 51 are emitted, while a batch at or below the persisted mark stays
+    // deduped.
+    let mut machine = machine();
+    let opened = machine.step(StepInput::external(user_input("refactor the parser")));
+    let before_batch = observation_batch("before-restart");
+    let completed = machine.step(StepInput::resume(external_resolution(
+        opened.requirements[0].id,
+        completed_with(50, sequenced(48, before_batch.clone())),
+    )));
+    assert_eq!(external_events(&completed.notifications), before_batch);
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Done);
+
+    // Persist and restore across the process boundary; the consumed mark of 50
+    // rides the retained session facts.
+    let encoded = serde_json::to_value(machine.state()).expect("serialize state");
+    let decoded: ExternalAgentState = serde_json::from_value(encoded).expect("deserialize state");
+    let mut restored = ExternalAgentMachine::new(decoded, Arc::new(SeqRequirementIds::default()));
+
+    // The follow-up turn asks the driver to resume the persisted session, so
+    // the request carries the old high-water mark for the adapter to seed from.
+    let follow_up = restored.step(StepInput::external(user_input_seq("now add tests", 1)));
+    assert_eq!(
+        need_session_request(&follow_up)
+            .session
+            .as_ref()
+            .and_then(|session| session.last_event_seq),
+        Some(50),
+        "the resume request carries the persisted high-water mark"
+    );
+
+    // A resumed session whose decoder continued the seq line at 51 emits its
+    // first post-resume observations instead of dropping them.
+    let after_batch = observation_batch("after-restart");
+    let completed = restored.step(StepInput::resume(external_resolution(
+        follow_up.requirements[0].id,
+        completed_with(53, sequenced(51, after_batch.clone())),
+    )));
+    assert_eq!(restored.cursor().kind(), LoopCursorKind::Done);
+    assert_eq!(
+        external_events(&completed.notifications),
+        after_batch,
+        "the first observations of a resumed session survive the persisted mark"
+    );
+
+    // A decoder that wrongly restarted at 0 would produce only seqs at or below
+    // the mark; those stay deduped, which is exactly the silent gap M-EXT-1
+    // reported — this assertion pins the dedup side of the contract.
+    let third = restored.step(StepInput::external(user_input_seq("and format", 2)));
+    let replayed = restored.step(StepInput::resume(external_resolution(
+        third.requirements[0].id,
+        completed_with(53, sequenced(51, observation_batch("replay"))),
+    )));
+    assert!(
+        replayed.notifications.is_empty(),
+        "observations at or below the persisted mark must not be replayed"
+    );
+}
+
+#[test]
 fn external_agent_records_artifacts() {
     // A completed session folds `ExternalAgentOutput.artifacts` into the retained
     // trace on `ExternalAgentState`, preserving order (design §11).
