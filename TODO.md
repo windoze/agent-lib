@@ -965,7 +965,7 @@ cargo clippy --all-targets \
   --workspace`（clean，默认 + 全 external feature 均通过）；`cargo check --examples --features "…"`（clean）；
   `cargo test --all --all-targets`（全绿，无 failure）。
 
-### M4-5 [TODO] Review：managed external 可用性和 capability 来源
+### M4-5 [DONE] Review：managed external 可用性和 capability 来源
 
 检查范围：
 
@@ -990,6 +990,44 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 ```
 
 - 手工复核 `docs/refine.md` 中 “managed external capability 混淆声明和验证” 与 “README quick start 缺少 session handler” 两个条目的状态，必要时补充当前修复说明。
+
+完成记录（M4-5）：
+
+- 代码复核（逐项确认 M4-1 ~ M4-4 落地且一致）：
+  - **handler 装配路径可工作**：README managed external quick start（`README.md` §Managed
+    external）用一步式 `ManagedExternalAgent::codex()…build_with_default_session_handler().await?`
+    直接产出已挂 handler 的 agent，并说明自定义 handler 的手工 `.session_handler(..).build()`
+    路径与底层 `default_external_session_handler(&agent)`；`docs/facade-api.md` §11.2 与
+    `docs/managed-external-agent.md` 描述同一 seam。`examples/support/managed.rs` 的全手工
+    scoped-effect wiring `cargo check --examples` 通过。
+  - **默认 feature 不拉入 CLI adapter**：`build_default_registry` 每个 runtime arm 均
+    `#[cfg(feature = "external-*")]` 门控，feature 关时走 catch-all `runtime_feature_disabled`
+    非密 fail-fast；`Cargo.toml` 三个 CLI feature 为空 feature（仅复用 tokio），ACP feature 才引
+    真实 optional deps。默认 `cargo clippy --all-targets`（clean）与 `cargo check --examples`
+    （clean）证明默认 build 不链接任何 adapter 机制。
+  - **capability source 覆盖四值**：`CapabilitySource` 枚举含 `Declared` / `Supplied` /
+    `Probed` / `Negotiated`，`ExternalAgentCapabilities::source()` 暴露 provenance，构造函数
+    `declared`/`supplied`/`probed`/`from_acp_negotiation` 一一对应；serde 缺字段回落 `Declared`。
+  - **unsupported capability fallback 基于真实能力视图**：`require_capability` 读
+    `self.capabilities`（agent 当前持有的视图），`build_with_default_session_handler` probe 成功后
+    把 `Probed` 视图折回 agent 并用共享的 `validate_external_mode` 按 probed 重新校验
+    `ExternalRunMode`（probed 比 declared 窄时以 probed 为准）；ACP 无离线 probe，保留视图。
+  - **错误与测试 fixture 无 secret**：`FacadeError::{UnsupportedExternalMode,
+    UnsupportedExternalCapability}` 仅用 `&'static str` 标签 + 稳定 runtime label + 能力名列表，
+    `capability_source` 为稳定字符串；`ExternalAgent.message` 来自不含凭据的 classified
+    `ExternalAgentError`。`facade::external` 测试断言 rendered 错误含能力名/来源但不含 `KEY`/`TOKEN`。
+- 文档：`docs/refine.md` §4「Managed external capability 的 declared / verified 语义边界」与
+  §5「External quick start 文档和 handler 注入 API」各在标题下标注**状态：已修复**（§4：M4-3,
+  M4-4；§5：M4-1, M4-2；均 M4-5 复核通过），保留原始缺口描述作为背景，条目末尾新增「修复结果」
+  小节逐条说明来源模型、probed 折入/优先、一步式装配 API、README 改写与 secret-free 保证及 M4-5
+  验证结果。顶层「总体判断」剩余问题清单沿用 M3-5 约定不改（以各条目状态标注为准）。
+- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
+  `cargo test -p agent-lib --lib facade::external`（22 passed）；`cargo check --examples`（clean）；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode
+  external-acp" -- -D warnings`（clean）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --workspace`（clean）。说明：本任务为 Review + 文档修订，仅改动 `docs/refine.md`、`TODO.md`、
+  `memory/claude_plan.md`，未触碰任何库/测试编译产物代码，故未重跑全量 `cargo test --all
+  --all-targets`（上次 M4-4 全绿结果仍有效）。
 
 ## M5：完整逃生出口
 
