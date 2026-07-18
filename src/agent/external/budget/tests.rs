@@ -70,6 +70,7 @@ fn start_request() -> ExternalSessionRequest {
         agent_id: agent_id(),
         runtime: ExternalRuntimeKind::ClaudeCode,
         worktree: WorktreeRef::new("/repo/agent-lib"),
+        session_dir: None,
         session: None,
         input: ExternalSessionInput::Start {
             prompt: "do the thing".to_owned(),
@@ -84,6 +85,7 @@ fn continue_request(session_id: &str) -> ExternalSessionRequest {
         agent_id: agent_id(),
         runtime: ExternalRuntimeKind::ClaudeCode,
         worktree: WorktreeRef::new("/repo/agent-lib"),
+        session_dir: None,
         session: Some(session_ref(session_id)),
         input: ExternalSessionInput::Continue {
             message: "keep going".to_owned(),

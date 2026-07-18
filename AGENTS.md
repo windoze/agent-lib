@@ -112,9 +112,15 @@ cargo test --features "external-claude-code external-codex" \
 
 ### Safety properties
 
-- **Worktree isolation** — every managed child runs in a throwaway `git init`
-  worktree under the OS temp dir, removed when the drive finishes, so a child
-  that writes files never touches the checkout it launched from
+- **Worktree isolation** — `ExternalSessionPolicy.isolation` is applied inside
+  the library by `ExternalSessionRegistry` through its `WorktreeManager`
+  (default `GitWorktreeManager`, M2-7): the prepared path becomes the session's
+  working directory, and cleanup after a drive removes an ephemeral worktree on
+  a clean close while retaining a dirty one for inspection. Facade-managed
+  drives declare `EphemeralGitWorktree`, so their children run in a per-session
+  throwaway linked worktree under the OS temp dir; the examples build their own
+  `git init` worktree and declare `Shared` (the host owns that directory). Either
+  way, a child that writes files never touches the checkout it launched from
   (`docs/managed-external-agent.md` §16).
 - **Process-group kill** — on unix every managed child leads its own process
   group, and a force-close signals the whole group (SIGTERM, then SIGKILL), so

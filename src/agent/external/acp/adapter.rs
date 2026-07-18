@@ -854,16 +854,42 @@ impl AcpAdapter {
         Ok(())
     }
 
-    /// Resolves the working directory a session runs in: the configured working
-    /// dir when set, otherwise the request's worktree.
+    /// Resolves the effective session configuration for `request`.
+    ///
+    /// Request-level policy wins over the construction-time config (M2-7 /
+    /// M-PROM-5): [`ExternalSessionPolicy::permission_mode`] overrides
+    /// [`with_permission_mode`](AcpConfig::with_permission_mode), and a prepared
+    /// [`session_dir`](ExternalSessionRequest::session_dir) overrides
+    /// [`with_working_dir`](AcpConfig::with_working_dir).
+    fn session_config(&self, request: &ExternalSessionRequest) -> AcpConfig {
+        let mut config = self
+            .config
+            .clone()
+            .with_permission_mode(request.policy.permission_mode);
+        if let Some(dir) = &request.session_dir {
+            config = config.with_working_dir(dir.path().to_path_buf());
+        }
+        config
+    }
+
+    /// Resolves the working directory a session runs in: the request's prepared
+    /// session dir when the session layer resolved one, then the configured
+    /// working dir, otherwise the request's worktree.
     fn session_cwd(&self, request: &ExternalSessionRequest) -> PathBuf {
-        self.config
-            .working_dir()
-            .map(Path::to_path_buf)
+        request
+            .session_dir
+            .as_ref()
+            .map(|dir| dir.path().to_path_buf())
+            .or_else(|| self.config.working_dir().map(Path::to_path_buf))
             .unwrap_or_else(|| request.worktree.path().to_path_buf())
     }
 
     /// Builds a session over a freshly launched transport.
+    ///
+    /// The session's permission mode comes from the request's policy (the
+    /// request-level override, M2-7), so the plan-mode write gate inside the
+    /// session follows the per-session policy rather than the construction-time
+    /// config.
     fn session_over(
         &self,
         transport: SpawnedAcpAgent,
@@ -877,7 +903,7 @@ impl AcpAdapter {
             request.agent_id,
             sink,
             self.capabilities.clone(),
-            self.config.permission_mode(),
+            request.policy.permission_mode,
             self.session_cwd(request),
             self.config.timeout(),
         )
@@ -901,7 +927,8 @@ impl ExternalRuntimeAdapter for AcpAdapter {
         sink: Option<Arc<dyn ExternalEventSink>>,
     ) -> Result<Box<dyn ExternalRuntimeSession>, ExternalAgentError> {
         self.reject_unsupported_tools(request)?;
-        let transport = self.launcher.launch(&self.config).await?;
+        let config = self.session_config(request);
+        let transport = self.launcher.launch(&config).await?;
         let mut session = self.session_over(transport, request, ctx, sink);
         session.begin(None).await?;
         Ok(Box::new(session))
@@ -921,7 +948,8 @@ impl ExternalRuntimeAdapter for AcpAdapter {
                 detail: "acp session has no id to resume".to_owned(),
             });
         };
-        let transport = self.launcher.launch(&self.config).await.map_err(|error| {
+        let config = self.session_config(request);
+        let transport = self.launcher.launch(&config).await.map_err(|error| {
             ExternalAgentError::ResumeUnavailable {
                 session: session.clone(),
                 detail: format!("failed launching acp agent to resume: {error}"),
@@ -1162,6 +1190,7 @@ mod tests {
             agent_id: agent_id(),
             runtime: acp_runtime_kind(),
             worktree: WorktreeRef::new("/repo/agent-lib"),
+            session_dir: None,
             session: None,
             input: ExternalSessionInput::Start {
                 prompt: "investigate the failing test".to_owned(),
@@ -1493,18 +1522,23 @@ mod tests {
             &prompt_result_line(),
         ]));
         let adapter = AcpAdapter::with_launcher(
+            // The construction-time mode is Prompt; the *request* policy carries
+            // Plan, and the request level wins (M2-7) — the write must still be
+            // refused.
             AcpConfig::opencode_acp()
                 .with_working_dir(&dir)
-                .with_permission_mode(ExternalPermissionMode::Plan),
+                .with_permission_mode(ExternalPermissionMode::Prompt),
             Arc::clone(&launcher) as Arc<dyn AcpLauncher>,
         );
         let ctx = run_context();
-        let mut session = match adapter.start(&start_request(Vec::new()), &ctx, None).await {
+        let mut request = start_request(Vec::new());
+        request.policy.permission_mode = ExternalPermissionMode::Plan;
+        let mut session = match adapter.start(&request, &ctx, None).await {
             Ok(session) => session,
             Err(error) => panic!("handshake, got {error:?}"),
         };
         session
-            .advance(&start_request(Vec::new()).input, &ctx)
+            .advance(&request.input, &ctx)
             .await
             .expect("the refused write still lets the turn complete");
 
@@ -1772,5 +1806,40 @@ mod tests {
         assert_eq!(apply_line_window(content, None, None), content);
         assert_eq!(apply_line_window(content, Some(2), Some(2)), "two\nthree");
         assert_eq!(apply_line_window(content, Some(3), None), "three\nfour");
+    }
+
+    #[test]
+    fn session_config_applies_request_level_policy_overrides() {
+        // M2-7: the request's policy overrides the construction-time config,
+        // and the session cwd prefers the prepared session dir, then the
+        // config working dir, then the request worktree.
+        let adapter = AcpAdapter::new(
+            AcpConfig::new("acp-stub", Vec::<String>::new())
+                .with_permission_mode(ExternalPermissionMode::Prompt)
+                .with_working_dir("/config/dir"),
+        );
+
+        let mut request = start_request(Vec::new());
+        request.policy.permission_mode = ExternalPermissionMode::Plan;
+        request.session_dir = Some(WorktreeRef::new("/prepared/session-0"));
+
+        let effective = adapter.session_config(&request);
+        assert_eq!(effective.permission_mode(), ExternalPermissionMode::Plan);
+        assert_eq!(
+            effective.working_dir(),
+            Some(std::path::Path::new("/prepared/session-0")),
+        );
+        assert_eq!(
+            adapter.session_cwd(&request),
+            std::path::PathBuf::from("/prepared/session-0"),
+            "the prepared session dir is the session cwd"
+        );
+
+        let fallback = adapter.session_cwd(&start_request(Vec::new()));
+        assert_eq!(
+            fallback,
+            std::path::PathBuf::from("/config/dir"),
+            "without a prepared session dir the config working dir stays"
+        );
     }
 }

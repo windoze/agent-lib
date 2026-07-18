@@ -195,6 +195,7 @@ mod tests {
             agent_id: ids.agent_id(),
             runtime: ExternalRuntimeKind::ClaudeCode,
             worktree: WorktreeRef::new("/repo/agent-lib"),
+            session_dir: None,
             session: None,
             input,
             tools: Vec::new(),

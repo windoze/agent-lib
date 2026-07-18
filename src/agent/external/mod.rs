@@ -262,13 +262,33 @@ pub enum ExternalStreamPolicy {
 }
 
 /// Static policy knobs applied to one external session.
+///
+/// Every knob is consumed by a designated layer — none is advisory-only
+/// (M2-7 / M-PROM-5):
+///
+/// - [`permission_mode`](Self::permission_mode) is applied by the runtime
+///   adapter at session start/resume, overriding the adapter config's
+///   construction-time mode (which remains the fallback for adapter-level
+///   operations that carry no request, such as capability probes).
+/// - [`isolation`](Self::isolation) is applied by
+///   [`ExternalSessionRegistry`]
+///   through its [`WorktreeManager`]:
+///   the prepared path is handed to the adapter as the session's working
+///   directory ([`ExternalSessionRequest::session_dir`]) and cleaned up with
+///   the session's shutdown disposition.
+/// - [`max_turns`](Self::max_turns) is enforced by the
+///   [`ExternalAgentMachine`] as a
+///   bound on runtime round-trips (decision loops), uniformly across runtimes;
+///   it is not passed as a CLI flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalSessionPolicy {
     /// How permission-gated actions are handled.
     pub permission_mode: ExternalPermissionMode,
     /// Worktree isolation level for the session.
     pub isolation: WorktreeIsolation,
-    /// Optional cap on the number of agent turns for the session.
+    /// Optional cap on the number of agent turns (runtime round-trips) for the
+    /// session, machine-enforced with a classified
+    /// [`LimitExceeded`](ExternalAgentError::LimitExceeded) failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns: Option<u32>,
     /// How fine-grained events are surfaced.
@@ -579,7 +599,23 @@ pub struct ExternalSessionRequest {
     /// Runtime that should service the request.
     pub runtime: ExternalRuntimeKind,
     /// Filesystem boundary the session runs within.
+    ///
+    /// This is the *base* worktree the agent was assigned; the session layer
+    /// may resolve it into a different concrete directory (see
+    /// [`session_dir`](Self::session_dir)) before the runtime is spawned.
     pub worktree: WorktreeRef,
+    /// Effective working directory the session runs in, if resolved.
+    ///
+    /// The machine always mints requests with `None` here. The session layer
+    /// ([`ExternalSessionRegistry`])
+    /// fills it in with the [`PreparedWorktree`]
+    /// path produced by applying [`ExternalSessionPolicy::isolation`] through its
+    /// [`WorktreeManager`] before the
+    /// adapter starts or resumes the runtime. When `Some`, adapters treat it as
+    /// the session's working directory, overriding the adapter config's
+    /// construction-time `working_dir` (M2-7 / M-PROM-5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_dir: Option<WorktreeRef>,
     /// Existing session to continue or resume, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<ExternalSessionRef>,
@@ -1136,6 +1172,7 @@ mod tests {
             agent_id: agent_id(),
             runtime: ExternalRuntimeKind::Custom("bespoke-cli".to_owned()),
             worktree: WorktreeRef::new("/repo/agent-lib"),
+            session_dir: None,
             session: Some(session_ref()),
             input: ExternalSessionInput::Start {
                 prompt: "Refactor the parser.".to_owned(),

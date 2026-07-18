@@ -507,6 +507,7 @@ mod tests {
             agent_id: agent_id(),
             runtime: ExternalRuntimeKind::ClaudeCode,
             worktree: WorktreeRef::new("/repo/agent-lib"),
+            session_dir: None,
             session: None,
             input: ExternalSessionInput::Start {
                 prompt: "Refactor the parser.".to_owned(),

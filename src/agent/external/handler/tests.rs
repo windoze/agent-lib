@@ -45,9 +45,12 @@ fn run_context() -> RunContext {
 }
 
 fn policy() -> ExternalSessionPolicy {
+    // Shared isolation: handler tests exercise the fulfill/advance contract, not
+    // worktree preparation (covered by the registry tests), and Shared prepares
+    // without touching a real git binary.
     ExternalSessionPolicy {
         permission_mode: ExternalPermissionMode::Prompt,
-        isolation: WorktreeIsolation::EphemeralGitWorktree,
+        isolation: WorktreeIsolation::Shared,
         max_turns: Some(8),
         stream_events: ExternalStreamPolicy::Buffered,
     }
@@ -68,6 +71,7 @@ fn start_request(agent: AgentId) -> ExternalSessionRequest {
         agent_id: agent,
         runtime: ExternalRuntimeKind::ClaudeCode,
         worktree: WorktreeRef::new("/repo/agent-lib"),
+        session_dir: None,
         session: None,
         input: ExternalSessionInput::Start {
             prompt: "do the thing".to_owned(),
@@ -82,6 +86,7 @@ fn respond_request(agent: AgentId) -> ExternalSessionRequest {
         agent_id: agent,
         runtime: ExternalRuntimeKind::ClaudeCode,
         worktree: WorktreeRef::new("/repo/agent-lib"),
+        session_dir: None,
         session: Some(session_ref(SESSION_ID)),
         input: ExternalSessionInput::RespondInteraction {
             action_id: "action-1".to_owned(),

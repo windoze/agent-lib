@@ -638,6 +638,26 @@ impl ClaudeCodeAdapter {
         Ok(())
     }
 
+    /// Resolves the effective session configuration for `request`.
+    ///
+    /// Request-level policy wins over the construction-time config (M2-7 /
+    /// M-PROM-5): [`ExternalSessionPolicy::permission_mode`] overrides
+    /// [`with_permission_mode`](ClaudeCodeConfig::with_permission_mode), and a
+    /// prepared [`session_dir`](ExternalSessionRequest::session_dir) overrides
+    /// [`with_working_dir`](ClaudeCodeConfig::with_working_dir). The stored
+    /// config remains the fallback for request-less operations (the capability
+    /// probe).
+    fn session_config(&self, request: &ExternalSessionRequest) -> ClaudeCodeConfig {
+        let mut config = self
+            .config
+            .clone()
+            .with_permission_mode(request.policy.permission_mode);
+        if let Some(dir) = &request.session_dir {
+            config = config.with_working_dir(dir.path().to_path_buf());
+        }
+        config
+    }
+
     /// Builds the decode context binding permission interactions to the host's
     /// run identity and the requesting agent.
     ///
@@ -668,8 +688,9 @@ impl ExternalRuntimeAdapter for ClaudeCodeAdapter {
     ) -> Result<Box<dyn ExternalRuntimeSession>, ExternalAgentError> {
         self.reject_unsupported_tools(request)?;
 
-        let io = ClaudeProcessIo::spawn(&self.config, None)
-            .map_err(|error| launch_error(&self.config, "spawning claude code", &error))?;
+        let config = self.session_config(request);
+        let io = ClaudeProcessIo::spawn(&config, None)
+            .map_err(|error| launch_error(&config, "spawning claude code", &error))?;
         let mut session = ClaudeCodeSession::new(
             io,
             Self::decode_context(ctx, request),
@@ -677,7 +698,7 @@ impl ExternalRuntimeAdapter for ClaudeCodeAdapter {
             self.capabilities.clone(),
         );
         session
-            .begin(Some(&request.input), None, ctx, self.config.timeout())
+            .begin(Some(&request.input), None, ctx, config.timeout())
             .await?;
         Ok(Box::new(session))
     }
@@ -698,7 +719,8 @@ impl ExternalRuntimeAdapter for ClaudeCodeAdapter {
             });
         };
 
-        let io = ClaudeProcessIo::spawn(&self.config, Some(&session_id)).map_err(|error| {
+        let config = self.session_config(request);
+        let io = ClaudeProcessIo::spawn(&config, Some(&session_id)).map_err(|error| {
             ExternalAgentError::ResumeUnavailable {
                 session: session.clone(),
                 detail: format!("failed spawning claude code to resume: {:?}", error.kind()),
@@ -711,7 +733,7 @@ impl ExternalRuntimeAdapter for ClaudeCodeAdapter {
             self.capabilities.clone(),
         )
         .with_resume_high_water(session.last_event_seq);
-        live.begin(None, Some(session_id), ctx, self.config.timeout())
+        live.begin(None, Some(session_id), ctx, config.timeout())
             .await?;
         Ok(Box::new(live))
     }
@@ -881,6 +903,7 @@ mod tests {
             agent_id: agent_id(),
             runtime: ExternalRuntimeKind::ClaudeCode,
             worktree: WorktreeRef::new("/repo/agent-lib"),
+            session_dir: None,
             session: None,
             input: ExternalSessionInput::Start {
                 prompt: "investigate the failing test".to_owned(),
@@ -1555,5 +1578,51 @@ mod tests {
             assert_eq!(io.close().await, ExternalSessionShutdown::ForcedKill);
             process_group::assert_process_group_reaped(pgid).await;
         }
+    }
+
+    #[test]
+    fn session_config_applies_request_level_policy_overrides() {
+        // M2-7: the request's policy overrides the construction-time config —
+        // permission_mode always, session_dir (the registry-prepared worktree)
+        // when present; the config's working_dir remains the fallback.
+        let adapter = ClaudeCodeAdapter::new(
+            ClaudeCodeConfig::new()
+                .with_permission_mode(ExternalPermissionMode::Prompt)
+                .with_working_dir("/config/dir"),
+        );
+
+        let mut request = start_request(Vec::new());
+        request.policy.permission_mode = ExternalPermissionMode::Plan;
+        request.session_dir = Some(WorktreeRef::new("/prepared/session-0"));
+
+        let effective = adapter.session_config(&request);
+        assert_eq!(
+            effective.permission_mode(),
+            ExternalPermissionMode::Plan,
+            "the request policy mode wins over the config mode"
+        );
+        assert_eq!(
+            effective.working_dir(),
+            Some(std::path::Path::new("/prepared/session-0")),
+            "the prepared session dir wins over the config working dir"
+        );
+        let args = effective.base_session_args();
+        let flag = args
+            .iter()
+            .position(|arg| arg == "--permission-mode")
+            .expect("permission-mode flag present");
+        assert_eq!(args[flag + 1], "plan");
+
+        let fallback = adapter.session_config(&start_request(Vec::new()));
+        assert_eq!(
+            fallback.working_dir(),
+            Some(std::path::Path::new("/config/dir")),
+            "without a prepared session dir the config working dir stays"
+        );
+        assert_eq!(
+            fallback.permission_mode(),
+            ExternalPermissionMode::Prompt,
+            "the fixture request policy still overrides (here: same value)"
+        );
     }
 }

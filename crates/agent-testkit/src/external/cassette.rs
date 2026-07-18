@@ -940,8 +940,9 @@ impl CassetteRuntimeExternalSessionHandler {
             turns: Mutex::new(Some(cassette.turns.iter().cloned().collect())),
             start_log: start_log.clone(),
         };
-        let registry = Arc::new(ExternalSessionRegistry::new(
-            Arc::new(adapter) as Arc<dyn ExternalRuntimeAdapter>
+        let registry = Arc::new(ExternalSessionRegistry::with_worktree_manager(
+            Arc::new(adapter) as Arc<dyn ExternalRuntimeAdapter>,
+            Arc::new(crate::external::PassThroughWorktreeManager),
         ));
         Self {
             registry,

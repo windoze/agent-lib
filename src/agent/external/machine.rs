@@ -535,6 +535,12 @@ impl ExternalAgentMachine {
     /// with a classified [`LimitExceeded`](ExternalAgentError::LimitExceeded)
     /// before minting another `NeedExternalSession` — so an unbounded
     /// pause/respond loop stops loudly instead of spinning (design §6.3).
+    ///
+    /// The spec's [`ExternalSessionPolicy::max_turns`] is enforced here too,
+    /// uniformly across runtimes: one decision loop is one runtime round-trip,
+    /// so exceeding the policy cap fails with the same classified
+    /// [`LimitExceeded`](ExternalAgentError::LimitExceeded) rather than relying
+    /// on a CLI-specific flag (M2-7 / M-PROM-5).
     fn block_on_session(&mut self, step_id: StepId, input: ExternalSessionInput) -> StepOutcome {
         let loops = self.state.record_decision_loop();
         if let Some(limit) = self.config.max_decision_loops()
@@ -543,6 +549,18 @@ impl ExternalAgentMachine {
             return self.fail(
                 ExternalAgentError::LimitExceeded {
                     limit: format!("max external decision loops ({limit}) exceeded"),
+                }
+                .to_string(),
+            );
+        }
+        if let Some(max_turns) = self.state.spec().session_policy().max_turns
+            && loops > max_turns
+        {
+            return self.fail(
+                ExternalAgentError::LimitExceeded {
+                    limit: format!(
+                        "session policy max_turns ({max_turns}) exceeded after {loops} runtime round-trips"
+                    ),
                 }
                 .to_string(),
             );
@@ -579,6 +597,9 @@ impl ExternalAgentMachine {
             agent_id: spec.id(),
             runtime: spec.runtime().clone(),
             worktree: spec.worktree().clone(),
+            // The session layer (registry worktree preparation) resolves the
+            // effective session directory; the machine mints requests without one.
+            session_dir: None,
             session: self.state.session().cloned(),
             input,
             tools: self.state.active_tools().tools().to_vec(),

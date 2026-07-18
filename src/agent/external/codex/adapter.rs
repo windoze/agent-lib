@@ -779,6 +779,25 @@ impl CodexAdapter {
             .unwrap_or_else(|| request.worktree.path().to_string_lossy().into_owned());
         CodexDecodeContext::new().with_cwd(cwd)
     }
+
+    /// Resolves the effective session configuration for `request`.
+    ///
+    /// Request-level policy wins over the construction-time config (M2-7 /
+    /// M-PROM-5): [`ExternalSessionPolicy::permission_mode`] overrides
+    /// [`with_permission_mode`](CodexConfig::with_permission_mode), and a
+    /// prepared [`session_dir`](ExternalSessionRequest::session_dir) overrides
+    /// [`with_working_dir`](CodexConfig::with_working_dir). The stored config
+    /// remains the fallback for request-less operations (the capability probe).
+    fn session_config(&self, request: &ExternalSessionRequest) -> CodexConfig {
+        let mut config = self
+            .config
+            .clone()
+            .with_permission_mode(request.policy.permission_mode);
+        if let Some(dir) = &request.session_dir {
+            config = config.with_working_dir(dir.path().to_path_buf());
+        }
+        config
+    }
 }
 
 #[async_trait]
@@ -808,15 +827,16 @@ impl ExternalRuntimeAdapter for CodexAdapter {
             prompt: prompt.clone(),
         };
 
-        let launcher = SystemCodexLauncher::new(self.config.clone());
+        let config = self.session_config(request);
+        let launcher = SystemCodexLauncher::new(config.clone());
         let mut session = CodexSession::new(
             launcher,
-            Self::decode_context(&self.config, request),
+            Self::decode_context(&config, request),
             sink,
             self.capabilities.clone(),
         );
         session
-            .begin(&spec, FirstLaunch::Fresh, ctx, self.config.timeout())
+            .begin(&spec, FirstLaunch::Fresh, ctx, config.timeout())
             .await?;
         Ok(Box::new(session))
     }
@@ -842,10 +862,11 @@ impl ExternalRuntimeAdapter for CodexAdapter {
             message,
         };
 
-        let launcher = SystemCodexLauncher::new(self.config.clone());
+        let config = self.session_config(request);
+        let launcher = SystemCodexLauncher::new(config.clone());
         let mut live = CodexSession::new(
             launcher,
-            Self::decode_context(&self.config, request),
+            Self::decode_context(&config, request),
             sink,
             self.capabilities.clone(),
         )
@@ -854,7 +875,7 @@ impl ExternalRuntimeAdapter for CodexAdapter {
             &spec,
             FirstLaunch::Resume(session.clone()),
             ctx,
-            self.config.timeout(),
+            config.timeout(),
         )
         .await?;
         Ok(Box::new(live))
@@ -996,6 +1017,7 @@ mod tests {
             agent_id: agent_id(),
             runtime: ExternalRuntimeKind::Codex,
             worktree: WorktreeRef::new("/repo/agent-lib"),
+            session_dir: None,
             session: None,
             input: ExternalSessionInput::Start {
                 prompt: "investigate the failing test".to_owned(),
@@ -1979,5 +2001,51 @@ mod tests {
             assert_eq!(turn.close().await, ExternalSessionShutdown::ForcedKill);
             process_group::assert_process_group_reaped(pgid).await;
         }
+    }
+
+    #[test]
+    fn session_config_applies_request_level_policy_overrides() {
+        // M2-7: the request's policy overrides the construction-time config,
+        // flowing into the approval/sandbox flags every turn spawns with.
+        let adapter = CodexAdapter::new(
+            CodexConfig::new()
+                .with_permission_mode(ExternalPermissionMode::Prompt)
+                .with_working_dir("/config/dir"),
+        );
+
+        let mut request = start_request(Vec::new());
+        request.policy.permission_mode = ExternalPermissionMode::BypassPermissions;
+        request.session_dir = Some(WorktreeRef::new("/prepared/session-0"));
+
+        let effective = adapter.session_config(&request);
+        assert_eq!(
+            effective.permission_mode(),
+            ExternalPermissionMode::BypassPermissions,
+        );
+        assert_eq!(
+            effective.working_dir(),
+            Some(std::path::Path::new("/prepared/session-0")),
+        );
+        let spec = CodexTurnSpec::Fresh {
+            prompt: "do the thing".to_owned(),
+        };
+        let args = spec.args(&effective);
+        let approval = args
+            .iter()
+            .position(|arg| arg == "-a")
+            .expect("approval flag present");
+        assert_eq!(args[approval + 1], "never");
+        let sandbox = args
+            .iter()
+            .position(|arg| arg == "-s")
+            .expect("sandbox flag present");
+        assert_eq!(args[sandbox + 1], "danger-full-access");
+
+        let fallback = adapter.session_config(&start_request(Vec::new()));
+        assert_eq!(
+            fallback.working_dir(),
+            Some(std::path::Path::new("/config/dir")),
+            "without a prepared session dir the config working dir stays"
+        );
     }
 }

@@ -803,6 +803,28 @@ impl OpenCodeAdapter {
             .unwrap_or_else(|| request.worktree.path().to_string_lossy().into_owned());
         OpenCodeDecodeContext::new().with_cwd(cwd)
     }
+
+    /// Resolves the effective session configuration for `request`.
+    ///
+    /// Request-level policy wins over the construction-time config (M2-7 /
+    /// M-PROM-5): [`ExternalSessionPolicy::permission_mode`] overrides
+    /// [`with_permission_mode`](OpenCodeConfig::with_permission_mode), and a
+    /// prepared [`session_dir`](ExternalSessionRequest::session_dir) overrides
+    /// [`with_working_dir`](OpenCodeConfig::with_working_dir) — which is what
+    /// [`base_run_args`](OpenCodeConfig::base_run_args) emits as `--dir`, so a
+    /// prepared worktree flows through to the flag OpenCode actually resolves
+    /// file operations from. The stored config remains the fallback for
+    /// request-less operations (the capability probe).
+    fn session_config(&self, request: &ExternalSessionRequest) -> OpenCodeConfig {
+        let mut config = self
+            .config
+            .clone()
+            .with_permission_mode(request.policy.permission_mode);
+        if let Some(dir) = &request.session_dir {
+            config = config.with_working_dir(dir.path().to_path_buf());
+        }
+        config
+    }
 }
 
 #[async_trait]
@@ -832,15 +854,16 @@ impl ExternalRuntimeAdapter for OpenCodeAdapter {
             prompt: prompt.clone(),
         };
 
-        let launcher = SystemOpenCodeLauncher::new(self.config.clone());
+        let config = self.session_config(request);
+        let launcher = SystemOpenCodeLauncher::new(config.clone());
         let mut session = OpenCodeSession::new(
             launcher,
-            Self::decode_context(&self.config, request),
+            Self::decode_context(&config, request),
             sink,
             self.capabilities.clone(),
         );
         session
-            .begin(&spec, FirstLaunch::Fresh, ctx, self.config.timeout())
+            .begin(&spec, FirstLaunch::Fresh, ctx, config.timeout())
             .await?;
         Ok(Box::new(session))
     }
@@ -866,10 +889,11 @@ impl ExternalRuntimeAdapter for OpenCodeAdapter {
             message,
         };
 
-        let launcher = SystemOpenCodeLauncher::new(self.config.clone());
+        let config = self.session_config(request);
+        let launcher = SystemOpenCodeLauncher::new(config.clone());
         let mut live = OpenCodeSession::new(
             launcher,
-            Self::decode_context(&self.config, request),
+            Self::decode_context(&config, request),
             sink,
             self.capabilities.clone(),
         )
@@ -878,7 +902,7 @@ impl ExternalRuntimeAdapter for OpenCodeAdapter {
             &spec,
             FirstLaunch::Resume(session.clone()),
             ctx,
-            self.config.timeout(),
+            config.timeout(),
         )
         .await?;
         Ok(Box::new(live))
@@ -1020,6 +1044,7 @@ mod tests {
             agent_id: agent_id(),
             runtime: ExternalRuntimeKind::OpenCode,
             worktree: WorktreeRef::new("/repo/agent-lib"),
+            session_dir: None,
             session: None,
             input: ExternalSessionInput::Start {
                 prompt: "investigate the failing test".to_owned(),
@@ -2078,5 +2103,49 @@ mod tests {
             assert_eq!(turn.close().await, ExternalSessionShutdown::ForcedKill);
             process_group::assert_process_group_reaped(pgid).await;
         }
+    }
+
+    #[test]
+    fn session_config_applies_request_level_policy_overrides() {
+        // M2-7: the request's policy overrides the construction-time config;
+        // the prepared session dir flows into the `--dir` flag OpenCode
+        // actually resolves file operations from.
+        let adapter = OpenCodeAdapter::new(
+            OpenCodeConfig::new()
+                .with_permission_mode(ExternalPermissionMode::Prompt)
+                .with_working_dir("/config/dir"),
+        );
+
+        let mut request = start_request(Vec::new());
+        request.policy.permission_mode = ExternalPermissionMode::BypassPermissions;
+        request.session_dir = Some(WorktreeRef::new("/prepared/session-0"));
+
+        let effective = adapter.session_config(&request);
+        assert_eq!(
+            effective.permission_mode(),
+            ExternalPermissionMode::BypassPermissions,
+        );
+        assert!(effective.auto_approve());
+        let spec = OpenCodeTurnSpec::Fresh {
+            prompt: "do the thing".to_owned(),
+        };
+        let args = spec.args(&effective);
+        assert!(args.iter().any(|arg| arg == "--auto"));
+        let dir = args
+            .iter()
+            .position(|arg| arg == "--dir")
+            .expect("--dir flag present");
+        assert_eq!(args[dir + 1], "/prepared/session-0");
+
+        let fallback = adapter.session_config(&start_request(Vec::new()));
+        assert!(
+            !fallback.auto_approve(),
+            "the fixture policy is AcceptEdits"
+        );
+        assert_eq!(
+            fallback.working_dir(),
+            Some(std::path::Path::new("/config/dir")),
+            "without a prepared session dir the config working dir stays"
+        );
     }
 }

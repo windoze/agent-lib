@@ -1015,7 +1015,12 @@ const DEFAULT_EXTERNAL_IO_TIMEOUT: Duration = Duration::from_secs(120);
 /// permission mode), runs the runtime's capability probe (for the CLI runtimes)
 /// so the reported capabilities are the verified intersection rather than the
 /// declared baseline (§11.3), and wraps the probed adapter in a fresh registry.
-/// The returned handler is ready to inject with
+/// The registry owns a default
+/// [`GitWorktreeManager`](crate::agent::external::GitWorktreeManager), so the
+/// delegate policy's `isolation` level is applied inside the library on every
+/// session start/resume and cleaned up with the session's shutdown disposition
+/// (M2-7, `docs/managed-external-agent.md` §16). The returned handler is ready
+/// to inject with
 /// [`ManagedExternalAgentBuilder::session_handler`]. Because it returns the
 /// concrete [`RegistryExternalSessionHandler`] (which coerces to
 /// `Arc<dyn ExternalSessionHandler>` at the injection point), a host keeps the

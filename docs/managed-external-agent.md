@@ -129,7 +129,7 @@ scope wiring 决定 attended / headless 行为。
 | budget | handler/driver charge tokens/cost | runtime usage/cost event charge | 已落地(M9-2):`ExternalUsageChargingHandler` 把 runtime usage/cost 计入 run budget,见 §17 |
 | trace | requirement + tool + subagent nodes | external events + shutdown + artifacts | 部分已有:requirement/subagent/shutdown 节点已接;artifact 追踪见下 |
 | artifact | tool/model output | patch/diff/test/file artifact refs | 部分已有:见 §18 |
-| worktree isolation | `WorktreeRef` | shared / per-agent / ephemeral worktree manager | 已落地(M9-1):`WorktreeManager`/`GitWorktreeManager`(prepare/cleanup + residual 标记),见 §16 |
+| worktree isolation | `WorktreeRef` | shared / per-agent / ephemeral worktree manager | 已落地(M9-1):`WorktreeManager`/`GitWorktreeManager`(prepare/cleanup + residual 标记);库内接线(M2-7):registry 持有 manager,start/resume 前 prepare、cleanup 按 disposition 清扫,见 §16 |
 | reconfig | queued tool set swap | boundary-level tool bridge reconfigure | 已落地(M9-3):`ExternalAgentMachine::reconfigure` + `ExternalReconfigTiming`/`ExternalReconfigOutcome`(boundary 应用/排队;in-flight `Hot`→`UnsupportedCapability{Reconfigure}`),见 §19 |
 | snapshot/restore | `AgentState` + Conversation snapshot | `ExternalAgentState` + `ExternalSessionRef` resume | 已落地:`ExternalAgentState` 持久化 spec/session/cursor/conversation,registry 依 `ExternalSessionRef` reattach/`resume`(capability-gated),未知不可 resume 的 session 以 `ResumeUnavailable` 显式失败 |
 
@@ -512,7 +512,10 @@ StepInput::External(AgentInput::Pivot)
 external 也需要对应能力。已落地(M4-3)的做法把配置分成两半:
 
 - **runtime-facing hints** = `ExternalSessionPolicy`(permission/isolation/max_turns/stream_events),
-  随每个 `ExternalSessionRequest` 传给 handler / runtime。
+  随每个 `ExternalSessionRequest` 传给 handler / runtime。M2-7 起每个字段都有指定消费方:
+  `permission_mode` 由 adapter 在 start/resume 应用（请求级覆盖构造期 config）;`isolation` 由
+  registry 经 `WorktreeManager` 执行（§16）;`max_turns` 由 machine 强制为 runtime round-trip
+  （decision loop）上限，超限以分类 `LimitExceeded` 失败，不传 CLI flag（四个 runtime 口径一致）。
 - **machine-local policy** = `ExternalAgentMachineConfig`(纯数据 serde DTO,不进 `ExternalAgentState`,
   也不持有 live handler/sink/id source):
 
@@ -1268,6 +1271,8 @@ OpenCode 需要先做 capability probe,因为部署形态可能更多。
 >   OS 级 cwd——`tokio::process` 的 `current_dir()` 只 `chdir` 却不更新继承来的 `PWD`(仍指向启动进程的
 >   目录),故若只设 cwd,OpenCode 会把文件写进**启动它的那个 checkout**(实测复现)。因此 working dir 必须
 >   走 `--dir`(authoritative,压过 cwd 与 `$PWD`);launcher 另把它设为进程 `current_dir` 作 belt-and-suspenders。
+>   M2-7 起 registry prepare 产出的 `request.session_dir` 优先于构造期 `working_dir` 进入同一条
+>   `--dir` 通道（`session_config` 覆盖）,库内隔离对 OpenCode 真正生效。
 > - 真机 e2e:[`tests/external_opencode.rs`](../tests/external_opencode.rs) 有一个 `#[ignore]` 用例,通过
 >   `OPENCODE_BIN` 或 PATH 发现 `opencode`(可选 `OPENCODE_MODEL`/`OPENCODE_AGENT`),缺失 binary/登录即带清晰
 >   信息**跳过**(退出为绿),否则在临时 git worktree 里以 `BypassPermissions`(映射 `--auto`,让自主 CLI 能落盘
@@ -1350,7 +1355,18 @@ ExternalAgentError::UnsupportedCapability {
 ## 16. worktree isolation
 
 `WorktreeIsolation` 曾经只是 data。M9-1 起 `WorktreeManager` 真正执行隔离,默认实现
-`GitWorktreeManager`(handler/scheduler 侧 hook,object-safe,可作 `Arc<dyn WorktreeManager>`):
+`GitWorktreeManager`(handler/scheduler 侧 hook,object-safe,可作 `Arc<dyn WorktreeManager>`);
+M2-7 起该 manager 接入库内生产路径——`ExternalSessionRegistry` 持有一个
+`Arc<dyn WorktreeManager>`（`ExternalSessionRegistry::new` 默认 `GitWorktreeManager::new()`,
+`with_worktree_manager` 可注入），在 `get_or_start` 的每次 start/resume 前先按
+`request.policy.isolation` 调 `prepare`，把 prepared 路径写入 `request.session_dir` 交给
+adapter（各 adapter 的工作目录优先级：`session_dir` > 构造期 `config.working_dir`；
+OpenCode 同时贯通到 `--dir`）；registry 记住每个 live session 的 `PreparedWorktree`,
+`cleanup`/`cleanup_agent` 在 session 关闭后以同一 disposition 调 `WorktreeManager::cleanup`。
+prepare 失败按 start/resume 分类轴报 `Launch`/`ResumeUnavailable`;adapter start 失败的
+prepared 树以 `Graceful` 丢弃（ephemeral 不泄漏）;worktree cleanup 失败把返回的 disposition
+升级为 `Failed`（树可能残留，属 residual side effect）。reattach 到 live handle 不重复
+prepare。示例与 e2e 自建一次性 worktree 并声明 `Shared`（prepare 直通），该模式不变。
 
 | isolation | prepare 行为 | cleanup 行为 |
 |---|---|---|
@@ -1403,9 +1419,11 @@ placement/teardown 策略在无真实仓库下即可单测。
   `WorktreeCleanupOutcome::residual_side_effects()=true`,ephemeral 也**保留**供排查,
   `safe_to_reuse()` 返回 false。forced kill / failed 绝不误标 clean。
 
-registry 的 `cleanup` / `cleanup_agent` 返回 `ExternalSessionShutdown`;scheduler 把该 disposition
-既喂给 `TraceHandle::record_external_shutdown`(审计),又喂给 `WorktreeManager::cleanup`
-(决定删除/保留/标记),二者用同一 disposition 保持一致。Codex/OpenCode session 的 `shutdown()`
+registry 的 `cleanup` / `cleanup_agent` 在关闭 session 后自己把 disposition 喂给
+`WorktreeManager::cleanup`（M2-7,决定删除/保留/标记）；worktree cleanup 失败时返回的
+disposition 升级为 `Failed`。scheduler 仍把返回的 disposition 喂给
+`TraceHandle::record_external_shutdown`（审计），两处用同一 disposition 保持一致。
+Codex/OpenCode session 的 `shutdown()`
 会把 session 期间每次 mid-turn close(follow-up spawn 前关闭上一 turn 进程)的 disposition 折叠进
 最终报告(M2-5):severity `Graceful < Failed < ForcedKill`,中途被强杀/关闭失败的 turn 进程同样
 使最终 disposition 保持非 `Graceful`;这些 mid-turn close 同时以 `record_external_shutdown`

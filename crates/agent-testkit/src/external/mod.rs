@@ -67,17 +67,58 @@ use agent_lib::agent::external::{
     ExternalAgentSpec, ExternalAgentState, ExternalArtifactKind, ExternalArtifactRef,
     ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionInput,
     ExternalSessionPolicy, ExternalSessionRef, ExternalSessionRequest, ExternalSessionResult,
-    ExternalStreamPolicy, ExternalSubagentRequest, ExternalSubagentRequestId, ExternalToolBatchId,
-    ExternalToolCall, WorktreeIsolation,
+    ExternalSessionShutdown, ExternalStreamPolicy, ExternalSubagentRequest,
+    ExternalSubagentRequestId, ExternalToolBatchId, ExternalToolCall, PreparedWorktree,
+    WorktreeCleanupOutcome, WorktreeError, WorktreeIsolation, WorktreeManager,
 };
 use agent_lib::agent::{
-    AgentSpecRef, ExternalSessionHandler, Interaction, PermissionCategory, PermissionRequest,
-    PermissionRisk, RequirementKindTag, RequirementResult, RunContext, ToolSetRef, WorktreeRef,
+    AgentId, AgentSpecRef, ExternalSessionHandler, Interaction, PermissionCategory,
+    PermissionRequest, PermissionRisk, RequirementKindTag, RequirementResult, RunContext,
+    ToolSetRef, WorktreeRef,
 };
 use agent_lib::conversation::{Conversation, ConversationConfig};
 use async_trait::async_trait;
 
 use crate::ids::SeqIds;
+
+/// A [`WorktreeManager`] that performs no filesystem work.
+///
+/// Scripted and cassette drives never touch a real worktree: their requests
+/// name fixture paths that need no git backing, so the registry's isolation
+/// wiring (M2-7) is satisfied by returning the requested base unchanged from
+/// `prepare` and treating `cleanup` as a recorded no-op. The registry's real
+/// [`GitWorktreeManager`](agent_lib::agent::external::GitWorktreeManager)
+/// behavior is covered by agent-lib's own registry/worktree tests.
+#[derive(Debug, Default)]
+pub struct PassThroughWorktreeManager;
+
+#[async_trait]
+impl WorktreeManager for PassThroughWorktreeManager {
+    async fn prepare(
+        &self,
+        agent_id: AgentId,
+        base: &WorktreeRef,
+        isolation: WorktreeIsolation,
+    ) -> Result<PreparedWorktree, WorktreeError> {
+        Ok(
+            PreparedWorktree::new(agent_id, isolation, base.clone(), false)
+                .with_base_repo(base.clone()),
+        )
+    }
+
+    async fn cleanup(
+        &self,
+        prepared: PreparedWorktree,
+        disposition: ExternalSessionShutdown,
+    ) -> Result<WorktreeCleanupOutcome, WorktreeError> {
+        Ok(WorktreeCleanupOutcome::new(
+            prepared.isolation(),
+            prepared.worktree().clone(),
+            false,
+            disposition.leaves_residual_side_effects(),
+        ))
+    }
+}
 use crate::script::{CallLog, Script, ScriptStep};
 
 /// The observable call log of a scripted external session handler.
@@ -194,7 +235,7 @@ impl ExternalSessionHandler for ScriptedExternalSessionHandler {
 
 /// Builds provider-neutral external-agent effect shapes for tests.
 ///
-/// The fixture draws identity-bearing ids ([`AgentId`](agent_lib::agent::AgentId),
+/// The fixture draws identity-bearing ids ([`AgentId`],
 /// [`StepId`](agent_lib::agent::StepId)) from a [`SeqIds`] handle so a whole test
 /// tree stays deterministic and globally unique, matching the rest of
 /// [`crate::fixtures`]. It constructs only the *data* an
@@ -298,6 +339,7 @@ impl ExternalAgentFixture {
             agent_id: self.ids.agent_id(),
             runtime: ExternalRuntimeKind::ClaudeCode,
             worktree: WorktreeRef::new("/repo/agent-lib"),
+            session_dir: None,
             session: None,
             input: ExternalSessionInput::Start {
                 prompt: prompt.to_owned(),
@@ -315,6 +357,7 @@ impl ExternalAgentFixture {
             agent_id: self.ids.agent_id(),
             runtime: ExternalRuntimeKind::ClaudeCode,
             worktree: WorktreeRef::new("/repo/agent-lib"),
+            session_dir: None,
             session: Some(self.session_ref()),
             input: ExternalSessionInput::Continue {
                 message: message.to_owned(),

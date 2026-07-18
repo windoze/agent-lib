@@ -326,6 +326,7 @@ pub struct ExternalSessionRequest {
     pub agent_id: AgentId,
     pub runtime: ExternalRuntimeKind,
     pub worktree: WorktreeRef,
+    pub session_dir: Option<WorktreeRef>,  // (M2-7) registry prepare 后的 session 工作目录
     pub session: Option<ExternalSessionRef>,
     pub input: ExternalSessionInput,
     pub tools: Vec<Tool>,
@@ -339,6 +340,11 @@ pub enum ExternalSessionInput {
     Shutdown,
 }
 ```
+
+> `session_dir`（M2-7 新增）由 session 层（`ExternalSessionRegistry` 的 `WorktreeManager`
+> prepare）填写：machine 铸造请求时恒为 `None`;registry 按 `policy.isolation` prepare 后
+> 把 prepared 路径写入该字段,adapter 以它为 session 工作目录（优先于构造期
+> `config.working_dir`,OpenCode 贯通到 `--dir`）。详见 `managed-external-agent.md` §16。
 
 ### 5.2 Result
 

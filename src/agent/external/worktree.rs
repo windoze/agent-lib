@@ -151,6 +151,28 @@ pub struct WorktreeCleanupOutcome {
 }
 
 impl WorktreeCleanupOutcome {
+    /// Builds a cleanup outcome from its parts.
+    ///
+    /// [`GitWorktreeManager`] constructs its outcomes internally; this
+    /// constructor exists so a host-provided [`WorktreeManager`] implementation
+    /// (injected via
+    /// [`ExternalSessionRegistry::with_worktree_manager`](super::ExternalSessionRegistry::with_worktree_manager))
+    /// can report what its cleanup did.
+    #[must_use]
+    pub const fn new(
+        isolation: WorktreeIsolation,
+        worktree: WorktreeRef,
+        removed: bool,
+        residual_side_effects: bool,
+    ) -> Self {
+        Self {
+            isolation,
+            worktree,
+            removed,
+            residual_side_effects,
+        }
+    }
+
     /// Returns the isolation policy of the cleaned-up worktree.
     #[must_use]
     pub const fn isolation(&self) -> WorktreeIsolation {

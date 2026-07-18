@@ -475,7 +475,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - 文档：`docs/managed-external-agent.md` §16 补充 base repo 记录与损坏树兜底描述；`docs/review-2026-07.md` M-EXT-7 已标注 `✅ 已修复（M2-6）`。无 breaking change（`new()` 签名不变）。
 
-### M2-7 [TODO] `ExternalSessionPolicy` 与 `WorktreeManager` 接入（M-PROM-5）
+### M2-7 [DONE] `ExternalSessionPolicy` 与 `WorktreeManager` 接入（M-PROM-5）
 
 上下文：
 
@@ -501,6 +501,76 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 决策与理由写入完成记录；文档措辞与实现一致。
 - 单元测试覆盖：请求级 permission_mode 覆盖生效；registry 在 start 前调 `prepare`、在 cleanup 时按 disposition 调 `cleanup`（可用现有 `ScriptedGit`/`MockAdapter` 测试替身，见 worktree.rs:532、registry.rs:479）。
 - external feature 测试与 clippy 全过。
+
+完成记录：
+
+- **总体选型（按任务既定决策的库内接线方案落地）**：registry 层是唯一 choke point，
+  三个 policy 字段各有指定消费方，不再有静默忽略的 hint。
+- **`isolation`（registry 接线）**：`ExternalSessionRegistry` 新增
+  `worktrees: Arc<dyn WorktreeManager>` 字段；`new()` 默认 `GitWorktreeManager::new()`（行为
+  变化点：此前 registry 不做任何 worktree 管理），新增 `with_worktree_manager()` 注入构造。
+  `get_or_start` 在 start 与 resume（无 live handle）两条路径上先
+  `prepare(agent_id, &request.worktree, policy.isolation)`，reattach 不重复 prepare；
+  prepared 路径写入**新增的 `ExternalSessionRequest::session_dir: Option<WorktreeRef>`**
+  （`#[serde(default, skip_serializing_if)]`，旧 wire 数据/ cassette 兼容；不改写
+  `request.worktree`，base 语义保留）交给 adapter。registry map value 改
+  `LiveEntry { handle, prepared }`（`LiveSessionHandle` pub 类型与 `get()` 签名不变）；
+  `cleanup`/`cleanup_agent` 关闭 session 后以同一 disposition 调
+  `WorktreeManager::cleanup`——prepare 失败按分类轴报 `Launch`/`ResumeUnavailable`；
+  adapter start 失败的 prepared 树以 `Graceful` 丢弃（ephemeral 不泄漏，树未被写过）；
+  worktree cleanup 失败把返回 disposition 升级为 `Failed`（树可能残留即 residual）。
+- **`session_dir` 贯通（含 opencode `--dir` 漏传）**：四个 adapter 各新增私有
+  `session_config(request)`——clone 构造期 config 并应用请求级覆盖
+  （`with_permission_mode(request.policy.permission_mode)`；`session_dir` →
+  `with_working_dir`），spawn/argv/decode context/prelude timeout 全部走 effective config。
+  优先级：`session_dir` > `config.working_dir()`（ACP 保留第三级回退 `request.worktree`）。
+  OpenCode 的 prepared 路径经同一条 `base_run_args` 通道以 `--dir` 传出，"漏传 `--dir` 会写进
+  启动 checkout" 的面在库内隔离下闭合。
+- **`permission_mode`（请求级覆盖）**：随 `session_config` 落地——claude 的
+  `--permission-mode`、codex 的 `-a`/`-s`、opencode 的 `--auto`、ACP session 的 mode（其
+  plan-mode 写门禁 `service_write_file` 随之按请求策略生效）。构造期 config 的 mode 降为
+  无请求路径（capability probe）的默认值，文档如实标注。
+- **`max_turns`（machine 强制，选型记录）**：选 machine 统一强制而非 CLI flag——四个
+  runtime 口径一致、离线可测，且不依赖各 CLI 有无等价 flag（codex/opencode 无）。
+  `block_on_session` 在 `record_decision_loop` 后检查 `policy.max_turns`，超限以分类
+  `LimitExceeded`（"session policy max_turns (n) exceeded"）失败；一个 decision loop =
+  一次 runtime round-trip 的语义写入 policy rustdoc 与能力矩阵。
+- **配套 API 增量**：`WorktreeCleanupOutcome::new` 公有构造器（`WorktreeManager` 是公有可注入
+  trait，此前外部实现无法构造返回值——本次接线暴露的 API 缺口，同类修复）。
+- **测试**：
+  - registry（stub `StubWorktreeManager` + 扩展 `MockAdapter` 捕获 `session_dir`）：start
+    前 prepare（agent/base/isolation 三参）且 adapter 收到 prepared 路径、reattach 不重复
+    prepare、resume 同样 prepare、prepare 失败两轴分类（`Launch`/`ResumeUnavailable`）、
+    start 失败丢弃 prepared（Graceful）、cleanup 按 session disposition（ForcedKill）清扫、
+    cleanup_agent 逐 session 清扫、worktree cleanup 失败升级 `Failed`，共 8 条新增；既有 9
+    条改走 stub 注入。
+  - 四 adapter 各一条 `session_config_applies_request_level_policy_overrides`（mode 与
+    working_dir 覆盖 + argv 旗帜断言：claude `--permission-mode plan`、codex `-a never -s
+    danger-full-access`、opencode `--auto` + `--dir <prepared>`、ACP `session_cwd` 优先级）；
+    ACP `acp_adapter_plan_mode_refuses_fs_write` 改为请求 policy 携带 Plan（config 故意
+    Prompt，钉住请求级覆盖）。
+  - machine `external_session_policy_max_turns_bounds_runtime_round_trips`：cap=2 时第三次
+    round-trip 以 `LimitExceeded` 失败、不 mint 新 requirement、pending turn 被正常清理。
+  - testkit 新增 `PassThroughWorktreeManager`（无文件系统操作），scripted/cassette handler
+    的 registry 改注入它（cassette/scripted 测试不演练 worktree 管理，真实 manager 行为由
+    registry/worktree 测试覆盖）；`tests/external_*.rs` 四个真机 e2e 夹具 isolation 改
+    `Shared`（测试自建一次性 worktree，与 examples/support/managed.rs 同一模式）。
+- **文档**：`ExternalSessionPolicy`/request rustdoc 写明三字段消费方；registry 模块文档新增
+  worktree isolation 节；`docs/managed-external-agent.md` §16 新增 M2-7 接线段（优先级、失败
+  分类、丢弃/升级语义）+ §14 opencode `--dir` 补 M2-7 注记 + 能力表 worktree 行与 policy 节
+  同步；`docs/external-agent.md` §5.1 请求结构补 `session_dir`；`docs/capability-matrix.md`
+  policy 边界节与安全属性改为库内接线口径；AGENTS.md Worktree isolation 条目改为库级保证的
+  准确描述（facade 驱动 EphemeralGitWorktree 实际生效；示例 Shared 模式不变）；
+  `docs/review-2026-07.md` M-PROM-5 已标注 `✅ 已修复（M2-7）`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy
+  --all-targets --features "external-claude-code external-codex external-opencode external-acp"
+  -- -D warnings`、`cargo test --all --all-targets`、`cargo test --features "external-claude-code
+  external-codex external-opencode external-acp" --all-targets`、`RUSTDOCFLAGS="-D warnings"
+  cargo doc --no-deps --workspace` 全部通过。
+- **Breaking change**（pre-1.0，记录在此）：`ExternalSessionRequest` 新增 pub 字段
+  `session_dir`（struct literal 构造点需补；serde wire 兼容）；`ExternalSessionRegistry::new`
+  默认接线 `GitWorktreeManager`——非 `Shared` isolation 的驱动现在会真实 prepare/cleanup
+  worktree（facade 受管驱动声明的 `EphemeralGitWorktree` 从静默忽略变为实际生效）。
 
 ### M2-8 [TODO] M2 review：external 生命周期收口
 

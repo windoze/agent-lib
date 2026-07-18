@@ -28,6 +28,25 @@
 //! [`cleanup_agent`](ExternalSessionRegistry::cleanup_agent), each returning the
 //! [`ExternalSessionShutdown`] disposition a scheduler records to decide whether
 //! the worktree is safe to reuse.
+//!
+//! # Worktree isolation (M2-7 / M-PROM-5)
+//!
+//! The registry is the single choke point every managed session start/resume
+//! flows through, so it is also where
+//! [`ExternalSessionPolicy::isolation`](super::ExternalSessionPolicy) becomes
+//! real: before the adapter starts or resumes a session, the registry applies
+//! the request's isolation level through its
+//! [`WorktreeManager`](super::WorktreeManager) (a
+//! [`GitWorktreeManager`](super::GitWorktreeManager) by default) and hands the
+//! prepared path to the adapter as the session's working directory
+//! ([`ExternalSessionRequest::session_dir`]). Each live session's
+//! [`PreparedWorktree`] is remembered, and
+//! [`cleanup`](ExternalSessionRegistry::cleanup) /
+//! [`cleanup_agent`](ExternalSessionRegistry::cleanup_agent) feed the session's
+//! shutdown disposition into
+//! [`WorktreeManager::cleanup`](super::WorktreeManager::cleanup) so an
+//! ephemeral worktree is removed only when the session closed without residual
+//! side effects.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -39,7 +58,7 @@ use crate::agent::{AgentId, RunContext};
 use super::{
     ExternalAgentError, ExternalEventSink, ExternalRuntimeAdapter, ExternalRuntimeCapabilities,
     ExternalRuntimeKind, ExternalRuntimeSession, ExternalSessionRef, ExternalSessionRequest,
-    ExternalSessionShutdown,
+    ExternalSessionShutdown, GitWorktreeManager, PreparedWorktree, WorktreeManager,
 };
 
 /// A shared handle to one live [`ExternalRuntimeSession`].
@@ -51,6 +70,16 @@ use super::{
 /// handler drives another. Cloning a handle is cheap and shares the same live
 /// session.
 pub type LiveSessionHandle = Arc<AsyncMutex<Box<dyn ExternalRuntimeSession>>>;
+
+/// A live session plus the worktree prepared for it.
+///
+/// The `prepared` half is remembered so the registry can hand it back to the
+/// [`WorktreeManager`] with the session's shutdown disposition when the session
+/// is swept (M2-7); it plays no part in lookups.
+struct LiveEntry {
+    handle: LiveSessionHandle,
+    prepared: PreparedWorktree,
+}
 
 /// Registry key for a live session: an agent plus its runtime-assigned id.
 ///
@@ -107,18 +136,43 @@ impl RegisterError {
 /// [`ExternalAgentState`](super::ExternalAgentState).
 ///
 /// The adapter is shared as `Arc<dyn ExternalRuntimeAdapter>`, so a registry is
-/// runtime-agnostic and a host can build one per runtime kind.
+/// runtime-agnostic and a host can build one per runtime kind. The registry
+/// also owns the [`WorktreeManager`] that turns
+/// [`ExternalSessionPolicy::isolation`](super::ExternalSessionPolicy) into a
+/// concrete session working directory: every start/resume first
+/// [`prepare`](WorktreeManager::prepare)s the request's worktree and passes the
+/// prepared path to the adapter as
+/// [`ExternalSessionRequest::session_dir`], and every sweep hands the recorded
+/// [`PreparedWorktree`] back to [`cleanup`](WorktreeManager::cleanup) with the
+/// session's shutdown disposition (M2-7 / M-PROM-5).
 pub struct ExternalSessionRegistry {
     adapter: Arc<dyn ExternalRuntimeAdapter>,
-    live: Mutex<HashMap<LiveSessionKey, LiveSessionHandle>>,
+    worktrees: Arc<dyn WorktreeManager>,
+    live: Mutex<HashMap<LiveSessionKey, LiveEntry>>,
 }
 
 impl ExternalSessionRegistry {
     /// Creates a registry backed by `adapter` with no live sessions.
+    ///
+    /// Worktree preparation uses a default
+    /// [`GitWorktreeManager`](super::GitWorktreeManager) rooted under the OS
+    /// temp dir; inject a different manager with
+    /// [`with_worktree_manager`](Self::with_worktree_manager).
     #[must_use]
     pub fn new(adapter: Arc<dyn ExternalRuntimeAdapter>) -> Self {
+        Self::with_worktree_manager(adapter, Arc::new(GitWorktreeManager::new()))
+    }
+
+    /// Creates a registry backed by `adapter` that prepares and cleans up
+    /// session worktrees through `worktrees`.
+    #[must_use]
+    pub fn with_worktree_manager(
+        adapter: Arc<dyn ExternalRuntimeAdapter>,
+        worktrees: Arc<dyn WorktreeManager>,
+    ) -> Self {
         Self {
             adapter,
+            worktrees,
             live: Mutex::new(HashMap::new()),
         }
     }
@@ -157,7 +211,7 @@ impl ExternalSessionRegistry {
             .lock()
             .expect("registry mutex poisoned")
             .get(&key)
-            .cloned()
+            .map(|entry| entry.handle.clone())
     }
 
     /// Resolves the live session for `request`, starting or resuming as needed.
@@ -176,10 +230,19 @@ impl ExternalSessionRegistry {
     /// a host can tail live observations; it is ignored when reattaching to an
     /// existing handle whose sink was already wired at creation.
     ///
+    /// Before the adapter starts or resumes, the request's
+    /// [`isolation`](super::ExternalSessionPolicy) level is applied through the
+    /// registry's [`WorktreeManager`] and the prepared path is handed to the
+    /// adapter as the session's working directory
+    /// ([`ExternalSessionRequest::session_dir`]). Reattaching to a live handle
+    /// reuses the worktree prepared when that handle was created.
+    ///
     /// # Errors
     ///
     /// Returns [`ExternalAgentError::ResumeUnavailable`] when `request` names a
-    /// session that is neither live nor resumable, or any classified adapter
+    /// session that is neither live nor resumable, [`ExternalAgentError::Launch`]
+    /// (start) / [`ResumeUnavailable`](ExternalAgentError::ResumeUnavailable)
+    /// (resume) when worktree preparation fails, or any classified adapter
     /// error from starting or resuming.
     pub async fn get_or_start(
         &self,
@@ -189,18 +252,36 @@ impl ExternalSessionRegistry {
     ) -> Result<LiveSessionHandle, ExternalAgentError> {
         match &request.session {
             None => {
-                let session = self.adapter.start(request, ctx, sink).await?;
-                self.register(request.agent_id, session)
-                    .map_err(|err| err.into_external(self.adapter.kind()))
+                let (effective, prepared) = self.prepare(request).await?;
+                match self.adapter.start(&effective, ctx, sink).await {
+                    Ok(session) => self
+                        .register(request.agent_id, prepared, session)
+                        .map_err(|err| err.into_external(self.adapter.kind())),
+                    Err(error) => {
+                        self.discard_prepared(prepared).await;
+                        Err(error)
+                    }
+                }
             }
             Some(session_ref) => {
                 if let Some(existing) = self.get(request.agent_id, session_ref) {
                     return Ok(existing);
                 }
                 if self.adapter.capabilities().resume {
-                    let session = self.adapter.resume(session_ref, request, ctx, sink).await?;
-                    self.register(request.agent_id, session)
-                        .map_err(|err| err.into_external(self.adapter.kind()))
+                    let (effective, prepared) = self.prepare(request).await?;
+                    match self
+                        .adapter
+                        .resume(session_ref, &effective, ctx, sink)
+                        .await
+                    {
+                        Ok(session) => self
+                            .register(request.agent_id, prepared, session)
+                            .map_err(|err| err.into_external(self.adapter.kind())),
+                        Err(error) => {
+                            self.discard_prepared(prepared).await;
+                            Err(error)
+                        }
+                    }
                 } else {
                     Err(ExternalAgentError::ResumeUnavailable {
                         session: session_ref.clone(),
@@ -212,6 +293,56 @@ impl ExternalSessionRegistry {
                 }
             }
         }
+    }
+
+    /// Applies the request's isolation level, returning the effective request
+    /// (with [`ExternalSessionRequest::session_dir`] set to the prepared path)
+    /// and the [`PreparedWorktree`] to remember for cleanup.
+    ///
+    /// A preparation failure is classified along the start/resume axis: a fresh
+    /// start reports [`ExternalAgentError::Launch`], a resume reports
+    /// [`ExternalAgentError::ResumeUnavailable`] against the session it tried to
+    /// revive.
+    async fn prepare(
+        &self,
+        request: &ExternalSessionRequest,
+    ) -> Result<(ExternalSessionRequest, PreparedWorktree), ExternalAgentError> {
+        let prepared = self
+            .worktrees
+            .prepare(
+                request.agent_id,
+                &request.worktree,
+                request.policy.isolation,
+            )
+            .await
+            .map_err(|error| match &request.session {
+                None => ExternalAgentError::Launch {
+                    runtime: self.adapter.kind(),
+                    detail: format!("failed preparing the session worktree: {error}"),
+                },
+                Some(session_ref) => ExternalAgentError::ResumeUnavailable {
+                    session: session_ref.clone(),
+                    detail: format!("failed preparing the session worktree: {error}"),
+                },
+            })?;
+        let mut effective = request.clone();
+        effective.session_dir = Some(prepared.worktree().clone());
+        Ok((effective, prepared))
+    }
+
+    /// Best-effort discard of a worktree whose session never started.
+    ///
+    /// The adapter refused the start/resume after preparation succeeded, so no
+    /// runtime ever ran in the prepared tree: it is cleaned up with a
+    /// [`Graceful`](ExternalSessionShutdown::Graceful) disposition, which removes
+    /// an ephemeral tree instead of leaking it. A cleanup failure here is
+    /// deliberately swallowed — the original adapter error is the signal the
+    /// caller needs.
+    async fn discard_prepared(&self, prepared: PreparedWorktree) {
+        let _ = self
+            .worktrees
+            .cleanup(prepared, ExternalSessionShutdown::Graceful)
+            .await;
     }
 
     /// Registers a freshly started or resumed session under its assigned id.
@@ -229,6 +360,7 @@ impl ExternalSessionRegistry {
     fn register(
         &self,
         agent_id: AgentId,
+        prepared: PreparedWorktree,
         session: Box<dyn ExternalRuntimeSession>,
     ) -> Result<LiveSessionHandle, RegisterError> {
         let session_ref = session.session_ref();
@@ -239,9 +371,15 @@ impl ExternalSessionRegistry {
         let mut live = self.live.lock().expect("registry mutex poisoned");
         // Re-check under the lock so a concurrent start does not leak a handle.
         if let Some(existing) = live.get(&key) {
-            return Ok(existing.clone());
+            return Ok(existing.handle.clone());
         }
-        live.insert(key, handle.clone());
+        live.insert(
+            key,
+            LiveEntry {
+                handle: handle.clone(),
+                prepared,
+            },
+        );
         Ok(handle)
     }
 
@@ -252,6 +390,13 @@ impl ExternalSessionRegistry {
     /// is not registered (already swept, never started, or missing a session id)
     /// yields [`ExternalSessionShutdown::Graceful`] because there is nothing left
     /// to close.
+    ///
+    /// After the session closes, its recorded [`PreparedWorktree`] is handed to
+    /// the registry's [`WorktreeManager`] with the session's disposition, so an
+    /// ephemeral worktree is removed only when the session closed cleanly
+    /// (M2-7). A worktree-cleanup failure escalates the returned disposition to
+    /// [`Failed`](ExternalSessionShutdown::Failed): the tree may have been left
+    /// behind, which is a residual side effect.
     pub async fn cleanup(
         &self,
         agent_id: AgentId,
@@ -260,14 +405,30 @@ impl ExternalSessionRegistry {
         let Some(key) = LiveSessionKey::new(agent_id, session) else {
             return ExternalSessionShutdown::Graceful;
         };
-        let handle = self
+        let entry = self
             .live
             .lock()
             .expect("registry mutex poisoned")
             .remove(&key);
-        match handle {
-            Some(handle) => handle.lock().await.shutdown().await,
+        match entry {
+            Some(entry) => {
+                let disposition = entry.handle.lock().await.shutdown().await;
+                self.sweep_worktree(entry.prepared, disposition).await
+            }
             None => ExternalSessionShutdown::Graceful,
+        }
+    }
+
+    /// Cleans up a session's prepared worktree, escalating the disposition to
+    /// [`Failed`](ExternalSessionShutdown::Failed) when the cleanup itself fails.
+    async fn sweep_worktree(
+        &self,
+        prepared: PreparedWorktree,
+        disposition: ExternalSessionShutdown,
+    ) -> ExternalSessionShutdown {
+        match self.worktrees.cleanup(prepared, disposition).await {
+            Ok(_outcome) => disposition,
+            Err(_error) => ExternalSessionShutdown::Failed,
         }
     }
 
@@ -275,9 +436,11 @@ impl ExternalSessionRegistry {
     ///
     /// Each matching handle is removed and closed; the returned dispositions are
     /// ordered by session id for determinism. An agent with no live sessions
-    /// yields an empty vector.
+    /// yields an empty vector. Each session's prepared worktree is cleaned up
+    /// with that session's disposition, exactly as
+    /// [`cleanup`](Self::cleanup) does for a single session.
     pub async fn cleanup_agent(&self, agent_id: AgentId) -> Vec<ExternalSessionShutdown> {
-        let mut handles: Vec<(String, LiveSessionHandle)> = {
+        let mut entries: Vec<(String, LiveEntry)> = {
             let mut live = self.live.lock().expect("registry mutex poisoned");
             let keys: Vec<LiveSessionKey> = live
                 .keys()
@@ -287,15 +450,16 @@ impl ExternalSessionRegistry {
             keys.into_iter()
                 .filter_map(|key| {
                     live.remove(&key)
-                        .map(|handle| (key.session_id.clone(), handle))
+                        .map(|entry| (key.session_id.clone(), entry))
                 })
                 .collect()
         };
-        handles.sort_by(|(left, _), (right, _)| left.cmp(right));
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        let mut dispositions = Vec::with_capacity(handles.len());
-        for (_, handle) in handles {
-            dispositions.push(handle.lock().await.shutdown().await);
+        let mut dispositions = Vec::with_capacity(entries.len());
+        for (_, entry) in entries {
+            let disposition = entry.handle.lock().await.shutdown().await;
+            dispositions.push(self.sweep_worktree(entry.prepared, disposition).await);
         }
         dispositions
     }
@@ -312,8 +476,8 @@ impl std::fmt::Debug for ExternalSessionRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
 
@@ -321,8 +485,9 @@ mod tests {
         ExternalAgentError, ExternalAgentOutput, ExternalEventSink, ExternalPermissionMode,
         ExternalRuntimeAdapter, ExternalRuntimeCapabilities, ExternalRuntimeKind,
         ExternalRuntimeSession, ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef,
-        ExternalSessionRequest, ExternalSessionShutdown, ExternalStreamPolicy,
-        RuntimeDecisionPoint, WorktreeIsolation,
+        ExternalSessionRequest, ExternalSessionShutdown, ExternalStreamPolicy, PreparedWorktree,
+        RuntimeDecisionPoint, WorktreeCleanupOutcome, WorktreeError, WorktreeIsolation,
+        WorktreeManager,
     };
     use crate::agent::spec::WorktreeRef;
     use crate::agent::{AgentId, BudgetLimits, RunContext, RunId, TraceNodeId};
@@ -363,6 +528,7 @@ mod tests {
             agent_id: agent,
             runtime: ExternalRuntimeKind::ClaudeCode,
             worktree: WorktreeRef::new("/repo/agent-lib"),
+            session_dir: None,
             session: None,
             input: ExternalSessionInput::Start {
                 prompt: "do the thing".to_owned(),
@@ -377,6 +543,7 @@ mod tests {
             agent_id: agent,
             runtime: ExternalRuntimeKind::ClaudeCode,
             worktree: WorktreeRef::new("/repo/agent-lib"),
+            session_dir: None,
             session: Some(session_ref(session_id)),
             input: ExternalSessionInput::Continue {
                 message: "keep going".to_owned(),
@@ -441,6 +608,10 @@ mod tests {
         resumes: Arc<AtomicUsize>,
         shutdowns: Arc<AtomicUsize>,
         shutdown_disposition: ExternalSessionShutdown,
+        fail_start: bool,
+        /// `session_dir` the adapter observed on each start/resume request, in
+        /// call order — proves the registry's prepared path reaches the adapter.
+        observed_session_dirs: Arc<Mutex<Vec<Option<WorktreeRef>>>>,
     }
 
     impl MockAdapter {
@@ -452,6 +623,8 @@ mod tests {
                 resumes: Arc::new(AtomicUsize::new(0)),
                 shutdowns: Arc::new(AtomicUsize::new(0)),
                 shutdown_disposition: ExternalSessionShutdown::Graceful,
+                fail_start: false,
+                observed_session_dirs: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -461,6 +634,13 @@ mod tests {
                 shutdown_disposition: self.shutdown_disposition,
                 shutdowns: Arc::clone(&self.shutdowns),
             })
+        }
+
+        fn observe(&self, request: &ExternalSessionRequest) {
+            self.observed_session_dirs
+                .lock()
+                .expect("observed dirs poisoned")
+                .push(request.session_dir.clone());
         }
     }
 
@@ -478,11 +658,18 @@ mod tests {
 
         async fn start(
             &self,
-            _request: &ExternalSessionRequest,
+            request: &ExternalSessionRequest,
             _ctx: &RunContext,
             _sink: Option<Arc<dyn ExternalEventSink>>,
         ) -> Result<Box<dyn ExternalRuntimeSession>, ExternalAgentError> {
             self.starts.fetch_add(1, Ordering::SeqCst);
+            self.observe(request);
+            if self.fail_start {
+                return Err(ExternalAgentError::Launch {
+                    runtime: ExternalRuntimeKind::ClaudeCode,
+                    detail: "stub launch failure".to_owned(),
+                });
+            }
             let n = self.next_session.fetch_add(1, Ordering::SeqCst);
             Ok(self.make_session(format!("session-{n}")))
         }
@@ -490,11 +677,12 @@ mod tests {
         async fn resume(
             &self,
             session: &ExternalSessionRef,
-            _request: &ExternalSessionRequest,
+            request: &ExternalSessionRequest,
             _ctx: &RunContext,
             _sink: Option<Arc<dyn ExternalEventSink>>,
         ) -> Result<Box<dyn ExternalRuntimeSession>, ExternalAgentError> {
             self.resumes.fetch_add(1, Ordering::SeqCst);
+            self.observe(request);
             let session_id = session
                 .session_id
                 .clone()
@@ -503,13 +691,102 @@ mod tests {
         }
     }
 
+    /// Records every prepare/cleanup call and hands out synthetic prepared paths
+    /// under `/prepared/` so tests can watch the registry's worktree wiring
+    /// without touching a real filesystem.
+    struct StubWorktreeManager {
+        prepares: Mutex<Vec<(AgentId, WorktreeRef, WorktreeIsolation)>>,
+        cleanups: Mutex<Vec<(WorktreeRef, ExternalSessionShutdown)>>,
+        fail_prepare: AtomicBool,
+        fail_cleanup: AtomicBool,
+    }
+
+    impl StubWorktreeManager {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                prepares: Mutex::new(Vec::new()),
+                cleanups: Mutex::new(Vec::new()),
+                fail_prepare: AtomicBool::new(false),
+                fail_cleanup: AtomicBool::new(false),
+            })
+        }
+
+        fn prepares(&self) -> Vec<(AgentId, WorktreeRef, WorktreeIsolation)> {
+            self.prepares.lock().expect("prepares poisoned").clone()
+        }
+
+        fn cleanups(&self) -> Vec<(WorktreeRef, ExternalSessionShutdown)> {
+            self.cleanups.lock().expect("cleanups poisoned").clone()
+        }
+
+        /// The prepared path the `n`-th prepare call handed out.
+        fn prepared_path(n: usize) -> WorktreeRef {
+            WorktreeRef::new(format!("/prepared/session-{n}"))
+        }
+    }
+
+    #[async_trait]
+    impl WorktreeManager for StubWorktreeManager {
+        async fn prepare(
+            &self,
+            agent_id: AgentId,
+            base: &WorktreeRef,
+            isolation: WorktreeIsolation,
+        ) -> Result<PreparedWorktree, WorktreeError> {
+            if self.fail_prepare.load(Ordering::SeqCst) {
+                return Err(WorktreeError::Prepare {
+                    isolation,
+                    path: base.path().to_string_lossy().into_owned(),
+                    detail: "stub prepare failure".to_owned(),
+                });
+            }
+            let mut prepares = self.prepares.lock().expect("prepares poisoned");
+            let path = Self::prepared_path(prepares.len());
+            prepares.push((agent_id, base.clone(), isolation));
+            Ok(PreparedWorktree::new(agent_id, isolation, path, true).with_base_repo(base.clone()))
+        }
+
+        async fn cleanup(
+            &self,
+            prepared: PreparedWorktree,
+            disposition: ExternalSessionShutdown,
+        ) -> Result<WorktreeCleanupOutcome, WorktreeError> {
+            if self.fail_cleanup.load(Ordering::SeqCst) {
+                return Err(WorktreeError::Cleanup {
+                    isolation: prepared.isolation(),
+                    path: prepared.worktree().path().to_string_lossy().into_owned(),
+                    detail: "stub cleanup failure".to_owned(),
+                });
+            }
+            self.cleanups
+                .lock()
+                .expect("cleanups poisoned")
+                .push((prepared.worktree().clone(), disposition));
+            Ok(WorktreeCleanupOutcome::new(
+                prepared.isolation(),
+                prepared.worktree().clone(),
+                true,
+                disposition.leaves_residual_side_effects(),
+            ))
+        }
+    }
+
+    /// Builds a registry over `adapter` whose worktree preparation is watched by
+    /// the returned stub.
+    fn registry_with_stub(
+        adapter: Arc<MockAdapter>,
+        stub: Arc<StubWorktreeManager>,
+    ) -> ExternalSessionRegistry {
+        ExternalSessionRegistry::with_worktree_manager(adapter, stub)
+    }
+
     #[tokio::test]
     async fn external_runtime_registry_start_registers_and_get_finds_live_handle() {
         // A fresh Start goes through the adapter, is registered under its
         // runtime-assigned id, and is then findable by a pure `get`.
         let adapter = Arc::new(MockAdapter::new(false));
         let starts = Arc::clone(&adapter.starts);
-        let registry = ExternalSessionRegistry::new(adapter);
+        let registry = registry_with_stub(adapter, StubWorktreeManager::new());
         let ctx = run_context();
 
         assert_eq!(registry.live_len(), 0);
@@ -537,7 +814,7 @@ mod tests {
         let adapter = Arc::new(MockAdapter::new(false));
         let starts = Arc::clone(&adapter.starts);
         let resumes = Arc::clone(&adapter.resumes);
-        let registry = ExternalSessionRegistry::new(adapter);
+        let registry = registry_with_stub(adapter, StubWorktreeManager::new());
         let ctx = run_context();
 
         let started = registry
@@ -570,7 +847,7 @@ mod tests {
         // the session from its persisted reference and registers the handle.
         let adapter = Arc::new(MockAdapter::new(true));
         let resumes = Arc::clone(&adapter.resumes);
-        let registry = ExternalSessionRegistry::new(adapter);
+        let registry = registry_with_stub(adapter, StubWorktreeManager::new());
         let ctx = run_context();
 
         let resumed = registry
@@ -597,7 +874,7 @@ mod tests {
         // No live handle and an adapter that cannot resume: the session is
         // unknown and unresumable, surfaced as a classified ResumeUnavailable.
         let adapter = Arc::new(MockAdapter::new(false));
-        let registry = ExternalSessionRegistry::new(adapter);
+        let registry = registry_with_stub(adapter, StubWorktreeManager::new());
         let ctx = run_context();
 
         let error = match registry
@@ -624,7 +901,7 @@ mod tests {
         // the handle so a later lookup misses.
         let adapter = Arc::new(MockAdapter::new(false));
         let shutdowns = Arc::clone(&adapter.shutdowns);
-        let registry = ExternalSessionRegistry::new(adapter);
+        let registry = registry_with_stub(adapter, StubWorktreeManager::new());
         let ctx = run_context();
 
         let started = registry
@@ -652,7 +929,7 @@ mod tests {
     async fn external_runtime_registry_cleanup_missing_session_is_graceful() {
         // Cleaning a session that was never registered is a graceful no-op.
         let adapter = Arc::new(MockAdapter::new(false));
-        let registry = ExternalSessionRegistry::new(adapter);
+        let registry = registry_with_stub(adapter, StubWorktreeManager::new());
 
         let disposition = registry.cleanup(agent_id(), &session_ref("absent")).await;
         assert_eq!(disposition, ExternalSessionShutdown::Graceful);
@@ -665,7 +942,7 @@ mod tests {
         // agents' sessions live (the never-resume cancel sweep).
         let adapter = Arc::new(MockAdapter::new(false));
         let shutdowns = Arc::clone(&adapter.shutdowns);
-        let registry = ExternalSessionRegistry::new(adapter);
+        let registry = registry_with_stub(adapter, StubWorktreeManager::new());
         let ctx = run_context();
 
         registry
@@ -697,9 +974,272 @@ mod tests {
     async fn external_runtime_registry_cleanup_agent_without_sessions_is_empty() {
         // Sweeping an agent with no live sessions yields no dispositions.
         let adapter = Arc::new(MockAdapter::new(false));
-        let registry = ExternalSessionRegistry::new(adapter);
+        let registry = registry_with_stub(adapter, StubWorktreeManager::new());
 
         let dispositions = registry.cleanup_agent(agent_id()).await;
         assert!(dispositions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn external_runtime_registry_start_prepares_worktree_and_hands_session_dir_to_adapter() {
+        // M2-7: a fresh start applies the request's isolation through the
+        // registry's WorktreeManager *before* the adapter runs, and the adapter
+        // sees the prepared path as the request's session_dir.
+        let adapter = Arc::new(MockAdapter::new(false));
+        let observed = Arc::clone(&adapter.observed_session_dirs);
+        let stub = StubWorktreeManager::new();
+        let registry = registry_with_stub(adapter, Arc::clone(&stub));
+        let ctx = run_context();
+
+        registry
+            .get_or_start(&start_request(agent_id()), &ctx, None)
+            .await
+            .expect("start succeeds");
+
+        assert_eq!(
+            stub.prepares(),
+            vec![(
+                agent_id(),
+                WorktreeRef::new("/repo/agent-lib"),
+                WorktreeIsolation::EphemeralGitWorktree,
+            ),],
+            "prepare ran with the request's agent, base worktree, and isolation"
+        );
+        assert_eq!(
+            observed.lock().expect("observed poisoned").as_slice(),
+            &[Some(StubWorktreeManager::prepared_path(0))],
+            "the adapter received the prepared path as session_dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_runtime_registry_reattach_reuses_prepared_worktree() {
+        // Reattaching to a live handle must not prepare a second worktree: the
+        // session keeps running in the one prepared when it started.
+        let adapter = Arc::new(MockAdapter::new(false));
+        let stub = StubWorktreeManager::new();
+        let registry = registry_with_stub(adapter, Arc::clone(&stub));
+        let ctx = run_context();
+
+        let started = registry
+            .get_or_start(&start_request(agent_id()), &ctx, None)
+            .await
+            .expect("start succeeds");
+        let session_id = started.lock().await.session_ref().session_id.expect("id");
+        registry
+            .get_or_start(&continue_request(agent_id(), &session_id), &ctx, None)
+            .await
+            .expect("reattach succeeds");
+
+        assert_eq!(
+            stub.prepares().len(),
+            1,
+            "reattaching to a live handle reuses the prepared worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_runtime_registry_resume_prepares_worktree_and_hands_session_dir_to_adapter() {
+        // A resume (no live handle) also runs through preparation: the revived
+        // session gets a fresh prepared worktree handed to the adapter.
+        let adapter = Arc::new(MockAdapter::new(true));
+        let observed = Arc::clone(&adapter.observed_session_dirs);
+        let stub = StubWorktreeManager::new();
+        let registry = registry_with_stub(adapter, Arc::clone(&stub));
+        let ctx = run_context();
+
+        registry
+            .get_or_start(&continue_request(agent_id(), "persisted-1"), &ctx, None)
+            .await
+            .expect("resume succeeds");
+
+        assert_eq!(stub.prepares().len(), 1, "resume prepares a worktree");
+        assert_eq!(
+            observed.lock().expect("observed poisoned").as_slice(),
+            &[Some(StubWorktreeManager::prepared_path(0))],
+            "the adapter received the prepared path as session_dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_runtime_registry_prepare_failure_on_start_maps_to_launch() {
+        // A worktree that cannot be prepared fails the start loudly with a
+        // classified Launch error, before the adapter ever runs.
+        let adapter = Arc::new(MockAdapter::new(false));
+        let starts = Arc::clone(&adapter.starts);
+        let stub = StubWorktreeManager::new();
+        stub.fail_prepare.store(true, Ordering::SeqCst);
+        let registry = registry_with_stub(adapter, stub);
+        let ctx = run_context();
+
+        let error = match registry
+            .get_or_start(&start_request(agent_id()), &ctx, None)
+            .await
+        {
+            Ok(_) => panic!("start should fail when worktree preparation fails"),
+            Err(error) => error,
+        };
+
+        match error {
+            ExternalAgentError::Launch { runtime, detail } => {
+                assert_eq!(runtime, ExternalRuntimeKind::ClaudeCode);
+                assert!(detail.contains("worktree"), "detail names the cause");
+            }
+            other => panic!("expected Launch, got {other:?}"),
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 0, "adapter never ran");
+        assert_eq!(registry.live_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_runtime_registry_prepare_failure_on_resume_maps_to_resume_unavailable() {
+        // The same preparation failure on a resume classifies along the resume
+        // axis, against the session that was being revived.
+        let adapter = Arc::new(MockAdapter::new(true));
+        let resumes = Arc::clone(&adapter.resumes);
+        let stub = StubWorktreeManager::new();
+        stub.fail_prepare.store(true, Ordering::SeqCst);
+        let registry = registry_with_stub(adapter, stub);
+        let ctx = run_context();
+
+        let error = match registry
+            .get_or_start(&continue_request(agent_id(), "persisted-1"), &ctx, None)
+            .await
+        {
+            Ok(_) => panic!("resume should fail when worktree preparation fails"),
+            Err(error) => error,
+        };
+
+        match error {
+            ExternalAgentError::ResumeUnavailable { session, detail } => {
+                assert_eq!(session.session_id.as_deref(), Some("persisted-1"));
+                assert!(detail.contains("worktree"), "detail names the cause");
+            }
+            other => panic!("expected ResumeUnavailable, got {other:?}"),
+        }
+        assert_eq!(resumes.load(Ordering::SeqCst), 0, "adapter never ran");
+    }
+
+    #[tokio::test]
+    async fn external_runtime_registry_failed_start_discards_prepared_worktree() {
+        // When the adapter refuses the start after preparation succeeded, the
+        // prepared tree is discarded with a Graceful disposition so an ephemeral
+        // worktree is not leaked for a session that never ran.
+        let mut mock = MockAdapter::new(false);
+        mock.fail_start = true;
+        let adapter = Arc::new(mock);
+        let stub = StubWorktreeManager::new();
+        let registry = registry_with_stub(adapter, Arc::clone(&stub));
+        let ctx = run_context();
+
+        let result = registry
+            .get_or_start(&start_request(agent_id()), &ctx, None)
+            .await;
+        assert!(result.is_err(), "the adapter's launch failure surfaces");
+        assert_eq!(stub.prepares().len(), 1);
+        assert_eq!(
+            stub.cleanups(),
+            vec![(
+                StubWorktreeManager::prepared_path(0),
+                ExternalSessionShutdown::Graceful,
+            ),],
+            "the prepared worktree was discarded after the failed start"
+        );
+        assert_eq!(registry.live_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn external_runtime_registry_cleanup_sweeps_worktree_with_session_disposition() {
+        // M2-7: cleanup hands the session's recorded PreparedWorktree to the
+        // WorktreeManager with the session's own shutdown disposition, so a
+        // force-killed session keeps its ephemeral tree for inspection.
+        let mut mock = MockAdapter::new(false);
+        mock.shutdown_disposition = ExternalSessionShutdown::ForcedKill;
+        let adapter = Arc::new(mock);
+        let stub = StubWorktreeManager::new();
+        let registry = registry_with_stub(adapter, Arc::clone(&stub));
+        let ctx = run_context();
+
+        let started = registry
+            .get_or_start(&start_request(agent_id()), &ctx, None)
+            .await
+            .expect("start succeeds");
+        let session_id = started.lock().await.session_ref().session_id.expect("id");
+
+        let disposition = registry
+            .cleanup(agent_id(), &session_ref(&session_id))
+            .await;
+        assert_eq!(disposition, ExternalSessionShutdown::ForcedKill);
+        assert_eq!(
+            stub.cleanups(),
+            vec![(
+                StubWorktreeManager::prepared_path(0),
+                ExternalSessionShutdown::ForcedKill,
+            ),],
+            "the worktree manager saw the session's ForcedKill disposition"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_runtime_registry_cleanup_agent_sweeps_each_prepared_worktree() {
+        // The cancel sweep cleans up every swept session's prepared worktree
+        // with that session's disposition.
+        let adapter = Arc::new(MockAdapter::new(false));
+        let stub = StubWorktreeManager::new();
+        let registry = registry_with_stub(adapter, Arc::clone(&stub));
+        let ctx = run_context();
+
+        registry
+            .get_or_start(&start_request(agent_id()), &ctx, None)
+            .await
+            .expect("first start");
+        registry
+            .get_or_start(&start_request(agent_id()), &ctx, None)
+            .await
+            .expect("second start");
+
+        let dispositions = registry.cleanup_agent(agent_id()).await;
+        assert_eq!(dispositions.len(), 2);
+        assert_eq!(
+            stub.cleanups(),
+            vec![
+                (
+                    StubWorktreeManager::prepared_path(0),
+                    ExternalSessionShutdown::Graceful,
+                ),
+                (
+                    StubWorktreeManager::prepared_path(1),
+                    ExternalSessionShutdown::Graceful,
+                ),
+            ],
+            "each swept session's prepared worktree was cleaned up"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_runtime_registry_worktree_cleanup_failure_escalates_disposition() {
+        // A worktree that cannot be cleaned up may have been left behind, which
+        // is a residual side effect: the returned disposition escalates to
+        // Failed even though the session itself closed gracefully.
+        let adapter = Arc::new(MockAdapter::new(false));
+        let stub = StubWorktreeManager::new();
+        let registry = registry_with_stub(adapter, Arc::clone(&stub));
+        let ctx = run_context();
+
+        let started = registry
+            .get_or_start(&start_request(agent_id()), &ctx, None)
+            .await
+            .expect("start succeeds");
+        let session_id = started.lock().await.session_ref().session_id.expect("id");
+
+        stub.fail_cleanup.store(true, Ordering::SeqCst);
+        let disposition = registry
+            .cleanup(agent_id(), &session_ref(&session_id))
+            .await;
+        assert_eq!(
+            disposition,
+            ExternalSessionShutdown::Failed,
+            "a failed worktree cleanup escalates the disposition"
+        );
     }
 }

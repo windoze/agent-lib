@@ -205,7 +205,10 @@ fn policy() -> ExternalSessionPolicy {
         // autonomous CLI write inside its scratch worktree without a host
         // approval this adapter cannot answer.
         permission_mode: ExternalPermissionMode::AcceptEdits,
-        isolation: WorktreeIsolation::EphemeralGitWorktree,
+        // The test owns the throwaway worktree it launches the CLI in
+        // (created by `make_worktree`), so the registry must not prepare a
+        // second one: Shared passes the base through unchanged (M2-7).
+        isolation: WorktreeIsolation::Shared,
         max_turns: Some(MAX_TURNS as u32),
         stream_events: ExternalStreamPolicy::Buffered,
     }
@@ -216,6 +219,7 @@ fn start_request(worktree: &std::path::Path, prompt: &str) -> ExternalSessionReq
         agent_id: agent_id(),
         runtime: ExternalRuntimeKind::Codex,
         worktree: WorktreeRef::new(worktree),
+        session_dir: None,
         session: None,
         input: ExternalSessionInput::Start {
             prompt: prompt.to_owned(),

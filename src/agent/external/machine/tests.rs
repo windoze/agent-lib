@@ -121,6 +121,10 @@ fn tool(name: &str) -> Tool {
 }
 
 fn spec() -> ExternalAgentSpec {
+    spec_with_max_turns(Some(8))
+}
+
+fn spec_with_max_turns(max_turns: Option<u32>) -> ExternalAgentSpec {
     ExternalAgentSpec::new(
         agent_id(),
         ExternalRuntimeKind::ClaudeCode,
@@ -130,7 +134,7 @@ fn spec() -> ExternalAgentSpec {
         ExternalSessionPolicy {
             permission_mode: ExternalPermissionMode::AcceptEdits,
             isolation: WorktreeIsolation::EphemeralGitWorktree,
-            max_turns: Some(8),
+            max_turns,
             stream_events: ExternalStreamPolicy::Buffered,
         },
     )
@@ -2356,6 +2360,59 @@ fn external_loop_limit_fails_before_unbounded_pause_loop() {
         other => panic!("expected an Error cursor, got {other:?}"),
     }
     // The dangling turn is discarded so no half-open turn lingers.
+    assert!(machine.state().conversation().pending().is_none());
+}
+
+#[test]
+fn external_session_policy_max_turns_bounds_runtime_round_trips() {
+    // M2-7: the spec's policy max_turns is enforced by the machine itself,
+    // uniformly across runtimes — one decision loop is one runtime round-trip.
+    // With a cap of two, the third round-trip fails with a classified
+    // LimitExceeded instead of minting another NeedExternalSession.
+    let mut machine = ExternalAgentMachine::new(
+        ExternalAgentState::new(spec_with_max_turns(Some(2)), empty_conversation()),
+        Arc::new(SeqRequirementIds::default()),
+    )
+    .with_tool_execution_ids(Arc::new(SeqToolIds::default()));
+
+    // Round-trip 1: the opening Start.
+    let opened = machine.step(StepInput::external(user_input("refactor the parser")));
+    let session_requirement_id = opened.requirements[0].id;
+    assert_eq!(machine.state().decision_loops(), 1);
+
+    // Round-trip 2: the first pause/respond cycle.
+    let second_session_id =
+        drive_one_tool_round(&mut machine, session_requirement_id, "batch-1", "call-a");
+    assert_eq!(machine.state().decision_loops(), 2);
+
+    // A second pause/respond cycle would open a third round-trip past the
+    // policy cap, so the machine fails instead.
+    let paused = machine.step(StepInput::resume(external_resolution(
+        second_session_id,
+        paused_for_tools("batch-2", vec![external_tool_call("call-b", "apply_patch")]),
+    )));
+    let tool_requirement_id = paused.requirements[0].id;
+    let over_limit = machine.step(StepInput::resume(tool_resolution(
+        tool_requirement_id,
+        "call-b",
+        "patch applied",
+    )));
+
+    assert!(over_limit.is_quiescent());
+    assert!(
+        over_limit.requirements.is_empty(),
+        "an over-limit turn must not mint another session requirement"
+    );
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+    match machine.state().cursor() {
+        ExternalAgentCursor::Error { message } => {
+            assert!(
+                message.contains("max_turns") && message.contains("limit exceeded"),
+                "unexpected error text: {message}"
+            );
+        }
+        other => panic!("expected an Error cursor, got {other:?}"),
+    }
     assert!(machine.state().conversation().pending().is_none());
 }
 
