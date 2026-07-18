@@ -1000,6 +1000,21 @@ pub struct AgentSnapshot {
 故常规 capture 下为空（能力已就绪，供未来可中断 delegation）。task brief 默认不写入持久 snapshot
 （R5）。
 
+`mailbox` / `blackboard` / `plan` 保存已启用协作底座的 data-only snapshot（未启用为 `None`，
+带 `#[serde(default)]` 兼容旧格式）。restore 采用 **snapshot 内容为准，topology 只作为兼容旧
+snapshot 的 provision hint** 的冲突策略：
+
+- snapshot 带某个协作 slice 时，无论 restore 时 topology 派生的 `Collaboration` 是否启用该底座，
+  都优先从 snapshot 恢复该底座及其内容（mailbox 续接 inbox 与 seq 游标，blackboard / plan 保留
+  board / plan 身份与消息 / 任务历史）；
+- snapshot 缺该 slice 时才回落到 topology：topology 启用但无快照内容（如早于协作 capture 的旧
+  snapshot）建空底座并从 ids 铸新身份，topology 也未启用则保持 `None`；
+- 恢复出的 `CollabState.config` 会拓宽以覆盖任何由 snapshot 恢复的底座，使
+  `Agent::collaboration()` 广告的 flag 与 `mailbox()` / `blackboard()` / `plan()` 访问器返回的
+  live 原语始终一致。
+
+顶层 `artifacts` 目前为保留字段（见 §15 后续里程碑），restore 不依赖它。
+
 Local subagent:
 
 ```text

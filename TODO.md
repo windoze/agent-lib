@@ -511,7 +511,7 @@ cargo test -p agent-lib --lib facade::collab
   `cargo test --all --all-targets`（全绿）、`cargo test --all --doc`（全绿）、
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
-### M3-3 [TODO] 让 restore 优先使用 snapshot 中的协作内容
+### M3-3 [DONE] 让 restore 优先使用 snapshot 中的协作内容
 
 上下文：
 
@@ -536,6 +536,43 @@ cargo test -p agent-lib --lib facade::collab
 ```bash
 cargo test -p agent-lib --lib facade::agent::snapshot
 ```
+
+完成记录（M3-3）：
+
+- 实现：
+  - `src/facade/collab.rs`：重写 `CollabState::restore`，把冲突策略从「topology 权威」改为
+    **「snapshot 内容为准，topology 只作旧 snapshot 的 provision hint」**。每个协作原语：
+    snapshot 有内容 → `from_snapshot`（即使 topology 未启用也恢复）；无内容 → 回落到
+    `config.*_enabled()` 空建（旧 snapshot 兼容）；两者皆无 → 保持 `None`。恢复后把 effective
+    `config` 拓宽以覆盖任何由 snapshot 恢复的原语，使 `Agent::collaboration()` 广告的 flag 与
+    `mailbox()`/`blackboard()`/`plan()` 访问器返回的 live 原语始终一致（不再出现「访问器 Some 但
+    config 说 disabled」的不一致）。更新该函数 doc 注释说明冲突规则。
+  - `src/facade/agent/snapshot.rs`：更新 `AgentRestoreBuilder::build` 中 `resolve(...)` 前的注释，
+    说明 topology 派生的 `Collaboration` 现在仅作 provision hint，snapshot 的 mailbox/blackboard/
+    plan slice 具权威性。
+  - `docs/facade-api.md` §15.2：新增段落，明确协作 restore 的冲突策略、旧格式（缺字段）兼容行为，
+    以及顶层 `artifacts` 目前为保留字段、restore 不依赖它。
+- 测试：
+  - `src/facade/agent/snapshot_tests.rs`（`facade::agent::snapshot::tests`，新增 2 个）：
+    - `snapshot_content_overrides_disabled_restore_topology`：把已填充的 mailbox snapshot 嫁接到
+      无 delegate（topology 派生空底座）的 base agent snapshot 上，restore 后 mailbox 被恢复、
+      `collaboration().mailbox_enabled()` 为真、内容按序可读、续 seq=2；未携带的 blackboard/plan
+      仍为 `None`。
+    - `legacy_snapshot_without_collaboration_fields_restores_bare`：把真实 snapshot 编码为 JSON、
+      删除 `mailbox`/`blackboard`/`plan`/`artifacts` 键，经 `#[serde(default)]` 反序列化为空，
+      restore 成功并由 topology 派生空 mailbox（内容为空），blackboard/plan 为 `None`。
+    - 既有 M3-2 round-trip 续操作测试（mailbox 续 seq、blackboard 续 offset）保留并回归。
+  - `src/facade/collab.rs`（`facade::collab::tests`，新增 2 个）：
+    - `restore_without_snapshot_falls_back_to_topology_hint`：无 slice 时 restore 退化为按 config
+      空建（等价 provision）。
+    - `restore_snapshot_content_overrides_disabled_config`：空 config + 带内容 mailbox snapshot →
+      恢复 mailbox 且 config 拓宽、续 seq。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
+  `cargo test -p agent-lib --lib facade::agent::snapshot`（6 passed）、
+  `cargo test -p agent-lib --lib facade::collab`（19 passed）、
+  `cargo test -p agent-lib --lib agent::collab`（28 passed，回归）、
+  `cargo test --all --all-targets`（全绿）、`cargo test --all --doc`（全绿）、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
 ### M3-4 [TODO] 明确并实现顶层 artifact snapshot 策略
 

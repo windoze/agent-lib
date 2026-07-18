@@ -265,19 +265,26 @@ impl CollabState {
         }
     }
 
-    /// Provisions the live primitives `config` enables, rehydrating each enabled
-    /// substrate from its snapshot when one is present and falling back to a fresh
-    /// empty primitive otherwise (`docs/facade-api.md` §15.2).
+    /// Restores the live primitives, treating a captured snapshot slice as the
+    /// authoritative source of both *whether* a substrate exists and its
+    /// *contents* (`docs/facade-api.md` §15.2).
     ///
-    /// `config` decides *whether* a substrate exists — a substrate the restored
-    /// topology does not enable stays `None`, so restore never resurrects an
-    /// unconfigured primitive even if a stray snapshot slice is supplied. When a
-    /// substrate is enabled, its snapshot (if any) supplies the *contents*: the
-    /// mailbox resumes its inboxes and sequence cursor, and the blackboard / plan
-    /// keep their captured identity and message / task history. An enabled
-    /// substrate with no snapshot slice (for example an older snapshot that
-    /// predates collaboration capture) provisions an empty primitive, minting its
-    /// identity from `ids`.
+    /// The conflict rule is **snapshot content wins; topology is only a provision
+    /// hint for older snapshots**:
+    ///
+    /// - a captured slice always restores its substrate — even when the
+    ///   topology-derived `config` would leave it disabled — rehydrating the
+    ///   mailbox's inboxes and sequence cursor or the blackboard / plan's captured
+    ///   identity and message / task history;
+    /// - a *missing* slice falls back to `config`: an enabled-but-uncaptured
+    ///   substrate (for example an older snapshot that predates collaboration
+    ///   capture) provisions a fresh empty primitive, minting its identity from
+    ///   `ids`, while a disabled-and-uncaptured substrate stays `None`.
+    ///
+    /// The effective [`config`](Self::config) is widened to cover every substrate
+    /// the snapshot restored, so the advertised
+    /// [`Collaboration`](crate::facade::Agent::collaboration) flags never disagree
+    /// with the live primitives an accessor hands back.
     pub(crate) fn restore(
         config: Collaboration,
         ids: &FacadeIds,
@@ -285,20 +292,43 @@ impl CollabState {
         blackboard: Option<BlackboardSnapshot>,
         plan: Option<PlanSnapshot>,
     ) -> Self {
+        let mailbox = mailbox
+            .map(|snapshot| Arc::new(Mailbox::from_snapshot(snapshot)))
+            .or_else(|| config.mailbox_enabled().then(|| Arc::new(Mailbox::new())));
+        let blackboard = blackboard
+            .map(|snapshot| Arc::new(Blackboard::from_snapshot(snapshot)))
+            .or_else(|| {
+                config
+                    .blackboard_enabled()
+                    .then(|| Arc::new(Blackboard::new(ids.blackboard_id())))
+            });
+        let plan = plan
+            .map(|snapshot| Arc::new(Plan::from_snapshot(snapshot)))
+            .or_else(|| {
+                config
+                    .plan_enabled()
+                    .then(|| Arc::new(Plan::new(ids.plan_id())))
+            });
+
+        // Widen the effective config so the advertised substrate flags stay
+        // consistent with the primitives the snapshot restored (a snapshot slice
+        // can enable a substrate the restored topology alone would not).
+        let mut config = config;
+        if mailbox.is_some() {
+            config = config.mailbox();
+        }
+        if blackboard.is_some() {
+            config = config.blackboard();
+        }
+        if plan.is_some() {
+            config = config.plan();
+        }
+
         Self {
             config,
-            mailbox: config
-                .mailbox_enabled()
-                .then(|| Arc::new(mailbox.map_or_else(Mailbox::new, Mailbox::from_snapshot))),
-            blackboard: config.blackboard_enabled().then(|| {
-                Arc::new(blackboard.map_or_else(
-                    || Blackboard::new(ids.blackboard_id()),
-                    Blackboard::from_snapshot,
-                ))
-            }),
-            plan: config.plan_enabled().then(|| {
-                Arc::new(plan.map_or_else(|| Plan::new(ids.plan_id()), Plan::from_snapshot))
-            }),
+            mailbox,
+            blackboard,
+            plan,
         }
     }
 }
@@ -472,7 +502,7 @@ mod tests {
     };
     use crate::agent::collab::TaskStatus;
     use crate::agent::external::ExternalAgentEvent;
-    use crate::agent::{AgentId, Notification};
+    use crate::agent::{AgentId, Mailbox, Notification};
     use crate::facade::delegate::Delegation;
     use crate::facade::ids::FacadeIds;
 
@@ -562,6 +592,47 @@ mod tests {
 
         let all = CollabState::provision(Collaboration::new().plan().blackboard().mailbox(), &ids);
         assert!(all.mailbox.is_some() && all.blackboard.is_some() && all.plan.is_some());
+    }
+
+    #[test]
+    fn restore_without_snapshot_falls_back_to_topology_hint() {
+        // With no captured slices, restore behaves like `provision`: the topology
+        // config alone decides which empty primitives exist.
+        let ids = FacadeIds::new();
+
+        let none = CollabState::restore(Collaboration::new(), &ids, None, None, None);
+        assert!(none.mailbox.is_none() && none.blackboard.is_none() && none.plan.is_none());
+
+        let enabled = CollabState::restore(Collaboration::new().mailbox(), &ids, None, None, None);
+        assert!(enabled.config.mailbox_enabled());
+        assert!(
+            enabled.mailbox.is_some(),
+            "an enabled-but-uncaptured mailbox provisions an empty primitive"
+        );
+        assert!(enabled.blackboard.is_none() && enabled.plan.is_none());
+    }
+
+    #[test]
+    fn restore_snapshot_content_overrides_disabled_config() {
+        // Snapshot content wins even when the topology-derived config disables the
+        // substrate: the mailbox restores and the effective config widens to match.
+        let ids = FacadeIds::new();
+        let source = Mailbox::new();
+        source.send("reviewer", "researcher", "need sources");
+        let captured = source.snapshot();
+
+        let restored = CollabState::restore(Collaboration::new(), &ids, Some(captured), None, None);
+        assert!(
+            restored.config.mailbox_enabled(),
+            "a captured mailbox widens the effective config"
+        );
+        let mailbox = restored.mailbox.expect("mailbox restored from snapshot");
+        let inbox = mailbox.read_from("researcher", 0);
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "need sources");
+        // The sequence cursor is authoritative: the next send continues it.
+        assert_eq!(mailbox.send("planner", "researcher", "more"), 1);
+        assert!(restored.blackboard.is_none() && restored.plan.is_none());
     }
 
     #[test]

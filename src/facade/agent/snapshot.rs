@@ -784,12 +784,15 @@ impl AgentRestoreBuilder {
 
         // Re-derive the collaboration substrate from the restored topology (§14).
         // A snapshot carries no explicit `Collaboration` (§15.2), so restore
-        // reconstructs the default set the same delegate topology would enable.
-        // The substrate flags decide *which* primitives exist; the snapshot's
-        // mailbox / blackboard / plan slices supply their *contents*, so a
-        // restored agent resumes on the same shared inbox / board / plan. An
-        // enabled substrate with no captured slice (an older snapshot) provisions
-        // an empty primitive, and a disabled substrate stays absent.
+        // derives the default set the same delegate topology would enable and
+        // hands it to `CollabState::restore` as a *provision hint*. The captured
+        // mailbox / blackboard / plan slices are authoritative: each restores its
+        // substrate and content even when the derived topology alone would leave
+        // it disabled, so a restored agent resumes on the same shared inbox /
+        // board / plan. The topology hint only fills gaps — an enabled substrate
+        // with no captured slice (an older snapshot) provisions an empty
+        // primitive, and a substrate that is neither captured nor enabled stays
+        // absent (`docs/facade-api.md` §15.2).
         let collaboration = resolve(
             None,
             &snapshot.delegation,

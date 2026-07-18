@@ -1,14 +1,20 @@
-//! Round-trip tests for the collaboration slices of an [`AgentSnapshot`] (M3-2).
+//! Round-trip tests for the collaboration slices of an [`AgentSnapshot`] (M3-2,
+//! M3-3).
 //!
 //! These tests assert that [`Agent::snapshot`](crate::facade::Agent::snapshot)
 //! captures the *live* mailbox / blackboard / plan substrate an agent has
 //! provisioned, and that [`Agent::restore`](crate::facade::Agent::restore)
 //! rehydrates that content — while a disabled substrate stays absent on both
-//! sides so restore never resurrects an unconfigured primitive. Each test drives
-//! a realistic §14 delegate topology, so the restored agent re-derives the same
-//! substrate set and the snapshot supplies its contents. Every test is fully
-//! offline: a [`StubClient`] is only present so the builder / restore builder
-//! have a client to hold; it is never driven.
+//! sides so restore never resurrects an unconfigured primitive. Restore follows
+//! the §15.2 conflict rule (**snapshot content wins; topology is only a provision
+//! hint for older snapshots**): a captured slice restores its substrate even when
+//! the restored topology alone would leave it disabled, while a legacy snapshot
+//! that predates collaboration capture decodes its missing slices to absent and
+//! re-derives an empty substrate from the topology. Each test drives a realistic
+//! §14 delegate topology, so the restored agent re-derives the same substrate set
+//! and the snapshot supplies its contents. Every test is fully offline: a
+//! [`StubClient`] is only present so the builder / restore builder have a client
+//! to hold; it is never driven.
 
 use std::sync::Arc;
 
@@ -233,6 +239,112 @@ fn disabled_collaboration_leaves_snapshot_and_restore_bare() {
         "restore does not enable an unconfigured substrate"
     );
     assert!(restored.mailbox().is_none());
+    assert!(restored.blackboard().is_none());
+    assert!(restored.plan().is_none());
+}
+
+#[test]
+fn snapshot_content_overrides_disabled_restore_topology() {
+    // Capture a populated mailbox from a topology that enables one...
+    let supervisor = mailbox_supervisor();
+    let mailbox = supervisor.mailbox().expect("mailbox provisioned");
+    mailbox.send("reviewer", "researcher", "need sources for claim 3");
+    mailbox.send("planner", "researcher", "prioritise section 2");
+    let populated = supervisor
+        .snapshot()
+        .expect("snapshot")
+        .mailbox
+        .expect("mailbox captured live");
+
+    // ...then graft it onto a base agent whose topology derives *no* substrate,
+    // producing a snapshot whose mailbox content conflicts with its topology.
+    let base = AgentBuilder::default()
+        .client(Arc::new(StubClient))
+        .model("supervisor-model")
+        .build()
+        .expect("build agent");
+    let mut snapshot = base.snapshot().expect("snapshot at a committed point");
+    assert!(
+        snapshot.mailbox.is_none(),
+        "the base topology derives no mailbox"
+    );
+    snapshot.mailbox = Some(populated);
+
+    // Snapshot content wins: restore rehydrates the mailbox even though the
+    // restored topology alone would leave it disabled, and the advertised config
+    // is widened so `collaboration()` agrees with the live primitive.
+    let restored = restore(snapshot);
+    assert!(
+        restored.collaboration().mailbox_enabled(),
+        "a captured mailbox slice widens the effective collaboration config"
+    );
+    let restored_mailbox = restored.mailbox().expect("mailbox restored from snapshot");
+    let researcher = restored_mailbox.read_from("researcher", 0);
+    assert_eq!(
+        researcher
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["need sources for claim 3", "prioritise section 2"],
+        "snapshot content restores the researcher inbox in order"
+    );
+    // The sequence cursor is authoritative too: a post-restore send continues it
+    // rather than reusing an old seq.
+    let next_seq = restored_mailbox.send("planner", "researcher", "one more");
+    assert_eq!(next_seq, 2, "restore resumes the mailbox sequence cursor");
+
+    // A substrate the snapshot did not carry (and the topology did not enable)
+    // stays absent — the widening only covers what the snapshot restored.
+    assert!(restored.blackboard().is_none());
+    assert!(restored.plan().is_none());
+}
+
+#[test]
+fn legacy_snapshot_without_collaboration_fields_restores_bare() {
+    // Simulate a snapshot persisted before collaboration capture existed: encode
+    // a real snapshot, drop the collaboration slices, and confirm the
+    // `#[serde(default)]` fields decode to empty and restore builds a bare agent.
+    let agent = mailbox_supervisor();
+    agent.mailbox().expect("mailbox provisioned").send(
+        "reviewer",
+        "researcher",
+        "will be dropped from the legacy blob",
+    );
+    let snapshot = agent.snapshot().expect("snapshot at a committed point");
+
+    let mut value = serde_json::to_value(&snapshot).expect("encode snapshot");
+    let object = value
+        .as_object_mut()
+        .expect("snapshot encodes as an object");
+    for legacy_absent in ["mailbox", "blackboard", "plan", "artifacts"] {
+        object.remove(legacy_absent);
+    }
+    assert!(
+        !object.contains_key("mailbox"),
+        "the legacy blob omits the collaboration slices entirely"
+    );
+
+    let legacy: AgentSnapshot =
+        serde_json::from_value(value).expect("legacy snapshot decodes via serde defaults");
+    assert!(
+        legacy.mailbox.is_none() && legacy.blackboard.is_none() && legacy.plan.is_none(),
+        "missing collaboration fields default to absent"
+    );
+    assert!(
+        legacy.artifacts.is_empty(),
+        "missing artifacts defaults empty"
+    );
+
+    // Restore succeeds and re-derives an *empty* substrate from the topology: the
+    // two-delegate recipe still enables a mailbox, but with no captured content.
+    let restored = restore(legacy);
+    let restored_mailbox = restored
+        .mailbox()
+        .expect("topology re-enables an empty mailbox");
+    assert!(
+        restored_mailbox.read_from("researcher", 0).is_empty(),
+        "a legacy snapshot restores empty collaboration content"
+    );
     assert!(restored.blackboard().is_none());
     assert!(restored.plan().is_none());
 }
