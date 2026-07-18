@@ -1,6 +1,9 @@
 //! Unit tests for the collaboration primitives and their bridge tool adapters
-//! (M6-3). Every test name contains `tool_adapter` so the milestone validation
-//! selector `cargo test tool_adapter` runs the whole module.
+//! (M6-3). The bridge-adapter tests are named with a `tool_adapter` prefix so the
+//! milestone validation selector `cargo test tool_adapter` runs that whole slice;
+//! the data-only snapshot / restore round-trips added for M3-1 are named after the
+//! primitive they exercise (`mailbox_snapshot_*`, `blackboard_snapshot_*`,
+//! `plan_snapshot_*`).
 //!
 //! The tests cover three layers:
 //!
@@ -14,9 +17,9 @@
 //! - the [`SpawnAgentRequest`] translation, which turns a `spawn_agent` tool call
 //!   into a [`RequirementKind::NeedSubagent`] instead of running inline.
 
-use super::blackboard::{Blackboard, DEFAULT_CHANNEL};
-use super::mailbox::Mailbox;
-use super::plan::{Plan, PlanError, TaskStatus};
+use super::blackboard::{Blackboard, BlackboardSnapshot, DEFAULT_CHANNEL};
+use super::mailbox::{MailMessage, Mailbox, MailboxSnapshot};
+use super::plan::{Plan, PlanError, PlanSnapshot, TaskStatus};
 use super::tools::{
     BLACKBOARD_POST, BLACKBOARD_READ, CollabToolHandler, PLAN_ADD_TASK, PLAN_CLAIM,
     PLAN_CLAIM_FIRST_AVAILABLE, PLAN_READ, PLAN_UPDATE, REPORT_ARTIFACT, RUN_HOST_TOOL,
@@ -35,6 +38,7 @@ use crate::model::content::ContentBlock;
 use crate::model::tool::{Tool, ToolCall, ToolResponse, ToolStatus};
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -757,4 +761,128 @@ async fn tool_adapter_task_status_label_round_trip() {
         assert_eq!(back, status);
     }
     assert_eq!(TaskStatus::from_label("bogus"), None);
+}
+
+// ----- Data-only snapshot / restore round-trips (M3-1) ---------------------
+
+/// A [`Mailbox`] snapshot is data-only serde and round-trips: after restore the
+/// inboxes are identical and a fresh send continues the monotonic sequence
+/// rather than reusing a delivered seq.
+#[tokio::test]
+async fn mailbox_snapshot_round_trip_preserves_inboxes_and_seq() {
+    let mail = mailbox();
+    assert_eq!(mail.send("a", "b", "hi b"), 0);
+    assert_eq!(mail.send("a", "c", "hi c"), 1);
+    assert_eq!(mail.send("b", "a", "hi a"), 2);
+
+    let snapshot = mail.snapshot();
+    let encoded = serde_json::to_string(&snapshot).expect("serialize mailbox snapshot");
+    let decoded: MailboxSnapshot =
+        serde_json::from_str(&encoded).expect("deserialize mailbox snapshot");
+    assert_eq!(decoded, snapshot);
+
+    let restored = Mailbox::from_snapshot(decoded);
+    assert_eq!(restored.read_from("b", 0), mail.read_from("b", 0));
+    assert_eq!(restored.read_from("c", 0), mail.read_from("c", 0));
+    assert_eq!(restored.read_from("a", 0), mail.read_from("a", 0));
+
+    // A fresh send continues the sequence at the next value, not an old one.
+    assert_eq!(restored.send("c", "a", "again"), 3);
+    assert_eq!(restored.inbox("a").last().expect("inbox a").seq, 3);
+}
+
+/// [`Mailbox::from_snapshot`] reconciles a stale `next_seq` up to
+/// `max(seq) + 1`, so even a hand-written or older snapshot can never hand out a
+/// sequence that collides with delivered mail.
+#[tokio::test]
+async fn mailbox_from_snapshot_reconciles_stale_next_seq() {
+    let mut inboxes = BTreeMap::new();
+    inboxes.insert(
+        "a".to_owned(),
+        vec![MailMessage {
+            seq: 7,
+            from: "x".to_owned(),
+            to: "a".to_owned(),
+            text: "hi".to_owned(),
+        }],
+    );
+    // next_seq trails the delivered mail; restore must repair it.
+    let snapshot = MailboxSnapshot {
+        next_seq: 0,
+        inboxes,
+    };
+    let mail = Mailbox::from_snapshot(snapshot);
+    assert_eq!(mail.send("a", "b", "next"), 8);
+}
+
+/// A [`Blackboard`] whole-board snapshot is data-only serde and round-trips:
+/// after restore the identity, channel list, and each channel's ordered content
+/// match, and a fresh post continues each channel's offset.
+#[tokio::test]
+async fn blackboard_snapshot_all_round_trip_preserves_channels_and_offsets() {
+    let board = blackboard();
+    assert_eq!(board.post("alpha", "s", "a0"), 0);
+    assert_eq!(board.post("beta", "s", "b0"), 0);
+    assert_eq!(board.post("alpha", "s", "a1"), 1);
+
+    let snapshot = board.snapshot_all();
+    let encoded = serde_json::to_string(&snapshot).expect("serialize blackboard snapshot");
+    let decoded: BlackboardSnapshot =
+        serde_json::from_str(&encoded).expect("deserialize blackboard snapshot");
+    assert_eq!(decoded, snapshot);
+
+    let restored = Blackboard::from_snapshot(decoded);
+    assert_eq!(restored.id(), board.id());
+    let mut channels = restored.channels_list();
+    channels.sort();
+    assert_eq!(channels, vec!["alpha".to_owned(), "beta".to_owned()]);
+    assert_eq!(restored.snapshot("alpha"), board.snapshot("alpha"));
+    assert_eq!(restored.snapshot("beta"), board.snapshot("beta"));
+
+    // A fresh post continues each channel's offset from its current length.
+    assert_eq!(restored.post("alpha", "s", "a2"), 2);
+    assert_eq!(restored.post("beta", "s", "b1"), 1);
+}
+
+/// A [`Plan`] snapshot is data-only serde and round-trips: after restore the id,
+/// version, task order, and task states match, the retained version still guards
+/// a CAS claim, and the restored plan can continue driving operations.
+#[tokio::test]
+async fn plan_snapshot_round_trip_preserves_state_and_resumes_operations() {
+    let plan = plan();
+    plan.add_task("design", Vec::<String>::new())
+        .expect("add design");
+    plan.add_task("impl", ["design"]).expect("add impl");
+    plan.claim("design", "alice", plan.version())
+        .expect("claim design");
+
+    let snapshot = plan.snapshot();
+    let encoded = serde_json::to_string(&snapshot).expect("serialize plan snapshot");
+    let decoded: PlanSnapshot = serde_json::from_str(&encoded).expect("deserialize plan snapshot");
+    assert_eq!(decoded, snapshot);
+
+    let restored = Plan::from_snapshot(decoded);
+    assert_eq!(restored.id(), plan.id());
+    assert_eq!(restored.version(), plan.version());
+    let restored_snapshot = restored.snapshot();
+    assert_eq!(restored_snapshot.task_order, snapshot.task_order);
+    assert_eq!(restored_snapshot.tasks, snapshot.tasks);
+
+    // The retained version still guards a CAS claim: a stale version is rejected.
+    assert!(matches!(
+        restored.claim("impl", "bob", 0),
+        Err(PlanError::VersionConflict { .. })
+    ));
+
+    // With design completed and the correct version, the dependent claim proceeds.
+    restored
+        .update_status("design", "alice", TaskStatus::Completed, restored.version())
+        .expect("complete design");
+    restored
+        .claim("impl", "bob", restored.version())
+        .expect("claim impl after restore");
+    assert_eq!(
+        restored.snapshot().tasks["impl"].status,
+        TaskStatus::InProgress
+    );
 }

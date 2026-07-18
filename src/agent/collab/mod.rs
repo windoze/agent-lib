@@ -28,8 +28,8 @@ pub mod tools;
 #[cfg(test)]
 mod tests;
 
-pub use blackboard::{Blackboard, BoardMessage, DEFAULT_CHANNEL};
-pub use mailbox::{MailMessage, Mailbox};
+pub use blackboard::{Blackboard, BlackboardSnapshot, BoardMessage, DEFAULT_CHANNEL};
+pub use mailbox::{MailMessage, Mailbox, MailboxSnapshot};
 pub use plan::{Plan, PlanError, PlanSnapshot, TaskSnapshot, TaskStatus};
 pub use tools::{
     ArtifactSink, BLACKBOARD_POST, BLACKBOARD_READ, CollabToolHandler, PLAN_ADD_TASK, PLAN_CLAIM,

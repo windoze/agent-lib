@@ -32,9 +32,10 @@ pub use approval::{
     ToolApprovalPolicy,
 };
 pub use collab::{
-    ArtifactSink, Blackboard, BoardMessage, CollabToolHandler, MailMessage, Mailbox, Plan,
-    PlanError, PlanSnapshot, RecordingArtifactSink, SpawnAgentRequest, TaskSnapshot, TaskStatus,
-    ToolAdapterError, bridge_tool_declarations, bridge_tool_set,
+    ArtifactSink, Blackboard, BlackboardSnapshot, BoardMessage, CollabToolHandler, MailMessage,
+    Mailbox, MailboxSnapshot, Plan, PlanError, PlanSnapshot, RecordingArtifactSink,
+    SpawnAgentRequest, TaskSnapshot, TaskStatus, ToolAdapterError, bridge_tool_declarations,
+    bridge_tool_set,
 };
 pub use context::{
     BudgetCharge, BudgetDimension, BudgetError, BudgetHandle, BudgetLimits, BudgetSnapshot,

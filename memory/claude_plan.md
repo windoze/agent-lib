@@ -1,30 +1,33 @@
-# M2-3 执行计划：Review 非流式事件一致性
+# M3-1 执行计划：为 mailbox、blackboard、plan 补齐 data-only snapshot API
 
 ## 任务
-TODO.md M2-3（Review 任务）：复核 M2-1/M2-2 落地的非流式事件一致性。
+TODO.md M3-1：在 collab 层为 mailbox / blackboard / plan 补齐 data-only snapshot + restore
+API，保证 seq/offset 单调性与旧格式兼容，并加 round-trip 测试。
 
-## 检查范围
-1. run_full / run / stream 事件语义是否清楚。
-2. approval approve / deny / fallback 路径是否都有事件。
-3. 文档是否明确非流式不产生 token delta。
-4. 新增 recorder 是否不改变真实 handler 执行顺序（仅观察不决策）。
+## 现状调研
+- `src/agent/collab/mailbox.rs`：有 `Mailbox`（Mutex<MailboxState{next_seq, inboxes}>）、
+  `MailMessage`。仅有 `inbox`/`read_from`，无整体 snapshot / restore。
+- `src/agent/collab/blackboard.rs`：有 `Blackboard{id, channels}`、`BoardMessage`，
+  有 per-channel `snapshot(channel)` 与 `channels_list()`，无整体 snapshot / restore。
+- `src/agent/collab/plan.rs`：`PlanSnapshot{id, version, task_order, tasks}` 已完整，
+  有 `snapshot()`，但无 `from_snapshot()` restore API。
+- 注意 `src/facade/agent/snapshot.rs` 里有占位 `MailboxSnapshot{}`/`BlackboardSnapshot{}`
+  （空）—— 那是 M3-2/M3-3 的 facade 接线范围，本任务不动。
+
+## 实现要求
+1. mailbox：新增 data-only `MailboxSnapshot{next_seq, inboxes}`（serde，`#[serde(default)]`）；
+   `Mailbox::snapshot()` + `Mailbox::from_snapshot()`；restore 保 next_seq 单调（并防御性
+   reconcile 到 max(seq)+1）。
+2. blackboard：新增 data-only `BlackboardSnapshot{id, channels}`（serde）；
+   `Blackboard::snapshot_all()` + `Blackboard::from_snapshot()`；保 id/channel/offset 顺序。
+3. plan：新增 `Plan::from_snapshot(PlanSnapshot)`；确认 PlanSnapshot 覆盖全状态（已覆盖）。
+4. 从 collab mod / agent mod 导出新 snapshot 类型（与 PlanSnapshot 对齐）。
 
 ## 验证条件
-- cargo fmt --all
-- cargo clippy --all-targets -- -D warnings
-- cargo test -p agent-lib --lib facade::agent::
-- RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-- 手工复核 docs/refine.md “非流式 RunOutput.events 缺少审批请求” 条目状态并补充。
-
-## 执行步骤
-1. [ ] 代码复核：collect_traces / weave_approval_events / RecordingInteractionHandler
-   （src/facade/agent.rs）、TapInteractionHandler（stream.rs）、enriched_approval_request
-   （approval.rs）、RunEvent/RunOutput（run.rs）。
-2. [ ] 复核 recorder 只观察不决策、handler 优先级不变。
-3. [ ] 复核文档：docs/facade-api.md §6.2 事件一致性边界、README.md、run.rs rustdoc。
-4. [ ] 复核 docs/refine.md 条目状态，补充当前修复说明（若需要）。
-5. [ ] 运行验证命令（fmt/clippy/test/doc）。
-6. [ ] TODO.md 标记 M2-3 [DONE] 并填完成记录；提交。
+- 新增 mailbox round-trip 测试（多 recipient、snapshot→restore、read_from 一致、seq 续增）。
+- 新增 blackboard round-trip 测试（多 channel、snapshot→restore、channel 列表与内容一致、offset 续）。
+- 新增 plan round-trip 测试（snapshot→restore、version/task_order/tasks 一致、可续操作）。
+- cargo fmt / clippy --all-targets -D warnings / `cargo test -p agent-lib --lib agent::collab`。
 
 ## 状态：完成
-M2-3 复核完成：代码符合规范，refine.md §3 补充修复状态注记，验证全绿，已标记 [DONE]。
+M3-1 完成：mailbox/blackboard/plan 补齐 data-only snapshot+restore API，新增 4 个 round-trip 测试，fmt/clippy/test/doc 全绿，TODO.md 标记 [DONE]。

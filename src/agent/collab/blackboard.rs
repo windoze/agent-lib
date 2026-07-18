@@ -48,6 +48,22 @@ pub struct BoardMessage {
     pub text: String,
 }
 
+/// A serde-friendly, data-only snapshot of a whole [`Blackboard`] (design §6.4).
+///
+/// The snapshot captures the board [`id`](Self::id) plus every channel's ordered
+/// log, so restoring it with [`Blackboard::from_snapshot`] reproduces the board
+/// identity, the channel set, and each message's offset. The type is data only:
+/// it holds no lock and no runtime handle, so it is safe to persist.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlackboardSnapshot {
+    /// Identity of the blackboard.
+    pub id: BlackboardId,
+    /// Channel name -> ordered message log. Only channels that hold at least one
+    /// message are present, matching [`Blackboard::channels_list`].
+    #[serde(default)]
+    pub channels: BTreeMap<String, Vec<BoardMessage>>,
+}
+
 /// A live, shareable append-only blackboard (design §6.4).
 ///
 /// Every channel is an independent, ordered log. Wrap the blackboard in an `Arc`
@@ -66,6 +82,20 @@ impl Blackboard {
         Self {
             id,
             channels: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Rebuilds a blackboard from a data-only [`BlackboardSnapshot`].
+    ///
+    /// The restored board keeps the snapshot's identity and every channel log
+    /// verbatim, so a reader holding a prior offset cursor still sees the same
+    /// stable, gap-free order and a fresh [`post`](Self::post) continues from the
+    /// channel's current length.
+    #[must_use]
+    pub fn from_snapshot(snapshot: BlackboardSnapshot) -> Self {
+        Self {
+            id: snapshot.id,
+            channels: Mutex::new(snapshot.channels),
         }
     }
 
@@ -144,5 +174,18 @@ impl Blackboard {
     #[must_use]
     pub fn channels_list(&self) -> Vec<String> {
         self.channels().keys().cloned().collect()
+    }
+
+    /// Captures a data-only [`BlackboardSnapshot`] of the whole board: its
+    /// identity plus every channel's ordered log.
+    ///
+    /// Restoring the snapshot with [`from_snapshot`](Self::from_snapshot)
+    /// reproduces the board identity, the channel set, and each message's offset.
+    #[must_use]
+    pub fn snapshot_all(&self) -> BlackboardSnapshot {
+        BlackboardSnapshot {
+            id: self.id,
+            channels: self.channels().clone(),
+        }
     }
 }

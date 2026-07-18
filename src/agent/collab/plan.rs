@@ -319,6 +319,21 @@ impl Plan {
         }
     }
 
+    /// Rebuilds a plan board from a data-only [`PlanSnapshot`].
+    ///
+    /// The [`PlanSnapshot`] already carries the full board state — the plan
+    /// [`id`](PlanSnapshot::id), the [`version`](PlanSnapshot::version) counter,
+    /// the stable [`task_order`](PlanSnapshot::task_order), and every
+    /// [`TaskSnapshot`] — so restore is a direct rehydration: the resumed plan
+    /// keeps its version so a subsequent CAS [`claim`](Self::claim) still needs
+    /// the caller's `expected_version` to match.
+    #[must_use]
+    pub fn from_snapshot(snapshot: PlanSnapshot) -> Self {
+        Self {
+            board: Mutex::new(snapshot),
+        }
+    }
+
     /// Locks the board, recovering the guard even if a prior holder panicked.
     ///
     /// A poisoned lock only means some earlier operation panicked mid-way; the

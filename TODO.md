@@ -382,7 +382,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M3：协作状态 snapshot 和 restore
 
-### M3-1 [TODO] 为 mailbox、blackboard、plan 补齐 data-only snapshot API
+### M3-1 [DONE] 为 mailbox、blackboard、plan 补齐 data-only snapshot API
 
 上下文：
 
@@ -409,6 +409,38 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 ```bash
 cargo test -p agent-lib --lib agent::collab
 ```
+
+完成记录（M3-1）：
+
+- 实现：
+  - `src/agent/collab/mailbox.rs`：新增 data-only `MailboxSnapshot { next_seq, inboxes }`
+    （`Serialize`/`Deserialize`，字段带 `#[serde(default)]` 保兼容），并加
+    `Mailbox::snapshot()` 与 `Mailbox::from_snapshot()`。restore 时把 `next_seq`
+    防御性 reconcile 到 `max(seq)+1`，保证恢复后新发送消息 seq 严格递增、不复用旧 seq。
+  - `src/agent/collab/blackboard.rs`：新增 data-only `BlackboardSnapshot { id, channels }`
+    （`channels` 带 `#[serde(default)]`），并加 `Blackboard::snapshot_all()`（整板快照，
+    与已有 per-channel `snapshot(channel)` 区分）与 `Blackboard::from_snapshot()`，保留
+    board id、channel 列表与每条消息的 offset 顺序；恢复后 `post` 从 channel 现长度续 offset。
+  - `src/agent/collab/plan.rs`：`PlanSnapshot { id, version, task_order, tasks }` 已覆盖
+    全部 plan 状态，无需补字段；新增 `Plan::from_snapshot(PlanSnapshot)` 直接 rehydrate，
+    恢复后保留 version，使后续 CAS `claim` 仍需匹配 `expected_version`。
+  - 导出：`src/agent/collab/mod.rs` 与 `src/agent/mod.rs` 追加导出 `MailboxSnapshot`、
+    `BlackboardSnapshot`（与既有 `PlanSnapshot`/`TaskSnapshot` 对齐）。
+  - 说明：`src/facade/agent/snapshot.rs` 中的占位 `MailboxSnapshot{}`/`BlackboardSnapshot{}`
+    属 M3-2/M3-3 的 facade 接线范围，本任务未改动。
+- 测试（`src/agent/collab/tests.rs`，新增 4 个）：
+  - `mailbox_snapshot_round_trip_preserves_inboxes_and_seq`：多 recipient 发送后 snapshot→
+    serde 往返→restore，`read_from` 每个 recipient 内容一致，新发送 seq 续增到 3。
+  - `mailbox_from_snapshot_reconciles_stale_next_seq`：手写 next_seq 落后于已投递 seq=7 的
+    snapshot，restore 后下一条 send 得到 8，不复用旧 seq。
+  - `blackboard_snapshot_all_round_trip_preserves_channels_and_offsets`：多 channel 多消息
+    snapshot→serde 往返→restore，id、channel 列表与每 channel 内容一致，新 post offset 续。
+  - `plan_snapshot_round_trip_preserves_state_and_resumes_operations`：snapshot→serde 往返→
+    restore，id/version/task_order/tasks 一致；旧 version claim 被 `VersionConflict` 拒；
+    补齐依赖后可继续 claim。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`（clean）、
+  `cargo test -p agent-lib --lib agent::collab`（28 passed）、
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）。
 
 ### M3-2 [TODO] 让 `AgentSnapshot::capture` 保存 live 协作内容
 

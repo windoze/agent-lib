@@ -40,6 +40,27 @@ struct MailboxState {
     inboxes: BTreeMap<String, Vec<MailMessage>>,
 }
 
+/// A serde-friendly, data-only snapshot of a whole [`Mailbox`] (design §3.5).
+///
+/// The snapshot captures every recipient inbox **and** the mailbox-global
+/// [`next_seq`](Self::next_seq) cursor, so restoring it and sending fresh mail
+/// keeps assigning strictly increasing sequence numbers rather than replaying old
+/// ones. The type is data only: it holds no lock and no runtime handle, so it is
+/// safe to persist and later feed back to [`Mailbox::from_snapshot`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailboxSnapshot {
+    /// Next sequence number the mailbox will assign after restore.
+    ///
+    /// On restore this is reconciled up to `max(seq) + 1` across the captured
+    /// inboxes, so even a hand-written or older snapshot can never hand out a
+    /// sequence that collides with delivered mail.
+    #[serde(default)]
+    pub next_seq: u64,
+    /// Recipient label -> ordered inbox, in delivery order.
+    #[serde(default)]
+    pub inboxes: BTreeMap<String, Vec<MailMessage>>,
+}
+
 /// A live, shareable directed mailbox (design §3.5).
 ///
 /// Wrap it in an `Arc` to share across agents. Every [`send`](Self::send) is a
@@ -55,6 +76,33 @@ impl Mailbox {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Rebuilds a mailbox from a data-only [`MailboxSnapshot`].
+    ///
+    /// The restored mailbox keeps every recipient inbox and resumes its sequence
+    /// counter from the snapshot. To defend against a hand-written or older
+    /// snapshot whose `next_seq` trails its delivered mail, the counter is
+    /// reconciled up to `max(seq) + 1` across all inboxes, so the first message
+    /// sent after restore can never reuse a delivered sequence number.
+    #[must_use]
+    pub fn from_snapshot(snapshot: MailboxSnapshot) -> Self {
+        let highest = snapshot
+            .inboxes
+            .values()
+            .flatten()
+            .map(|message| message.seq)
+            .max();
+        let next_seq = match highest {
+            Some(seq) => snapshot.next_seq.max(seq + 1),
+            None => snapshot.next_seq,
+        };
+        Self {
+            state: Mutex::new(MailboxState {
+                next_seq,
+                inboxes: snapshot.inboxes,
+            }),
+        }
     }
 
     /// Locks the state, recovering the guard even if a prior holder panicked
@@ -114,5 +162,20 @@ impl Mailbox {
             .filter(|message| message.seq >= from)
             .cloned()
             .collect()
+    }
+
+    /// Captures a data-only [`MailboxSnapshot`] of every inbox plus the shared
+    /// sequence cursor, in delivery order.
+    ///
+    /// Restoring the snapshot with [`from_snapshot`](Self::from_snapshot)
+    /// reproduces the inboxes and continues assigning strictly increasing
+    /// sequence numbers.
+    #[must_use]
+    pub fn snapshot(&self) -> MailboxSnapshot {
+        let state = self.state();
+        MailboxSnapshot {
+            next_seq: state.next_seq,
+            inboxes: state.inboxes.clone(),
+        }
     }
 }
