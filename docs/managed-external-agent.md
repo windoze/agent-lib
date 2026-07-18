@@ -902,8 +902,11 @@ claude --print --output-format stream-json --input-format stream-json ...
 live session，见 M6-2/M6-3）：
 
 - `ClaudeCodeConfig`（`src/agent/external/claude_code/config.rs`）：binary path / env override /
-  working dir(worktree) / permission mode / optional model / profile / timeout 的纯数据配置。serde
-  round-trip；手写 `Debug` 脱敏 env 值（只印 key + `<redacted>`）。`permission_mode_arg()` 映射
+  working dir(worktree) / permission mode / optional model / profile / 三个独立超时的纯数据配置
+  （`timeout` 只管 probe/launch；`read_idle_timeout` 默认 10 min，是每行 stdout 空闲上限；
+  `shutdown_grace` 默认 30s，是优雅关闭的等待上限——见下文「三类超时」）。serde
+  round-trip（新增超时字段带 serde default，旧配置可反序列化）；手写 `Debug` 脱敏 env 值
+  （只印 key + `<redacted>`）。`permission_mode_arg()` 映射
   `ExternalPermissionMode` → Claude CLI `--permission-mode` 值（`Prompt→default`、
   `AcceptEdits→acceptEdits`、`Plan→plan`、`BypassPermissions→bypassPermissions`）；`base_session_args()`
   产出 `--print --output-format stream-json --input-format stream-json --permission-mode <m> [--model <m>]`。
@@ -912,6 +915,19 @@ live session，见 M6-2/M6-3）：
   其余能力从 `--help` 开关**保守探测**（未广告即 `false`），永不 panic。探测走可注入的
   `ClaudeCodeProbeExec`（生产实现 `SystemClaudeCodeExec` 用 `tokio::process`），单测用 fake exec 离线覆盖
   全部错误分类，无需真实 Claude Code，也不泄露 env secret。
+
+**三类超时（M1-5 拆分，三个 CLI adapter 口径一致）**：
+
+- `timeout`（默认 30s）：只管一次性控制操作——capability probe 与 launch 握手。
+- `read_idle_timeout`（默认 10 min）：live session 的**每行 stdout 空闲上限**。CLI 跑长静默命令
+  （构建/测试套件）数分钟无帧属正常，绝不复用 30s 的 launch 超时，否则长静默 turn 会被误判
+  `SessionLost` 杀掉。
+- `shutdown_grace`（默认 30s）：close 时丢弃 stdin 发 EOF 后等待 CLI 自行退出的上限，超时
+  `start_kill` → `ForcedKill`。
+
+Claude Code 是单条长驻进程，该空闲上限跨整个 session 逐行生效；Codex/OpenCode 是每 turn 一个
+一次性进程（见 §13/§14），同一上限在单个 turn 进程内逐行生效——语义相同，只是作用域是一个
+turn 而非整条 session。
 
 ### 12.2 streaming decoder
 
@@ -973,10 +989,10 @@ decoder 必须:
   `stream-json` 帧(`Start`/`Continue`→`user` 文本帧;`RespondInteraction`(权限)→`control_response`
   `allow`/`deny` 帧),再逐行读 stdout 喂 decoder、把观测镜像到 live sink,直到 decoder 落定一个
   `RuntimeDecisionPoint`;stdout 提前 EOF→`SessionLost`,非法帧→`Protocol`。`shutdown` 丢弃 stdin 让 CLI
-  见 EOF,在 timeout 内等待优雅退出(超时则 `start_kill` → `ForcedKill`,归类
+  见 EOF,在 shutdown grace 内等待优雅退出(超时则 `start_kill` → `ForcedKill`,归类
   `Graceful`/`ForcedKill`/`Failed`)。
 - IO 经私有 `ClaudeSessionIo` trait 注入:生产用 `ClaudeProcessIo`(`tokio::process`,stderr 丢弃、
-  `kill_on_drop`、每读超时),单测注入 fake transport 回放固定帧并捕获 stdin,**离线**跑通
+  `kill_on_drop`、每读空闲超时 `read_idle_timeout`),单测注入 fake transport 回放固定帧并捕获 stdin,**离线**跑通
   start/advance/resume/shutdown 全状态机,无需真实 binary、无网络。
 - 宿主工具(spec 允许,§12.3):本 adapter **不跑 MCP server**,故 `implemented_capabilities()` 诚实报告
   `host_tools=false` / `host_subagents=false`,并对声明了 `tools` 的 `start`/`resume` 请求以
@@ -1043,7 +1059,9 @@ codex -s read-only -a never exec --json -C <worktree> ...
   （`untrusted`/`on-request`/`never`）与 `mcp` 子命令位于**顶层**;`-s/--sandbox`
   （`read-only`/`workspace-write`/`danger-full-access`）顶层与 `exec` 均有;`exec resume <id>` 支持续跑。
 - `CodexConfig`:binary path / env override（BTreeMap，手写 `Debug` 脱敏,只印 key + `<redacted>`）/
-  working dir(worktree) / permission mode / optional model / profile / timeout;serde round-trip 可持久化。
+  working dir(worktree) / permission mode / optional model / profile / 三个独立超时（口径同 §12 的
+  「三类超时」:`timeout` 只管 probe/launch,`read_idle_timeout` 默认 10 min 是每行 stdout 空闲上限,
+  `shutdown_grace` 默认 30s;新字段带 serde default）;serde round-trip 可持久化。
   `approval_policy_arg()` 与 `sandbox_mode_arg()` 把 `ExternalPermissionMode` 映射到当前 CLI 词汇:
   `Prompt→untrusted+read-only`（仅受信命令免批,其余升级宿主）、`AcceptEdits→on-request+workspace-write`、
   `Plan→never+read-only`、`BypassPermissions→never+danger-full-access`。`base_exec_args()` 产出
@@ -1141,7 +1159,7 @@ decoder 接进 milestone-5 的 `ExternalRuntimeAdapter` / `ExternalRuntimeSessio
   (`codex -a <approval> -s <sandbox> [--model M][--profile P] exec resume --json --skip-git-repo-check
   <id>`),再由 adapter 追加 `<message>`;frozen 的 `base_exec_args()`(M7-1,有断言精确顺序的测试)不改动。
   生产进程 **stdin=null**(否则 codex 阻塞在 "Reading additional input from stdin…")、**stderr 丢弃**(防原始
-  文本泄漏)、stdout piped 逐行喂 decoder,`kill_on_drop`、每读超时。
+  文本泄漏)、stdout piped 逐行喂 decoder,`kill_on_drop`、每读空闲超时 `read_idle_timeout`。
 - 能力(诚实按 M7-2 结论):`codex exec --json` **自主运行**——审批按命令行预置的 sandbox/approval 策略解决、
   自己执行工具,流里**没有**任何 host 可暂停的 tool-call/approval 帧,一个 turn 只会 `Completed` 或
   `Failed`。故 `implemented_capabilities()` 报告 `host_tools=false` / `host_subagents=false` /
@@ -1208,7 +1226,7 @@ OpenCode 需要先做 capability probe,因为部署形态可能更多。
 >   `SessionStarted` 观测)为止,把这些前导观测缓存给第一次 `advance` 续读;此后每个 `Continue` follow-up 在
 >   `advance` spawn 一个新的 `run --session` 进程,整段 session 共用一个跨全程单调 `seq` 的 decoder。生产进程
 >   **stdin=null**(否则 `run` 阻塞在从 stdin 读消息)、**stderr 丢弃**(防原始文本泄漏)、stdout piped 逐行喂
->   decoder,`kill_on_drop`、每读超时。
+>   decoder,`kill_on_drop`、每读空闲超时 `read_idle_timeout`。
 > - 能力(诚实按 M8-2 结论):`run --format json` **自主运行**,流里没有 host 可暂停的 tool-call/approval 帧,
 >   一个 turn 只会 `Completed`/`Failed`。故 `implemented_capabilities()` 报 `host_tools=false` /
 >   `host_subagents=false` / **`permission_bridge=false`**,`streaming`/`resume`/`artifacts`/`usage`/

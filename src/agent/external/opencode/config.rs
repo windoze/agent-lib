@@ -55,6 +55,30 @@ const DEFAULT_BINARY: &str = "opencode";
 /// The default probe/launch timeout applied when a caller does not set one.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The default per-line stdout idle timeout for a live `opencode run` turn
+/// process.
+///
+/// This is deliberately far longer than [`DEFAULT_TIMEOUT`]: a turn can run a
+/// silent build or test suite for minutes without emitting a frame, and that
+/// silence must not be mistaken for a dead CLI.
+const DEFAULT_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The default grace period a close waits for the turn process to exit on its
+/// own before force-killing the child.
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// Serde default for [`OpenCodeConfig::read_idle_timeout`], so configs
+/// persisted before the field existed still deserialize.
+const fn default_read_idle_timeout() -> Duration {
+    DEFAULT_READ_IDLE_TIMEOUT
+}
+
+/// Serde default for [`OpenCodeConfig::shutdown_grace`], so configs persisted
+/// before the field existed still deserialize.
+const fn default_shutdown_grace() -> Duration {
+    DEFAULT_SHUTDOWN_GRACE
+}
+
 /// Data-only launch configuration for the managed OpenCode adapter.
 ///
 /// Build one with [`OpenCodeConfig::new`] (or [`Default`], which uses the
@@ -76,7 +100,23 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// - [`agent`](Self::agent): optional `--agent` preset selector (OpenCode's
 ///   agent/permission configuration).
 /// - [`timeout`](Self::timeout): the wall-clock bound applied to a probe
-///   invocation (and, later, to launch handshakes).
+///   invocation and to the launch handshake.
+/// - [`read_idle_timeout`](Self::read_idle_timeout): the per-line stdout idle
+///   bound for a live turn process — how long the CLI may stay silent between
+///   frames before the turn is declared lost.
+/// - [`shutdown_grace`](Self::shutdown_grace): how long a close waits for the
+///   turn process to exit on its own before force-killing the child.
+///
+/// # The three timeouts
+///
+/// [`timeout`](Self::timeout) bounds only one-shot control operations
+/// (probe, launch). Steady-state session IO uses the other two:
+/// [`read_idle_timeout`](Self::read_idle_timeout) guards each stdout line read
+/// so a long silent command (a build, a test suite) is not mistaken for a
+/// dead CLI, and [`shutdown_grace`](Self::shutdown_grace) bounds the graceful
+/// close before the fallback kill. All three are independent knobs. Because
+/// `opencode run` is a one-shot process per turn, the idle bound applies
+/// within a single turn rather than across a long-lived session.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenCodeConfig {
     binary: PathBuf,
@@ -90,6 +130,10 @@ pub struct OpenCodeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent: Option<String>,
     timeout: Duration,
+    #[serde(default = "default_read_idle_timeout")]
+    read_idle_timeout: Duration,
+    #[serde(default = "default_shutdown_grace")]
+    shutdown_grace: Duration,
 }
 
 impl Default for OpenCodeConfig {
@@ -102,6 +146,8 @@ impl Default for OpenCodeConfig {
             model: None,
             agent: None,
             timeout: DEFAULT_TIMEOUT,
+            read_idle_timeout: DEFAULT_READ_IDLE_TIMEOUT,
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         }
     }
 }
@@ -162,9 +208,33 @@ impl OpenCodeConfig {
     }
 
     /// Sets the probe/launch timeout.
+    ///
+    /// This bounds only probe invocations and the launch handshake; it does
+    /// **not** bound steady-state session reads (see
+    /// [`with_read_idle_timeout`](Self::with_read_idle_timeout)) or the
+    /// graceful close (see [`with_shutdown_grace`](Self::with_shutdown_grace)).
     #[must_use]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Sets the per-line stdout idle timeout for a live turn process.
+    ///
+    /// Each stdout line read is bounded by this duration; exceeding it
+    /// declares the session lost. The default (10 minutes) leaves room for
+    /// long silent commands such as builds or test suites.
+    #[must_use]
+    pub const fn with_read_idle_timeout(mut self, read_idle_timeout: Duration) -> Self {
+        self.read_idle_timeout = read_idle_timeout;
+        self
+    }
+
+    /// Sets the grace period a close waits for the turn process to exit on its
+    /// own before force-killing the child.
+    #[must_use]
+    pub const fn with_shutdown_grace(mut self, shutdown_grace: Duration) -> Self {
+        self.shutdown_grace = shutdown_grace;
         self
     }
 
@@ -208,6 +278,18 @@ impl OpenCodeConfig {
     #[must_use]
     pub const fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// Returns the per-line stdout idle timeout for a live turn process.
+    #[must_use]
+    pub const fn read_idle_timeout(&self) -> Duration {
+        self.read_idle_timeout
+    }
+
+    /// Returns the grace period a close waits before force-killing.
+    #[must_use]
+    pub const fn shutdown_grace(&self) -> Duration {
+        self.shutdown_grace
     }
 
     /// Whether the configured permission mode maps onto OpenCode's `--auto`
@@ -319,13 +401,18 @@ impl std::fmt::Debug for OpenCodeConfig {
             .field("model", &self.model)
             .field("agent", &self.agent)
             .field("timeout", &self.timeout)
+            .field("read_idle_timeout", &self.read_idle_timeout)
+            .field("shutdown_grace", &self.shutdown_grace)
             .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_BINARY, DEFAULT_TIMEOUT, OpenCodeConfig};
+    use super::{
+        DEFAULT_BINARY, DEFAULT_READ_IDLE_TIMEOUT, DEFAULT_SHUTDOWN_GRACE, DEFAULT_TIMEOUT,
+        OpenCodeConfig,
+    };
     use crate::agent::external::ExternalPermissionMode;
     use std::path::Path;
     use std::time::Duration;
@@ -340,6 +427,8 @@ mod tests {
         assert!(config.model().is_none());
         assert!(config.agent().is_none());
         assert_eq!(config.timeout(), DEFAULT_TIMEOUT);
+        assert_eq!(config.read_idle_timeout(), DEFAULT_READ_IDLE_TIMEOUT);
+        assert_eq!(config.shutdown_grace(), DEFAULT_SHUTDOWN_GRACE);
     }
 
     #[test]
@@ -465,7 +554,9 @@ mod tests {
             .with_permission_mode(ExternalPermissionMode::Plan)
             .with_model("anthropic/claude-sonnet-4")
             .with_agent("plan")
-            .with_timeout(Duration::from_secs(90));
+            .with_timeout(Duration::from_secs(90))
+            .with_read_idle_timeout(Duration::from_secs(1200))
+            .with_shutdown_grace(Duration::from_secs(45));
 
         let encoded = serde_json::to_string(&config).expect("serialize config");
         let decoded: OpenCodeConfig = serde_json::from_str(&encoded).expect("deserialize config");
@@ -479,6 +570,23 @@ mod tests {
         assert!(!obj.contains_key("working_dir"));
         assert!(!obj.contains_key("model"));
         assert!(!obj.contains_key("agent"));
+    }
+
+    #[test]
+    fn opencode_config_old_json_without_idle_fields_uses_defaults() {
+        // Configs persisted before `read_idle_timeout`/`shutdown_grace` existed
+        // must still deserialize, picking up the new defaults rather than the
+        // (short) probe/launch timeout.
+        let mut legacy = serde_json::to_value(OpenCodeConfig::new()).expect("serialize");
+        let obj = legacy.as_object_mut().expect("config is an object");
+        obj.remove("read_idle_timeout");
+        obj.remove("shutdown_grace");
+
+        let decoded: OpenCodeConfig =
+            serde_json::from_value(legacy).expect("deserialize legacy config");
+        assert_eq!(decoded.read_idle_timeout(), DEFAULT_READ_IDLE_TIMEOUT);
+        assert_eq!(decoded.shutdown_grace(), DEFAULT_SHUTDOWN_GRACE);
+        assert_eq!(decoded.timeout(), DEFAULT_TIMEOUT);
     }
 
     #[test]

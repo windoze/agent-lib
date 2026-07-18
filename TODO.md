@@ -145,7 +145,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（含 77 条 adapter 测试、8 条 http 测试全过）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - `docs/review-2026-07.md` H-SEC-4 已标注 `✅ 已修复（M1-4）`。无 breaking change（错误消息措辞变化不计入 API 稳定性承诺）。
 
-### M1-5 [TODO] external 流读取超时与 launch 超时拆分（H-EXT-1）
+### M1-5 [DONE] external 流读取超时与 launch 超时拆分（H-EXT-1）
 
 上下文：
 
@@ -165,6 +165,17 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：config 默认值与 serde round-trip（含缺字段旧 JSON 反序列化）。
 - 现有 external 测试全过：`cargo test --features "external-claude-code external-codex external-opencode" --all-targets`。
 - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D warnings`。
+
+完成记录：
+
+- 三个 config（`claude_code/config.rs`、`codex/config.rs`、`opencode/config.rs`）各新增两个独立字段：`read_idle_timeout: Duration`（默认 10 min，`DEFAULT_READ_IDLE_TIMEOUT`）与 `shutdown_grace: Duration`（默认 30s，`DEFAULT_SHUTDOWN_GRACE`），均带 `#[serde(default = ...)]` 私有默认函数，旧 JSON 缺字段反序列化落到新默认值而非 30s launch 超时。`timeout()` 保留为 probe/launch 语义，rustdoc 与 struct 文档新增「The three timeouts」节写清三者口径；配套 `with_read_idle_timeout`/`with_shutdown_grace` setter 与 getter，手写 `Debug` 同步补两个字段。
+- 三个 adapter session 构造改接线：`claude_code/adapter.rs`（`ClaudeProcessIo::spawn`）与 `codex/adapter.rs`、`opencode/adapter.rs` 的 `read_timeout`/`shutdown_grace` 分别改取 `config.read_idle_timeout()`/`config.shutdown_grace()`；`ClaudeProcessIo`/`CodexProcessTurn`/`OpenCodeProcessTurn` 的 doc comment 同步改述。probe 路径（`*/probe.rs`）仍用 `config.timeout()`，语义不变。
+- codex/opencode one-shot 与 claude 长会话的静默上限语义差异已写入文档：同一 per-line 空闲上限，claude 跨整条 session 逐行生效，codex/opencode 在单个 turn 进程内逐行生效（config rustdoc 与 `docs/managed-external-agent.md` §12 新增「三类超时」段落均有说明）。
+- 测试：三个 config 各 3 条新断言——默认值含两个新字段、serde round-trip 携带自定义值、旧 JSON（删掉 `read_idle_timeout`/`shutdown_grace` 键）反序列化得到新默认值。
+- 文档：`docs/managed-external-agent.md` §12 新增「三类超时（M1-5 拆分）」段落（含 codex/opencode one-shot 语义差异说明），§12/§13/§14 中「每读超时」「在 timeout 内等待优雅退出」等旧措辞改述为新字段口径。
+- 范围说明：ACP（`acp/connection.rs` 的 `read_timeout`、`acp/adapter.rs` 的 `shutdown_grace` 也取 `config.timeout()`）不在 H-EXT-1 条目与 M1-5 范围内（审查条目只列三个 CLI adapter），未改动。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo clippy --all-targets -- -D warnings`、`cargo test --features "external-claude-code external-codex external-opencode" --all-targets`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- `docs/review-2026-07.md` H-EXT-1 已标注 `✅ 已修复（M1-5）`。无 breaking change（新增字段均有 serde default；新增 API 纯增量）。
 
 ### M1-6 [TODO] `close()` 按退出码分类 Graceful/Failed（H-EXT-3）
 

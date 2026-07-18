@@ -33,6 +33,29 @@ const DEFAULT_BINARY: &str = "claude";
 /// The default probe/launch timeout applied when a caller does not set one.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The default per-line stdout idle timeout for a live session.
+///
+/// This is deliberately far longer than [`DEFAULT_TIMEOUT`]: a turn can run a
+/// silent build or test suite for minutes without emitting a frame, and that
+/// silence must not be mistaken for a dead CLI.
+const DEFAULT_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The default grace period a session close waits for the CLI to exit on its
+/// own (after stdin EOF) before force-killing the child.
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// Serde default for [`ClaudeCodeConfig::read_idle_timeout`], so configs
+/// persisted before the field existed still deserialize.
+const fn default_read_idle_timeout() -> Duration {
+    DEFAULT_READ_IDLE_TIMEOUT
+}
+
+/// Serde default for [`ClaudeCodeConfig::shutdown_grace`], so configs
+/// persisted before the field existed still deserialize.
+const fn default_shutdown_grace() -> Duration {
+    DEFAULT_SHUTDOWN_GRACE
+}
+
 /// Data-only launch configuration for the managed Claude Code adapter.
 ///
 /// Build one with [`ClaudeCodeConfig::new`] (or [`Default`], which uses the
@@ -53,7 +76,21 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// - [`model`](Self::model) / [`profile`](Self::profile): optional `--model` and
 ///   host-side profile selectors.
 /// - [`timeout`](Self::timeout): the wall-clock bound applied to a probe
-///   invocation (and, later, to launch handshakes).
+///   invocation and to the launch handshake.
+/// - [`read_idle_timeout`](Self::read_idle_timeout): the per-line stdout idle
+///   bound for a live session — how long the CLI may stay silent between
+///   frames before the session is declared lost.
+/// - [`shutdown_grace`](Self::shutdown_grace): how long a session close waits
+///   for a graceful exit (after stdin EOF) before force-killing the child.
+///
+/// # The three timeouts
+///
+/// [`timeout`](Self::timeout) bounds only one-shot control operations
+/// (probe, launch). Steady-state session IO uses the other two:
+/// [`read_idle_timeout`](Self::read_idle_timeout) guards each stdout line read
+/// so a long silent command (a build, a test suite) is not mistaken for a
+/// dead CLI, and [`shutdown_grace`](Self::shutdown_grace) bounds the graceful
+/// close before the fallback kill. All three are independent knobs.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeCodeConfig {
     binary: PathBuf,
@@ -67,6 +104,10 @@ pub struct ClaudeCodeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile: Option<String>,
     timeout: Duration,
+    #[serde(default = "default_read_idle_timeout")]
+    read_idle_timeout: Duration,
+    #[serde(default = "default_shutdown_grace")]
+    shutdown_grace: Duration,
 }
 
 impl Default for ClaudeCodeConfig {
@@ -79,6 +120,8 @@ impl Default for ClaudeCodeConfig {
             model: None,
             profile: None,
             timeout: DEFAULT_TIMEOUT,
+            read_idle_timeout: DEFAULT_READ_IDLE_TIMEOUT,
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
         }
     }
 }
@@ -139,9 +182,33 @@ impl ClaudeCodeConfig {
     }
 
     /// Sets the probe/launch timeout.
+    ///
+    /// This bounds only probe invocations and the launch handshake; it does
+    /// **not** bound steady-state session reads (see
+    /// [`with_read_idle_timeout`](Self::with_read_idle_timeout)) or the
+    /// graceful close (see [`with_shutdown_grace`](Self::with_shutdown_grace)).
     #[must_use]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Sets the per-line stdout idle timeout for a live session.
+    ///
+    /// Each stdout line read is bounded by this duration; exceeding it
+    /// declares the session lost. The default (10 minutes) leaves room for
+    /// long silent commands such as builds or test suites.
+    #[must_use]
+    pub const fn with_read_idle_timeout(mut self, read_idle_timeout: Duration) -> Self {
+        self.read_idle_timeout = read_idle_timeout;
+        self
+    }
+
+    /// Sets the grace period a session close waits for the CLI to exit on its
+    /// own (after stdin EOF) before force-killing the child.
+    #[must_use]
+    pub const fn with_shutdown_grace(mut self, shutdown_grace: Duration) -> Self {
+        self.shutdown_grace = shutdown_grace;
         self
     }
 
@@ -185,6 +252,18 @@ impl ClaudeCodeConfig {
     #[must_use]
     pub const fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// Returns the per-line stdout idle timeout for a live session.
+    #[must_use]
+    pub const fn read_idle_timeout(&self) -> Duration {
+        self.read_idle_timeout
+    }
+
+    /// Returns the grace period a session close waits before force-killing.
+    #[must_use]
+    pub const fn shutdown_grace(&self) -> Duration {
+        self.shutdown_grace
     }
 
     /// Maps the configured [`ExternalPermissionMode`] onto the Claude Code
@@ -250,13 +329,18 @@ impl std::fmt::Debug for ClaudeCodeConfig {
             .field("model", &self.model)
             .field("profile", &self.profile)
             .field("timeout", &self.timeout)
+            .field("read_idle_timeout", &self.read_idle_timeout)
+            .field("shutdown_grace", &self.shutdown_grace)
             .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeCodeConfig, DEFAULT_BINARY, DEFAULT_TIMEOUT};
+    use super::{
+        ClaudeCodeConfig, DEFAULT_BINARY, DEFAULT_READ_IDLE_TIMEOUT, DEFAULT_SHUTDOWN_GRACE,
+        DEFAULT_TIMEOUT,
+    };
     use crate::agent::external::ExternalPermissionMode;
     use std::path::Path;
     use std::time::Duration;
@@ -271,6 +355,8 @@ mod tests {
         assert!(config.model().is_none());
         assert!(config.profile().is_none());
         assert_eq!(config.timeout(), DEFAULT_TIMEOUT);
+        assert_eq!(config.read_idle_timeout(), DEFAULT_READ_IDLE_TIMEOUT);
+        assert_eq!(config.shutdown_grace(), DEFAULT_SHUTDOWN_GRACE);
     }
 
     #[test]
@@ -325,7 +411,9 @@ mod tests {
             .with_permission_mode(ExternalPermissionMode::Plan)
             .with_model("claude-opus")
             .with_profile("reviewer")
-            .with_timeout(Duration::from_secs(90));
+            .with_timeout(Duration::from_secs(90))
+            .with_read_idle_timeout(Duration::from_secs(1200))
+            .with_shutdown_grace(Duration::from_secs(45));
 
         let encoded = serde_json::to_string(&config).expect("serialize config");
         let decoded: ClaudeCodeConfig = serde_json::from_str(&encoded).expect("deserialize config");
@@ -339,6 +427,23 @@ mod tests {
         assert!(!obj.contains_key("working_dir"));
         assert!(!obj.contains_key("model"));
         assert!(!obj.contains_key("profile"));
+    }
+
+    #[test]
+    fn claude_code_config_old_json_without_idle_fields_uses_defaults() {
+        // Configs persisted before `read_idle_timeout`/`shutdown_grace` existed
+        // must still deserialize, picking up the new defaults rather than the
+        // (short) probe/launch timeout.
+        let mut legacy = serde_json::to_value(ClaudeCodeConfig::new()).expect("serialize");
+        let obj = legacy.as_object_mut().expect("config is an object");
+        obj.remove("read_idle_timeout");
+        obj.remove("shutdown_grace");
+
+        let decoded: ClaudeCodeConfig =
+            serde_json::from_value(legacy).expect("deserialize legacy config");
+        assert_eq!(decoded.read_idle_timeout(), DEFAULT_READ_IDLE_TIMEOUT);
+        assert_eq!(decoded.shutdown_grace(), DEFAULT_SHUTDOWN_GRACE);
+        assert_eq!(decoded.timeout(), DEFAULT_TIMEOUT);
     }
 
     #[test]

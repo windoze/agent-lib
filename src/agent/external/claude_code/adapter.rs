@@ -108,10 +108,10 @@ trait ClaudeSessionIo: Send {
 /// Production [`ClaudeSessionIo`] backed by a real `tokio::process` child.
 ///
 /// It pipes the CLI's stdin/stdout, kills the child on drop, bounds each read
-/// with the config timeout, and — on [`close`](ClaudeSessionIo::close) — drops
-/// stdin so the CLI sees EOF, waits for a graceful exit within the timeout, and
-/// force-kills on overrun. stderr is discarded so no raw runtime text can leak
-/// into a diagnostic.
+/// with the configured read-idle timeout, and — on
+/// [`close`](ClaudeSessionIo::close) — drops stdin so the CLI sees EOF, waits
+/// for a graceful exit within the shutdown grace, and force-kills on overrun.
+/// stderr is discarded so no raw runtime text can leak into a diagnostic.
 struct ClaudeProcessIo {
     child: Child,
     stdin: Option<tokio::process::ChildStdin>,
@@ -165,8 +165,8 @@ impl ClaudeProcessIo {
             child,
             stdin,
             stdout: BufReader::new(stdout).lines(),
-            read_timeout: config.timeout(),
-            shutdown_grace: config.timeout(),
+            read_timeout: config.read_idle_timeout(),
+            shutdown_grace: config.shutdown_grace(),
         })
     }
 }

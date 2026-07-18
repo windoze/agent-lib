@@ -219,18 +219,18 @@ impl CodexLauncher for SystemCodexLauncher {
         Ok(Box::new(CodexProcessTurn {
             child,
             stdout: BufReader::new(stdout).lines(),
-            read_timeout: self.config.timeout(),
-            shutdown_grace: self.config.timeout(),
+            read_timeout: self.config.read_idle_timeout(),
+            shutdown_grace: self.config.shutdown_grace(),
         }))
     }
 }
 
 /// Production [`CodexTurnStream`] backed by a real `tokio::process` child.
 ///
-/// It pipes the CLI's stdout, kills the child on drop, bounds each read with the
-/// config timeout, and — on [`close`](CodexTurnStream::close) — waits for the
-/// one-shot process to exit within the timeout (a settled turn has already
-/// exited) and force-kills on overrun.
+/// It pipes the CLI's stdout, kills the child on drop, bounds each read with
+/// the configured read-idle timeout, and — on [`close`](CodexTurnStream::close)
+/// — waits for the one-shot process to exit within the shutdown grace (a
+/// settled turn has already exited) and force-kills on overrun.
 struct CodexProcessTurn {
     child: Child,
     stdout: Lines<BufReader<ChildStdout>>,
