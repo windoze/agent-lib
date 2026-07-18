@@ -536,7 +536,9 @@ M3-4 落地的具体类型:
 
 - `ExternalSessionShutdown`(`Graceful` / `ForcedKill` / `Failed`,`Copy` 分类)是 shutdown disposition
   的载体,`leaves_residual_side_effects()` 对 `ForcedKill` / `Failed` 返回 `true`,提示调度器该
-  worktree 可能不干净(§10)。详细失败文本仍留在 `ExternalAgentError::ShutdownFailed`,不塞进这个分类。
+  worktree 可能不干净(§10)。子进程退出码参与分类:0 → `Graceful`,非 0 → `Failed`(M1-6 /
+  H-EXT-3),崩溃 session 不会把写了一半的 worktree 判为干净。详细失败文本仍留在
+  `ExternalAgentError::ShutdownFailed`,不塞进这个分类。
 - `TraceHandle::record_external_shutdown(id, disposition)` 把该 disposition 记进 trace,对应
   `TraceNodeKind::ExternalShutdown { disposition }` 节点,由 handle 侧在强制关闭 session 后调用。
 - machine 是 sans-io 的,cancel 时 `step(Abandon)` 只能把孤儿 session 标记到 state 上:

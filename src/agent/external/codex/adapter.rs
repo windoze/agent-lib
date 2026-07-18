@@ -230,7 +230,8 @@ impl CodexLauncher for SystemCodexLauncher {
 /// It pipes the CLI's stdout, kills the child on drop, bounds each read with
 /// the configured read-idle timeout, and — on [`close`](CodexTurnStream::close)
 /// — waits for the one-shot process to exit within the shutdown grace (a
-/// settled turn has already exited) and force-kills on overrun.
+/// settled turn has already exited), classifies the exit by status (zero →
+/// graceful, non-zero → failed), and force-kills on overrun.
 struct CodexProcessTurn {
     child: Child,
     stdout: Lines<BufReader<ChildStdout>>,
@@ -255,7 +256,10 @@ impl CodexTurnStream for CodexProcessTurn {
         // graceful close usually just reaps it; a still-running turn is waited on
         // within the grace window and force-killed on overrun.
         match timeout(self.shutdown_grace, self.child.wait()).await {
-            Ok(Ok(_status)) => ExternalSessionShutdown::Graceful,
+            Ok(Ok(status)) if status.success() => ExternalSessionShutdown::Graceful,
+            // A non-zero exit means the CLI turn failed, so its partial side
+            // effects cannot be trusted as clean (H-EXT-3).
+            Ok(Ok(_status)) => ExternalSessionShutdown::Failed,
             Ok(Err(_error)) => ExternalSessionShutdown::Failed,
             Err(_elapsed) => match self.child.start_kill() {
                 Ok(()) => {
@@ -1459,6 +1463,59 @@ mod tests {
             }
             Err(other) => panic!("expected UnsupportedCapability, got {other:?}"),
             Ok(_) => panic!("declared host tools must be refused before spawning"),
+        }
+    }
+
+    /// H-EXT-3: `close` classifies the child exit by status code, so a crashed
+    /// turn process is never mistaken for a clean close (which would mark a
+    /// dirty worktree as reusable). These tests spawn a real short-lived `sh`
+    /// child wired exactly like the production turn stream.
+    mod close_classification {
+        use super::super::{CodexProcessTurn, CodexTurnStream};
+        use crate::agent::external::ExternalSessionShutdown;
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
+
+        /// Spawns a real `sh -c <script>` child with piped stdout.
+        fn spawn_sh(script: &str) -> CodexProcessTurn {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn sh");
+            let stdout = child.stdout.take().expect("stdout is piped");
+            CodexProcessTurn {
+                child,
+                stdout: BufReader::new(stdout).lines(),
+                read_timeout: Duration::from_secs(1),
+                shutdown_grace: Duration::from_millis(250),
+            }
+        }
+
+        /// A zero exit status closes `Graceful`.
+        #[tokio::test]
+        async fn zero_exit_is_graceful() {
+            let mut turn = spawn_sh("exit 0");
+            assert_eq!(turn.close().await, ExternalSessionShutdown::Graceful);
+        }
+
+        /// A non-zero exit status closes `Failed`, not `Graceful`.
+        #[tokio::test]
+        async fn nonzero_exit_is_failed() {
+            let mut turn = spawn_sh("exit 1");
+            assert_eq!(turn.close().await, ExternalSessionShutdown::Failed);
+        }
+
+        /// A child still running past the grace window is force-killed.
+        #[tokio::test]
+        async fn grace_overrun_is_forced_kill() {
+            let mut turn = spawn_sh("sleep 30");
+            assert_eq!(turn.close().await, ExternalSessionShutdown::ForcedKill);
         }
     }
 }

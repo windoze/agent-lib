@@ -1,35 +1,45 @@
-# 当前执行计划：M1-5 external 流读取超时与 launch 超时拆分（H-EXT-1）
+# 当前执行计划
 
-## 任务识别
-- `TODO.md` 中第一个未完成任务是 **M1-5 [TODO]**（M1-1~M1-4 均已 `[DONE]`）。
-- 问题：三个 CLI adapter 把 `config.timeout()`（默认 30s，本为 probe/launch 设计）同时用作每行 stdout 读取超时与 shutdown grace。CLI 跑长静默命令（构建/测试）30s 无输出即被误杀。
+## 任务:M1-6 [TODO] `close()` 按退出码分类 Graceful/Failed(H-EXT-3)
 
-## 执行步骤
-1. 阅读三个 config：`src/agent/external/claude_code/config.rs`、`codex/config.rs`、`opencode/config.rs`，弄清现有 `timeout()` 语义与 serde 形状。
-2. 阅读三个 adapter 的 session 构造点（`claude_code/adapter.rs:168-169`、`codex/adapter.rs:222-223`、`opencode/adapter.rs:236-237` 附近），确认 `read_timeout` / `shutdown_grace` 如何被消费；同时检查 ACP 是否使用同名字段（本任务范围是三个 CLI adapter，ACP 如涉及一并核对）。
-3. 三个 config 各新增字段：
-   - `read_idle_timeout: Duration`，默认 10 min，`#[serde(default = ...)]`，旧 JSON 可反序列化。
-   - `shutdown_grace` 独立字段，默认保持 30s，`#[serde(default = ...)]`。
-   - 保留 `timeout()` 为 probe/launch 语义，rustdoc 写清三者口径。
-4. 三个 adapter 的 session 构造改用新字段。
-5. 文档同步：`docs/managed-external-agent.md` + config rustdoc；说明 codex `exec` one-shot 与 claude/opencode 长会话的静默上限语义差异（如有）。
-6. 单元测试：每个 config 的默认值断言 + serde round-trip（含缺新字段的旧 JSON 反序列化）。
-7. 验证（按 TODO 要求）：
-   - `cargo test --features "external-claude-code external-codex external-opencode" --all-targets`
-   - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D warnings`
-   - `cargo fmt --all`
-8. 在 `TODO.md` 标记 M1-5 `[DONE]` 并写完成记录；`docs/review-2026-07.md` H-EXT-1 标注 `✅ 已修复（M1-5）`。
-9. 提交 git commit，停止。
+来源:TODO.md 第一个未完成任务(M1-1..M1-5 均已 [DONE])。
 
-## 进度
-- [x] 识别任务 M1-5，写入本计划
-- [x] 代码阅读（三个 config + 三个 adapter 构造点；确认 ACP 不在本任务范围）
-- [x] 实现：三个 config 新增 `read_idle_timeout`（默认 10 min）与 `shutdown_grace`（默认 30s），
-  均带 serde default；三个 adapter session 构造改接线；rustdoc 同步
-- [x] 测试：三个 config 各补默认值/serde round-trip/旧 JSON 兼容断言；
-  `cargo test --features "external-claude-code external-codex external-opencode" --all-targets` 通过；
-  `cargo clippy --all-targets --features "external-... external-acp" -- -D warnings` 通过
-- [x] 文档：`docs/managed-external-agent.md` §12 新增「三类超时」段落并改述旧措辞；
-  `docs/review-2026-07.md` H-EXT-1 标注 ✅；TODO.md 标记 M1-5 [DONE] + 完成记录
-- [x] 全量门禁（clippy 默认 feature + 全量测试 + rustdoc）全部通过
-- [x] git commit `4fe86f6` 并停止。M1-5 完成。
+### 任务要求
+
+- 四处 close 站点统一改为按退出码分类:
+  - `src/agent/external/claude_code/adapter.rs:198-199`
+  - `src/agent/external/codex/adapter.rs:257-258`
+  - `src/agent/external/opencode/adapter.rs:271-272`
+  - `src/agent/external/acp/connection.rs:188-189`
+  - `status.success()` → `Graceful`;否则 → 失败变体(查看 `ExternalSessionShutdown` 现有变体,必要时新增带 exit code 的变体,注意 serde 兼容与 `leaves_residual_side_effects()` 语义)。
+- 检查 `ExternalSessionShutdown` 全部 match 点,确认穷尽匹配不破坏。
+- 同步 `docs/managed-external-agent.md` §6.4 关闭分类描述。
+
+### 验证条件
+
+- 单元测试:exit 0 → Graceful;exit 1 → Failed 类;grace 超时 → ForcedKill 不变。
+- `cargo test --features "external-claude-code external-codex external-opencode" --all-targets`
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D warnings`
+- 全量门禁:cargo fmt / clippy(无 feature)/ cargo test --all --all-targets / doc。
+
+### 执行步骤
+
+1. [ ] 读 `ExternalSessionShutdown` 定义与全部 match 点(worktree.rs、machine、handler 等)。
+2. [ ] 确定失败变体方案:优先复用现有失败变体;若无合适的,新增带 exit code 的变体,检查 serde 兼容与 `leaves_residual_side_effects()`。
+3. [ ] 四处 close 站点改为 `status.success()` 分类。
+4. [ ] 补单元测试:exit 0 → Graceful;exit 非 0 → Failed 类;超时路径 → ForcedKill 不回归。
+5. [ ] 更新 `docs/managed-external-agent.md` §6.4。
+6. [ ] 跑 fmt → clippy(带 feature)→ clippy(默认)→ 全量 test → doc。
+7. [ ] TODO.md 标记 [DONE] + 完成记录;`docs/review-2026-07.md` H-EXT-3 标注(若 M1-7 才做则看条目惯例,参照 M1-5 已完成记录中 review 文档勾销惯例)。
+8. [ ] git commit,停止。
+
+### 进展日志
+
+- 2026-07-19:开始,读 TODO.md 确认 M1-6 为第一个未完成任务,正在探索代码。
+- 2026-07-19:**M1-6 完成**。
+  - 变体选型:复用现有 `ExternalSessionShutdown::Failed`(Copy 分类载体,详细文本留 `ShutdownFailed`),未新增变体 → serde wire 不变、无穷尽匹配破坏。
+  - 四处 close 站点改为 `status.success()` guard 分类:0 → Graceful,非 0 → Failed,超时 → ForcedKill 不变。
+  - 四模块各加 `close_classification` 测试子模块(真实 `sh -c` 子进程):exit 0/1/超时 3 条 × 4 = 12 条全过。
+  - 文档:managed-external-agent.md §12/§16、external-agent.md §6.4、review-2026-07.md H-EXT-3 标注 ✅。
+  - 门禁:fmt / clippy(默认+external features)/ feature 测试 / 全量测试 / rustdoc 全绿。
+  - TODO.md 已标 [DONE] + 完成记录。随后 commit 并停止。

@@ -177,7 +177,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo clippy --all-targets -- -D warnings`、`cargo test --features "external-claude-code external-codex external-opencode" --all-targets`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - `docs/review-2026-07.md` H-EXT-1 已标注 `✅ 已修复（M1-5）`。无 breaking change（新增字段均有 serde default；新增 API 纯增量）。
 
-### M1-6 [TODO] `close()` 按退出码分类 Graceful/Failed（H-EXT-3）
+### M1-6 [DONE] `close()` 按退出码分类 Graceful/Failed（H-EXT-3）
 
 上下文：
 
@@ -194,6 +194,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试（可用 testkit 的 scripted/cassette handler 或 fake 进程）：子进程 exit 0 → Graceful；exit 1 → Failed 类；grace 超时 → ForcedKill 不变。
 - external feature 测试与 clippy 全过（命令同 M1-5）。
+
+完成记录：
+
+- 四处 close 站点（`claude_code/adapter.rs`、`codex/adapter.rs`、`opencode/adapter.rs`、`acp/connection.rs`）统一改为 guard 分类：`Ok(Ok(status)) if status.success()` → `Graceful`；`Ok(Ok(_))`（非零退出）→ `Failed`；wait 错误 / start_kill 失败仍为 `Failed`；grace 超时 + 成功 kill 仍为 `ForcedKill`。
+- 变体选型：复用现有 `ExternalSessionShutdown::Failed`，**未新增变体**——该 enum 是 `Copy` 分类载体，详细失败文本按设计留在 `ExternalAgentError::ShutdownFailed`；`Failed` 语义（“关闭未干净完成，可能有残留副作用”）正好覆盖非零退出，serde wire 不变，`leaves_residual_side_effects()` 已对其返回 `true`，无需改动。`Failed` 变体 rustdoc 补充说明非零退出也归此类。
+- match 点核查：`ExternalSessionShutdown` 的全部使用点（shutdown.rs `label()`、worktree.rs `cleanup` 经 `leaves_residual_side_effects()`、registry/handler/budget/machine 透传）均为非穷尽构造或对现有三变体的完整覆盖，未新增变体故无穷尽匹配破坏。
+- 测试：四个模块各新增 `close_classification` 子模块（真实 `sh -c` 短生命周期子进程，按生产 transport 接线）：`exit 0` → `Graceful`、`exit 1` → `Failed`、`sleep 30` + 250ms grace → `ForcedKill`，共 12 条，全部通过（约 0.3s）。
+- 文档：`docs/managed-external-agent.md` §12（claude shutdown 段）与 §16（residual side-effect 策略）改为按退出码分类口径；`docs/external-agent.md` §6.4 补记非零退出 → `Failed`；`docs/review-2026-07.md` H-EXT-3 已标注 `✅ 已修复（M1-6）`。三处 struct/trait doc comment（`ClaudeProcessIo`、`CodexProcessTurn`、`OpenCodeProcessTurn`、acp `close`）同步。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo clippy --all-targets -- -D warnings`、`cargo test --features "external-claude-code external-codex external-opencode" --all-targets`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。无 breaking change（enum 形状与 serde wire 未变）。
 
 ### M1-7 [TODO] M1 review：安全与崩溃级修复收口
 

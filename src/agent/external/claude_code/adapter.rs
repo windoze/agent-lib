@@ -110,7 +110,8 @@ trait ClaudeSessionIo: Send {
 /// It pipes the CLI's stdin/stdout, kills the child on drop, bounds each read
 /// with the configured read-idle timeout, and — on
 /// [`close`](ClaudeSessionIo::close) — drops stdin so the CLI sees EOF, waits
-/// for a graceful exit within the shutdown grace, and force-kills on overrun.
+/// for the exit within the shutdown grace (classifying it by status: zero →
+/// graceful, non-zero → failed), and force-kills on overrun.
 /// stderr is discarded so no raw runtime text can leak into a diagnostic.
 struct ClaudeProcessIo {
     child: Child,
@@ -196,7 +197,10 @@ impl ClaudeSessionIo for ClaudeProcessIo {
         // Dropping stdin signals EOF so the CLI can exit on its own.
         self.stdin = None;
         match timeout(self.shutdown_grace, self.child.wait()).await {
-            Ok(Ok(_status)) => ExternalSessionShutdown::Graceful,
+            Ok(Ok(status)) if status.success() => ExternalSessionShutdown::Graceful,
+            // A non-zero exit means the CLI failed mid-session, so its partial
+            // side effects cannot be trusted as clean (H-EXT-3).
+            Ok(Ok(_status)) => ExternalSessionShutdown::Failed,
             Ok(Err(_error)) => ExternalSessionShutdown::Failed,
             Err(_elapsed) => match self.child.start_kill() {
                 Ok(()) => {
@@ -1268,5 +1272,60 @@ mod tests {
         .expect("cancel frame");
         let value: serde_json::Value = serde_json::from_str(&frame).expect("json");
         assert_eq!(value["response"]["response"]["behavior"], "deny");
+    }
+
+    /// H-EXT-3: `close` classifies the child exit by status code, so a crashed
+    /// CLI is never mistaken for a clean close (which would mark a dirty
+    /// worktree as reusable). These tests spawn a real short-lived `sh` child
+    /// wired exactly like the production transport.
+    mod close_classification {
+        use super::super::{ClaudeProcessIo, ClaudeSessionIo};
+        use crate::agent::external::ExternalSessionShutdown;
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
+
+        /// Spawns a real `sh -c <script>` child with piped stdio.
+        fn spawn_sh(script: &str) -> ClaudeProcessIo {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn sh");
+            let stdin = child.stdin.take();
+            let stdout = child.stdout.take().expect("stdout is piped");
+            ClaudeProcessIo {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout).lines(),
+                read_timeout: Duration::from_secs(1),
+                shutdown_grace: Duration::from_millis(250),
+            }
+        }
+
+        /// A zero exit status closes `Graceful`.
+        #[tokio::test]
+        async fn zero_exit_is_graceful() {
+            let mut io = spawn_sh("exit 0");
+            assert_eq!(io.close().await, ExternalSessionShutdown::Graceful);
+        }
+
+        /// A non-zero exit status closes `Failed`, not `Graceful`.
+        #[tokio::test]
+        async fn nonzero_exit_is_failed() {
+            let mut io = spawn_sh("exit 1");
+            assert_eq!(io.close().await, ExternalSessionShutdown::Failed);
+        }
+
+        /// A child still running past the grace window is force-killed.
+        #[tokio::test]
+        async fn grace_overrun_is_forced_kill() {
+            let mut io = spawn_sh("sleep 30");
+            assert_eq!(io.close().await, ExternalSessionShutdown::ForcedKill);
+        }
     }
 }

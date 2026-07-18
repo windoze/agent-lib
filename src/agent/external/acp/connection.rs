@@ -171,8 +171,10 @@ impl SpawnedAcpAgent {
     /// Closes the transport, returning how the session ended.
     ///
     /// Drops stdin so the agent observes EOF (the graceful stop signal), then, for
-    /// a real child, waits up to `grace` for a clean exit and force-kills on
-    /// overrun. A childless (fake) transport reports the injected
+    /// a real child, waits up to `grace` for the exit and classifies it by status
+    /// (zero → [`Graceful`](ExternalSessionShutdown::Graceful), non-zero →
+    /// [`Failed`](ExternalSessionShutdown::Failed)), force-killing on overrun. A
+    /// childless (fake) transport reports the injected
     /// [`with_shutdown_disposition`](Self::with_shutdown_disposition) value,
     /// defaulting to [`Graceful`](ExternalSessionShutdown::Graceful).
     pub async fn close(&mut self, grace: Duration) -> ExternalSessionShutdown {
@@ -186,7 +188,10 @@ impl SpawnedAcpAgent {
         };
 
         match tokio::time::timeout(grace, child.wait()).await {
-            Ok(Ok(_status)) => ExternalSessionShutdown::Graceful,
+            Ok(Ok(status)) if status.success() => ExternalSessionShutdown::Graceful,
+            // A non-zero exit means the agent failed, so its partial side
+            // effects cannot be trusted as clean (H-EXT-3).
+            Ok(Ok(_status)) => ExternalSessionShutdown::Failed,
             Ok(Err(_error)) => ExternalSessionShutdown::Failed,
             Err(_elapsed) => match child.start_kill() {
                 Ok(()) => {
@@ -411,6 +416,62 @@ mod tests {
                 assert!(detail.contains("already closed"));
             }
             other => panic!("expected SessionLost after close, got {other:?}"),
+        }
+    }
+
+    /// H-EXT-3: a child-backed `close` classifies the exit by status code, so a
+    /// crashed agent is never mistaken for a clean close. These tests spawn a
+    /// real short-lived `sh` child wired exactly like the production transport.
+    mod close_classification {
+        use super::super::SpawnedAcpAgent;
+        use crate::agent::external::ExternalSessionShutdown;
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        /// Spawns a real `sh -c <script>` child with piped stdio.
+        fn spawn_sh(script: &str) -> SpawnedAcpAgent {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn sh");
+            let stdin = child.stdin.take().expect("stdin is piped");
+            let stdout = child.stdout.take().expect("stdout is piped");
+            SpawnedAcpAgent::from_child(child, stdin, stdout, Duration::from_secs(1))
+        }
+
+        /// A zero exit status closes `Graceful`.
+        #[tokio::test]
+        async fn zero_exit_is_graceful() {
+            let mut agent = spawn_sh("exit 0");
+            assert_eq!(
+                agent.close(Duration::from_millis(250)).await,
+                ExternalSessionShutdown::Graceful
+            );
+        }
+
+        /// A non-zero exit status closes `Failed`, not `Graceful`.
+        #[tokio::test]
+        async fn nonzero_exit_is_failed() {
+            let mut agent = spawn_sh("exit 1");
+            assert_eq!(
+                agent.close(Duration::from_millis(250)).await,
+                ExternalSessionShutdown::Failed
+            );
+        }
+
+        /// A child still running past the grace window is force-killed.
+        #[tokio::test]
+        async fn grace_overrun_is_forced_kill() {
+            let mut agent = spawn_sh("sleep 30");
+            assert_eq!(
+                agent.close(Duration::from_millis(250)).await,
+                ExternalSessionShutdown::ForcedKill
+            );
         }
     }
 }

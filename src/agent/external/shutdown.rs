@@ -31,7 +31,10 @@ use serde::{Deserialize, Serialize};
 ///   the session (killed the process, dropped the connection). Side effects the
 ///   runtime already performed cannot be rolled back.
 /// - [`Failed`](Self::Failed): closing the session did not complete cleanly, so
-///   an unmanaged process or unreconciled side effect may remain.
+///   an unmanaged process or unreconciled side effect may remain. This covers
+///   both a close that itself errored and a child that exited with a non-zero
+///   status: the runtime signalled failure, so its partial side effects cannot
+///   be trusted as clean.
 ///
 /// [`ForcedKill`](Self::ForcedKill) and [`Failed`](Self::Failed) both signal
 /// "side effects may remain", so [`leaves_residual_side_effects`] returns `true`
@@ -47,6 +50,9 @@ pub enum ExternalSessionShutdown {
     /// The session was force-closed on the never-resume cancel path.
     ForcedKill,
     /// Closing the session failed; a process or side effect may remain.
+    ///
+    /// Reported both when the close itself errors (wait/kill failure) and when
+    /// the child exits with a non-zero status.
     Failed,
 }
 

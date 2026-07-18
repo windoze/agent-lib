@@ -989,8 +989,8 @@ decoder 必须:
   `stream-json` 帧(`Start`/`Continue`→`user` 文本帧;`RespondInteraction`(权限)→`control_response`
   `allow`/`deny` 帧),再逐行读 stdout 喂 decoder、把观测镜像到 live sink,直到 decoder 落定一个
   `RuntimeDecisionPoint`;stdout 提前 EOF→`SessionLost`,非法帧→`Protocol`。`shutdown` 丢弃 stdin 让 CLI
-  见 EOF,在 shutdown grace 内等待优雅退出(超时则 `start_kill` → `ForcedKill`,归类
-  `Graceful`/`ForcedKill`/`Failed`)。
+  见 EOF,在 shutdown grace 内等待退出并按退出码分类(0 → `Graceful`,非 0 → `Failed`;超时则
+  `start_kill` → `ForcedKill`)。
 - IO 经私有 `ClaudeSessionIo` trait 注入:生产用 `ClaudeProcessIo`(`tokio::process`,stderr 丢弃、
   `kill_on_drop`、每读空闲超时 `read_idle_timeout`),单测注入 fake transport 回放固定帧并捕获 stdin,**离线**跑通
   start/advance/resume/shutdown 全状态机,无需真实 binary、无网络。
@@ -1362,7 +1362,8 @@ git 操作走 `WorktreeGitExec` hook(生产实现 `SystemGit` shell out `git wor
 
 `cleanup` 消费 session registry 报告的 `ExternalSessionShutdown` disposition:
 
-- `Graceful` → 无 residual;ephemeral 被删除,worktree 视为 clean 可复用。
+- `Graceful` → 无 residual;ephemeral 被删除,worktree 视为 clean 可复用。仅当子进程**退出码为 0**
+  时才归此类(M1-6 / H-EXT-3):非零退出意味着 CLI 中途失败,按 `Failed` 处理。
 - `ForcedKill` / `Failed` → `leaves_residual_side_effects()` 为真;**任何** isolation 都标
   `WorktreeCleanupOutcome::residual_side_effects()=true`,ephemeral 也**保留**供排查,
   `safe_to_reuse()` 返回 false。forced kill / failed 绝不误标 clean。
