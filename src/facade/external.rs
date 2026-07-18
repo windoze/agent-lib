@@ -529,6 +529,35 @@ impl ManagedExternalAgent {
         &self.capabilities
     }
 
+    /// Gates a managed feature against the agent's **currently held** capability
+    /// view, honoring its [`CapabilitySource`].
+    ///
+    /// A host calls this before requesting a capability-bearing behavior (host
+    /// tools, a permission bridge, resume, …) so an unsupported request fails
+    /// fast rather than silently degrading. The judgment is made against
+    /// [`capabilities()`](Self::capabilities): once
+    /// [`build_with_default_session_handler`](ManagedExternalAgentBuilder::build_with_default_session_handler)
+    /// has folded in a [`Probed`](CapabilitySource::Probed) grade, this reflects
+    /// what the live runtime actually reported, not the conservative declared
+    /// baseline (§11.3) — so a capability the declared baseline advertises but the
+    /// probe did not is correctly rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacadeError::UnsupportedExternalCapability`] naming the runtime,
+    /// the capability, and the view's [`CapabilitySource`] when the capability is
+    /// not supported. The message carries no runtime output or credentials.
+    pub fn require_capability(&self, capability: ExternalCapability) -> Result<(), FacadeError> {
+        if self.capabilities.supports(capability) {
+            return Ok(());
+        }
+        Err(FacadeError::UnsupportedExternalCapability {
+            runtime: runtime_label(&self.runtime),
+            capability: capability.as_str(),
+            capability_source: self.capabilities.source().as_str(),
+        })
+    }
+
     /// Returns the worktree the runtime is confined to, if one was set.
     #[must_use]
     pub fn worktree(&self) -> Option<&WorktreeRef> {
@@ -798,21 +827,7 @@ impl ManagedExternalAgentBuilder {
     /// supported grade (see [`ExternalAgentCapabilities::supported_modes`]) or a
     /// different runtime instead of degrading silently.
     pub fn build(self) -> Result<ManagedExternalAgent, FacadeError> {
-        if !self.capabilities.supports_mode(self.mode) {
-            let missing = self
-                .capabilities
-                .missing_for_mode(self.mode)
-                .into_iter()
-                .map(|capability| capability.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(FacadeError::UnsupportedExternalMode {
-                runtime: runtime_label(&self.runtime),
-                mode: self.mode.as_str(),
-                missing,
-                capability_source: self.capabilities.source().as_str(),
-            });
-        }
+        validate_external_mode(&self.runtime, self.mode, &self.capabilities)?;
 
         Ok(ManagedExternalAgent {
             runtime: self.runtime,
@@ -842,7 +857,22 @@ impl ManagedExternalAgentBuilder {
     ///   entry point.
     /// - Otherwise the agent's runtime is probed and the official
     ///   registry-backed handler is assembled via
-    ///   [`default_external_session_handler`] and attached to the returned agent.
+    ///   [`default_external_session_handler_with_capabilities`] and attached to
+    ///   the returned agent. The probe result is folded back in as the agent's
+    ///   capability view, tagged [`CapabilitySource::Probed`], so every later
+    ///   capability judgment (`capabilities()`,
+    ///   [`require_capability`](ManagedExternalAgent::require_capability)) reflects
+    ///   what the live runtime actually reported rather than the conservative
+    ///   declared baseline (§11.3). Because the probed grade can be narrower than
+    ///   the declared one, the requested [`ExternalRunMode`] is re-validated
+    ///   against it: if the live runtime does not advertise a capability the mode
+    ///   needs, construction fails fast with
+    ///   [`FacadeError::UnsupportedExternalMode`] (now naming the `probed` source)
+    ///   rather than returning an agent whose probed view contradicts its mode.
+    ///
+    /// The ACP arm negotiates capabilities through the live `initialize`
+    /// handshake per session rather than an offline probe, so it attaches the
+    /// handler without overriding the declared/negotiated view.
     ///
     /// The default build pulls in **no** CLI-adapter machinery, so when the
     /// matching `external-*` feature is not compiled in this fails fast with the
@@ -853,12 +883,13 @@ impl ManagedExternalAgentBuilder {
     /// # Errors
     ///
     /// Returns [`FacadeError::UnsupportedExternalMode`] when the requested mode is
-    /// not supported by the runtime's capabilities (as [`build`](Self::build)
-    /// does), or [`FacadeError::ExternalAgent`] when the default handler cannot be
-    /// assembled because the runtime's adapter feature is not compiled in or its
-    /// capability probe fails (missing binary, unauthenticated CLI). The probe
-    /// error carries no credentials, so a host can treat it as a conservative
-    /// skip rather than a crash.
+    /// not supported by the runtime's capabilities — checked first against the
+    /// declared baseline (as [`build`](Self::build) does) and again against the
+    /// probed view — or [`FacadeError::ExternalAgent`] when the default handler
+    /// cannot be assembled because the runtime's adapter feature is not compiled
+    /// in or its capability probe fails (missing binary, unauthenticated CLI). The
+    /// probe error carries no credentials, so a host can treat it as a
+    /// conservative skip rather than a crash.
     pub async fn build_with_default_session_handler(
         self,
     ) -> Result<ManagedExternalAgent, FacadeError> {
@@ -868,11 +899,48 @@ impl ManagedExternalAgentBuilder {
             return self.build();
         }
         let mut agent = self.build()?;
-        let handler: Arc<dyn ExternalSessionHandler> =
-            default_external_session_handler(&agent).await?;
+        let (handler, probed) = default_external_session_handler_with_capabilities(&agent).await?;
         agent.session_handler = Some(handler);
+        // Fold the probe result in as the agent's real capability view so later
+        // judgments are made against verified capabilities, not the declared
+        // baseline. Re-validate the mode: the probed grade may be narrower.
+        if let Some(probed) = probed {
+            validate_external_mode(agent.runtime(), agent.mode(), &probed)?;
+            agent.capabilities = probed;
+        }
         Ok(agent)
     }
+}
+
+/// Validates that `capabilities` can serve `mode`, mapping a gap to a non-secret
+/// [`FacadeError::UnsupportedExternalMode`] that names the missing capabilities
+/// and the view's [`CapabilitySource`].
+///
+/// Shared by [`ManagedExternalAgentBuilder::build`] (against the declared
+/// baseline) and
+/// [`build_with_default_session_handler`](ManagedExternalAgentBuilder::build_with_default_session_handler)
+/// (again against the probed view), so the "probed wins" rule applies to the
+/// mode grade too.
+fn validate_external_mode(
+    runtime: &ExternalRuntimeKind,
+    mode: ExternalRunMode,
+    capabilities: &ExternalAgentCapabilities,
+) -> Result<(), FacadeError> {
+    if capabilities.supports_mode(mode) {
+        return Ok(());
+    }
+    let missing = capabilities
+        .missing_for_mode(mode)
+        .into_iter()
+        .map(|capability| capability.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(FacadeError::UnsupportedExternalMode {
+        runtime: runtime_label(runtime),
+        mode: mode.as_str(),
+        missing,
+        capability_source: capabilities.source().as_str(),
+    })
 }
 
 /// Returns the stable, non-secret label for a runtime kind.
@@ -976,30 +1044,79 @@ const DEFAULT_EXTERNAL_IO_TIMEOUT: Duration = Duration::from_secs(120);
 pub async fn default_external_session_handler(
     agent: &ManagedExternalAgent,
 ) -> Result<Arc<RegistryExternalSessionHandler>, FacadeError> {
-    let registry = build_default_registry(agent).await?;
-    Ok(Arc::new(RegistryExternalSessionHandler::new(Arc::new(
-        registry,
-    ))))
+    let (handler, _capabilities) =
+        default_external_session_handler_with_capabilities(agent).await?;
+    Ok(handler)
 }
 
-/// Selects the live adapter for `agent`'s runtime and wraps it in a registry.
+/// Assembles the official registry-backed [`ExternalSessionHandler`] like
+/// [`default_external_session_handler`] and, for the CLI runtimes, also returns
+/// the [`Probed`](CapabilitySource::Probed) capability view the probe reported.
+///
+/// This is the seam
+/// [`build_with_default_session_handler`](ManagedExternalAgentBuilder::build_with_default_session_handler)
+/// uses to fold the probe result back into the agent so its capability view is
+/// the verified grade rather than the declared baseline (§11.3). The returned
+/// capabilities are:
+///
+/// - `Some(view)` tagged [`CapabilitySource::Probed`] for the CLI runtimes
+///   (Claude Code, Codex, OpenCode), which run an offline capability probe, and
+/// - `None` for ACP, which negotiates capabilities through the live `initialize`
+///   handshake per session rather than an offline probe — the caller keeps its
+///   declared/negotiated view.
+///
+/// # Errors
+///
+/// Same non-secret [`FacadeError::ExternalAgent`] conditions as
+/// [`default_external_session_handler`]: the runtime's adapter feature is not
+/// compiled in, or its capability probe fails (missing binary, unauthenticated
+/// CLI). Credentials are never included, so a host can treat a probe failure as a
+/// conservative skip.
+pub async fn default_external_session_handler_with_capabilities(
+    agent: &ManagedExternalAgent,
+) -> Result<
+    (
+        Arc<RegistryExternalSessionHandler>,
+        Option<ExternalAgentCapabilities>,
+    ),
+    FacadeError,
+> {
+    let (registry, probed) = build_default_registry(agent).await?;
+    let handler = Arc::new(RegistryExternalSessionHandler::new(Arc::new(registry)));
+    let capabilities = probed.map(ExternalAgentCapabilities::probed);
+    Ok((handler, capabilities))
+}
+
+/// Selects the live adapter for `agent`'s runtime and wraps it in a registry,
+/// returning the probe result alongside for the CLI runtimes.
 ///
 /// Every named arm is feature-gated; a runtime whose feature is off falls
 /// through to the catch-all, which fails fast with an explicit "enable the
-/// feature" message rather than degrading silently.
+/// feature" message rather than degrading silently. The second tuple element is
+/// the probed [`ExternalRuntimeCapabilities`] for the CLI runtimes and `None` for
+/// ACP (which negotiates per session).
 async fn build_default_registry(
     agent: &ManagedExternalAgent,
-) -> Result<ExternalSessionRegistry, FacadeError> {
+) -> Result<(ExternalSessionRegistry, Option<ExternalRuntimeCapabilities>), FacadeError> {
     match agent.runtime() {
         #[cfg(feature = "external-claude-code")]
-        ExternalRuntimeKind::ClaudeCode => build_claude_code_registry(agent).await,
+        ExternalRuntimeKind::ClaudeCode => {
+            let (registry, probed) = build_claude_code_registry(agent).await?;
+            Ok((registry, Some(probed)))
+        }
         #[cfg(feature = "external-codex")]
-        ExternalRuntimeKind::Codex => build_codex_registry(agent).await,
+        ExternalRuntimeKind::Codex => {
+            let (registry, probed) = build_codex_registry(agent).await?;
+            Ok((registry, Some(probed)))
+        }
         #[cfg(feature = "external-opencode")]
-        ExternalRuntimeKind::OpenCode => build_opencode_registry(agent).await,
+        ExternalRuntimeKind::OpenCode => {
+            let (registry, probed) = build_opencode_registry(agent).await?;
+            Ok((registry, Some(probed)))
+        }
         #[cfg(feature = "external-acp")]
         ExternalRuntimeKind::Custom(label) if label == ACP_RUNTIME_LABEL => {
-            build_acp_registry(agent)
+            Ok((build_acp_registry(agent)?, None))
         }
         other => Err(runtime_feature_disabled(other)),
     }
@@ -1052,11 +1169,13 @@ fn agent_working_dir(agent: &ManagedExternalAgent) -> Option<PathBuf> {
         .map(|worktree| worktree.path().to_path_buf())
 }
 
-/// Probes the local Claude Code CLI and wraps it in a registry.
+/// Probes the local Claude Code CLI and wraps it in a registry, returning the
+/// probed capabilities alongside so the caller can fold them into the agent's
+/// capability view.
 #[cfg(feature = "external-claude-code")]
 async fn build_claude_code_registry(
     agent: &ManagedExternalAgent,
-) -> Result<ExternalSessionRegistry, FacadeError> {
+) -> Result<(ExternalSessionRegistry, ExternalRuntimeCapabilities), FacadeError> {
     use crate::agent::external::{ClaudeCodeAdapter, ClaudeCodeConfig, probe};
 
     let mut config = ClaudeCodeConfig::new()
@@ -1075,14 +1194,16 @@ async fn build_claude_code_registry(
         .await
         .map_err(|error| external_probe_error(agent.runtime(), &error))?;
     let adapter = ClaudeCodeAdapter::with_probed_capabilities(config, &probed);
-    Ok(ExternalSessionRegistry::new(Arc::new(adapter)))
+    Ok((ExternalSessionRegistry::new(Arc::new(adapter)), probed))
 }
 
-/// Probes the local Codex CLI and wraps it in a registry.
+/// Probes the local Codex CLI and wraps it in a registry, returning the probed
+/// capabilities alongside so the caller can fold them into the agent's capability
+/// view.
 #[cfg(feature = "external-codex")]
 async fn build_codex_registry(
     agent: &ManagedExternalAgent,
-) -> Result<ExternalSessionRegistry, FacadeError> {
+) -> Result<(ExternalSessionRegistry, ExternalRuntimeCapabilities), FacadeError> {
     use crate::agent::external::{CodexAdapter, CodexConfig, codex_probe};
 
     let mut config = CodexConfig::new()
@@ -1101,14 +1222,16 @@ async fn build_codex_registry(
         .await
         .map_err(|error| external_probe_error(agent.runtime(), &error))?;
     let adapter = CodexAdapter::with_probed_capabilities(config, &probed);
-    Ok(ExternalSessionRegistry::new(Arc::new(adapter)))
+    Ok((ExternalSessionRegistry::new(Arc::new(adapter)), probed))
 }
 
-/// Probes the local OpenCode CLI and wraps it in a registry.
+/// Probes the local OpenCode CLI and wraps it in a registry, returning the probed
+/// capabilities alongside so the caller can fold them into the agent's capability
+/// view.
 #[cfg(feature = "external-opencode")]
 async fn build_opencode_registry(
     agent: &ManagedExternalAgent,
-) -> Result<ExternalSessionRegistry, FacadeError> {
+) -> Result<(ExternalSessionRegistry, ExternalRuntimeCapabilities), FacadeError> {
     use crate::agent::external::{OpenCodeAdapter, OpenCodeConfig, opencode_probe};
 
     let mut config = OpenCodeConfig::new()
@@ -1127,7 +1250,7 @@ async fn build_opencode_registry(
         .await
         .map_err(|error| external_probe_error(agent.runtime(), &error))?;
     let adapter = OpenCodeAdapter::with_probed_capabilities(config, &probed);
-    Ok(ExternalSessionRegistry::new(Arc::new(adapter)))
+    Ok((ExternalSessionRegistry::new(Arc::new(adapter)), probed))
 }
 
 /// Rebuilds the ACP launch config from the managed spec and wraps the shared ACP
@@ -2157,6 +2280,131 @@ mod tests {
                 assert!(
                     !message.is_empty(),
                     "the fail-fast error must carry a non-empty, non-secret message"
+                );
+            }
+            other => panic!("expected a fail-fast ExternalAgent error, got {other:?}"),
+        }
+    }
+
+    // A probe can report a *narrower* grade than the declared baseline. Once a
+    // `Probed` view is folded in, the capability gate follows it — a capability
+    // the declared baseline advertises but the probe did not verify is rejected,
+    // and the classified error names the capability and provenance without a
+    // secret.
+    #[test]
+    fn require_capability_gates_against_probed_view() {
+        // The Claude Code declared baseline advertises a permission bridge; model
+        // a probe that verified streaming but not the permission bridge or host
+        // tools.
+        let mut probed_caps = declared_capabilities(&ExternalRuntimeKind::ClaudeCode);
+        assert!(
+            probed_caps.permission_bridge,
+            "the Claude Code declared baseline advertises a permission bridge"
+        );
+        probed_caps.permission_bridge = false;
+        probed_caps.host_tools = false;
+
+        let agent = ManagedExternalAgent::claude_code()
+            .mode(ExternalRunMode::BlackBox)
+            .capabilities(ExternalAgentCapabilities::probed(probed_caps))
+            .build()
+            .expect("black-box needs no capability, so the build succeeds");
+
+        // The agent holds the probed view, not the declared baseline.
+        assert_eq!(agent.capabilities().source(), CapabilitySource::Probed);
+
+        // A capability the probe verified passes the gate.
+        agent
+            .require_capability(ExternalCapability::Streaming)
+            .expect("streaming was probed as supported");
+
+        // A capability the declared baseline advertises but the probe did not is
+        // rejected — the probed view wins over the declared one.
+        let error = agent
+            .require_capability(ExternalCapability::PermissionBridge)
+            .expect_err("the permission bridge was not verified by the probe");
+        match error {
+            FacadeError::UnsupportedExternalCapability {
+                runtime,
+                capability,
+                capability_source,
+            } => {
+                assert_eq!(runtime, "claude_code");
+                assert_eq!(capability, "permission_bridge");
+                assert_eq!(capability_source, "probed");
+            }
+            other => panic!("expected UnsupportedExternalCapability, got {other:?}"),
+        }
+
+        // The rendered error names the capability and provenance but never a
+        // launch line, environment variable, or credential.
+        let rendered = agent
+            .require_capability(ExternalCapability::HostTools)
+            .expect_err("host tools were not verified by the probe")
+            .to_string();
+        assert!(
+            rendered.contains("host_tools"),
+            "the error must name the capability, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("probed"),
+            "the error must name the capability source, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("KEY") && !rendered.contains("TOKEN"),
+            "the capability error must not leak a secret, got: {rendered}"
+        );
+    }
+
+    // A declared-baseline preset still reports the `declared` provenance in the
+    // gate error, so a host can tell a conservative baseline apart from a probed
+    // grade.
+    #[test]
+    fn require_capability_reports_declared_provenance_for_a_preset() {
+        let codex = ManagedExternalAgent::codex().build().expect("build codex");
+        // Codex's declared baseline honestly advertises streaming.
+        codex
+            .require_capability(ExternalCapability::Streaming)
+            .expect("codex declares streaming");
+        let error = codex
+            .require_capability(ExternalCapability::HostTools)
+            .expect_err("codex declares no host-tool bridge");
+        match error {
+            FacadeError::UnsupportedExternalCapability {
+                runtime,
+                capability,
+                capability_source,
+            } => {
+                assert_eq!(runtime, "codex");
+                assert_eq!(capability, "host_tools");
+                assert_eq!(capability_source, "declared");
+            }
+            other => panic!("expected UnsupportedExternalCapability, got {other:?}"),
+        }
+    }
+
+    // The capabilities-returning helper fails fast with the same non-secret
+    // "enable the feature" error when the runtime's adapter feature is off, so a
+    // host that wants the probed view never gets a silent no-op.
+    #[cfg(not(feature = "external-codex"))]
+    #[tokio::test]
+    async fn default_handler_with_capabilities_fails_fast_when_feature_disabled() {
+        use super::default_external_session_handler_with_capabilities;
+
+        let codex = ManagedExternalAgent::codex().build().expect("build codex");
+        let error = default_external_session_handler_with_capabilities(&codex)
+            .await
+            .expect_err("a runtime with no compiled adapter must fail fast");
+        match error {
+            FacadeError::ExternalAgent { name, message } => {
+                assert_eq!(name, "codex");
+                assert!(
+                    message.contains("external-codex"),
+                    "the message must name the feature to enable, got: {message}"
+                );
+                assert!(
+                    !message.contains("KEY") && !message.contains("TOKEN"),
+                    "the fail-fast message must not leak a secret, got: {message}"
                 );
             }
             other => panic!("expected a fail-fast ExternalAgent error, got {other:?}"),

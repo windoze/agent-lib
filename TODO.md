@@ -889,7 +889,7 @@ cargo test -p agent-lib --lib facade::external
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）；
   `cargo test --all --all-targets`（全绿，50 个 test binary，无 failure）。
 
-### M4-4 [TODO] 让 probed capability 成为 managed external agent 的真实能力视图
+### M4-4 [DONE] 让 probed capability 成为 managed external agent 的真实能力视图
 
 上下文：
 
@@ -915,6 +915,55 @@ cargo test -p agent-lib --lib facade::external
 cargo clippy --all-targets \
   --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
 ```
+
+完成记录（M4-4）：
+
+- 实现（`src/facade/external.rs`）：
+  - `build_default_registry` 改为返回 `(ExternalSessionRegistry, Option<ExternalRuntimeCapabilities>)`：
+    三个 CLI arm（claude_code/codex/opencode）返回 `Some(probed)`（各 `build_*_registry` 现返回
+    `(registry, probed)` 元组，probe 结果既 wire 进 adapter 又回传）；ACP arm 返回 `None`（能力经 live
+    `initialize` 每会话协商，无离线 probe）；feature-disabled catch-all 仍走非 secret fail-fast Err。
+  - 新增 pub helper `default_external_session_handler_with_capabilities(agent)
+    -> Result<(Arc<RegistryExternalSessionHandler>, Option<ExternalAgentCapabilities>), FacadeError>`：把
+    probed 包成 `ExternalAgentCapabilities::probed(..)`（source=`Probed`）随 handler 一并返回。
+    `default_external_session_handler` 保留旧签名，改为薄封装（丢弃 capabilities），向后兼容。
+  - `build_with_default_session_handler`：改用新 helper，attach handler 后若 `Some(probed_view)` 则把
+    `agent.capabilities` 覆盖为 probed 视图（source=Probed），取代 build 时的 Declared 基线；因 probed 可能
+    比 declared 窄，抽出的 `validate_external_mode(runtime, mode, caps)` 会**再次**按 probed 视图校验
+    `ExternalRunMode`（缺能力则 `UnsupportedExternalMode`，source 标 `probed`）。`build()` 复用同一 helper。
+    已手工 `.session_handler(..)` 时仍短路 probe、honor 自定义 handler（不覆盖能力视图）。
+  - 新增 `ManagedExternalAgent::require_capability(cap) -> Result<(), FacadeError>`：基于 agent **当前持有**的
+    `self.capabilities` 判断，缺失时返回新变体 `FacadeError::UnsupportedExternalCapability
+    { runtime, capability, capability_source }`。
+- 错误类型（`src/facade/error.rs`）：新增 `#[non_exhaustive]` 变体 `UnsupportedExternalCapability`
+  （`runtime: String` / `capability: &'static str` / `capability_source: &'static str`），`#[error]` 文案点名
+  runtime、capability、capability source，稳定字符串、绝不含 runtime 输出或凭据。
+- re-export（`src/facade/mod.rs`）：导出 `default_external_session_handler_with_capabilities`。
+- 文档：
+  - `docs/capability-matrix.md` 新增「能力来源：declared vs probed（facade §11.3）」小节：`CapabilitySource`
+    四值表 + declared 是保守猜测/probed 是验证真相、一步式装配折入 probed、probed 比 declared 窄时以 probed
+    为准、ACP 无离线 probe、来源标签进错误信息且不含 secret。
+  - `docs/facade-api.md` §11.2 补 `default_external_session_handler_with_capabilities` 签名与「probe 结果折入
+    真实能力视图」说明；§11.3 补 `CapabilitySource` 来源模型与 `require_capability(..)`/
+    `UnsupportedExternalCapability` 门禁说明。
+- 测试（`facade::external` tests，新增 3）：
+  - `require_capability_gates_against_probed_view`：构造持 `Probed` 视图（claude_code declared 广告
+    permission_bridge，模拟 probe 未证实 → 关掉 permission_bridge/host_tools）的 BlackBox agent；断言
+    `source()==Probed`、supported 能力放行、`require_capability(PermissionBridge)`→
+    `UnsupportedExternalCapability{runtime:"claude_code",capability:"permission_bridge",source:"probed"}`（证明
+    probed 覆盖 declared）、rendered 错误含 `host_tools`/`probed` 且不含 `KEY`/`TOKEN`。
+  - `require_capability_reports_declared_provenance_for_a_preset`：declared preset(codex) 缺 host_tools 时错误
+    source=`declared`，与 probed 对照。
+  - `default_handler_with_capabilities_fails_fast_when_feature_disabled`（`cfg(not(external-codex))`）：新 helper
+    feature 关时同样非 secret fail-fast、点名 `external-codex`、不漏 secret。
+  - 说明：真实 probe 折入 Probed 需本机 CLI + login（`probe()` 真起进程），离线无法单测该端到端路径；靠
+    `probed(..)` 构造 + 上述门禁测试覆盖逻辑，feature clippy 覆盖 feature-gated 装配分支编译正确性。
+- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
+  `cargo test -p agent-lib --lib facade::external`（22 passed 默认 feature / 22 passed 含全部 external
+  feature，含 3 新增）；`cargo clippy --all-targets --features "external-claude-code external-codex
+  external-opencode external-acp" -- -D warnings`（clean）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --workspace`（clean，默认 + 全 external feature 均通过）；`cargo check --examples --features "…"`（clean）；
+  `cargo test --all --all-targets`（全绿，无 failure）。
 
 ### M4-5 [TODO] Review：managed external 可用性和 capability 来源
 

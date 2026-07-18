@@ -762,6 +762,11 @@ pub struct RegistryExternalSessionHandler { /* Arc<ExternalSessionRegistry> + Op
 pub async fn default_external_session_handler(
     agent: &ManagedExternalAgent,
 ) -> Result<Arc<RegistryExternalSessionHandler>, FacadeError>;
+
+// 同上,但额外返回探到的 `Probed` capability view(CLI runtime = Some;ACP = None,能力经 initialize 每会话协商)。
+pub async fn default_external_session_handler_with_capabilities(
+    agent: &ManagedExternalAgent,
+) -> Result<(Arc<RegistryExternalSessionHandler>, Option<ExternalAgentCapabilities>), FacadeError>;
 ```
 
 - `fulfill` 每次 `registry.get_or_start(..)` 解析 live handle → `handle.advance(..)` 推进一个 decision
@@ -771,6 +776,11 @@ pub async fn default_external_session_handler(
   `.registry()`(宿主用 `cleanup_agent` / `cleanup` 强制关闭)。更顺手的一步式装配是
   `ManagedExternalAgentBuilder::build_with_default_session_handler().await?`,它在 build 时探测本机
   runtime 并接上同一个 registry-backed handler(已手工 `.session_handler(..)` 时短路 probe、honor 自定义 handler)。
+- **probe 结果折入真实能力视图(§11.3)**:一步式装配用
+  `default_external_session_handler_with_capabilities` 把 CLI probe 探到的能力集折回 agent 的
+  `ExternalAgentCapabilities`,来源标 `CapabilitySource::Probed`,取代构造时的 `Declared` 基线;因为 probed
+  档可能比 declared 窄,会**再次**按 probed 视图校验 `ExternalRunMode`(缺能力则 `UnsupportedExternalMode`,
+  source 标 `probed`)。ACP 无离线 probe(能力经 `initialize` 每会话协商),保留 declared/negotiated 视图。
 - 缺二进制 / 未登录 / 能力不支持时走既有保守路径(probe fail-fast → `FacadeError::ExternalAgent` 或
   `UnsupportedCapability` / skip),**不静默降级**;未编入对应 feature 的 runtime 显式 fail-fast(消息点名要开的 feature)。
 
@@ -785,7 +795,13 @@ Managed external agent 的能力取决于 runtime:
 | 可注入宿主 tools/subagents | `ExternalRunMode::ManagedWithTools` |
 | 可 attach/resume 长生命周期 session | `ExternalRunMode::Attachable` |
 
-构建时应检查 `ExternalAgentCapabilities`,不支持的能力要 fail fast 或明确降级。
+构建时应检查 `ExternalAgentCapabilities`,不支持的能力要 fail fast 或明确降级。每个能力视图都带
+`CapabilitySource`(`Declared` / `Supplied` / `Probed` / `Negotiated`),用 `.source()` 可读出判断依据:
+preset 构造为 `Declared`(保守静态基线);`build_with_default_session_handler` 探测成功后折入 `Probed`;
+`.capabilities(..)` 存调用方 `Supplied`;ACP `.acp_negotiated(..)` 为 `Negotiated`。宿主用
+`ManagedExternalAgent::require_capability(cap)` 针对 agent **当前持有**的视图门禁某个能力,缺失时
+返回 `FacadeError::UnsupportedExternalCapability { runtime, capability, capability_source }`(点名能力与来源、
+不含 secret);因此 declared 基线声称支持、但 probe 未证实的能力会被正确拒绝(以 probed 为准)。
 
 runtime 到能力档的现状(与 `ExternalRuntimeCapabilities` 8 项对齐):
 

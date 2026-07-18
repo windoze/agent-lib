@@ -58,6 +58,7 @@ pub use external::{
     CapabilitySource, ExternalAgentCapabilities, ExternalDelegateStatus, ExternalRunMode,
     ManagedExternalAgent, ManagedExternalAgentBuilder, ManagedExternalDelegate,
     RegistryExternalSessionHandler, RestoreExternal, default_external_session_handler,
+    default_external_session_handler_with_capabilities,
 };
 pub use ids::FacadeIds;
 pub use run::{

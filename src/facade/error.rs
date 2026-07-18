@@ -128,6 +128,37 @@ pub enum FacadeError {
         capability_source: &'static str,
     },
 
+    /// A managed external agent was asked for a capability its current
+    /// capability view does not support.
+    ///
+    /// Raised by
+    /// [`ManagedExternalAgent::require_capability`](crate::facade::ManagedExternalAgent::require_capability)
+    /// when a host gates a managed feature (host tools, permission bridge, …)
+    /// against the agent's *currently held*
+    /// [`ExternalAgentCapabilities`](crate::facade::ExternalAgentCapabilities) and
+    /// the runtime does not advertise it. The check honors the view's
+    /// [`CapabilitySource`](crate::facade::CapabilitySource): once
+    /// [`build_with_default_session_handler`](crate::facade::ManagedExternalAgentBuilder::build_with_default_session_handler)
+    /// has folded in a [`Probed`](crate::facade::CapabilitySource::Probed) grade,
+    /// the judgment reflects what the live runtime actually reported rather than
+    /// the conservative declared baseline (see `docs/facade-api.md` §11.3). The
+    /// message names the runtime, capability, and provenance and carries no
+    /// runtime output or credentials.
+    #[error(
+        "external runtime `{runtime}` does not support capability `{capability}` \
+         (capability source: {capability_source})"
+    )]
+    UnsupportedExternalCapability {
+        /// Stable label of the runtime that lacks the capability.
+        runtime: String,
+        /// Stable label of the capability that was requested.
+        capability: &'static str,
+        /// Stable label of the capability view's provenance
+        /// ([`CapabilitySource`](crate::facade::CapabilitySource)) the check was
+        /// made against — `declared`, `supplied`, `probed`, or `negotiated`.
+        capability_source: &'static str,
+    },
+
     /// A managed external delegate could not be driven to fulfill a delegation.
     ///
     /// Raised while fulfilling an `ask_<name>` external delegation (M4-2) when

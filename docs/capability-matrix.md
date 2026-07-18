@@ -289,6 +289,38 @@ M8-4 review 逐项核对了源码，确认四个维度一致，唯一差异是 C
 adapter（里程碑 5-8）后才逐项翻真并注明验证来源。**不要把此表当成任一 runtime 的服务等级
 承诺。**
 
+### 能力来源：declared vs probed（facade §11.3）
+
+facade 的 `ExternalAgentCapabilities` 除了持有上表 9 个 `bool`，还带一个
+`CapabilitySource` 记录**这份能力视图是怎么来的**，避免把「adapter 声称支持」与「我们已
+验证支持」混为一谈：
+
+| `CapabilitySource` | 含义 | 谁产生 |
+|---|---|---|
+| `Declared` | adapter / preset 的**静态声明**，保守起点，未对 live runtime 验证 | preset 构造器（`claude_code()` / `codex()` / …）、快照 restore、ACP pre-negotiation 基线 |
+| `Supplied` | **调用方**经 `.capabilities(..)` 手工提供(可能自带外部探测结果) | `from_runtime_capabilities(..)` / `supplied(..)` |
+| `Probed` | **探测 live CLI runtime**得到,反映本机二进制实际广告的能力位 | `build_with_default_session_handler()` / `default_external_session_handler_with_capabilities()` 折入 |
+| `Negotiated` | 经 ACP `initialize` 握手协商得到 | `.acp_negotiated(..)`（feature `external-acp`） |
+
+关键区别与保证:
+
+- **declared 是保守猜测,probed/negotiated 才是验证过的真相。** preset 构造出的 agent 持
+  `Declared` 视图(例如 Claude Code declared 广告 `permission_bridge=true`)。这只是「adapter 打算
+  支持」,不是「本机 CLI 一定支持」。
+- **一步式装配折入 probed 视图。** `ManagedExternalAgentBuilder::build_with_default_session_handler()`
+  probe 成功后,把探到的 `ExternalRuntimeCapabilities` 折回 agent 的能力视图并标 `Probed`,取代
+  declared 基线;之后 `agent.capabilities()` / `require_capability(..)` / `ExternalRunMode` 校验都以
+  probed 为准。若 probed 比 declared 窄(某能力 declared 声称支持、probe 未证实),**以 probed 为准**——
+  该能力会被 `require_capability(..)` 以
+  `FacadeError::UnsupportedExternalCapability { runtime, capability, capability_source: "probed" }` 拒绝,
+  requested `ExternalRunMode` 也会按 probed 视图**重新**校验(缺能力则 `UnsupportedExternalMode`,source 标 `probed`)。
+- **ACP 无离线 probe。** ACP 能力经 live `initialize` 每会话协商,故一步式装配对 ACP **不**覆盖能力视图
+  (保留 declared/negotiated),由 `.acp_negotiated(..)` 折入 `Negotiated`。
+- **来源标签进错误信息,便于诊断且不含 secret。** `UnsupportedExternalMode` /
+  `UnsupportedExternalCapability` 都带 `capability_source`(`declared` / `supplied` / `probed` /
+  `negotiated`),让调用方一眼看出当前判断基于保守基线还是已验证档位;标签为稳定字符串,绝不
+  嵌入 runtime 输出、启动命令行或凭据。
+
 ### 能力缺失时的 fallback 策略
 
 `ExternalAgentMachine` 遇到某个 runtime 无法兑现的决策点时不静默降级，而是按下述策略明确
