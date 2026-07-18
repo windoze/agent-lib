@@ -175,6 +175,58 @@ impl std::fmt::Display for ExternalRunMode {
     }
 }
 
+/// Where a [`ExternalAgentCapabilities`] view came from — its *provenance*.
+///
+/// A capability grade is only as trustworthy as its source. A static
+/// [`Declared`](Self::Declared) baseline is a conservative guess; a
+/// [`Probed`](Self::Probed) or [`Negotiated`](Self::Negotiated) view reflects what
+/// a real runtime actually advertised. Carrying the source lets a caller (and the
+/// build-time capability check) tell "the adapter *claims* this" apart from "we
+/// *verified* this", instead of treating every grade as equally authoritative
+/// (§11.3, design §15).
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySource {
+    /// The adapter's or preset's static declaration — a conservative starting
+    /// point, not verified against a live runtime. This is the default a preset
+    /// constructor attaches before a probe or negotiation refines it.
+    #[default]
+    Declared,
+    /// Supplied by the caller through
+    /// [`ManagedExternalAgentBuilder::capabilities`] (for example after folding
+    /// in an out-of-band probe of their own).
+    Supplied,
+    /// Obtained by probing the live CLI runtime (or its registry-backed handler),
+    /// so it reflects what the local binary actually reports.
+    Probed,
+    /// Obtained through an ACP `initialize` negotiation with the running agent.
+    Negotiated,
+}
+
+impl CapabilitySource {
+    /// Returns the stable, non-secret label for the source.
+    ///
+    /// The label matches the serde representation and is safe to embed in error
+    /// messages and logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Supplied => "supplied",
+            Self::Probed => "probed",
+            Self::Negotiated => "negotiated",
+        }
+    }
+}
+
+impl std::fmt::Display for CapabilitySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The facade view of what managed features a runtime session can fulfill.
 ///
 /// This wraps the lower-layer [`ExternalRuntimeCapabilities`] and adds the
@@ -183,33 +235,93 @@ impl std::fmt::Display for ExternalRunMode {
 /// declared capabilities) and is refined by a probe or an ACP `initialize`
 /// negotiation before or during a real run — the facade never claims a feature it
 /// has not verified (§11.3, design §15).
+///
+/// Every view also records its [`CapabilitySource`] (accessible with
+/// [`source`](Self::source)), so a caller can tell a static
+/// [`Declared`](CapabilitySource::Declared) baseline apart from a
+/// [`Probed`](CapabilitySource::Probed) or
+/// [`Negotiated`](CapabilitySource::Negotiated) grade that was verified against a
+/// live runtime.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExternalAgentCapabilities {
     inner: ExternalRuntimeCapabilities,
+    /// The provenance of this capability view (§11.3). Defaults to
+    /// [`CapabilitySource::Declared`] so views decoded from older snapshots that
+    /// predate the source model are treated as the conservative baseline.
+    #[serde(default)]
+    source: CapabilitySource,
 }
 
 impl ExternalAgentCapabilities {
     /// Wraps a lower-layer capability set as the facade view.
+    ///
+    /// The provenance is recorded as [`CapabilitySource::Supplied`]: this is the
+    /// generic public constructor a caller reaches for when handing the facade a
+    /// capability set of their own (for example to pass to
+    /// [`ManagedExternalAgentBuilder::capabilities`]). Preset baselines use
+    /// [`declared`](Self::declared) and probe results use [`probed`](Self::probed)
+    /// so their provenance is not conflated with a caller-supplied grade.
     #[must_use]
     pub fn from_runtime_capabilities(inner: ExternalRuntimeCapabilities) -> Self {
-        Self { inner }
+        Self::with_source(inner, CapabilitySource::Supplied)
+    }
+
+    /// Wraps a capability set with an explicit [`CapabilitySource`].
+    #[must_use]
+    fn with_source(inner: ExternalRuntimeCapabilities, source: CapabilitySource) -> Self {
+        Self { inner, source }
+    }
+
+    /// Wraps an adapter/preset's static declared baseline
+    /// ([`CapabilitySource::Declared`]).
+    #[must_use]
+    pub fn declared(inner: ExternalRuntimeCapabilities) -> Self {
+        Self::with_source(inner, CapabilitySource::Declared)
+    }
+
+    /// Wraps a caller-supplied capability set ([`CapabilitySource::Supplied`]).
+    #[must_use]
+    pub fn supplied(inner: ExternalRuntimeCapabilities) -> Self {
+        Self::with_source(inner, CapabilitySource::Supplied)
+    }
+
+    /// Wraps a capability set obtained by probing the live runtime
+    /// ([`CapabilitySource::Probed`]).
+    #[must_use]
+    pub fn probed(inner: ExternalRuntimeCapabilities) -> Self {
+        Self::with_source(inner, CapabilitySource::Probed)
     }
 
     /// Builds the facade view from a negotiated ACP `initialize` handshake.
     ///
     /// The mapping is the pure [`capabilities_from_initialize`] projection: the
     /// three protocol-guaranteed bits (streaming, permission bridge, graceful
-    /// shutdown) plus `resume` iff the agent advertised `session/load`.
+    /// shutdown) plus `resume` iff the agent advertised `session/load`. The
+    /// provenance is recorded as [`CapabilitySource::Negotiated`].
     #[cfg(feature = "external-acp")]
     #[must_use]
     pub fn from_acp_negotiation(negotiated: &AcpNegotiatedCapabilities) -> Self {
-        Self::from_runtime_capabilities(capabilities_from_initialize(negotiated))
+        Self::with_source(
+            capabilities_from_initialize(negotiated),
+            CapabilitySource::Negotiated,
+        )
     }
 
     /// Returns the runtime these capabilities describe.
     #[must_use]
     pub const fn runtime(&self) -> &ExternalRuntimeKind {
         &self.inner.runtime
+    }
+
+    /// Returns the provenance of this capability view.
+    ///
+    /// A [`Declared`](CapabilitySource::Declared) source is a conservative static
+    /// baseline; [`Probed`](CapabilitySource::Probed) and
+    /// [`Negotiated`](CapabilitySource::Negotiated) reflect what a live runtime
+    /// actually advertised (§11.3).
+    #[must_use]
+    pub const fn source(&self) -> CapabilitySource {
+        self.source
     }
 
     /// Reports whether `capability` is supported.
@@ -477,8 +589,7 @@ impl ManagedExternalAgent {
         args: Vec<String>,
         permission_mode: ExternalPermissionMode,
     ) -> Self {
-        let capabilities =
-            ExternalAgentCapabilities::from_runtime_capabilities(declared_capabilities(&runtime));
+        let capabilities = ExternalAgentCapabilities::declared(declared_capabilities(&runtime));
         Self {
             runtime,
             mode,
@@ -534,8 +645,7 @@ impl ManagedExternalAgentBuilder {
     /// Builds a builder for a named CLI runtime with its declared baseline
     /// capabilities.
     fn for_runtime(runtime: ExternalRuntimeKind) -> Self {
-        let capabilities =
-            ExternalAgentCapabilities::from_runtime_capabilities(declared_capabilities(&runtime));
+        let capabilities = ExternalAgentCapabilities::declared(declared_capabilities(&runtime));
         Self {
             runtime,
             mode: ExternalRunMode::Managed,
@@ -551,10 +661,16 @@ impl ManagedExternalAgentBuilder {
 
     /// Builds a builder from an ACP launch config, seeding launch data and the
     /// protocol-guaranteed (pre-negotiation) capability baseline.
+    ///
+    /// The baseline is tagged [`CapabilitySource::Declared`]: it is the static
+    /// pre-negotiation floor, not the result of a live `initialize` handshake. A
+    /// real [`acp_negotiated`](Self::acp_negotiated) call folds in the
+    /// [`Negotiated`](CapabilitySource::Negotiated) grade once the agent responds.
     #[cfg(feature = "external-acp")]
     fn from_acp_config(config: AcpConfig) -> Self {
-        let capabilities =
-            ExternalAgentCapabilities::from_acp_negotiation(&AcpNegotiatedCapabilities::none());
+        let capabilities = ExternalAgentCapabilities::declared(capabilities_from_initialize(
+            &AcpNegotiatedCapabilities::none(),
+        ));
         Self {
             runtime: acp_runtime_kind(),
             mode: ExternalRunMode::Managed,
@@ -674,10 +790,13 @@ impl ManagedExternalAgentBuilder {
     ///
     /// Returns [`FacadeError::UnsupportedExternalMode`] when the runtime does not
     /// support every capability the requested [`ExternalRunMode`] needs. The error
-    /// names the runtime, the mode, and the missing capabilities, so a host can
-    /// pick a supported grade (see
-    /// [`ExternalAgentCapabilities::supported_modes`]) or a different runtime
-    /// instead of degrading silently.
+    /// names the runtime, the mode, the missing capabilities, and the
+    /// [`CapabilitySource`] the check was made against (so a host can tell a
+    /// conservative [`Declared`](CapabilitySource::Declared) baseline apart from a
+    /// verified [`Probed`](CapabilitySource::Probed) or
+    /// [`Negotiated`](CapabilitySource::Negotiated) grade), so a host can pick a
+    /// supported grade (see [`ExternalAgentCapabilities::supported_modes`]) or a
+    /// different runtime instead of degrading silently.
     pub fn build(self) -> Result<ManagedExternalAgent, FacadeError> {
         if !self.capabilities.supports_mode(self.mode) {
             let missing = self
@@ -691,6 +810,7 @@ impl ManagedExternalAgentBuilder {
                 runtime: runtime_label(&self.runtime),
                 mode: self.mode.as_str(),
                 missing,
+                capability_source: self.capabilities.source().as_str(),
             });
         }
 
@@ -1522,7 +1642,8 @@ fn map_artifact(artifact: &ExternalArtifactRef) -> ArtifactRef {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalAgentCapabilities, ExternalRunMode, ManagedExternalAgent, declared_capabilities,
+        CapabilitySource, ExternalAgentCapabilities, ExternalRunMode, ManagedExternalAgent,
+        declared_capabilities,
     };
     use crate::agent::{ExternalCapability, ExternalPermissionMode, ExternalRuntimeKind};
     use crate::facade::error::FacadeError;
@@ -1617,13 +1738,98 @@ mod tests {
                 runtime,
                 mode,
                 missing,
+                capability_source,
             } => {
                 assert_eq!(runtime, "codex");
                 assert_eq!(mode, "managed_with_tools");
                 assert_eq!(missing, "host_tools");
+                // The check was made against the preset's declared baseline.
+                assert_eq!(capability_source, "declared");
             }
             other => panic!("expected UnsupportedExternalMode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn preset_capabilities_are_declared() {
+        // A preset seeds the runtime's conservative *declared* baseline, not a
+        // verified grade.
+        let codex = ManagedExternalAgent::codex().build().expect("build codex");
+        assert_eq!(codex.capabilities().source(), CapabilitySource::Declared);
+    }
+
+    #[test]
+    fn from_runtime_capabilities_is_supplied() {
+        // The generic public wrapper records caller-supplied provenance so a
+        // manual `.capabilities(..)` path is not conflated with a declared or
+        // probed grade.
+        let caps = ExternalAgentCapabilities::from_runtime_capabilities(declared_capabilities(
+            &ExternalRuntimeKind::Codex,
+        ));
+        assert_eq!(caps.source(), CapabilitySource::Supplied);
+        assert_eq!(
+            ExternalAgentCapabilities::supplied(declared_capabilities(&ExternalRuntimeKind::Codex))
+                .source(),
+            CapabilitySource::Supplied
+        );
+    }
+
+    #[test]
+    fn supplied_capabilities_flow_through_builder() {
+        // Folding a caller-built capability set through `.capabilities(..)`
+        // preserves its `Supplied` provenance on the built agent.
+        let supplied =
+            ExternalAgentCapabilities::supplied(declared_capabilities(&ExternalRuntimeKind::Codex));
+        let codex = ManagedExternalAgent::codex()
+            .capabilities(supplied)
+            .build()
+            .expect("build codex");
+        assert_eq!(codex.capabilities().source(), CapabilitySource::Supplied);
+    }
+
+    #[test]
+    fn probed_capabilities_are_probed() {
+        // The probe-provenance constructor tags its view accordingly; the default
+        // handler builder (M4-4) folds such a view in after a real probe.
+        let caps = ExternalAgentCapabilities::probed(declared_capabilities(
+            &ExternalRuntimeKind::ClaudeCode,
+        ));
+        assert_eq!(caps.source(), CapabilitySource::Probed);
+    }
+
+    #[test]
+    fn capability_source_labels_match_serde() {
+        for source in [
+            CapabilitySource::Declared,
+            CapabilitySource::Supplied,
+            CapabilitySource::Probed,
+            CapabilitySource::Negotiated,
+        ] {
+            let json = serde_json::to_value(source).expect("serialize source");
+            assert_eq!(json, serde_json::Value::String(source.as_str().to_owned()));
+            assert_eq!(source.to_string(), source.as_str());
+        }
+        assert_eq!(CapabilitySource::default(), CapabilitySource::Declared);
+    }
+
+    #[test]
+    fn capabilities_source_defaults_when_absent_from_serde() {
+        // A view decoded from data that predates the source model falls back to
+        // the conservative `Declared` baseline rather than failing.
+        let mut encoded = serde_json::to_value(
+            ManagedExternalAgent::codex()
+                .build()
+                .expect("build codex")
+                .capabilities(),
+        )
+        .expect("serialize caps");
+        encoded
+            .as_object_mut()
+            .expect("caps object")
+            .remove("source");
+        let decoded: ExternalAgentCapabilities =
+            serde_json::from_value(encoded).expect("deserialize legacy caps");
+        assert_eq!(decoded.source(), CapabilitySource::Declared);
     }
 
     #[test]
@@ -1698,13 +1904,22 @@ mod tests {
                 .capabilities()
                 .supports_mode(ExternalRunMode::Attachable)
         );
+        // The pre-negotiation baseline is a static declared floor, not a live
+        // handshake result.
+        assert_eq!(base.capabilities().source(), CapabilitySource::Declared);
 
         // Attachable fails fast before load_session is negotiated.
         let error = ManagedExternalAgent::opencode_acp()
             .mode(ExternalRunMode::Attachable)
             .build()
             .expect_err("resume must be negotiated first");
-        assert!(matches!(error, FacadeError::UnsupportedExternalMode { .. }));
+        assert!(matches!(
+            error,
+            FacadeError::UnsupportedExternalMode {
+                capability_source: "declared",
+                ..
+            }
+        ));
 
         // Folding in a handshake that advertised session/load enables resume and
         // therefore the Attachable grade.
@@ -1718,6 +1933,11 @@ mod tests {
             attachable
                 .capabilities()
                 .supports(ExternalCapability::Resume)
+        );
+        // A real negotiation result is tagged as such.
+        assert_eq!(
+            attachable.capabilities().source(),
+            CapabilitySource::Negotiated
         );
         assert_eq!(attachable.mode(), ExternalRunMode::Attachable);
     }

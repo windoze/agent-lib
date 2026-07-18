@@ -813,7 +813,7 @@ cargo clippy --all-targets \
   README/facade-api.md/managed-external-agent.md 均非 doctest（`src/` 无 `include_str!(README)`），rust 块不参与编译。
   本任务仅改动 `*.md` 文档、无 `.rs` 代码或编译产物变化，故复用上次全量 `cargo test --all --all-targets` 绿结果，不重跑全量套件。
 
-### M4-3 [TODO] 为 external capability 增加来源模型
+### M4-3 [DONE] 为 external capability 增加来源模型
 
 上下文：
 
@@ -844,6 +844,50 @@ cargo clippy --all-targets \
 ```bash
 cargo test -p agent-lib --lib facade::external
 ```
+
+完成记录（M4-3）：
+
+- 实现（`src/facade/external.rs`）：
+  - 新增 pub `CapabilitySource` 枚举，覆盖 `Declared` / `Supplied` / `Probed` /
+    `Negotiated`，derive `Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize,
+    Deserialize`，`#[serde(rename_all="snake_case")]`，`Default = Declared`，
+    带非 secret `as_str()` + `Display`。从 `facade::mod` re-export。
+  - `ExternalAgentCapabilities` 增加 `source: CapabilitySource` 字段（`#[serde(default)]`，
+    旧数据缺字段回落到保守的 `Declared`），新增 `source()` const accessor。
+  - provenance-tagged 构造函数：`declared(inner)` / `supplied(inner)` / `probed(inner)`
+    （私有 `with_source` 复用）；`from_runtime_capabilities(inner)` 语义改为“调用方提供”=
+    `Supplied`（通用 pub wrapper，向后兼容——仍可编译、旧调用方拿到 Supplied provenance）；
+    `from_acp_negotiation(negotiated)` 标记 `Negotiated`（cfg external-acp）。
+  - 内部构造点改为 provenance 正确：preset `for_runtime` 与 `from_restored_parts` 用
+    `declared(..)`；ACP preset baseline `from_acp_config` 改为
+    `declared(capabilities_from_initialize(&none()))`（pre-negotiation 静态 floor = Declared，
+    区别于真实 `.acp_negotiated(..)` 的 Negotiated）。
+  - `.capabilities(caps)` setter 保留“存储调用方 caps provenance”语义（调用方用
+    `supplied(..)`/`from_runtime_capabilities(..)` → Supplied），不强制覆盖，便于 M4-4 传入
+    Probed view。
+- 校验与错误信息（`src/facade/error.rs`）：`FacadeError::UnsupportedExternalMode` 增加
+  `capability_source: &'static str` 字段（字段名避开 thiserror 对 `source` 的特殊处理），
+  `#[error]` 文案追加 `capability source: {capability_source}`；`build()` 失败时填
+  `self.capabilities.source().as_str()`，让调用方看出当前 mode 判断基于哪种 provenance。
+- 测试（`facade::external` tests，新增 6 + 更新 2）：
+  - `preset_capabilities_are_declared`：codex preset `source()==Declared`。
+  - `from_runtime_capabilities_is_supplied` / `supplied_capabilities_flow_through_builder`：
+    `from_runtime_capabilities`/`supplied` = Supplied，且经 `.capabilities(..)` build 后保留。
+  - `probed_capabilities_are_probed`：`probed(..)` = Probed（供 M4-4 装配用）。
+  - `capability_source_labels_match_serde`：4 变体 serde/label/Default 一致。
+  - `capabilities_source_defaults_when_absent_from_serde`：删掉 `source` 字段后反序列化回落 Declared。
+  - 更新 `unsupported_mode_fails_fast_with_missing_capabilities` 断言 `capability_source=="declared"`；
+    更新 `acp_presets_map_negotiated_capabilities` 断言 baseline source==Declared、错误
+    `capability_source:"declared"`、negotiated 结果 source==Negotiated。
+  - Probed 的真实 probe 装配需本机 CLI + login（`probe()` 真起进程），离线无法单测；靠
+    `probed(..)` 构造函数单测 + 后续 M4-4（默认 handler API 折入 Probed view）+ feature clippy
+    覆盖该分支编译正确性。
+- 验证（全绿）：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`（clean）；
+  `cargo test -p agent-lib --lib facade::external`（19 passed 默认 feature / 21 passed 含
+  external-acp，含全部新增）；`cargo clippy --all-targets --features "external-claude-code
+  external-codex external-opencode external-acp" -- -D warnings`（clean）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（clean）；
+  `cargo test --all --all-targets`（全绿，50 个 test binary，无 failure）。
 
 ### M4-4 [TODO] 让 probed capability 成为 managed external agent 的真实能力视图
 

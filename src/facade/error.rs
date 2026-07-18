@@ -111,7 +111,7 @@ pub enum FacadeError {
     /// can pick a supported mode or a different runtime.
     #[error(
         "external runtime `{runtime}` does not support run mode `{mode}` \
-         (missing capabilities: {missing})"
+         (missing capabilities: {missing}; capability source: {capability_source})"
     )]
     UnsupportedExternalMode {
         /// Stable label of the runtime that could not fulfill the mode.
@@ -120,6 +120,12 @@ pub enum FacadeError {
         mode: &'static str,
         /// Comma-separated capabilities the runtime is missing for the mode.
         missing: String,
+        /// Stable label of the capability view's provenance
+        /// ([`CapabilitySource`](crate::facade::CapabilitySource)) the check was
+        /// made against — `declared`, `supplied`, `probed`, or `negotiated` — so a
+        /// host can tell a conservative static baseline apart from a verified
+        /// grade.
+        capability_source: &'static str,
     },
 
     /// A managed external delegate could not be driven to fulfill a delegation.
