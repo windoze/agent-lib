@@ -113,7 +113,8 @@ enum OpenCodeTurnSpec {
     Resume {
         /// The runtime-assigned session id to resume.
         session_id: String,
-        /// The follow-up user message, appended after the resume flags.
+        /// The follow-up user message, appended after the resume flags and a
+        /// `--` separator.
         message: String,
     },
 }
@@ -125,10 +126,18 @@ impl OpenCodeTurnSpec {
     /// appends the prompt; a resume turn reuses
     /// [`base_resume_args`](OpenCodeConfig::base_resume_args) and appends the
     /// follow-up message after the `--session <id>` flag.
+    ///
+    /// The user-controlled text is always preceded by a `--` separator so a
+    /// prompt that starts with `-` (for example `--model`) is parsed as the
+    /// positional message instead of a flag. OpenCode's yargs entry point sets
+    /// `parserConfiguration({ "populate--": true })` (sst/opencode
+    /// `src/index.ts`), so post-`--` words populate the `message` positional
+    /// array (confirmed against the installed CLI source, M2-4 / M-EXT-4).
     fn args(&self, config: &OpenCodeConfig) -> Vec<String> {
         match self {
             OpenCodeTurnSpec::Fresh { prompt } => {
                 let mut args = config.base_run_args();
+                args.push("--".to_owned());
                 args.push(prompt.clone());
                 args
             }
@@ -137,6 +146,7 @@ impl OpenCodeTurnSpec {
                 message,
             } => {
                 let mut args = config.base_resume_args(session_id);
+                args.push("--".to_owned());
                 args.push(message.clone());
                 args
             }
@@ -1531,13 +1541,19 @@ mod tests {
         .args(&config);
         assert_eq!(resume.last().map(String::as_str), Some("again"));
         assert!(resume.iter().any(|a| a == "--session"));
-        // The session id is the trailing positional argument the message follows.
+        // The session id flag is followed by a `--` separator and then the
+        // message.
         let id_pos = resume
             .iter()
             .position(|a| a == "ses_9")
             .expect("session id present");
-        assert_eq!(id_pos, resume.len() - 2, "id precedes the appended message");
-        assert_eq!(resume.get(id_pos + 1).map(String::as_str), Some("again"));
+        assert_eq!(
+            id_pos,
+            resume.len() - 3,
+            "id precedes the `--` separator and the appended message"
+        );
+        assert_eq!(resume.get(id_pos + 1).map(String::as_str), Some("--"));
+        assert_eq!(resume.get(id_pos + 2).map(String::as_str), Some("again"));
 
         // A configured working directory rides along as `--dir <path>` for both a
         // fresh and a resumed turn, so OpenCode confines its file operations to
@@ -1554,6 +1570,40 @@ mod tests {
         }
         .args(&scoped);
         assert!(scoped_resume.windows(2).any(|w| w == ["--dir", "/tmp/wt"]));
+    }
+
+    #[test]
+    fn opencode_turn_spec_separates_dash_prefixed_prompt_with_double_dash() {
+        // M2-4 / M-EXT-4: a message that starts with `-` must not be parsed
+        // as a flag; a `--` separator keeps it positional (OpenCode's yargs
+        // sets `populate--: true`).
+        let config = OpenCodeConfig::new();
+
+        let fresh = OpenCodeTurnSpec::Fresh {
+            prompt: "--model openai/gpt-5".to_owned(),
+        }
+        .args(&config);
+        assert_eq!(
+            fresh.last().map(String::as_str),
+            Some("--model openai/gpt-5")
+        );
+        assert_eq!(
+            fresh.get(fresh.len() - 2).map(String::as_str),
+            Some("--"),
+            "prompt follows a `--` separator"
+        );
+
+        let resume = OpenCodeTurnSpec::Resume {
+            session_id: "ses_9".to_owned(),
+            message: "--session other".to_owned(),
+        }
+        .args(&config);
+        assert_eq!(resume.last().map(String::as_str), Some("--session other"));
+        assert_eq!(
+            resume.get(resume.len() - 2).map(String::as_str),
+            Some("--"),
+            "message follows a `--` separator"
+        );
     }
 
     #[test]

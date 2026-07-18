@@ -123,6 +123,10 @@ cargo test --features "external-claude-code external-codex" \
   semantics and kills only the direct child.
 - **Secret redaction** — credentials are never read into logs or printed; cassette
   fixtures are scrubbed and asserted secret-free.
+- **Prompt argv exposure** — Codex/OpenCode prompts are passed as CLI positional
+  arguments guarded by a `--` separator (Claude Code uses stdin frames); argv is
+  visible to same-host `ps`, so prompts must not carry secrets
+  (`docs/managed-external-agent.md` §16).
 - **Unsupported-capability fallback** — a missing CLI or a failed capability
   probe becomes a non-secret **skip** (exit 0), and a request for a capability
   the runtime has not opted into (for example host tools) is rejected with an

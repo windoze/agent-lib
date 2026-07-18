@@ -341,7 +341,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 无 breaking change（enum 新增字段带 serde default，旧数据可读；Debug/Display 输出变化不计入 API
   稳定性承诺）。
 
-### M2-4 [TODO] Codex/OpenCode prompt 传参加固（M-EXT-4）
+### M2-4 [DONE] Codex/OpenCode prompt 传参加固（M-EXT-4）
 
 上下文：
 
@@ -356,6 +356,34 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：构造以 `--model` 开头的 prompt，断言生成的 argv 含 `--` 分隔且 prompt 原样位于其后。
 - external feature 测试与 clippy 全过；`#[ignore]` real e2e 手工抽查一次（如环境允许）。
+
+完成记录：
+
+- **`--` 分隔符支持确认**：Codex 为 clap 原生支持，本机实测 `codex exec --help` / `codex exec resume --help`
+  （v0.144.1+，prompt 为 `[PROMPT]` 位置参数）；OpenCode 的 yargs 入口配置
+  `parserConfiguration({ "populate--": true })`（克隆 sst/opencode 源码 `src/index.ts:46` 确认），`--` 之后
+  的词进入 `run [message..]` 位置数组。两 CLI 均支持，故按主方案落地 argv + `--`。
+- 实现：`CodexTurnSpec::args`（`codex/adapter.rs`）与 `OpenCodeTurnSpec::args`（`opencode/adapter.rs`）
+  的 Fresh/Resume 两个分支统一在 prompt/message 前 `args.push("--")`；doc comment 记录分隔符理由与
+  支持性确认来源。其余 argv 构造（config 的 `base_*_args`）不含用户文本，未动。
+- **ps 可见性选型：维持 argv 并文档化**。评估过 stdin 替代（Codex `exec` 支持 `-` 从 stdin 读 prompt），
+  未采用：prompt 是任务文本而非凭据，与本机 CLI 自身存储的登录凭据同一信任域；stdin 传参需改 spawn 的
+  stdio 接线增加失败面；OpenCode 的 stdin 读消息是未文档化隐式行为不宜依赖。该暴露面与「prompt 中不得
+  放 secret」约定写入 `docs/managed-external-agent.md` §16 新增「prompt argv 暴露面（M2-4 / M-EXT-4）」节，
+  §13/§14 的启动形态描述同步 `--` 口径；AGENTS.md Safety properties 新增 Prompt argv exposure 条目。
+- 测试：更新两条既有 argv 断言（resume 的 session id 后现在是 `--` + message）；新增
+  `codex_turn_spec_separates_dash_prefixed_prompt_with_double_dash` 与
+  `opencode_turn_spec_separates_dash_prefixed_prompt_with_double_dash`——以 `--model ...` 开头的
+  prompt/message 断言原样位于 argv 末尾且前一元素恰为 `--`。
+- real e2e 抽查（环境允许，两 CLI 均已登录）：`cargo test --features external-codex --test external_codex
+  -- --ignored` 通过（16s，5 observations）；`cargo test --features external-opencode --test external_opencode
+  -- --ignored` 通过（10s，4 observations）——真实 CLI 接受 `--` 分隔的 prompt。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets
+  --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、
+  `cargo test --all --all-targets`（exit 0，无挂起）、`cargo test --features "external-claude-code
+  external-codex external-opencode external-acp" --all-targets`（无 FAILED）、`RUSTDOCFLAGS="-D warnings"
+  cargo doc --no-deps --workspace` 全部通过。
+- `docs/review-2026-07.md` M-EXT-4 已标注 `✅ 已修复（M2-4）`。无 breaking change（仅 argv 形状加固）。
 
 ### M2-5 [TODO] 决策点后 reap 子进程 + prelude 总时限与取消（M-EXT-5、M-EXT-6）
 

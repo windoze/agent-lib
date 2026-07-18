@@ -105,7 +105,8 @@ enum CodexTurnSpec {
     Resume {
         /// The runtime-assigned thread id to resume.
         session_id: String,
-        /// The follow-up user message, appended after the thread id.
+        /// The follow-up user message, appended after the thread id and a
+        /// `--` separator.
         message: String,
     },
 }
@@ -117,10 +118,17 @@ impl CodexTurnSpec {
     /// appends the prompt; a resume turn reuses
     /// [`base_resume_args`](CodexConfig::base_resume_args) and appends the
     /// follow-up message after the thread id.
+    ///
+    /// The user-controlled text is always preceded by a `--` separator so a
+    /// prompt that starts with `-` (for example `--model`) is parsed as the
+    /// positional prompt instead of a clap flag. `codex exec` is clap-based
+    /// and honors the separator (confirmed against `codex exec --help` and
+    /// `codex exec resume --help`, M2-4 / M-EXT-4).
     fn args(&self, config: &CodexConfig) -> Vec<String> {
         match self {
             CodexTurnSpec::Fresh { prompt } => {
                 let mut args = config.base_exec_args();
+                args.push("--".to_owned());
                 args.push(prompt.clone());
                 args
             }
@@ -129,6 +137,7 @@ impl CodexTurnSpec {
                 message,
             } => {
                 let mut args = config.base_resume_args(session_id);
+                args.push("--".to_owned());
                 args.push(message.clone());
                 args
             }
@@ -1458,13 +1467,51 @@ mod tests {
         .args(&config);
         assert_eq!(resume.last().map(String::as_str), Some("again"));
         assert!(resume.iter().any(|a| a == "resume"));
-        // The session id is the trailing positional argument the message follows.
+        // The session id is followed by a `--` separator and then the message.
         let id_pos = resume
             .iter()
             .position(|a| a == "thread-9")
             .expect("session id present");
-        assert_eq!(id_pos, resume.len() - 2, "id precedes the appended message");
-        assert_eq!(resume.get(id_pos + 1).map(String::as_str), Some("again"));
+        assert_eq!(
+            id_pos,
+            resume.len() - 3,
+            "id precedes the `--` separator and the appended message"
+        );
+        assert_eq!(resume.get(id_pos + 1).map(String::as_str), Some("--"));
+        assert_eq!(resume.get(id_pos + 2).map(String::as_str), Some("again"));
+    }
+
+    #[test]
+    fn codex_turn_spec_separates_dash_prefixed_prompt_with_double_dash() {
+        // M2-4 / M-EXT-4: a prompt that starts with `-` must not be parsed as
+        // a clap flag; a `--` separator keeps it positional.
+        let config = CodexConfig::new();
+
+        let fresh = CodexTurnSpec::Fresh {
+            prompt: "--model gpt-5".to_owned(),
+        }
+        .args(&config);
+        assert_eq!(fresh.last().map(String::as_str), Some("--model gpt-5"));
+        assert_eq!(
+            fresh.get(fresh.len() - 2).map(String::as_str),
+            Some("--"),
+            "prompt follows a `--` separator"
+        );
+
+        let resume = CodexTurnSpec::Resume {
+            session_id: "thread-9".to_owned(),
+            message: "--sandbox read-only".to_owned(),
+        }
+        .args(&config);
+        assert_eq!(
+            resume.last().map(String::as_str),
+            Some("--sandbox read-only")
+        );
+        assert_eq!(
+            resume.get(resume.len() - 2).map(String::as_str),
+            Some("--"),
+            "message follows a `--` separator"
+        );
     }
 
     #[test]

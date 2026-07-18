@@ -1,97 +1,51 @@
-# 当前任务计划：M2-3 decoder 错误消息与"不折叠原文"承诺对齐（M-EXT-3）
+# 执行计划（2026-07-19）
 
-## 任务理解
+## 当前任务：M2-4 [TODO] Codex/OpenCode prompt 传参加固（M-EXT-4）
 
-TODO.md 第一个未完成任务是 **M2-3**。
+### 任务理解（来自 TODO.md）
 
-问题：三个 external decoder 文档承诺 "Every diagnostic is a fixed string; no prompt text, tool
-input, or credential is ever folded into an error message."，但实现违背：
+问题：
+- `src/agent/external/codex/adapter.rs:121-124`：`args.push(prompt.clone())` 作为最后位置参数，
+  前面没有 `--` 分隔符；`opencode/adapter.rs:127-143` 同样。以 `-` 开头的用户消息会被 clap
+  当成 flag（例如用户输入以 `--model` 开头会导致 CLI 解析失败/语义改变）。
+- prompt 明文出现在 argv 中，对本机 `ps` 可见（信息泄露面）。Claude Code 走 stdin frame 无此问题。
 
-- `src/agent/external/claude_code/decoder.rs:517-521`：把 `frame.get("result").and_then(Value::as_str)`
-  原文塞进 `ExternalAgentError::Runtime.message`
-- `codex/decoder.rs:446-453`：`turn.failed` 的 `error.message` 同构
-- `opencode/decoder.rs:496-509`：`error.data.message` 同构
+要求：
+1. 在 prompt 前插入 `"--"` 分隔符；先用 `codex exec --help` / `opencode --help` 或官方文档确认
+   两个 CLI 支持 `--`（记录确认结果）。若某 CLI 不支持，改为其支持的等价机制（如 stdin）并在
+   代码注释说明。
+2. `ps` 可见性：评估 stdin 传 prompt 的可行性；若维持 argv，在
+   `docs/managed-external-agent.md` 安全节明确记载该暴露面与理由。
 
-该文本受模型输出影响，可含模型读到的任意文件内容。
+验证：
+- 单元测试：构造以 `--model` 开头的 prompt，断言生成的 argv 含 `--` 分隔且 prompt 原样位于其后。
+- external feature 测试与 clippy 全过；`#[ignore]` real e2e 手工抽查一次（如环境允许）。
 
-## 执行步骤
+### 执行步骤
 
-1. 阅读相关代码：
-   - 三个 decoder 的错误构造点
-   - `ExternalAgentError` 定义（enum 形状、Display、serde）
-   - `machine.rs:713` 使用点（敏感原文是否会经 Display 进入 cursor/日志）
-   - 错误类型的全部 match / Display / 序列化使用点
-2. 选定方案（任务推荐 a）：
-   - (a) `message` 固定字符串 + 原文放入单独的、标注 "may contain runtime output, do not
-     log blindly" 的字段
-   - 检查 `error.to_string()` 的 Display 实现不输出原文
-3. 实现：
-   - `ExternalAgentError::Runtime`（或相关变体）改形状：固定 message + 单独原文字段
-     （注意 serde 兼容：该错误是否被持久化/cursor 化？若参与 serde，新字段
-     `#[serde(default)]`）
-   - 三个 decoder 改构造点
-   - Display 实现不折叠原文
-4. 测试：
-   - 新增单元测试：构造含敏感字样（如 `API_KEY=...`）的 runtime error frame，断言
-     `error.to_string()` 不含该字样
-5. 文档：同步三个 decoder 模块文档承诺
-6. 验证：
-   - `cargo fmt --all`
-   - `cargo clippy --all-targets -- -D warnings`
-   - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
-   - `cargo test --all --all-targets`
-   - `cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`
-   - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
-7. `docs/review-2026-07.md` M-EXT-3 标注 `✅ 已修复（M2-3）`
-8. TODO.md 标记 M2-3 [DONE] + 完成记录
-9. 提交 commit
+1. 阅读 `codex/adapter.rs` 与 `opencode/adapter.rs` 的 argv 构造点（约 121-124 / 127-143 行附近），
+   以及 `claude_code` 的 stdin 传 prompt 方式作对照。
+2. 检查本机是否有 `codex` / `opencode` CLI（`which codex opencode`，`codex exec --help`），
+   确认 `--` 分隔符支持；若无本机二进制，查官方文档/web。
+3. 在两个 adapter 的 argv 构造中于 prompt 前插入 `"--"`，补注释说明理由。
+4. 评估 stdin 传 prompt 可行性（codex `exec` 支持从 stdin 读 prompt 吗？opencode `run` 呢？），
+   记录选型；若维持 argv，更新 `docs/managed-external-agent.md` 安全节记录 ps 暴露面。
+5. 新增单元测试：argv 断言（`--model` 开头 prompt → argv 含 `--` 且 prompt 紧随其后）。
+6. 找出现有 argv 构造相关测试（如有），更新断言。
+7. `docs/review-2026-07.md` 的 M-EXT-4 条目打标 `✅ 已修复（M2-4）`。
+8. 运行门禁：`cargo fmt --all` → `cargo clippy --all-targets -- -D warnings` →
+   `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings` →
+   `cargo test --all --all-targets` → `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
+9. TODO.md 把 M2-4 标题改 `[DONE]`，追加完成记录（含 CLI `--` 确认结果、ps 暴露面决策）。
+10. commit（`[M2-4] ...`），停止。
 
-## 探索结论（子代理报告）
+### 进展日志
 
-- `ExternalAgentError` 定义在 `src/agent/external/mod.rs:989-1061`，thiserror Display，全 enum serde。
-  `Runtime { code: Option<String>, message: String }`，Display `external runtime error: {message}` 直接嵌入不可信文本。
-- 4 个不可信文本构造点：claude_code/decoder.rs:532-539、codex/decoder.rs:463-477、
-  opencode/decoder.rs:513-533（decode_error）、acp/adapter.rs:998-1012（classify_error）。
-- 泄露链：decoder → adapter Err → ExternalSessionResult::Failed → machine.rs:713
-  `error.to_string()` → `fail_with` 写入两个可持久化 cursor（ExternalAgentCursor::Error /
-  LoopCursor::Error）→ facade 错误消息。修 Display 即可切断全链。
-- testkit 固定字符串构造点（cassette.rs:785、runtime.rs:363、mod.rs:181、
-  assertions/external.rs:213）可保留 message。
-- 需要更新的断言：tests/agent_claude_code_cassette.rs:592、agent_codex_cassette.rs:482、
-  agent_opencode_cassette.rs:639（原断言 message == 运行原文，改为断言新字段）；
-  mod.rs:1246-1299 serde round-trip 测试加新字段。
-- 现成测试范式：mod.rs:1301-1324 `unsupported_capability_display_does_not_leak_*`。
+- [x] 步骤 1-2：阅读代码 + 确认 CLI `--` 支持（codex clap 原生；opencode yargs `populate--: true` 源码确认）
+- [x] 步骤 3-5：实现 + 测试（两 adapter `args()` 插 `--`；更新 2 条既有断言 + 新增 2 条 `--model` 前缀测试）
+- [x] 步骤 6-7：文档（managed-external-agent.md §16 新增暴露面节 + §13/§14 同步；review doc 打标；AGENTS.md 条目）
+- [x] 步骤 8：门禁全过（fmt / clippy 默认+external / 全量测试 / external 测试 / doc）
+- [x] real e2e 抽查：codex（16s）与 opencode（10s）均通过
+- [x] 步骤 9-10：TODO 完成记录 + commit
 
-## 方案（选型 a）
-
-- `Runtime` 增加字段 `runtime_output: Option<String>`（`#[serde(default, skip_serializing_if)]`，
-  rustdoc 标注 "may contain runtime output, do not log blindly"）；`message` 改为各 runtime
-  固定字符串（claude: "claude code runtime error"；codex: "codex turn failed"；opencode:
-  "opencode session failed"；acp: "acp agent reported an error"）。Display 不变但 message 已固定
-  → 不再泄露。旧 serde 数据缺新字段可反序列化（default → None）。
-- 四个构造点把原文移入 `runtime_output`（opencode 的 `error.name` 回退也进 runtime_output，
-  同为不可信远端文本）。
-
-## 进度
-
-- [x] 读取 TODO.md，确定当前任务为 M2-3
-- [x] 探索相关代码
-- [x] 实现修复：`ExternalAgentError::Runtime` 新增 `runtime_output: Option<String>` 字段
-  （serde default + skip_serializing_if，rustdoc 标注不可信）；5 个构造点（claude/codex/
-  opencode decoder、acp decoder handle_error、acp adapter classify_error）原文移入
-  `runtime_output`，`message` 改固定字符串；testkit 4 处固定诊断补 `runtime_output: None`；
-  real_e2e stdout/stderr tail 移入 `runtime_output`
-- [x] 测试更新：三 cassette 断言改验 runtime_output；codex/opencode cassette fixture 用
-  `AGENT_LIB_UPDATE_EXTERNAL_CASSETTES=1` 再生成；新增 5 条泄露测试（mod.rs Runtime Display
-  + 三 cassette decoder + acp decoder inline，均断言含 `API_KEY=...` 的帧 error.to_string()
-  不含敏感字样）
-- [x] cassette 测试全过（claude 8、codex 8、opencode 8、acp 4）
-- [x] fmt + 双 clippy 通过
-- [x] 全量测试（默认套件 exit 0 约 49s；external features 套件无 FAILED）
-- [x] doc 构建（默认 + external features 各一遍，-D warnings 通过）
-- [x] TODO 完成记录 + review 标注
-- [x] 提交：71cd824 [M2-3] Keep untrusted runtime error text out of ExternalAgentError Display
-
-## 任务完成
-
-M2-3 已落地并提交。下一任务为 M2-4（Codex/OpenCode prompt 传参加固），留待下次调用。
+任务 M2-4 已完成。
