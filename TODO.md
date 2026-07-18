@@ -1335,7 +1335,7 @@ cargo clippy --all-targets \
 - 本任务未改动任何编译产物（仅 `TODO.md` 完成记录与 `memory/claude_plan.md` 计划文件），全量
   绿测结果即为本次实跑结果。
 
-### M6-3 [TODO] Review：最终正确性和完整性验收
+### M6-3 [DONE] Review：最终正确性和完整性验收
 
 检查范围：
 
@@ -1353,3 +1353,69 @@ cargo clippy --all-targets \
   - 修复的设计目标差距。
   - 仍保留的非阻断风险。
   - 已运行的验证命令。
+
+完成记录：
+
+**检查范围结论**
+
+- **所有 milestone review 已完成**：`TODO.md` 中 M1-3、M2-3、M3-5、M4-5、M5-3 五个
+  review 任务标题均为 `[DONE]`；实现任务 M1-1 ~ M5-2 亦全部 `[DONE]`。剩余仅 M6 收尾
+  链（M6-1、M6-2 已 `[DONE]`，本任务 M6-3 为最后一项）。
+- **PLAN.md / TODO.md / docs/refine.md 一致**：`docs/refine.md` 六类问题的状态行逐条标注
+  「已修复」并注明对应 milestone（#1→M1-1/M1-2/M1-3、#2→M3-1~M3-4/M3-5、#3→M2-1/M2-2/M2-3、
+  #4→M4-3/M4-4/M4-5、#5→M4-1/M4-2/M4-5、#6→M5-1/M5-2/M5-3），与 `PLAN.md`（M1–M6 里程碑
+  设计要求）和 `TODO.md` 任务编号完全对应，无互相矛盾的遗留描述。
+- **README quick start 能避开已知坑**：`README.md` §4 external quick start 使用
+  M4-1 新增的一步式 `build_with_default_session_handler()`（避开原 quick start「构造后没有
+  session handler」的坑，即问题 #5），并写明默认 build 不含 CLI adapter、未开启对应
+  `external-*` feature 时 fail-fast（非密错误）、每个子 agent 在隔离临时 worktree 运行、
+  自定义 handler 的手工路径与 `default_external_session_handler` 便捷构造，与
+  `docs/managed-external-agent.md` / `docs/capability-matrix.md` 一致。
+- **默认测试 / feature clippy / rustdoc 全通过**：见下方验证命令。
+- **无未排期的必修设计目标缺口**：`PLAN.md` 七项目标（stream 生命周期恢复、非流式事件一致性、
+  协作 snapshot/restore、managed external 可用性、capability 来源模型、完整 `into_parts`
+  逃生舱、文档/测试同步）均已由 M1–M5 落地并各自通过 review；未发现必须本轮修复却未进入任务
+  列表的缺口。
+
+**修复的设计目标差距（M1–M5 汇总）**
+
+1. 流式 facade 提前 drop 的一致性恢复：`RunStream` / `AgentRunStream` 均新增幂等
+   `Drop` guard（`abandon()` = discard pending turn / `StepInput::Abandon`），drop 后
+   session/agent 可继续使用（问题 #1）。
+2. 非流式事件一致性：`Agent::run_full` 的 `RunOutput.events` 现包含富化
+   `ApprovalRequested`，与 stream 路径 parity（问题 #3）。
+3. 协作状态 snapshot/restore：mailbox/blackboard/plan 补齐 data-only snapshot API，
+   `AgentSnapshot::capture` 持久化 live 协作内容，restore 优先用 snapshot 内容，顶层
+   artifact 策略明确（问题 #2）。
+4. managed external 可用性：新增 `build_with_default_session_handler` 一步装配 API 并修正
+   README quick start（问题 #5）。
+5. capability 来源模型：区分 declared / supplied / probed / negotiated，`UnsupportedCapability`
+   基于真实 capability view 判定（问题 #4）。
+6. 完整逃生舱：`AgentParts` / `into_parts` 覆盖 external delegate、保留会话、协作底座与
+   交互处理器，rustdoc 明确适用边界（问题 #6）。
+
+**仍保留的非阻断风险**
+
+- managed external 真机 e2e（external claude-code / codex / opencode 结构化回归 3+3+3、
+  mixed managed 多智能体 1，共 10 个 `#[ignore]`）在默认无 CLI/login 配置时干净跳过，未在
+  默认套件中执行；这是设计上的非目标（不把 ignored real e2e 变成默认必跑），非阻断。
+- snapshot 顶层 artifact 采用「保留兼容字段 + 由 external session snapshot 持有明细」的策略
+  （M3-4 已明确并文档化），非缺陷。
+- 三个 `external-*` CLI adapter 与 `external-acp` 默认关闭；启用时才拉入可选依赖，属既定
+  feature 边界，非阻断。
+
+**已运行的验证命令（本次实跑，cheap→expensive 顺序）**
+
+1. `cargo fmt --all` —— 无源码改动（本任务仅改 `TODO.md` 与 `memory/claude_plan.md`）。
+2. `cargo clippy --all-targets -- -D warnings` —— EXIT=0，clean。
+3. `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
+   —— EXIT=0，clean。
+4. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` —— EXIT=0，无 rustdoc warning。
+5. `cargo test --all --all-targets` —— EXIT=0，全库 0 failed（含 lib 单测 878、testkit 153
+   及各集成/replay/cassette/smoke 二进制），10 个 real e2e 保持 `#[ignore]` 干净跳过。
+6. `git diff --check` —— EXIT=0（无行尾/空白冲突标记）。
+7. `rg "\[TODO\]" TODO.md` —— 标记 M6-3 `[DONE]` 后仅命中顶部图例说明行（文档说明，非任务
+   标题），无剩余未完成任务标记。
+
+本任务仅改动文档/记录文件（`TODO.md`、`memory/claude_plan.md`），未改动任何编译产物；上述全量
+绿测即为本次实跑结果。至此 M1–M6 全部任务完成，项目达成 `PLAN.md` 全部设计目标。

@@ -1,33 +1,30 @@
-# M6-2 执行计划：全量验证默认构建、测试、文档和 external feature clippy
+# M6-3 执行计划：Review 最终正确性和完整性验收
 
 ## 任务性质
-验收/验证任务（TODO.md M6-2）。按 cheap→expensive 顺序运行完整验证命令，
-确认默认构建、clippy、test、rustdoc、以及 external feature clippy 全部通过。
-若失败，回到对应 milestone 修正（不只记录失败）。ignored real e2e 不强制运行，
-但确认未配置时干净跳过（保持 #[ignore]）。
+最终验收/复核任务（TODO.md M6-3）。这是项目最后一个任务；完成后需打 `endtag` tag。
 
-## 验证命令（全部必须通过）
+## 检查范围
+1. 所有 milestone review 任务是否完成（M1-3、M2-3、M3-5、M4-5、M5-3）。
+2. PLAN.md / TODO.md / docs/refine.md 是否一致。
+3. README quick start 是否能让新调用方避开已知坑。
+4. 默认测试、feature clippy、rustdoc 是否都通过。
+5. 是否还有必须本轮修复但未排入任务的设计目标缺口。
+
+## 验证条件
+- `rg "\[TODO\]" TODO.md` 完成后不应再有未完成任务标记（仅剩 legend 说明行）。
+- `git diff --check` 通过。
+- 完成记录列出：修复的设计目标差距、仍保留的非阻断风险、已运行的验证命令。
+
+## 验证命令
 1. cargo fmt --all
 2. cargo clippy --all-targets -- -D warnings
-3. cargo test --all --all-targets
+3. cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
 4. RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-5. cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
-
-## 执行顺序（先便宜后昂贵，避免 fmt/clippy 修改后重跑 test）
-- [x] 1. cargo fmt --all（无代码改动）
-- [x] 2. default clippy -D warnings（EXIT=0）
-- [x] 3. external feature clippy -D warnings（EXIT=0）
-- [x] 4. rustdoc -D warnings（EXIT=0）
-- [x] 5. cargo test --all --all-targets（EXIT=0，0 failed，10 ignored）
-
-## 完成后
-- TODO.md 标记 M6-2 [DONE]，完成记录写明各命令结果。
-- 提交，停止（不进入 M6-3）。
+5. cargo test --all --all-targets
 
 ## 进度
-- [x] fmt
-- [x] default clippy
-- [x] external clippy
-- [x] rustdoc
-- [x] test suite（878 lib passed，全库 0 failed，10 ignored real e2e）
-- [x] TODO.md [DONE] + commit
+- [x] 读取 TODO/PLAN/refine，确认一致
+- [x] 审阅 README quick start（build_with_default_session_handler，避开 handler 坑）
+- [x] 运行全量验证（fmt/clippy x2/rustdoc/test 全 EXIT=0）
+- [x] TODO.md 标记 M6-3 [DONE] + 完成记录
+- [ ] commit + 打 endtag tag
