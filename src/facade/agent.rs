@@ -45,15 +45,15 @@ use async_trait::async_trait;
 
 use crate::agent::requirement::AgentSpecRef;
 use crate::agent::{
-    AgentError, AgentInput, AgentSpec, AgentState, Blackboard, BudgetLimits, Capability, CostTier,
-    DefaultAgentMachine, EscalationError, EscalationOutcome, EscalationRules, EscalationTrigger,
-    Escalator, HandlerScope, HumanGate, ImpactScope, Interaction, InteractionHandler,
-    InteractionKind, LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor, LoopDoneReason,
-    LoopPolicy, Mailbox, ModelRef, Notification, PermissionRisk, Plan, RequirementIds,
-    RequirementResult, RunContext, RunId, ScriptedVerifier, TaskDescriptor, TaskEvaluator,
-    ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy, ToolHandler, ToolRegistry,
-    ToolRegistryHandler, ToolSetRef, Uncertainty, Verifier, WorkerProfile, WorkerProfileRef,
-    WorkerReport, WorkerRoster, WorktreeRef, drain,
+    AgentError, AgentInput, AgentMachine, AgentSpec, AgentState, Blackboard, BudgetLimits,
+    Capability, CostTier, DefaultAgentMachine, EscalationError, EscalationOutcome, EscalationRules,
+    EscalationTrigger, Escalator, HandlerScope, HumanGate, ImpactScope, Interaction,
+    InteractionHandler, InteractionKind, LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor,
+    LoopDoneReason, LoopPolicy, Mailbox, ModelRef, Notification, PermissionRisk, Plan,
+    RequirementIds, RequirementResult, RunContext, RunId, ScriptedVerifier, StepInput,
+    TaskDescriptor, TaskEvaluator, ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy,
+    ToolHandler, ToolRegistry, ToolRegistryHandler, ToolSetRef, Uncertainty, Verifier,
+    WorkerProfile, WorkerProfileRef, WorkerReport, WorkerRoster, WorktreeRef, drain,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig};
@@ -206,6 +206,63 @@ impl std::fmt::Debug for Agent {
     }
 }
 
+/// Synchronously closes a stranded facade turn by feeding one never-resume input.
+///
+/// Abandoning any outstanding requirement closes the whole in-flight turn on the
+/// default machine: an LLM step discards its pending turn, while a tool phase
+/// folds cancelled tool results and returns to a feedable cursor.
+fn abandon_in_flight_turn(machine: &mut DefaultAgentMachine) {
+    if let Some(id) = machine
+        .cursor()
+        .pending_requirement_ids()
+        .into_iter()
+        .next()
+    {
+        let _ = machine.step(StepInput::Abandon(id));
+    }
+}
+
+/// Drop guard for non-streaming facade drives.
+///
+/// `run_full` cannot perform async cleanup when its future is dropped by a host
+/// timeout, so this guard performs the same synchronous abandon step used by the
+/// streaming drop path.
+struct RunFullDropGuard {
+    machine: std::ptr::NonNull<DefaultAgentMachine>,
+    armed: bool,
+}
+
+impl RunFullDropGuard {
+    fn new(machine: &mut DefaultAgentMachine) -> Self {
+        Self {
+            machine: std::ptr::NonNull::from(machine),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RunFullDropGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        // SAFETY: the guard is created inside `Agent::run_full` from the same
+        // `&mut Agent` that owns the machine, so the pointer remains valid for
+        // the lifetime of the future. The `drain` future is declared after this
+        // guard and is therefore dropped before the guard when the run future is
+        // cancelled, releasing its temporary `&mut DefaultAgentMachine` borrow
+        // before this synchronous recovery step runs.
+        unsafe {
+            abandon_in_flight_turn(self.machine.as_mut());
+        }
+    }
+}
+
 impl Agent {
     /// Starts a fluent [`AgentBuilder`].
     #[must_use]
@@ -267,7 +324,11 @@ impl Agent {
     ///   duplicate tool name (already validated at build, so this is defensive).
     ///
     /// A failed turn discards its uncommitted work inside the machine, so the
-    /// `Agent` stays usable and its committed history is unchanged.
+    /// `Agent` stays usable and its committed history is unchanged. If the run
+    /// future is dropped before completion — for example because the host wraps
+    /// it in `tokio::time::timeout` — a synchronous guard abandons the stranded
+    /// requirement before control returns to the caller, leaving the same
+    /// committed consistency point available for the next run or snapshot.
     pub async fn run_full(
         &mut self,
         input: impl IntoUserMessage,
@@ -352,7 +413,12 @@ impl Agent {
             self.ids.step_id(),
         )?;
 
-        let done = drain(&mut self.machine, agent_input, &scope, None, &ctx).await?;
+        let mut drop_guard = RunFullDropGuard::new(&mut self.machine);
+        let done = {
+            let drive = drain(&mut self.machine, agent_input, &scope, None, &ctx);
+            drive.await?
+        };
+        drop_guard.disarm();
         let collected = collect_traces(done.notifications(), &recorder);
         // Recovered in fulfill order so a paused approval sits before the tool
         // lifecycle it gated (or at the tail when the tool never started).

@@ -1234,7 +1234,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M5：facade 承诺对齐
 
-### M5-1 [TODO] `run_full` 增加 drop/timeout 安全防护（H-STATE-3）
+### M5-1 [DONE] `run_full` 增加 drop/timeout 安全防护（H-STATE-3）
 
 上下文：
 
@@ -1251,6 +1251,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：`timeout(short, agent.run(..))` 超时后，下一次 `run` 正常完成；`snapshot` 一致。
 - `cargo test -p agent-lib --lib facade::agent` 全过。
+
+完成记录：
+
+- 选型：采用同步 RAII drop guard，而非惰性恢复。`run_full` 在进入 `drain` 前创建 `RunFullDropGuard`，正常返回后 `disarm()`；如果外层 `tokio::time::timeout` / `select!` drop 该 future，guard 在 drop 时同步向 `DefaultAgentMachine` 喂一个 `StepInput::Abandon`，复用机器既有 never-resume 语义回收整轮 pending turn。由于 async drop 不存在，恢复动作保持纯同步；guard 内部用 `NonNull<DefaultAgentMachine>` 保存指针，并在安全注释中固定不变量：`drain` future 在 guard 之后创建，取消 drop 时先释放临时 `&mut DefaultAgentMachine` 借用，再执行 guard。
+- `src/facade/agent.rs`：新增 `abandon_in_flight_turn` 共享 helper 与 `RunFullDropGuard`；`run_full` rustdoc 补充 future 被 drop/timeout 后 Agent 回到上一 committed 一致点，可继续 `run` 或 `snapshot`。
+- `src/facade/agent/stream.rs`：`AgentRunStream::abandon` 改调同一个 `abandon_in_flight_turn` helper，流式与非流式提前 drop 的恢复语义保持单一来源。
+- 测试：新增 `RunTimeoutClient` 与 `timing_out_non_streaming_run_discards_it_and_leaves_agent_runnable`，首个 `chat` 永久挂起并由 `tokio::time::timeout(20ms, agent.run(..))` drop；断言 timeout 后立即 `snapshot()` 成功，下一次 `run` 返回 `"recovered."`，两次 LLM 请求的 `messages.len()` 均为 1，证明被超时的 pending turn 没有进入 committed history。
+- 文档：`docs/facade-api.md` §8.2 补充 `run` / `run_full` / `stream` 在 timeout/drop 后自动 abandon 未提交 turn、回到上一 committed 一致点；`docs/review-2026-07.md` H-STATE-3 已标注 `✅ 已修复（M5-1）`。
+- 验证：`cargo test -p agent-lib --lib facade::agent`（51 条全过）、`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`（默认离线套件全过，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。无 breaking change（内部 guard 与私有 helper；公共行为仅从 timeout/drop 后带病状态修正为可恢复）。
 
 ### M5-2 [TODO] 审批行为与文档对齐 + 流式 `Done.events` 审批事件补齐（M-PROM-4、M-ADP-3）
 

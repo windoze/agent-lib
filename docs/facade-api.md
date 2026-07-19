@@ -491,6 +491,12 @@ impl Agent {
 `Agent::worker()` 用于构造 local subagent 模板。它可以要求更少 provider 配置,允许继承 supervisor
 的 provider/model/client,也可以显式指定自己的 model。
 
+`run` / `run_full` 与 `stream` 都会在调用方提前放弃一次运行时保持 agent 可继续使用:非流式
+future 被 drop(例如外层 `tokio::time::timeout` 或 `select!` 分支取消)时,facade 会同步向
+底层 machine 发送 never-resume/abandon 输入,丢弃未提交的 pending turn;流式 `AgentRunStream`
+被提前 drop 时走同一 abandon 语义。两种路径都回到上一 committed 一致点,因此 timeout/drop
+之后可以立即再次 `run` 或 `snapshot`。
+
 `AgentBuilder` 另有若干**依赖注入口**(Milestone 7,详见 §21):
 
 ```rust

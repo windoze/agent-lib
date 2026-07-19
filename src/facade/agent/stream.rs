@@ -64,8 +64,8 @@ use crate::stream::accumulator::{Accumulator, AccumulatorError};
 use crate::stream::{Delta, StreamEvent};
 
 use super::{
-    Agent, classify_error, collect_traces, drive_dispatcher_routed, drive_rules_routed,
-    final_turn_summary, user_message_text,
+    Agent, abandon_in_flight_turn, classify_error, collect_traces, drive_dispatcher_routed,
+    drive_rules_routed, final_turn_summary, user_message_text,
 };
 
 /// A shared sink the tapping handlers push live [`RunEvent`]s into while the
@@ -546,18 +546,7 @@ impl AgentRunStream<'_> {
         let Ok(mut guard) = self.machine.try_borrow_mut() else {
             return;
         };
-        let machine = &mut **guard;
-        if let Some(id) = machine
-            .cursor()
-            .pending_requirement_ids()
-            .into_iter()
-            .next()
-        {
-            // Abandoning any one outstanding requirement closes the whole in-flight
-            // turn: an LLM step discards its pending turn, and a tool phase folds
-            // `Cancelled` results for every still-open call, both settling to `Idle`.
-            let _ = machine.step(StepInput::Abandon(id));
-        }
+        abandon_in_flight_turn(&mut guard);
     }
 }
 

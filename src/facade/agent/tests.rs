@@ -1645,6 +1645,57 @@ struct DropTestClient {
     chat_request_lens: Mutex<Vec<usize>>,
 }
 
+/// A non-streaming client whose first `chat` call never resolves, then every
+/// later call returns a text recovery response.
+#[derive(Debug)]
+struct RunTimeoutClient {
+    calls: AtomicUsize,
+    chat_request_lens: Mutex<Vec<usize>>,
+    recovery_response: Response,
+}
+
+impl RunTimeoutClient {
+    fn new(recovery_response: Response) -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            chat_request_lens: Mutex::new(Vec::new()),
+            recovery_response,
+        })
+    }
+
+    fn chat_request_lens(&self) -> Vec<usize> {
+        self.chat_request_lens.lock().expect("lens mutex").clone()
+    }
+}
+
+#[async_trait]
+impl LlmClient for RunTimeoutClient {
+    fn capability(&self) -> &Capability {
+        &crate::client::ANTHROPIC_DEFAULT_CAPABILITY
+    }
+
+    async fn chat(&self, request: ChatRequest) -> Result<Response, ClientError> {
+        self.chat_request_lens
+            .lock()
+            .expect("lens mutex")
+            .push(request.messages.len());
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::future::pending::<Result<Response, ClientError>>().await
+        } else {
+            Ok(self.recovery_response.clone())
+        }
+    }
+
+    async fn chat_stream(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError> {
+        Err(ClientError::Other(
+            "streaming not used in fixture".to_owned(),
+        ))
+    }
+}
+
 impl DropTestClient {
     fn new(
         stream_events: Vec<StreamEvent>,
@@ -1742,6 +1793,41 @@ fn parking_weather_tool() -> Tool {
             std::future::pending::<Result<String, Infallible>>().await
         },
     )
+}
+
+/// Dropping a non-streaming `run` future through a host timeout abandons the
+/// stranded LLM requirement synchronously, so the agent is immediately
+/// snapshot-able and the next run starts from the previous committed history.
+#[tokio::test]
+async fn timing_out_non_streaming_run_discards_it_and_leaves_agent_runnable() {
+    let client = RunTimeoutClient::new(text_response("recovered."));
+    let mut agent = AgentBuilder::default()
+        .client(client.clone())
+        .model("test-model")
+        .build()
+        .expect("build agent");
+
+    let timed_out = tokio::time::timeout(
+        std::time::Duration::from_millis(20),
+        agent.run("this call will time out"),
+    )
+    .await;
+    assert!(timed_out.is_err(), "the first run is deliberately parked");
+
+    agent
+        .snapshot()
+        .expect("timeout guard returns the machine to a snapshot-able point");
+
+    let reply = agent.run("again").await.expect("run after timeout");
+    assert_eq!(reply.text(), "recovered.");
+    assert_eq!(
+        client.chat_request_lens(),
+        vec![1, 1],
+        "the recovery turn carried only its own user message; the timed-out turn left no residue"
+    );
+    agent
+        .snapshot()
+        .expect("recovered agent remains snapshot-able");
 }
 
 /// Dropping a stream that was never polled leaves the machine untouched, so the
