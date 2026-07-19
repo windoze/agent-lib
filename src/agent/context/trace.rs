@@ -7,6 +7,7 @@ use crate::agent::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     fmt,
     sync::{Arc, Mutex},
 };
@@ -183,8 +184,34 @@ fn non_empty(value: String) -> Option<String> {
 /// Live handle for appending trace records under a current parent node.
 #[derive(Clone, Debug)]
 pub struct TraceHandle {
-    records: Arc<Mutex<Vec<TraceRecord>>>,
+    state: Arc<Mutex<TraceState>>,
     parent: TraceNodeId,
+}
+
+/// Mutable trace storage plus an id index for O(1) duplicate/parent checks.
+#[derive(Debug)]
+struct TraceState {
+    records: Vec<TraceRecord>,
+    ids: HashSet<TraceNodeId>,
+}
+
+impl TraceState {
+    fn new(root: TraceRecord) -> Self {
+        let root_id = root.id.clone();
+        Self {
+            records: vec![root],
+            ids: HashSet::from([root_id]),
+        }
+    }
+
+    fn contains(&self, id: &TraceNodeId) -> bool {
+        self.ids.contains(id)
+    }
+
+    fn push(&mut self, record: TraceRecord) {
+        self.ids.insert(record.id.clone());
+        self.records.push(record);
+    }
 }
 
 impl TraceHandle {
@@ -198,7 +225,7 @@ impl TraceHandle {
             Some(run_id.to_string()),
         );
         Self {
-            records: Arc::new(Mutex::new(vec![root])),
+            state: Arc::new(Mutex::new(TraceState::new(root))),
             parent: root_id,
         }
     }
@@ -210,17 +237,17 @@ impl TraceHandle {
     /// Returns [`TraceError::UnknownParent`] when `parent` is not present in
     /// the shared trace record list.
     pub fn with_parent(&self, parent: TraceNodeId) -> Result<Self, TraceError> {
-        let records = self
-            .records
+        let state = self
+            .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if !records.iter().any(|record| record.id == parent) {
+        if !state.contains(&parent) {
             return Err(TraceError::UnknownParent { parent });
         }
-        drop(records);
+        drop(state);
 
         Ok(Self {
-            records: Arc::clone(&self.records),
+            state: Arc::clone(&self.state),
             parent,
         })
     }
@@ -234,9 +261,10 @@ impl TraceHandle {
     /// Returns a serializable snapshot of all trace records.
     #[must_use]
     pub fn records(&self) -> Vec<TraceRecord> {
-        self.records
+        self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+            .records
             .clone()
     }
 
@@ -382,21 +410,21 @@ impl TraceHandle {
         kind: TraceNodeKind,
         label: Option<String>,
     ) -> Result<TraceRecord, TraceError> {
-        let mut records = self
-            .records
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if records.iter().any(|record| record.id == id) {
+        if state.contains(&id) {
             return Err(TraceError::DuplicateNodeId { node_id: id });
         }
-        if !records.iter().any(|record| record.id == self.parent) {
+        if !state.contains(&self.parent) {
             return Err(TraceError::UnknownParent {
                 parent: self.parent.clone(),
             });
         }
 
         let record = TraceRecord::new(id, Some(self.parent.clone()), kind, label);
-        records.push(record.clone());
+        state.push(record.clone());
         Ok(record)
     }
 }

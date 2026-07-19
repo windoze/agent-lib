@@ -397,7 +397,7 @@ pub(super) fn start(
         cancel: ctx.cancellation().clone(),
         trace: ctx.trace().clone(),
     };
-    let registry = FacadeToolRegistry::new(
+    let registry = FacadeToolRegistry::from_shared(
         agent.tools.clone(),
         agent.custom_registry.clone(),
         agent.extra_declarations.clone(),

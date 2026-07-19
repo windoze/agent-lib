@@ -19,7 +19,7 @@
 
 use super::blackboard::{Blackboard, BlackboardSnapshot, DEFAULT_CHANNEL};
 use super::mailbox::{MailMessage, Mailbox, MailboxSnapshot};
-use super::plan::{Plan, PlanError, PlanSnapshot, TaskStatus};
+use super::plan::{Plan, PlanError, PlanSnapshot, TaskSnapshot, TaskStatus};
 use super::tools::{
     BLACKBOARD_POST, BLACKBOARD_READ, CollabToolHandler, MAILBOX_READ, PLAN_ADD_TASK, PLAN_CLAIM,
     PLAN_CLAIM_FIRST_AVAILABLE, PLAN_READ, PLAN_UPDATE, REPORT_ARTIFACT, RUN_HOST_TOOL,
@@ -228,6 +228,40 @@ async fn tool_adapter_plan_add_task_rejects_malformed_graph() {
     // Every rejected add left the plan untouched.
     assert_eq!(plan.version(), version);
     assert_eq!(plan.snapshot().tasks.len(), 1);
+}
+
+#[tokio::test]
+async fn plan_add_task_defensively_rejects_a_restored_cycle_without_cloning_the_board() {
+    let mut tasks = BTreeMap::new();
+    tasks.insert(
+        "a".to_owned(),
+        TaskSnapshot {
+            status: TaskStatus::Todo,
+            owner: None,
+            depends_on: vec!["b".to_owned()],
+        },
+    );
+    tasks.insert(
+        "b".to_owned(),
+        TaskSnapshot {
+            status: TaskStatus::Todo,
+            owner: None,
+            depends_on: vec!["a".to_owned()],
+        },
+    );
+    let plan = Plan::from_snapshot(PlanSnapshot {
+        id: PlanId::new(Uuid::from_u128(0x6003_00ff)),
+        version: 7,
+        task_order: vec!["a".to_owned(), "b".to_owned()],
+        tasks,
+    });
+
+    assert!(matches!(
+        plan.add_task("c", ["a"]),
+        Err(PlanError::DependencyCycle(cycle)) if cycle.len() == 3
+    ));
+    assert_eq!(plan.version(), 7);
+    assert_eq!(plan.snapshot().tasks.len(), 2);
 }
 
 /// Status transitions are enforced: only the owner may update, terminal states

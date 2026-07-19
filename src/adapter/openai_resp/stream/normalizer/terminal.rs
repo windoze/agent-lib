@@ -24,6 +24,11 @@ impl StreamNormalizer {
     ) -> Result<Vec<StreamEvent>, ClientError> {
         self.validate_response_snapshot(&event.response, expected_status)?;
         self.validate_terminal_output(&event.response)?;
+        // Item state is only needed to validate the terminal snapshot. Drop it
+        // before parsing the full response so `output_item.done` payloads do not
+        // remain live alongside the parsed terminal response.
+        self.items.clear();
+        self.item_indices.clear();
         let mut response = parse_response_value(event.response)?;
         if !self.unmodeled_events.is_empty() {
             common::insert_preserving_collision(

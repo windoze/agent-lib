@@ -237,13 +237,17 @@ pub enum PlanError {
     NoAvailableItem,
 }
 
-/// Detects a dependency cycle in `tasks` and returns one offending path.
+/// Detects a dependency cycle after adding one virtual task.
 ///
 /// The returned path lists the ids around the cycle, ending with the id it
 /// closes back onto (for example `["a", "b", "a"]`). Returns `None` when the
 /// `depends_on` edges form a DAG.
 #[must_use]
-fn detect_cycle(tasks: &BTreeMap<String, TaskSnapshot>) -> Option<Vec<String>> {
+fn detect_cycle_after_insert(
+    tasks: &BTreeMap<String, TaskSnapshot>,
+    candidate_id: &str,
+    candidate_depends_on: &[String],
+) -> Option<Vec<String>> {
     let mut visited: BTreeSet<String> = BTreeSet::new();
     let mut stack: Vec<String> = Vec::new();
     let mut on_stack: BTreeSet<String> = BTreeSet::new();
@@ -252,17 +256,40 @@ fn detect_cycle(tasks: &BTreeMap<String, TaskSnapshot>) -> Option<Vec<String>> {
         if visited.contains(root) {
             continue;
         }
-        if let Some(cycle) = visit(root, tasks, &mut visited, &mut stack, &mut on_stack) {
+        if let Some(cycle) = visit_after_insert(
+            root,
+            tasks,
+            candidate_id,
+            candidate_depends_on,
+            &mut visited,
+            &mut stack,
+            &mut on_stack,
+        ) {
             return Some(cycle);
         }
+    }
+    if !visited.contains(candidate_id)
+        && let Some(cycle) = visit_after_insert(
+            candidate_id,
+            tasks,
+            candidate_id,
+            candidate_depends_on,
+            &mut visited,
+            &mut stack,
+            &mut on_stack,
+        )
+    {
+        return Some(cycle);
     }
     None
 }
 
-/// Depth-first helper for [`detect_cycle`].
-fn visit(
+/// Depth-first helper for [`detect_cycle_after_insert`].
+fn visit_after_insert(
     node: &str,
     tasks: &BTreeMap<String, TaskSnapshot>,
+    candidate_id: &str,
+    candidate_depends_on: &[String],
     visited: &mut BTreeSet<String>,
     stack: &mut Vec<String>,
     on_stack: &mut BTreeSet<String>,
@@ -271,19 +298,32 @@ fn visit(
     stack.push(node.to_owned());
     on_stack.insert(node.to_owned());
 
-    if let Some(task) = tasks.get(node) {
-        for dep in &task.depends_on {
-            if on_stack.contains(dep) {
-                let start = stack.iter().position(|id| id == dep).unwrap_or(0);
-                let mut cycle = stack[start..].to_vec();
-                cycle.push(dep.clone());
-                return Some(cycle);
-            }
-            if !visited.contains(dep)
-                && let Some(cycle) = visit(dep, tasks, visited, stack, on_stack)
-            {
-                return Some(cycle);
-            }
+    let depends_on: &[String] = if node == candidate_id {
+        candidate_depends_on
+    } else if let Some(task) = tasks.get(node) {
+        &task.depends_on
+    } else {
+        &[]
+    };
+    for dep in depends_on {
+        if on_stack.contains(dep) {
+            let start = stack.iter().position(|id| id == dep).unwrap_or(0);
+            let mut cycle = stack[start..].to_vec();
+            cycle.push(dep.clone());
+            return Some(cycle);
+        }
+        if !visited.contains(dep)
+            && let Some(cycle) = visit_after_insert(
+                dep,
+                tasks,
+                candidate_id,
+                candidate_depends_on,
+                visited,
+                stack,
+                on_stack,
+            )
+        {
+            return Some(cycle);
         }
     }
 
@@ -396,9 +436,7 @@ impl Plan {
             return Err(PlanError::UnknownTask(unknown.clone()));
         }
 
-        let mut candidate = plan.tasks.clone();
-        candidate.insert(id.clone(), TaskSnapshot::todo(depends_on.clone()));
-        if let Some(cycle) = detect_cycle(&candidate) {
+        if let Some(cycle) = detect_cycle_after_insert(&plan.tasks, &id, &depends_on) {
             return Err(PlanError::DependencyCycle(cycle));
         }
 

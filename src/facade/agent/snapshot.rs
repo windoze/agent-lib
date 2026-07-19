@@ -952,9 +952,9 @@ impl AgentRestoreBuilder {
         Ok(Agent {
             machine,
             client,
-            tools: self.tools,
+            tools: Arc::from(self.tools),
             custom_registry: self.custom_registry,
-            extra_declarations: self.extra_declarations,
+            extra_declarations: Arc::from(self.extra_declarations),
             approval,
             // A snapshot is data-only: a host-injected interaction handler is a
             // runtime handle it never carries (§15.2), so it must be re-injected

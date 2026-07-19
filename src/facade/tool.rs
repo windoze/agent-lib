@@ -485,9 +485,9 @@ fn derive_schema<Args: schemars::JsonSchema>() -> Value {
 /// builds a fresh [`ToolContext`] from the run-scoped handles supplied when the
 /// registry was assembled.
 pub struct FacadeToolRegistry {
-    tools: Vec<Tool>,
+    tools: Arc<[Tool]>,
     custom: Option<Arc<dyn ToolRegistry>>,
-    extra: Vec<ToolDecl>,
+    extra: Arc<[ToolDecl]>,
     context: ToolContextParts,
 }
 
@@ -535,6 +535,16 @@ impl FacadeToolRegistry {
         tools: Vec<Tool>,
         custom: Option<Arc<dyn ToolRegistry>>,
         extra: Vec<ToolDecl>,
+        context: ToolContextParts,
+    ) -> Result<Self, FacadeError> {
+        Self::from_shared(Arc::from(tools), custom, Arc::from(extra), context)
+    }
+
+    /// Assembles a registry from shared tool/declaration slices.
+    pub(crate) fn from_shared(
+        tools: Arc<[Tool]>,
+        custom: Option<Arc<dyn ToolRegistry>>,
+        extra: Arc<[ToolDecl]>,
         context: ToolContextParts,
     ) -> Result<Self, FacadeError> {
         ensure_unique_tool_names(&tools, &extra, custom.as_ref())?;

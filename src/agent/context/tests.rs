@@ -261,6 +261,29 @@ fn trace_rejects_duplicate_node_ids_and_unknown_parents() {
 }
 
 #[test]
+fn trace_index_tracks_many_node_ids_without_losing_records() {
+    let context = context_with_limits(BudgetLimits::unbounded());
+    for index in 0..1_000 {
+        let id = format!("step-{index}");
+        context
+            .trace()
+            .record_step(node_id(&id), step_id())
+            .expect("record indexed trace node");
+    }
+
+    assert_eq!(context.trace().records().len(), 1_001);
+    assert_eq!(
+        context
+            .trace()
+            .record_tool(node_id("step-999"), "duplicate")
+            .expect_err("duplicate remains indexed"),
+        TraceError::DuplicateNodeId {
+            node_id: node_id("step-999"),
+        }
+    );
+}
+
+#[test]
 fn budget_and_trace_records_are_serializable_data() {
     let snapshot = BudgetSnapshot::from_parts(
         BudgetLimits::new(Some(2), Some(100), Some(500), Some(Duration::from_secs(30))),

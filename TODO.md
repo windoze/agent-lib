@@ -1792,7 +1792,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo test -p agent-lib --lib`（1008 条）、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - Breaking change（pre-1.0，记录在此）：`ApprovalRequest::call_id` 类型改为 `Option<String>`；`Normalized<T>` 字段私有化；`ModelConfig::temperature` 签名改为 `Result<Self, FacadeError>`；`RunEvent`/`WireRunEvent` 变为 `#[non_exhaustive]`；`ToolCall` 新增 pub 字段 `extra`；`QueuedReconfig` 别名删除。
 
-### M9-3 [TODO] 性能小项批
+### M9-3 [DONE] 性能小项批
 
 上下文：
 
@@ -1811,6 +1811,18 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 验证条件：
 
 - 全量测试通过；优化点无行为变化（现有断言原样通过）。
+
+完成记录：
+
+- `TraceHandle`：内部存储从单一 `Vec<TraceRecord>` 改为 `TraceState { records, ids }`，`record_node` / `with_parent` 的 duplicate/parent 检查由全表扫描改为 `HashSet<TraceNodeId>` 查询；`records()` 仍返回原顺序 Vec 快照，公共 API 与 serde 形状不变。新增 `trace_index_tracks_many_node_ids_without_losing_records`，记录 1000 个节点并断言总数与 duplicate 拒绝。
+- `Plan::add_task`：删除为环检测克隆整张 `tasks` 表的路径，改为在现有表上做“虚拟插入”DFS（候选 task 的依赖边以 borrowed slice 注入）。正常 API 仍按 duplicate/self/unknown/cycle 原子拒绝；`from_snapshot` 恢复出的坏环仍被防御性拒绝。新增 `plan_add_task_defensively_rejects_a_restored_cycle_without_cloning_the_board`。
+- facade 工具注册：`Agent` 运行期持有 `Arc<[Tool]>` 与 `Arc<[ToolDecl]>`，non-stream / stream / rules-routed drive 创建 per-run `FacadeToolRegistry` 时克隆 Arc 而非深拷贝工具闭包与整棵 JSON schema。保留公开 `FacadeToolRegistry::new(Vec<_>, .., Vec<_>, ..)`，新增 crate-private `from_shared` 给 facade 内部使用；`AgentParts` 仍输出 Vec，避免公开 API 破坏。
+- `History::contains_message_id`：`History` 新增 `Arc<HashSet<MessageId>>` retained message id 索引；append 时 `Arc::make_mut` 增量插入新 turn 消息，fork/shared prefix 与 restore 会按可见 raw scope 重建索引。`contains_message_id` 从物化 `raw_turns()` 并扫所有消息改为 O(1) 查询；新增 `retained_message_id_index_covers_long_histories`（512 turn 计数断言 + 重复 message id 拒绝）。`pending/cancel/prepare.rs` 与 commit validation 的全量 id set 重建保留为 validator 单一来源，未在本批拆分。
+- `ConversationRows::insert_set_against`：删除 diff 前 `self.clone().into_snapshot()?` / `existing.clone().into_snapshot()?` 双份全量行集重组，新增 borrowed `validate_for_insert_diff()`，复用 schema/generation/owner/FK/sequence/projection shape 校验但不构造 `ConversationSnapshot`、不克隆 message payload。diff key 与错误分类保持不变，既有 persistence 演进/冲突测试原样通过。
+- OpenAI Responses stream normalizer：`response.completed` / `response.incomplete` 先用 retained item state 校验 terminal `output`，校验通过后立即 `clear()` `items` / `item_indices`，避免 `output_item.done` payload 与后续 parsed terminal response 同时常驻。`raw.clone()` / unknown content raw 与 `unmodeled_events` 未删除：前者是 `ContentBlock::Unknown` / `Delta::Unknown` 的证据输出，后者是 M7-5 前向兼容 metadata 承诺；为保证现有协议证据与 public event 语义，本批只释放校验后缓存，不降级证据保留。
+- 文档/审查记录：`docs/review-2026-07.md` 中 M-CONV-4 与性能清单已按 M9-3 标注；OpenAI raw/unmodeled 证据保留已记录为有意不优化。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::history::tests::retention::retained_message_id_index_covers_long_histories`、`cargo test --all --all-targets`（默认离线全量，1011 lib 测试 + 所有集成/示例目标通过，真实 endpoint/CLI 测试保持 ignored，无挂起）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（1178 lib 测试 + external/acp 目标通过，真实 CLI 测试 ignored）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 无 breaking change（新增字段/入口均 crate-private 或公开兼容保留；公共类型、函数签名、serde/wire 形状不变）。
 
 ### M9-4 [TODO] 文档同步与审查报告勾销
 

@@ -174,9 +174,9 @@ impl CancelHandle {
 pub struct Agent {
     machine: DefaultAgentMachine,
     client: Arc<dyn LlmClient>,
-    tools: Vec<Tool>,
+    tools: Arc<[Tool]>,
     custom_registry: Option<Arc<dyn ToolRegistry>>,
-    extra_declarations: Vec<ToolDecl>,
+    extra_declarations: Arc<[ToolDecl]>,
     approval: Arc<FacadeApproval>,
     /// An optional host-supplied interaction handler that replaces
     /// [`FacadeApproval`] as the scope's [`InteractionHandler`] when set (§19).
@@ -476,7 +476,7 @@ impl Agent {
             cancel: ctx.cancellation().clone(),
             trace: ctx.trace().clone(),
         };
-        let registry = FacadeToolRegistry::new(
+        let registry = FacadeToolRegistry::from_shared(
             self.tools.clone(),
             self.custom_registry.clone(),
             self.extra_declarations.clone(),
@@ -731,7 +731,7 @@ impl Agent {
             cancel: ctx.cancellation().clone(),
             trace: ctx.trace().clone(),
         };
-        let registry = FacadeToolRegistry::new(
+        let registry = FacadeToolRegistry::from_shared(
             self.tools.clone(),
             self.custom_registry.clone(),
             self.extra_declarations.clone(),
@@ -1047,9 +1047,9 @@ impl Agent {
         AgentParts {
             state: self.machine.into_state(),
             client: self.client,
-            tools: self.tools,
+            tools: self.tools.iter().cloned().collect(),
             custom_registry: self.custom_registry,
-            extra_declarations: self.extra_declarations,
+            extra_declarations: self.extra_declarations.iter().cloned().collect(),
             approval: self.approval,
             interaction_handler: self.interaction_handler,
             ids: self.ids,
@@ -1541,9 +1541,9 @@ impl AgentBuilder {
         Ok(Agent {
             machine,
             client,
-            tools: self.tools,
+            tools: Arc::from(self.tools),
             custom_registry: self.custom_registry,
-            extra_declarations: self.extra_declarations,
+            extra_declarations: Arc::from(self.extra_declarations),
             approval,
             interaction_handler: self.interaction_handler,
             ids,

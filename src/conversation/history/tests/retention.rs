@@ -117,3 +117,26 @@ fn replacement_lineage_hides_old_suffix_but_retains_raw_and_all_identities() {
             .is_none()
     );
 }
+
+#[test]
+fn retained_message_id_index_covers_long_histories() {
+    let mut conversation = conversation();
+    for index in 0..512 {
+        commit_text_turn(&mut conversation, 1_000 + index, 10_000 + index * 10);
+    }
+
+    let duplicate = conversation
+        .begin_turn(
+            turn_id(9_000),
+            message_id(10_000 + 255 * 10),
+            user("duplicate message"),
+        )
+        .expect_err("message id retained in index");
+    assert_eq!(
+        duplicate,
+        ConversationError::PendingTurn(PendingTurnError::DuplicateMessageId {
+            message_id: message_id(10_000 + 255 * 10),
+        })
+    );
+    assert_eq!(conversation.raw_turns().len(), 512);
+}

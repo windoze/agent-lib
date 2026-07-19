@@ -886,6 +886,61 @@ impl ConversationRows {
         ))
     }
 
+    /// Validates the row invariants needed before computing an insert-only diff.
+    ///
+    /// This mirrors the row-level checks in [`into_snapshot`](Self::into_snapshot)
+    /// but borrows the rows instead of cloning and reassembling a full snapshot.
+    fn validate_for_insert_diff(&self) -> Result<(), RowMappingError> {
+        let owner = self.conversation.conversation_id;
+        self.validate_schema_versions()?;
+        self.validate_generations()?;
+        self.validate_row_owners(owner)?;
+
+        let raw_members = sorted_conversation_turns(&self.raw_turns)?;
+        let lineage_members = sorted_lineage_turns(&self.lineage_turns)?;
+        let turn_records = unique_by_key(&self.turns, "turn_records", "$.turns", |turn| {
+            turn.turn_id.to_string()
+        })?;
+        let retained_turns = retained_turn_ids(&raw_members)?;
+        reject_orphan_turn_records(&self.turns, &retained_turns)?;
+
+        let messages_by_turn = group_messages(&self.messages, &turn_records, &retained_turns)?;
+        let pairings_by_turn =
+            group_tool_pairings(&self.tool_pairings, &turn_records, &retained_turns)?;
+
+        for (raw_index, membership) in raw_members.iter().enumerate() {
+            if !turn_records.contains_key(&membership.turn_id.to_string()) {
+                return Err(RowMappingError::MissingTurnRow {
+                    path: format!("$.raw_turns[{raw_index}].turn_id"),
+                    turn_id: membership.turn_id,
+                });
+            }
+            validate_messages_for_turn(
+                membership.turn_id,
+                raw_index,
+                messages_by_turn.get(&membership.turn_id),
+            )?;
+            validate_pairings_for_turn(pairings_by_turn.get(&membership.turn_id))?;
+        }
+
+        for (lineage_index, membership) in lineage_members.iter().enumerate() {
+            if !retained_turns.contains(&membership.turn_id) {
+                return Err(RowMappingError::MissingTurnRow {
+                    path: format!("$.lineage_turns[{lineage_index}].turn_id"),
+                    turn_id: membership.turn_id,
+                });
+            }
+        }
+
+        rows_to_projection(
+            owner,
+            &self.projection_spans,
+            &self.artifacts,
+            "$.projection_spans",
+        )?;
+        Ok(())
+    }
+
     /// Computes rows that can be inserted without updating existing facts.
     ///
     /// This is useful when exporting a fork child after a parent prefix has
@@ -912,8 +967,8 @@ impl ConversationRows {
         &self,
         existing: &ConversationRows,
     ) -> Result<ConversationRowInsertSet, RowMappingError> {
-        self.clone().into_snapshot()?;
-        existing.clone().into_snapshot()?;
+        self.validate_for_insert_diff()?;
+        existing.validate_for_insert_diff()?;
 
         let conversations = diff_single_conversation(&self.conversation, &existing.conversation)?;
         Ok(ConversationRowInsertSet {
@@ -1518,6 +1573,29 @@ fn messages_for_turn(
         .collect())
 }
 
+/// Checks that one Turn's message rows exist and have a dense order.
+fn validate_messages_for_turn(
+    turn_id: TurnId,
+    raw_index: usize,
+    rows: Option<&Vec<&MessageRecord>>,
+) -> Result<(), RowMappingError> {
+    let rows = rows.ok_or_else(|| RowMappingError::MissingMessageRows {
+        path: format!("$.raw_turns[{raw_index}]"),
+        turn_id,
+    })?;
+    let sorted =
+        sorted_by_dense_sequence(rows.as_slice(), "message_records", "$.messages", |row| {
+            row.message_sequence
+        })?;
+    if sorted.is_empty() {
+        return Err(RowMappingError::MissingMessageRows {
+            path: format!("$.raw_turns[{raw_index}]"),
+            turn_id,
+        });
+    }
+    Ok(())
+}
+
 /// Rebuilds ordered tool pairing rows for one Turn.
 fn pairings_for_turn(
     rows: Option<&Vec<&ToolPairingRecord>>,
@@ -1540,6 +1618,21 @@ fn pairings_for_turn(
             result_msg: Some(row.result_message_id),
         })
         .collect())
+}
+
+/// Checks that one Turn's pairing rows, if any, have a dense order.
+fn validate_pairings_for_turn(
+    rows: Option<&Vec<&ToolPairingRecord>>,
+) -> Result<(), RowMappingError> {
+    if let Some(rows) = rows {
+        sorted_by_dense_sequence(
+            rows.as_slice(),
+            "tool_pairing_records",
+            "$.tool_pairings",
+            |row| row.pairing_sequence,
+        )?;
+    }
+    Ok(())
 }
 
 /// Rebuilds Projection data from span and artifact rows.

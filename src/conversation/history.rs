@@ -6,11 +6,23 @@
 //! the raw log retains nodes that are no longer on that lineage.
 
 use crate::conversation::{MessageId, ToolCallId, Turn, TurnId};
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 mod index;
 
 pub use index::{ToolCallIndex, ToolCallLocation, ToolCallLocationKind};
+
+fn message_id_set<'a>(turns: impl IntoIterator<Item = &'a Turn>) -> HashSet<MessageId> {
+    turns
+        .into_iter()
+        .flat_map(Turn::messages)
+        .map(crate::conversation::ConversationMessage::id)
+        .collect()
+}
 
 /// Append-only raw history plus the currently effective lineage.
 ///
@@ -21,6 +33,7 @@ pub use index::{ToolCallIndex, ToolCallLocation, ToolCallLocationKind};
 pub(crate) struct History {
     raw: RawHistory,
     lineage: Arc<Lineage>,
+    message_ids: Arc<HashSet<MessageId>>,
     lineage_len: usize,
     active_len: usize,
 }
@@ -32,6 +45,7 @@ impl History {
         Self {
             raw: RawHistory::new(lineage.clone()),
             lineage,
+            message_ids: Arc::new(HashSet::new()),
             lineage_len: 0,
             active_len: 0,
         }
@@ -97,6 +111,12 @@ impl History {
             turn.parent()
         );
         self.raw.append(node.clone());
+        let message_ids = Arc::make_mut(&mut self.message_ids);
+        message_ids.extend(
+            turn.messages()
+                .iter()
+                .map(crate::conversation::ConversationMessage::id),
+        );
 
         let mut nodes = self.lineage.nodes[..self.active_len].to_vec();
         let mut turns = self.lineage.turns[..self.active_len].to_vec();
@@ -120,6 +140,7 @@ impl History {
         Some(Self {
             raw: RawHistory::from_shared_lineage(self.lineage.clone(), lineage_len),
             lineage: self.lineage.clone(),
+            message_ids: Arc::new(message_id_set(&self.lineage.turns[..lineage_len])),
             lineage_len,
             active_len: lineage_len,
         })
@@ -183,6 +204,7 @@ impl History {
         Self {
             raw,
             lineage: Arc::new(Lineage { nodes, turns }),
+            message_ids: Arc::new(message_id_set(&raw_turns)),
             lineage_len,
             active_len,
         }
@@ -209,11 +231,7 @@ impl History {
 
     /// Reports whether any retained branch already owns a message identity.
     pub(crate) fn contains_message_id(&self, message_id: MessageId) -> bool {
-        self.raw_turns().into_iter().any(|turn| {
-            turn.messages()
-                .iter()
-                .any(|message| message.id() == message_id)
-        })
+        self.message_ids.contains(&message_id)
     }
 
     /// Collects framework call identities across every retained raw branch.
