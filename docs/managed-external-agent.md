@@ -121,7 +121,7 @@ scope wiring 决定 attended / headless 行为。
 | 多轮会话 | Conversation + model history | `ExternalSessionRef` + runtime resume/continue | 已落地:registry `get_or_start` 首轮 start、后续 reattach;跨进程 `resume` 按 adapter capability 门控(runtime-dependent) |
 | 流式文本 | `StreamEvent` / `Notification::Llm` | `ExternalAgentEvent::TextDelta` / live sink | 已落地:`ExternalEventSink` sequenced(M4-1),三 adapter 把解码帧镜像到 live sink;handler 经 `get_or_start(.., Some(sink))` 接线(M6–M8) |
 | tool call | `ContentBlock::ToolUse` -> `NeedTool` | runtime tool call -> `NeedTool` -> `RespondToolResults` | 已落地:machine external tool phase(M2)+ registry-backed handler(M5)。**host custom-tool 注入**仍 capability-gated 关(`host_tools=false`,§12.3),对声明工具的请求以 `UnsupportedCapability{HostTools}` 拒绝 |
-| tool approval | `NeedInteraction(Approval)` | runtime permission 或 host tool approval -> `NeedInteraction` | 已落地:runtime permission pause(`PausedForInteraction`)→ `NeedInteraction`,由 scope interaction handler 就地批准(M3;real e2e M9-4;examples 用 `approve_all`) |
+| tool approval | `NeedInteraction(Approval)` | runtime permission 或 host tool approval -> `NeedInteraction` | 已落地:runtime permission pause(`PausedForInteraction`)→ `NeedInteraction`;作为 facade external delegate 时由父级注入 `InteractionHandler` 应答并带 delegate/depth 归因,无 handler 时明确失败 |
 | user question | `NeedInteraction(Question)` | runtime question -> `NeedInteraction(Question)` | 已落地:runtime question/choice → `NeedInteraction`(M3-2) |
 | subagent | `NeedSubagent` | runtime spawn request -> `NeedSubagent` | 已落地:`PausedForSubagent`→`NeedSubagent`(M3-1)+ `spawn_agent` tool-bridge 特判(M3-3);real DeepSeek 协调器派生 Claude/Codex child(M9-4) |
 | tool failure policy | `ToolFailurePolicy` | external tool result error 回灌或 fail turn | 已落地(M4-3):`ExternalToolFailurePolicy`(`ReturnErrorToRuntime` 默认 / `StopRun`) |
@@ -688,20 +688,25 @@ adapter 需要把 runtime 的答案回写协议映射为 `RespondInteraction`。
 
 ### 9.3 interaction pop
 
-external child 通常是 headless scope:
+facade external delegate 的 child scope 只服务 runtime session,interaction 由外层路由决定:
 
 ```text
 child scope:
   external -> runtime handler
-  tool     -> host tools
   interaction absent
 
-parent scope:
-  subagent -> DrivingSubagentHandler
-  interaction -> UI / approval policy
+outer external route:
+  if parent injected InteractionHandler:
+    interaction -> parent handler, with Interaction.origin { delegate, depth }
+  else:
+    interaction absent -> clear ExternalAgent error
 ```
 
-child 发出的 `NeedInteraction` 会 pop 到 parent,与内部 child 完全一致。
+child 发出的 `NeedInteraction` 会 pop 到这层外部路由。父级注入 handler 存在时,`ExternalPermissionMode::Prompt`
+的 permission pause 会端到端走 `PausedForInteraction` → `NeedInteraction` → 父级 handler →
+`RespondInteraction`；未注入时保持 headless 失败语义,错误明确说明 external agent 请求了权限但没有 handler 可应答。
+Claude Code 与 ACP adapter 具现的 `PausedForInteraction` 都走这同一路由层；Codex/OpenCode 当前自主运行,无
+host-answerable permission pause。
 
 ## 10. 流式输出设计
 

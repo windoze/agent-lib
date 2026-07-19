@@ -1913,6 +1913,7 @@ impl DelegationToolHandler {
             &self.ids,
             task,
             &self.collab,
+            self.parent_interaction.clone(),
             ctx,
         )
         .await

@@ -536,10 +536,12 @@ impl AgentRunStream<'_> {
 
 `Agent::worker()` 用于构造 local subagent 模板。它可以要求更少 provider 配置,允许继承 supervisor
 的 provider/model/client,也可以显式指定自己的 model。local subagent 的 `ApprovalPolicy` 仍决定
-哪些子工具调用会暂停；当 supervisor 通过 `AgentBuilder::interaction_handler` 注入了异步
-`InteractionHandler` 时,这些已暂停的子交互会转发给该父级 handler,并在 `Interaction.origin`
-中携带 delegate 名与委派深度。未注入父级 handler 时保持旧行为:子 agent 使用自己的同步
-`FacadeApproval` fallback 应答,headless ask 仍会 deny。
+哪些子工具调用会暂停；managed external delegate 的 runtime permission bridge 仍由其 adapter / session
+handler 产生 `NeedInteraction`。当 supervisor 通过 `AgentBuilder::interaction_handler` 注入了异步
+`InteractionHandler` 时,local 与 managed external 子交互都会转发给该父级 handler,并在
+`Interaction.origin` 中携带 delegate 名与委派深度。未注入父级 handler 时保持旧行为:local 子 agent
+使用自己的同步 `FacadeApproval` fallback 应答,headless ask 仍会 deny；external 子 agent 的 permission
+prompt 则以明确的 `ExternalAgent` 错误失败,避免静默等待。
 
 `run` / `run_full` 与 `stream` 都会在调用方提前放弃一次运行时保持 agent 可继续使用:非流式
 future 被 drop(例如外层 `tokio::time::timeout` 或 `select!` 分支取消)时,facade 会同步向
@@ -576,8 +578,10 @@ impl AgentBuilder {
 ```
 
 该 handler 是被暂停交互的应答方,但不是 gate:普通 supervisor 工具与 local subagent 工具是否暂停
-仍由各自的 `ApprovalPolicy` 决定。local subagent 转发到父级 handler 的交互会带 `Interaction.origin`,
-用于 UI 渲染「哪个 delegate 在问」;权限主体仍由 `PermissionRequest.actor` 等具体请求字段表示。
+仍由各自的 `ApprovalPolicy` 决定,managed external permission prompt 是否出现由 runtime adapter / session
+policy 决定。local subagent 与 managed external delegate 转发到父级 handler 的交互都会带
+`Interaction.origin`,用于 UI 渲染「哪个 delegate 在问」;权限主体仍由 `PermissionRequest.actor` 等具体
+请求字段表示。
 
 `snapshot` / `restore` / `into_parts` / `builder` 用途各异,文档不暗示它们可互相替代:
 
@@ -856,12 +860,13 @@ Agent facade
   -> runtime adapter(Codex / Claude Code / OpenCode / ACP / Custom)
 ```
 
-runtime adapter 已落地的有:三个私有 wire 的 CLI adapter(Claude Code / Codex / OpenCode,均自主运行、
-无 permission bridge)与一个 **ACP adapter**(feature `external-acp`,基于官方 `agent-client-protocol`
+runtime adapter 已落地的有:三个私有 wire 的 CLI adapter(Claude Code / Codex / OpenCode,均自主运行；
+其中 Claude Code 可产生 host-pausable permission bridge,Codex/OpenCode 当前无 host-answerable
+permission bridge)与一个 **ACP adapter**(feature `external-acp`,基于官方 `agent-client-protocol`
 crate,以一个标准 ACP client 对接任意 ACP agent——Gemini/OpenCode 原生、Claude/Codex 经 Zed adapter
-进程)。ACP adapter 是首个支持 permission bridge 的 runtime(`session/request_permission` 映射到
-`NeedInteraction`),facade 的 `ManagedExternalAgent` 构造器因此应能表达「ACP 后端 + permission bridge
-可用」这一档(见 §11.3)。
+进程)。ACP adapter 的 `session/request_permission` 映射到 `NeedInteraction`;作为 external delegate
+挂在 facade 下时,该 interaction 会 pop 到父级注入的 `InteractionHandler`,带 delegate/depth 归因,应答再经
+`RespondInteraction` 回灌 runtime。
 
 如果 external agent 作为 child agent 挂载,推荐仍通过 `NeedSubagent` 进入 `ExternalAgentMachine`。
 `ExternalAgentMachine` 内部再发 `NeedExternalSession` 推进真实 runtime。这样它与 local subagent
@@ -921,11 +926,12 @@ preset 构造为 `Declared`(保守静态基线);`build_with_default_session_hand
 
 runtime 到能力档的现状(与 `ExternalRuntimeCapabilities` 8 项对齐):
 
-- 三个 CLI adapter(Claude Code / Codex / OpenCode)自主运行,`permission_bridge` / `host_tools` 为
-  `false`,对应 `ExternalRunMode::Managed` 但**无**权限桥;它们经 `session/update` 式观测提供流式事件与
-  artifact。
-- **ACP adapter** 是首个 `permission_bridge=true` 的 runtime(`session/request_permission`),属带权限桥的
-  `Managed`;`resume` 取决于 ACP `loadSession` 协商能力;`host_tools`(经 client MCP)为后续能力。因为 ACP
+- 三个 CLI adapter(Claude Code / Codex / OpenCode)自主运行,`host_tools` 为 `false`;Claude Code 可产生
+  host-pausable `PausedForInteraction`,Codex/OpenCode 当前无 host-answerable permission bridge。它们经
+  `session/update` 式观测提供流式事件与 artifact。
+- **ACP adapter** 支持 `permission_bridge=true` 的 runtime(`session/request_permission`),属带权限桥的
+  `Managed`;facade external delegate 路径会把该 permission bridge 路由到父级注入的 `InteractionHandler`
+  并回灌 `RespondInteraction`。`resume` 取决于 ACP `loadSession` 协商能力;`host_tools`(经 client MCP)为后续能力。因为 ACP
   是标准协议,facade 侧「选哪个 external runtime」与「它能做什么」两件事解耦:runtime 选择决定启动命令,
   能力档由 `initialize` 协商结果填充。
 

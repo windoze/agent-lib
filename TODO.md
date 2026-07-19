@@ -142,7 +142,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
   `cargo test --all --all-targets`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 
-### M1-3 [TODO] external 委派路径：`NeedInteraction` 路由到父级 handler（替换 `EmptyExternalScope`）
+### M1-3 [DONE] external 委派路径：`NeedInteraction` 路由到父级 handler（替换 `EmptyExternalScope`）
 
 上下文：
 
@@ -175,6 +175,30 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   Permission 交互 → 应答 allow → 子 agent 继续 → 委派成功。
 - 对照：父级无 handler → 委派以明确错误失败（不是 hang）。
 - `cargo test --features external-acp -p agent-lib --lib facade::external` 通过。
+
+完成记录（2026-07-20）：
+
+- `drive_external` 现在接收可选父级注入 `InteractionHandler`，并用 `ExternalInteractionScope` / `ExternalInteractionRouter`
+  替换旧外层空 scope：external child 的 `NeedExternalSession` 仍由自身 session handler 服务，`NeedInteraction` pop 到外层路由。
+- 父级 handler 存在时，external runtime 具现的 permission/question/choice/approval interaction 会带
+  `InteractionOrigin { delegate, depth: ctx.depth() }` 转发给父级 handler，应答以
+  `RequirementResult::Interaction` 回灌 external machine，再由 machine 发送 `RespondInteraction` 给 runtime。
+- 父级 handler 不存在时保持 external headless 失败语义，但 `drive_external` 把 interaction family 的
+  `UnhandledRequirement` 转成明确错误：external agent 请求了权限但没有 interaction handler 可应答，避免静默 hang。
+- CLI adapter 核查：Claude Code 与 ACP 均可产生 `PausedForInteraction`，因此自动走同一路由层；Codex/OpenCode 当前自主运行，
+  无 host-answerable permission pause，未来若具现 `NeedInteraction` 也会被该路由覆盖。
+- 新增 `external-acp` gated 离线测试：scripted ACP-like handler 先返回 `PausedForInteraction`，父级 recording handler 收到带
+  `origin { delegate: "coder", depth: 1 }` 的 permission interaction 并 approve，第二次 session request 为
+  `RespondInteraction` 且委派成功；无父级 handler 的对照测试断言明确失败且只推进一次 session。
+- 为保证 `external-acp` 单 feature 编译无 warning，`agent/external/process` 中 CLI-only transport/deadline/autonomous helper
+  改为仅在 CLI adapter feature 下编译；ACP 仍保留共享 read/close/capability helper。
+- 文档同步：`docs/facade-api.md`、`docs/managed-external-agent.md`、`docs/capability-matrix.md` 说明 external permission bridge
+  的父级 handler 路由与 no-handler 语义；`docs/mag-gaps.md` 标注 A1 的 M1-3 已修复。
+- Breaking change：无公开 API 破坏；`drive_external` 是 crate-private helper，签名调整只影响内部委派调用点。
+- 验证通过：`cargo fmt --all`；`cargo test --features external-acp -p agent-lib --lib facade::external`；
+  `cargo clippy --all-targets -- -D warnings`；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  `cargo test --all --all-targets`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 
 ### M1-4 [TODO] external-start approval 去留评估与收口（A1 关联，可降级）
 

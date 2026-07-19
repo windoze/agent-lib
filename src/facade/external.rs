@@ -76,12 +76,13 @@ use crate::agent::external::{
     WorktreeIsolation,
 };
 use crate::agent::{
-    AgentError, AgentId, AgentInput, AgentMachine, AgentSpecRef, DrivingSubagentHandler,
-    ExternalCapability, ExternalPermissionMode, ExternalRuntimeCapabilities, ExternalRuntimeKind,
-    ExternalSessionHandler, HandlerScope, Interaction, LoopCursor, RequirementIds,
-    RequirementResult, RunContext, RunId, ScopePop, SpawnedChild, StepInput, StepOutcome,
-    SubagentHandler, SubagentOutput, SubagentSpawner, ToolSetRef, TraceNodeId, TurnDone,
-    WorktreeRef,
+    AgentError, AgentId, AgentInput, AgentMachine, AgentSpecRef, ApprovalDecision,
+    ApprovalResponse, DrivingSubagentHandler, ExternalCapability, ExternalPermissionMode,
+    ExternalRuntimeCapabilities, ExternalRuntimeKind, ExternalSessionHandler, HandlerScope,
+    Interaction, InteractionHandler, InteractionKind, InteractionOrigin, InteractionResponse,
+    LoopCursor, PermissionResponse, RequirementIds, RequirementKindTag, RequirementResult,
+    RunContext, RunId, ScopePop, SpawnedChild, StepInput, StepOutcome, SubagentHandler,
+    SubagentOutput, SubagentSpawner, ToolSetRef, TraceNodeId, TurnDone, WorktreeRef,
 };
 use crate::conversation::{Conversation, ConversationConfig};
 use crate::facade::agent::final_turn_summary;
@@ -93,6 +94,7 @@ use crate::facade::run::ArtifactRef;
 use crate::model::content::ContentBlock;
 use crate::model::message::{Message, Role};
 use crate::model::usage::Usage;
+use async_trait::async_trait;
 use serde_json::Map;
 
 #[cfg(feature = "external-acp")]
@@ -1541,13 +1543,12 @@ impl AgentMachine for RecordingExternalMachine {
 /// The child external session's own drain layer: it serves only the
 /// `NeedExternalSession` family through the injected handler.
 ///
-/// Every other requirement the external machine could emit (a bridged
-/// `NeedInteraction`, `NeedTool`, or `NeedSubagent`) pops to the outer layer;
-/// M4-2 wires a headless [`EmptyExternalScope`] there, so a request the base
-/// approval/host path does not serve surfaces as an
-/// [`UnhandledRequirement`](crate::agent::AgentError::UnhandledRequirement)
-/// rather than being silently dropped. The richer external approval wiring lands
-/// in M4-3.
+/// Other requirements the external machine could emit (a bridged
+/// `NeedInteraction`, `NeedTool`, or `NeedSubagent`) pop to the outer layer. The
+/// facade installs [`ExternalInteractionScope`] outside this child layer so
+/// external permission prompts can be answered by the supervisor-injected
+/// interaction handler while unsupported families still surface as unhandled
+/// requirements instead of being silently dropped.
 struct ExternalChildScope {
     external: Arc<dyn ExternalSessionHandler>,
 }
@@ -1558,11 +1559,73 @@ impl HandlerScope for ExternalChildScope {
     }
 }
 
-/// An empty outer layer for the external child drive.
-#[derive(Default)]
-struct EmptyExternalScope;
+/// The outer layer for an external child drive.
+///
+/// When the supervisor supplied an async interaction handler, this scope answers
+/// external runtime permission prompts through it with delegate attribution. When
+/// no handler is present the scope deliberately stays headless for interactions;
+/// `drive_external` turns the resulting `UnhandledRequirement` into a clearer
+/// facade error.
+struct ExternalInteractionScope {
+    interaction: Option<ExternalInteractionRouter>,
+}
 
-impl HandlerScope for EmptyExternalScope {}
+impl ExternalInteractionScope {
+    /// Builds the optional interaction route for one external delegate.
+    fn new(delegate: String, parent: Option<Arc<dyn InteractionHandler>>) -> Self {
+        Self {
+            interaction: parent.map(|parent| ExternalInteractionRouter { delegate, parent }),
+        }
+    }
+}
+
+impl HandlerScope for ExternalInteractionScope {
+    fn interaction(&self) -> Option<&dyn InteractionHandler> {
+        self.interaction
+            .as_ref()
+            .map(|router| router as &dyn InteractionHandler)
+    }
+}
+
+/// Routes an external child interaction to the supervisor's injected handler.
+struct ExternalInteractionRouter {
+    delegate: String,
+    parent: Arc<dyn InteractionHandler>,
+}
+
+#[async_trait]
+impl InteractionHandler for ExternalInteractionRouter {
+    async fn fulfill(&self, request: &Interaction, ctx: &RunContext) -> RequirementResult {
+        let routed = request
+            .clone()
+            .with_origin(InteractionOrigin::new(self.delegate.clone(), ctx.depth()));
+        tokio::select! {
+            biased;
+            _ = ctx.cancellation().cancelled() => cancelled_external_interaction_result(&routed),
+            result = self.parent.fulfill(&routed, ctx) => result,
+        }
+    }
+}
+
+/// Builds an in-family interaction result when cancellation wins the route.
+fn cancelled_external_interaction_result(request: &Interaction) -> RequirementResult {
+    let response = match request.kind() {
+        InteractionKind::Approval { call_id, .. } => {
+            InteractionResponse::Approval(ApprovalResponse::new(
+                request.step_id(),
+                *call_id,
+                ApprovalDecision::Deny,
+                Some("interaction cancelled".to_owned()),
+            ))
+        }
+        InteractionKind::Question { .. } => InteractionResponse::answer(String::new()),
+        InteractionKind::Choice { .. } => InteractionResponse::Choice(0),
+        InteractionKind::Permission { request } => InteractionResponse::Permission(
+            PermissionResponse::cancel(request.action_id().to_owned()),
+        ),
+    };
+    RequirementResult::Interaction(response)
+}
 
 /// Turns one external delegation into a drivable [`ExternalAgentMachine`], its
 /// scope, and its opening input.
@@ -1670,7 +1733,10 @@ impl SubagentSpawner for FacadeExternalSpawner {
 /// derivation, cancel propagation, budget ledger, and trace node. The child
 /// machine is an [`ExternalAgentMachine`] whose `NeedExternalSession`
 /// requirements are served by the delegate's injected
-/// [`ExternalSessionHandler`] (design §11.2). A cancelled `ctx` makes the drive
+/// [`ExternalSessionHandler`] (design §11.2). External `NeedInteraction`
+/// requirements pop to an outer route that uses the supervisor-injected
+/// [`InteractionHandler`] when present, adding delegate/depth attribution before
+/// the answer is fed back to the runtime. A cancelled `ctx` makes the drive
 /// abandon the outstanding session step, so the returned outcome carries the
 /// runtime cleanup marker.
 ///
@@ -1684,6 +1750,7 @@ pub(crate) async fn drive_external(
     ids: &FacadeIds,
     task: String,
     collab: &CollabBridge,
+    parent_interaction: Option<Arc<dyn InteractionHandler>>,
     ctx: &RunContext,
 ) -> Result<ExternalDriveOutcome, FacadeError> {
     let Some(handler) = agent.session_handler() else {
@@ -1724,8 +1791,8 @@ pub(crate) async fn drive_external(
 
     let spec_ref = AgentSpecRef(agent_id);
     let brief = Interaction::question(ids.step_id(), task);
-    let empty = EmptyExternalScope;
-    let mut outer = ScopePop::new(&empty, None);
+    let interaction_scope = ExternalInteractionScope::new(name.to_owned(), parent_interaction);
+    let mut outer = ScopePop::new(&interaction_scope, None);
 
     let result = handler
         .fulfill(&spec_ref, &brief, None, &mut outer, ctx)
@@ -1741,7 +1808,7 @@ pub(crate) async fn drive_external(
         RequirementResult::Subagent(Ok(_output)) => Ok(captured),
         RequirementResult::Subagent(Err(error)) => Err(FacadeError::ExternalAgent {
             name: name.to_owned(),
-            message: error.to_string(),
+            message: external_drive_error_message(&error),
         }),
         other => Err(FacadeError::ExternalAgent {
             name: name.to_owned(),
@@ -1751,6 +1818,22 @@ pub(crate) async fn drive_external(
             ),
         }),
     }
+}
+
+/// Renders external drive failures with a targeted interaction-routing message.
+fn external_drive_error_message(error: &AgentError) -> String {
+    if matches!(
+        error,
+        AgentError::UnhandledRequirement {
+            kind: RequirementKindTag::Interaction,
+            ..
+        }
+    ) {
+        return "external agent requested permission but no interaction handler is available to answer it"
+            .to_owned();
+    }
+
+    error.to_string()
 }
 
 /// Projects an agent-layer [`ExternalArtifactRef`] into the facade
@@ -2120,6 +2203,7 @@ mod tests {
             &ids,
             "refactor".to_owned(),
             &CollabBridge::default(),
+            None,
             &ctx,
         )
         .await
@@ -2136,6 +2220,327 @@ mod tests {
             "a cancelled external session did not complete"
         );
         assert!(outcome.artifacts.is_empty());
+    }
+
+    #[cfg(feature = "external-acp")]
+    fn acp_permission_interaction(
+        ids: &crate::facade::ids::FacadeIds,
+    ) -> (crate::agent::Interaction, crate::agent::AgentId) {
+        use crate::agent::{PermissionCategory, PermissionRequest, PermissionRisk};
+
+        let actor = ids.agent_id();
+        let request = PermissionRequest::new(
+            "act-1".to_owned(),
+            actor,
+            PermissionCategory::Shell,
+            "run `cargo test`".to_owned(),
+            serde_json::Value::Null,
+            PermissionRisk::Medium,
+            Some("verify the refactor".to_owned()),
+        );
+        (
+            crate::agent::Interaction::permission(ids.step_id(), request),
+            actor,
+        )
+    }
+
+    #[cfg(feature = "external-acp")]
+    fn acp_completed_output(summary: &str) -> crate::agent::external::ExternalAgentOutput {
+        crate::agent::external::ExternalAgentOutput {
+            summary: summary.to_owned(),
+            artifacts: Vec::new(),
+            usage: None,
+            cost_micros: None,
+        }
+    }
+
+    #[cfg(feature = "external-acp")]
+    fn external_root_context(ids: &crate::facade::ids::FacadeIds) -> crate::agent::RunContext {
+        crate::agent::RunContext::new_root(
+            ids.run_id(),
+            crate::agent::BudgetLimits::unbounded(),
+            ids.trace_root("external-interaction-route"),
+        )
+    }
+
+    #[cfg(feature = "external-acp")]
+    fn acp_session_ref() -> crate::agent::external::ExternalSessionRef {
+        crate::agent::external::ExternalSessionRef {
+            runtime: crate::agent::external::acp_runtime_kind(),
+            session_id: Some("sess-1".to_owned()),
+            transcript_ref: None,
+            resume_token: None,
+            last_event_seq: None,
+        }
+    }
+
+    #[cfg(feature = "external-acp")]
+    fn acp_permission_pause(
+        interaction: crate::agent::Interaction,
+    ) -> crate::agent::external::ExternalSessionResult {
+        use crate::agent::external::{ExternalAgentEvent, ExternalObservedEvent};
+
+        crate::agent::external::ExternalSessionResult::PausedForInteraction {
+            session: acp_session_ref(),
+            action_id: "act-1".to_owned(),
+            request: interaction,
+            observations: ExternalObservedEvent::unsequenced_for_tests(vec![
+                ExternalAgentEvent::PermissionRequested {
+                    action_id: "act-1".to_owned(),
+                    summary: "run `cargo test`".to_owned(),
+                },
+            ]),
+        }
+    }
+
+    #[cfg(feature = "external-acp")]
+    fn acp_completed(summary: &str) -> crate::agent::external::ExternalSessionResult {
+        crate::agent::external::ExternalSessionResult::Completed {
+            session: acp_session_ref(),
+            output: acp_completed_output(summary),
+            observations: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "external-acp")]
+    struct ScriptedExternalHandler {
+        steps: std::sync::Mutex<
+            std::collections::VecDeque<crate::agent::external::ExternalSessionResult>,
+        >,
+        requests:
+            std::sync::Arc<std::sync::Mutex<Vec<crate::agent::external::ExternalSessionRequest>>>,
+    }
+
+    #[cfg(feature = "external-acp")]
+    impl ScriptedExternalHandler {
+        fn new(
+            steps: impl IntoIterator<Item = crate::agent::external::ExternalSessionResult>,
+        ) -> Self {
+            Self {
+                steps: std::sync::Mutex::new(steps.into_iter().collect()),
+                requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn log(
+            &self,
+        ) -> std::sync::Arc<std::sync::Mutex<Vec<crate::agent::external::ExternalSessionRequest>>>
+        {
+            self.requests.clone()
+        }
+    }
+
+    #[cfg(feature = "external-acp")]
+    #[async_trait::async_trait]
+    impl crate::agent::ExternalSessionHandler for ScriptedExternalHandler {
+        async fn fulfill(
+            &self,
+            request: &crate::agent::external::ExternalSessionRequest,
+            _ctx: &crate::agent::RunContext,
+        ) -> crate::agent::RequirementResult {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(request.clone());
+            let result = self
+                .steps
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .pop_front()
+                .unwrap_or_else(|| crate::agent::external::ExternalSessionResult::Failed {
+                    session: None,
+                    error: crate::agent::external::ExternalAgentError::Runtime {
+                        code: None,
+                        message: "scripted external handler exhausted".to_owned(),
+                        runtime_output: None,
+                    },
+                    observations: Vec::new(),
+                });
+            crate::agent::RequirementResult::ExternalSession(Box::new(result))
+        }
+    }
+
+    #[cfg(feature = "external-acp")]
+    struct RecordingParentInteractionHandler {
+        requests: std::sync::Arc<std::sync::Mutex<Vec<crate::agent::Interaction>>>,
+    }
+
+    #[cfg(feature = "external-acp")]
+    impl RecordingParentInteractionHandler {
+        fn new() -> Self {
+            Self {
+                requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn log(&self) -> std::sync::Arc<std::sync::Mutex<Vec<crate::agent::Interaction>>> {
+            self.requests.clone()
+        }
+    }
+
+    #[cfg(feature = "external-acp")]
+    #[async_trait::async_trait]
+    impl crate::agent::InteractionHandler for RecordingParentInteractionHandler {
+        async fn fulfill(
+            &self,
+            request: &crate::agent::Interaction,
+            _ctx: &crate::agent::RunContext,
+        ) -> crate::agent::RequirementResult {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(request.clone());
+            let crate::agent::InteractionKind::Permission { request } = request.kind() else {
+                panic!("expected permission interaction, got {:?}", request.kind());
+            };
+            crate::agent::RequirementResult::Interaction(
+                crate::agent::InteractionResponse::Permission(
+                    crate::agent::PermissionResponse::approve(request.action_id().to_owned()),
+                ),
+            )
+        }
+    }
+
+    #[cfg(feature = "external-acp")]
+    #[tokio::test]
+    async fn drive_external_routes_permission_interaction_to_parent_handler() {
+        use super::drive_external;
+        use crate::agent::{
+            ExternalSessionInput, InteractionHandler, InteractionKind, InteractionResponse,
+            PermissionDecision,
+        };
+        use crate::facade::collab::CollabBridge;
+        use crate::facade::ids::FacadeIds;
+        use std::sync::Arc;
+
+        let ids = FacadeIds::seeded(11);
+        let (interaction, actor) = acp_permission_interaction(&ids);
+        let runtime = ScriptedExternalHandler::new([
+            acp_permission_pause(interaction),
+            acp_completed("external complete"),
+        ]);
+        let external_log = runtime.log();
+
+        let parent = RecordingParentInteractionHandler::new();
+        let parent_log = parent.log();
+        let parent_handler: Arc<dyn InteractionHandler> = Arc::new(parent);
+
+        let agent = ManagedExternalAgent::opencode_acp()
+            .session_handler(Arc::new(runtime))
+            .build()
+            .expect("managed ACP external agent builds");
+        let ctx = external_root_context(&ids);
+
+        let outcome = drive_external(
+            "coder",
+            &agent,
+            &ids,
+            "refactor".to_owned(),
+            &CollabBridge::default(),
+            Some(parent_handler),
+            &ctx,
+        )
+        .await
+        .expect("parent interaction handler resolves the external permission prompt");
+
+        assert!(outcome.completed);
+        assert_eq!(outcome.summary, "external complete");
+
+        let interaction_records = parent_log
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        assert_eq!(interaction_records.len(), 1);
+        let request = &interaction_records[0];
+        let origin = request
+            .origin
+            .as_deref()
+            .expect("external route marks origin");
+        assert_eq!(origin.delegate, "coder");
+        assert_eq!(origin.depth, 1);
+        match request.kind() {
+            InteractionKind::Permission { request } => {
+                assert_eq!(request.action_id(), "act-1");
+                assert_eq!(request.actor(), actor);
+            }
+            other => panic!("expected permission interaction, got {other:?}"),
+        }
+
+        let external_records = external_log
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        assert_eq!(external_records.len(), 2);
+        assert!(matches!(
+            external_records[0].input,
+            ExternalSessionInput::Start { .. }
+        ));
+        match &external_records[1].input {
+            ExternalSessionInput::RespondInteraction {
+                action_id,
+                response,
+            } => {
+                assert_eq!(action_id, "act-1");
+                match response {
+                    InteractionResponse::Permission(response) => {
+                        assert_eq!(response.action_id(), "act-1");
+                        assert_eq!(response.decision(), &PermissionDecision::Approve);
+                    }
+                    other => panic!("expected permission response, got {other:?}"),
+                }
+            }
+            other => panic!("expected RespondInteraction, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "external-acp")]
+    #[tokio::test]
+    async fn drive_external_permission_without_parent_handler_fails_clearly() {
+        use super::drive_external;
+        use crate::facade::collab::CollabBridge;
+        use crate::facade::ids::FacadeIds;
+        use std::sync::Arc;
+
+        let ids = FacadeIds::seeded(12);
+        let (interaction, _actor) = acp_permission_interaction(&ids);
+        let runtime = ScriptedExternalHandler::new([acp_permission_pause(interaction)]);
+        let external_log = runtime.log();
+
+        let agent = ManagedExternalAgent::opencode_acp()
+            .session_handler(Arc::new(runtime))
+            .build()
+            .expect("managed ACP external agent builds");
+        let ctx = external_root_context(&ids);
+
+        let error = drive_external(
+            "coder",
+            &agent,
+            &ids,
+            "refactor".to_owned(),
+            &CollabBridge::default(),
+            None,
+            &ctx,
+        )
+        .await
+        .expect_err("permission prompt without parent handler must fail clearly");
+
+        match error {
+            FacadeError::ExternalAgent { name, message } => {
+                assert_eq!(name, "coder");
+                assert!(
+                    message.contains("external agent requested permission")
+                        && message.contains("no interaction handler"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected ExternalAgent error, got {other:?}"),
+        }
+
+        let external_records = external_log
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        assert_eq!(external_records.len(), 1);
     }
 
     #[cfg(feature = "external-acp")]

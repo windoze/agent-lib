@@ -13,22 +13,56 @@
 
 mod group;
 
-use std::future::Future;
 use std::io;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::time::{Instant, timeout, timeout_at};
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
+use std::{future::Future, process::Stdio};
 
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::Child;
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
+use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::time::timeout;
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
+use tokio::time::{Instant, timeout_at};
+
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
 use crate::agent::{RunContext, TraceNodeId};
 
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
+use super::ExternalSessionInput;
 use super::{
     ExternalAgentError, ExternalCapability, ExternalEventSink, ExternalObservedEvent,
-    ExternalRuntimeCapabilities, ExternalRuntimeKind, ExternalSessionInput, ExternalSessionRef,
-    ExternalSessionRequest, ExternalSessionShutdown,
+    ExternalRuntimeCapabilities, ExternalRuntimeKind, ExternalSessionRef, ExternalSessionRequest,
+    ExternalSessionShutdown,
 };
 
 pub(crate) use group::{configure_managed_command, force_kill};
@@ -38,6 +72,11 @@ pub(crate) use group::{configure_managed_command, force_kill};
 pub(crate) use group::assert_process_group_reaped;
 
 /// Whether a managed child should expose a writable stdin pipe.
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChildStdinMode {
     /// The runtime receives host turns through stdin.
@@ -52,6 +91,11 @@ pub(crate) enum ChildStdinMode {
 /// child handle, optional stdin, and stdout reader; process-group setup, read
 /// timeout, exit-code classification, and force-kill fallback live here so the
 /// M1/M2 lifecycle fixes remain single-sourced.
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
 pub(crate) struct ManagedChild {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -61,6 +105,11 @@ pub(crate) struct ManagedChild {
     read_timeout_message: &'static str,
 }
 
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
 impl ManagedChild {
     /// Spawns `command` as a managed line-oriented child.
     ///
@@ -145,6 +194,11 @@ impl ManagedChild {
 }
 
 /// Writes one newline-terminated line to an async writer and flushes it.
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
 pub(crate) async fn write_line<W>(writer: &mut W, line: &str) -> io::Result<()>
 where
     W: AsyncWrite + Unpin + ?Sized,
@@ -189,10 +243,20 @@ pub(crate) async fn close_child(child: &mut Child, grace: Duration) -> ExternalS
 }
 
 /// Deadline guard for startup preludes that must not loop forever.
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
 pub(crate) struct PreludeDeadline {
     deadline: Instant,
 }
 
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
 impl PreludeDeadline {
     /// Starts a wall-clock deadline lasting `timeout` from now.
     pub(crate) fn new(timeout: Duration) -> Self {
@@ -305,6 +369,11 @@ pub(crate) fn reject_unsupported_tools(
 }
 
 /// Diagnostics for runtimes that accept only autonomous text turns.
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AutonomousTurnMessages {
     pub(crate) interaction: &'static str,
@@ -314,6 +383,11 @@ pub(crate) struct AutonomousTurnMessages {
 }
 
 /// Extracts text from a start/continue input for autonomous one-shot CLIs.
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
 pub(crate) fn autonomous_turn_message(
     capabilities: &ExternalRuntimeCapabilities,
     input: &ExternalSessionInput,
@@ -339,6 +413,11 @@ pub(crate) fn autonomous_turn_message(
 }
 
 /// Records and folds a mid-session child close disposition.
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
 pub(crate) fn record_mid_session_close(
     ctx: &RunContext,
     close_trace_seq: &mut u64,

@@ -235,7 +235,7 @@ M8-4 review 逐项核对了源码，确认四个维度一致，唯一差异是 C
 | 进程模型 | 常驻 stdio 进程（stdin 帧续跑） | 一进程/一 turn（`exec resume`） | 一进程/一 turn（`run --session`） | Codex≡OpenCode 同构；Claude 常驻（设计意图） |
 | `ExternalRuntimeAdapter` | kind/capabilities/start/resume | 同 | 同 | ✓ 一致 |
 | `ExternalRuntimeSession` | session_ref/advance/shutdown | 同 | 同 | ✓ 一致 |
-| decision 臂（`finish`） | Completed/Failed/**PausedForToolCalls**/**PausedForInteraction** | Completed/Failed | Completed/Failed | Claude 多 host-pausable 臂（permission bridge） |
+| decision 臂（`finish`） | Completed/Failed/**PausedForToolCalls**/**PausedForInteraction** | Completed/Failed | Completed/Failed | Claude 多 host-pausable 臂（permission bridge）；facade 委派路径把 `PausedForInteraction` 路由到父级注入 handler |
 | capability fallback | `new()`→implemented；`with_probed_capabilities()`→逐位 AND | 同 | 同 | ✓ 一致 helper |
 | host-tool 门禁 | `reject_unsupported_tools` + `turn_message` 拒绝 | 同 | 同 | ✓ 一致（`UnsupportedCapability`/`Protocol`） |
 | `permission_bridge` | `true`（权限控制通道） | `false`（自主） | `false`（自主） | **唯一能力差异**（诚实暴露） |
@@ -259,7 +259,7 @@ M8-4 review 逐项核对了源码，确认四个维度一致，唯一差异是 C
 |---|---|---|---|
 | `Streaming` | `streaming` | 把细粒度事件转发给 live [`ExternalEventSink`](../src/agent/external/sink.rs) | `false` |
 | `Resume` | `resume` | 用存储的 session ref/token 续跑既有会话 | `false` |
-| `PermissionBridge` | `permission_bridge` | 把 runtime 权限/交互 pause 桥成 host approval | `false` |
+| `PermissionBridge` | `permission_bridge` | 把 runtime 权限/交互 pause 桥成 host `NeedInteraction`;作为 facade external delegate 时由父级注入 `InteractionHandler` 应答并经 `RespondInteraction` 回灌 runtime | `false` |
 | `HostTools` | `host_tools` | 注入 host 提供、runtime 可调用的工具 | `false` |
 | `HostSubagents` | `host_subagents` | 把 runtime spawn 请求桥成 host 管理的 subagent | `false` |
 | `Artifacts` | `artifacts` | 把产出的 artifact（patch/文件）回报给 host | `false` |

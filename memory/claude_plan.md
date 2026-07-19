@@ -22,12 +22,14 @@
 ## Current Progress
 
 - New invocation initialized. This file records the actionable plan and progress summary; private reasoning is intentionally not recorded.
-- Selected first incomplete task: `M1-2` (`local subagent 路径：子 agent 交互应答路由到父级注入 handler`).
-- Next step: check the latest commit message only for unfinished work directly relevant to `M1-2`, then inspect the local delegation/interaction routing code and tests.
-- Planned implementation focus: preserve each child worker's own `ApprovalPolicy` as the gate, route paused child interactions to the parent-injected async `InteractionHandler` when present, add origin attribution with delegate name and child `RunContext.depth`, preserve current no-parent-handler behavior, and add the specified parent-route/no-parent/cancel tests.
-- Latest commit checked: `[M1-1] Add interaction origin attribution`; it does not state unfinished `M1-2` work.
-- Implementation in progress: `DelegationToolHandler` now carries an optional parent-injected interaction handler into local subagent drives; child scope selects a `ChildInteractionRouter` with origin attribution when present, otherwise keeps the child `FacadeApproval` fallback.
-- Added offline delegate tests covering parent-handler routing with origin, no-parent fallback behavior (existing child approval path), and cancellation while the parent child-interaction handler is parked.
-- Validation progress: `cargo fmt --all` and `cargo test -p agent-lib --lib facade::delegate` passed.
-- Validation completed successfully: default clippy, external feature clippy, full `cargo test --all --all-targets`, and rustdoc all passed.
-- Documentation updated in `docs/facade-api.md` and `docs/mag-gaps.md`; `TODO.md` now marks `M1-2` as `[DONE]` with implementation notes, compatibility notes, and validation results.
+- Selected first incomplete task: `M1-3` (`external 委派路径：NeedInteraction 路由到父级 handler（替换 EmptyExternalScope）`).
+- Planned implementation focus: inspect the external facade drive/scope wiring, preserve existing no-parent-handler failure semantics with a clearer message, route external `NeedInteraction` to the parent-injected async `InteractionHandler` with `InteractionOrigin { delegate, depth }`, map the answer back to `RequirementResult::Interaction`, add offline `external-acp` tests, update managed external/capability docs, validate, mark `TODO.md`, commit, and stop.
+- Latest commit checked: `dad7482 [M1-2] Route local child interactions to parent handler`; it does not state unfinished `M1-3` work.
+- Implementation in progress: replaced the external child drive's empty outer scope with an optional parent-handler interaction route, added delegate/depth origin attribution, preserved explicit no-handler failure, and threaded the parent interaction handler from `DelegationToolHandler` into `drive_external`.
+- Added `external-acp` gated offline facade external tests for parent-handler permission routing and no-parent-handler failure, using the scripted runtime handler rather than a real CLI/network.
+- Documentation draft updated in `docs/facade-api.md`, `docs/managed-external-agent.md`, `docs/capability-matrix.md`, and `docs/mag-gaps.md`.
+- Targeted validation progress: `cargo fmt --all` passed; `cargo test --features external-acp -p agent-lib --lib facade::external` passed without warnings after gating CLI-only process helpers away from ACP-only builds.
+- Validation completed successfully: `cargo clippy --all-targets -- -D warnings`; `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`; `cargo test --all --all-targets`; `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`.
+- `TODO.md` now marks `M1-3` as `[DONE]` with implementation notes, no-breaking-change note, adapter coverage notes, and validation results.
+- Git status/diff/log inspected before commit; changed files are limited to the M1-3 implementation, tests, docs, TODO, and this progress record.
+- Next step: create the task-scoped git commit and stop.
