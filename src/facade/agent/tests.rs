@@ -363,6 +363,23 @@ fn builder_rejects_blank_delegation_tool_name() {
 }
 
 #[test]
+fn builder_rejects_empty_rules_delegation() {
+    // A rules-routed delegation with no rules can never route and exposes no
+    // delegate tools, so registered subagents would be silently unreachable.
+    let error = AgentBuilder::default()
+        .client(ScriptedClient::new(vec![text_response("done")]))
+        .model("test-model")
+        .delegation(Delegation::rules())
+        .build()
+        .expect_err("rules delegation with no rules is rejected");
+
+    let FacadeError::Config(message) = error else {
+        panic!("expected config error")
+    };
+    assert!(message.contains("at least one rule"), "{message}");
+}
+
+#[test]
 fn builder_rejects_invalid_rules_routing_entries() {
     for (delegation, expected) in [
         (

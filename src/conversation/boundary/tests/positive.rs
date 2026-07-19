@@ -1,6 +1,15 @@
 //! Successful zero, head, redo-suffix, and fork-prefix Boundary behavior.
 
-use super::{commit_text_turn, conversation, conversation_id, shared_prefix_child, turn_id};
+use super::{
+    commit_text_turn, conversation, conversation_id, message_id, shared_prefix_child, turn_id,
+};
+use crate::{
+    conversation::{ConversationError, PendingTurnError},
+    model::{
+        content::ContentBlock,
+        message::{Message, Role},
+    },
+};
 
 #[test]
 fn empty_conversation_exposes_one_valid_zero_boundary() {
@@ -123,4 +132,47 @@ fn shared_prefix_child_exposes_only_its_ceiling_without_copying_turn_messages() 
     child
         .validate_boundary(&boundaries[1])
         .expect("child ceiling boundary validates under child owner/version");
+}
+
+#[test]
+fn shared_prefix_child_message_id_index_covers_only_its_ceiling() {
+    let mut parent = conversation(6);
+    for seed in 40..43 {
+        commit_text_turn(&mut parent, seed);
+    }
+    let mut child = shared_prefix_child(&parent, conversation_id(7), 1);
+    let user = |value: &str| Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: value.to_owned(),
+            extra: Default::default(),
+        }],
+    };
+
+    // Message ids from the retained prefix stay reserved for the child: the
+    // fork-built index must cover the shared prefix, not just turns the child
+    // appended itself.
+    let duplicate = child
+        .begin_turn(
+            turn_id(50),
+            message_id(40 * 10),
+            user("duplicate prefix message"),
+        )
+        .expect_err("prefix message id is retained in the child index");
+    assert_eq!(
+        duplicate,
+        ConversationError::PendingTurn(PendingTurnError::DuplicateMessageId {
+            message_id: message_id(40 * 10),
+        })
+    );
+
+    // Message ids from turns beyond the fork ceiling are not part of the
+    // child's raw history, so the child may reuse them.
+    child
+        .begin_turn(
+            turn_id(51),
+            message_id(41 * 10),
+            user("beyond-ceiling message"),
+        )
+        .expect("beyond-ceiling message id is not retained for the child");
 }

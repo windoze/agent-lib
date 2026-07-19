@@ -10,9 +10,9 @@ use crate::{
     client::Response,
     conversation::{
         AssistantFinish, CommitError, Conversation, ConversationConfig, ConversationError,
-        ConversationId, MessageId, PendingTurnPhase, Projection, ProjectionError, RestoreError,
-        RowMappingError, SnapshotError, Span, ToolCallId, ToolCallIndex, ToolCallMapping, Turn,
-        TurnId, TurnMeta,
+        ConversationId, MessageId, PendingTurnError, PendingTurnPhase, Projection, ProjectionError,
+        RestoreError, RowMappingError, SnapshotError, Span, ToolCallId, ToolCallIndex,
+        ToolCallMapping, Turn, TurnId, TurnMeta,
         projection::{
             Artifact, ArtifactProvenance, CheckedTurnRange, CompactionPlan, CompactionStep,
             StrategyRef, TokenAccounting,
@@ -1901,6 +1901,71 @@ fn insert_set_against_rejects_same_generation_tampering() {
             .expect_err("same-generation divergent content conflicts"),
         RowMappingError::InsertConflict { .. }
     ));
+}
+
+#[test]
+fn insert_set_against_rejects_corrupt_rows_on_either_side() {
+    let mut conversation = conversation(36);
+    commit_text_turn(&mut conversation, 360);
+    commit_text_turn(&mut conversation, 361);
+    let rows = conversation
+        .snapshot()
+        .expect("snapshot")
+        .to_rows()
+        .expect("rows");
+
+    // A corrupt candidate fails validation before any diffing happens, with
+    // the same error `into_snapshot` reports for the same corruption.
+    let mut corrupt_candidate = rows.clone();
+    let duplicate = corrupt_candidate.messages[0].clone();
+    corrupt_candidate.messages.push(duplicate);
+    assert!(matches!(
+        corrupt_candidate
+            .insert_set_against(&rows)
+            .expect_err("corrupt candidate rows rejected"),
+        RowMappingError::DuplicatePrimaryKey {
+            table: "message_records",
+            ..
+        }
+    ));
+
+    // Corrupt stored rows are validated too, so a poisoned store cannot be
+    // diffed against silently.
+    let mut corrupt_existing = rows.clone();
+    let removed_turn = corrupt_existing.raw_turns[0].turn_id;
+    corrupt_existing
+        .messages
+        .retain(|row| row.turn_id != removed_turn);
+    assert!(matches!(
+        rows.insert_set_against(&corrupt_existing)
+            .expect_err("corrupt stored rows rejected"),
+        RowMappingError::MissingMessageRows { turn_id, .. } if turn_id == removed_turn
+    ));
+}
+
+#[test]
+fn restored_conversation_message_id_index_rejects_reuse() {
+    let mut conversation = conversation(37);
+    commit_text_turn(&mut conversation, 370);
+    commit_text_turn(&mut conversation, 371);
+    let snapshot = conversation.snapshot().expect("snapshot");
+
+    // The message-id index rebuilt by `History::from_restored` must cover the
+    // restored raw history exactly like the append-maintained one does.
+    let mut restored = Conversation::restore(snapshot).expect("restore");
+    let duplicate = restored
+        .begin_turn(
+            turn_id(372),
+            message_id(370 * 10),
+            user("duplicate message"),
+        )
+        .expect_err("restored history index retains committed message ids");
+    assert_eq!(
+        duplicate,
+        ConversationError::PendingTurn(PendingTurnError::DuplicateMessageId {
+            message_id: message_id(370 * 10),
+        })
+    );
 }
 
 #[test]

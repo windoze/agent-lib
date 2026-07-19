@@ -895,6 +895,14 @@ impl Delegation {
                 ))
             }
             DelegationMode::Rules { rules } => {
+                if rules.is_empty() {
+                    // A rules-routed delegation with no rules routes nothing
+                    // and exposes no delegate tools, so registered subagents
+                    // would be silently unreachable.
+                    return Err(FacadeError::Config(
+                        "rules-routed delegation requires at least one rule".to_owned(),
+                    ));
+                }
                 for (index, rule) in rules.iter().enumerate() {
                     if rule.delegate.trim().is_empty() {
                         return Err(FacadeError::Config(format!(
