@@ -31,4 +31,5 @@
 - Updated `docs/review-2026-07.md` to mark M-ADP-1 fixed in M7-2.
 - Updated `TODO.md`: M7-2 is now `[DONE]` with completion record, validation summary, and compatibility note.
 - Inspected git status, full diff, and recent log; change set is scoped to M7-2. `git diff --check` passed.
-- Next step: commit the M7-2 changes and stop.
+- Created implementation commit: `db5ad25 [M7-2] Document stream usage semantics`.
+- Next step: commit this final execution-log update and stop.
