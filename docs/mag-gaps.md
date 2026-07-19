@@ -200,13 +200,24 @@ facade re-export 完整性已收口（M2-4）。
 
 1. cancel 触发时，**批级等待被抢占**：不再等未完成的 tool/interaction fulfill future，
    在途 requirement 按既有 never-resume 语义 settle（`StepInput::Abandon`，
-   `stream.rs:270-279` 已有先例），turn 以 cancelled 收尾。
+   `stream.rs:270-279` 已有先例），turn 以 cancelled 收尾。✅ 已修复（M3-3，
+   `fulfill_batch_cancellable`:`drain` 与 `drive_streamed` 的批等待与 cancel 令牌
+   select,命中后经 2s unwind 宽限仍阻塞即抢占）
 2. **被丢弃的 tool future 的语义要定义并文档化**：drop（detached，副作用工具应自己响应
    `ToolContext::cancel`）还是 join 等待——推荐 drop + 文档强制要求长工具 select cancel；
    `InteractionHandler::fulfill` 侧同理（mag 的 handler 已自行 select `ctx.cancellation()`）。
-3. 非流式路径（`run`/`run_full`）与流式路径行为一致。
+   ✅ 已修复（M3-3，选 **drop(detached) + 有界宽限**:cancel 命中后先 poll 在途批 2s
+   让合作 handler 跑清理尾——纯即时 drop 会跳过 M3-2 的 external 会话清扫（清扫在
+   `drive_external` 返回后执行）导致泄漏，后台 join 因批 future 借用 scope 栈非 `'static`
+   不可 spawn;宽限到期后 drop。强制约定写入 `ToolHandler`/`InteractionHandler`/
+   `ToolContext::cancel` rustdoc）
+3. 非流式路径（`run`/`run_full`）与流式路径行为一致。✅ 已修复（M3-3，两条路径共用
+   `fulfill_batch_cancellable`;facade 两侧各有阻塞工具 + cancel 测试钉住）
 4. 这是行为收紧：现有的「批完成后才响应 cancel」测试需要更新；文档
    （`docs/agent-layer.md` / `docs/agent-effect-model.md`）同步取消延迟口径。
+   ✅ 已修复（M3-3，无测试钉住旧延迟口径,既有 cancel 测试全部保持通过;
+   `agent-layer.md` §3 观测点表、`agent-effect-model.md` §6.3 取消延迟段、
+   `facade-api.md` 取消段已同步）
 
 ---
 

@@ -198,6 +198,15 @@ impl ToolRegistryHandler {
 
 #[async_trait]
 impl ToolHandler for ToolRegistryHandler {
+    /// Executes the call through the currently-installed registry.
+    ///
+    /// The run context is deliberately not selected on here: cancellation
+    /// reaches a blocked tool through the drive's batch pre-emption (M3-3),
+    /// which detaches a still-running tool future after the unwind grace, and
+    /// through the tool itself — the registry hands every tool the shared
+    /// cancel token (facade [`ToolContext::cancel`](crate::facade::ToolContext::cancel)),
+    /// and long-running tools are required to select on it (see the
+    /// [`ToolHandler`] contract).
     async fn fulfill(
         &self,
         call_id: ToolCallId,

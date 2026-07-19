@@ -3068,6 +3068,40 @@ fn parking_weather_tool() -> Tool {
     )
 }
 
+/// Flags when the future holding it is dropped, proving a blocked tool
+/// execution future was detached by the cancelled drive (M3-3).
+struct ToolDropProbe(Arc<AtomicUsize>);
+
+impl Drop for ToolDropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A `get_weather` tool that records it started, then blocks forever; its
+/// execution future carries a [`ToolDropProbe`] so a test can observe the
+/// cancelled drive detaching it.
+fn blocking_weather_tool(started: Arc<AtomicUsize>, dropped: Arc<AtomicUsize>) -> Tool {
+    Tool::function_with_schema(
+        "get_weather",
+        "Look up the current weather for a city.",
+        json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"]
+        }),
+        move |_ctx: ToolContext, _args: Value| {
+            let started = started.clone();
+            let dropped = dropped.clone();
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let _probe = ToolDropProbe(dropped);
+                std::future::pending::<Result<String, Infallible>>().await
+            }
+        },
+    )
+}
+
 /// Dropping a non-streaming `run` future through a host timeout abandons the
 /// stranded LLM requirement synchronously, so the agent is immediately
 /// snapshot-able and the next run starts from the previous committed history.
@@ -3171,6 +3205,146 @@ async fn cancelling_stream_stops_it_and_leaves_agent_runnable() {
         assert!(
             matches!(&error, FacadeError::Agent(agent) if agent.to_string().contains("cancelled")),
             "cancelled stream should surface an agent cancellation diagnostic, got {error:?}"
+        );
+    }
+
+    let reply = agent.run("again").await.expect("run after stream cancel");
+    assert_eq!(reply.text(), "recovered.");
+    assert_eq!(
+        client.chat_request_lens(),
+        vec![1],
+        "the recovery turn carried only its own user message; the cancelled stream left no residue"
+    );
+}
+
+/// Cancelling a non-streaming run that is blocked inside a never-returning
+/// tool pre-empts the batch wait (M3-3): the tool future is detached, the turn
+/// ends cancelled within seconds, and the agent runs again with no residue.
+#[tokio::test]
+async fn cancelling_a_run_blocked_in_a_tool_detaches_it_and_leaves_agent_runnable() {
+    let client = ScriptedClient::new(vec![tool_use_response(), text_response("recovered.")]);
+    let started = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut agent = AgentBuilder::default()
+        .client(client.clone())
+        .model("test-model")
+        .tool(blocking_weather_tool(started.clone(), dropped.clone()))
+        .approval(Approval::auto_allow())
+        .build()
+        .expect("build agent");
+    let cancel = CancelHandle::new();
+
+    let run = agent.run_full_with_cancel("weather?", cancel.clone());
+    let canceller = {
+        let started = started.clone();
+        let cancel = cancel.clone();
+        async move {
+            // Cancel only once the tool future is genuinely in flight, so the
+            // test cannot pass through the pre-batch cancel check; the bound
+            // keeps a regression from hanging the suite.
+            for _ in 0..10_000 {
+                if started.load(Ordering::SeqCst) > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            cancel.cancel();
+        }
+    };
+    let (result, ()) = tokio::join!(
+        async move { tokio::time::timeout(std::time::Duration::from_secs(30), run).await },
+        canceller,
+    );
+    let error = result
+        .expect("a pre-empted run settles within seconds, never hangs")
+        .expect_err("the run should stop through the cancel handle");
+    assert!(
+        matches!(&error, FacadeError::Agent(agent) if agent.to_string().contains("cancelled")),
+        "cancelled run should surface an agent cancellation diagnostic, got {error:?}"
+    );
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        1,
+        "the blocked tool actually started before the cancel"
+    );
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "the blocked tool future was detached after the unwind grace"
+    );
+
+    // A tool-phase cancel closes the dangling tool_use with a synthesized
+    // `Cancelled` result and keeps the coherent pending turn parked at `Idle`;
+    // the next run supersedes it, so the recovery turn carries no residue.
+    let reply = agent.run("again").await.expect("run after cancel");
+    assert_eq!(reply.text(), "recovered.");
+    let message_lens: Vec<usize> = client
+        .requests()
+        .iter()
+        .map(|request| request.messages.len())
+        .collect();
+    assert_eq!(
+        message_lens,
+        vec![1, 1],
+        "the recovery turn carried only its own user message; the cancelled turn left no residue"
+    );
+}
+
+/// Cancelling a stream that is blocked inside a never-returning tool pre-empts
+/// the batch wait exactly like the non-streaming path (M3-3): the tool future
+/// is detached, the stream fails terminally within seconds, and the agent runs
+/// again with no residue.
+#[tokio::test]
+async fn cancelling_a_stream_blocked_in_a_tool_detaches_it_and_leaves_agent_runnable() {
+    let client = DropTestClient::new(tool_stream(), false, text_response("recovered."));
+    let started = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut agent = AgentBuilder::default()
+        .client(client.clone())
+        .model("test-model")
+        .tool(blocking_weather_tool(started.clone(), dropped.clone()))
+        .approval(Approval::auto_allow())
+        .build()
+        .expect("build agent");
+
+    {
+        let mut stream = agent.stream("weather?").await.expect("open stream");
+        // Drain the events buffered up to the tool call, stopping once the
+        // drive parks inside the never-returning tool.
+        let mut saw_tool_started = false;
+        for _ in 0..1000 {
+            let mut next = std::pin::pin!(stream.next());
+            match futures::poll!(next.as_mut()) {
+                Poll::Ready(Some(item)) => {
+                    let event = item.expect("event ok");
+                    if matches!(&event, RunEvent::ToolStarted(trace) if trace.name == "get_weather")
+                    {
+                        saw_tool_started = true;
+                    }
+                }
+                Poll::Ready(None) => break,
+                Poll::Pending => break,
+            }
+        }
+        assert!(
+            saw_tool_started,
+            "the streamed turn reached the tool call before the cancel"
+        );
+
+        stream.cancel();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(30), stream.next())
+            .await
+            .expect("a pre-empted stream settles within seconds, never hangs")
+            .expect("stream yields a terminal cancellation")
+            .expect_err("cancelled stream should fail terminally");
+        assert!(
+            matches!(&error, FacadeError::Agent(agent) if agent.to_string().contains("cancelled")),
+            "cancelled stream should surface an agent cancellation diagnostic, got {error:?}"
+        );
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            1,
+            "the blocked tool future was detached after the unwind grace"
         );
     }
 

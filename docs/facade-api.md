@@ -623,9 +623,11 @@ stream;需要从其他 task 触发取消时,传递 `CancelHandle` 或调用 `can
 显式取消使用 `CancelHandle`:`run_with_cancel` / `run_full_with_cancel` / `stream_with_cancel`
 接收调用方持有的句柄,普通 `run` / `run_full` / `stream` 内部创建未暴露的句柄。调用
 `CancelHandle::cancel()` 或 `AgentRunStream::cancel()` 后,底层 driver 在既有有界取消观测点
-never-resume 当前 outstanding requirement,工具看到同一个 token (`ToolContext.cancel`),完成后
-agent 回到可继续使用的一致点。当前取消在 facade 层仍以 `FacadeError::Agent` 中的取消诊断返回;
-专用 `FacadeError::Cancelled` 可作为后续 API 打磨项。
+never-resume 当前 outstanding requirement;批级等待可被抢占(M3-3)——阻塞中的
+tool/interaction fulfill future 在一个有界 unwind 宽限(2s,供合作 handler 跑清理尾)后被
+drop(detach),不再冻结整个 run,工具看到同一个 token (`ToolContext.cancel`),长工具必须自行
+select 它。完成后 agent 回到可继续使用的一致点。当前取消在 facade 层仍以
+`FacadeError::Agent` 中的取消诊断返回;专用 `FacadeError::Cancelled` 可作为后续 API 打磨项。
 
 流式 pivot 使用 `AgentRunStream::interject(...)`。由于 `AgentRunStream` 持有 `&mut Agent` 的
 运行中 machine 借用,中途注入不能通过 `Agent::interject` 形式同时调用;控制入口放在 stream

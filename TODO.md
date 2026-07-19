@@ -791,7 +791,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   收尾时会 force-close 本 drive 的 live session——此前该 session 泄漏至 registry
   drop；committed drive 语义不变。
 
-### M3-3 [TODO] tool/interaction 批的 cancel 抢占
+### M3-3 [DONE] tool/interaction 批的 cancel 抢占
 
 上下文：
 
@@ -820,6 +820,73 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   cancelled 收尾；会话可继续下一 run（cursor Idle、committed 历史不变）。
 - 单元测试：非流式路径同样行为。
 - 回归：正常批完成路径测试不受影响。
+
+完成记录（2026-07-20）：
+
+- **抢占机制**：新增 `fulfill_batch_cancellable`（`src/agent/drive.rs`）——把
+  `fulfill_batch` 的批 future 与 `RunContext` 取消令牌做 `tokio::select!`(biased)。两条
+  驱动路径共用:`drain`（非流式 `run`/`run_full`）与 `drive_streamed`（流式）都改为经它
+  等待批；返回 `BatchOutcome::Completed` 走既有 resume/批后复检路径,
+  `BatchOutcome::Preempted` 时对批内**全部** outstanding requirement 按既有 never-resume
+  语义 settle（逐一 `NeverResumed` 留痕 + `StepInput::Abandon`),turn 以
+  `cancelled() == true` 收尾,cursor 回 `Idle`。批前/批后两个既有观测点保持不变,cancel
+  观测点从两个变为三个。
+- **drop-vs-join 抉择（选 drop + 有界 unwind 宽限）**：评估发现**纯即时 drop 有真实状态
+  风险**——`drive_external` 的 external 会话清扫（M3-2,`cleanup_agent` → adapter
+  shutdown + 进程组终止）在 `handler.fulfill` 返回**之后**执行;cancel 触发瞬间若外层
+  select 抢先 drop 整个批 future 树,清扫永远不跑,协作取消的常规路径也会泄漏子进程。
+  「标记 abandon 但后台 join」不可实现:批 future 借用 scope 栈（`&pending`/`&mut dyn
+  Pop`/`&RunContext`),非 `'static`,无法 `tokio::spawn`  detach 后继续 join。因此取
+  折中:cancel 命中后继续 poll 在途批一个**有界宽限**(`CANCEL_UNWIND_GRACE = 2s`,
+  常量带 rustdoc 说明),合作的 handler（LLM cancel-select、M3-1 的 ACP 读循环、自行
+  select 令牌的工具）在窗口内收尾、external 清扫照常执行;宽限到期仍阻塞的 fulfill
+  future 被 **drop(detached)**。嵌套层不叠加宽限——同一令牌同时唤醒各层,最深层的
+  清扫也在同一个 2s 预算内完成。
+- **文档强制约定**：被 detach 的 handler 不得依赖「跑到返回」——长工具必须自行 select
+  取消令牌。写入 `ToolHandler` / `InteractionHandler` trait rustdoc（agent 层,
+  `RunContext::cancellation`)、`ToolContext::cancel` 字段 rustdoc（facade 工具)、
+  `ToolRegistryHandler::fulfill`（解释为何刻意不 select ctx)、`drain` # Cancellation、
+  `Agent::run_full_with_cancel` / `AgentRunStream::cancel` rustdoc,以及
+  `docs/agent-effect-model.md` §6.3（新增「取消延迟（M3-3)」段)、`docs/agent-layer.md`
+  §3 cancel 行（两个观测点→三个)、`docs/facade-api.md` 取消段。
+- **文件**:`src/agent/drive.rs`（`fulfill_batch_cancellable` / `BatchOutcome` /
+  `CANCEL_UNWIND_GRACE`;`drain` 批等待改抢占式 + rustdoc;`ToolHandler` /
+  `InteractionHandler` rustdoc;测试 +3 个夹具 +1 测试)、`src/agent/drive/reference.rs`
+  （`ToolRegistryHandler::fulfill` rustdoc)、`src/facade/agent/stream.rs`
+  （`drive_streamed` 批等待改抢占式;`cancel()` rustdoc)、`src/facade/agent.rs`
+  （`run_full_with_cancel` rustdoc)、`src/facade/tool.rs`（`ToolContext::cancel`
+  rustdoc)、`src/facade/agent/tests.rs`（`blocking_weather_tool` + `ToolDropProbe`
+  夹具 +2 测试)、`docs/agent-effect-model.md`、`docs/agent-layer.md`、
+  `docs/facade-api.md`、`docs/mag-gaps.md`（A4 四条 ✅ 已修复（M3-3）标注）。
+- **测试（全部离线）**：
+  - `agent::drive::tests::drain_preempts_a_blocked_tool_and_interaction_batch_on_cancel`——
+    永不返回的 tool + interaction 同批,cancel 在两者都 in-flight 后触发;断言 30s 上限内
+    settle(实际 ~2s 宽限)、`cancelled()`、两个 future 的 `DropProbe` 均触发（detach 语义
+    钉死)、无 resume、两条 requirement 均 `NeverResumed` 留痕;随后用合作 handler 再
+    drive 一轮正常完成（机器可复用）。
+  - `facade::agent::tests::cancelling_a_run_blocked_in_a_tool_detaches_it_and_leaves_agent_runnable`
+    （非流式）与 `..._stream_blocked_in_a_tool_...`（流式)——阻塞工具 + cancel,秒级以
+    `FacadeError::Agent` 取消诊断收尾,工具 future 被 detach;agent 立即可复用,恢复
+    run 只携带自己的 user 消息（committed 历史无残留)。注意:tool phase 的 cancel 按
+    既有语义（`CancelDisposition::ResumeTurn`）保留一个闭合了悬空 tool_use 的**一致
+    pending turn**,cursor 停 `Idle`,下一次 run 将其作为被取代事务丢弃——因此这两个
+    测试**不断言 snapshot 可用**(pending turn 存在时 snapshot 拒绝,这是 M4-4 既有
+    语义,LLM phase cancel 的 DiscardTurn 路径不受影响)。
+  - 既有测试更新:无——排查确认没有任何测试钉住「批完成后才响应 cancel」的旧延迟
+    （既有 cancel 测试全部走合作 handler,宽限内完成,断言不变全绿）;新行为由上述
+    三个新测试钉住。正常批完成路径回归:`agent::`(515)、`facade::`(264)全绿。
+- **Breaking change（行为收紧）**：无公开 API 形状破坏（仅新增 `pub(crate)` 项与
+  rustdoc)。行为变化:cancel 不再等阻塞中的 tool/interaction 批自行返回——阻塞
+  handler 的 fulfill future 现在会在 cancel + 2s 宽限后被 **drop**,而不是一直 awaited。
+  依赖「工具一定跑到返回」做收尾（释放锁、关闭句柄、落盘）的宿主 handler 必须改为
+  select `ToolContext::cancel` / `RunContext::cancellation`,或在 `Drop` 中收尾;cancel
+  延迟从「最坏 = 批内最慢 handler 的返回时间」收紧为「最坏 ≈ 2s 宽限」。
+- 验证通过:`cargo fmt --all`;`cargo test -p agent-lib --lib agent::`(515 passed);
+  `cargo test -p agent-lib --lib facade::`(264 passed,+2);
+  `cargo clippy --all-targets -- -D warnings`;`cargo clippy --all-targets --features
+  "external-claude-code external-codex external-opencode external-acp" -- -D warnings`;
+  `cargo test --all --all-targets`(50 套件全绿);`RUSTDOCFLAGS="-D warnings" cargo doc
+  --no-deps --workspace`。
 
 ### M3-R [TODO] M3 review：cancel 强化收口 + 全计划终检
 

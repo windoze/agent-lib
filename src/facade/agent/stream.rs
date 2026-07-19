@@ -45,8 +45,8 @@ use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 
 use crate::agent::drive::{
-    Resolved, budget_precheck_exhausted, charge_resolution_budget, fulfill_batch, is_terminal,
-    record_requirement, record_requirement_resolution,
+    BatchOutcome, Resolved, budget_precheck_exhausted, charge_resolution_budget,
+    fulfill_batch_cancellable, is_terminal, record_requirement, record_requirement_resolution,
 };
 use crate::agent::interaction::{Interaction, InteractionKind};
 use crate::agent::{
@@ -282,7 +282,23 @@ async fn drive_streamed(
             pivot_window_allowed = false;
         }
 
-        let resolutions = fulfill_batch(&pending, scope, None, ctx).await?;
+        // The batch wait is cancel-preemptible, exactly like `drain` (M3-3): a
+        // cancel that lands mid-batch first gives cooperative handlers the
+        // unwind grace, then detaches whatever is still blocked and settles
+        // every outstanding requirement as a never-resume.
+        let resolutions = match fulfill_batch_cancellable(&pending, scope, None, ctx).await? {
+            BatchOutcome::Completed(resolutions) => resolutions,
+            BatchOutcome::Preempted => {
+                for requirement in &pending {
+                    record_requirement(ctx, requirement, 0, RequirementDisposition::NeverResumed);
+                    let mut guard = machine.borrow_mut();
+                    let mut outcome = guard.step(StepInput::Abandon(requirement.id));
+                    notifications.append(&mut outcome.notifications);
+                }
+                cancelled = true;
+                break;
+            }
+        };
 
         // Re-check cancellation between the batch settling and feeding the
         // resolutions back, exactly like `drain`: a cancel that landed while
@@ -725,6 +741,11 @@ impl AgentRunStream<'_> {
     }
 
     /// Requests cooperative cancellation of this streamed run.
+    ///
+    /// The drive observes the token at its bounded cancel points — including
+    /// pre-empting the wait on a blocked tool/interaction batch (M3-3), where
+    /// a still-blocked fulfill future is detached after a bounded unwind
+    /// grace — and the turn ends with a terminal cancellation error.
     pub fn cancel(&self) {
         self.control.cancel.cancel();
     }

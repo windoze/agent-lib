@@ -134,6 +134,16 @@ pub trait LlmHandler: Send + Sync {
 ///
 /// The returned [`RequirementResult`] must be a [`RequirementResult::Tool`];
 /// execution failures are carried inside its `Err`.
+///
+/// # Cancellation
+///
+/// A cancelled drive pre-empts the batch wait (M3-3): after a bounded unwind
+/// grace, a still-blocked fulfill future is **dropped (detached)** and its
+/// requirement is settled as a never-resume. Implementations whose work
+/// outlives casual dropping — anything with side effects, held resources, or
+/// human-visible prompts — must therefore select on
+/// [`RunContext::cancellation`] themselves for long work; facade tools receive
+/// the same token as [`ToolContext::cancel`](crate::facade::ToolContext::cancel).
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
     /// Executes `call` under the framework `call_id` and returns its result.
@@ -151,6 +161,14 @@ pub trait ToolHandler: Send + Sync {
 /// [`ToolApprovalPolicy`](crate::agent::ToolApprovalPolicy) (unattended). The
 /// returned [`RequirementResult`] must be a [`RequirementResult::Interaction`]
 /// whose response family matches the interaction request.
+///
+/// # Cancellation
+///
+/// Same detach contract as [`ToolHandler`]: a cancelled run pre-empts the
+/// batch wait and may drop a still-pending fulfill future after the unwind
+/// grace (M3-3), so an attended backend that blocks on a human must select on
+/// [`RunContext::cancellation`] to abort its prompt instead of relying on
+/// running to completion.
 #[async_trait]
 pub trait InteractionHandler: Send + Sync {
     /// Presents `request` to the backend and returns the resolved response.
@@ -413,11 +431,14 @@ impl Pop for ScopePop<'_, '_> {
 ///
 /// # Cancellation
 ///
-/// Cancellation is observed at two points per loop iteration: before a batch
-/// is fulfilled, and again right after the batch-fulfil await returns — a cancel
-/// that landed while a batch was in flight stops the drive before any
-/// resolution is fed back or further work is requested. Either way, *every*
-/// outstanding requirement of the interrupted batch is settled as a
+/// Cancellation is observed at three points per loop iteration: before a batch
+/// is fulfilled, *during* the batch wait (M3-3), and again right after the
+/// batch-fulfil await returns. A cancel that lands while a batch is in flight
+/// pre-empts the batch-level wait: cooperative handlers get a bounded unwind
+/// grace to finish (so their cleanup tails run), then any still-blocked
+/// fulfill future is detached and the drive stops without feeding any
+/// resolution back or requesting further work. Either way, *every* outstanding requirement
+/// of the interrupted batch is settled as a
 /// never-resume: recorded on the trace with a
 /// [`NeverResumed`](RequirementDisposition::NeverResumed) disposition and
 /// abandoned through the machine's never-resume path. The returned
@@ -483,7 +504,19 @@ where
             break;
         }
 
-        let resolutions = fulfill_batch(&pending, scope, parent.as_deref_mut(), ctx).await?;
+        let resolutions =
+            match fulfill_batch_cancellable(&pending, scope, parent.as_deref_mut(), ctx).await? {
+                BatchOutcome::Completed(resolutions) => resolutions,
+                // Cancellation pre-empted the batch wait: the in-flight fulfill
+                // futures were detached (dropped) after the unwind grace, so
+                // every outstanding requirement of the batch is settled as a
+                // never-resume, exactly like the pre-batch cancel path (M3-3).
+                BatchOutcome::Preempted => {
+                    settle_cancelled(machine, ctx, pending.iter(), &mut notifications);
+                    cancelled = true;
+                    break;
+                }
+            };
 
         // Re-check cancellation between the batch settling and feeding the
         // resolutions back (M4-5): a cancel that landed while the batch was in
@@ -865,6 +898,78 @@ pub(crate) async fn fulfill_batch(
     }
 
     Ok(resolutions)
+}
+
+/// The bounded window a cancelled batch gets to unwind cooperatively before
+/// its still-running fulfill futures are detached (M3-3).
+///
+/// Cancellation wakes every cancel-selecting handler at about the same time —
+/// the reference LLM handler, the shipped external-session read loops (M3-1),
+/// and any host tool/interaction handler that selects on the shared token.
+/// Those handlers may need a short moment to run their cleanup tail: an
+/// external delegate's session sweep runs *after* its drive returns (M3-2), so
+/// dropping the batch future the instant cancel fires would skip that sweep
+/// and leak the session. The grace keeps polling the in-flight batch instead;
+/// a handler that ignores cancellation — a blocked ask-user tool is the
+/// canonical case — is detached only once the grace expires.
+pub(crate) const CANCEL_UNWIND_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The outcome of driving one requirement batch under cancellation (M3-3).
+pub(crate) enum BatchOutcome {
+    /// The batch ran to completion — either undisturbed, or inside the
+    /// post-cancel unwind grace when cancel landed mid-batch but every
+    /// in-flight handler unwound cooperatively in time.
+    Completed(Vec<Resolved>),
+    /// Cancellation pre-empted the batch wait: the unwind grace expired with
+    /// fulfill futures still in flight, and those futures were **dropped
+    /// (detached)**. No resolution was fed back; the caller settles every
+    /// outstanding requirement of the batch as a never-resume through the
+    /// usual cancel path.
+    Preempted,
+}
+
+/// Fulfills a batch like [`fulfill_batch`], but lets cancellation pre-empt the
+/// batch-level wait (M3-3).
+///
+/// The batch future races the run's cancellation token. A cancel that lands
+/// mid-batch does not detach in-flight fulfill futures on the spot: the batch
+/// keeps being polled for up to [`CANCEL_UNWIND_GRACE`] so cooperative
+/// handlers can observe the token and run their cleanup tails (plain drop was
+/// evaluated and rejected — an external delegate's session cleanup runs after
+/// its drive future returns, so detaching that future would leak the runtime;
+/// a detached background join was not an option because the batch future
+/// borrows the scope stack and so is not `'static`). When the grace expires
+/// with futures still in flight, the batch future is dropped, detaching them.
+///
+/// The detach semantics place a contract on handlers: a fulfill future may be
+/// dropped at any await point once the run is cancelled and the grace has
+/// expired, so long-running handlers **must** select on
+/// [`RunContext::cancellation`] themselves (facade tools see the same token as
+/// [`ToolContext::cancel`](crate::facade::ToolContext::cancel)) instead of
+/// relying on running to completion.
+pub(crate) async fn fulfill_batch_cancellable(
+    requirements: &[Requirement],
+    scope: &dyn HandlerScope,
+    parent: Option<&mut (dyn Pop + '_)>,
+    ctx: &RunContext,
+) -> Result<BatchOutcome, AgentError> {
+    let batch = fulfill_batch(requirements, scope, parent, ctx);
+    tokio::pin!(batch);
+    tokio::select! {
+        biased;
+        result = &mut batch => Ok(BatchOutcome::Completed(result?)),
+        () = ctx.cancellation().cancelled() => {
+            match tokio::time::timeout(CANCEL_UNWIND_GRACE, &mut batch).await {
+                // Every in-flight handler unwound inside the grace: the batch
+                // completed, and the caller's post-batch cancel re-check
+                // settles the resolutions as never-resumed.
+                Ok(result) => Ok(BatchOutcome::Completed(result?)),
+                // The grace expired with futures still in flight: drop the
+                // batch future, detaching them (see the fn docs).
+                Err(_elapsed) => Ok(BatchOutcome::Preempted),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1585,11 +1690,16 @@ mod tests {
         interaction: Option<CountingInteractionHandler>,
         delay_tool: Option<DelayToolHandler>,
         cancelling_tool: Option<CancellingToolHandler>,
+        blocking_tool: Option<BlockingToolHandler>,
+        blocking_interaction: Option<BlockingInteractionHandler>,
         external: Option<CountingExternalSessionHandler>,
     }
 
     impl HandlerScope for TestScope {
         fn tool(&self) -> Option<&dyn ToolHandler> {
+            if let Some(handler) = self.blocking_tool.as_ref() {
+                return Some(handler as &dyn ToolHandler);
+            }
             if let Some(handler) = self.delay_tool.as_ref() {
                 return Some(handler as &dyn ToolHandler);
             }
@@ -1602,6 +1712,9 @@ mod tests {
         }
 
         fn interaction(&self) -> Option<&dyn InteractionHandler> {
+            if let Some(handler) = self.blocking_interaction.as_ref() {
+                return Some(handler as &dyn InteractionHandler);
+            }
             self.interaction
                 .as_ref()
                 .map(|handler| handler as &dyn InteractionHandler)
@@ -2132,6 +2245,135 @@ mod tests {
             requirement_trace(&ctx, requirement_id_n(4), RequirementKindTag::Tool),
             (0, RequirementDisposition::NeverResumed)
         );
+    }
+
+    // ----- M3-3: cancel pre-empts a blocked batch -----
+
+    /// Flags when the future holding it is dropped, proving a blocked fulfill
+    /// future was detached by the cancelled drive.
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A tool handler whose fulfill future never resolves: it records that it
+    /// started, then parks forever unless the future is dropped.
+    #[derive(Clone, Default)]
+    struct BlockingToolHandler {
+        started: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolHandler for BlockingToolHandler {
+        async fn fulfill(
+            &self,
+            _call_id: ToolCallId,
+            _call: &ToolCall,
+            _ctx: &RunContext,
+        ) -> RequirementResult {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let _probe = DropProbe(self.dropped.clone());
+            std::future::pending::<()>().await;
+            unreachable!("the blocked tool future never completes")
+        }
+    }
+
+    /// An interaction handler whose fulfill future never resolves, mirroring
+    /// [`BlockingToolHandler`] for the interaction family.
+    #[derive(Clone, Default)]
+    struct BlockingInteractionHandler {
+        started: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl InteractionHandler for BlockingInteractionHandler {
+        async fn fulfill(&self, _request: &Interaction, _ctx: &RunContext) -> RequirementResult {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let _probe = DropProbe(self.dropped.clone());
+            std::future::pending::<()>().await;
+            unreachable!("the blocked interaction future never completes")
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_preempts_a_blocked_tool_and_interaction_batch_on_cancel() {
+        // A batch whose tool and interaction handlers both block forever:
+        // cancel must pre-empt the batch wait, detach both futures, and close
+        // the turn as cancelled within seconds (M3-3).
+        let tool = BlockingToolHandler::default();
+        let interaction = BlockingInteractionHandler::default();
+        let scope = TestScope {
+            blocking_tool: Some(tool.clone()),
+            blocking_interaction: Some(interaction.clone()),
+            ..TestScope::default()
+        };
+        let mut machine =
+            BatchMachine::new(vec![tool_requirement(9, 0), interaction_requirement(10)]);
+        let ctx = run_context();
+        let token = ctx.cancellation().clone();
+
+        let canceller = {
+            let tool = tool.clone();
+            let interaction = interaction.clone();
+            async move {
+                // Cancel only once both fulfill futures are genuinely in
+                // flight, so the test cannot pass through the pre-batch check.
+                while tool.started.load(Ordering::SeqCst) == 0
+                    || interaction.started.load(Ordering::SeqCst) == 0
+                {
+                    tokio::task::yield_now().await;
+                }
+                token.cancel();
+            }
+        };
+        let drive = drain(&mut machine, external_input(), &scope, None, &ctx);
+        let (result, ()) = tokio::join!(
+            async move { tokio::time::timeout(std::time::Duration::from_secs(30), drive).await },
+            canceller,
+        );
+        let done = result
+            .expect("a pre-empted drain settles within seconds, never hangs")
+            .expect("cancelled drain closes the turn");
+
+        assert!(done.cancelled());
+        // Both blocked futures were dropped (detached), never resumed.
+        assert_eq!(tool.dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(interaction.dropped.load(Ordering::SeqCst), 1);
+        assert!(machine.resume_order.is_empty());
+        // Every outstanding requirement is traced never-resumed at hop 0.
+        for (n, tag) in [
+            (9, RequirementKindTag::Tool),
+            (10, RequirementKindTag::Interaction),
+        ] {
+            assert_eq!(
+                requirement_trace(&ctx, requirement_id_n(n), tag),
+                (0, RequirementDisposition::NeverResumed)
+            );
+        }
+
+        // The machine still accepts a fresh turn: a second drain with
+        // cooperative handlers runs to a normal completion.
+        let cooperative = TestScope {
+            tool: Some(CountingToolHandler::default()),
+            interaction: Some(CountingInteractionHandler::default()),
+            ..TestScope::default()
+        };
+        let next = drain(
+            &mut machine,
+            external_input(),
+            &cooperative,
+            None,
+            &run_context(),
+        )
+        .await
+        .expect("the machine drives another turn after a pre-empted one");
+        assert!(!next.cancelled());
+        assert!(matches!(next.cursor(), LoopCursor::Done(_)));
     }
 
     // ----- M4-3: pivot re-emission vs trace node id dedup (H-STATE-4) -----

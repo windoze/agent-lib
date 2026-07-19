@@ -448,8 +448,10 @@ impl Agent {
     ///
     /// This is the cancellable form of [`run_full`](Agent::run_full). The handle
     /// is cooperative: cancellation is observed at the same bounded points as the
-    /// lower-level Agent driver, and an interrupted turn is abandoned so the
-    /// `Agent` remains usable.
+    /// lower-level Agent driver — including pre-empting the wait on a blocked
+    /// tool/interaction batch (M3-3), where a still-blocked fulfill future is
+    /// detached after a bounded unwind grace — and an interrupted turn is
+    /// abandoned so the `Agent` remains usable.
     ///
     /// # Errors
     ///

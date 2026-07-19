@@ -67,6 +67,12 @@ pub struct ToolContext {
     /// The isolated worktree the agent is running against.
     pub worktree: WorktreeRef,
     /// Cooperative cancellation token; tools should check it for long work.
+    ///
+    /// Checking is effectively required for anything that can block: a
+    /// cancelled run pre-empts the drive's batch wait (M3-3) and **drops
+    /// (detaches)** a still-blocked tool future after a bounded unwind grace,
+    /// so a tool must not rely on running to completion — long-running tools
+    /// should select on this token to abort their own work promptly.
     pub cancel: CancellationToken,
     /// Trace handle for recording tool-scoped diagnostic records.
     pub trace: TraceHandle,
