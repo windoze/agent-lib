@@ -1,24 +1,28 @@
-# 当前执行计划
+# 本轮执行计划
 
-更新时间：2026-07-19
+## 约束
+- 以 `TODO.md` 为唯一任务排序与完成状态来源。
+- 只完成第一个标题未带 `[DONE]` 的任务，完成后提交并停止。
+- 若遇到阻塞当前任务的缺陷或未排期失败测试，先修复或在 `TODO.md` 中插入最小必要前置任务并提交停止。
+- 不因任务较大而拆分；仅在确有无法一起落地的前置依赖时才最小化拆分。
+- 不改动无关用户变更，不回滚未由我产生的工作区内容。
 
-1. 读取 `TODO.md`，只按标题是否带 `[DONE]` 判断完成状态，确定第一个未完成任务。
-2. 查看最新提交信息，只有在其明确提到与该任务直接相关的未完成事项时，才把它纳入当前任务或作为前置项记录到 `TODO.md`。
-3. 针对第一个未完成任务读取必要上下文，避免开放式历史问题扫描。
-4. 如任务可直接完成，做最小正确实现，并补充或调整相关测试与文档。
-5. 按顺序运行验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、必要时 `cargo test --all --all-targets`（完整测试最长 30 分钟）。如代码未变且仅文档/TODO 变更，则复用最近一次绿色结果并在完成记录说明。
-6. 若发现未排期且影响当前任务或测试失败的问题，优先修复；若必须新增前置任务，则更新 `TODO.md`、保持当前任务未完成、提交后停止。
-7. 完成后在 `TODO.md` 中给当前任务标题加 `[DONE]` 并更新完成记录；仅当阶段级计划改变时才更新 `PLAN.md`。
-8. 检查 `git status`、`git diff`、`git log --oneline -10`，提交本次任务相关所有改动，然后停止，不进入下一个任务。
+## 步骤
+1. 读取 `TODO.md`，定位第一个标题未带 `[DONE]` 的任务，并确认其要求、依赖和验证标准。
+2. 检查最近提交信息；若明确指出与当前任务直接相关的未完成问题，则纳入当前任务或作为前置任务记录。
+3. 读取与当前任务相关的源码、测试和文档，限定范围内建立实现上下文。
+4. 按任务要求做最小正确实现；如果计划发生实质变化，更新本文件。
+5. 运行必要验证，顺序优先为 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、相关测试，再根据任务影响决定是否运行完整测试；完整 Rust 测试不超过 30 分钟超时。
+6. 若测试失败且未被明确排期，修复失败或在 `TODO.md` 插入最小必要前置任务并停止。
+7. 更新 `TODO.md`：给完成任务标题加 `[DONE]`，补充完成记录和验证结果；仅当阶段计划真实变化时更新 `PLAN.md`。
+8. 检查 `git status`、`git diff`、最近提交，确认只提交本轮相关改动；如本轮是恢复未提交任务，则按要求包含当前未提交文件。
+9. 使用清晰的任务编号提交信息提交变更，然后停止，不继续下一个任务。
 
-当前状态：已识别第一个未完成任务为 `M7-5 ContentBlock 增加反序列化兜底 variant`。最新提交 `M7-4` 明确把未知 `ContentBlock` 兜底留给 M7-5，直接相关且已由任务单排期。
-
-实施细化：
-
-1. `ContentBlock` 增加 `Unknown { type_name, raw }`，改为手写 `Serialize`/`Deserialize`：未知 `type` 进入 `Unknown`，已知类型仍按既有规则严格校验，`Unknown` 序列化 best-effort 原样输出 `raw`。
-2. 扩展 stream 事件模型与 accumulator：新增未知块 kind/delta，使流式 adapter 可把 provider 未知块折叠为 `ContentBlock::Unknown`。
-3. Anthropic/OpenAI 非流式与流式 adapter 接入未知块保留；请求构造侧对 `Unknown.raw` 直接透传。
-4. conversation validator 允许 assistant 顶层 `Unknown`，用户消息和 tool-result 内容仍按既有语法拒绝，并给出 `unknown` kind。
-5. 补 model、adapter 非流式/流式、conversation validator 测试；更新 `lib.rs`、审查文档和 `TODO.md` 完成记录。
-
-进度更新：代码实现、`lib.rs` 前向兼容文档、`docs/review-2026-07.md` 标注、`TODO.md` `[DONE]` 与完成记录均已完成。验证已通过：`cargo fmt --all`、默认 clippy、external feature clippy、相关定向测试、`cargo test --all --all-targets`、rustdoc。下一步检查 diff/status 并提交本任务改动，然后停止。
+## 当前状态
+- 已定位第一个未完成任务：`M7-6 [TODO] M7 review：adapter 收口`。
+- 最近提交为 `[M7-5] Add ContentBlock unknown fallback`，与当前 M7 review 直接相关；本轮将把 M7-1 ~ M7-5 的收口核对纳入审查。
+- 已核对 `docs/review-2026-07.md`：M-ERR-4、M-ADP-1、M-ADP-2 均为 `✅ 已修复`；协议解析边角中空 arguments、Anthropic 可选字段、CLI 非 JSON 噪声、未知 `ContentBlock`、非对象 usage details 均分别标注 M7-4/M7-5 已修复。
+- 已抽查代码/测试覆盖点：HTTP 误分类测试、`StreamEvent::Usage` 增量语义文档、OpenAI 缺失 sequence number 测试、M7-4 容错测试、`ContentBlock::Unknown` 兜底测试均在场。
+- 已完成 M7 review 全量门禁：`cargo fmt --all`、默认 clippy、external feature clippy、`cargo test --all --all-targets`、rustdoc 全部通过。
+- 已将 `TODO.md` 中 `M7-6` 标记为 `[DONE]` 并写入完成记录。
+- 提交前检查结果：工作区仅有 `TODO.md` 与 `memory/claude_plan.md` 两个本轮相关改动；准备提交 `[M7-6] Review adapter fixes`。

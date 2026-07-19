@@ -1628,12 +1628,19 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - **验证**：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib model::content`、`cargo test -p agent-lib --lib stream::accumulator`、`cargo test -p agent-lib --lib adapter::anthropic`、`cargo test -p agent-lib --lib adapter::openai_resp`、`cargo test -p agent-lib --lib conversation::validation`、`cargo test --all --all-targets`（默认离线全量，真实端点/CLI 测试保持 ignored，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - **Breaking change（pre-1.0，记录在此）**：`ContentBlock`、`BlockKind`、`Delta`、`ContentBlockKind` 均新增 public variant，外部穷尽 match 需补分支；`ContentBlock` 的已知 variant 仍保持原 serde 形状，未知 block 新数据在旧版本中不可读。
 
-### M7-6 [TODO] M7 review：adapter 收口
+### M7-6 [DONE] M7 review：adapter 收口
 
 检查项：
 
 - 逐条核对 M-ERR-4、M-ADP-1、M-ADP-2、M7-4/M7-5 覆盖项状态，`docs/review-2026-07.md` 已标注。
 - 全量门禁命令通过。
+
+完成记录：
+
+- 条目核对：`docs/review-2026-07.md` 中 M7 相关条目均已标注——M-ERR-4（M7-1）、M-ADP-1（M7-2）、M-ADP-2（M7-3）为 `✅ 已修复`；协议解析边角清单中空 `arguments`、Anthropic 可选字段、CLI 非 JSON 噪声、非对象 usage details 均标注 `✅ 已修复（M7-4）`，未知 `ContentBlock` 兜底标注 `✅ 已修复（M7-5）`。
+- 代码点位抽查确认修复在场：HTTP 认证状态优先于 body marker、5xx 不再按 body marker 分类；`StreamEvent::Usage` rustdoc 明确所有 usage event 为可累加增量段；OpenAI Responses 缺失 `sequence_number` 的兼容流测试在场；M7-4 容错测试覆盖空 function arguments、缺 `MessageDelta.usage`、三 CLI decoder 有界非 JSON 噪声、非对象 usage details；M7-5 的 `ContentBlock::Unknown`、`BlockKind::Unknown`、`Delta::Unknown` 与 conversation validator/adapter request 透传路径在场。
+- 全量门禁：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（默认离线全量，真实端点/CLI 测试保持 ignored，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 本任务为 review 收口，无生产代码改动；仅更新任务单完成记录与执行计划文件。无 breaking change。
 
 ---
 
