@@ -1702,13 +1702,22 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - **验证**：`cargo fmt --all`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo clippy --all-targets -- -D warnings`、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（通过，real CLI 测试保持 ignored）、`cargo test --all --all-targets`（通过，real endpoint/CLI 测试保持 ignored）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过，无挂起测试。
 - `docs/review-2026-07.md` “复制代码”中三个 CLI adapter 重复项已标注 `✅ 已修复（M8-2）`。无 breaking change（crate-private 重构；公共类型、函数签名、serde/wire 行为不变）。
 
-### M8-3 [TODO] M8 review：收敛收口
+### M8-3 [DONE] M8 review：收敛收口
 
 检查项：
 
 - 确认两份收敛无行为回归（全量测试 + 人工抽查关键路径 diff）。
 - `docs/managed-external-agent.md`、AGENTS.md 的模块描述同步（新增公共模块的位置）。
 - 全量门禁命令通过。
+
+完成记录：
+
+- 最近提交核对：`[M8-2] Consolidate external process helpers` 未提到未完成事项，M8-3 无需插入额外前置任务。
+- M8-1 抽查：`src/adapter/mod.rs` 只暴露 provider-specific 模块并以 crate-private `mod common` 挂载共享实现；`src/adapter/common/` 包含 HTTP 传输/错误 body 上限/query 脱敏、泛型 SSE decoder、endpoint URL/header 构造与 JSON collision helper。Anthropic/OpenAI 的非流式与流式入口均调用 `common::execute_json_response` / `common::execute_sse_response` / `common::normalize_sse` / `common::endpoint_*`；重复实现 grep（`validate_event_stream_content_type`、`insert_preserving_collision`、`endpoint_headers`、`append_header`、`DecoderState`、`map_event_stream_error` 等）只命中 `src/adapter/common/*`，两个 adapter 目录只剩 provider-specific 薄接线与编解码逻辑。
+- M8-2 抽查：`src/agent/external/process/` 包含共享 `ManagedChild`、`PreludeDeadline`、`process::group`、capability/unsupported 工具/autonomous turn helper 与 mid-session close 记录 helper；Claude Code、Codex、OpenCode 与 ACP 均调用该共享模块。`intersect_capabilities` 只剩 `process/mod.rs` 单一实现；各 adapter 中的 `drain_and_emit` / `maybe_session_ref` / close 记录仅保留 runtime-specific 薄封装，子进程 spawn/read/close/force-kill 行为单一来源。
+- 文档同步：`AGENTS.md` 的 repository layout 已补 `adapter/common/` 与 `agent/external/process/`；`docs/managed-external-agent.md` §11.3 新增共享 process 模块说明，并把 Claude/Codex/OpenCode 的生产 IO 描述改为共享 `process::ManagedChild` 口径；§16 旧 `agent::external::process_group` 路径改为 `agent::external::process::group`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过；额外运行 `cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets` 也通过（真实 endpoint/CLI 测试保持 ignored，无挂起）。
+- 本任务为 review 收口；除文档与任务记录外无生产代码改动。无 breaking change。
 
 ---
 

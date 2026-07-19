@@ -827,6 +827,17 @@ CLI adapter 通用需求:
 - graceful shutdown timeout。
 - forced kill fallback。
 
+实际代码中这些共同需求收敛在 crate-private `src/agent/external/process/`（M8-2）:
+
+- `process::ManagedChild`:三个 CLI adapter 的共享 line-oriented child transport,统一负责
+  `tokio::process::Command` stdio 接线、`kill_on_drop`、每行 read-idle timeout、graceful close 的退出码分类,
+  以及超时后的 force-kill 兜底。Claude Code 只额外负责 stdin frame 写入;Codex/OpenCode 只负责 argv 构造。
+- `process::PreludeDeadline`:fresh/resume prelude 的 wall-clock deadline 与 cancel 检查,避免各 adapter 各自实现
+  M2-5 的防挂起逻辑。
+- `process::group`:原 M2-1 `process_group` 逻辑的最终位置,提供 unix 进程组 spawn 与 SIGTERM→SIGKILL 强杀。
+- `process::{intersect_capabilities, reject_unsupported_tools, autonomous_turn_message}` 等纯 helper:保持三
+  runtime 的 capability 交集、unsupported 工具拒绝与 autonomous turn 输入分类一致。
+
 ### 11.4 实现状态（M5，已落地）
 
 Milestone 5（TODO `M5-1`..`M5-3`）冻结了 runtime abstraction 边界。真实
@@ -1005,8 +1016,8 @@ decoder 必须:
   `RuntimeDecisionPoint`;stdout 提前 EOF→`SessionLost`,非法帧→`Protocol`。`shutdown` 丢弃 stdin 让 CLI
   见 EOF,在 shutdown grace 内等待退出并按退出码分类(0 → `Graceful`,非 0 → `Failed`;超时则
   进程组级强杀 → `ForcedKill`,见 §16「进程组级 kill」)。
-- IO 经私有 `ClaudeSessionIo` trait 注入:生产用 `ClaudeProcessIo`(`tokio::process`,stderr 丢弃、
-  `kill_on_drop`、每读空闲超时 `read_idle_timeout`),单测注入 fake transport 回放固定帧并捕获 stdin,**离线**跑通
+- IO 经私有 `ClaudeSessionIo` trait 注入:生产用共享 `process::ManagedChild`(`tokio::process`,stderr 丢弃、
+  `kill_on_drop`、每读空闲超时 `read_idle_timeout`,退出码分类与进程组级强杀),单测注入 fake transport 回放固定帧并捕获 stdin,**离线**跑通
   start/advance/resume/shutdown 全状态机,无需真实 binary、无网络。
 - 宿主工具(spec 允许,§12.3):本 adapter **不跑 MCP server**,故 `implemented_capabilities()` 诚实报告
   `host_tools=false` / `host_subagents=false`,并对声明了 `tools` 的 `start`/`resume` 请求以
@@ -1192,8 +1203,8 @@ decoder 接进 milestone-5 的 `ExternalRuntimeAdapter` / `ExternalRuntimeSessio
   `tools` 的 `start`/`resume` 请求以 `UnsupportedCapability{HostTools}` 明确拒绝;follow-up 的
   `RespondToolResults`→`UnsupportedCapability{HostTools}`、`RespondSubagent`→`{HostSubagents}`、
   `RespondInteraction`→`{PermissionBridge}`,均**明确拒绝而非静默忽略**。
-- IO 经私有 `CodexLauncher` / `CodexTurnStream` trait 注入:生产用 `SystemCodexLauncher`(`tokio::process`),
-  单测注入 `FakeLauncher` 回放固定 JSONL 帧并**逐 turn 捕获 `CodexTurnSpec`**,**离线**跑通
+- IO 经私有 `CodexLauncher` / `CodexTurnStream` trait 注入:生产 `SystemCodexLauncher` 只构造 argv/env/cwd,
+  子进程生命周期由共享 `process::ManagedChild` 处理;单测注入 `FakeLauncher` 回放固定 JSONL 帧并**逐 turn 捕获 `CodexTurnSpec`**,**离线**跑通
   begin/advance(fresh + resume)/shutdown 全状态机,无需真实 binary、无网络。
 - 真机 e2e:`tests/external_codex.rs` 有一个 `#[ignore]` 用例,通过 `CODEX_BIN` 或 PATH 发现 `codex`,缺失
   binary/登录即带清晰信息**跳过**(退出为绿),否则在临时 git worktree 里以 `AcceptEdits`(`workspace-write`,
@@ -1263,8 +1274,8 @@ OpenCode 需要先做 capability probe,因为部署形态可能更多。
 >   `graceful_shutdown` 为 true;声明 `tools` 的 `start`/`resume` 以 `UnsupportedCapability{HostTools}` 拒绝,
 >   follow-up 的 `RespondToolResults`→`{HostTools}`、`RespondSubagent`→`{HostSubagents}`、
 >   `RespondInteraction`→`{PermissionBridge}` 均**明确拒绝而非静默忽略**。
-> - IO 经私有 `OpenCodeLauncher` / `OpenCodeTurnStream` trait 注入:生产用 `SystemOpenCodeLauncher`
->   (`tokio::process`),单测注入 `FakeLauncher` 回放固定 JSON 帧并**逐 turn 捕获 `OpenCodeTurnSpec`**,**离线**
+> - IO 经私有 `OpenCodeLauncher` / `OpenCodeTurnStream` trait 注入:生产 `SystemOpenCodeLauncher`
+>   只构造 argv/env/cwd,子进程生命周期由共享 `process::ManagedChild` 处理;单测注入 `FakeLauncher` 回放固定 JSON 帧并**逐 turn 捕获 `OpenCodeTurnSpec`**,**离线**
 >   跑通 begin/advance(fresh + resume)/shutdown 全状态机,无需真实 binary、无网络。
 > - **worktree 隔离**:配置了 `working_dir` 时,`base_run_args()`/`base_resume_args()` 以显式
 >   `--dir <path>` 传入。OpenCode 从 `--dir`/继承的 `$PWD` 解析其项目与文件落盘位置,**而非仅**子进程的
@@ -1433,7 +1444,7 @@ Codex/OpenCode session 的 `shutdown()`
 
 CLI 经其 shell 工具拉起的孙进程（构建、测试、dev server）若只杀直接子进程会变成孤儿，可能继续写
 已被删除/复用的 worktree。因此三个 CLI adapter 与 ACP connection 统一收口在
-`agent::external::process_group`（crate 私有，M8-2 将并入共享 process 模块）：
+crate-private `agent::external::process::group`（经 `agent::external::process` 复用）：
 
 - **spawn**：unix 上 `Command::process_group(0)` 使子进程自成进程组（pgid == pid）。
 - **force-close**（shutdown grace 超时后）：先向**整个进程组**发 SIGTERM，2s 升级窗口内未退出

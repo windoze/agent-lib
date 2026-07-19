@@ -7,10 +7,12 @@ short "how to build, test, and run things" reference.
 
 ## Repository layout
 
-- `src/` — the `agent-lib` crate: `client/` (LLM wire adapters), `conversation/`
-  (Conversation core), `model/` (normalized data model + escape hatches), and
-  `agent/` (sans-io machines + effect handlers, including
-  `agent/external/` for the managed external-runtime stack).
+- `src/` — the `agent-lib` crate: `client/` (provider-neutral client
+  contracts), `adapter/` (LLM wire adapters; shared HTTP/SSE/request helpers
+  live in `adapter/common/`), `conversation/` (Conversation core), `model/`
+  (normalized data model + escape hatches), and `agent/` (sans-io machines +
+  effect handlers, including `agent/external/` for the managed external-runtime
+  stack and `agent/external/process/` for shared CLI child-process plumbing).
 - `crates/agent-testkit/` — dev-only test harness (`TestScope`, `SeqIds`,
   scripted/cassette handlers, fixtures, assertions). It is a dev-dependency, so
   it is available to tests, benches, and **examples** but never to the library
