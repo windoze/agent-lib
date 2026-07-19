@@ -397,8 +397,39 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `cargo test -p agent-lib --lib facade::`；`cargo clippy --all-targets -- -D warnings`；
   `cargo test --all --all-targets`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`；
   `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`。
+- 后续修正（2026-07-20 review）：委派工具（`ask_<name>`）的移除绕过了过滤 registry——
+  `DelegationToolHandler` 的固定 route 先于 `allowed_names` 检查解析，被 reconfig 移除的委派
+  工具仍可驱动委派。该需求违反由新增任务 **M2-3** 收口，本任务的「完成」不含委派工具路径。
 
-### M2-3 [TODO] reconfig 与 snapshot/restore 的交互确认 + 文档收口
+上下文：
+
+- `DelegationToolHandler::fulfill`（`src/facade/delegate.rs:2136`）经 `self.route.resolve(call)`
+  ——per-run 固定的 `DelegationRoute`（按注册 delegates 构建，`src/facade/agent.rs:709-712`）——
+  **先于** `ActiveFacadeToolRegistry` 的 `allowed_names` 检查
+  （`src/facade/agent/reconfig.rs:180-183`）解析委派调用。
+- 后果（review probe 实测确认）：`ReplaceToolSet`/`PatchToolSet` 移除 `ask_reviewer` 后，模型调它
+  仍驱动完整委派（`DelegationTrace{status: Completed}`），而非 UnknownTool。违反 M2-2「被移除的
+  工具若仍被模型调用，会得到明确 `UnknownTool` tool result」的硬性要求；`docs/facade-api.md` 与
+  `docs/agent-layer.md` 的对应描述当前与实现不符（文档承诺先行）。
+- mid-run swap 路径同洞：registry slot 换入新 registry 时 route 不重建。
+
+实现要求：
+
+- 委派路由解析（`Resolved::Delegate` / `Resolved::External`）以**当前 active tool set / slot
+  registry 的声明集**为准：被 reconfig 移除的 `ask_<name>` 调用返回 UnknownTool tool result，
+  不驱动委派。
+- run 起点与 mid-run swap 两条路径一致（route 按 active tool set 重建，或解析时查 slot
+  registry——选型写入完成记录）。
+- 未被移除的委派工具行为不变（现有委派测试全绿）。
+
+验证条件：
+
+- 单元测试：`ReplaceToolSet` 移除 `ask_reviewer` → 下一 run 模型调它得到 UnknownTool，无
+  `DelegationStarted` 事件；保留的委派工具正常驱动。
+- `PatchToolSet` 移除路径同样覆盖（review 指出的测试缺口）。
+- `cargo test -p agent-lib --lib facade::` 通过。
+
+### M2-4 [TODO] reconfig 与 snapshot/restore 的交互确认 + 准入校验补齐 + 文档收口
 
 上下文：
 
@@ -406,20 +437,43 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   committed 一致点取（`agent.rs:987-993`）。
 - reconfig 排队在 turn 边界应用——与「快照在 committed 点」的时序要保证 reconfig 落进
   state 先于快照读取，否则 snapshot 丢失已应用的 reconfig。
+- **review 实测（2026-07-20）**：restore 只查重不校验快照 `current_tool_set` ⊆ 重注入工具面
+  （`snapshot.rs:857-864`）；工具面偏小时每次 run 在 drain 开始前即失败
+  （`agent.rs:754-757` `tool_handlers_for_run`），排队中的矫正性 `ReplaceToolSet` 永远没机会
+  应用——agent 被永久锁死，`into_parts` 之外无解。
+- **review 实测**：`SetModel` 准入跳过 builder 校验（`agent.rs:1496-1523` 的空白 model 名 /
+  非有限 temperature / provider_extras 匹配检查），`SetModel { model: "" }` 或 NaN temperature
+  会被接受并原样渲染进下一个 `ChatRequest`（`src/agent/request.rs:31-43`）。
+- **review 实测**：facade re-export 不全——缺 `ToolSetId`（`ToolSetRef::new` /
+  `ToolSetPatch::new` 必需）与声明类型 `model::tool::Tool`；crate 自己的测试都得从
+  `crate::agent` 内部路径 import（`src/facade/agent/tests.rs:22-27`），facade-only 消费者
+  构造不了 `ReplaceToolSet`。
 
 实现要求：
 
 - 测试钉住：reconfig（SetModel + ReplaceToolSet）→ run 完成 → snapshot → restore →
   恢复的 agent 用新 model/工具集（restore 以快照 `AgentState` 为权威，
   `snapshot.rs:864-869`，本就该成立——用测试锁住）。
-- 边界情形：reconfig 排队未应用时取 snapshot 的语义（丢弃 or 含排队）文档化。
+- **restore 锁死修复**：restore 时校验快照 `current_tool_set`（与 queued reconfigs）⊆
+  重注入工具面，不满足即 restore 显式报错；或 run 起点按 post-application 集合解析使排队
+  矫正有机会应用——二选一，选型与理由写入完成记录。不允许出现「公开 API 无法恢复」的状态。
+- **`SetModel` 准入校验**：对齐 builder 的校验（非空 model、有限 temperature、
+  provider_extras 与 provider 匹配），不合法即准入失败、不排队。
+- **re-export 补齐**：facade 公共路径可构造全部已支持 reconfig 请求（补 `ToolSetId` 与
+  工具声明类型）。
+- 边界情形：reconfig 排队未应用时取 snapshot 的语义（丢弃 or 含排队）文档化——
+  `Agent::snapshot()` rustdoc 目前未说明 queued reconfig 会被快照捕获并在 restore 后重新
+  计划，此语义必须钉死并文档化。
 - 文档同步：`docs/facade-api.md`（reconfig 入口、时机语义、与 restore 的分工——restore
   仍是换 provider/client/handler 的路径，reconfig 是换 model/tools/system 的路径）、
   `docs/agent-layer.md` §4.2（更新为「facade 可达」）。
 
 验证条件：
 
-- 上述 snapshot/restore 测试通过。
+- 上述 snapshot/restore 测试通过；restore 工具面校验的允许/拒绝两路径各有测试。
+- `SetModel` 非法输入（空白 model / NaN temperature）准入失败测试。
+- facade-only 路径（不 import `agent::` 内部模块）构造 `ReplaceToolSet` 的编译测试或 doc
+  示例。
 - 文档落位，无「机制齐备但 facade 不可达」的过时描述残留。
 
 ### M2-R [TODO] M2 review：facade reconfigure 收口
@@ -427,7 +481,12 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 逐条核对 `docs/mag-gaps.md` A2 的落地状态并标注。
 - 核对 mag 验收线索：turn 边界可换 model/tools/system，会话历史保留，snapshot/restore
   不丢 reconfig。
-- 核对「不允许静默 mismatch」在代码与测试中都成立。
+- 核对「不允许静默 mismatch」在代码与测试中都成立——含 M2-3 的委派工具移除一致性、
+  M2-4 的 restore 工具面校验。
+- 核对 review 指出的 should-fix 已收口：`SetModel` 准入校验、facade re-export 完整性。
+- 核对 review nit 的处置（逐条决定修复或登记）：声明内容仅按名校验（同名不同 schema 被
+  接受）、skill 变体拒绝与时机拒绝同为 `InvalidState` 不可区分、`available_names` 在
+  build/restore 时冻结、`SetLoopPolicy` 覆盖 facade 派生 budget 的交互未文档化。
 - 全量门禁通过。
 
 ---
@@ -526,6 +585,11 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 核对 mag 验收线索：cancel 一个静默 ACP 子进程秒级返回、无子进程泄漏；阻塞 tool 不再
   冻结 run。
 - 取消语义三处（read loop、session 清理、批抢占）的文档口径一致。
+- M1 review（2026-07-20）遗留项逐条评估（登记于 `docs/mag-gaps.md` C7–C9）：委派的审批
+  绕过 tap/recorder（无 `RunEvent::ApprovalRequested`、不进 `RunOutput.events`）、
+  SingleTool 委派模式 external start 双重 gate、child auto-deny 层可被父 handler 改判
+  Approve 的语义文档化、M1 测试缺口（external cancel-while-parked、M1-4 family-mismatch、
+  Claude Code 路径覆盖）——逐条决定收口或保持登记，结论写入完成记录。
 - 全量门禁通过（含 external features 的 clippy 与测试）。
 - 终检：PLAN.md 四个目标逐项核对；本计划与任务单归档到
   `docs/archive/<完成日期>-mag-gaps/`。

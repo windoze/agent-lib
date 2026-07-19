@@ -202,6 +202,19 @@ M2-3/M2-R 收口。
   `InteractionHandler` 且启动策略需要 ask 时，启动审批走同一异步 interaction 通道；无父级 handler
   时保留同步 fallback/headless deny。
 - **C6**（mag A10）`DelegationTrace` 增加 `is_external`；`RunEvent` 携带 run id。
+- **C7**（2026-07-20 review 登记，agent-lib 内部一致性项，非 mag 阻塞）委派的审批绕过
+  tap/recorder：两条 run 路径把裸 handler 传给 `DelegationToolHandler`，子 agent 审批不产生
+  `RunEvent::ApprovalRequested`、不进 `RunOutput.events`，与 supervisor 层口径不一致。对 mag
+  无害（`IpcApproval` 自行发事件）；修复需注意 `enriched_approval_request` 只看 supervisor
+  pending 表，需 origin-aware  enrichment。M3-R 评估收口与否。
+- **C8**（2026-07-20 review 登记）SingleTool 委派模式下 external start 被双重 gate：机器 tool
+  gate 对统一工具名暂停一次（无归因），驱动层 start-ask 再问一次（有归因）。PerSubagentTool
+  模式的豁免是真实的（`facade/approval.rs:778-780`），SingleTool 模式不在豁免内
+  （`facade/delegate.rs:1213`）。mag 用 PerSubagentTool 模式，不受影响。
+- **C9**（2026-07-20 review 登记）语义文档与测试缺口：(a) child 的 auto-deny 层会暂停且父
+  handler 可改判 Approve——与 supervisor 层设计一致（mag 依赖此兜底模式），但子 policy 的
+  「deny 可应答」语义未文档化；(b) M1-3 external 路径缺 cancel-while-parked 测试、M1-4 缺
+  family-mismatch 测试、Claude Code 路径只有结构性覆盖。M3-R 评估收口与否。
 
 ## 使用约束（mag 侧已知晓的陷阱，非缺口）
 

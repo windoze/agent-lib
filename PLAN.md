@@ -82,12 +82,16 @@
 - `ReconfigRegistryHandler` / `ToolRegistryResolver` 接线到 facade 同步与流式两条驱动路径。
 - `ReplaceToolSet` 的声明/闭包一致性保证（一并替换注册表，或校验名字集合、不一致报错）。
 - reconfig 与 snapshot/restore 的交互确认（reconfig 落进 `AgentState` 先于快照点）。
+- 2026-07-20 review 追加（TODO M2-3/M2-4）：委派工具（`ask_<name>`）移除后对路由层同样生效
+  （不允许绕过过滤 registry 继续驱动委派）；restore 校验快照工具集 ⊆ 重注入面（不允许
+  永久锁死状态）；`SetModel` 准入校验对齐 builder；facade re-export 补齐。
 
 重点文件：
 
 - `src/agent/state.rs`、`src/agent/state/queue.rs`（`ReconfigRequest`、`queue_reconfig`）
 - `src/agent/drive/reference.rs`（`ReconfigRegistryHandler`、`ToolRegistryResolver`）
 - `src/facade/agent.rs`、`src/facade/agent/stream.rs`、`src/facade/agent/snapshot.rs`
+- `src/facade/agent/reconfig.rs`、`src/facade/delegate.rs`（委派路由与过滤 registry 的次序）
 - `docs/facade-api.md`、`docs/agent-layer.md` §4.2
 
 ### M3：cancel 强化（A3 + A4）
