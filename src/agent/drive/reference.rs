@@ -69,6 +69,18 @@ type SharedRegistry = Arc<Mutex<Arc<dyn ToolRegistry>>>;
 /// [`collect`](crate::stream::accumulator::collect); transport failures are
 /// carried inside [`RequirementResult::Llm`]'s `Err`, never by returning the
 /// wrong result family.
+///
+/// # Cancellation
+///
+/// The in-flight LLM call races the run context's cancellation token (M4-5 /
+/// M-ERR-2): when the token fires, the HTTP request future is dropped and the
+/// handler returns immediately instead of waiting out the response, so cancel
+/// latency is bounded by signal delivery rather than by model latency. The
+/// placeholder error carried in that early result is always discarded — the
+/// driver re-checks the token after every batch and settles the requirement as
+/// a never-resume instead of resuming with it. (Tool executions are *not*
+/// interrupted mid-flight: a half-finished side effect is worse than a bounded
+/// wait for a usually-quick tool call.)
 #[derive(Clone)]
 pub struct LlmClientHandler {
     client: Arc<dyn LlmClient>,
@@ -88,26 +100,41 @@ impl LlmHandler for LlmClientHandler {
         &self,
         request: &ChatRequest,
         mode: LlmStepMode,
-        _ctx: &RunContext,
+        ctx: &RunContext,
     ) -> RequirementResult {
-        let mut request = request.clone();
-        let result = match mode {
-            LlmStepMode::NonStreaming => {
-                request.stream = false;
-                self.client.chat(request).await
-            }
-            LlmStepMode::Streaming => {
-                request.stream = true;
-                match self.client.chat_stream(request).await {
-                    Ok(stream) => collect(stream).await.map_err(|error| match error {
-                        CollectError::Stream(err) => err,
-                        CollectError::Accumulator(err) => ClientError::Protocol(err.to_string()),
-                    }),
-                    Err(err) => Err(err),
+        let client = self.client.clone();
+        let call = async move {
+            let mut request = request.clone();
+            match mode {
+                LlmStepMode::NonStreaming => {
+                    request.stream = false;
+                    client.chat(request).await
+                }
+                LlmStepMode::Streaming => {
+                    request.stream = true;
+                    match client.chat_stream(request).await {
+                        Ok(stream) => collect(stream).await.map_err(|error| match error {
+                            CollectError::Stream(err) => err,
+                            CollectError::Accumulator(err) => {
+                                ClientError::Protocol(err.to_string())
+                            }
+                        }),
+                        Err(err) => Err(err),
+                    }
                 }
             }
         };
-        RequirementResult::Llm(result)
+        // Biased: an already-cancelled token short-circuits before the client
+        // is even called. The placeholder error never reaches the machine —
+        // the driver's post-batch cancel re-check settles this requirement as
+        // a never-resume and discards the resolution (see `drain`).
+        tokio::select! {
+            biased;
+            _ = ctx.cancellation().cancelled() => RequirementResult::Llm(Err(
+                ClientError::Other("llm call interrupted: run context cancelled".to_owned()),
+            )),
+            result = call => RequirementResult::Llm(result),
+        }
     }
 }
 
@@ -384,15 +411,24 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::ApprovalInteractionHandler;
-    use crate::agent::{
-        AgentId, ApprovalDecision, ApprovalRequirement, InteractionHandler, PermissionCategory,
-        PermissionDecision, PermissionRequest, PermissionRisk, RequirementResult,
-        context::{BudgetLimits, RunContext, TraceNodeId},
-        id::{RunId, StepId},
-        interaction::{Interaction, InteractionResponse},
+    use super::{ApprovalInteractionHandler, LlmClientHandler};
+    use crate::{
+        agent::{
+            AgentId, ApprovalDecision, ApprovalRequirement, InteractionHandler, LlmHandler,
+            LlmStepMode, PermissionCategory, PermissionDecision, PermissionRequest, PermissionRisk,
+            RequirementResult,
+            context::{BudgetLimits, RunContext, TraceNodeId},
+            id::{RunId, StepId},
+            interaction::{Interaction, InteractionResponse},
+        },
+        client::{Capability, ChatRequest, ClientError, LlmClient, Response},
+        conversation::ToolCallId,
+        stream::StreamEvent,
     };
-    use crate::conversation::ToolCallId;
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn run_id() -> RunId {
         "018f0d9c-7b6a-7c12-8f31-1234567890f1"
@@ -536,6 +572,97 @@ mod tests {
         assert_eq!(
             fulfilled(&handler, &choice).await,
             InteractionResponse::Choice(0)
+        );
+    }
+
+    /// An [`LlmClient`] whose calls never complete, so a fulfill only returns
+    /// through the cancellation race.
+    struct BlockingClient {
+        capability: Capability,
+    }
+
+    #[async_trait]
+    impl LlmClient for BlockingClient {
+        fn capability(&self) -> &Capability {
+            &self.capability
+        }
+
+        async fn chat(&self, _request: ChatRequest) -> Result<Response, ClientError> {
+            futures::future::pending().await
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError> {
+            futures::future::pending().await
+        }
+    }
+
+    fn chat_request() -> ChatRequest {
+        ChatRequest {
+            model: "test-model".to_owned(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            system: None,
+            max_tokens: 16,
+            temperature: None,
+            stream: false,
+            provider_extras: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_client_handler_returns_promptly_when_cancelled_mid_flight() {
+        // The client never answers: without the cancellation race the fulfill
+        // would hang forever (M4-5: cancel latency is bounded by signal
+        // delivery, not by model latency).
+        let handler = LlmClientHandler::new(Arc::new(BlockingClient {
+            capability: Capability::default(),
+        }));
+        let ctx = context();
+        let canceller = ctx.cancellation().clone();
+        let wake = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            canceller.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            handler.fulfill(&chat_request(), LlmStepMode::NonStreaming, &ctx),
+        )
+        .await
+        .expect("a mid-flight cancel must unblock the fulfill");
+        wake.await.expect("canceller task");
+
+        let RequirementResult::Llm(Err(error)) = result else {
+            panic!("a cancelled call returns an in-family Llm error, got {result:?}");
+        };
+        assert!(
+            error.to_string().contains("cancelled"),
+            "the early return explains the cancellation, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_client_handler_short_circuits_a_pre_cancelled_context() {
+        // An already-cancelled token must not even start the client call.
+        let handler = LlmClientHandler::new(Arc::new(BlockingClient {
+            capability: Capability::default(),
+        }));
+        let ctx = context();
+        ctx.cancellation().cancel();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            handler.fulfill(&chat_request(), LlmStepMode::Streaming, &ctx),
+        )
+        .await
+        .expect("a pre-cancelled context short-circuits");
+
+        assert!(
+            matches!(result, RequirementResult::Llm(Err(_))),
+            "a pre-cancelled context returns an in-family Llm error, got {result:?}"
         );
     }
 

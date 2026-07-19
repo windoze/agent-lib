@@ -235,23 +235,42 @@ pub trait ExternalSessionHandler: Send + Sync {
 /// Outcome of draining one machine to the end of a turn.
 ///
 /// Carries the notifications produced across the whole drain (the driver simply
-/// forwards them; see migration doc §12 decision C) and the terminal
-/// [`LoopCursor`] the machine came to rest on ([`LoopCursor::Done`] or
-/// [`LoopCursor::Error`]).
+/// forwards them; see migration doc §12 decision C) and the [`LoopCursor`] the
+/// machine came to rest on, plus whether the drain was cut short by
+/// cancellation:
+///
+/// - A *natural* end rests on a terminal cursor ([`LoopCursor::Done`] or
+///   [`LoopCursor::Error`]) and reports `cancelled() == false`.
+/// - A *cancelled* drain closes the in-flight turn through the machine's
+///   never-resume path and stops driving; the machine's own rest state after
+///   that closure is [`LoopCursor::Idle`] on the reference machines, and the
+///   outcome reports `cancelled() == true`. Callers must consult
+///   [`cancelled`](Self::cancelled) rather than the cursor alone to tell a
+///   cancelled turn apart from a completed one (M4-5 / M-ERR-2).
 #[derive(Clone, Debug)]
 pub struct TurnDone {
     notifications: Vec<Notification>,
     cursor: LoopCursor,
+    cancelled: bool,
 }
 
 impl TurnDone {
-    /// Creates a turn result from the drained notifications and terminal cursor.
+    /// Creates a turn result from the drained notifications and final cursor
+    /// (a natural, non-cancelled end of the drain).
     #[must_use]
     pub const fn new(notifications: Vec<Notification>, cursor: LoopCursor) -> Self {
         Self {
             notifications,
             cursor,
+            cancelled: false,
         }
+    }
+
+    /// Marks whether the drain ended through cancellation.
+    #[must_use]
+    pub fn with_cancelled(mut self, cancelled: bool) -> Self {
+        self.cancelled = cancelled;
+        self
     }
 
     /// Returns the notifications produced over the whole drain, in order.
@@ -260,10 +279,17 @@ impl TurnDone {
         &self.notifications
     }
 
-    /// Returns the terminal cursor the machine came to rest on.
+    /// Returns the cursor the machine came to rest on (terminal on a natural
+    /// end; the machine's post-cancel rest state on a cancelled drain).
     #[must_use]
     pub const fn cursor(&self) -> &LoopCursor {
         &self.cursor
+    }
+
+    /// Returns whether the drain was cut short by cancellation.
+    #[must_use]
+    pub const fn cancelled(&self) -> bool {
+        self.cancelled
     }
 
     /// Consumes the result and returns the drained notifications.
@@ -359,6 +385,20 @@ impl Pop for ScopePop<'_, '_> {
 /// *total*: a requirement with no handler and no parent is an
 /// [`AgentError::UnhandledRequirement`].
 ///
+/// # Cancellation
+///
+/// Cancellation is observed at two points per loop iteration: before a batch
+/// is fulfilled, and again right after the batch-fulfil await returns — a cancel
+/// that landed while a batch was in flight stops the drive before any
+/// resolution is fed back or further work is requested. Either way, *every*
+/// outstanding requirement of the interrupted batch is settled as a
+/// never-resume: recorded on the trace with a
+/// [`NeverResumed`](RequirementDisposition::NeverResumed) disposition and
+/// abandoned through the machine's never-resume path. The returned
+/// [`TurnDone`] reports `cancelled() == true`; the cursor it carries is the
+/// machine's post-cancel rest state (`Idle` on the reference machines), not a
+/// terminal `Done`/`Error`.
+///
 /// # Errors
 ///
 /// Returns [`AgentError::UnhandledRequirement`] when a requirement reaches the
@@ -377,6 +417,7 @@ where
     M: AgentMachine + ?Sized,
 {
     let mut notifications = Vec::new();
+    let mut cancelled = false;
 
     let mut outcome = machine.step(StepInput::External(input));
     notifications.append(&mut outcome.notifications);
@@ -400,18 +441,35 @@ where
         // never-resume path (`cancel_pending`), settling the cursor to a
         // feedable rest state, so we stop driving this turn once it lands. A
         // never-resume is a real event that mutates the underlying Conversation
-        // (§6.3), so it is recorded in the trace, settled at the performing
-        // layer (`resolved_at_scope == 0`) with a `NeverResumed` disposition.
+        // (§6.3), so *every* outstanding requirement of the batch is recorded
+        // in the trace, settled at the performing layer (`resolved_at_scope ==
+        // 0`) with a `NeverResumed` disposition — not just the one the `Abandon`
+        // targets (M4-5: a partially traced batch violates the "every
+        // requirement settles exactly once" contract).
         if ctx.is_cancelled() {
-            if let Some(requirement) = pending.first() {
-                record_requirement(ctx, requirement, 0, RequirementDisposition::NeverResumed);
-                let mut outcome = machine.step(StepInput::Abandon(requirement.id));
-                notifications.append(&mut outcome.notifications);
-            }
+            settle_cancelled(machine, ctx, pending.iter(), &mut notifications);
+            cancelled = true;
             break;
         }
 
         let resolutions = fulfill_batch(&pending, scope, parent.as_deref_mut(), ctx).await?;
+
+        // Re-check cancellation between the batch settling and feeding the
+        // resolutions back (M4-5): a cancel that landed while the batch was in
+        // flight stops the turn here instead of advancing one more batch. The
+        // fulfilled results are deliberately never fed back, so every one is a
+        // never-resume and is traced as such; the `Abandon` steps then close
+        // the turn through the same never-resume path as above.
+        if ctx.is_cancelled() {
+            settle_cancelled(
+                machine,
+                ctx,
+                resolutions.iter().map(|resolved| &resolved.resolution),
+                &mut notifications,
+            );
+            cancelled = true;
+            break;
+        }
 
         pending = Vec::new();
         for Resolved {
@@ -434,7 +492,63 @@ where
         }
     }
 
-    Ok(TurnDone::new(notifications, machine.cursor().clone()))
+    Ok(TurnDone::new(notifications, machine.cursor().clone()).with_cancelled(cancelled))
+}
+
+/// A settled requirement reference used on the cancel path: either the
+/// outstanding [`Requirement`] itself (cancel observed before fulfilment) or
+/// its fulfilled-but-never-resumed [`RequirementResolution`] (cancel observed
+/// right after the batch settled).
+trait SettledRef {
+    /// The settled requirement's id.
+    fn id(&self) -> RequirementId;
+    /// Records the never-resume in the trace at the performing layer (hop 0).
+    fn record_never_resumed(&self, ctx: &RunContext);
+}
+
+impl SettledRef for &Requirement {
+    fn id(&self) -> RequirementId {
+        self.id
+    }
+
+    fn record_never_resumed(&self, ctx: &RunContext) {
+        record_requirement(ctx, self, 0, RequirementDisposition::NeverResumed);
+    }
+}
+
+impl SettledRef for &RequirementResolution {
+    fn id(&self) -> RequirementId {
+        self.id
+    }
+
+    fn record_never_resumed(&self, ctx: &RunContext) {
+        record_requirement_resolution(ctx, self, 0, RequirementDisposition::NeverResumed);
+    }
+}
+
+/// Settles every outstanding requirement of a cancelled batch: records each as
+/// `NeverResumed` and feeds the machine one `Abandon` per id.
+///
+/// The first `Abandon` closes the whole in-flight turn through the machine's
+/// never-resume path; further `Abandon` steps for ids that closure already
+/// settled are soft-rejected no-ops (M4-4), leaving state untouched. Recording
+/// still happens for *every* requirement, keeping the "each requirement
+/// settles exactly once" trace contract on multi-requirement batches (M4-5).
+fn settle_cancelled<M, I>(
+    machine: &mut M,
+    ctx: &RunContext,
+    settled: I,
+    notifications: &mut Vec<Notification>,
+) where
+    M: AgentMachine + ?Sized,
+    I: IntoIterator,
+    I::Item: SettledRef,
+{
+    for item in settled {
+        item.record_never_resumed(ctx);
+        let mut outcome = machine.step(StepInput::Abandon(item.id()));
+        notifications.append(&mut outcome.notifications);
+    }
 }
 
 /// Records a settled requirement (identified by its own `Requirement`) in the
@@ -1278,12 +1392,16 @@ mod tests {
         tool: Option<CountingToolHandler>,
         interaction: Option<CountingInteractionHandler>,
         delay_tool: Option<DelayToolHandler>,
+        cancelling_tool: Option<CancellingToolHandler>,
         external: Option<CountingExternalSessionHandler>,
     }
 
     impl HandlerScope for TestScope {
         fn tool(&self) -> Option<&dyn ToolHandler> {
             if let Some(handler) = self.delay_tool.as_ref() {
+                return Some(handler as &dyn ToolHandler);
+            }
+            if let Some(handler) = self.cancelling_tool.as_ref() {
                 return Some(handler as &dyn ToolHandler);
             }
             self.tool
@@ -1614,6 +1732,7 @@ mod tests {
         .await
         .expect("drain completes");
         assert!(matches!(done.cursor(), LoopCursor::Done(_)));
+        assert!(!done.cancelled(), "a natural end is not marked cancelled");
 
         // The tool was settled in place by the emitting (inner) scope: hop 0.
         assert_eq!(
@@ -1640,15 +1759,112 @@ mod tests {
         // fulfilling it: a never-resume that must still be traced.
         ctx.cancellation().cancel();
 
-        drain(&mut machine, external_input(), &scope, None, &ctx)
+        let done = drain(&mut machine, external_input(), &scope, None, &ctx)
             .await
             .expect("cancelled drain closes the turn");
 
+        // The cancel outcome is distinguishable from a natural end (M4-5).
+        assert!(done.cancelled());
         // The requirement was never fulfilled by the handler.
         assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
         // The never-resume is recorded, settled at the performing layer (hop 0).
         assert_eq!(
             requirement_trace(&ctx, requirement_id_n(7), RequirementKindTag::Tool),
+            (0, RequirementDisposition::NeverResumed)
+        );
+    }
+
+    /// Fulfills a tool call successfully but cancels the run context while the
+    /// batch is in flight, so the driver's post-batch re-check observes it.
+    #[derive(Clone, Default)]
+    struct CancellingToolHandler {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolHandler for CancellingToolHandler {
+        async fn fulfill(
+            &self,
+            _call_id: ToolCallId,
+            call: &ToolCall,
+            ctx: &RunContext,
+        ) -> RequirementResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ctx.cancellation().cancel();
+            RequirementResult::Tool(Ok(ok_tool_response(call)))
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_records_never_resumed_for_every_outstanding_requirement_on_cancel() {
+        // A batch of three differently-kinded requirements, all locally
+        // fulfillable: cancelling must settle *every* one on the trace, not
+        // just the first (M4-5).
+        let tool = CountingToolHandler::default();
+        let interaction = CountingInteractionHandler::default();
+        let external = CountingExternalSessionHandler::default();
+        let scope = TestScope {
+            tool: Some(tool.clone()),
+            interaction: Some(interaction.clone()),
+            external: Some(external.clone()),
+            ..TestScope::default()
+        };
+        let mut machine = BatchMachine::new(vec![
+            tool_requirement(1, 0),
+            interaction_requirement(2),
+            external_requirement(3),
+        ]);
+        let ctx = run_context();
+        ctx.cancellation().cancel();
+
+        let done = drain(&mut machine, external_input(), &scope, None, &ctx)
+            .await
+            .expect("cancelled drain closes the turn");
+
+        assert!(done.cancelled());
+        // No handler ever ran.
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(interaction.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(external.calls.load(Ordering::SeqCst), 0);
+        // Every outstanding requirement has its own never-resumed trace node.
+        for (n, tag) in [
+            (1, RequirementKindTag::Tool),
+            (2, RequirementKindTag::Interaction),
+            (3, RequirementKindTag::ExternalSession),
+        ] {
+            assert_eq!(
+                requirement_trace(&ctx, requirement_id_n(n), tag),
+                (0, RequirementDisposition::NeverResumed)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_rechecks_cancellation_after_fulfill_and_never_resumes_the_settled_batch() {
+        // The cancel lands *while the batch is in flight*: the handler
+        // completes successfully but flags the token. The post-batch re-check
+        // must stop the drive before the resolution is resumed (M4-5).
+        let tool = CancellingToolHandler::default();
+        let scope = TestScope {
+            cancelling_tool: Some(tool.clone()),
+            ..TestScope::default()
+        };
+        let mut machine = BatchMachine::new(vec![tool_requirement(4, 0)]);
+        let ctx = run_context();
+
+        let done = drain(&mut machine, external_input(), &scope, None, &ctx)
+            .await
+            .expect("cancel-after-fulfill drain closes the turn");
+
+        assert!(done.cancelled());
+        // The handler ran (the batch was fulfilled) ...
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+        // ... but the resolution was never fed back to the machine.
+        assert!(machine.resume_order.is_empty());
+        // And the fulfilled-but-discarded requirement is traced never-resumed,
+        // not resumed.
+        assert_eq!(
+            requirement_trace(&ctx, requirement_id_n(4), RequirementKindTag::Tool),
             (0, RequirementDisposition::NeverResumed)
         );
     }

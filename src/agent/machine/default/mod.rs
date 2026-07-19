@@ -486,8 +486,12 @@ impl DefaultAgentMachine {
 
     /// Opens a fresh user turn and blocks on one `NeedLlm` requirement.
     fn begin_user_turn(&mut self, user: AgentUserInput) -> Result<StepOutcome, StepError> {
-        // A fresh user message is only feedable at a rest boundary (`Idle`, or
-        // the terminal `Done`/`Error` a previous turn settled on). Mid-turn —
+        // A fresh user message is only feedable at a rest boundary (`Idle`, the
+        // terminal `Done`/`Error` a previous turn settled on, or the transient
+        // `CancelRecovery` a persisted snapshot may have captured between the
+        // never-resume closure and the settle back to `Idle` — the scratch
+        // rebuild already maps it to `None`, so it is a rest boundary too,
+        // M4-5). Mid-turn —
         // while the machine is parked on an LLM step, a tool batch, an approval,
         // or a reconfig — a second user message would collide with the live
         // pending turn (`Conversation::begin_turn` rejects a second open
@@ -496,7 +500,10 @@ impl DefaultAgentMachine {
         // pivot at a legal boundary). Checked before any state is touched.
         if !matches!(
             self.state.loop_cursor(),
-            LoopCursor::Idle | LoopCursor::Done(_) | LoopCursor::Error(_)
+            LoopCursor::Idle
+                | LoopCursor::Done(_)
+                | LoopCursor::Error(_)
+                | LoopCursor::CancelRecovery(_)
         ) {
             let kind = self.state.loop_cursor().kind();
             return Err(StepError::Rejected(StepRejectReason::TurnInProgress(
@@ -521,13 +528,15 @@ impl DefaultAgentMachine {
         );
 
         // A completed or errored turn settles the cursor at a terminal rest state
-        // (`Done` / `Error`). The same machine is reused across turns, so a new
+        // (`Done` / `Error`), and a restored snapshot may have captured the
+        // transient `CancelRecovery` marker mid-settle (M4-5). The same machine
+        // is reused across turns, so a new
         // user message supersedes that finished turn: reset the cursor to the
         // feedable `Idle` before opening the next one. (A fresh machine already
         // starts at `Idle`, so this is a no-op for the first turn.)
         if matches!(
             self.state.loop_cursor(),
-            LoopCursor::Done(_) | LoopCursor::Error(_)
+            LoopCursor::Done(_) | LoopCursor::Error(_) | LoopCursor::CancelRecovery(_)
         ) {
             self.state
                 .transition_cursor(LoopCursor::Idle)

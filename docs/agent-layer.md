@@ -192,7 +192,7 @@ handler(`src/agent/drive.rs`)兑现或逐级向上 pop;取消是"永不兑现某
 |---|---|---|
 | **审批**(human-in-loop) | 机器 `step` 交回 `Requirement{ kind: NeedInteraction }`;`&mut self` 天然挂起,不结束任何流 | `InteractionHandler` 兑现:attended scope 接人类 UI,unattended scope 接 `ToolApprovalPolicy`;本层不挂 handler 则 **pop** 到外层。结果经 `StepInput::Resume(RequirementResult::Interaction(..))` 回灌 |
 | **pivot**(用户改向) | 不是特殊通道,而是两次 step 之间**多喂一个** `StepInput::External(AgentInput::Pivot(..))`;在合法 step 边界注入 `user` 消息(见 §4) | 由 driver / session 决定何时喂;库内不再排队(`interject` / pivot queue 已删) |
-| **cancel** | 不是单独的取消流,而是对在途 `Requirement` 喂 `StepInput::Abandon(id)`,即 **never-resume** | driver 观察到 `RunContext.cancel` 后 abandon 未兑现 requirement,并调 `Conversation::cancel_pending` 闭合 pending;闭合后仍可再喂(硬性验收标准) |
+| **cancel** | 不是单独的取消流,而是对在途 `Requirement` 喂 `StepInput::Abandon(id)`,即 **never-resume** | driver 在批次 fulfil 前与 fulfil 返回后(resume 前)两个观测点检查 `RunContext.cancel`(M4-5),命中即对批内**全部**未兑现 requirement 逐一 `NeverResumed` 留痕并 abandon,机器经 `Conversation::cancel_pending` 闭合 pending;闭合后仍可再喂(硬性验收标准);`TurnDone.cancelled()` 区分取消与自然结束 |
 
 **统一带来的三个好处**(正是 push 契约做不到的,见 `agent-effect-model.md` §1):
 

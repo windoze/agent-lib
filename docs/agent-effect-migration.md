@@ -322,6 +322,13 @@ cancel 不是单独机制,是 handler 行为(effect-model §6.3)。落地:
 > 决定 Abandon 哪些 requirement),但它**不再**是 cancel 的实现主体——实现主体是 never-resume +
 > `cancel_pending`。现有 `CancelRecoveryCursor` / `CancelRecoveryReason` 正好承接这个状态。
 
+> 落地修正(M4-5):driver 在**两个点**观测取消——批次 fulfil 前与 fulfil 返回后(resume
+> 前)——任一观测点命中时,批次内**全部** outstanding requirement 逐一按 `NeverResumed`
+> 留痕并 `Abandon`(不是只处理第一个);参考 LLM handler 把令牌接入在途调用(`select!`),
+> 取消延迟以信号投递为界。返回的 `TurnDone` 以 `cancelled()` 区分取消与自然结束(取消的
+> cursor 是 rest 态 `Idle`,非 terminal `Done|Error`)。`CancelRecovery` 是瞬态标记,持久化
+> 快照若恰好捕获它,恢复后的 turn 边界把它当 rest 态重置为 `Idle`(仍可 feed)。
+
 **multishot 不做**;多路径一律 `Conversation::fork_at` → 新 Agent 承载(effect-model §6.2)。
 本迁移不引入任何 continuation 复制设施。
 

@@ -372,6 +372,15 @@ impl Agent {
         }
 
         match done.cursor() {
+            // A cancelled drain rests on the machine's post-cancel rest state
+            // (`Idle`), not a terminal cursor (M4-5): surface an honest cancel
+            // error instead of the misleading "non-terminal cursor" one. A
+            // dedicated facade-level cancellation surface lands with the cancel
+            // entry points in M5-4.
+            cursor if done.cancelled() => Err(FacadeError::Agent(AgentError::Other(format!(
+                "agent run cancelled (cursor: {:?})",
+                cursor.kind()
+            )))),
             // A per-turn step-limit stop is a normal terminal on the machine
             // (M4-4); the facade surfaces it as its structured limit error.
             LoopCursor::Done(done_cursor)

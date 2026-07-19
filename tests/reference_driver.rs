@@ -643,18 +643,22 @@ async fn reference_cancel_during_tool_wait_abandons_turn() {
         &ids,
         agent_state(&ids, agent_spec_with_tools(&ids, vec![weather_tool()])),
     );
-    // The LLM step cancels the context as it returns a tool_use response; the tool
-    // handler must never run because cancellation abandons the batch first.
+    // The tool handler cancels the context while the tool batch is in flight:
+    // the call executes (an in-flight side effect cannot be un-run), but the
+    // driver's post-batch re-check (M4-5) discards its resolution and settles
+    // the requirement as a never-resume instead of resuming the machine with it.
     let scope = TestScope::builder()
-        .llm(Arc::new(CancelOnCall::before(
-            ScriptedLlmHandler::from_steps([LlmStep::tool_use(vec![tool_call(
+        .llm(Arc::new(ScriptedLlmHandler::from_steps([
+            LlmStep::tool_use(vec![tool_call(
                 "call-weather",
                 "get_weather",
                 json!({ "city": "Shanghai" }),
             )])
-            .with_usage(usage(5, 2))]),
+            .with_usage(usage(5, 2)),
+        ])))
+        .tool(Arc::new(CancelOnCall::before(
+            ScriptedToolHandler::from_steps([ToolStep::ok("call-weather", "sunny")]),
         )))
-        .tool(Arc::new(PanicOnCall::new()))
         .build();
     let ctx = root_context(&ids);
 
@@ -662,9 +666,11 @@ async fn reference_cancel_during_tool_wait_abandons_turn() {
         .await
         .expect("a cancelled turn drains to a rest state");
 
-    // Never-resume: the emitted tool batch is abandoned, the cursor settles to a
-    // feedable Idle, and the pending turn is coherent (its tool_use closed by a
-    // synthesized cancelled result) with nothing committed to history.
+    // The cancel outcome is distinguishable from a natural end (M4-5).
+    assert!(done.cancelled());
+    // Never-resume: the fulfilled tool batch is abandoned, the cursor settles to
+    // a feedable Idle, and the pending turn is coherent (its tool_use closed by
+    // a synthesized cancelled result) with nothing committed to history.
     assert!(matches!(done.cursor(), LoopCursor::Idle));
     assert_eq!(machine.state().loop_cursor().kind(), LoopCursorKind::Idle);
     let conversation = machine.state().conversation();
@@ -675,7 +681,8 @@ async fn reference_cancel_during_tool_wait_abandons_turn() {
     assert_eq!(pending.tool_calls().len(), 1);
     assert!(conversation.turns().is_empty());
 
-    // The turn never resumes, so no tool ran and no step boundary was emitted.
+    // The turn never resumes: the tool's real result was discarded on the
+    // never-resume path, so no tool-finished or step boundary was emitted.
     assert!(done.notifications().iter().all(|event| !matches!(
         event,
         Notification::ToolCallFinished(_) | Notification::StepBoundary(_)

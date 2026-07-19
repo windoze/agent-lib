@@ -112,6 +112,7 @@ async fn drive_streamed(
     ctx: &RunContext,
 ) -> Result<TurnDone, AgentError> {
     let mut notifications = Vec::new();
+    let mut cancelled = false;
 
     let mut pending = {
         let mut guard = machine.borrow_mut();
@@ -132,21 +133,43 @@ async fn drive_streamed(
             )));
         }
 
-        // Cancellation is a downward "should stop" signal (migration doc §7): abandon
-        // the whole in-flight turn through the machine's never-resume path and stop
-        // driving. The streaming drop path abandons synchronously instead (see
-        // [`AgentRunStream::abandon`]); this mirrors `drain` for a cancelled `ctx`.
+        // Cancellation is a downward "should stop" signal (migration doc §7): settle
+        // *every* outstanding requirement of the batch as a never-resume (traced,
+        // then abandoned) and stop driving — mirroring `drain` (M4-5). The
+        // streaming drop path abandons synchronously instead (see
+        // [`AgentRunStream::abandon`]).
         if ctx.is_cancelled() {
-            if let Some(requirement) = pending.first() {
+            for requirement in &pending {
                 record_requirement(ctx, requirement, 0, RequirementDisposition::NeverResumed);
                 let mut guard = machine.borrow_mut();
                 let mut outcome = guard.step(StepInput::Abandon(requirement.id));
                 notifications.append(&mut outcome.notifications);
             }
+            cancelled = true;
             break;
         }
 
         let resolutions = fulfill_batch(&pending, scope, None, ctx).await?;
+
+        // Re-check cancellation between the batch settling and feeding the
+        // resolutions back, exactly like `drain`: a cancel that landed while
+        // the batch was in flight stops here; the fulfilled results are never
+        // fed back and are traced as never-resumed.
+        if ctx.is_cancelled() {
+            for Resolved { resolution, .. } in &resolutions {
+                record_requirement_resolution(
+                    ctx,
+                    resolution,
+                    0,
+                    RequirementDisposition::NeverResumed,
+                );
+                let mut guard = machine.borrow_mut();
+                let mut outcome = guard.step(StepInput::Abandon(resolution.id));
+                notifications.append(&mut outcome.notifications);
+            }
+            cancelled = true;
+            break;
+        }
 
         pending = Vec::new();
         for Resolved {
@@ -168,7 +191,7 @@ async fn drive_streamed(
     }
 
     let cursor = machine.borrow().cursor().clone();
-    Ok(TurnDone::new(notifications, cursor))
+    Ok(TurnDone::new(notifications, cursor).with_cancelled(cancelled))
 }
 
 /// Opens one streamed agent turn over `agent`, returning an [`AgentRunStream`].
@@ -275,6 +298,15 @@ pub(super) fn start(
             return Err(FacadeError::ApprovalDenied);
         }
         match done.cursor() {
+            // A cancelled drain rests on the machine's post-cancel rest state
+            // (`Idle`), not a terminal cursor (M4-5): surface an honest cancel
+            // error instead of the misleading "non-terminal cursor" one. A
+            // dedicated facade-level cancellation surface lands with the cancel
+            // entry points in M5-4.
+            cursor if done.cancelled() => Err(FacadeError::Agent(AgentError::Other(format!(
+                "agent run cancelled (cursor: {:?})",
+                cursor.kind()
+            )))),
             // A per-turn step-limit stop is a normal terminal on the machine
             // (M4-4); the facade surfaces it as its structured limit error,
             // matching `run_full`.
@@ -654,15 +686,27 @@ impl LlmHandler for StreamingTapHandler {
         &self,
         request: &ChatRequest,
         _mode: LlmStepMode,
-        _ctx: &RunContext,
+        ctx: &RunContext,
     ) -> RequirementResult {
-        let mut request = request.clone();
-        request.stream = true;
-        let result = match self.client.chat_stream(request).await {
-            Ok(stream) => self.fold(stream).await,
-            Err(error) => Err(error),
+        let call = async {
+            let mut request = request.clone();
+            request.stream = true;
+            match self.client.chat_stream(request).await {
+                Ok(stream) => self.fold(stream).await,
+                Err(error) => Err(error),
+            }
         };
-        RequirementResult::Llm(result)
+        // Same cancellation wiring as the reference `LlmClientHandler` (M4-5):
+        // a cancelled run drops the in-flight stream instead of waiting it
+        // out; the placeholder error is discarded by the driver's post-batch
+        // cancel re-check, which settles the requirement as a never-resume.
+        tokio::select! {
+            biased;
+            _ = ctx.cancellation().cancelled() => RequirementResult::Llm(Err(
+                ClientError::Other("llm call interrupted: run context cancelled".to_owned()),
+            )),
+            result = call => RequirementResult::Llm(result),
+        }
     }
 }
 

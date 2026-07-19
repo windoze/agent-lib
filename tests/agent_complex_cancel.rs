@@ -334,10 +334,12 @@ fn never_resumed_requirement_ids(ctx: &RunContext) -> Vec<RequirementId> {
 /// [`InteractionDecision::Cancel`] and proves the run keeps going: the dangerous
 /// tool never runs, a following `safe_read` does, the turn commits with a final
 /// answer, and the context is still live with no never-resume in the trace. Phase
-/// B — a fresh machine over its own store — cancels the run context right after
-/// the model emits a `safe_read` call, so the reference driver abandons that
-/// outstanding `NeedTool`: the tool handler never runs, the context reads
-/// cancelled, and the trace records the tool requirement as `NeverResumed`.
+/// B — a fresh machine over its own store — cancels the run context as the first
+/// LLM step resolves, so the driver's post-batch re-check (M4-5) settles the
+/// fulfilled-but-in-flight `NeedLlm` as a never-resume instead of resuming the
+/// machine with it: the model's answer never enters the conversation, the tool
+/// it asked for never becomes a requirement, and the turn is discarded wholesale
+/// on the LLM abandon path.
 #[tokio::test]
 async fn complex_approval_cancel_does_not_cancel_context_unless_driver_cancels() {
     // ----- phase A: approval Cancel does not cancel the context ------------
@@ -425,10 +427,12 @@ async fn complex_approval_cancel_does_not_cancel_context_unless_driver_cancels()
     let store_b = Arc::new(MockPlanBlackboardStore::new(context_cancel_plan_id()));
     let handler_b = complex_tool_handler(Arc::clone(&store_b));
 
-    // The model emits a benign tool call; the `CancelOnCall::after` wrapper then
-    // cancels the run context as that LLM step resolves, modelling a driver stop
-    // that lands with a tool call outstanding. The scripted step never needs a
-    // second call: the outstanding tool is abandoned before the model resumes.
+    // The model's answer (asking for a benign tool call) resolves while the
+    // `CancelOnCall::after` wrapper cancels the run context, modelling a driver
+    // stop that lands with the LLM batch fulfilled but not yet resumed. The
+    // scripted step never needs a second call: the fulfilled LLM requirement is
+    // never-resumed by the post-batch re-check before the machine can emit the
+    // tool requirement.
     let cancel_llm = Arc::new(CancelOnCall::after(ScriptedLlmHandler::from_steps([
         LlmStep::tool_use(vec![tool_call("b-safe", SAFE_READ, json!({}))]),
     ])));
@@ -466,34 +470,33 @@ async fn complex_approval_cancel_does_not_cancel_context_unless_driver_cancels()
         "the model was not asked to resume after the abandon"
     );
 
-    // The outstanding tool was abandoned on the never-resume path, so its handler
-    // never ran — the store-mutating `safe_read` never touched the store.
+    // The cancelled LLM step's answer never entered the conversation: the tool
+    // it asked for was never emitted, so its handler never ran — the
+    // store-mutating `safe_read` never touched the store.
     assert_tool_executions(&handler_b, SAFE_READ, 0);
     assert_board_messages(&store_b, &[]);
 
     // The trace tells the two cancels apart: phase B abandons exactly one
-    // requirement, and it is the outstanding tool, settled at the performing
-    // layer.
+    // requirement, and it is the in-flight LLM step, settled as a never-resume
+    // at the performing layer (M4-5: the fulfilled batch is discarded, not
+    // resumed).
     let abandoned = never_resumed_requirement_ids(&ctx_b);
     assert_eq!(
         abandoned.len(),
         1,
-        "a context cancel abandons exactly the outstanding requirement, found {abandoned:?}"
+        "a context cancel abandons exactly the in-flight requirement, found {abandoned:?}"
     );
     assert_trace(&ctx_b)
         .requirement(abandoned[0])
-        .tag(RequirementKindTag::Tool)
+        .tag(RequirementKindTag::Llm)
         .resolved_at_scope(0)
         .never_resumed();
 
-    // The abandoned tool phase leaves a *coherent* but uncommitted turn: the
-    // never-resume synthesizes a `Cancelled` result for the outstanding call (so
-    // there is no dangling tool_use and no open call), yet the turn never closes
-    // on a final answer, so it stays pending rather than committing.
+    // The LLM abandon discards the pending turn wholesale (`DiscardTurn`): the
+    // discarded answer's tool_use never enters the conversation at all, so the
+    // store stays clean and nothing is left pending.
     let machine_b = harness_b.into_machine();
     assert_conversation(machine_b.state().conversation())
         .committed_turns(0)
-        .pending_present()
-        .open_call_count(0)
-        .tool_result_status("b-safe", ToolStatus::Cancelled);
+        .pending_none();
 }

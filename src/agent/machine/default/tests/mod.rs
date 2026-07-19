@@ -453,6 +453,38 @@ fn abandon_streaming_step_discards_turn_and_settles_idle() {
 }
 
 #[test]
+fn user_message_after_a_restored_cancel_recovery_marker_opens_a_new_turn() {
+    // A persisted snapshot can capture the cursor between the never-resume
+    // closure and the settle back to `Idle` — the transient `CancelRecovery`
+    // marker. A machine restored from it must stay feedable (M4-5): the marker
+    // is a rest boundary, not a mid-turn park.
+    let mut machine = machine(LlmStepMode::NonStreaming);
+    park_on_need_llm(&mut machine);
+    machine
+        .state
+        .transition_cursor(LoopCursor::cancel_recovery(
+            Some(step_id()),
+            crate::agent::CancelRecoveryReason::LlmInterrupted,
+        ))
+        .expect("streaming step -> cancel recovery is a legal edge");
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::CancelRecovery);
+
+    let outcome = machine.step(StepInput::external(second_user_input()));
+
+    // Not soft-rejected: the stale pending is discarded and a fresh turn opens.
+    assert!(!outcome.is_rejected());
+    assert!(outcome.is_quiescent());
+    assert_eq!(outcome.requirements.len(), 1);
+    let RequirementKind::NeedLlm { .. } = &outcome.requirements[0].kind else {
+        panic!("a new user turn must emit NeedLlm");
+    };
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    let conversation = machine.state().conversation();
+    assert!(conversation.pending().is_some());
+    assert!(conversation.turns().is_empty());
+}
+
+#[test]
 fn abandon_streaming_step_then_user_message_opens_new_turn() {
     let mut machine = machine(LlmStepMode::NonStreaming);
     let id = park_on_need_llm(&mut machine);

@@ -1145,7 +1145,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `LoopLimitExceeded`）；游标转移表新增 `(Done|Error) → Error` 边；reconfig abandon 从
   DiscardTurn 变为 commit_pending（行为修正）。
 
-### M4-5 [TODO] 取消语义：延迟有界 + `TurnDone` 契约修正（M-ERR-2）
+### M4-5 [DONE] 取消语义：延迟有界 + `TurnDone` 契约修正（M-ERR-2）
 
 上下文：
 
@@ -1165,6 +1165,23 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：飞行中的 LLM requirement 期间触发取消，drain 在当前批次 settle 后立即停，不再推进下一批；全部 outstanding requirement 有 trace 记录。
 - 单元测试：取消路径返回的 outcome 可与自然结束区分。
 - `cargo test -p agent-lib --lib agent::drive` 全过；`docs/agent-effect-model.md` §8 同步。
+
+完成记录：
+
+- **取消观测点收紧（延迟有界）**：`drain`（`src/agent/drive.rs`）与镜像 `drive_streamed`（`src/facade/agent/stream.rs`）在 `fulfill_batch` 返回后、resume 前新增第二次取消检查——飞行中被取消的批次在回灌前截停，已兑现结果被有意丢弃并按 never-resume 留痕，turn 不再多推进一批。
+- **批内全部 settle**：两个观测点命中取消时，批次内**每一个** outstanding requirement 逐一以 `NeverResumed`（hop 0）记录并 `StepInput::Abandon`——新增共享 `settle_cancelled` + crate 私有 `SettledRef` 抽象，覆盖 pre-fulfill（`&Requirement`）与 post-fulfill（`&RequirementResolution`）两种引用形态。首个 Abandon 经机器 never-resume 路径闭合整轮，同批后续 Abandon 被 M4-4 软拒绝为 no-op（状态不变）；trace 留痕一个不落，恢复 §8「每个 requirement 恰好以一种方式 settle 并记录」。
+- **`TurnDone` 契约修正（选型：`cancelled: bool` 字段而非独立 outcome 变体——`TurnDone` 本就是 struct，加字段爆炸半径最小）**：`new` 保持 2 参（默认 false），新增 `with_cancelled(bool)` builder 与 `cancelled()` 访问器；rustdoc 改为真实契约——自然结束 → terminal `Done|Error` 且 `cancelled()==false`；取消 → 机器 never-resume 后的 rest 态（参考机器 `Idle`）且 `cancelled()==true`。facade 两条消费路径（`agent.rs` run_full、`stream.rs` drive future）match 首位加 `done.cancelled()` 守卫，取消返回措辞准确的 `"agent run cancelled (cursor: ...)"`，替代误导性的 "non-terminal cursor (Idle)"；专用 facade Cancelled 错误面归 M5-4（facade cancel 入口），注释已注明。
+- **参考 handler ctx 贯通**：`CancellationToken` 新增 `cancelled()` 异步等待原语——`CancellationState` 加 `tokio::sync::Notify`，`cancel()` 置位后 `notify_waiters()`；等待方收集祖先链（父取消可唤醒子等待，与 `is_cancelled` 语义一致），先 `Notified::enable()` 注册再复查 flag 闭合 check-then-park 竞态，`select_all` 等待任一环。`LlmClientHandler::fulfill`（class-wide：facade `StreamingTapHandler::fulfill` 同）用 biased `tokio::select!` 竞争令牌与整个 LLM 调用（含流式 fold）；取消即弃在途请求，返回 in-family `Llm(Err(ClientError::Other("...cancelled")))` 占位——该值必被 drain 复查丢弃（取消单调），不进机器；与 M1-2 超时设施正交（超时管 provider 无响应，令牌管宿主取消）。tool/interaction/reconfig handler 有意不中途打断（半途副作用比有界等待更糟），rustdoc 注明。
+- **CancelRecovery restore 坑（选型：纳入重置，不动 serde 形状）**：`begin_user_turn` 的准入守卫与 `Done|Error → Idle` 重置均纳入 `CancelRecovery(_)`——它是 `finish_cancel` 两次 transition 之间的瞬态标记，持久化快照可能恰好捕获；scratch 重建本就把它映射为 `TurnScratch::None`，纳入后恢复机器在 turn 边界可正常 feed（遗留 pending 走既有 `Idle` 丢弃路径）。转移表 `(CancelRecovery, Idle)` 边本已存在，无需加边。
+- **测试**：
+  - cancel.rs 4 条：`cancelled()` 预取消即返、自身取消唤醒、祖先取消唤醒（父取消不置子 flag）、兄弟取消不唤醒。
+  - reference.rs 2 条：永不返回的 BlockingClient 飞行中取消有界返回（含 "cancelled" 字样）；预取消 ctx 短路（biased select 不发起调用）。
+  - drive.rs：`drain_records_never_resumed_for_every_outstanding_requirement_on_cancel`（tool/interaction/external 三个不同 kind 的 requirement 预取消，无 handler 被调、全部 NeverResumed、`done.cancelled()`）；`drain_rechecks_cancellation_after_fulfill_and_never_resumes_the_settled_batch`（handler 飞行中取消，machine 零 resume、记 NeverResumed 而非 Resumed——验证条件第一条）；既有 `drain_records_never_resumed_disposition_on_cancel` 补 cancelled 断言、`drain_records_resolved_at_scope...` 补 `!done.cancelled()`（验证条件第二条）。
+  - machine 1 条：`user_message_after_a_restored_cancel_recovery_marker_opens_a_new_turn`（模拟快照捕获 CancelRecovery + 遗留 pending，feed UserMessage 不软拒、新 turn 正常打开）。
+  - 集成测试按新契约更新 2 条（行为收紧的必然跟进，非 workaround）：`complex_approval_cancel_does_not_cancel_context_unless_driver_cancels` phase B 改断新契约（LLM 批次飞行中取消 → LLM requirement NeverResumed、答案不入会话、pending 整体 DiscardTurn）；`reference_cancel_during_tool_wait_abandons_turn` 改为确定性的「tool 批次飞行中取消」（`CancelOnCall` 包 tool handler——工具副作用已发生但结果被弃、tool-phase abandon 合成 Cancelled 闭包、pending 一致、`done.cancelled()`），保留 drain 级 tool-phase abandon 覆盖。
+- **文档**：`docs/agent-effect-model.md` §8 新增取消四条（批内全部留痕、双观测点、延迟有界、`TurnDone` 契约）；`docs/agent-effect-migration.md` §7 补 M4-5 落地修正段；`docs/agent-layer.md` §2 cancel 行同步；`docs/review-2026-07.md` M-ERR-2 已标注 `✅ 已修复（M4-4 第 4 条 + M4-5 其余）`（该条目第 4 条 reconfig abandon 已由 M4-4 修复）。README/AGENTS/facade-api/managed-external-agent/capability-matrix/conversation-core 不覆盖 drain 取消契约细节，无需更新。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0，无挂起）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（exit 0）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（默认与 external features 各一遍）全部通过；`cargo test -p agent-lib --lib agent::drive` 31 条全过。
+- **Breaking change**（pre-1.0，记录在此）：`TurnDone` 新增字段与 `cancelled()`/`with_cancelled` API（`new` 签名不变）；取消语义行为修正——drain 在批次 fulfil 后新增截停点，取消比以往更早生效（被取消批次的结果不再回灌进机器）；facade 取消路径错误消息措辞变化。
 
 ### M4-6 [TODO] 统一 reconfig 的 resolver 来源，修复默认 resolver footgun（M-ERR-3）
 
