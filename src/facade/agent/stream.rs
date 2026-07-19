@@ -52,8 +52,8 @@ use crate::agent::interaction::{Interaction, InteractionKind};
 use crate::agent::{
     AgentError, AgentInput, AgentMachine, DefaultAgentMachine, HandlerScope, InteractionHandler,
     LlmHandler, LlmStepMode, LoopCursor, LoopDoneReason, Notification, PivotMessage, PivotSource,
-    Requirement, RequirementDisposition, RequirementKind, RequirementResult, RunContext, StepInput,
-    StepOutcome, ToolHandler, ToolRegistry, ToolRegistryHandler, TurnDone,
+    ReconfigHandler, ReconfigRegistryHandler, Requirement, RequirementDisposition, RequirementKind,
+    RequirementResult, RunContext, StepInput, StepOutcome, ToolHandler, TurnDone,
 };
 use crate::client::{ChatRequest, ClientError, LlmClient, Response};
 use crate::conversation::ToolCallId;
@@ -64,7 +64,7 @@ use crate::facade::ids::FacadeIds;
 use crate::facade::run::{
     DelegationStatus, IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary,
 };
-use crate::facade::tool::{FacadeToolRegistry, ToolContextParts};
+use crate::facade::tool::ToolContextParts;
 use crate::model::message::Message;
 use crate::model::tool::ToolCall;
 use crate::stream::accumulator::{Accumulator, AccumulatorError};
@@ -397,13 +397,7 @@ pub(super) fn start(
         cancel: ctx.cancellation().clone(),
         trace: ctx.trace().clone(),
     };
-    let registry = FacadeToolRegistry::from_shared(
-        agent.tools.clone(),
-        agent.custom_registry.clone(),
-        agent.extra_declarations.clone(),
-        context,
-    )?;
-    let registry: Arc<dyn ToolRegistry> = Arc::new(registry);
+    let (tool_handler, reconfig_handler) = agent.tool_handlers_for_run(context)?;
 
     let agent_input = AgentInput::user_message(
         agent.ids.turn_id(),
@@ -424,7 +418,7 @@ pub(super) fn start(
         },
         tool: TapToolHandler {
             inner: DelegationToolHandler::new(
-                ToolRegistryHandler::new(registry),
+                tool_handler,
                 agent.delegation_route(),
                 agent.client.clone(),
                 agent.supervisor_model(),
@@ -443,6 +437,7 @@ pub(super) fn start(
             recorder: approvals.clone(),
             sink: sink.clone(),
         },
+        reconfig: reconfig_handler,
     };
 
     // Share the held machine so the drive future and the stream's `Drop` both reach
@@ -884,6 +879,7 @@ struct FacadeStreamScope {
     llm: StreamingTapHandler,
     tool: TapToolHandler,
     interaction: TapInteractionHandler,
+    reconfig: ReconfigRegistryHandler,
 }
 
 impl HandlerScope for FacadeStreamScope {
@@ -897,6 +893,10 @@ impl HandlerScope for FacadeStreamScope {
 
     fn interaction(&self) -> Option<&dyn InteractionHandler> {
         Some(&self.interaction)
+    }
+
+    fn reconfig(&self) -> Option<&dyn ReconfigHandler> {
+        Some(&self.reconfig)
     }
 }
 

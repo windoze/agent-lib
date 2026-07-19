@@ -24,7 +24,7 @@
 //!
 //! No new effect family or bespoke state machine is introduced: a run is a
 //! [`drain`] of the [`DefaultAgentMachine`] against a per-run
-//! [`HandlerScope`] carrying the LLM client, the [`FacadeToolRegistry`], and the
+//! [`HandlerScope`] carrying the LLM client, the [`crate::facade::FacadeToolRegistry`], and the
 //! [`FacadeApproval`] interaction handler (`docs/facade-api.md` §19).
 //!
 //! # Loop policy mapping
@@ -51,10 +51,11 @@ use crate::agent::{
     EscalationTrigger, Escalator, HandlerScope, HumanGate, ImpactScope, Interaction,
     InteractionHandler, InteractionKind, LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor,
     LoopDoneReason, LoopPolicy, Mailbox, ModelRef, Notification, PermissionRisk, Plan,
-    ReconfigRequest, RequirementIds, RequirementResult, RunContext, RunId, ScriptedVerifier,
-    StepInput, TaskDescriptor, TaskEvaluator, ToolApprovalPolicy, ToolExecutionIds,
-    ToolFailurePolicy, ToolHandler, ToolRegistry, ToolRegistryHandler, ToolSetRef, Uncertainty,
-    Verifier, WorkerProfile, WorkerProfileRef, WorkerReport, WorkerRoster, WorktreeRef, drain,
+    ReconfigHandler, ReconfigRegistryHandler, ReconfigRequest, RequirementIds, RequirementResult,
+    RunContext, RunId, ScriptedVerifier, StepInput, TaskDescriptor, TaskEvaluator,
+    ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy, ToolHandler, ToolRegistry,
+    ToolRegistryHandler, ToolSetRef, Uncertainty, Verifier, WorkerProfile, WorkerProfileRef,
+    WorkerReport, WorkerRoster, WorktreeRef, drain,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig};
@@ -79,16 +80,18 @@ use crate::facade::run::{
     IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary,
 };
 use crate::facade::tool::{
-    FacadeToolRegistry, Tool, ToolContextParts, ensure_unique_declaration_names,
-    ensure_unique_tool_names,
+    Tool, ToolContextParts, ensure_unique_declaration_names, ensure_unique_tool_names,
 };
 use crate::model::content::ContentBlock;
 use crate::model::extras::ProviderExtras;
 use crate::model::message::Message;
 use crate::model::tool::Tool as ToolDecl;
 
+mod reconfig;
 mod snapshot;
 mod stream;
+
+use self::reconfig::FacadeToolRegistryResolver;
 
 pub use snapshot::{
     AgentParts, AgentRestoreBuilder, AgentSnapshot, AgentStateSnapshot, BlackboardSnapshot,
@@ -177,6 +180,7 @@ pub struct Agent {
     tools: Arc<[Tool]>,
     custom_registry: Option<Arc<dyn ToolRegistry>>,
     extra_declarations: Arc<[ToolDecl]>,
+    tool_registry_resolver: Arc<FacadeToolRegistryResolver>,
     approval: Arc<FacadeApproval>,
     /// An optional host-supplied interaction handler that replaces
     /// [`FacadeApproval`] as the scope's [`InteractionHandler`] when set (§19).
@@ -383,7 +387,7 @@ impl Agent {
     /// reaches a final assistant response or exhausts its loop budget. Tool
     /// execution, the approval policy, and the LLM client are all supplied
     /// through a per-run [`HandlerScope`]; the run-scoped
-    /// [`FacadeToolRegistry`] is rebuilt each call so each tool sees the current
+    /// [`crate::facade::FacadeToolRegistry`] is rebuilt each call so each tool sees the current
     /// run id, worktree, cancellation token, and trace handle.
     ///
     /// On success the committed turn's aggregated token usage and final stop
@@ -476,13 +480,7 @@ impl Agent {
             cancel: ctx.cancellation().clone(),
             trace: ctx.trace().clone(),
         };
-        let registry = FacadeToolRegistry::from_shared(
-            self.tools.clone(),
-            self.custom_registry.clone(),
-            self.extra_declarations.clone(),
-            context,
-        )?;
-        let registry: Arc<dyn ToolRegistry> = Arc::new(registry);
+        let (tool_handler, reconfig_handler) = self.tool_handlers_for_run(context)?;
 
         let recorder = new_delegation_recorder();
         // Records each approval the drive pauses on so the non-streaming
@@ -492,7 +490,7 @@ impl Agent {
         let scope = FacadeAgentScope {
             llm: LlmClientHandler::new(self.client.clone()),
             tool: DelegationToolHandler::new(
-                ToolRegistryHandler::new(registry),
+                tool_handler,
                 self.delegation_route(),
                 self.client.clone(),
                 self.supervisor_model(),
@@ -507,6 +505,7 @@ impl Agent {
                 inner: self.interaction_handler(),
                 recorder: approvals.clone(),
             }),
+            reconfig: reconfig_handler,
         };
 
         let agent_input = AgentInput::user_message(
@@ -745,6 +744,23 @@ impl Agent {
         }
     }
 
+    /// Builds the active tool handler and its matching reconfig handler for one
+    /// run-scoped [`ToolContextParts`].
+    fn tool_handlers_for_run(
+        &self,
+        context: ToolContextParts,
+    ) -> Result<(ToolRegistryHandler, ReconfigRegistryHandler), FacadeError> {
+        self.tool_registry_resolver.bind_context(context);
+        let registry = self
+            .tool_registry_resolver
+            .resolve_active_registry(self.machine.state().current_tool_set())
+            .map_err(AgentError::from)?;
+        Ok(ToolRegistryHandler::with_reconfig_resolver(
+            registry,
+            self.machine.tool_registry_resolver(),
+        ))
+    }
+
     /// Builds the per-run [`DelegationToolHandler`] used to drive a rules-routed
     /// delegation, wired with a fresh `recorder` and the run's identity, tools,
     /// client, model, and approval policy (§13.2).
@@ -761,15 +777,9 @@ impl Agent {
             cancel: ctx.cancellation().clone(),
             trace: ctx.trace().clone(),
         };
-        let registry = FacadeToolRegistry::from_shared(
-            self.tools.clone(),
-            self.custom_registry.clone(),
-            self.extra_declarations.clone(),
-            context,
-        )?;
-        let registry: Arc<dyn ToolRegistry> = Arc::new(registry);
+        let (tool_handler, _) = self.tool_handlers_for_run(context)?;
         Ok(DelegationToolHandler::new(
-            ToolRegistryHandler::new(registry),
+            tool_handler,
             self.delegation_route(),
             self.client.clone(),
             self.supervisor_model(),
@@ -1529,6 +1539,14 @@ impl AgentBuilder {
             &self.delegates,
             &self.external_agents,
         )?;
+        let tools: Arc<[Tool]> = Arc::from(self.tools);
+        let extra_declarations: Arc<[ToolDecl]> = Arc::from(self.extra_declarations);
+        let tool_registry_resolver = Arc::new(FacadeToolRegistryResolver::new(
+            tools.clone(),
+            self.custom_registry.clone(),
+            extra_declarations.clone(),
+            declarations.clone(),
+        ));
 
         let spec = AgentSpec::new(
             ids.agent_id(),
@@ -1551,11 +1569,12 @@ impl AgentBuilder {
         let external_tool_names = delegation.external_tool_names(&self.external_agents);
         let approval = build_facade_approval(
             self.approval.unwrap_or_default(),
-            &self.tools,
+            &tools,
             external_tool_names,
         );
 
-        let machine = assemble_machine(state, &ids, approval.clone());
+        let machine = assemble_machine(state, &ids, approval.clone())
+            .with_tool_registry_resolver(tool_registry_resolver.clone());
         let budget = self.budget.unwrap_or_else(BudgetLimits::unbounded);
 
         // Resolve the collaboration substrate from the delegate topology (§14),
@@ -1572,9 +1591,10 @@ impl AgentBuilder {
         Ok(Agent {
             machine,
             client,
-            tools: Arc::from(self.tools),
+            tools,
             custom_registry: self.custom_registry,
-            extra_declarations: Arc::from(self.extra_declarations),
+            extra_declarations,
+            tool_registry_resolver,
             approval,
             interaction_handler: self.interaction_handler,
             ids,
@@ -1705,14 +1725,12 @@ pub(crate) fn assemble_machine(
         .with_tool_registry_resolver(Arc::new(DeclaredOnlyToolRegistryResolver))
 }
 
-/// One total drain layer carrying the LLM client, the run-scoped tool registry,
-/// and the resolved interaction handler.
+/// One total drain layer carrying the LLM client, active tool registry,
+/// reconfiguration registry swapper, and resolved interaction handler.
 ///
-/// The three accessors [`drain`] consults are provided; every other handler
-/// family defaults to `None` on the base agent path. Facade reconfiguration is
-/// admitted through [`Agent::reconfigure`], but the live registry handler that
-/// fulfills tool-set swaps is wired in the M2-2 task; model / system / loop
-/// changes need no handler because they apply directly at the turn boundary. The
+/// Model / system / loop reconfigurations apply directly at the turn boundary;
+/// tool-set changes park on `NeedReconfigRegistry`, which this scope fulfills by
+/// swapping the same registry slot read by tool execution. The
 /// [`interaction`](Self::interaction) handler is the host-injected
 /// [`InteractionHandler`] when one was supplied, otherwise the shared
 /// [`FacadeApproval`] (§19).
@@ -1720,6 +1738,7 @@ struct FacadeAgentScope {
     llm: LlmClientHandler,
     tool: DelegationToolHandler,
     interaction: Arc<dyn InteractionHandler>,
+    reconfig: ReconfigRegistryHandler,
 }
 
 impl HandlerScope for FacadeAgentScope {
@@ -1733,6 +1752,10 @@ impl HandlerScope for FacadeAgentScope {
 
     fn interaction(&self) -> Option<&dyn InteractionHandler> {
         Some(self.interaction.as_ref())
+    }
+
+    fn reconfig(&self) -> Option<&dyn ReconfigHandler> {
+        Some(&self.reconfig)
     }
 }
 

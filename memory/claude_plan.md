@@ -1,31 +1,39 @@
-# Execution Plan
+## Execution Plan
 
-## Scope
+This file records the actionable plan and progress updates for the current invocation. It intentionally contains a concise rationale and step-by-step execution plan, not private hidden reasoning.
 
-- Work from `TODO.md` as the authoritative source.
-- Select exactly the first incomplete task whose heading is not prefixed with `[DONE]`.
-- Complete that one task only, then stop after committing.
-- Update this file whenever the plan changes or a key step completes.
+1. Read `TODO.md` to identify the first task whose heading is not prefixed with `[DONE]`.
+2. Check the latest commit only for unfinished work directly relevant to that task.
+3. Inspect the code and documentation needed for that task, avoiding unrelated historical triage.
+4. Implement the task exactly as specified, or add the minimum prerequisite task if a concrete blocker makes completion impossible.
+5. Run required formatting, linting, and tests in the requested order, using the task's validation requirements plus relevant targeted checks.
+6. Update `TODO.md` completion record and prefix the task title with `[DONE]` only after implementation and validation are complete.
+7. Commit all intended changes with a clear task-scoped commit message, then stop without starting the next task.
 
-## Plan
+## Progress
 
-1. Read `TODO.md` first and identify the first incomplete task.
-2. Inspect the latest commit only for directly relevant unfinished work tied to that task.
-3. Read the task's referenced files and requirements, avoiding unrelated historical triage.
-4. Implement the smallest complete change that satisfies the task without workarounds or scope narrowing.
-5. Add or update focused tests and documentation required by the task.
-6. Run validation in the required order: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, then `cargo test --all --all-targets` with a timeout under 30 minutes; include feature-specific validation if touched.
-7. If an unscheduled failing test or blocking spec mismatch appears, either fix it or add the minimum prerequisite task before the blocked task in `TODO.md`, then commit and stop.
-8. Mark the completed task by prefixing its title with `[DONE]` and update its completion record.
-9. Commit all task-related changes with a descriptive message and stop without starting the next task.
-
-## Progress Log
-
-- Initial execution plan written before reading project task files or running commands.
-- Identified first incomplete task: `M2-1 [TODO] facade reconfig 入口 API 与校验`.
-- Current scope: expose and validate a facade reconfiguration entry point, document its chosen timing semantics, and add the required focused tests for `facade::agent`.
-- Implemented initial M2-1 code path: `Agent::reconfigure`, facade reconfig re-exports, request-family validation, between-run cursor validation, declaration-level tool-set admission, and focused facade tests.
-- Updated docs describing the M2-1 facade timing choice and the remaining M2-2/M2-3 boundaries.
-- Validation completed: `cargo fmt --all`, `cargo test -p agent-lib --lib facade::agent`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all --all-targets`, and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` all passed.
-- Marked `M2-1` as `[DONE]` in `TODO.md` with a completion record. Preparing final git commit for this task only.
-- Corrected one post-validation Markdown-only wording issue in `docs/mag-gaps.md` so its A2 requirement text matches the M2-1 facade `InvalidState` timing choice; no code changed after validation.
+- Initial plan recorded before reading the task list.
+- First incomplete task identified: `M2-2 [TODO] reconfig handler 接线（流式 + 非流式）与 ReplaceToolSet 一致性`.
+- Task-specific plan:
+  1. Check current git status and recent commit for directly relevant unfinished M2-2 context.
+  2. Inspect facade non-streaming and streaming drive paths, current reconfig queue handling, and tool registry abstractions.
+  3. Implement reconfig requirement handling in both drive paths with explicit declaration/registry consistency checks for `ReplaceToolSet` and `PatchToolSet`.
+  4. Ensure applied reconfig is observable through trace/run behavior as required by the task documentation.
+  5. Add tests for non-streaming, streaming, removed-tool error, and declaration/registry mismatch failure.
+  6. Run validation in order: `cargo fmt --all`, relevant targeted tests, `cargo clippy --all-targets -- -D warnings`, full tests/doc checks as needed.
+  7. Mark M2-2 `[DONE]` with completion notes, commit the task-scoped changes, and stop.
+- Implemented facade reconfig wiring in progress:
+  - Added shared registry-slot helper for `ToolRegistryHandler` + `ReconfigRegistryHandler`.
+  - Added facade resolver/active registry filtering so queued `ToolSetRef` values must map to registered facade tool names and removed tools stop executing across later runs.
+  - Wired non-streaming and streaming facade scopes to expose `reconfig()`.
+  - Added tests for non-streaming replace, non-streaming patch, streaming replace, and unbacked declaration failure.
+- Validation phase started with `cargo fmt --all`.
+- Validation completed:
+  - `cargo fmt --all`
+  - `cargo test -p agent-lib --lib facade::agent`
+  - `cargo test -p agent-lib --lib facade::`
+  - `cargo clippy --all-targets -- -D warnings`
+  - `cargo test --all --all-targets`
+  - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+  - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
+- Marked M2-2 `[DONE]` in `TODO.md` with completion notes. Diff/status review is complete; preparing the task-scoped commit.

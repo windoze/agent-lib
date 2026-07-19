@@ -160,6 +160,23 @@ impl ToolRegistryHandler {
         }
     }
 
+    /// Wraps `registry` and returns the matching reconfiguration handler.
+    ///
+    /// Both handlers share one slot: tool execution reads the currently installed
+    /// registry, while a fulfilled `NeedReconfigRegistry` resolves and swaps the
+    /// slot through `resolver` before the machine resumes.
+    #[must_use]
+    pub fn with_reconfig_resolver(
+        registry: Arc<dyn ToolRegistry>,
+        resolver: Arc<dyn ToolRegistryResolver>,
+    ) -> (Self, ReconfigRegistryHandler) {
+        let slot: SharedRegistry = Arc::new(Mutex::new(registry));
+        (
+            Self::from_slot(slot.clone()),
+            ReconfigRegistryHandler::new(resolver, slot),
+        )
+    }
+
     /// Wraps a shared registry slot, so swaps made through it are observed here.
     fn from_slot(registry: SharedRegistry) -> Self {
         Self { registry }

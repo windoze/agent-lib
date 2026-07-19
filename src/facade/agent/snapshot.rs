@@ -61,6 +61,7 @@ use crate::facade::tool::Tool;
 use crate::model::extras::ProviderExtras;
 use crate::model::tool::Tool as ToolDecl;
 
+use super::reconfig::FacadeToolRegistryResolver;
 use super::{Agent, assemble_machine, build_agent_tool_declarations, build_facade_approval};
 
 /// A serializable, data-only snapshot of an [`Agent`]'s supervisor state.
@@ -853,7 +854,7 @@ impl AgentRestoreBuilder {
         // Restore keeps the snapshot's AgentState declarations as the data
         // authority, but the runtime handlers re-injected here still must be
         // compatible with the restored delegation surface.
-        build_agent_tool_declarations(
+        let declarations = build_agent_tool_declarations(
             &self.tools,
             &self.extra_declarations,
             self.custom_registry.as_ref(),
@@ -916,12 +917,21 @@ impl AgentRestoreBuilder {
         }
 
         let external_tool_names = snapshot.delegation.external_tool_names(&external_agents);
+        let tools: Arc<[Tool]> = Arc::from(self.tools);
+        let extra_declarations: Arc<[ToolDecl]> = Arc::from(self.extra_declarations);
+        let tool_registry_resolver = Arc::new(FacadeToolRegistryResolver::new(
+            tools.clone(),
+            self.custom_registry.clone(),
+            extra_declarations.clone(),
+            declarations,
+        ));
         let approval = build_facade_approval(
             self.approval.unwrap_or_default(),
-            &self.tools,
+            &tools,
             external_tool_names,
         );
-        let machine = assemble_machine(state, &ids, approval.clone());
+        let machine = assemble_machine(state, &ids, approval.clone())
+            .with_tool_registry_resolver(tool_registry_resolver.clone());
         let budget = self.budget.unwrap_or_else(BudgetLimits::unbounded);
 
         // Re-derive the collaboration substrate from the restored topology (§14).
@@ -952,9 +962,10 @@ impl AgentRestoreBuilder {
         Ok(Agent {
             machine,
             client,
-            tools: Arc::from(self.tools),
+            tools,
             custom_registry: self.custom_registry,
-            extra_declarations: Arc::from(self.extra_declarations),
+            extra_declarations,
+            tool_registry_resolver,
             approval,
             // A snapshot is data-only: a host-injected interaction handler is a
             // runtime handle it never carries (§15.2), so it must be re-injected

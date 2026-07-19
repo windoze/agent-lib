@@ -39,6 +39,7 @@ use crate::model::content::ContentBlock;
 use crate::model::extras::{ProviderExtras, ProviderId};
 use crate::model::message::{Message, Role};
 use crate::model::normalized::{Normalized, StopReason};
+use crate::model::tool::ToolStatus;
 use crate::model::usage::Usage;
 use crate::stream::{BlockId, BlockKind, Delta, StreamEvent};
 
@@ -136,16 +137,16 @@ fn provider_config(provider: ProviderId) -> ProviderConfig {
     )
 }
 
-/// Builds an assistant response that asks to call `get_weather`, carrying the
-/// given provider-assigned call id.
-fn tool_use_response_with_id(id: &str) -> Response {
+/// Builds an assistant response that asks to call `tool_name`, carrying the
+/// given provider-assigned call id and JSON input.
+fn tool_use_response_for(tool_name: &str, id: &str, input: Value) -> Response {
     Response {
         message: Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: id.to_owned(),
-                name: "get_weather".to_owned(),
-                input: json!({ "city": "Shanghai" }),
+                name: tool_name.to_owned(),
+                input,
                 extra: Map::new(),
             }],
         },
@@ -157,6 +158,12 @@ fn tool_use_response_with_id(id: &str) -> Response {
         stop_reason: StopReason::normalize("tool_use"),
         extra: Map::new(),
     }
+}
+
+/// Builds an assistant response that asks to call `get_weather`, carrying the
+/// given provider-assigned call id.
+fn tool_use_response_with_id(id: &str) -> Response {
+    tool_use_response_for("get_weather", id, json!({ "city": "Shanghai" }))
 }
 
 /// Builds an assistant response that asks to call `get_weather`.
@@ -236,6 +243,18 @@ fn agent_with(client: Arc<dyn LlmClient>, tool: Tool, approval: Approval) -> Age
         .expect("build agent")
 }
 
+fn agent_with_tools(client: Arc<dyn LlmClient>, tools: Vec<Tool>, approval: Approval) -> Agent {
+    let mut builder = AgentBuilder::default()
+        .client(client)
+        .model("test-model")
+        .system("You are a concise weather assistant.")
+        .approval(approval);
+    for tool in tools {
+        builder = builder.tool(tool);
+    }
+    builder.build().expect("build agent")
+}
+
 fn reconfig_model(name: &str) -> ModelRef {
     ModelRef::new(
         name,
@@ -259,6 +278,10 @@ fn reconfig_skill_id() -> SkillId {
 }
 
 fn calendar_tool_decl() -> crate::model::tool::Tool {
+    counting_calendar_tool(Arc::new(AtomicUsize::new(0))).declaration()
+}
+
+fn counting_calendar_tool(counter: Arc<AtomicUsize>) -> Tool {
     Tool::function_with_schema(
         "read_calendar",
         "Read calendar availability.",
@@ -267,9 +290,19 @@ fn calendar_tool_decl() -> crate::model::tool::Tool {
             "properties": { "day": { "type": "string" } },
             "required": ["day"]
         }),
-        |_ctx: ToolContext, _args: Value| async move { Ok::<_, Infallible>("free") },
+        move |_ctx: ToolContext, args: Value| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let day = args.get("day").and_then(Value::as_str).unwrap_or("?");
+                Ok::<_, Infallible>(format!("{day}: free"))
+            }
+        },
     )
-    .declaration()
+}
+
+fn tool_names(tools: &[crate::model::tool::Tool]) -> Vec<&str> {
+    tools.iter().map(|tool| tool.name.as_str()).collect()
 }
 
 #[tokio::test]
@@ -372,11 +405,14 @@ fn reconfigure_rejects_skill_requests_explicitly() {
 }
 
 #[test]
-fn reconfigure_accepts_tool_set_declaration_requests_at_admission() {
+fn reconfigure_accepts_executable_tool_set_declaration_requests_at_admission() {
     let client = ScriptedClient::new(vec![text_response("unused")]);
-    let mut replace_agent = agent_with(
+    let mut replace_agent = agent_with_tools(
         client,
-        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        vec![
+            counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+            counting_calendar_tool(Arc::new(AtomicUsize::new(0))),
+        ],
         Approval::auto_allow(),
     );
     let replacement = ToolSetRef::new(reconfig_tool_set_id(1), vec![calendar_tool_decl()]);
@@ -389,16 +425,19 @@ fn reconfigure_accepts_tool_set_declaration_requests_at_admission() {
     assert_eq!(replace_agent.state().queued_reconfigs().len(), 1);
 
     let client = ScriptedClient::new(vec![text_response("unused")]);
-    let mut patch_agent = agent_with(
+    let mut patch_agent = agent_with_tools(
         client,
-        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        vec![
+            counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+            counting_calendar_tool(Arc::new(AtomicUsize::new(0))),
+        ],
         Approval::auto_allow(),
     );
     let patch = ToolSetPatch::new(
         patch_agent.state().current_tool_set().id(),
         reconfig_tool_set_id(2),
+        vec!["get_weather".to_owned()],
         Vec::new(),
-        vec![calendar_tool_decl()],
     )
     .expect("valid tool-set patch");
 
@@ -406,6 +445,135 @@ fn reconfigure_accepts_tool_set_declaration_requests_at_admission() {
         .reconfigure(ReconfigRequest::PatchToolSet { patch })
         .expect("patch-tool-set reconfig is accepted at admission");
     assert_eq!(patch_agent.state().queued_reconfigs().len(), 1);
+}
+
+#[test]
+fn reconfigure_rejects_tool_set_not_backed_by_facade_registry() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let mut agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), vec![calendar_tool_decl()]);
+
+    let error = agent
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement,
+        })
+        .expect_err("unbacked tool-set reconfig is rejected");
+
+    assert!(
+        matches!(error, FacadeError::Agent(AgentError::Tool(ref tool_error)) if tool_error.to_string().contains("not present in the facade registry")),
+        "unexpected error: {error:?}"
+    );
+    assert!(agent.state().queued_reconfigs().is_empty());
+}
+
+#[tokio::test]
+async fn reconfigure_replace_tool_set_updates_non_streaming_registry() {
+    let client = ScriptedClient::new(vec![
+        tool_use_response_for("read_calendar", "call-calendar", json!({ "day": "Monday" })),
+        text_response("calendar checked"),
+        tool_use_response_for("get_weather", "call-weather", json!({ "city": "Shanghai" })),
+        text_response("weather was unavailable"),
+    ]);
+    let weather_calls = Arc::new(AtomicUsize::new(0));
+    let calendar_calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = agent_with_tools(
+        client.clone(),
+        vec![
+            counting_weather_tool(weather_calls.clone()),
+            counting_calendar_tool(calendar_calls.clone()),
+        ],
+        Approval::auto_allow(),
+    );
+    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), vec![calendar_tool_decl()]);
+
+    agent
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement.clone(),
+        })
+        .expect("replace-tool-set reconfig is accepted");
+
+    let first = agent
+        .run_full("Use the current tool set.")
+        .await
+        .expect("calendar run succeeds");
+
+    assert_eq!(first.reply.text(), "calendar checked");
+    assert_eq!(agent.state().current_tool_set(), &replacement);
+    assert!(agent.state().queued_reconfigs().is_empty());
+    assert_eq!(calendar_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(weather_calls.load(Ordering::SeqCst), 0);
+
+    let second = agent
+        .run_full("Try the removed weather tool.")
+        .await
+        .expect("removed tool error is returned to the model");
+
+    assert_eq!(second.reply.text(), "weather was unavailable");
+    assert_eq!(calendar_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(weather_calls.load(Ordering::SeqCst), 0);
+
+    let requests = client.requests();
+    assert_eq!(tool_names(&requests[0].tools), vec!["read_calendar"]);
+    assert_eq!(tool_names(&requests[2].tools), vec!["read_calendar"]);
+    assert!(
+        messages_contain_tool_error(&requests[3].messages, "unknown tool `get_weather`"),
+        "final request should include the removed-tool error result: {:?}",
+        requests[3].messages
+    );
+}
+
+#[tokio::test]
+async fn reconfigure_patch_tool_set_updates_non_streaming_registry() {
+    let client = ScriptedClient::new(vec![
+        tool_use_response_for(
+            "read_calendar",
+            "call-calendar",
+            json!({ "day": "Tuesday" }),
+        ),
+        text_response("patched calendar checked"),
+    ]);
+    let weather_calls = Arc::new(AtomicUsize::new(0));
+    let calendar_calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = agent_with_tools(
+        client.clone(),
+        vec![
+            counting_weather_tool(weather_calls.clone()),
+            counting_calendar_tool(calendar_calls.clone()),
+        ],
+        Approval::auto_allow(),
+    );
+    let patch = ToolSetPatch::new(
+        agent.state().current_tool_set().id(),
+        reconfig_tool_set_id(2),
+        vec!["get_weather".to_owned()],
+        Vec::new(),
+    )
+    .expect("valid tool-set patch");
+
+    agent
+        .reconfigure(ReconfigRequest::PatchToolSet { patch })
+        .expect("patch-tool-set reconfig is accepted");
+
+    let output = agent
+        .run_full("Use the patched tool set.")
+        .await
+        .expect("patched calendar run succeeds");
+
+    assert_eq!(output.reply.text(), "patched calendar checked");
+    assert_eq!(
+        tool_names(agent.state().current_tool_set().tools()),
+        vec!["read_calendar"]
+    );
+    assert_eq!(calendar_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(weather_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        tool_names(&client.requests()[0].tools),
+        vec!["read_calendar"]
+    );
 }
 
 #[tokio::test]
@@ -981,7 +1149,7 @@ fn build_rejects_duplicate_tool_names() {
 struct StreamingScriptedClient {
     scripts: Vec<Vec<StreamEvent>>,
     calls: Mutex<usize>,
-    requests: Mutex<Vec<Vec<Message>>>,
+    requests: Mutex<Vec<ChatRequest>>,
 }
 
 impl StreamingScriptedClient {
@@ -998,6 +1166,15 @@ impl StreamingScriptedClient {
     }
 
     fn requests(&self) -> Vec<Vec<Message>> {
+        self.requests
+            .lock()
+            .expect("requests mutex")
+            .iter()
+            .map(|request| request.messages.clone())
+            .collect()
+    }
+
+    fn chat_requests(&self) -> Vec<ChatRequest> {
         self.requests.lock().expect("requests mutex").clone()
     }
 }
@@ -1018,10 +1195,7 @@ impl LlmClient for StreamingScriptedClient {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError> {
-        self.requests
-            .lock()
-            .expect("requests mutex")
-            .push(request.messages.clone());
+        self.requests.lock().expect("requests mutex").push(request);
         let mut calls = self.calls.lock().expect("calls mutex");
         let index = (*calls).min(self.scripts.len() - 1);
         *calls += 1;
@@ -1064,12 +1238,16 @@ fn text_stream(chunks: &[&str], usage: Usage) -> Vec<StreamEvent> {
 
 /// Builds a tool-use response stream that asks to call `get_weather`.
 fn tool_stream() -> Vec<StreamEvent> {
-    tool_stream_with_id("call-1")
+    tool_stream_for("get_weather", "call-1", "{\"city\":\"Shanghai\"}")
 }
 
 /// Builds a tool-use response stream asking to call `get_weather` under a
 /// caller-chosen provider call id (a fresh id per step mirrors a real model).
 fn tool_stream_with_id(call_id: &str) -> Vec<StreamEvent> {
+    tool_stream_for("get_weather", call_id, "{\"city\":\"Shanghai\"}")
+}
+
+fn tool_stream_for(tool_name: &str, call_id: &str, input: &str) -> Vec<StreamEvent> {
     let id = BlockId::new("tool-1");
     vec![
         StreamEvent::MessageStart {
@@ -1078,13 +1256,13 @@ fn tool_stream_with_id(call_id: &str) -> Vec<StreamEvent> {
         StreamEvent::BlockStart {
             id: id.clone(),
             kind: BlockKind::ToolInput {
-                tool_name: "get_weather".to_owned(),
+                tool_name: tool_name.to_owned(),
                 tool_call_id: call_id.to_owned(),
             },
         },
         StreamEvent::BlockDelta {
             id: id.clone(),
-            delta: Delta::Json("{\"city\":\"Shanghai\"}".to_owned()),
+            delta: Delta::Json(input.to_owned()),
         },
         StreamEvent::BlockStop { id: id.clone() },
         StreamEvent::MessageStop {
@@ -1170,6 +1348,23 @@ fn message_text(message: &Message) -> String {
             _ => None,
         })
         .collect()
+}
+
+fn messages_contain_tool_error(messages: &[Message], needle: &str) -> bool {
+    messages.iter().any(|message| {
+        message.content.iter().any(|block| match block {
+            ContentBlock::ToolResult {
+                content, status, ..
+            } => {
+                *status == ToolStatus::Error
+                    && content.iter().any(|nested| match nested {
+                        ContentBlock::Text { text, .. } => text.contains(needle),
+                        _ => false,
+                    })
+            }
+            _ => false,
+        })
+    })
 }
 
 #[tokio::test]
@@ -1259,6 +1454,46 @@ async fn stream_tool_round_trip_emits_tool_events() {
         2,
         "one tool-use step plus one final step"
     );
+}
+
+#[tokio::test]
+async fn reconfigure_replace_tool_set_updates_streaming_registry() {
+    let usage = Usage {
+        input: 11,
+        output: 7,
+        ..Usage::default()
+    };
+    let client = StreamingScriptedClient::new(vec![
+        tool_stream_for("read_calendar", "call-calendar", "{\"day\":\"Monday\"}"),
+        text_stream(&["calendar checked"], usage),
+    ]);
+    let weather_calls = Arc::new(AtomicUsize::new(0));
+    let calendar_calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = agent_with_tools(
+        client.clone(),
+        vec![
+            counting_weather_tool(weather_calls.clone()),
+            counting_calendar_tool(calendar_calls.clone()),
+        ],
+        Approval::auto_allow(),
+    );
+    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), vec![calendar_tool_decl()]);
+
+    agent
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement.clone(),
+        })
+        .expect("replace-tool-set reconfig is accepted");
+
+    let events = drain_agent_stream(&mut agent, "Use the current tool set.").await;
+
+    assert_eq!(streamed_text(&events), "calendar checked");
+    assert_eq!(agent.state().current_tool_set(), &replacement);
+    assert_eq!(calendar_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(weather_calls.load(Ordering::SeqCst), 0);
+    let requests = client.chat_requests();
+    assert_eq!(tool_names(&requests[0].tools), vec!["read_calendar"]);
+    assert_eq!(terminal_output(&events).tool_calls[0].name, "read_calendar");
 }
 
 #[tokio::test]

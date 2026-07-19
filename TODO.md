@@ -342,7 +342,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `cargo clippy --all-targets -- -D warnings`；`cargo test --all --all-targets`；
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 
-### M2-2 [TODO] reconfig handler 接线（流式 + 非流式）与 `ReplaceToolSet` 一致性
+### M2-2 [DONE] reconfig handler 接线（流式 + 非流式）与 `ReplaceToolSet` 一致性
 
 上下文：
 
@@ -369,6 +369,34 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   执行、被移除的工具调用得到明确错误。
 - 单元测试：声明与注册表名字不一致时按设计失败（非静默）。
 - `cargo test -p agent-lib --lib facade::` 通过。
+
+完成记录（2026-07-20）：
+
+- 非流式 `FacadeAgentScope` 与流式 `FacadeStreamScope` 均已接线 `ReconfigRegistryHandler`；两条路径的
+  `ToolRegistryHandler` 与 reconfig handler 共享同一个 active registry slot，`NeedReconfigRegistry` 会在
+  turn 边界换入新 registry 后再恢复 machine。
+- 新增 facade 专用 `FacadeToolRegistryResolver` / active filtered registry：queue-time validation 与
+  apply-time swap 使用同一 resolver；`ReplaceToolSet` / `PatchToolSet` 的目标声明名字必须来自该 agent
+  已注册的 facade tool surface。声明/执行集合不一致会在 `Agent::reconfigure` 准入时显式
+  `FacadeError::Agent(AgentError::Tool(..))` 失败，不再排队成静默 mismatch。
+- 每个 run 的初始 tool registry 也按 `state.current_tool_set()` 过滤，避免上一轮移除的工具在下一轮因
+  registry 重新构造而恢复执行能力；被移除工具若仍被模型调用，会得到明确 `UnknownTool` tool result，
+  不执行旧闭包。
+- reconfig 可观测性选择不新增 `RunEvent` 变体：完成后可通过 `AgentState::current_tool_set`、后续 LLM
+  request 的 `tools` 字段以及 removed-tool 的错误 tool result 观察；文档已在 `docs/facade-api.md` 与
+  `docs/agent-layer.md` 说明该口径。
+- 新增/更新离线测试覆盖：非流式 `ReplaceToolSet` 后只声明/执行新 active 工具且旧工具返回错误；非流式
+  `PatchToolSet` 后同步过滤 registry；流式 `ReplaceToolSet` 后 request tools 与执行路径一致；未注册工具声明
+  显式失败而非静默 mismatch。
+- 文档同步：`docs/facade-api.md` 记录 reconfig tool-set resolver、active registry slot 与可观测性；
+  `docs/agent-layer.md` 记录 facade 两条 drive path 的 handler 接线；`docs/mag-gaps.md` 将 A2 的
+  live registry 一致性标注为 `✅ 已修复（M2-2）`，保留 M2-3 snapshot/restore 后续项。
+- Breaking change：无公开 API 破坏；行为变化是更严格地拒绝 facade registry 未注册的 tool-set
+  reconfig 声明，避免之前 M2-1 中 declared-only resolver 允许的不可执行声明入队。
+- 验证通过：`cargo fmt --all`；`cargo test -p agent-lib --lib facade::agent`；
+  `cargo test -p agent-lib --lib facade::`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo test --all --all-targets`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`。
 
 ### M2-3 [TODO] reconfig 与 snapshot/restore 的交互确认 + 文档收口
 
