@@ -855,10 +855,21 @@ impl ConversationRows {
     /// omitted when their immutable facts are identical; child association rows
     /// still appear because they belong to the child Conversation.
     ///
+    /// It also supports re-exporting the *same* Conversation after it evolved:
+    /// conversation, lineage membership, projection span, and artifact
+    /// membership rows are keyed by generation, so a commit/revert/compaction
+    /// export inserts the new generation's rows alongside the stored ones
+    /// (immutable fact rows are still shared). The stored history of
+    /// generations can then be reassembled through
+    /// [`ConversationRowInsertSet::into_snapshot`], which selects the maximum
+    /// generation as the current state.
+    ///
     /// # Errors
     ///
     /// Returns [`RowMappingError::InsertConflict`] if a row with the same
-    /// primary key already exists but contains different immutable data.
+    /// primary key already exists but contains different data. For the
+    /// generation-scoped tables the key includes the generation, so only
+    /// same-generation content drift conflicts.
     pub fn insert_set_against(
         &self,
         existing: &ConversationRows,
@@ -881,7 +892,15 @@ impl ConversationRows {
                 "$.lineage_turns",
                 &self.lineage_turns,
                 &existing.lineage_turns,
-                |row| format!("{}#{}", row.conversation_id, row.lineage_sequence),
+                // Lineage membership is generation-scoped: evolution inserts a
+                // new generation of membership rows instead of conflicting
+                // with the previous one at the same sequence.
+                |row| {
+                    format!(
+                        "{}#{}#{}",
+                        row.conversation_id, row.generation, row.lineage_sequence
+                    )
+                },
             )?,
             turns: diff_rows(
                 "turn_records",
@@ -916,7 +935,14 @@ impl ConversationRows {
                 "$.projection_spans",
                 &self.projection_spans,
                 &existing.projection_spans,
-                |row| format!("{}#{}", row.conversation_id, row.span_sequence),
+                // Spans are generation-scoped like lineage rows: a compaction
+                // rewrites the span set under the new generation.
+                |row| {
+                    format!(
+                        "{}#{}#{}",
+                        row.conversation_id, row.generation, row.span_sequence
+                    )
+                },
             )?,
             artifacts: diff_rows(
                 "artifact_records",
@@ -1552,18 +1578,25 @@ fn row_to_span(
 }
 
 /// Computes the Conversation row diff.
+///
+/// The primary key is `(conversation_id, generation)`: re-exporting an
+/// evolved conversation inserts a new generation row instead of conflicting
+/// with the previously stored one. Only same-generation content drift is an
+/// [`RowMappingError::InsertConflict`].
 fn diff_single_conversation(
     current: &ConversationRecord,
     existing: &ConversationRecord,
 ) -> Result<Vec<ConversationRecord>, RowMappingError> {
-    if current.conversation_id == existing.conversation_id {
+    if current.conversation_id == existing.conversation_id
+        && current.generation == existing.generation
+    {
         if current == existing {
             return Ok(Vec::new());
         }
         return Err(RowMappingError::InsertConflict {
             path: "$.conversation".to_owned(),
             table: "conversation_records",
-            key: current.conversation_id.to_string(),
+            key: format!("{}#{}", current.conversation_id, current.generation),
         });
     }
     Ok(vec![current.clone()])

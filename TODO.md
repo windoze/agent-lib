@@ -775,7 +775,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - `docs/review-2026-07.md` M-CONV-3 按既定口径留待 M3-5-1~4 全部落地后（M3-9）标注。
 - Breaking change（pre-1.0，记录在此）：`ArtifactRecord` 新增必填 `generation` 字段（struct literal 构造点需补，serde 旧数据不可读）；`CONVERSATION_ROW_SCHEMA_VERSION` 2 → 3；`insert_set_against` artifact diff key 形状变化（行为修正）。
 
-#### M3-5-3 [TODO] `insert_set_against` 代次键 diff + 演进场景测试
+#### M3-5-3 [DONE] `insert_set_against` 代次键 diff + 演进场景测试
 
 实现要求：
 
@@ -793,7 +793,19 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - round-trip：两次导出的行集合并后 `into_snapshot` 得到最新状态（与 M3-5-2 联动）。
 - `cargo test -p agent-lib --lib conversation::persistence` 全过。
 
-#### M3-5-4 [TODO] rows 代次模型文档同步
+完成记录：
+
+- **diff key 代次化**（`src/conversation/persistence/rows.rs`）：`diff_single_conversation` 的主键改为 `(conversation_id, generation)`——同 id 不同代次作为新行插入（`Ok(vec![current])`），仅同 id 同代次内容漂移报 `InsertConflict`（key 格式 `cid#generation`）；`diff_rows` 的 lineage/span key 闭包分别加 generation 段（`cid#generation#lineage_sequence` / `cid#generation#span_sequence`），与 M3-5-2 已落地的 artifact key（`cid#generation#artifact_id`）同构。事实表（raw membership/turn/message/pairing/projection）diff key 不变。`insert_set_against` rustdoc 补「同一 Conversation 演进后重导出」场景说明（演进行按代次插入共存，经 `ConversationRowInsertSet::into_snapshot` 取最大代次重组当前状态）。
+- **L-3 评估结论（任务要求的顺带项）**：放宽 `insert_set_against` 的 `existing` 为「多 conversation 行集的子集查询结果」需要把 `existing: &ConversationRows` 改为 Vec/InsertSet 形状并新增按 owner 过滤——是 pub API 签名级 breaking，超出本任务 diff key 范围，已作为后续项列入 M9-2 API 打磨批。
+- **测试**（persistence 35 条全过，新增 5 条）：
+  - `insert_set_against_follows_commit_evolution_without_conflict`：导出 → 再 commit → 重导出，`insert_set_against` 成功；insert set = 1 条新代次 conversation 行 + 全新代次重签的 lineage/span 行 + 仅新 turn 的事实行（raw membership 1 条、turn 1 条、message 全属新 turn），projection 行内容不变不插入。
+  - `insert_set_against_follows_revert_evolution_without_conflict`：导出 → revert → 新分支 commit → 重导出不冲突；新 lineage 行以新代次与旧代次共存（合并行集在同一 `lineage_sequence` 上两个代次各一行、分别引用旧/新分支 turn）。
+  - `insert_set_against_follows_compaction_evolution_without_conflict`：导出 → apply_compaction → 重导出不冲突；重写的 span 行与新 artifact 成员行全部以新代次插入，无新事实行。
+  - `insert_set_against_rejects_same_generation_tampering`：手工改同代次 conversation 行（`head_turn_count+1`）仍 `InsertConflict`（key = `cid#generation`）；同一 Conversation 双实例分叉演进到**相同代次**不同内容（确定性构造函数重放 + 不同 turn）的两份合法导出互相 diff 仍 `InsertConflict`——代次键只合法化「更新代次」，不合法化同代次漂移。
+  - `insert_set_against_rows_merge_into_the_latest_snapshot`：模拟存储流程——已存 gen N 行集 + 追加 gen N+1 的 insert-only diff，合并后 `into_snapshot` 重组 == 最新 snapshot 且可 `Conversation::restore`（与 M3-5-2 联动）。
+  - 测试中发现（如实记录）：无 compaction 的导出也含 projection span 行（raw span 集合），演进后同样按新代次重签插入；`Conversation` 不实现 `Clone`，分叉场景改用确定性构造 `conversation(seed)` 双实例重放。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::persistence`（35 条全过）、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- `docs/review-2026-07.md` M-CONV-3 按既定口径留待 M3-5-1~4 全部落地后（M3-9）标注。无 breaking change（diff key 形状变化是行为修正——同 conversation 二次导出从必然 `InsertConflict` 变为合法插入；函数签名未变）。
 
 实现要求：
 
@@ -1352,6 +1364,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 命名/动词一致性（`ask`/`send`/`run`、`Agent` vs `AgentSession`、lib.rs 未提 facade、`facade/mod.rs` milestone 叙事、不存在的 `AgentSession`）：统一或文档说明现状，0.1.x 窗口内决策。
 - `src/model/tool.rs:19-27`：`ToolCall` 补 `extra` 逃生舱，与 `ContentBlock::ToolUse` 对齐（评估）。
 - `RunEvent` 从不产生的 variant 与 "shape stable" 承诺矛盾（`src/facade/run.rs:282-285,298,417`）：加 `#[non_exhaustive]` 或收回承诺。
+- 审查 L-3（M3-5-3 评估记录）：放宽 `ConversationRows::insert_set_against` 的 `existing: &ConversationRows` 为「多 conversation 行集的子集查询结果」——签名级 breaking（`existing` 改 Vec/InsertSet 形状 + 按 owner 过滤），列入本批决策（实现或显式记录不做）。
 
 实现要求：
 

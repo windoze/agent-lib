@@ -1653,6 +1653,286 @@ fn insert_set_into_snapshot_survives_artifact_membership_changes_across_generati
 }
 
 #[test]
+fn insert_set_against_follows_commit_evolution_without_conflict() {
+    let mut conversation = conversation(30);
+    commit_text_turn(&mut conversation, 300);
+    commit_text_turn(&mut conversation, 301);
+    let before = conversation
+        .snapshot()
+        .expect("first snapshot")
+        .to_rows()
+        .expect("first rows");
+
+    commit_text_turn(&mut conversation, 302);
+    let latest_snapshot = conversation.snapshot().expect("latest snapshot");
+    let after = latest_snapshot.to_rows().expect("second rows");
+    let new_generation = after.conversation.generation;
+    assert!(new_generation > before.conversation.generation);
+
+    let inserts = after
+        .insert_set_against(&before)
+        .expect("re-exporting an evolved conversation is insert-only");
+
+    assert_eq!(inserts.conversations.len(), 1);
+    assert_eq!(inserts.conversations[0].generation, new_generation);
+    // The whole lineage re-stamps under the new generation; every lineage row
+    // of the new export is a new row keyed by (id, generation, sequence).
+    assert_eq!(inserts.lineage_turns.len(), after.lineage_turns.len());
+    assert!(
+        inserts
+            .lineage_turns
+            .iter()
+            .all(|row| row.generation == new_generation),
+        "lineage rows insert under the new generation"
+    );
+    // Only the newly committed turn contributes new fact rows.
+    assert_eq!(
+        inserts
+            .raw_turns
+            .iter()
+            .map(|row| row.turn_id)
+            .collect::<Vec<_>>(),
+        vec![turn_id(302)],
+        "shared raw membership rows are not duplicated"
+    );
+    assert_eq!(
+        inserts
+            .turns
+            .iter()
+            .map(|row| row.turn_id)
+            .collect::<Vec<_>>(),
+        vec![turn_id(302)]
+    );
+    assert!(
+        inserts
+            .messages
+            .iter()
+            .all(|row| row.turn_id == turn_id(302)),
+        "only the new turn's messages insert"
+    );
+    assert!(inserts.projections.is_empty());
+    // Span rows exist even without compaction (the raw span set); they are
+    // generation-scoped, so they re-insert under the new generation.
+    assert_eq!(inserts.projection_spans.len(), after.projection_spans.len());
+    assert!(
+        inserts
+            .projection_spans
+            .iter()
+            .all(|row| row.generation == new_generation),
+        "span rows re-insert under the new generation"
+    );
+    assert!(inserts.artifacts.is_empty());
+}
+
+#[test]
+fn insert_set_against_follows_revert_evolution_without_conflict() {
+    let mut conversation = conversation(31);
+    commit_text_turn(&mut conversation, 310);
+    commit_text_turn(&mut conversation, 311);
+    commit_text_turn(&mut conversation, 312);
+    let before = conversation
+        .snapshot()
+        .expect("first snapshot")
+        .to_rows()
+        .expect("first rows");
+
+    // Revert and grow a different branch: the lineage slot at sequence 1 now
+    // references a different turn under a new generation.
+    let boundary = conversation.valid_boundaries()[1];
+    conversation.revert_to(boundary).expect("revert");
+    commit_text_turn(&mut conversation, 313);
+    let after = conversation
+        .snapshot()
+        .expect("second snapshot")
+        .to_rows()
+        .expect("second rows");
+    let new_generation = after.conversation.generation;
+    assert!(new_generation > before.conversation.generation);
+    assert_eq!(after.lineage_turns.len(), 2);
+    assert_eq!(after.lineage_turns[1].turn_id, turn_id(313));
+    assert_eq!(before.lineage_turns[1].turn_id, turn_id(311));
+
+    let inserts = after
+        .insert_set_against(&before)
+        .expect("revert evolution must not conflict with the stored generation");
+
+    assert_eq!(inserts.conversations.len(), 1);
+    assert_eq!(inserts.lineage_turns.len(), 2);
+    assert!(
+        inserts
+            .lineage_turns
+            .iter()
+            .all(|row| row.generation == new_generation),
+        "the new branch's lineage coexists with the old generation"
+    );
+    assert_eq!(inserts.raw_turns.len(), 1);
+    assert_eq!(inserts.raw_turns[0].turn_id, turn_id(313));
+    // The merged store keeps both generations at lineage sequence 1.
+    let mut merged = ConversationRowInsertSet::from(before.clone());
+    merged.merge(inserts);
+    let mut at_slot = merged
+        .lineage_turns
+        .iter()
+        .filter(|row| row.lineage_sequence == 1)
+        .map(|row| (row.generation, row.turn_id))
+        .collect::<Vec<_>>();
+    at_slot.sort();
+    assert_eq!(
+        at_slot,
+        vec![
+            (before.conversation.generation, turn_id(311)),
+            (new_generation, turn_id(313)),
+        ],
+        "old and new branch lineage rows coexist at the same sequence"
+    );
+}
+
+#[test]
+fn insert_set_against_follows_compaction_evolution_without_conflict() {
+    let mut conversation = conversation(32);
+    commit_text_turn(&mut conversation, 320);
+    commit_text_turn(&mut conversation, 321);
+    let before = conversation
+        .snapshot()
+        .expect("first snapshot")
+        .to_rows()
+        .expect("first rows");
+    assert!(before.artifacts.is_empty());
+
+    let covers = range(&conversation, 0, 1);
+    let produced_by = strategy("diff-compaction");
+    let artifact = summary_artifact(
+        &conversation,
+        covers.clone(),
+        32_500,
+        produced_by.clone(),
+        "summary:320",
+    );
+    let plan = CompactionPlan::new(
+        &conversation,
+        vec![CompactionStep::raw(covers, artifact.id(), produced_by)],
+        vec![artifact],
+    );
+    conversation.apply_compaction(&plan).expect("compaction");
+    let after = conversation
+        .snapshot()
+        .expect("second snapshot")
+        .to_rows()
+        .expect("second rows");
+    let new_generation = after.conversation.generation;
+
+    let inserts = after
+        .insert_set_against(&before)
+        .expect("compaction evolution must not conflict with the stored generation");
+
+    assert_eq!(inserts.conversations.len(), 1);
+    assert!(!inserts.projection_spans.is_empty());
+    assert!(
+        inserts
+            .projection_spans
+            .iter()
+            .all(|row| row.generation == new_generation),
+        "rewritten span rows insert under the new generation"
+    );
+    assert!(!inserts.artifacts.is_empty());
+    assert!(
+        inserts
+            .artifacts
+            .iter()
+            .all(|row| row.generation == new_generation),
+        "artifact membership rows insert under the new generation"
+    );
+    // Compaction does not add turns: no fact rows insert at all.
+    assert!(inserts.raw_turns.is_empty());
+    assert!(inserts.turns.is_empty());
+    assert!(inserts.messages.is_empty());
+}
+
+#[test]
+fn insert_set_against_rejects_same_generation_tampering() {
+    let mut conv = conversation(34);
+    commit_text_turn(&mut conv, 340);
+    commit_text_turn(&mut conv, 341);
+    let rows = conv.snapshot().expect("snapshot").to_rows().expect("rows");
+    let generation = rows.conversation.generation;
+
+    // Same id + same generation + different content is still a conflict.
+    let mut tampered_conversation = rows.clone();
+    tampered_conversation.conversation.head_turn_count += 1;
+    assert!(matches!(
+        tampered_conversation
+            .insert_set_against(&rows)
+            .expect_err("same-generation conversation drift conflicts"),
+        RowMappingError::InsertConflict { table, key, .. }
+            if table == "conversation_records"
+                && key == format!("{}#{}", conv.id(), generation)
+    ));
+
+    // Two valid exports of the same Conversation at the same generation but
+    // with diverging content (the same conversation evolved two ways) still
+    // conflict: generation scoping only legalizes *newer* generations.
+    // `conversation(seed)` is deterministic, so two instances built with the
+    // same seed share the conversation id and replay to the same generation.
+    let mut branch_a = conversation(34);
+    let mut branch_b = conversation(34);
+    commit_text_turn(&mut branch_a, 340);
+    commit_text_turn(&mut branch_a, 341);
+    commit_text_turn(&mut branch_b, 340);
+    commit_text_turn(&mut branch_b, 341);
+    commit_text_turn(&mut branch_a, 342);
+    commit_text_turn(&mut branch_b, 343);
+    let rows_a = branch_a
+        .snapshot()
+        .expect("branch a snapshot")
+        .to_rows()
+        .expect("branch a rows");
+    let rows_b = branch_b
+        .snapshot()
+        .expect("branch b snapshot")
+        .to_rows()
+        .expect("branch b rows");
+    assert_eq!(
+        rows_a.conversation.generation,
+        rows_b.conversation.generation
+    );
+    assert!(matches!(
+        rows_b
+            .insert_set_against(&rows_a)
+            .expect_err("same-generation divergent content conflicts"),
+        RowMappingError::InsertConflict { .. }
+    ));
+}
+
+#[test]
+fn insert_set_against_rows_merge_into_the_latest_snapshot() {
+    let mut conversation = conversation(35);
+    commit_text_turn(&mut conversation, 350);
+    commit_text_turn(&mut conversation, 351);
+    let before = conversation
+        .snapshot()
+        .expect("first snapshot")
+        .to_rows()
+        .expect("first rows");
+
+    commit_text_turn(&mut conversation, 352);
+    let latest_snapshot = conversation.snapshot().expect("latest snapshot");
+    let after = latest_snapshot.to_rows().expect("second rows");
+
+    // Simulate a store that already holds the first generation: apply the
+    // insert-only diff, then reassemble the current state from both.
+    let inserts = after
+        .insert_set_against(&before)
+        .expect("evolved export is insert-only");
+    let mut store = ConversationRowInsertSet::from(before);
+    store.merge(inserts);
+    let reassembled = store
+        .into_snapshot()
+        .expect("stored generations reassemble the latest state");
+    assert_eq!(reassembled, latest_snapshot);
+    Conversation::restore(reassembled).expect("selected snapshot restores");
+}
+
+#[test]
 fn snapshot_rejects_active_text_and_tool_partials() {
     let text_id = BlockId::new("text-partial");
     let mut text_partial = conversation(5);
