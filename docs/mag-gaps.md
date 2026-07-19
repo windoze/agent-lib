@@ -87,6 +87,11 @@ permission/question/choice 仍按 M1-3 路由到父级 handler。
 
 ## A2（硬阻塞）facade 级 reconfigure API（turn 边界生效）
 
+状态：facade reconfig 入口与准入校验已落地（M2-1）：`Agent::reconfigure(ReconfigRequest)` 支持
+model / system overlay / tool-set declaration / loop policy 请求,skill 请求显式拒绝；facade 选择
+between-run/rest cursor 准入,active turn 返回 `InvalidState`。流式/非流式 reconfig handler、
+`ReplaceToolSet` 的 live registry 一致性与 snapshot/restore 交互仍待 M2-2/M2-3/M2-R 收口。
+
 ### 现状
 
 - agent 层 reconfig 机制**齐备**：`AgentState::queue_reconfig`（`src/agent/state.rs:182-188`），
@@ -94,8 +99,10 @@ permission/question/choice 仍按 M1-3 路由到父级 handler。
   ReplaceToolSet, PatchToolSet, SetModel, SetLoopPolicy}`（`agent/state/queue.rs:186-229`），
   turn 边界经 `NeedReconfigRegistry` requirement + `ReconfigRegistryHandler` /
   `ToolRegistryResolver` 应用（`agent/drive/reference.rs:191-244`）。
-- **facade 从未接线**：`facade/agent.rs:1679-1681` 自述 "no reconfiguration, subagents, or host
-  permissions on the base agent path"；grep 确认 facade 无任何 reconfig 入口。
+- **facade 入口已接线（M2-1）**：`Agent::reconfigure` 接受 facade 重导的 `ReconfigRequest`,并在
+  between-run/rest cursor 准入；active/parked turn 显式 `InvalidState`。`SetModel` 与
+  `SetSystemPromptOverlay` 可在下一 turn 起点进入 LLM request；tool-set 请求完成声明层准入,但 live
+  registry handler 与声明/执行闭包一致性仍是 M2-2 待办。
 - **snapshot/restore 不能替代**：恢复以快照 `AgentState` 为权威，`current_model` / system
   prompt / `current_tool_set` 声明全部保留（`facade/agent/snapshot.rs:864-869`）；重注入不同
   工具集只按名字替换执行闭包（`snapshot.rs:656-664`），模型看到的声明仍是旧快照——静默不一致。
@@ -105,8 +112,9 @@ permission/question/choice 仍按 M1-3 路由到父级 handler。
 1. facade 暴露 reconfig 入口（如 `Agent::reconfigure(..)` 或 builder 形式），接受
    `ReconfigRequest`（至少覆盖 mag 需要的 `SetModel` / `ReplaceToolSet` /
    `SetSystemPromptOverlay`；skill 类可一并透出或显式不支持）。
-2. **时机语义与 `docs/agent-layer.md` §4.2 一致**：reconfig 只在 turn 边界应用；turn 进行中
-   到达的请求排队到当前 turn 结束。run 空闲时调用 → 下一 turn 起点生效。
+2. **时机语义与 `docs/agent-layer.md` §4.2 一致**：reconfig 只在 turn 边界应用。底层
+   `DefaultAgentMachine` 支持 turn 中请求排队；facade M2-1 入口选择更保守的 between-run/rest
+   cursor 准入，turn 进行中调用返回 `InvalidState`。run 空闲时调用 → 下一 turn 起点生效。
 3. 接线 `ReconfigRegistryHandler` / `ToolRegistryResolver` 到 facade 的同步与流式两条驱动
    路径；`ReplaceToolSet` 时**声明与执行闭包的一致性**要有明确答案（一并替换注册表 / 校验
    名字集合并报错，不允许静默 mismatch）。

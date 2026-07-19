@@ -286,7 +286,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M2：facade reconfigure（A2）
 
-### M2-1 [TODO] facade reconfig 入口 API 与校验
+### M2-1 [DONE] facade reconfig 入口 API 与校验
 
 上下文：
 
@@ -317,6 +317,30 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   （scripted client 断言 model 字段）。
 - 单元测试：turn 中调用的行为与文档一致（InvalidState 或排队后 turn 末生效）。
 - `cargo test -p agent-lib --lib facade::agent` 通过。
+
+完成记录（2026-07-20）：
+
+- 新增 `Agent::reconfigure(&mut self, request: ReconfigRequest) -> Result<(), FacadeError>`，通过底层
+  `DefaultAgentMachine::reconfigure` 做准入校验并把请求排进 turn-boundary reconfig queue；`SetModel` 与
+  `SetSystemPromptOverlay` 会在下一 turn 起点进入 LLM request 渲染。
+- `facade` 现在重导 `ReconfigRequest`、`ToolSetPatch`、`ModelRef`、`ToolSetRef`、`LoopPolicy` 与
+  `ToolFailurePolicy`，下游可从 facade 公共路径构造 reconfig 请求，无需依赖 `agent::state::queue` 内部路径。
+- 支持 `SetModel` / `SetSystemPromptOverlay` / `ReplaceToolSet` / `PatchToolSet` / `SetLoopPolicy` 的入口准入；
+  skill 三变体因 facade 尚无 skill registry 与 skill-to-prompt/tool 展开层，显式返回
+  `FacadeError::InvalidState`，不静默忽略。
+- facade 时机语义选择 `InvalidState`：只在 between-run/rest cursor（`Idle` / `Done` / `Error` /
+  `CancelRecovery`）接受 reconfig；active/parked turn 拒绝，且 `AgentRunStream` 存活时的 `&mut Agent`
+  借用从类型上阻止并发 reconfigure。
+- 为让 tool-set declaration reconfig 通过入口准入，facade machine 装配声明型 resolver；live registry
+  handler、流式/非流式接线和声明/执行闭包一致性仍按 M2-2 任务收口，本任务不把该后续项标为完成。
+- 新增离线单元测试覆盖：Idle 时 `SetModel` + system overlay 下一 turn 生效并由 scripted client 断言请求；
+  in-flight cursor 调用返回 `InvalidState`；skill 变体显式拒绝；`ReplaceToolSet` / `PatchToolSet` 入口准入。
+- 文档同步：`docs/facade-api.md` 记录入口 API、支持/拒绝变体和时机语义；`docs/agent-layer.md` 区分底层
+  machine 排队能力与 facade 的保守准入策略；`docs/mag-gaps.md` 更新 A2 现状并保留 M2-2/M2-3 待办。
+- Breaking change：无，新增公开方法和重导均为 additive。
+- 验证通过：`cargo fmt --all`；`cargo test -p agent-lib --lib facade::agent`；
+  `cargo clippy --all-targets -- -D warnings`；`cargo test --all --all-targets`；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 
 ### M2-2 [TODO] reconfig handler 接线（流式 + 非流式）与 `ReplaceToolSet` 一致性
 

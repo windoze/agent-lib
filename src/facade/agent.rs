@@ -46,15 +46,15 @@ use async_trait::async_trait;
 use crate::agent::requirement::AgentSpecRef;
 use crate::agent::{
     AgentError, AgentInput, AgentMachine, AgentSpec, AgentState, Blackboard, BudgetLimits,
-    CancellationToken, Capability, CostTier, DefaultAgentMachine, ErrorCursor, ErrorCursorKind,
-    EscalationError, EscalationOutcome, EscalationRules, EscalationTrigger, Escalator,
-    HandlerScope, HumanGate, ImpactScope, Interaction, InteractionHandler, InteractionKind,
-    LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor, LoopDoneReason, LoopPolicy, Mailbox,
-    ModelRef, Notification, PermissionRisk, Plan, RequirementIds, RequirementResult, RunContext,
-    RunId, ScriptedVerifier, StepInput, TaskDescriptor, TaskEvaluator, ToolApprovalPolicy,
-    ToolExecutionIds, ToolFailurePolicy, ToolHandler, ToolRegistry, ToolRegistryHandler,
-    ToolSetRef, Uncertainty, Verifier, WorkerProfile, WorkerProfileRef, WorkerReport, WorkerRoster,
-    WorktreeRef, drain,
+    CancellationToken, Capability, CostTier, DeclaredOnlyToolRegistryResolver, DefaultAgentMachine,
+    ErrorCursor, ErrorCursorKind, EscalationError, EscalationOutcome, EscalationRules,
+    EscalationTrigger, Escalator, HandlerScope, HumanGate, ImpactScope, Interaction,
+    InteractionHandler, InteractionKind, LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor,
+    LoopDoneReason, LoopPolicy, Mailbox, ModelRef, Notification, PermissionRisk, Plan,
+    ReconfigRequest, RequirementIds, RequirementResult, RunContext, RunId, ScriptedVerifier,
+    StepInput, TaskDescriptor, TaskEvaluator, ToolApprovalPolicy, ToolExecutionIds,
+    ToolFailurePolicy, ToolHandler, ToolRegistry, ToolRegistryHandler, ToolSetRef, Uncertainty,
+    Verifier, WorkerProfile, WorkerProfileRef, WorkerReport, WorkerRoster, WorktreeRef, drain,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig};
@@ -604,6 +604,35 @@ impl Agent {
     #[must_use]
     pub const fn state(&self) -> &AgentState {
         self.machine.state()
+    }
+
+    /// Queues a turn-boundary reconfiguration for this facade agent.
+    ///
+    /// Accepted requests are validated eagerly and applied only at the next turn
+    /// boundary. Calls are allowed only while the facade is between runs (the
+    /// machine is resting on `Idle`, `Done`, `Error`, or `CancelRecovery`); an
+    /// active or parked turn returns [`FacadeError::InvalidState`] instead of
+    /// making the change visible mid-turn. The stream API borrows the agent
+    /// mutably for its whole lifetime, so this same rule also prevents
+    /// reconfiguration while a stream is live.
+    ///
+    /// The facade supports model, tool-set declaration, system-prompt overlay,
+    /// and loop-policy requests. Skill activation requests are rejected because
+    /// the facade does not yet expose a skill registry or skill-to-prompt/tool
+    /// expansion layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacadeError::InvalidState`] when a turn is in progress or when
+    /// the request family is not supported by the facade. Returns
+    /// [`FacadeError::Agent`] when the underlying agent state rejects the request,
+    /// for example because a system-prompt overlay version is stale or a tool-set
+    /// patch targets a non-current tool-set id.
+    pub fn reconfigure(&mut self, request: ReconfigRequest) -> Result<(), FacadeError> {
+        ensure_facade_reconfig_request_supported(&request)?;
+        ensure_facade_reconfig_rest_boundary(self.machine.cursor())?;
+        self.machine.reconfigure(request)?;
+        Ok(())
     }
 
     /// Returns the local subagent delegates registered on this agent.
@@ -1673,15 +1702,18 @@ pub(crate) fn assemble_machine(
     DefaultAgentMachine::new(state, LlmStepMode::NonStreaming, requirement_ids)
         .with_tool_execution_ids(tool_ids)
         .with_approval_policy(approval_policy)
+        .with_tool_registry_resolver(Arc::new(DeclaredOnlyToolRegistryResolver))
 }
 
 /// One total drain layer carrying the LLM client, the run-scoped tool registry,
 /// and the resolved interaction handler.
 ///
 /// The three accessors [`drain`] consults are provided; every other handler
-/// family defaults to `None` because the facade never emits those requirements
-/// (no reconfiguration, subagents, or host permissions on the base agent path).
-/// The [`interaction`](Self::interaction) handler is the host-injected
+/// family defaults to `None` on the base agent path. Facade reconfiguration is
+/// admitted through [`Agent::reconfigure`], but the live registry handler that
+/// fulfills tool-set swaps is wired in the M2-2 task; model / system / loop
+/// changes need no handler because they apply directly at the turn boundary. The
+/// [`interaction`](Self::interaction) handler is the host-injected
 /// [`InteractionHandler`] when one was supplied, otherwise the shared
 /// [`FacadeApproval`] (§19).
 struct FacadeAgentScope {
@@ -1821,6 +1853,40 @@ pub(crate) fn build_loop_policy(
         NonZeroU32::new(1).expect("one is non-zero"),
         tool_failure_policy,
     )
+}
+
+fn ensure_facade_reconfig_request_supported(request: &ReconfigRequest) -> Result<(), FacadeError> {
+    match request {
+        ReconfigRequest::ActivateSkill { .. }
+        | ReconfigRequest::DeactivateSkill { .. }
+        | ReconfigRequest::ReplaceActiveSkills { .. } => Err(FacadeError::InvalidState(
+            "facade reconfigure does not support skill activation requests; use the agent layer \
+             until facade skill registry wiring exists"
+                .to_owned(),
+        )),
+        ReconfigRequest::SetSystemPromptOverlay { .. }
+        | ReconfigRequest::ReplaceToolSet { .. }
+        | ReconfigRequest::PatchToolSet { .. }
+        | ReconfigRequest::SetModel { .. }
+        | ReconfigRequest::SetLoopPolicy { .. } => Ok(()),
+    }
+}
+
+fn ensure_facade_reconfig_rest_boundary(cursor: &LoopCursor) -> Result<(), FacadeError> {
+    if matches!(
+        cursor,
+        LoopCursor::Idle
+            | LoopCursor::Done(_)
+            | LoopCursor::Error(_)
+            | LoopCursor::CancelRecovery(_)
+    ) {
+        return Ok(());
+    }
+
+    Err(FacadeError::InvalidState(format!(
+        "facade reconfigure is only accepted between runs; current cursor is {:?}",
+        cursor.kind()
+    )))
 }
 
 /// Classifies an [`ErrorCursor`] into a [`FacadeError`].

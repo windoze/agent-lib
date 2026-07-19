@@ -39,7 +39,10 @@ pub mod ids;
 pub mod run;
 pub mod tool;
 
-pub use crate::agent::BudgetLimits;
+pub use crate::agent::{
+    BudgetLimits, LoopPolicy, ModelRef, ReconfigRequest, ToolFailurePolicy, ToolSetPatch,
+    ToolSetRef,
+};
 pub use agent::{
     Agent, AgentBuilder, AgentParts, AgentRestoreBuilder, AgentRunStream, AgentSnapshot,
     AgentStateSnapshot, BlackboardSnapshot, CancelHandle, DelegateSnapshot, DelegationSnapshot,

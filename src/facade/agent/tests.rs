@@ -6,6 +6,7 @@
 //! or CLI is involved and each test finishes well under a second.
 
 use std::convert::Infallible;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,8 +20,10 @@ use tokio::sync::oneshot;
 
 use super::{Agent, AgentBuilder, AgentSnapshot, CancelHandle};
 use crate::agent::{
-    AgentError, ApprovalResponse, BudgetLimits, ErrorCursor, ErrorCursorKind, Interaction,
-    InteractionHandler, InteractionKind, InteractionResponse, RequirementResult, RunContext,
+    AgentError, AgentInput, AgentMachine, ApprovalResponse, BudgetLimits, ErrorCursor,
+    ErrorCursorKind, Interaction, InteractionHandler, InteractionKind, InteractionResponse,
+    LoopCursorKind, ModelRef, ReconfigRequest, RequirementResult, RunContext, SkillId, StepInput,
+    ToolSetId, ToolSetPatch, ToolSetRef,
 };
 use crate::client::{
     AuthScheme, Capability, ChatRequest, ClientError, EndpointConfig, LlmClient, Response,
@@ -231,6 +234,178 @@ fn agent_with(client: Arc<dyn LlmClient>, tool: Tool, approval: Approval) -> Age
         .approval(approval)
         .build()
         .expect("build agent")
+}
+
+fn reconfig_model(name: &str) -> ModelRef {
+    ModelRef::new(
+        name,
+        NonZeroU32::new(321).expect("non-zero max tokens"),
+        Some(0.25),
+        None,
+    )
+}
+
+fn reconfig_tool_set_id(offset: u8) -> ToolSetId {
+    let uuid = match offset {
+        1 => "018f0d9c-7b6a-7c12-8f31-1234567890e1",
+        2 => "018f0d9c-7b6a-7c12-8f31-1234567890e2",
+        _ => "018f0d9c-7b6a-7c12-8f31-1234567890ef",
+    };
+    ToolSetId::parse_str(uuid).expect("tool set id")
+}
+
+fn reconfig_skill_id() -> SkillId {
+    SkillId::parse_str("018f0d9c-7b6a-7c12-8f31-1234567890f5").expect("skill id")
+}
+
+fn calendar_tool_decl() -> crate::model::tool::Tool {
+    Tool::function_with_schema(
+        "read_calendar",
+        "Read calendar availability.",
+        json!({
+            "type": "object",
+            "properties": { "day": { "type": "string" } },
+            "required": ["day"]
+        }),
+        |_ctx: ToolContext, _args: Value| async move { Ok::<_, Infallible>("free") },
+    )
+    .declaration()
+}
+
+#[tokio::test]
+async fn reconfigure_set_model_and_overlay_apply_at_next_turn_start() {
+    let client = ScriptedClient::new(vec![text_response("updated")]);
+    let mut agent = agent_with(
+        client.clone(),
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    let model = reconfig_model("test-model-v2");
+
+    agent
+        .reconfigure(ReconfigRequest::SetModel {
+            model: model.clone(),
+        })
+        .expect("set-model reconfig is accepted while idle");
+    agent
+        .reconfigure(ReconfigRequest::set_system_prompt_overlay(
+            Some("Prefer the updated runtime config.".to_owned()),
+            0,
+        ))
+        .expect("system overlay reconfig is accepted while idle");
+
+    let reply = agent.run("Use the latest config.").await.unwrap();
+
+    assert_eq!(reply.text(), "updated");
+    assert_eq!(agent.state().current_model(), &model);
+    assert_eq!(agent.state().system_prompt_overlay_version(), 1);
+    assert!(agent.state().queued_reconfigs().is_empty());
+    let requests = client.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "test-model-v2");
+    assert_eq!(requests[0].max_tokens, 321);
+    assert_eq!(requests[0].temperature, Some(0.25));
+    assert_eq!(
+        requests[0].system.as_deref(),
+        Some("You are a concise weather assistant.\n\nPrefer the updated runtime config.")
+    );
+}
+
+#[test]
+fn reconfigure_rejects_active_turns() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let mut agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    let input = AgentInput::user_message(
+        agent.ids.turn_id(),
+        agent.ids.message_id(),
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "hold the turn".to_owned(),
+                extra: Map::new(),
+            }],
+        },
+        agent.ids.message_id(),
+        agent.ids.step_id(),
+    )
+    .expect("valid user input");
+
+    let outcome = agent.machine.step(StepInput::External(input));
+    assert_eq!(agent.machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert_eq!(outcome.requirements.len(), 1);
+
+    let error = agent
+        .reconfigure(ReconfigRequest::SetModel {
+            model: reconfig_model("late-model"),
+        })
+        .expect_err("active turn reconfigure is rejected");
+
+    assert!(
+        matches!(error, FacadeError::InvalidState(message) if message.contains("between runs"))
+    );
+    assert!(agent.state().queued_reconfigs().is_empty());
+}
+
+#[test]
+fn reconfigure_rejects_skill_requests_explicitly() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let mut agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+
+    let error = agent
+        .reconfigure(ReconfigRequest::ActivateSkill {
+            skill_id: reconfig_skill_id(),
+        })
+        .expect_err("facade skill reconfig is not supported");
+
+    assert!(
+        matches!(error, FacadeError::InvalidState(message) if message.contains("skill activation"))
+    );
+    assert!(agent.state().queued_reconfigs().is_empty());
+}
+
+#[test]
+fn reconfigure_accepts_tool_set_declaration_requests_at_admission() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let mut replace_agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), vec![calendar_tool_decl()]);
+
+    replace_agent
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement,
+        })
+        .expect("replace-tool-set reconfig is accepted at admission");
+    assert_eq!(replace_agent.state().queued_reconfigs().len(), 1);
+
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let mut patch_agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    let patch = ToolSetPatch::new(
+        patch_agent.state().current_tool_set().id(),
+        reconfig_tool_set_id(2),
+        Vec::new(),
+        vec![calendar_tool_decl()],
+    )
+    .expect("valid tool-set patch");
+
+    patch_agent
+        .reconfigure(ReconfigRequest::PatchToolSet { patch })
+        .expect("patch-tool-set reconfig is accepted at admission");
+    assert_eq!(patch_agent.state().queued_reconfigs().len(), 1);
 }
 
 #[tokio::test]

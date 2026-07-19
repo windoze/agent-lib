@@ -1,31 +1,31 @@
-# 当前执行计划
+# Execution Plan
 
-## 约束说明
+## Scope
 
-- 本文件记录可审阅的执行计划、关键决策和进度更新；不会记录不可公开的内部推理细节。
-- 本轮只处理 `TODO.md` 中第一个未完成任务，完成后提交并停止。
-- `TODO.md` 是任务排序、要求、验证和完成记录的权威来源；仅在阶段级计划变化时更新 `PLAN.md`。
+- Work from `TODO.md` as the authoritative source.
+- Select exactly the first incomplete task whose heading is not prefixed with `[DONE]`.
+- Complete that one task only, then stop after committing.
+- Update this file whenever the plan changes or a key step completes.
 
-## 步骤计划
+## Plan
 
-1. 读取 `TODO.md`，按标题是否带 `[DONE]` 判断第一个未完成任务。
-2. 查看最新提交摘要；如果它明确提到与当前任务直接相关的未完成问题，将其纳入当前任务或作为必要前置项记录到 `TODO.md`。
-3. 阅读当前任务相关说明和必要代码/文档，确认范围、依赖、验证要求和是否存在阻塞项。
-4. 若任务可直接完成，则实施最小正确变更；若发现必须先修复的具体前置问题，则把最少的新前置任务插入 `TODO.md`，提交后停止。
-5. 针对变更运行由任务要求和仓库规范决定的验证，顺序优先为 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、相关测试、必要时完整测试/文档构建。
-6. 若出现未被后续任务明确覆盖的测试失败，立即修复；若无法在当前任务中正确修复，则在 `TODO.md` 中加入最小前置/跟进任务并停止。
-7. 完成后将当前任务标题加上 `[DONE]`，更新其完成记录；仅当阶段级计划实际变化时修改 `PLAN.md`。
-8. 检查工作区状态和差异，确认只提交本轮相关变更；如果是恢复未提交任务状态，则按用户要求包含所有当前未提交文件。
-9. 使用包含任务编号的清晰提交信息提交变更。
-10. 停止，不处理下一个任务。
+1. Read `TODO.md` first and identify the first incomplete task.
+2. Inspect the latest commit only for directly relevant unfinished work tied to that task.
+3. Read the task's referenced files and requirements, avoiding unrelated historical triage.
+4. Implement the smallest complete change that satisfies the task without workarounds or scope narrowing.
+5. Add or update focused tests and documentation required by the task.
+6. Run validation in the required order: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, then `cargo test --all --all-targets` with a timeout under 30 minutes; include feature-specific validation if touched.
+7. If an unscheduled failing test or blocking spec mismatch appears, either fix it or add the minimum prerequisite task before the blocked task in `TODO.md`, then commit and stop.
+8. Mark the completed task by prefixing its title with `[DONE]` and update its completion record.
+9. Commit all task-related changes with a descriptive message and stop without starting the next task.
 
-## 当前状态
+## Progress Log
 
-- 已创建本计划文件。
-- 已读取 `TODO.md`，第一个未完成任务为 `M1-R [TODO] M1 review：委派交互路由收口`。
-- 最新提交为 `89823ae [M1-4] Route external start approvals`，未明确提到需先处理的未完成问题。
-- 已核对 M1-R 指定的 A1 状态、归因语义、向后兼容和文档同步情况；未发现需要新增前置任务的阻塞项。
-- 已按 M1-R 要求运行全量门禁验证，全部通过。
-- 已将 `TODO.md` 中 M1-R 标题改为 `[DONE]` 并补充完成记录。
-- 已提交 M1-R review 结果，提交为 `123dab0 [M1-R] Review delegated interaction routing`。
-- 本轮任务已完成；停止，不处理 M2-1。
+- Initial execution plan written before reading project task files or running commands.
+- Identified first incomplete task: `M2-1 [TODO] facade reconfig 入口 API 与校验`.
+- Current scope: expose and validate a facade reconfiguration entry point, document its chosen timing semantics, and add the required focused tests for `facade::agent`.
+- Implemented initial M2-1 code path: `Agent::reconfigure`, facade reconfig re-exports, request-family validation, between-run cursor validation, declaration-level tool-set admission, and focused facade tests.
+- Updated docs describing the M2-1 facade timing choice and the remaining M2-2/M2-3 boundaries.
+- Validation completed: `cargo fmt --all`, `cargo test -p agent-lib --lib facade::agent`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all --all-targets`, and `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` all passed.
+- Marked `M2-1` as `[DONE]` in `TODO.md` with a completion record. Preparing final git commit for this task only.
+- Corrected one post-validation Markdown-only wording issue in `docs/mag-gaps.md` so its A2 requirement text matches the M2-1 facade `InvalidState` timing choice; no code changed after validation.

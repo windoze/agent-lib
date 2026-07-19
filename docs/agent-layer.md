@@ -284,6 +284,12 @@ skill 启停、tool 增删、system prompt 变更都改的是 config/projection,
 - 若 reconfig 请求在 turn 进行中到达,**排队到当前 turn 结束后生效**(类比 pivot 的
   "软转向",只是生效边界更粗)。
 
+facade 的 `Agent::reconfigure` 入口(M2-1)在这个底层能力上选择更保守的准入策略:只在两次
+`run` / `stream` 之间的 rest cursor(`Idle` / `Done` / `Error` / `CancelRecovery`)接受请求;
+active/parked turn 上调用返回 `FacadeError::InvalidState`,不暴露 turn 中排队入口。该选择仍满足
+"只在 turn 边界生效"的不变量,并避免 `AgentRunStream` 存活期间的并发配置写入。需要 turn 中
+排队语义的高级宿主仍可直接使用 agent 层 `DefaultAgentMachine::reconfigure`。
+
 当前默认机器由 `ReconfigRequest`/`ReconfigQueue` 表达 skill、tool set、system overlay、
 model 与 loop policy 变更,并在 turn 边界原子应用。其中 tool set 变化会 reify 成
 `Requirement{ kind: NeedReconfigRegistry }`,由 driver 端的 `ReconfigHandler` 用
