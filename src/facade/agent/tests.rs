@@ -511,6 +511,38 @@ async fn exceeding_the_tool_round_budget_fails() {
 }
 
 #[tokio::test]
+async fn exceeding_the_tool_round_budget_fails_the_stream() {
+    // Same budget stop as the non-streaming path: the streamed run surfaces the
+    // structured step-limit terminal as LoopLimitExceeded (M4-4 parity). The
+    // client asks for the tool under a fresh call id on every step, so no final
+    // response is ever reached.
+    let client = AlwaysStreamingToolUse::new();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut agent = AgentBuilder::default()
+        .client(client)
+        .model("test-model")
+        .tool(counting_weather_tool(executions))
+        .approval(Approval::auto_allow())
+        .max_tool_rounds(1)
+        .build()
+        .expect("build agent");
+
+    let mut stream = agent.stream("loop forever").await.expect("open stream");
+    let mut terminal = None;
+    while let Some(item) = stream.next().await {
+        if let Err(error) = item {
+            terminal = Some(error);
+            break;
+        }
+    }
+
+    assert!(
+        matches!(terminal, Some(FacadeError::LoopLimitExceeded)),
+        "an exhausted loop budget maps to LoopLimitExceeded on the stream path, got {terminal:?}"
+    );
+}
+
+#[tokio::test]
 async fn multiple_runs_accumulate_history() {
     let client = ScriptedClient::new(vec![text_response("First."), text_response("Second.")]);
     let executions = Arc::new(AtomicUsize::new(0));
@@ -639,6 +671,12 @@ fn text_stream(chunks: &[&str], usage: Usage) -> Vec<StreamEvent> {
 
 /// Builds a tool-use response stream that asks to call `get_weather`.
 fn tool_stream() -> Vec<StreamEvent> {
+    tool_stream_with_id("call-1")
+}
+
+/// Builds a tool-use response stream asking to call `get_weather` under a
+/// caller-chosen provider call id (a fresh id per step mirrors a real model).
+fn tool_stream_with_id(call_id: &str) -> Vec<StreamEvent> {
     let id = BlockId::new("tool-1");
     vec![
         StreamEvent::MessageStart {
@@ -648,7 +686,7 @@ fn tool_stream() -> Vec<StreamEvent> {
             id: id.clone(),
             kind: BlockKind::ToolInput {
                 tool_name: "get_weather".to_owned(),
-                tool_call_id: "call-1".to_owned(),
+                tool_call_id: call_id.to_owned(),
             },
         },
         StreamEvent::BlockDelta {
@@ -660,6 +698,45 @@ fn tool_stream() -> Vec<StreamEvent> {
             stop_reason: Normalized::from_mapped(StopReason::ToolUse, "tool_use"),
         },
     ]
+}
+
+/// The streaming counterpart of [`AlwaysToolUse`]: every `chat_stream` asks to
+/// call the tool under a fresh provider call id, so a streamed run can never
+/// reach a final response and must stop on the loop budget.
+#[derive(Debug)]
+struct AlwaysStreamingToolUse {
+    calls: Mutex<usize>,
+}
+
+impl AlwaysStreamingToolUse {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl LlmClient for AlwaysStreamingToolUse {
+    fn capability(&self) -> &Capability {
+        &crate::client::ANTHROPIC_DEFAULT_CAPABILITY
+    }
+
+    async fn chat(&self, _request: ChatRequest) -> Result<Response, ClientError> {
+        Err(ClientError::Other(
+            "chat not used in streaming fixture".to_owned(),
+        ))
+    }
+
+    async fn chat_stream(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError> {
+        let mut calls = self.calls.lock().expect("calls mutex");
+        *calls += 1;
+        let events = tool_stream_with_id(&format!("call-{calls}"));
+        Ok(futures::stream::iter(events.into_iter().map(Ok::<_, ClientError>)).boxed())
+    }
 }
 
 /// Drives an [`Agent::stream`] to exhaustion, returning every yielded event.

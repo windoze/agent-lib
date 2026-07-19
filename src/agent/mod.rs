@@ -79,7 +79,7 @@ pub use id::{AgentId, BlackboardId, PlanId, RunId, SkillId, StepId, ToolSetId};
 pub use interaction::{
     Interaction, InteractionError, InteractionKind, InteractionKindTag, InteractionResponse,
 };
-pub use machine::{AgentMachine, DefaultAgentMachine, StepInput, StepOutcome};
+pub use machine::{AgentMachine, DefaultAgentMachine, StepInput, StepOutcome, StepRejectReason};
 pub use machine::{MachineTreeState, NestedMachine, NestedMachineError};
 pub use permission::{
     PermissionCategory, PermissionDecision, PermissionRequest, PermissionResponse, PermissionRisk,

@@ -4,7 +4,8 @@ use crate::{
         AgentInput, AgentMachine, AgentPath, AgentSlot, AgentSpec, AgentState, DefaultAgentMachine,
         LlmStepMode, LoopCursor, LoopCursorKind, LoopPolicy, ModelRef, RequirementError,
         RequirementId, RequirementIds, RequirementKind, RequirementKindTag, RequirementResolution,
-        RequirementResult, StepId, StepInput, ToolFailurePolicy, ToolSetRef, WorktreeRef,
+        RequirementResult, StepId, StepInput, StepRejectReason, ToolFailurePolicy, ToolSetRef,
+        WorktreeRef,
     },
     client::Response,
     conversation::{Conversation, ConversationConfig, ConversationId, MessageId, TurnId},
@@ -46,6 +47,10 @@ fn parent_requirement_id() -> RequirementId {
 
 fn child_requirement_id() -> RequirementId {
     RequirementId::parse_str(&uuid("b1")).expect("child requirement id")
+}
+
+fn stray_requirement_id() -> RequirementId {
+    RequirementId::parse_str(&uuid("c1")).expect("stray requirement id")
 }
 
 fn spec(agent_suffix: &str, tool_set_suffix: &str) -> AgentSpec {
@@ -237,6 +242,49 @@ fn resume_routes_by_id_to_the_child_only() {
         tree.outstanding_requirements(),
         vec![(parent_requirement_id(), AgentPath::root())]
     );
+}
+
+#[test]
+fn resume_or_abandon_with_an_unknown_id_is_soft_rejected_without_touching_the_tree() {
+    let mut tree = opened_tree();
+    tree.step(StepInput::external(parent_feed()));
+
+    // A resolution addressed to no outstanding requirement in the whole tree
+    // falls back to the root machine, which soft-rejects it (M4-4): neither the
+    // root's nor the child's in-flight turn is destroyed.
+    let resolution = RequirementResolution::new(
+        stray_requirement_id(),
+        RequirementResult::Llm(Ok(text_response("late"))),
+    );
+    let outcome = tree.step(StepInput::resume(resolution));
+    let Some(StepRejectReason::UnknownRequirement(_)) = outcome.rejection() else {
+        panic!(
+            "an unknown resume id must be soft-rejected, got {:?}",
+            outcome.rejection()
+        );
+    };
+    assert_eq!(tree.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert!(tree.own().state().conversation().pending().is_some());
+    let child = tree.child(CHILD_SLOT).expect("child");
+    assert_eq!(child.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert!(child.own().state().conversation().pending().is_some());
+    assert_eq!(tree.outstanding_requirements().len(), 2);
+
+    // Same for a stray abandon: soft-rejected, tree untouched.
+    let outcome = tree.step(StepInput::abandon(stray_requirement_id()));
+    let Some(StepRejectReason::UnknownRequirement(_)) = outcome.rejection() else {
+        panic!("an unknown abandon id must be soft-rejected");
+    };
+    assert_eq!(tree.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert_eq!(tree.outstanding_requirements().len(), 2);
+
+    // A genuinely addressed resume still routes and settles afterwards.
+    let outcome = tree.step(StepInput::resume(RequirementResolution::new(
+        parent_requirement_id(),
+        RequirementResult::Llm(Ok(text_response("parent done"))),
+    )));
+    assert!(!outcome.is_rejected());
+    assert_eq!(tree.cursor().kind(), LoopCursorKind::Done);
 }
 
 #[test]

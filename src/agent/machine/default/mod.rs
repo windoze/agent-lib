@@ -50,8 +50,8 @@ use crate::{
         LoopCursor, LoopDoneReason, NoApprovalPolicy, NoToolExecutionIds, Notification,
         PivotMessage, ReconfigRequest, Requirement, RequirementId, RequirementIds, RequirementKind,
         RequirementKindTag, RequirementResolution, RequirementResult, StepBoundary, StepId,
-        StepInput, StepOutcome, ToolApprovalPolicy, ToolExecutionIds, ToolRegistryResolver,
-        ToolRuntimeError,
+        StepInput, StepOutcome, StepRejectReason, ToolApprovalPolicy, ToolExecutionIds,
+        ToolRegistryResolver, ToolRuntimeError,
         request::build_chat_request,
         state::{ReconfigApplication, reconfig_boundary_metadata, reconfig_boundary_records},
     },
@@ -72,8 +72,9 @@ enum AbandonKind {
     /// A tool batch or approval is outstanding — resume with synthesized
     /// `Cancelled` results to close the dangling tool_use.
     Tool,
-    /// A queued reconfiguration is parked on a registry requirement — discard any
-    /// pending turn and drop the deferred reconfiguration scratch.
+    /// A queued reconfiguration is parked on a registry requirement — commit any
+    /// folded-but-uncommitted text turn and drop the deferred reconfiguration
+    /// scratch.
     Reconfig,
 }
 
@@ -485,6 +486,27 @@ impl DefaultAgentMachine {
 
     /// Opens a fresh user turn and blocks on one `NeedLlm` requirement.
     fn begin_user_turn(&mut self, user: AgentUserInput) -> Result<StepOutcome, StepError> {
+        // A fresh user message is only feedable at a rest boundary (`Idle`, or
+        // the terminal `Done`/`Error` a previous turn settled on). Mid-turn —
+        // while the machine is parked on an LLM step, a tool batch, an approval,
+        // or a reconfig — a second user message would collide with the live
+        // pending turn (`Conversation::begin_turn` rejects a second open
+        // pending), so it is soft-rejected instead: the turn in progress keeps
+        // its state and the driver may retry once the turn settles (or inject a
+        // pivot at a legal boundary). Checked before any state is touched.
+        if !matches!(
+            self.state.loop_cursor(),
+            LoopCursor::Idle | LoopCursor::Done(_) | LoopCursor::Error(_)
+        ) {
+            let kind = self.state.loop_cursor().kind();
+            return Err(StepError::Rejected(StepRejectReason::TurnInProgress(
+                format!(
+                    "a user message arrived while a turn is in progress (cursor `{kind:?}`); \
+                     feed it once the turn settles, or inject it as a pivot at a legal boundary"
+                ),
+            )));
+        }
+
         // Re-derive the mid-turn scratch from the persisted state at this turn
         // boundary so it is aligned to the cursor phase before the next turn
         // opens. This is the explicit stand-in for the former implicit
@@ -581,15 +603,17 @@ impl DefaultAgentMachine {
     fn inject_pivot(&mut self, pivot: PivotMessage) -> Result<StepOutcome, StepError> {
         let LoopCursor::StreamingStep(cursor) = self.state.loop_cursor() else {
             let kind = self.state.loop_cursor().kind();
-            return Err(StepError::Protocol(format!(
-                "pivot injection requires a streaming step boundary, but cursor is `{kind:?}`"
+            return Err(StepError::Rejected(StepRejectReason::IllegalPivotBoundary(
+                format!(
+                    "pivot injection requires a streaming step boundary, but cursor is `{kind:?}`"
+                ),
             )));
         };
         let Some(requirement_id) = cursor.requirement_id() else {
-            return Err(StepError::Protocol(
+            return Err(StepError::Rejected(StepRejectReason::IllegalPivotBoundary(
                 "streaming step has no outstanding LLM requirement to re-render for a pivot"
                     .to_string(),
-            ));
+            )));
         };
 
         // A `StreamingStep` cursor is isomorphic to the `TurnScratch::InTurn`
@@ -603,15 +627,32 @@ impl DefaultAgentMachine {
 
         // Reject non-user pivot payloads up front (mirrors the queued-pivot role
         // check); the injection entry re-validates the role as a second guard.
-        pivot.validate()?;
+        // A payload the driver should never have built is a soft rejection: the
+        // machine's state is provably untouched.
+        pivot.validate().map_err(|error| {
+            StepError::Rejected(StepRejectReason::IllegalPivotBoundary(format!(
+                "pivot payload rejected: {error}"
+            )))
+        })?;
 
         let boundary = self.state.conversation().head();
-        self.state.conversation_mut().inject_user_message(
-            boundary,
-            pivot.message_id(),
-            pivot.message().clone(),
-            pivot.message_meta(),
-        )?;
+        // The Conversation rejects an illegal injection boundary (no closed
+        // tool-result step yet, an open tool call, or a duplicate message id).
+        // That is a caller boundary violation, not an internal failure: reject
+        // softly, leaving the in-flight turn exactly as it was.
+        self.state
+            .conversation_mut()
+            .inject_user_message(
+                boundary,
+                pivot.message_id(),
+                pivot.message().clone(),
+                pivot.message_meta(),
+            )
+            .map_err(|error| {
+                StepError::Rejected(StepRejectReason::IllegalPivotBoundary(format!(
+                    "pivot injection boundary rejected: {error}"
+                )))
+            })?;
 
         // Re-render the outstanding LLM request so the pivot is part of the next
         // generation. Same step id and requirement id, re-rendered request, so
@@ -694,8 +735,10 @@ impl DefaultAgentMachine {
             }
             other => {
                 let kind = other.kind();
-                Err(StepError::Protocol(format!(
-                    "resume received while cursor is `{kind:?}`, no outstanding requirement"
+                Err(StepError::Rejected(StepRejectReason::UnknownRequirement(
+                    format!(
+                        "resume received while cursor is `{kind:?}`, no outstanding requirement"
+                    ),
                 )))
             }
         }
@@ -711,9 +754,11 @@ impl DefaultAgentMachine {
         if let Some(expected) = expected_id
             && resolution.id != expected
         {
-            return Err(StepError::Protocol(format!(
-                "resume targets requirement {}, but the machine awaits {expected}",
-                resolution.id
+            return Err(StepError::Rejected(StepRejectReason::UnknownRequirement(
+                format!(
+                    "resume targets requirement {}, but the machine awaits {expected}",
+                    resolution.id
+                ),
             )));
         }
 
@@ -867,9 +912,11 @@ impl DefaultAgentMachine {
         if let Some(expected) = expected_id
             && resolution.id != expected
         {
-            return Err(StepError::Protocol(format!(
-                "resume targets requirement {}, but the machine awaits {expected}",
-                resolution.id
+            return Err(StepError::Rejected(StepRejectReason::UnknownRequirement(
+                format!(
+                    "resume targets requirement {}, but the machine awaits {expected}",
+                    resolution.id
+                ),
             )));
         }
 
@@ -944,14 +991,16 @@ impl DefaultAgentMachine {
 
         let Some((kind, step_id)) = plan else {
             let cursor_kind = self.state.loop_cursor().kind();
-            return Err(StepError::Protocol(format!(
-                "abandon received while cursor is `{cursor_kind:?}`, no outstanding requirement"
+            return Err(StepError::Rejected(StepRejectReason::UnknownRequirement(
+                format!(
+                    "abandon received while cursor is `{cursor_kind:?}`, no outstanding requirement"
+                ),
             )));
         };
 
         if !outstanding.contains(&id) {
-            return Err(StepError::Protocol(format!(
-                "abandon targets requirement {id}, which is not outstanding this step"
+            return Err(StepError::Rejected(StepRejectReason::UnknownRequirement(
+                format!("abandon targets requirement {id}, which is not outstanding this step"),
             )));
         }
 
@@ -974,17 +1023,23 @@ impl DefaultAgentMachine {
     }
 
     /// Never-resume close for a deferred reconfiguration parked on a registry
-    /// requirement: drop the pending turn (if any) and the deferred
-    /// reconfiguration scratch, then settle back to a feedable `Idle`.
+    /// requirement: preserve the folded-but-uncommitted text turn (if any) and
+    /// drop the deferred reconfiguration scratch, then settle back to a feedable
+    /// `Idle`.
     ///
-    /// A start-of-turn reconfiguration has not opened a turn yet (no pending),
-    /// while a during-turn reconfiguration folded but did not commit its text
-    /// turn — both are closed by discarding any pending transaction.
+    /// A start-of-turn reconfiguration has not opened a turn yet (no pending).
+    /// A during-turn reconfiguration parks *after* the final assistant response
+    /// froze (`ReadyToCommit`), where [`CancelDisposition::ResumeTurn`] is not a
+    /// legal closure (the conversation layer only closes open tool calls there,
+    /// never commits), so committing the pending turn is the only closure that
+    /// preserves the text — the same "keep the caller's work" alignment the
+    /// tool-abandon path gets from `ResumeTurn` (M4-4). The abandoned
+    /// reconfiguration stays queued and is retried at the next turn boundary.
     fn abandon_reconfig(&mut self, step_id: Option<StepId>) -> Result<StepOutcome, StepError> {
         if self.state.conversation().pending().is_some() {
             self.state
                 .conversation_mut()
-                .cancel_pending(CancelDisposition::DiscardTurn)?;
+                .commit_pending(TurnMeta::default())?;
         }
         self.scratch = TurnScratch::None;
         self.finish_cancel(step_id, CancelRecoveryReason::Cancelled)
@@ -1018,20 +1073,40 @@ impl DefaultAgentMachine {
     /// Like [`fail`](Self::fail) but preserves notifications produced earlier in
     /// the same step (for example a tool step boundary emitted before a step
     /// limit was hit).
+    ///
+    /// Teardown failures are never swallowed (M4-4): a failed pending-turn
+    /// discard is folded into the parked message, and the error-cursor park
+    /// itself is total — the transition table accepts `Error` from every cursor
+    /// kind and the message is guaranteed non-empty — so the diagnostic can
+    /// never be lost the way the former `let _ =` pair allowed.
     fn fail_with_notifications(
         &mut self,
         notifications: Vec<Notification>,
         message: impl Into<String>,
     ) -> StepOutcome {
-        if self.state.conversation().pending().is_some() {
-            let _ = self
+        let mut message = message.into();
+        if self.state.conversation().pending().is_some()
+            && let Err(error) = self
                 .state
                 .conversation_mut()
-                .cancel_pending(CancelDisposition::DiscardTurn);
+                .cancel_pending(CancelDisposition::DiscardTurn)
+        {
+            // The discard failing means the pending turn survives; say so in
+            // the parked diagnostic instead of dropping the failure.
+            message =
+                format!("{message}; additionally failed to discard the pending turn: {error}");
+        }
+        if message.is_empty() {
+            message = "agent step failed without a diagnostic".to_owned();
         }
         self.scratch = TurnScratch::None;
-        if let Ok(cursor) = LoopCursor::error(message) {
-            let _ = self.state.transition_cursor(cursor);
+        let cursor =
+            LoopCursor::error(message).expect("the error message is normalized to be non-empty");
+        if let Err(error) = self.state.transition_cursor(cursor) {
+            // The transition table accepts `Error` from every cursor kind
+            // (M4-4 added the `(Done | Error) -> Error` edge), so this branch
+            // is structurally unreachable; keep it loud instead of silent.
+            debug_assert!(false, "parking on the error cursor is total: {error}");
         }
         StepOutcome::new(notifications, Vec::new(), true)
     }
@@ -1059,6 +1134,10 @@ impl AgentMachine for DefaultAgentMachine {
         };
         match result {
             Ok(outcome) => outcome,
+            // A caller protocol violation rejects the input without touching
+            // machine state (M4-4); only genuine runtime failures park on the
+            // error cursor.
+            Err(StepError::Rejected(reason)) => StepOutcome::rejected(reason),
             Err(error) => self.fail_from(error),
         }
     }

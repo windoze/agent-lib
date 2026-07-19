@@ -106,6 +106,16 @@ impl StepInput {
 /// blocking point or to quiescence, and may hand back a *batch* of requirements
 /// at once (migration decision B). This is a persistable description: every
 /// field serializes.
+///
+/// # Soft rejection (M4-4)
+///
+/// A *protocol violation by the driver* — an input that simply does not apply
+/// at the machine's current position (a stale or unknown requirement id, a
+/// pivot at an illegal boundary, a second user message mid-turn) — does **not**
+/// destroy the in-flight turn. The machine leaves its state untouched and
+/// reports the input back through [`StepOutcome::rejected`]; the driver may
+/// inspect the reason and keep driving. Payload-shape mismatches and internal
+/// inconsistencies remain hard failures (they park on [`LoopCursor::Error`]).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StepOutcome {
@@ -121,10 +131,39 @@ pub struct StepOutcome {
     /// produced output or is blocked on a requirement).
     #[serde(default)]
     pub quiescent: bool,
+    /// Why this step's input was rejected without changing machine state, if it
+    /// was. A rejected step never emits requirements and carries no
+    /// notifications; the machine remains parked exactly where it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<StepRejectReason>,
+}
+
+/// Why a [`AgentMachine::step`] input was rejected without changing machine
+/// state (M4-4 soft reject).
+///
+/// Each variant carries a human-readable detail string; the variant itself is
+/// the machine-readable classification. These are *caller* protocol violations
+/// — the machine's persisted state and cursor are provably unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
+pub enum StepRejectReason {
+    /// A `Resume`/`Abandon` named a requirement the machine is not awaiting —
+    /// the id is stale (already settled), unknown, or no requirement is
+    /// outstanding at all.
+    UnknownRequirement(String),
+    /// A pivot was injected at a boundary where pivots are not legal: the
+    /// cursor is not a streaming step with an outstanding LLM requirement, the
+    /// payload failed validation, or the Conversation rejected the injection
+    /// boundary.
+    IllegalPivotBoundary(String),
+    /// A fresh user message arrived while a turn was already in progress. The
+    /// driver must wait for the turn to settle (or inject a pivot at a legal
+    /// boundary) instead of opening a second turn.
+    TurnInProgress(String),
 }
 
 impl StepOutcome {
-    /// Creates a step outcome from its parts.
+    /// Creates a step outcome from its parts (never a soft rejection).
     #[must_use]
     pub const fn new(
         notifications: Vec<Notification>,
@@ -135,6 +174,19 @@ impl StepOutcome {
             notifications,
             requirements,
             quiescent,
+            rejected: None,
+        }
+    }
+
+    /// Creates the outcome of a soft-rejected step: no notifications, no
+    /// requirements, and the machine still at its previous rest point.
+    #[must_use]
+    pub const fn rejected(reason: StepRejectReason) -> Self {
+        Self {
+            notifications: Vec::new(),
+            requirements: Vec::new(),
+            quiescent: true,
+            rejected: Some(reason),
         }
     }
 
@@ -148,6 +200,19 @@ impl StepOutcome {
     #[must_use]
     pub const fn has_requirements(&self) -> bool {
         !self.requirements.is_empty()
+    }
+
+    /// Returns whether this step's input was soft-rejected (machine state
+    /// unchanged).
+    #[must_use]
+    pub const fn is_rejected(&self) -> bool {
+        self.rejected.is_some()
+    }
+
+    /// Returns the soft-rejection reason, if this step was rejected.
+    #[must_use]
+    pub const fn rejection(&self) -> Option<&StepRejectReason> {
+        self.rejected.as_ref()
     }
 }
 
@@ -359,10 +424,37 @@ mod tests {
         let outcome = StepOutcome::default();
         assert!(!outcome.is_quiescent());
         assert!(!outcome.has_requirements());
+        assert!(!outcome.is_rejected());
         let encoded = serde_json::to_value(&outcome).expect("serialize empty outcome");
         let decoded: StepOutcome =
             serde_json::from_value(encoded).expect("deserialize empty outcome");
         assert_eq!(decoded, outcome);
+    }
+
+    #[test]
+    fn rejected_step_outcome_round_trips() {
+        use super::StepRejectReason;
+
+        let outcome = StepOutcome::rejected(StepRejectReason::UnknownRequirement(
+            "resume targets a requirement the machine is not awaiting".to_owned(),
+        ));
+        assert!(outcome.is_quiescent());
+        assert!(!outcome.has_requirements());
+        assert!(outcome.is_rejected());
+        let encoded = serde_json::to_value(&outcome).expect("serialize rejected outcome");
+        let decoded: StepOutcome =
+            serde_json::from_value(encoded).expect("deserialize rejected outcome");
+        assert_eq!(decoded, outcome);
+
+        // Old data without the `rejected` key still deserializes (serde default).
+        let legacy = serde_json::json!({
+            "notifications": [],
+            "requirements": [],
+            "quiescent": true,
+        });
+        let decoded: StepOutcome =
+            serde_json::from_value(legacy).expect("legacy outcome without rejected key");
+        assert_eq!(decoded, StepOutcome::new(Vec::new(), Vec::new(), true));
     }
 
     #[test]

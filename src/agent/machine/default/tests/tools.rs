@@ -788,44 +788,72 @@ fn step_limit_stops_before_next_model_step() {
     );
     let (tool_req, call_id, _) = need_tool(&outcome, 0);
 
-    // Resolving the tool would start a second step, but the limit is one.
+    // Resolving the tool would start a second step, but the limit is one. The
+    // stop is a *normal* terminal (M4-4): the tool step boundary is still
+    // emitted, the cursor settles on Done(StepLimitReached), and the frozen
+    // tool results stay in a coherent pending turn instead of being discarded.
     let outcome = machine.step(StepInput::resume(RequirementResolution::new(
         tool_req,
         RequirementResult::Tool(Ok(tool_ok("call-weather", "sunny"))),
     )));
     assert!(outcome.is_quiescent());
     assert!(outcome.requirements.is_empty());
-    // The tool step boundary is still emitted before the failure.
+    assert!(!outcome.is_rejected());
     assert_tool_finished(&outcome.notifications[0], step_id(), call_id);
     let Notification::StepBoundary(_) = &outcome.notifications[1] else {
-        panic!("the tool step boundary must precede the step-limit failure");
+        panic!("the tool step boundary must precede the step-limit stop");
     };
-    let LoopCursor::Error(error) = machine.cursor() else {
-        panic!("the step limit must park on the error cursor");
+    let LoopCursor::Done(done) = machine.cursor() else {
+        panic!("the step limit must settle on the done cursor");
     };
-    assert!(error.message().contains("step limit"));
-    assert!(machine.state().conversation().pending().is_none());
+    assert_eq!(done.reason(), LoopDoneReason::StepLimitReached);
+
+    // user + assistant(tool-use) + tool result, all preserved.
+    let pending = machine
+        .state()
+        .conversation()
+        .pending()
+        .expect("the step limit preserves the frozen turn");
+    assert_eq!(pending.open_calls().count(), 0);
+    assert_eq!(pending.messages().len(), 3);
+
+    // The machine stays feedable: a fresh user message supersedes the leftover
+    // pending turn and opens a new one.
+    let outcome = machine.step(StepInput::external(second_user_input()));
+    assert!(!outcome.is_rejected());
+    assert_eq!(outcome.requirements.len(), 1);
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
 }
 
 #[test]
-fn tool_resume_with_unknown_requirement_fails() {
+fn tool_resume_with_unknown_requirement_is_soft_rejected() {
     let mut machine = tool_machine(Arc::new(NoApprovalPolicy));
     let llm_id = park_on_need_llm(&mut machine);
-    let _ = resume_llm(
+    let outcome = resume_llm(
         &mut machine,
         llm_id,
         single_tool_response("call-weather", "get_weather"),
     );
+    let (tool_req, _, _) = need_tool(&outcome, 0);
 
     let outcome = machine.step(StepInput::resume(RequirementResolution::new(
         other_requirement_id(),
         RequirementResult::Tool(Ok(tool_ok("call-weather", "sunny"))),
     )));
     assert!(outcome.is_quiescent());
-    let LoopCursor::Error(error) = machine.cursor() else {
-        panic!("an unknown tool requirement must park on the error cursor");
+    let Some(StepRejectReason::UnknownRequirement(detail)) = outcome.rejection() else {
+        panic!("an unknown tool requirement must be soft-rejected");
     };
-    assert!(error.message().contains("not an in-flight tool call"));
+    assert!(detail.contains("not an in-flight tool call"));
+    // The tool batch is still parked, exactly as before the rejected input.
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingTool);
+
+    let outcome = machine.step(StepInput::resume(RequirementResolution::new(
+        tool_req,
+        RequirementResult::Tool(Ok(tool_ok("call-weather", "sunny"))),
+    )));
+    assert!(!outcome.is_rejected());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
 }
 
 #[test]
@@ -871,6 +899,43 @@ fn approval_resume_rejecting_wrong_call_fails() {
         panic!("an approval for the wrong call must park on the error cursor");
     };
     assert!(error.message().contains("interaction result rejected"));
+}
+
+#[test]
+fn approval_resume_with_stale_id_is_soft_rejected_and_keeps_the_pending_approval() {
+    let mut machine = tool_machine(Arc::new(AlwaysApprove));
+    let llm_id = park_on_need_llm(&mut machine);
+    let outcome = resume_llm(
+        &mut machine,
+        llm_id,
+        single_tool_response("call-weather", "get_weather"),
+    );
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingApproval);
+    let (approval_req, _, _) = need_interaction(&outcome, 0);
+
+    // A stale id is rejected without consuming the pending approval from the
+    // scratch (M4-4): the cursor, the pending turn, and the outstanding
+    // approval are all exactly as they were.
+    let outcome = machine.step(StepInput::resume(RequirementResolution::new(
+        other_requirement_id(),
+        approval(ApprovalResponse::approve(step_id(), tool_call_id(0))),
+    )));
+    assert!(outcome.is_quiescent());
+    let Some(StepRejectReason::UnknownRequirement(detail)) = outcome.rejection() else {
+        panic!("a stale approval resume id must be soft-rejected");
+    };
+    assert!(detail.contains("but the machine awaits"));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingApproval);
+    assert!(machine.state().conversation().pending().is_some());
+
+    // The genuine approval resume still lands afterwards.
+    let outcome = machine.step(StepInput::resume(RequirementResolution::new(
+        approval_req,
+        approval(ApprovalResponse::approve(step_id(), tool_call_id(0))),
+    )));
+    assert!(!outcome.is_rejected());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingTool);
+    assert_eq!(outcome.requirements.len(), 1);
 }
 
 #[test]
@@ -1076,7 +1141,12 @@ fn non_user_pivot_payload_is_rejected_at_boundary() {
     let outcome = machine.step(StepInput::external(AgentInput::pivot(invalid)));
     assert!(outcome.is_quiescent());
     assert!(outcome.requirements.is_empty());
-    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+    let Some(StepRejectReason::IllegalPivotBoundary(_)) = outcome.rejection() else {
+        panic!("a non-user pivot payload must be soft-rejected");
+    };
+    // The streaming step and its outstanding requirement are untouched.
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert!(machine.state().conversation().pending().is_some());
 }
 
 #[test]
@@ -1090,7 +1160,11 @@ fn pivot_before_any_tool_result_is_rejected() {
     let outcome = machine.step(StepInput::external(pivot_input(2, "too early")));
     assert!(outcome.is_quiescent());
     assert!(outcome.requirements.is_empty());
-    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+    let Some(StepRejectReason::IllegalPivotBoundary(_)) = outcome.rejection() else {
+        panic!("a pivot before any tool result must be soft-rejected");
+    };
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert!(machine.state().conversation().pending().is_some());
 }
 
 #[test]
@@ -1107,7 +1181,11 @@ fn pivot_with_open_tool_calls_is_rejected() {
     let outcome = machine.step(StepInput::external(pivot_input(3, "mid tool call")));
     assert!(outcome.is_quiescent());
     assert!(outcome.requirements.is_empty());
-    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+    let Some(StepRejectReason::IllegalPivotBoundary(_)) = outcome.rejection() else {
+        panic!("a pivot with open tool calls must be soft-rejected");
+    };
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingTool);
+    assert!(machine.state().conversation().pending().is_some());
 }
 
 #[test]
@@ -1118,5 +1196,8 @@ fn pivot_while_idle_is_rejected() {
     let outcome = machine.step(StepInput::external(pivot_input(4, "nothing running")));
     assert!(outcome.is_quiescent());
     assert!(outcome.requirements.is_empty());
-    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+    let Some(StepRejectReason::IllegalPivotBoundary(_)) = outcome.rejection() else {
+        panic!("a pivot while idle must be soft-rejected");
+    };
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
 }

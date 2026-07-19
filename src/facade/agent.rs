@@ -48,11 +48,12 @@ use crate::agent::{
     AgentError, AgentInput, AgentSpec, AgentState, Blackboard, BudgetLimits, Capability, CostTier,
     DefaultAgentMachine, EscalationError, EscalationOutcome, EscalationRules, EscalationTrigger,
     Escalator, HandlerScope, HumanGate, ImpactScope, Interaction, InteractionHandler,
-    InteractionKind, LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor, LoopPolicy, Mailbox,
-    ModelRef, Notification, PermissionRisk, Plan, RequirementIds, RequirementResult, RunContext,
-    RunId, ScriptedVerifier, TaskDescriptor, TaskEvaluator, ToolApprovalPolicy, ToolExecutionIds,
-    ToolFailurePolicy, ToolHandler, ToolRegistry, ToolRegistryHandler, ToolSetRef, Uncertainty,
-    Verifier, WorkerProfile, WorkerProfileRef, WorkerReport, WorkerRoster, WorktreeRef, drain,
+    InteractionKind, LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor, LoopDoneReason,
+    LoopPolicy, Mailbox, ModelRef, Notification, PermissionRisk, Plan, RequirementIds,
+    RequirementResult, RunContext, RunId, ScriptedVerifier, TaskDescriptor, TaskEvaluator,
+    ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy, ToolHandler, ToolRegistry,
+    ToolRegistryHandler, ToolSetRef, Uncertainty, Verifier, WorkerProfile, WorkerProfileRef,
+    WorkerReport, WorkerRoster, WorktreeRef, drain,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig};
@@ -371,6 +372,13 @@ impl Agent {
         }
 
         match done.cursor() {
+            // A per-turn step-limit stop is a normal terminal on the machine
+            // (M4-4); the facade surfaces it as its structured limit error.
+            LoopCursor::Done(done_cursor)
+                if done_cursor.reason() == LoopDoneReason::StepLimitReached =>
+            {
+                Err(FacadeError::LoopLimitExceeded)
+            }
             LoopCursor::Done(_) => {
                 let (text, usage, stop_reason) =
                     final_turn_summary(self.machine.state().conversation());
@@ -1540,9 +1548,12 @@ pub(crate) fn build_loop_policy(
 /// Classifies an [`ErrorCursor`](crate::agent::ErrorCursor) message into a
 /// [`FacadeError`].
 ///
-/// The base machine reports an exhausted per-turn step budget with a stable
-/// message; that maps to [`FacadeError::LoopLimitExceeded`], while any other
-/// runtime error is preserved as [`FacadeError::Agent`].
+/// Since M4-4 the base machine reports an exhausted per-turn step budget as a
+/// normal terminal ([`LoopDoneReason::StepLimitReached`]), which both run paths
+/// map to [`FacadeError::LoopLimitExceeded`] structurally before reaching this
+/// function. The string match below is a legacy fallback for snapshots restored
+/// from pre-M4-4 error cursors; M5-3 replaces message-based classification with
+/// structured kinds throughout.
 fn classify_error(message: &str) -> FacadeError {
     if message.contains("loop step limit") {
         FacadeError::LoopLimitExceeded

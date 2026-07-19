@@ -47,9 +47,9 @@ use crate::agent::drive::{
 use crate::agent::interaction::{Interaction, InteractionKind};
 use crate::agent::{
     AgentError, AgentInput, AgentMachine, BudgetLimits, DefaultAgentMachine, HandlerScope,
-    InteractionHandler, LlmHandler, LlmStepMode, LoopCursor, RequirementDisposition,
-    RequirementResult, RunContext, StepInput, ToolHandler, ToolRegistry, ToolRegistryHandler,
-    TurnDone,
+    InteractionHandler, LlmHandler, LlmStepMode, LoopCursor, LoopDoneReason,
+    RequirementDisposition, RequirementResult, RunContext, StepInput, ToolHandler, ToolRegistry,
+    ToolRegistryHandler, TurnDone,
 };
 use crate::client::{ChatRequest, ClientError, LlmClient, Response};
 use crate::conversation::ToolCallId;
@@ -275,6 +275,14 @@ pub(super) fn start(
             return Err(FacadeError::ApprovalDenied);
         }
         match done.cursor() {
+            // A per-turn step-limit stop is a normal terminal on the machine
+            // (M4-4); the facade surfaces it as its structured limit error,
+            // matching `run_full`.
+            LoopCursor::Done(done_cursor)
+                if done_cursor.reason() == LoopDoneReason::StepLimitReached =>
+            {
+                Err(FacadeError::LoopLimitExceeded)
+            }
             LoopCursor::Done(_) => {
                 let machine = machine_for_future.borrow();
                 let (text, usage, stop_reason) = final_turn_summary(machine.state().conversation());

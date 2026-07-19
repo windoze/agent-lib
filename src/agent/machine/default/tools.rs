@@ -46,10 +46,11 @@ use super::error::StepError;
 use crate::{
     agent::{
         ApprovalDecision, ApprovalRequirement, ApprovalResponse, CancelRecoveryReason,
-        CursorRequirement, Interaction, LoopCursor, Notification, Requirement, RequirementId,
-        RequirementKind, RequirementKindTag, RequirementResolution, RequirementResult,
-        StepBoundary, StepId, StepOutcome, ToolCallFinished, ToolCallStarted, ToolFailurePolicy,
-        ToolWaitRequirements, approval::approval_response_for_decision,
+        CursorRequirement, Interaction, LoopCursor, LoopDoneReason, Notification, Requirement,
+        RequirementId, RequirementKind, RequirementKindTag, RequirementResolution,
+        RequirementResult, StepBoundary, StepId, StepOutcome, StepRejectReason, ToolCallFinished,
+        ToolCallStarted, ToolFailurePolicy, ToolWaitRequirements,
+        approval::approval_response_for_decision,
     },
     conversation::{
         CancelDisposition, CancelledToolResult, ConversationMessage, MessageId, PendingTurn,
@@ -405,9 +406,11 @@ impl DefaultAgentMachine {
             Some(phase) => match phase.running.remove(&resolution.id) {
                 Some(slot) => slot,
                 None => {
-                    return Err(StepError::Protocol(format!(
-                        "resume targets requirement {}, which is not an in-flight tool call",
-                        resolution.id
+                    return Err(StepError::Rejected(StepRejectReason::UnknownRequirement(
+                        format!(
+                            "resume targets requirement {}, which is not an in-flight tool call",
+                            resolution.id
+                        ),
                     )));
                 }
             },
@@ -477,11 +480,45 @@ impl DefaultAgentMachine {
         expected_id: Option<RequirementId>,
         resolution: RequirementResolution,
     ) -> Result<StepOutcome, StepError> {
-        let (requirement_id, slot) = match self
+        // Validate the resumed id *before* taking the pending approval out of
+        // the scratch: a stale or foreign id is a soft rejection, and a soft
+        // rejection must leave the machine bit-for-bit untouched (M4-4).
+        let requirement_id = match self
+            .tool_phase()
+            .and_then(|phase| phase.awaiting_approval.as_ref())
+        {
+            Some((requirement_id, _)) => *requirement_id,
+            None => {
+                return Err(StepError::Protocol(
+                    "approval resumed without a pending interaction".to_owned(),
+                ));
+            }
+        };
+
+        if let Some(expected) = expected_id
+            && resolution.id != expected
+        {
+            return Err(StepError::Rejected(StepRejectReason::UnknownRequirement(
+                format!(
+                    "resume targets requirement {}, but the machine awaits {expected}",
+                    resolution.id
+                ),
+            )));
+        }
+        if resolution.id != requirement_id {
+            return Err(StepError::Rejected(StepRejectReason::UnknownRequirement(
+                format!(
+                    "resume targets requirement {}, but the pending approval is {requirement_id}",
+                    resolution.id
+                ),
+            )));
+        }
+
+        let slot = match self
             .tool_phase_mut()
             .and_then(|phase| phase.awaiting_approval.take())
         {
-            Some(pair) => pair,
+            Some((_, slot)) => slot,
             None => {
                 return Err(StepError::Protocol(
                     "approval resumed without a pending interaction".to_owned(),
@@ -496,21 +533,6 @@ impl DefaultAgentMachine {
                 ));
             }
         };
-
-        if let Some(expected) = expected_id
-            && resolution.id != expected
-        {
-            return Err(StepError::Protocol(format!(
-                "resume targets requirement {}, but the machine awaits {expected}",
-                resolution.id
-            )));
-        }
-        if resolution.id != requirement_id {
-            return Err(StepError::Protocol(format!(
-                "resume targets requirement {}, but the pending approval is {requirement_id}",
-                resolution.id
-            )));
-        }
 
         let response = match resolution.result {
             RequirementResult::Interaction(response) => response,
@@ -595,12 +617,7 @@ impl DefaultAgentMachine {
             .in_flight()
             .map_or(0, |in_flight| in_flight.steps_started);
         if steps_started >= max_steps {
-            return Ok(self.fail_with_notifications(
-                notifications,
-                format!(
-                    "agent loop step limit {max_steps} reached before a final assistant response"
-                ),
-            ));
+            return self.finish_step_limit(notifications);
         }
 
         let next_step_id = match self.tool_ids.next_step_id() {
@@ -627,6 +644,35 @@ impl DefaultAgentMachine {
         }
 
         self.block_on_llm(next_step_id, notifications)
+    }
+
+    /// Closes the turn at the per-turn step limit as a *normal* terminal
+    /// (M4-4): the cursor settles on [`LoopCursor::Done`] with
+    /// [`LoopDoneReason::StepLimitReached`] instead of the error cursor, and the
+    /// frozen tool results are not discarded.
+    ///
+    /// The tool phase has just drained, so no call is open and an empty closure
+    /// is the exact one [`cancel_pending`](crate::conversation::Conversation::cancel_pending)
+    /// requires: [`CancelDisposition::ResumeTurn`] keeps every frozen message —
+    /// the completed tool results included — in a coherent, resumable pending
+    /// turn (the same preservation the tool-abandon path uses), rather than
+    /// dropping the whole turn the way the former error path did.
+    fn finish_step_limit(
+        &mut self,
+        notifications: Vec<Notification>,
+    ) -> Result<StepOutcome, StepError> {
+        if self.state.conversation().pending().is_some() {
+            self.state
+                .conversation_mut()
+                .cancel_pending(CancelDisposition::ResumeTurn {
+                    cancelled_results: Vec::new(),
+                })?;
+        }
+        self.scratch = super::TurnScratch::None;
+        self.state
+            .transition_cursor(LoopCursor::done(LoopDoneReason::StepLimitReached))
+            .map_err(StepError::CursorTransition)?;
+        Ok(StepOutcome::new(notifications, Vec::new(), true))
     }
 
     /// Extracts the tool-use calls from the pending turn's last assistant

@@ -2,9 +2,10 @@ use super::DefaultAgentMachine;
 use crate::{
     agent::{
         AgentInput, AgentMachine, AgentSpec, AgentState, InteractionResponse, LlmStepMode,
-        LoopCursor, LoopCursorKind, LoopPolicy, ModelRef, Notification, RequirementError,
-        RequirementId, RequirementIds, RequirementKind, RequirementKindTag, RequirementResolution,
-        RequirementResult, StepId, StepInput, ToolFailurePolicy, ToolSetRef, WorktreeRef,
+        LoopCursor, LoopCursorKind, LoopDoneReason, LoopPolicy, ModelRef, Notification,
+        RequirementError, RequirementId, RequirementIds, RequirementKind, RequirementKindTag,
+        RequirementResolution, RequirementResult, StepId, StepInput, StepRejectReason,
+        ToolFailurePolicy, ToolSetRef, WorktreeRef,
     },
     client::{ClientError, Response},
     conversation::{Conversation, ConversationConfig, MessageId, TurnId},
@@ -337,9 +338,9 @@ fn llm_invalid_assistant_response_moves_cursor_to_error_and_discards_pending() {
 }
 
 #[test]
-fn resume_with_mismatched_requirement_id_fails() {
+fn resume_with_mismatched_requirement_id_is_soft_rejected() {
     let mut machine = machine(LlmStepMode::NonStreaming);
-    let _id = park_on_need_llm(&mut machine);
+    let id = park_on_need_llm(&mut machine);
 
     let resolution = RequirementResolution::new(
         other_requirement_id(),
@@ -347,9 +348,31 @@ fn resume_with_mismatched_requirement_id_fails() {
     );
     let outcome = machine.step(StepInput::resume(resolution));
 
+    // A stale resume id is a caller protocol violation: the input is rejected
+    // without touching the machine — cursor, pending turn, and the outstanding
+    // requirement are all exactly as they were.
     assert!(outcome.is_quiescent());
-    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
-    assert!(machine.state().conversation().pending().is_none());
+    assert!(outcome.requirements.is_empty());
+    let Some(StepRejectReason::UnknownRequirement(detail)) = outcome.rejection() else {
+        panic!(
+            "a stale resume id must be soft-rejected, got {:?}",
+            outcome.rejection()
+        );
+    };
+    assert!(detail.contains("but the machine awaits"));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert!(machine.state().conversation().pending().is_some());
+
+    // The awaited resume still lands afterwards and completes the turn.
+    let outcome = machine.step(StepInput::resume(RequirementResolution::new(
+        id,
+        RequirementResult::Llm(Ok(text_response("hi"))),
+    )));
+    assert!(!outcome.is_rejected());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Done);
+    let conversation = machine.state().conversation();
+    assert!(conversation.pending().is_none());
+    assert_eq!(conversation.turns().len(), 1);
 }
 
 #[test]
@@ -391,7 +414,7 @@ fn tool_use_response_without_tool_id_source_fails() {
 }
 
 #[test]
-fn resume_without_outstanding_requirement_fails() {
+fn resume_without_outstanding_requirement_is_soft_rejected() {
     let mut machine = machine(LlmStepMode::NonStreaming);
 
     let resolution = RequirementResolution::new(
@@ -401,7 +424,11 @@ fn resume_without_outstanding_requirement_fails() {
     let outcome = machine.step(StepInput::resume(resolution));
 
     assert!(outcome.is_quiescent());
-    assert_eq!(machine.cursor().kind(), LoopCursorKind::Error);
+    let Some(StepRejectReason::UnknownRequirement(detail)) = outcome.rejection() else {
+        panic!("a resume with nothing outstanding must be soft-rejected");
+    };
+    assert!(detail.contains("no outstanding requirement"));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
 }
 
 #[test]
@@ -447,31 +474,85 @@ fn abandon_streaming_step_then_user_message_opens_new_turn() {
 }
 
 #[test]
-fn abandon_with_unmatched_requirement_id_fails() {
+fn abandon_with_unmatched_requirement_id_is_soft_rejected() {
     let mut machine = machine(LlmStepMode::NonStreaming);
-    let _id = park_on_need_llm(&mut machine);
+    let id = park_on_need_llm(&mut machine);
 
     let outcome = machine.step(StepInput::abandon(other_requirement_id()));
 
     assert!(outcome.is_quiescent());
-    let LoopCursor::Error(error) = machine.cursor() else {
-        panic!("abandoning a non-outstanding requirement must park on the error cursor");
+    let Some(StepRejectReason::UnknownRequirement(detail)) = outcome.rejection() else {
+        panic!("abandoning a non-outstanding requirement must be soft-rejected");
     };
-    assert!(error.message().contains("not outstanding"));
+    assert!(detail.contains("not outstanding"));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    assert!(machine.state().conversation().pending().is_some());
+
+    // Abandoning the actually outstanding requirement still works afterwards.
+    let outcome = machine.step(StepInput::abandon(id));
+    assert!(!outcome.is_rejected());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
     assert!(machine.state().conversation().pending().is_none());
 }
 
 #[test]
-fn abandon_without_outstanding_requirement_fails() {
+fn abandon_without_outstanding_requirement_is_soft_rejected() {
     let mut machine = machine(LlmStepMode::NonStreaming);
 
     let outcome = machine.step(StepInput::abandon(requirement_id()));
 
     assert!(outcome.is_quiescent());
-    let LoopCursor::Error(error) = machine.cursor() else {
-        panic!("abandon with no outstanding requirement must park on the error cursor");
+    let Some(StepRejectReason::UnknownRequirement(detail)) = outcome.rejection() else {
+        panic!("abandon with no outstanding requirement must be soft-rejected");
     };
-    assert!(error.message().contains("no outstanding requirement"));
+    assert!(detail.contains("no outstanding requirement"));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
+}
+
+#[test]
+fn user_message_mid_turn_is_soft_rejected_and_the_turn_continues() {
+    let mut machine = machine(LlmStepMode::NonStreaming);
+    let id = park_on_need_llm(&mut machine);
+
+    // A second user message while the first turn is parked on its LLM step is
+    // rejected without destroying the in-flight turn.
+    let outcome = machine.step(StepInput::external(second_user_input()));
+    assert!(outcome.is_quiescent());
+    assert!(outcome.requirements.is_empty());
+    assert!(outcome.notifications.is_empty());
+    let Some(StepRejectReason::TurnInProgress(detail)) = outcome.rejection() else {
+        panic!(
+            "a mid-turn user message must be soft-rejected, got {:?}",
+            outcome.rejection()
+        );
+    };
+    assert!(detail.contains("turn is in progress"));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
+    let pending = machine
+        .state()
+        .conversation()
+        .pending()
+        .expect("the in-flight turn survives the rejected input");
+    assert_eq!(pending.messages().len(), 1);
+
+    // The original turn then completes normally.
+    let outcome = machine.step(StepInput::resume(RequirementResolution::new(
+        id,
+        RequirementResult::Llm(Ok(text_response("hi"))),
+    )));
+    assert!(!outcome.is_rejected());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Done);
+    let conversation = machine.state().conversation();
+    assert_eq!(conversation.turns().len(), 1);
+    let turn = &conversation.turns()[0];
+    assert_text(turn.messages()[0].payload(), "hello");
+    assert_text(turn.messages()[1].payload(), "hi");
+
+    // And a fresh user message is feedable again once the turn settled.
+    let outcome = machine.step(StepInput::external(second_user_input()));
+    assert!(!outcome.is_rejected());
+    assert_eq!(outcome.requirements.len(), 1);
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::StreamingStep);
 }
 
 mod reconfig;

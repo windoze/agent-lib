@@ -22,7 +22,7 @@
 //! `fail_with_notifications` so those side-products are preserved.
 
 use crate::{
-    agent::{AgentStateError, RequirementError, ToolRuntimeError},
+    agent::{AgentStateError, RequirementError, StepRejectReason, ToolRuntimeError},
     conversation::ConversationError,
 };
 
@@ -57,6 +57,13 @@ pub(super) enum StepError {
     /// A protocol/phase violation or driver-supplied error already rendered to
     /// its final human-readable text; passed through verbatim.
     Protocol(String),
+    /// A caller protocol violation that leaves the machine untouched: the input
+    /// does not apply at the current position (stale/unknown requirement id,
+    /// illegal pivot boundary, second user message mid-turn). The outermost
+    /// `step()` boundary folds this into a soft-rejected
+    /// [`StepOutcome`](crate::agent::StepOutcome) instead of parking on
+    /// [`LoopCursor::Error`](crate::agent::LoopCursor::Error) (M4-4).
+    Rejected(StepRejectReason),
 }
 
 impl StepError {
@@ -72,6 +79,9 @@ impl StepError {
             StepError::ToolRuntime(error) => format!("tool runtime operation failed: {error}"),
             StepError::Requirement(error) => format!("requirement id unavailable: {error}"),
             StepError::Protocol(message) => message.clone(),
+            // A rejection never parks on the error cursor, so it has no error
+            // message; the detail string is only for the unreachable fallback.
+            StepError::Rejected(reason) => format!("step input rejected: {reason:?}"),
         }
     }
 }

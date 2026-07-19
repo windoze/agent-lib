@@ -36,7 +36,8 @@ use std::sync::Arc;
 use agent_lib::agent::{
     AgentError, AgentInput, AgentMachine, HandlerScope, LoopCursor, LoopCursorKind, Notification,
     PivotSource, Pop, QueuedPivot, Requirement, RequirementId, RequirementKindTag,
-    RequirementResolution, RequirementResult, RunContext, StepInput, StepOutcome, TurnDone, drain,
+    RequirementResolution, RequirementResult, RunContext, StepInput, StepOutcome, StepRejectReason,
+    TurnDone, drain,
 };
 
 use crate::fixtures::{user_input, user_message};
@@ -262,6 +263,7 @@ impl<M: AgentMachine> StepHarness<M> {
             notifications: outcome.notifications,
             requirements: outcome.requirements,
             quiescent: outcome.quiescent,
+            rejected: outcome.rejected,
             cursor: self.machine.cursor().clone(),
         }
     }
@@ -306,6 +308,7 @@ pub struct StepObservation {
     notifications: Vec<Notification>,
     requirements: Vec<Requirement>,
     quiescent: bool,
+    rejected: Option<StepRejectReason>,
     cursor: LoopCursor,
 }
 
@@ -332,6 +335,19 @@ impl StepObservation {
     #[must_use]
     pub const fn is_quiescent(&self) -> bool {
         self.quiescent
+    }
+
+    /// Returns whether this step's input was soft-rejected (machine state
+    /// unchanged, M4-4).
+    #[must_use]
+    pub const fn is_rejected(&self) -> bool {
+        self.rejected.is_some()
+    }
+
+    /// Returns the soft-rejection reason, if this step was rejected.
+    #[must_use]
+    pub const fn rejection(&self) -> Option<&StepRejectReason> {
+        self.rejected.as_ref()
     }
 
     /// Returns a snapshot of the machine's cursor after this step.

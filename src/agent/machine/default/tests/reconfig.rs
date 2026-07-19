@@ -326,6 +326,65 @@ fn reconfig_queued_during_text_turn_defers_commit_behind_registry_effect() {
     assert_eq!(machine.state().current_tool_set(), &replacement);
 }
 
+/// Abandoning the registry requirement of a during-turn reconfiguration no
+/// longer discards the folded text turn (M4-4): the pending turn sits at
+/// `ReadyToCommit`, where `ResumeTurn` is not a legal closure, so the machine
+/// commits the text turn to preserve it, settles back to `Idle`, and leaves the
+/// abandoned reconfiguration queued for the next turn boundary.
+#[test]
+fn abandon_during_turn_reconfig_commits_the_folded_text_turn() {
+    let mut machine = reconfig_machine(state());
+    let replacement = replacement_tool_set();
+
+    let outcome = machine.step(StepInput::external(user_input()));
+    let llm_id = outcome.requirements[0].id;
+    machine
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement.clone(),
+        })
+        .expect("tool set reconfig queued");
+
+    // The folded text response parks the commit behind a registry effect.
+    let outcome = machine.step(StepInput::resume(RequirementResolution::new(
+        llm_id,
+        RequirementResult::Llm(Ok(text_response("first"))),
+    )));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingReconfig);
+    assert_eq!(outcome.requirements.len(), 1);
+    let reconfig_id = outcome.requirements[0].id;
+
+    // Abandoning the registry requirement preserves the text turn by committing
+    // it, and the machine settles back to a feedable Idle.
+    let outcome = machine.step(StepInput::abandon(reconfig_id));
+    assert!(outcome.is_quiescent());
+    assert!(!outcome.is_rejected());
+    assert!(outcome.requirements.is_empty());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Idle);
+
+    // The folded text response is committed, not discarded.
+    let conversation = machine.state().conversation();
+    assert!(conversation.pending().is_none());
+    assert_eq!(conversation.turns().len(), 1);
+    let turn = &conversation.turns()[0];
+    assert_eq!(turn.messages().len(), 2);
+    assert_text(turn.messages()[0].payload(), "hello");
+    assert_text(turn.messages()[1].payload(), "first");
+
+    // The abandoned reconfiguration was never applied: it stays queued and the
+    // tool set is unchanged.
+    assert!(!machine.state().queued_reconfigs().is_empty());
+    assert_ne!(machine.state().current_tool_set(), &replacement);
+
+    // The next turn re-raises the deferred reconfiguration at its boundary.
+    let outcome = machine.step(StepInput::external(second_user_input()));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingReconfig);
+    assert_eq!(outcome.requirements.len(), 1);
+    let RequirementKind::NeedReconfigRegistry { tool_set } = &outcome.requirements[0].kind else {
+        panic!("the queued reconfiguration must re-emit its registry effect");
+    };
+    assert_eq!(tool_set, &replacement);
+}
+
 /// A reconfiguration queued while a tool turn is in flight does not disturb the
 /// current turn: the post-tool assistant continuation still renders the old
 /// tool set. The change only lands at the turn boundary, again behind the

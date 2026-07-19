@@ -1043,7 +1043,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `cargo clippy --all-targets -- -D warnings` 干净；`cargo test --all --all-targets`
   全绿。
 
-### M4-4 [TODO] 引入非破坏性 step 错误出口（软拒绝）（M-ERR-1 及连带项）
+### M4-4 [DONE] 引入非破坏性 step 错误出口（软拒绝）（M-ERR-1 及连带项）
 
 上下文：
 
@@ -1067,6 +1067,83 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：max_steps 到达后 cursor 为 Done(StepLimitReached) 且已冻结的 tool 结果不丢。
 - `cargo test -p agent-lib --lib agent::machine` 与 nested 测试全过。
 - `docs/agent-effect-model.md` 的 step 契约节同步。
+
+完成记录：
+
+- **选型：`StepOutcome` 增加 `rejected: Option<StepRejectReason>` 字段**（非专用 outcome
+  变体）——`StepOutcome` 本就是 struct，加字段爆炸半径最小；`#[serde(default,
+  skip_serializing_if)]` 保持旧数据可读。`StepOutcome::new` 保持 3 参（rejected=None，
+  全线 ~40 个构造点零改动），新增 `StepOutcome::rejected(reason)` 构造（quiescent=true：
+  被拒步不改变状态，机器仍停在原卡点）与 `is_rejected()`/`rejection()` 访问器。
+  **`StepRejectReason`**（pub enum，serde `tag=kind/content=detail`）：
+  `UnknownRequirement(String)`（stale/未知 id 的 Resume/Abandon，含嵌套树路由不到的 id）、
+  `IllegalPivotBoundary(String)`（非 StreamingStep 游标、无 outstanding LLM requirement、
+  payload 校验失败、Conversation 注入边界拒绝）、`TurnInProgress(String)`（turn 进行中
+  第二条 UserMessage）。软/硬边界：**软拒绝 = 输入在当前位置不适用**（时序/陈旧类调用方
+  失误，机器状态逐位不变）；**硬失败 = payload kind 不匹配与内部不一致**（driver bug 或
+  真故障，仍走 Error cursor）——审查条目只列的四类全部软化，wrong-kind 保持硬。
+- **机制**：`StepError` 新增 crate 私有变体 `Rejected(StepRejectReason)`；`step()` 在最外层
+  把它映射为 rejected outcome（不经 `fail_from`）。八个点位改造：resume 无 outstanding 分支、
+  resume_llm/resume_reconfig stale id、resume_tool 未知 id、abandon 两个分支、
+  inject_pivot 四处（cursor 守卫 ×2、`pivot.validate()`、`inject_user_message`）、
+  begin_user_turn 中游标守卫（**在任何状态变更之前**检查 cursor 非 Idle/Done/Error 即拒）。
+  **`resume_approval` 重排**（class-wide 必要修复）：原实现先 `.take()` 掉 pending approval
+  再校验 id——软拒绝要求零状态变化，id 校验（两个）已前移到 take 之前。
+- **`fail()` 吞错修复**：转移表新增 `(Done|Error) → Error` 边（error 停靠对所有 cursor kind
+  全可达）；`fail_with_notifications` 的 `cancel_pending` 失败折叠进 parked 错误消息；空消息
+  回退固定文本使 `LoopCursor::error` 全可达；transition 失败（加边后结构性不可达）以
+  `debug_assert!` + 注释显式声明，两处 `let _ =` 均消除。
+- **max_steps → 正常终态**：`finish_tool_phase` 改调新 `finish_step_limit`——tool phase 已
+  drain（无 open call），`cancel_pending(ResumeTurn { cancelled_results: vec![] })` 空闭包
+  合法且保全全部冻结 tool 结果（与 tool abandon 同一保全语义），cursor →
+  `Done(StepLimitReached)`，tool step boundary notification 照常发出。facade 两条路径
+  （`agent.rs` run_full、`agent/stream.rs`）在 Done 分支前加
+  `reason == StepLimitReached → FacadeError::LoopLimitExceeded` 的结构化映射——facade 用户
+  契约不变；`classify_error` 的 "loop step limit" 字符串匹配降级为 legacy fallback（旧
+  snapshot 恢复），彻底移除归 M5-3（注释已注明）。
+- **reconfig abandon 对齐**：during-turn park 的 pending 停在 `ReadyToCommit`，
+  `ResumeTurn` 被 conversation 层结构性拒绝（prepare.rs 只闭 open call、不提交），因此
+  「优先 ResumeTurn 保全文本」在该相位不可行；`abandon_reconfig` 改为
+  `commit_pending(TurnMeta::default())`——提交已冻结文本响应（保全语义与 tool abandon 对齐
+  的唯一可行闭包），被放弃的 reconfiguration 留在队列、下个 turn 边界重发；start-of-turn
+  park 无 pending，直接 finish_cancel。
+- **nested 传播**：`route_by_id`/`start_pending_children`/`step` 聚合携带 `rejected`；
+  未知 id fallback 经根机自然软拒绝——「迟到的 cancel/resume 销毁根机 turn」闭合。
+  testkit `StepObservation` 同步增加 `rejected` 字段与访问器。
+- **范围说明**：`ExternalAgentMachine` 有自己的 stale-id 路径（M-ERR-1 只列默认机器），
+  本次不动，其 outcome `rejected` 恒 None；驱动层（drain/facade）只喂当前 awaited id，
+  不产生软拒绝，无需改动。
+- **测试**：既有 8 条失败断言改软拒绝断言（mod.rs 4 条、tools.rs 4 条 pivot/stale），均附
+  「拒绝后正常输入继续」验证；`step_limit_stops_before_next_model_step` 改断
+  Done(StepLimitReached) + pending 三消息保全 + 后续可 feed；集成测试
+  `step_limit_parks_on_error_before_second_model_step` 更名
+  `step_limit_stops_before_second_model_step` 并改断新终态。新增：
+  `user_message_mid_turn_is_soft_rejected_and_the_turn_continues`（第二条 UserMessage 软拒、\n  原 turn 完成、settle 后可再 feed）、
+  `approval_resume_with_stale_id_is_soft_rejected_and_keeps_the_pending_approval`（scratch
+  未被 take）、`resume_or_abandon_with_an_unknown_id_is_soft_rejected_without_touching_the_tree`
+  （nested 双输入软拒 + 树状态不变）、
+  `abandon_during_turn_reconfig_commits_the_folded_text_turn`（文本落账 + reconfig 留队列重发）、
+  `rejected_step_outcome_round_trips`（serde + 旧数据无 rejected 键可读）、facade
+  `exceeding_the_tool_round_budget_fails_the_stream`（流式 parity，新 fixture
+  `AlwaysStreamingToolUse` 每步新 call id）。
+- **文档**：`docs/agent-effect-model.md` 新增 §2.4「step 的错误出口：软拒绝与硬失败
+  （M4-4）」（含两条终态修正）；`docs/agent-effect-migration.md` §2.1 类型草图补
+  `rejected` 字段与软/硬边界一句；`docs/agent-layer.md` §4.2 补 reconfig abandon 提交语义；
+  `docs/review-2026-07.md` M-ERR-1 已标注 `✅ 已修复（M4-4）`。facade-api.md 无需更新
+  （facade 用户可见行为不变：仍 `LoopLimitExceeded`）。
+- **验证**：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy
+  --all-targets --features "external-claude-code external-codex external-opencode external-acp"
+  -- -D warnings`、`cargo test --all --all-targets`（exit 0，50 个测试目标，无挂起）、
+  `cargo test --features "external-claude-code external-codex external-opencode external-acp"
+  --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- **Breaking change**（pre-1.0，记录在此）：`AgentMachine` 公共契约变化——四类协议违规输入
+  从「销毁 pending turn + Error cursor」变为 `StepOutcome.rejected` 软拒绝（行为修正）；
+  `StepOutcome` 新增 pub 字段 `rejected`（serde 旧数据可读；带 rejected 键的新数据在旧代码
+  `deny_unknown_fields` 下不可读；struct literal 构造点需补）；新增 pub 类型
+  `StepRejectReason`；步数上限终态从 `LoopCursor::Error` 变为 `Done(StepLimitReached)`
+  （`LoopDoneReason::StepLimitReached` 不再是死变体；facade 层面仍映射
+  `LoopLimitExceeded`）；游标转移表新增 `(Done|Error) → Error` 边；reconfig abandon 从
+  DiscardTurn 变为 commit_pending（行为修正）。
 
 ### M4-5 [TODO] 取消语义：延迟有界 + `TurnDone` 契约修正（M-ERR-2）
 

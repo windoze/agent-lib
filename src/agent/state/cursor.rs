@@ -339,7 +339,9 @@ impl LoopCursor {
                 // A completed or errored segment is a terminal rest state. The
                 // machine is reused across turns, so a fresh user turn resets it
                 // back to the feedable `Idle` before opening the next turn.
-                | (Done | Error, Idle)
+                // `Error` is also reachable from here so `fail` can always park
+                // a late runtime failure instead of dropping it (M4-4).
+                | (Done | Error, Idle | Error)
         )
     }
 }

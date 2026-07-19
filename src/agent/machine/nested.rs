@@ -230,19 +230,22 @@ impl NestedMachine {
     }
 
     /// Routes a resume/abandon input to the node stuck on `id`, or to this
-    /// node's own machine when no node awaits it (which surfaces a classified
-    /// error from the own machine).
+    /// node's own machine when no node awaits it (which soft-rejects the input
+    /// there — an unknown id is a caller protocol violation, not a reason to
+    /// destroy the root machine's in-flight turn, M4-4).
     fn route_by_id(
         &mut self,
         id: RequirementId,
         input: StepInput,
         notifications: &mut Vec<Notification>,
         requirements: &mut Vec<Requirement>,
+        rejected: &mut Option<crate::agent::StepRejectReason>,
     ) {
         if self.own.cursor().pending_requirement_ids().contains(&id) {
             let mut outcome = self.step_own(input);
             notifications.append(&mut outcome.notifications);
             requirements.append(&mut outcome.requirements);
+            *rejected = rejected.take().or(outcome.rejected);
             return;
         }
 
@@ -262,12 +265,15 @@ impl NestedMachine {
                 let mut outcome = child.machine.step(input);
                 notifications.append(&mut outcome.notifications);
                 requirements.append(&mut outcome.requirements);
+                *rejected = rejected.take().or(outcome.rejected);
             }
             None => {
-                // No node awaits this id; let the own machine classify the error.
+                // No node awaits this id; let the own machine classify the
+                // rejection (soft: state untouched).
                 let mut outcome = self.step_own(input);
                 notifications.append(&mut outcome.notifications);
                 requirements.append(&mut outcome.requirements);
+                *rejected = rejected.take().or(outcome.rejected);
             }
         }
     }
@@ -279,12 +285,14 @@ impl NestedMachine {
         &mut self,
         notifications: &mut Vec<Notification>,
         requirements: &mut Vec<Requirement>,
+        rejected: &mut Option<crate::agent::StepRejectReason>,
     ) {
         for child in self.children.values_mut() {
             if let Some(opening) = child.pending_start.take() {
                 let mut outcome = child.machine.step(StepInput::External(opening));
                 notifications.append(&mut outcome.notifications);
                 requirements.append(&mut outcome.requirements);
+                *rejected = rejected.take().or(outcome.rejected);
             }
         }
     }
@@ -294,12 +302,14 @@ impl AgentMachine for NestedMachine {
     fn step(&mut self, input: StepInput) -> StepOutcome {
         let mut notifications = Vec::new();
         let mut requirements = Vec::new();
+        let mut rejected = None;
 
         match input {
             StepInput::External(external) => {
                 let mut outcome = self.step_own(StepInput::External(external));
                 notifications.append(&mut outcome.notifications);
                 requirements.append(&mut outcome.requirements);
+                rejected = outcome.rejected;
             }
             StepInput::Resume(resolution) => {
                 let id = resolution.id;
@@ -308,6 +318,7 @@ impl AgentMachine for NestedMachine {
                     StepInput::Resume(resolution),
                     &mut notifications,
                     &mut requirements,
+                    &mut rejected,
                 );
             }
             StepInput::Abandon(id) => {
@@ -316,16 +327,19 @@ impl AgentMachine for NestedMachine {
                     StepInput::Abandon(id),
                     &mut notifications,
                     &mut requirements,
+                    &mut rejected,
                 );
             }
         }
 
         // One feed advances the whole tree: start freshly attached children so
         // their opening requirements join this step's aggregated batch.
-        self.start_pending_children(&mut notifications, &mut requirements);
+        self.start_pending_children(&mut notifications, &mut requirements, &mut rejected);
 
         let quiescent = !self.has_pending_starts();
-        StepOutcome::new(notifications, requirements, quiescent)
+        let mut outcome = StepOutcome::new(notifications, requirements, quiescent);
+        outcome.rejected = rejected;
+        outcome
     }
 
     fn cursor(&self) -> &LoopCursor {

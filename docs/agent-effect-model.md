@@ -103,6 +103,31 @@ drain 一个 stream 时必须区分:
 
 这是 drain 必须携带 handler 的根本原因(§4):忽略通知无害;忽略 requirement 会挂死。
 
+### 2.4 step 的错误出口:软拒绝与硬失败(M4-4)
+
+`step` 不能返回 `Result`,错误出口只有两种形状,按"错在谁"分开:
+
+- **软拒绝(driver 协议违规)**:输入在当前位置不适用 —— stale / 未知 requirement id
+  的 `Resume`/`Abandon`、不合法边界的 pivot、turn 进行中又喂一条 `UserMessage`、嵌套
+  树里路由不到任何节点的 id。机器**状态逐位不变**(cursor、pending turn、outstanding
+  requirement 全部保留),输入经 `StepOutcome.rejected: Option<StepRejectReason>` 回告
+  (`UnknownRequirement` / `IllegalPivotBoundary` / `TurnInProgress`),driver 检查原因
+  后可继续驱动 —— 一次手滑不再销毁整个在途 turn。
+- **硬失败(运行时故障)**:payload kind 不匹配、内部不一致、conversation / state 操作
+  失败。机器经 `cancel_pending(DiscardTurn)` 清理后停在 `LoopCursor::Error`。清理自身
+  的失败不再被吞:折叠进错误消息;转移表含 `(Done|Error) → Error` 边,error 停靠对
+  所有 cursor kind 全可达,诊断不会丢。
+
+同契约下的两条终态修正:
+
+- **步数上限是正常终态**:达到 `max_steps` 走 `LoopCursor::Done(StepLimitReached)`
+  而非 Error;tool phase 已 drain(无 open call),pending turn 以 `ResumeTurn` 空闭包
+  保全(已冻结的 tool 结果不丢)。facade 把该终态结构化映射为
+  `FacadeError::LoopLimitExceeded`(不再字符串匹配)。
+- **reconfig abandon 保全文本**:during-turn reconfig park 在 `ReadyToCommit`
+  (`ResumeTurn` 在该相位非法),abandon 时改为 `commit_pending` 提交已冻结的文本响应;
+  被放弃的 reconfiguration 留在队列,下个 turn 边界重发。
+
 ## 3. Requirement:被 reify 的 effect
 
 一个 requirement 是状态机对外界的一次请求。它**必须可寻址**,因为兑现结果要精确送回

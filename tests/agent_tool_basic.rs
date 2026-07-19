@@ -9,8 +9,8 @@
 //! - parallel tool — a two-call batch is served and both results are committed.
 //! - tool error — a failed tool result returns to the model (the fixture's
 //!   `ReturnErrorToModel` policy) and the turn still commits.
-//! - step limit — a one-step loop policy parks on the error cursor rather than
-//!   starting a second model step.
+//! - step limit — a one-step loop policy settles on `Done(StepLimitReached)`
+//!   rather than starting a second model step, preserving the frozen turn.
 //! - provider call mismatch — a tool result referencing an unregistered provider
 //!   call id fails the append and discards the pending turn.
 //!
@@ -26,7 +26,8 @@ use std::sync::Arc;
 use agent_testkit::prelude::*;
 
 use agent_lib::agent::{
-    AgentSpec, LoopCursorKind, LoopPolicy, ModelRef, ToolFailurePolicy, ToolSetRef, WorktreeRef,
+    AgentSpec, LoopCursor, LoopCursorKind, LoopDoneReason, LoopPolicy, ModelRef, ToolFailurePolicy,
+    ToolSetRef, WorktreeRef,
 };
 use agent_lib::model::tool::{Tool, ToolStatus};
 use serde_json::json;
@@ -184,10 +185,11 @@ async fn tool_error_returns_to_model_and_commits() {
 }
 
 /// A one-step loop policy stops before the second model step: after the tool
-/// runs, the machine parks on the error cursor instead of generating again, and
-/// the pending turn is discarded.
+/// runs, the machine settles on `Done(StepLimitReached)` as a *normal* terminal
+/// (M4-4) instead of generating again, and the frozen tool results stay in a
+/// coherent pending turn rather than being discarded.
 #[tokio::test]
-async fn step_limit_parks_on_error_before_second_model_step() {
+async fn step_limit_stops_before_second_model_step() {
     let ids = SeqIds::new();
     let ctx = root_context(&ids);
     let spec = spec_with_step_limit(&ids, 1, vec![weather_tool()]);
@@ -211,13 +213,15 @@ async fn step_limit_parks_on_error_before_second_model_step() {
     let observed = harness
         .run_user("weather?")
         .await
-        .expect("the step limit is a terminal error cursor, not a drive failure");
+        .expect("the step limit is a terminal done cursor, not a drive failure");
 
-    assert_eq!(
-        observed.final_cursor().kind(),
-        LoopCursorKind::Error,
-        "the one-step limit parks on the error cursor"
-    );
+    let LoopCursor::Done(done) = observed.final_cursor() else {
+        panic!(
+            "the one-step limit settles on the done cursor, got {:?}",
+            observed.final_cursor().kind()
+        );
+    };
+    assert_eq!(done.reason(), LoopDoneReason::StepLimitReached);
     assert_eq!(llm_log.len(), 1, "only the first model step ran");
     assert_eq!(
         tool_log.len(),
@@ -226,7 +230,17 @@ async fn step_limit_parks_on_error_before_second_model_step() {
     );
 
     let machine = harness.into_machine();
-    assert_conversation(machine.state().conversation()).pending_none();
+    let conversation = machine.state().conversation();
+    let pending = conversation
+        .pending()
+        .expect("the step limit preserves the frozen turn");
+    assert_eq!(
+        pending.open_calls().count(),
+        0,
+        "every tool call keeps its real result"
+    );
+    // user + assistant(tool_use) + tool result.
+    assert_eq!(pending.messages().len(), 3);
 }
 
 /// A tool result referencing a provider call id the turn never registered fails

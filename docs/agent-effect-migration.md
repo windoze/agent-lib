@@ -88,12 +88,17 @@ pub struct StepOutcome {
     pub requirements: Vec<Requirement>,
     /// 本步之后机器是否静止(所有分支要么产出、要么卡在 requirement 上)。
     pub quiescent: bool,
+    /// 软拒绝(M4-4):输入在当前位置不适用时机器状态不变,原因在此回告;
+    /// driver 可检查后重试或继续。
+    pub rejected: Option<StepRejectReason>,
 }
 ```
 
 > **要点**:`step` 一次只做"从当前状态到下一个卡点/静止"的**同步**推进。它绝不 await。
 > 所有 await 都在 driver 里对 requirement 的兑现上。`&mut self` 就是 §2.2 里说的天然背压:
-> 没有把上一批 requirement 的结果 `Resume` 回来,机器无法前进。
+> 没有把上一批 requirement 的结果 `Resume` 回来,机器无法前进。错误出口分两类(M4-4):
+> driver 协议违规(stale id、非法 pivot 边界、turn 进行中第二条 UserMessage)经
+> `rejected` **软拒绝**、机器状态不变;运行时故障才走 `LoopCursor::Error` 硬失败。
 
 ### 2.2 现有 `AgentInput` 的调整
 
