@@ -88,8 +88,9 @@ permission/question/choice 仍按 M1-3 路由到父级 handler。
 ## A2（硬阻塞）facade 级 reconfigure API（turn 边界生效）
 
 状态：facade reconfig 入口与准入校验已落地（M2-1）：`Agent::reconfigure(ReconfigRequest)` 支持
-model / system overlay / tool-set declaration / loop policy 请求,skill 请求显式拒绝；facade 选择
-between-run/rest cursor 准入,active turn 返回 `InvalidState`。流式/非流式 reconfig handler 与
+model / system overlay / tool-set declaration / loop policy 请求,skill 请求以
+`FacadeError::Config` 显式拒绝（请求内容问题，M2-R 与 `SetModel` 准入失败同族）；facade 选择
+between-run/rest cursor 准入,active turn 返回 `InvalidState`（时机问题）。流式/非流式 reconfig handler 与
 `ReplaceToolSet` / `PatchToolSet` 的 live registry 一致性已修复（M2-2）；被移除委派工具
 （`ask_<name>`）仍驱动委派的绕过已修复（M2-3）；snapshot/restore 交互、`SetModel` 准入校验与
 facade re-export 完整性已收口（M2-4）。
@@ -101,7 +102,7 @@ facade re-export 完整性已收口（M2-4）。
   ReplaceToolSet, PatchToolSet, SetModel, SetLoopPolicy}`（`agent/state/queue.rs:186-229`），
   turn 边界经 `NeedReconfigRegistry` requirement + `ReconfigRegistryHandler` /
   `ToolRegistryResolver` 应用（`agent/drive/reference.rs:191-244`）。
-- **facade 入口已接线（M2-1）**：`Agent::reconfigure` 接受 facade 重导的 `ReconfigRequest`,并在
+- **facade 入口已接线（✅ 已修复，M2-1）**：`Agent::reconfigure` 接受 facade 重导的 `ReconfigRequest`,并在
   between-run/rest cursor 准入；active/parked turn 显式 `InvalidState`。`SetModel` 与
   `SetSystemPromptOverlay` 可在下一 turn 起点进入 LLM request。
 - **live registry 一致性已接线（✅ 已修复，M2-2）**：facade 的非流式与流式 drive scope 都提供

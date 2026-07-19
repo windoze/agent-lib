@@ -617,9 +617,10 @@ impl Agent {
     /// reconfiguration while a stream is live.
     ///
     /// The facade supports model, tool-set declaration, system-prompt overlay,
-    /// and loop-policy requests. Skill activation requests are rejected because
-    /// the facade does not yet expose a skill registry or skill-to-prompt/tool
-    /// expansion layer. Every supported request can be constructed from facade
+    /// and loop-policy requests. Skill activation requests are rejected with
+    /// [`FacadeError::Config`] because the facade does not yet expose a skill
+    /// registry or skill-to-prompt/tool expansion layer. Every supported
+    /// request can be constructed from facade
     /// re-exports alone ([`ModelRef`], [`ToolSetId`](crate::facade::ToolSetId),
     /// [`ToolSetRef`], [`ToolSetPatch`](crate::facade::ToolSetPatch),
     /// [`ToolDecl`], [`LoopPolicy`]) — no `agent::` internal imports are needed:
@@ -650,9 +651,10 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// Returns [`FacadeError::InvalidState`] when a turn is in progress or when
-    /// the request family is not supported by the facade. Returns
-    /// [`FacadeError::Config`] when a `SetModel` payload fails the builder-level
+    /// Returns [`FacadeError::InvalidState`] when a turn is in progress.
+    /// Returns [`FacadeError::Config`] when the request content is invalid or
+    /// unsupported: a skill-variant request (no facade skill registry exists),
+    /// or a `SetModel` payload that fails the builder-level
     /// model checks (blank name, non-finite temperature, mismatched provider
     /// extras). Returns [`FacadeError::Agent`] when the underlying agent state
     /// rejects the request, for example because a system-prompt overlay version
@@ -1309,6 +1311,10 @@ impl AgentBuilder {
 
     /// Registers an escape-hatch [`ToolRegistry`] whose tools the facade does not
     /// own (`docs/facade-api.md` §7.3).
+    ///
+    /// The tool names admissible through [`Agent::reconfigure`] are frozen from
+    /// the declarations known at build/restore time; a custom registry that
+    /// changes its declarations later does not update that admission surface.
     #[must_use]
     pub fn tool_registry(mut self, registry: Arc<dyn ToolRegistry>) -> Self {
         self.custom_registry = Some(registry);
@@ -1927,7 +1933,7 @@ fn ensure_facade_reconfig_request_supported(request: &ReconfigRequest) -> Result
     match request {
         ReconfigRequest::ActivateSkill { .. }
         | ReconfigRequest::DeactivateSkill { .. }
-        | ReconfigRequest::ReplaceActiveSkills { .. } => Err(FacadeError::InvalidState(
+        | ReconfigRequest::ReplaceActiveSkills { .. } => Err(FacadeError::Config(
             "facade reconfigure does not support skill activation requests; use the agent layer \
              until facade skill registry wiring exists"
                 .to_owned(),

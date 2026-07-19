@@ -398,9 +398,7 @@ fn reconfigure_rejects_skill_requests_explicitly() {
         })
         .expect_err("facade skill reconfig is not supported");
 
-    assert!(
-        matches!(error, FacadeError::InvalidState(message) if message.contains("skill activation"))
-    );
+    assert!(matches!(error, FacadeError::Config(message) if message.contains("skill activation")));
     assert!(agent.state().queued_reconfigs().is_empty());
 }
 

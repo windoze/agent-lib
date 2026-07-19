@@ -576,7 +576,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `cargo test --all --all-targets`（50 套件全绿）；`RUSTDOCFLAGS="-D warnings" cargo doc
   --no-deps --workspace`；`cargo test --doc -p agent-lib`（新增 reconfigure doc 示例通过）。
 
-### M2-R [TODO] M2 review：facade reconfigure 收口
+### M2-R [DONE] M2 review：facade reconfigure 收口
 
 - 逐条核对 `docs/mag-gaps.md` A2 的落地状态并标注。
 - 核对 mag 验收线索：turn 边界可换 model/tools/system，会话历史保留，snapshot/restore
@@ -588,6 +588,50 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   接受）、skill 变体拒绝与时机拒绝同为 `InvalidState` 不可区分、`available_names` 在
   build/restore 时冻结、`SetLoopPolicy` 覆盖 facade 派生 budget 的交互未文档化。
 - 全量门禁通过。
+
+完成记录（2026-07-20）：
+
+- **A2 状态标注核对**：`docs/mag-gaps.md` A2 全部子条目已带正确任务 id 的 `✅ 已修复`
+  标注（M2-1/M2-2/M2-3/M2-4）；本轮把 M2-1 条目从「已接线（M2-1）」补齐为
+  「✅ 已修复（M2-1）」统一口径，状态总述补充 skill 拒绝变体为 `Config` 的说明，无
+  「未实现」的过时描述残留。
+- **mag 验收线索核对（读测试，未重跑全量）**：turn 边界换 model/system 由
+  `reconfigure_set_model_and_overlay_apply_at_next_turn_start` 钉住（scripted client 断言下一
+  request 的 model/system 字段），换 tools 由非流式 Replace/Patch 与流式 Replace 三个
+  registry 测试钉住；reconfig 不触碰 `Conversation`，会话历史保留由 `Conversation` 累积
+  committed turn 的既有不变量与 `snapshot_then_restore_continues_history` 覆盖；
+  snapshot/restore 不丢已应用 reconfig（`snapshot_restore_preserves_applied_model_and_tool_set_reconfig`）
+  且捕获排队未应用队列（`snapshot_captures_queued_unapplied_reconfigs_for_restore`）。
+  无静默 mismatch：M2-2 准入校验（`reconfigure_rejects_tool_set_not_backed_by_facade_registry`）、
+  M2-3 委派 gating（`reconfigure_replace/patch_tool_set_removing_a_delegate_yields_unknown_tool`）、
+  M2-4 restore 工具面校验（`restore_rejects_a_surface_missing_current_tool_set_tools` /
+  `restore_rejects_a_surface_missing_a_queued_reconfig_tool_set`）均在测试钉住，无缺口需补。
+- **nit 处置逐条**：
+  a. 准入仅按名字校验声明——判定 BY DESIGN，已在 `docs/facade-api.md` §8.2 reconfigure
+     段新增一段：名字被校验，description/input_schema 是调用方提供的展示元数据（原样渲染进
+     LLM request），执行永远使用注册闭包，同名不同 schema 的声明被接受是有意设计。
+  b. skill 变体拒绝从 `FacadeError::InvalidState` 改为 `FacadeError::Config`，与 M2-4
+     `SetModel` 准入失败同族——请求内容问题报 `Config`，时机问题（active/parked turn）保留
+     `InvalidState`，两者可区分。更新 `ensure_facade_reconfig_request_supported`、
+     `Agent::reconfigure` rustdoc（含 # Errors）、`docs/facade-api.md` 与测试
+     `reconfigure_rejects_skill_requests_explicitly`。**行为变化（minor）**：skill 变体拒绝的
+     错误变体改变，按变体判等的下游会观察到差异；消息文本不变。
+  c. `available_names` 在 build/restore 时冻结——登记为已知限制，写入
+     `docs/facade-api.md` §7.3 与 `AgentBuilder::tool_registry` rustdoc（动态 custom registry
+     后续改声明不会更新准入面）。
+  d. `SetLoopPolicy` 静默取代派生 budget——已在 `docs/facade-api.md` §8.2 文档化：
+     `SetLoopPolicy` 整体替换 `min(max_steps, max_tool_rounds + 1)` 派生 budget，builder 的
+     `max_steps` / `max_tool_rounds` 此后不再参与计算。
+- **should-fix 收口核对**：`SetModel` 准入校验（三个 M2-4 测试）与 facade re-export 完整性
+  （`facade_surface::facade_paths_construct_every_supported_reconfig_request` 编译级测试 +
+  reconfigure doctest）均已收口，无遗留。
+- Breaking change：无公开 API 形状破坏；唯一行为变化是 nit b 的 skill 变体拒绝错误变体
+  （`InvalidState` → `Config`）。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  `cargo test --all --all-targets`（50 套件全绿）；`cargo test -p agent-lib --lib facade::`
+  （262 passed）；`cargo test --doc -p agent-lib`（12 passed）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 
 ---
 
