@@ -1424,13 +1424,6 @@ impl AgentBuilder {
             }
         };
 
-        // Reject duplicate tool names up front, before any machine is assembled.
-        ensure_unique_tool_names(
-            &self.tools,
-            &self.extra_declarations,
-            self.custom_registry.as_ref(),
-        )?;
-
         let mut model = ModelConfig::new(model_name);
         if let Some(max_tokens) = self.max_tokens {
             model = model.max_tokens(max_tokens);
@@ -1450,55 +1443,15 @@ impl AgentBuilder {
                 .unwrap_or(ToolFailurePolicy::ReturnErrorToModel),
         );
 
-        // The advertised tool set must mirror what the run-scoped
-        // FacadeToolRegistry reports, so build it from the same three sources,
-        // then append the delegation tool declarations the configured
-        // `Delegation` mode advertises for the registered subagents: one
-        // `ask_<name>` tool per delegate (model-routed, §10.1) or a single
-        // unified `<name>(agent, task)` tool (§10.2).
         let delegation = self.delegation.unwrap_or_default();
-
-        // Rules-routed delegation names its delegates by string; a name no agent
-        // registered can never route, so reject it up front rather than failing
-        // silently at run time (§13.2).
-        if let Some(unknown) =
-            delegation.first_unknown_rule_delegate(&self.delegates, &self.external_agents)
-        {
-            return Err(FacadeError::Config(format!(
-                "rules-routed delegation references unregistered delegate `{unknown}`"
-            )));
-        }
-
-        // Dispatcher-routed delegation likewise names its primary / verifier /
-        // escalation delegates by string: a missing primary or an unregistered
-        // name can never run, so reject both up front (§13.3).
-        if let Some(config) = delegation.dispatcher_config() {
-            if config.primary().is_empty() {
-                return Err(FacadeError::Config(
-                    "dispatcher-routed delegation is missing a `primary` delegate".to_owned(),
-                ));
-            }
-            if let Some(unknown) =
-                delegation.first_unknown_dispatcher_delegate(&self.delegates, &self.external_agents)
-            {
-                return Err(FacadeError::Config(format!(
-                    "dispatcher-routed delegation references unregistered delegate `{unknown}`"
-                )));
-            }
-        }
-
-        let mut declarations: Vec<ToolDecl> = self.tools.iter().map(Tool::declaration).collect();
-        declarations.extend(self.extra_declarations.iter().cloned());
-        if let Some(custom) = &self.custom_registry {
-            declarations.extend(custom.declarations());
-        }
-        declarations.extend(delegation.declarations(&self.delegates, &self.external_agents));
-
-        // Reject any name collision the delegation tools introduce — two
-        // delegates minting the same `ask_<name>`, or a delegation tool clashing
-        // with a typed tool / escape-hatch declaration (§10.1). The base tool
-        // sources were already checked above; this covers the delegation layer.
-        ensure_unique_declaration_names(&declarations)?;
+        let declarations = build_agent_tool_declarations(
+            &self.tools,
+            &self.extra_declarations,
+            self.custom_registry.as_ref(),
+            &delegation,
+            &self.delegates,
+            &self.external_agents,
+        )?;
 
         let spec = AgentSpec::new(
             ids.agent_id(),
@@ -1579,6 +1532,77 @@ fn build_facade_approval(
         }
     }
     Arc::new(approval)
+}
+
+/// Builds and validates the complete model-visible tool declaration surface.
+///
+/// Fresh build and restore both need the same checks: the runtime tool handlers
+/// cannot collide with each other, routing modes may not reference missing
+/// delegates, and synthesized delegation tools must not collide with any base
+/// tool declaration.
+pub(crate) fn build_agent_tool_declarations(
+    tools: &[Tool],
+    extra_declarations: &[ToolDecl],
+    custom_registry: Option<&Arc<dyn ToolRegistry>>,
+    delegation: &Delegation,
+    delegates: &[LocalSubagent],
+    external_agents: &[ManagedExternalDelegate],
+) -> Result<Vec<ToolDecl>, FacadeError> {
+    // Reject duplicate base tool names before adding delegation declarations.
+    ensure_unique_tool_names(tools, extra_declarations, custom_registry)?;
+
+    validate_delegation_references(delegation, delegates, external_agents)?;
+
+    // The advertised tool set must mirror what the run-scoped
+    // FacadeToolRegistry reports, then include any synthesized delegation tools:
+    // one `ask_<name>` tool per delegate (model-routed, §10.1) or a single
+    // unified `<name>(agent, task)` tool (§10.2).
+    let mut declarations: Vec<ToolDecl> = tools.iter().map(Tool::declaration).collect();
+    declarations.extend(extra_declarations.iter().cloned());
+    if let Some(custom) = custom_registry {
+        declarations.extend(custom.declarations());
+    }
+    declarations.extend(delegation.declarations(delegates, external_agents));
+
+    // Reject collisions introduced by the delegation layer: two delegates minting
+    // the same `ask_<name>`, or a delegation tool clashing with a typed tool /
+    // escape-hatch declaration (§10.1).
+    ensure_unique_declaration_names(&declarations)?;
+    Ok(declarations)
+}
+
+fn validate_delegation_references(
+    delegation: &Delegation,
+    delegates: &[LocalSubagent],
+    external_agents: &[ManagedExternalDelegate],
+) -> Result<(), FacadeError> {
+    // Rules-routed delegation names delegates by string; a name no agent
+    // registered can never route, so reject it up front (§13.2).
+    if let Some(unknown) = delegation.first_unknown_rule_delegate(delegates, external_agents) {
+        return Err(FacadeError::Config(format!(
+            "rules-routed delegation references unregistered delegate `{unknown}`"
+        )));
+    }
+
+    // Dispatcher-routed delegation likewise names its primary / verifier /
+    // escalation delegates by string: a missing primary or an unregistered name
+    // can never run, so reject both up front (§13.3).
+    if let Some(config) = delegation.dispatcher_config() {
+        if config.primary().is_empty() {
+            return Err(FacadeError::Config(
+                "dispatcher-routed delegation is missing a `primary` delegate".to_owned(),
+            ));
+        }
+        if let Some(unknown) =
+            delegation.first_unknown_dispatcher_delegate(delegates, external_agents)
+        {
+            return Err(FacadeError::Config(format!(
+                "dispatcher-routed delegation references unregistered delegate `{unknown}`"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Assembles the §8.3 [`DefaultAgentMachine`] over `state`, wiring the facade

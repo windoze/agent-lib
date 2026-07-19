@@ -57,11 +57,11 @@ use crate::facade::external::{
 };
 use crate::facade::ids::FacadeIds;
 use crate::facade::run::ArtifactRef;
-use crate::facade::tool::{Tool, ensure_unique_tool_names};
+use crate::facade::tool::Tool;
 use crate::model::extras::ProviderExtras;
 use crate::model::tool::Tool as ToolDecl;
 
-use super::{Agent, assemble_machine, build_facade_approval};
+use super::{Agent, assemble_machine, build_agent_tool_declarations, build_facade_approval};
 
 /// A serializable, data-only snapshot of an [`Agent`]'s supervisor state.
 ///
@@ -766,7 +766,8 @@ impl AgentRestoreBuilder {
     /// - [`FacadeError::Config`] when no snapshot was set, or when neither an
     ///   explicit client nor a provider was supplied.
     /// - [`FacadeError::DuplicateTool`] when a re-injected tool name collides
-    ///   with another tool, an escape-hatch declaration, or the custom registry.
+    ///   with another tool, an escape-hatch declaration, the custom registry, or
+    ///   a restored delegation tool declaration.
     /// - [`FacadeError::InvalidState`] when the captured
     ///   [`AgentStateSnapshot`] cannot be deserialized back into an
     ///   [`AgentState`].
@@ -792,10 +793,56 @@ impl AgentRestoreBuilder {
             }
         };
 
-        ensure_unique_tool_names(
+        // Rebuild the registered external delegates from their data-only
+        // snapshots (a snapshot cannot carry the runtime session handler, §15.2),
+        // then apply the caller's re-registrations (which re-supply that handler),
+        // replacing the persisted recipe of the same name in place — symmetric to
+        // the local-subagent restore below.
+        let mut external_agents: Vec<ManagedExternalDelegate> = snapshot
+            .external_delegates
+            .iter()
+            .map(ExternalDelegateSnapshot::to_delegate)
+            .collect();
+        for override_delegate in self.external_overrides {
+            match external_agents
+                .iter_mut()
+                .find(|existing| existing.name() == override_delegate.name())
+            {
+                Some(existing) => *existing = override_delegate,
+                None => external_agents.push(override_delegate),
+            }
+        }
+
+        // Rebuild the registered delegates from their data-only snapshots,
+        // defaulting each approval policy (a runtime handle the snapshot cannot
+        // carry, §15.2). A caller may re-register a delegate through
+        // `.subagent(..)` to re-supply an approval policy; a re-registration
+        // replaces the persisted recipe of the same name in place.
+        let mut delegates: Vec<LocalSubagent> = snapshot
+            .delegates
+            .into_iter()
+            .map(|delegate| delegate.into_delegate(ApprovalPolicy::default()))
+            .collect();
+        for override_delegate in self.subagent_overrides {
+            match delegates
+                .iter_mut()
+                .find(|existing| existing.name() == override_delegate.name())
+            {
+                Some(existing) => *existing = override_delegate,
+                None => delegates.push(override_delegate),
+            }
+        }
+
+        // Restore keeps the snapshot's AgentState declarations as the data
+        // authority, but the runtime handlers re-injected here still must be
+        // compatible with the restored delegation surface.
+        build_agent_tool_declarations(
             &self.tools,
             &self.extra_declarations,
             self.custom_registry.as_ref(),
+            &snapshot.delegation,
+            &delegates,
+            &external_agents,
         )?;
 
         // The restored state is otherwise authoritative: it preserves the spec,
@@ -812,26 +859,6 @@ impl AgentRestoreBuilder {
         let ids = self
             .ids
             .unwrap_or_else(|| FacadeIds::continuing_after(state.conversation()));
-
-        // Rebuild the registered external delegates from their data-only
-        // snapshots (a snapshot cannot carry the runtime session handler, §15.2),
-        // then apply the caller's re-registrations (which re-supply that handler),
-        // replacing the persisted recipe of the same name in place — symmetric to
-        // the local-subagent restore above.
-        let mut external_agents: Vec<ManagedExternalDelegate> = snapshot
-            .external_delegates
-            .iter()
-            .map(ExternalDelegateSnapshot::to_delegate)
-            .collect();
-        for override_delegate in self.external_overrides {
-            match external_agents
-                .iter_mut()
-                .find(|existing| existing.name() == override_delegate.name())
-            {
-                Some(existing) => *existing = override_delegate,
-                None => external_agents.push(override_delegate),
-            }
-        }
 
         // Reconcile each snapshotted delegate's recorded session under the chosen
         // `restore_external` policy (§15.3).
@@ -878,26 +905,6 @@ impl AgentRestoreBuilder {
             external_tool_names,
         );
         let machine = assemble_machine(state, &ids, approval.clone());
-
-        // Rebuild the registered delegates from their data-only snapshots,
-        // defaulting each approval policy (a runtime handle the snapshot cannot
-        // carry, §15.2). A caller may re-register a delegate through
-        // `.subagent(..)` to re-supply an approval policy; a re-registration
-        // replaces the persisted recipe of the same name in place.
-        let mut delegates: Vec<LocalSubagent> = snapshot
-            .delegates
-            .into_iter()
-            .map(|delegate| delegate.into_delegate(ApprovalPolicy::default()))
-            .collect();
-        for override_delegate in self.subagent_overrides {
-            match delegates
-                .iter_mut()
-                .find(|existing| existing.name() == override_delegate.name())
-            {
-                Some(existing) => *existing = override_delegate,
-                None => delegates.push(override_delegate),
-            }
-        }
 
         // Re-derive the collaboration substrate from the restored topology (§14).
         // A snapshot carries no explicit `Collaboration` (§15.2), so restore

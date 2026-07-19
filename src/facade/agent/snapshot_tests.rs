@@ -16,6 +16,7 @@
 //! [`StubClient`] is only present so the builder / restore builder have a client
 //! to hold; it is never driven.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -24,7 +25,7 @@ use futures::stream::BoxStream;
 use crate::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
 use crate::facade::agent::{Agent, AgentBuilder};
 use crate::facade::delegate::Delegation;
-use crate::facade::{AgentSnapshot, ArtifactRef, Collaboration};
+use crate::facade::{AgentSnapshot, ArtifactRef, Collaboration, FacadeError, Tool, ToolContext};
 use crate::stream::StreamEvent;
 
 /// A never-driven client, so the builder / restore builder have a runtime handle
@@ -63,6 +64,17 @@ fn restore(snapshot: AgentSnapshot) -> Agent {
         .expect("restore agent")
 }
 
+fn noop_tool(name: &str) -> Tool {
+    Tool::function_with_schema(
+        name,
+        "No-op restore test tool.",
+        serde_json::json!({ "type": "object" }),
+        |_ctx: ToolContext, _args: serde_json::Value| async move {
+            Ok::<_, Infallible>("ok".to_owned())
+        },
+    )
+}
+
 /// A two-delegate supervisor: §14 auto-enables a shared mailbox (only).
 fn mailbox_supervisor() -> Agent {
     AgentBuilder::default()
@@ -99,6 +111,86 @@ fn dispatcher_supervisor() -> Agent {
         )
         .build()
         .expect("build agent")
+}
+
+#[test]
+fn restore_rejects_tool_name_colliding_with_restored_delegation_tool() {
+    let agent = AgentBuilder::default()
+        .client(Arc::new(StubClient))
+        .model("supervisor-model")
+        .subagent(
+            "reviewer",
+            Agent::worker()
+                .description("Reviews changes.")
+                .system("review")
+                .build()
+                .expect("worker builds"),
+        )
+        .build()
+        .expect("agent builds");
+    let snapshot = agent.snapshot().expect("snapshot at a committed point");
+
+    let error = Agent::restore()
+        .snapshot(snapshot)
+        .client(Arc::new(StubClient))
+        .tool(noop_tool("ask_reviewer"))
+        .build()
+        .expect_err("restore rejects delegation/tool declaration collision");
+
+    assert!(
+        matches!(error, FacadeError::DuplicateTool { ref name } if name == "ask_reviewer"),
+        "restore should reject the restored ask_reviewer delegation tool collision, got {error:?}"
+    );
+}
+
+#[test]
+fn restore_rejects_unknown_rules_routed_delegate_references() {
+    let agent = AgentBuilder::default()
+        .client(Arc::new(StubClient))
+        .model("supervisor-model")
+        .build()
+        .expect("agent builds");
+    let mut snapshot = agent.snapshot().expect("snapshot at a committed point");
+    snapshot.delegation = Delegation::rules().when_task_contains(["fix"], "ghost");
+
+    let error = Agent::restore()
+        .snapshot(snapshot)
+        .client(Arc::new(StubClient))
+        .build()
+        .expect_err("restore rejects unknown rules-routed delegates");
+
+    let FacadeError::Config(message) = error else {
+        panic!("expected Config for unknown rule delegate, got {error:?}");
+    };
+    assert!(
+        message.contains("rules-routed") && message.contains("ghost"),
+        "unexpected config message: {message}"
+    );
+}
+
+#[test]
+fn restore_rejects_unknown_dispatcher_delegate_references() {
+    let agent = AgentBuilder::default()
+        .client(Arc::new(StubClient))
+        .model("supervisor-model")
+        .build()
+        .expect("agent builds");
+    let mut snapshot = agent.snapshot().expect("snapshot at a committed point");
+    snapshot.delegation = Delegation::dispatcher().primary("ghost");
+
+    let error = Agent::restore()
+        .snapshot(snapshot)
+        .client(Arc::new(StubClient))
+        .build()
+        .expect_err("restore rejects unknown dispatcher delegates");
+
+    let FacadeError::Config(message) = error else {
+        panic!("expected Config for unknown dispatcher delegate, got {error:?}");
+    };
+    assert!(
+        message.contains("dispatcher-routed") && message.contains("ghost"),
+        "unexpected config message: {message}"
+    );
 }
 
 #[test]

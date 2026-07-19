@@ -1369,7 +1369,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test -p agent-lib --lib facade::`（222 条通过）、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - 无 breaking change（新增 builder API 纯增量；默认 provider_extras 仍为 `None`，既有构建路径行为保持兼容）。
 
-### M5-6 [TODO] restore 路径补齐 build 同级校验（M-ADP-5）
+### M5-6 [DONE] restore 路径补齐 build 同级校验（M-ADP-5）
 
 上下文：
 
@@ -1384,6 +1384,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：restore 一个带 delegation 的 agent 再 `.tool(..)` 注入同名 `ask_<name>` 工具，`build` 报错而非带病上线。
 - `cargo test -p agent-lib --lib facade::agent` 全过。
+
+完成记录：
+
+- `src/facade/agent.rs`：抽取 `build_agent_tool_declarations` 作为 fresh build / restore build 共享校验入口。该入口先检查 typed tools + extra declarations + custom registry 的基础重名，再校验 rules/dispatcher delegation 是否引用未注册 delegate，最后把 delegation 合成声明加入完整声明列表并用 `ensure_unique_declaration_names` 检查 `ask_<name>` / unified delegation tool 与基础工具的碰撞。
+- `src/facade/agent/snapshot.rs`：restore build 先按 snapshot + 调用方 override 重建最终 local/external delegate 拓扑，再调用共享校验入口；restore 仍以 snapshot 的 `AgentState` 声明为数据权威，不重写 restored state，只拒绝与 restored delegation 表面不兼容的重新注入 runtime 工具/registry。
+- 测试：`src/facade/agent/snapshot_tests.rs` 新增三条离线回归——`restore_rejects_tool_name_colliding_with_restored_delegation_tool`（`.tool("ask_reviewer")` 与 restored delegation 合成工具对撞时报 `DuplicateTool`）、`restore_rejects_unknown_rules_routed_delegate_references`、`restore_rejects_unknown_dispatcher_delegate_references`。
+- 文档：`docs/facade-api.md` §15.2 补充 restore 阶段复用 fresh build 声明/委托校验；`docs/review-2026-07.md` M-ADP-5 已标注 `✅ 已修复（M5-6）`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test -p agent-lib --lib facade::agent`（62 条通过）、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。验证后仅追加 markdown/TODO 完成记录，无需重跑编译测试。
+- 无 breaking change（仅让 restore 早期拒绝 fresh build 已会拒绝的不一致工具/委托配置）。
 
 ### M5-7 [TODO] M5 review：facade 承诺收口
 

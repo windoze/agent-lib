@@ -1104,6 +1104,12 @@ pub struct AgentSnapshot {
 故常规 capture 下为空（能力已就绪，供未来可中断 delegation）。task brief 默认不写入持久 snapshot
 （R5）。
 
+restore 重新注入 typed tools、escape-hatch declarations/custom registry、local/external delegate runtime
+attachments 后，会复用 fresh build 的同一套声明与委托校验：重新注入的 runtime 工具不得与 restored
+delegation 合成的 `ask_<name>` / unified delegation tool 重名，rules-routed 与 dispatcher-routed
+delegation 也不得引用未注册 delegate。失败在 `AgentRestoreBuilder::build()` 阶段以
+`DuplicateTool` 或 `Config` 返回，而不是把不一致的声明面带到下一次 provider request。
+
 `mailbox` / `blackboard` / `plan` 保存已启用协作底座的 data-only snapshot（未启用为 `None`，
 带 `#[serde(default)]` 兼容旧格式）。restore 采用 **snapshot 内容为准，topology 只作为兼容旧
 snapshot 的 provision hint** 的冲突策略：
