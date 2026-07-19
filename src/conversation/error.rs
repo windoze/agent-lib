@@ -936,8 +936,8 @@ pub enum SnapshotError {
 /// A versioned snapshot could not be restored into live runtime state.
 ///
 /// Restore errors carry a stable JSON-like path so callers can identify the
-/// persisted fact that failed schema, history, turn, origin, projection, or
-/// derived-runtime validation. No live [`Conversation`](super::Conversation)
+/// persisted fact that failed schema, history, turn, origin, or projection
+/// validation. No live [`Conversation`](super::Conversation)
 /// is produced on any restore error.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum RestoreError {
@@ -1135,13 +1135,6 @@ pub enum RestoreError {
         /// Underlying projection validation error.
         #[source]
         source: ProjectionError,
-    },
-
-    /// A derived runtime index did not match an independent rebuild.
-    #[error("restore rejected {path}: rebuilt tool-call index does not match full scan")]
-    DerivedIndexMismatch {
-        /// JSON-like path of the facts used to derive the index.
-        path: String,
     },
 }
 

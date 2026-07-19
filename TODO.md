@@ -651,7 +651,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::persistence`（19 条全过，含新 e2e）、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。无 `conversation_persistence*` 集成测试目标，persistence 测试均在 lib 内（按现有测试目标名执行）。
 - `docs/review-2026-07.md` H-STATE-2 已标注 `✅ 已修复（M3-2）`。无 breaking change（serde 向后兼容增量字段；struct literal 构造点仅库内一处已同步）。
 
-### M3-3 [TODO] 修复 restore 派生索引的空校验（M-CONV-1）
+### M3-3 [DONE] 修复 restore 派生索引的空校验（M-CONV-1）
 
 上下文：
 
@@ -666,6 +666,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 现有 restore 测试全过；若保留 (b)，新增一条"增量与全量不一致"的构造性测试（可通过测试专用 hook 注入）。
 - `cargo test -p agent-lib --lib conversation::persistence` 通过。
+
+完成记录：
+
+- 选型：方案 (a)。`ToolCallIndex::rebuild(turns, None)` 是纯函数，对同一输入必得同一输出，两次调用再比较结构性不可达、无校验价值；方案 (b) 的增量对照（`push_committed_turn` 逐 turn 推进 vs 全量 rebuild）在此不适用——restore 本身就是全量重建路径，增量路径只在运行时 commit 边界使用，无对照意义。
+- `src/conversation/persistence/snapshot.rs`：删除 `rebuild_tool_call_index` 包装函数，`restore_v1` 直接 `ToolCallIndex::rebuild(history.turns(), None)`（派生索引是已验证事实的确定性重建缓存，代码注释记录该推理）；`Conversation::restore` rustdoc 错误清单删去 "derived index mismatch"。
+- `src/conversation/error.rs`：删除 `RestoreError::DerivedIndexMismatch` 变体（零构造点、零 match 点、零测试引用，已 grep 确认）；enum 级文档的错误类别清单同步删去 "derived-runtime validation"。
+- `RestoreError` 未标 `#[non_exhaustive]`，删除变体属 breaking change（pre-1.0，记录在此）：外部对该枚举的穷尽 match 需删分支。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::persistence`（19 条全过）、`cargo test --all --all-targets`（exit 0）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- `docs/review-2026-07.md` M-CONV-1 已标注 `✅ 已修复（M3-3）`。
 
 ### M3-4 [TODO] 消除长链递归（restore 校验 + History drop）（M-CONV-2）
 

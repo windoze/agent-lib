@@ -274,7 +274,7 @@ impl Conversation {
     ///
     /// Returns a path-carrying [`RestoreError`] for unsupported schema
     /// versions, invalid raw history, illegal closed turns, inconsistent fork
-    /// provenance, invalid projection facts, or derived index mismatch.
+    /// provenance, or invalid projection facts.
     pub fn restore(snapshot: ConversationSnapshot) -> Result<Self, ConversationError> {
         Self::try_from(snapshot)
     }
@@ -310,7 +310,9 @@ fn restore_v1(snapshot: ConversationSnapshot) -> Result<Conversation, RestoreErr
     )?;
     let history =
         History::from_restored(validated_turns, &snapshot.history.lineage_turns, active_len);
-    let tool_call_index = rebuild_tool_call_index(history.turns())?;
+    // The tool-call index is a derived cache rebuilt deterministically from the
+    // validated turns above, so it needs no cross-check of its own (M3-3).
+    let tool_call_index = ToolCallIndex::rebuild(history.turns(), None);
     let mut conversation = Conversation {
         id: snapshot.id,
         config: snapshot.config,
@@ -560,18 +562,6 @@ fn validate_origin(
     }
 
     Ok(())
-}
-
-/// Rebuilds and cross-checks the derived tool-call index from closed facts.
-fn rebuild_tool_call_index(turns: &[Turn]) -> Result<ToolCallIndex, RestoreError> {
-    let rebuilt = ToolCallIndex::rebuild(turns, None);
-    let full_scan = ToolCallIndex::rebuild(turns, None);
-    if rebuilt != full_scan {
-        return Err(RestoreError::DerivedIndexMismatch {
-            path: "$.history.raw_turns".to_owned(),
-        });
-    }
-    Ok(rebuilt)
 }
 
 /// Converts in-memory collection sizes to the stable snapshot integer width.
