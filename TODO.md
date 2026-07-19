@@ -915,7 +915,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::boundary`（23 条全过，无行为变化）、`cargo test -p agent-lib --doc`（12 条全过，含 `fork_at` doctest）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。全量测试套件按既定政策跳过——自 M3-7 绿色全量运行以来仅 rustdoc 注释与 markdown 文档变更，不影响编译输出，沿用前次绿色结果。
 - 无 breaking change（纯文档）。
 
-### M3-9 [TODO] M3 review：Conversation 正确性收口
+### M3-9 [DONE] M3 review：Conversation 正确性收口
 
 检查项：
 
@@ -923,6 +923,19 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 重点复验：M3-1 回归测试（revert→compact→redo→effective_view 完整）；rows round-trip 含 meta；10 万级链不栈溢出。
 - `docs/conversation-core.md` 与实现一致。
 - 全量门禁命令通过。
+
+完成记录：
+
+- 条目核对：`docs/review-2026-07.md` 八条均已标注——H-STATE-1（M3-1）、H-STATE-2（M3-2）、M-CONV-1（M3-3）、M-CONV-2（M3-4）、M-CONV-5（M3-6）、M-CONV-6（M3-7）为 `✅ 已修复`，M-CONV-7 为 `📄 已降级（文档承认现状，M3-8）`；M-CONV-3 按既定口径由本任务标注 `✅ 已修复（M3-5）`（M3-5-1~4 已全部落地：schema v3 代次列、最大代次重组、代次键 diff、文档同步）。代码点位抽查确认修复在场：`CompactionOnRevertedHead` 变体（error.rs:732）、`MessageRecord.meta`（rows.rs:192）、四类演进行的 `generation` 列与 `CONVERSATION_ROW_SCHEMA_VERSION = 3`、`PairingProviderIdResolver`（index.rs:405）、`validate_assistant_blocks` 预检（pending/turn.rs:394）、`check_parent_chain` 迭代化与 `HistoryNode`/`RawEntry` 手工 Drop。
+- 重点复验（`cargo test -p agent-lib --lib conversation::`，177 条全过，0.63s，无挂起）：
+  - M3-1 回归：`apply_compaction_rejects_a_reverted_head_and_redo_keeps_every_turn` 通过。
+  - rows round-trip 含 meta：`rows_round_trip_preserves_injected_user_message_meta` 通过。
+  - 10 万级链：`parent_graph_validation_handles_a_long_chain_iteratively` 等 4 条 snapshot::tests 通过。
+  - M-CONV-3 演进二次导出不冲突：`insert_set_against_follows_{commit,revert,compaction}_evolution_without_conflict`、`insert_set_against_rejects_same_generation_tampering`、`insert_set_against_rows_merge_into_the_latest_snapshot` 全过。
+  - M3-6 预检 3 条 freeze_boundary 测试与 M3-7 `rebuild_replays_the_validators_claimed_exclusion_for_optional_ids` 通过。
+- 文档核对：`docs/conversation-core.md` 与实现一致——finish 块级预检段（M3-6）、§6.1 reverted head 不可 compaction（M3-1）、§6.2 fork 不继承 projection（M3-8）、§10 messages 行 `meta` 列（M3-2）与代次演进段（M3-5，含四类演进行清单、`generation == structural_version`、最大代次选取、pre-1.0 无迁移路径）抽查均与代码口径一致。
+- 全量门禁：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0，约 32s，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 本任务纯审查，无代码改动（仅 `docs/review-2026-07.md` 的 M-CONV-3 标注与本完成记录），无 breaking change。
 
 ---
 

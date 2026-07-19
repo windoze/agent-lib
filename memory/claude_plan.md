@@ -1,39 +1,43 @@
-# 执行计划
+# 执行计划：M3-9 M3 review — Conversation 正确性收口
 
-## 当前任务：M3-8 fork 不继承 compaction projection 的文档化（M-CONV-7，方案 a）
+## 任务识别
 
-任务来源：`TODO.md` M3-8。前置状态：M3-7 已完成并提交（0cbd544），工作区干净。
-纯文档任务，不改行为。
+TODO.md 中第一个未完成任务为 **M3-9 [TODO] M3 review：Conversation 正确性收口**（M1、M2 全部 [DONE]；M3-1 ~ M3-8 全部 [DONE]）。这是一个 review 任务（纯审查，预期无代码改动）。
 
-### 首项 bookkeeping（已完成）
+## 检查项（来自 TODO.md）
 
-- `TODO.md` M3-5 父标题补标 `[DONE]`（全部子任务 M3-5-1 ~ M3-5-4 已完成，父任务无
-  独立工作）+ 一行父级完成记录；review 文档 M-CONV-3 标注仍留待 M3-9。
+1. 逐条核对 H-STATE-1/2、M-CONV-1/2/3/5/6/7 状态，`docs/review-2026-07.md` 已标注。
+   - 注意：M-CONV-3 按既定口径留待 M3-9 标注（M3-5-1~4 已全部落地，本次应标注 `✅ 已修复`）。
+   - 重点复验演进场景二次导出不冲突（M3-5-3 的 diff 代次键测试）。
+2. 重点复验（跑定向测试）：
+   - M3-1 回归测试：`apply_compaction_rejects_a_reverted_head_and_redo_keeps_every_turn`
+   - rows round-trip 含 meta：`rows_round_trip_preserves_injected_user_message_meta`
+   - 10 万级链不栈溢出：`parent_graph_validation_handles_a_long_chain_iteratively` 等 4 条
+   - M3-5 演进场景：`insert_set_against_*` 系列
+3. `docs/conversation-core.md` 与实现一致（抽查 M3 各任务新增段落）。
+4. 全量门禁命令通过：
+   - `cargo fmt --all`
+   - `cargo clippy --all-targets -- -D warnings`
+   - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
+   - `cargo test --all --all-targets`
+   - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
 
-### 进度记录
+## 执行步骤
 
-- [x] 读取 TODO.md / git 状态，确认首个未完成任务为 M3-8
-- [x] 写入本计划
-- [x] 读取 fork.rs、projection/mod.rs（`raw_for_active_turns`、`CheckedTurnRange`
-      owner 锚点）、conversation-core.md §6、DESIGN.md §Revert/Fork、
-      review-2026-07.md M-CONV-7
-- [x] `fork.rs`：模块文档 + `fork_at` “# Projection is not inherited” 节
-      （取舍/理由/影响；私有 `raw_for_active_turns` 不做 intra-doc link）
-- [x] `docs/conversation-core.md` 新增 §6.2（TODO 所称“§7 compaction/projection 节”
-      即当前 §6，按括号意图落位）
-- [x] DESIGN.md Fork 段补交叉引用 bullet
-- [x] `docs/review-2026-07.md` M-CONV-7 标注 `📄 已降级（文档承认现状，M3-8）`
-      （方案 a = 行为不变、文档承认现状；本任务单首个 📄）
-- [x] 验证：fmt、两道 clippy、`cargo test -p agent-lib --lib conversation::boundary`
-      （23 过）、`cargo test -p agent-lib --doc`（12 过，含 fork_at doctest）、
-      cargo doc（-D warnings）全过；全量套件按政策跳过（仅注释/文档变更，沿用
-      M3-7 绿色结果）
-- [x] TODO.md M3-8 标 [DONE] + 完成记录
-- [ ] 提交 `[M3-8] ...` 并停止
+1. 读 `docs/review-2026-07.md` 中 H-STATE-1/2、M-CONV-1/2/3/5/6/7 八条的标注状态；标注 M-CONV-3。
+2. 代码点位抽查确认修复在场（config 校验、generation 列、预检、resolver、fork 文档等）。
+3. 跑定向测试复验重点项。
+4. 抽查 `docs/conversation-core.md` 与实现一致性。
+5. 全量门禁（fmt → clippy → clippy+features → test → doc）。
+6. TODO.md 标记 M3-9 [DONE] + 完成记录。
+7. 提交 git commit（[M3-9] ...）。
 
-## 任务完成总结
+## 执行结果（已完成）
 
-M3-8 已完成（纯文档）：fork 不继承 compaction projection 的取舍在 rustdoc
-（fork.rs）、conversation-core.md §6.2、DESIGN.md 三处一致文档化；M-CONV-7 以
-📄 已降级标注。另顺手修正 M3-5 父标题的 [DONE] 标记。
-下一任务：M3-9（M3 review：Conversation 正确性收口）。
+- `docs/review-2026-07.md` M-CONV-3 已标注 `✅ 已修复（M3-5）`；其余七条此前已标注，核对无误。
+- 代码点位抽查：八条修复全部在场（CompactionOnRevertedHead、MessageRecord.meta、generation 列/schema v3、PairingProviderIdResolver、validate_assistant_blocks、check_parent_chain + 手工 Drop）。
+- 定向复验：`cargo test -p agent-lib --lib conversation::` 177 条全过（0.63s），含 M3-1 回归、meta round-trip、10 万链 4 条、M3-5 演进 5 条、M3-6/M3-7 测试。
+- `docs/conversation-core.md` 抽查与实现一致。
+- 全量门禁：fmt、clippy（默认 + external features）、`cargo test --all --all-targets`（exit 0，约 32s）、`cargo doc` 全部通过。
+- TODO.md M3-9 已标 [DONE] 并附完成记录。纯审查任务，无代码改动。
+- 下一步：git 提交后停止。
