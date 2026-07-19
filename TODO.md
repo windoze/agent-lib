@@ -1394,7 +1394,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test -p agent-lib --lib facade::agent`（62 条通过）、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。验证后仅追加 markdown/TODO 完成记录，无需重跑编译测试。
 - 无 breaking change（仅让 restore 早期拒绝 fresh build 已会拒绝的不一致工具/委托配置）。
 
-### M5-7 [TODO] M5 review：facade 承诺收口
+### M5-7 [DONE] M5 review：facade 承诺收口
 
 检查项：
 
@@ -1402,6 +1402,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 重点复验：timeout 后 Agent 可用；流式/非流式事件 parity（含 `Done.events`）；cancel/pivot/provider_extras 实际可达。
 - `docs/facade-api.md` 同步；`README.md` 如需更新已更新。
 - 全量门禁命令通过。
+
+完成记录：
+
+- 条目核对：`docs/review-2026-07.md` 的 M5 相关条目均已标注——H-STATE-3（M5-1）、M-PROM-4 / M-ADP-3（M5-2）、M-ERR-5（M5-3）、M-PROM-2 的 cancel/pivot 部分（M5-4）、M-PROM-6（M5-5）、M-ADP-5（M5-6）。`M-PROM-2` 的 budget 部分在审查报告中仍明确标为待 M6-2，符合当前 TODO 顺序，不作为 M5-7 阻塞项。
+- 重点复验：`cargo test -p agent-lib --lib facade::` 225 条全过，覆盖 timeout 后 Agent 可恢复、stream/run_full 审批事件 parity（含 `Done.events`）、cancel/pivot 控制面、provider_extras 贯通、结构化 `LoopLimitExceeded` 分类与 restore build 校验对齐等 M5 回归点。
+- 文档核对：`docs/facade-api.md` 已同步 M5 行为——builder `provider_extras` 及 provider 校验、typed tool deny 与 `ApprovalDenied` 触发范围、流式 `Done.events` 编织审批事件、timeout/drop 后 abandon 并保持 Agent 可用、`CancelHandle` 与 stream pivot 入口、结构化错误分类、restore 复用 fresh build 声明/委托校验。`README.md` 已把 facade 定位为推荐入口，M5 的内部承诺对齐项无需额外更新。
+- 全量门禁：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0；真实端点/CLI 测试保持 ignored；无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 本任务为 review 收口，无生产代码改动；仅更新任务单完成记录与执行计划文件。无 breaking change。
 
 ---
 
