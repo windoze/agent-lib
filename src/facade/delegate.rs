@@ -57,13 +57,13 @@ use serde_json::{Map, Value, json};
 use crate::agent::external::ExternalSessionRef;
 use crate::agent::{
     AgentError, AgentInput, AgentMachine, AgentSpec, AgentSpecRef, AgentState, ApprovalDecision,
-    ApprovalResponse, CancellationToken, DefaultAgentMachine, DrivingSubagentHandler, HandlerScope,
-    Interaction, InteractionHandler, InteractionKind, InteractionOrigin, InteractionResponse,
-    LlmClientHandler, LlmHandler, LoopCursor, LoopPolicy, ModelRef, PermissionResponse,
-    RequirementResult, RunContext, RunId, ScopePop, SpawnedChild, StepInput, StepOutcome,
-    SubagentHandler, SubagentOutput, SubagentSpawner, TaskEvaluator, ToolFailurePolicy,
-    ToolHandler, ToolRegistry, ToolRegistryHandler, ToolRuntimeError, ToolSetRef, TraceHandle,
-    TraceNodeId, TurnDone, Verifier, WorktreeRef,
+    ApprovalRequirement, ApprovalResponse, CancellationToken, DefaultAgentMachine,
+    DrivingSubagentHandler, HandlerScope, Interaction, InteractionHandler, InteractionKind,
+    InteractionOrigin, InteractionResponse, LlmClientHandler, LlmHandler, LoopCursor, LoopPolicy,
+    ModelRef, PermissionResponse, RequirementResult, RunContext, RunId, ScopePop, SpawnedChild,
+    StepInput, StepOutcome, SubagentHandler, SubagentOutput, SubagentSpawner, TaskEvaluator,
+    ToolFailurePolicy, ToolHandler, ToolRegistry, ToolRegistryHandler, ToolRuntimeError,
+    ToolSetRef, TraceHandle, TraceNodeId, TurnDone, Verifier, WorktreeRef,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig, ToolCallId};
@@ -1737,12 +1737,13 @@ impl DelegationToolHandler {
     /// path and recording each delegation's trace into `recorder`.
     ///
     /// `parent_interaction` is present only when the supervisor has an injected
-    /// async [`InteractionHandler`]; local child interactions are then answered
-    /// there with delegate attribution while the child approval policy remains
-    /// the gate. `approval` is the run's [`FacadeApproval`]; a managed external
-    /// delegate is gated through its
-    /// [`resolve_external_start`](FacadeApproval::resolve_external_start) before
-    /// it is driven (§9.2). `collab` is the facade's provisioned collaboration
+    /// async [`InteractionHandler`]; local child interactions and external-start
+    /// asks are then answered there with delegate attribution while each approval
+    /// policy remains the gate. `approval` is the run's [`FacadeApproval`]; a
+    /// managed external delegate is gated before it is driven (§9.2), using the
+    /// async parent handler for ask tiers when available and
+    /// [`resolve_external_start`](FacadeApproval::resolve_external_start) as the
+    /// synchronous fallback. `collab` is the facade's provisioned collaboration
     /// substrate (§14); a driven external delegate's collab observations are
     /// reflected into it.
     #[allow(clippy::too_many_arguments)]
@@ -1889,7 +1890,10 @@ impl DelegationToolHandler {
     ) -> RequirementResult {
         // Gate the external start at the drive layer (§9.2). The machine tool
         // gate exempts the delegate's start tool, so this is the sole authority.
-        if !self.approval.resolve_external_start(&call.name) {
+        if !self
+            .resolve_external_start(call_id, call, delegate.name(), ctx)
+            .await
+        {
             self.record_external(
                 &call_id,
                 delegate.name(),
@@ -1963,6 +1967,71 @@ impl DelegationToolHandler {
                 }))
             }
         }
+    }
+
+    /// Resolves the drive-layer approval gate for one managed external start.
+    ///
+    /// Auto allow/deny remain synchronous. When the effective policy tier is ask
+    /// and the supervisor injected an async [`InteractionHandler`], the start
+    /// decision is routed through that handler with delegate attribution; without
+    /// such a handler, the legacy synchronous [`FacadeApproval`] path is used.
+    async fn resolve_external_start(
+        &self,
+        call_id: ToolCallId,
+        call: &ToolCall,
+        delegate: &str,
+        ctx: &RunContext,
+    ) -> bool {
+        if self.approval.external_start_requires_ask(&call.name)
+            && let Some(parent) = &self.parent_interaction
+        {
+            return self
+                .resolve_external_start_with_parent(parent, call_id, call, delegate, ctx)
+                .await;
+        }
+        self.approval.resolve_external_start(&call.name)
+    }
+
+    /// Asks the injected parent interaction handler whether an external delegate
+    /// may start, using the same approval interaction family as tool approvals.
+    async fn resolve_external_start_with_parent(
+        &self,
+        parent: &Arc<dyn InteractionHandler>,
+        call_id: ToolCallId,
+        call: &ToolCall,
+        delegate: &str,
+        ctx: &RunContext,
+    ) -> bool {
+        let reason = format!(
+            "approve start of managed external agent `{delegate}` via `{}`",
+            call.name
+        );
+        let request = Interaction::approval(
+            self.ids.step_id(),
+            call_id,
+            ApprovalRequirement::required(Some(reason)),
+        )
+        .with_origin(InteractionOrigin::new(
+            delegate.to_owned(),
+            ctx.depth().saturating_add(1),
+        ));
+        let result = tokio::select! {
+            biased;
+            _ = ctx.cancellation().cancelled() => cancelled_interaction_result(&request),
+            result = parent.fulfill(&request, ctx) => result,
+        };
+
+        let RequirementResult::Interaction(response) = result else {
+            return false;
+        };
+        if request.accepts_response(&response).is_err() {
+            return false;
+        }
+        matches!(
+            response,
+            InteractionResponse::Approval(approval)
+                if approval.decision() == ApprovalDecision::Approve
+        )
     }
 
     /// Records one external delegation trace (with any reported artifacts and
@@ -3665,6 +3734,87 @@ mod model_routed_tests {
         assert!(
             matches!(error, crate::facade::FacadeError::ApprovalDenied),
             "headless ask_external_agents surfaces ApprovalDenied, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_start_ask_external_agents_routes_to_parent_handler() {
+        let parent_handler = Arc::new(RecordingParentInteractionHandler::new(
+            ApprovalDecision::Approve,
+        ));
+        let mut agent = AgentBuilder::default()
+            .client(external_supervisor_client())
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(ApprovalPolicy::from(Approval::auto_allow()).ask_external_agents())
+            .interaction_handler(parent_handler.clone())
+            .external_agent("coder", completed_coder())
+            .build()
+            .expect("agent builds");
+
+        let output = agent.run_full("Please refactor.").await.unwrap();
+
+        assert_eq!(output.delegations.len(), 1);
+        assert_eq!(output.delegations[0].delegate, "coder");
+        assert_eq!(output.delegations[0].status, DelegationStatus::Completed);
+        assert!(
+            tool_result_texts(&agent)
+                .iter()
+                .any(|text| text == "refactor complete"),
+            "an async-approved external delegate is driven"
+        );
+
+        let seen = parent_handler.seen();
+        assert_eq!(seen.len(), 1, "the parent handler receives the start ask");
+        let origin = seen[0]
+            .origin()
+            .expect("external-start approval carries delegate attribution");
+        assert_eq!(origin.delegate, "coder");
+        assert_eq!(origin.depth, 1);
+        let InteractionKind::Approval { requirement, .. } = seen[0].kind() else {
+            panic!("external-start approval uses the approval interaction family");
+        };
+        assert!(
+            requirement
+                .reason()
+                .is_some_and(|reason| reason.contains("managed external agent `coder`")),
+            "the approval reason identifies the delegate start"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_start_ask_tool_denied_by_parent_handler_surfaces_approval_denied() {
+        let parent_handler = Arc::new(RecordingParentInteractionHandler::new(
+            ApprovalDecision::Deny,
+        ));
+        let mut agent = AgentBuilder::default()
+            .client(external_supervisor_client())
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(ApprovalPolicy::default().ask_tool("ask_coder"))
+            .interaction_handler(parent_handler.clone())
+            .external_agent("coder", completed_coder())
+            .build()
+            .expect("agent builds");
+
+        let error = agent
+            .run_full("Please refactor.")
+            .await
+            .expect_err("the parent handler denies the external start");
+        assert!(
+            matches!(error, crate::facade::FacadeError::ApprovalDenied),
+            "async-denied external start surfaces ApprovalDenied, got {error:?}"
+        );
+        assert_eq!(
+            parent_handler.seen().len(),
+            1,
+            "per-tool ask_tool routes the start ask to the parent handler"
+        );
+        assert!(
+            !tool_result_texts(&agent)
+                .iter()
+                .any(|text| text == "refactor complete"),
+            "a denied external delegate is not driven"
         );
     }
 

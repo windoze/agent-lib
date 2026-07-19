@@ -224,6 +224,13 @@ impl Approval {
     }
 }
 
+impl ApprovalKind {
+    /// Returns whether this tier requires an approval decision.
+    const fn is_ask(&self) -> bool {
+        matches!(self, Self::Ask(_))
+    }
+}
+
 impl fmt::Debug for Approval {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let tier = match &self.kind {
@@ -329,10 +336,11 @@ impl ApprovalPolicy {
 
     /// Requires approval before a managed external agent runs (§9.2).
     ///
-    /// When set, a managed external delegate is gated before it starts: the
-    /// Agent facade defers to the policy default `ask` handler (denying headless)
-    /// unless a tool-level override or per-tool entry for that delegate's tool
-    /// name applies. A denial surfaces as
+    /// When set, a managed external delegate is gated before it starts. If the
+    /// supervisor injected an async `InteractionHandler`, the facade routes the
+    /// start ask there; otherwise it defers to the policy default `ask` handler
+    /// (denying headless) unless a tool-level override or per-tool entry for that
+    /// delegate's tool name applies. A denial surfaces as
     /// [`FacadeError::ApprovalDenied`](crate::facade::FacadeError::ApprovalDenied).
     #[must_use]
     pub fn ask_external_agents(mut self) -> Self {
@@ -553,6 +561,12 @@ impl FacadeApproval {
     /// Decides synchronously whether a managed external delegate may start,
     /// applying the §9.2 default-permission table.
     ///
+    /// This is the headless/synchronous fallback. When an external-start ask can
+    /// be answered by a supervisor-injected async interaction handler, the
+    /// delegation driver detects that with its crate-private
+    /// `external_start_requires_ask` helper and routes the ask before calling
+    /// this method.
+    ///
     /// External-delegate start is gated at the drive layer (not the machine tool
     /// gate) so a single call resolves to exactly one decision. The effective
     /// tier is chosen as:
@@ -563,9 +577,9 @@ impl FacadeApproval {
     ///    the policy default handler, denying headless), otherwise
     /// 3. the policy default tier.
     ///
-    /// Any [`ask`](Approval::ask) handler is invoked synchronously here. Returns
-    /// `true` when the delegate may start and `false` when it is denied; a denial
-    /// surfaces as
+    /// Any [`ask`](Approval::ask) handler that reaches this fallback is invoked
+    /// synchronously here. Returns `true` when the delegate may start and `false`
+    /// when it is denied; a denial surfaces as
     /// [`FacadeError::ApprovalDenied`](crate::facade::FacadeError::ApprovalDenied).
     ///
     /// [`ask_external_agents`]: ApprovalPolicy::ask_external_agents
@@ -579,6 +593,24 @@ impl FacadeApproval {
             Some(approval) => self.decide_tier(tool_name, &approval.kind),
             None if self.ask_external_agents => self.decide_ask_deferred(tool_name),
             None => self.decide_tier(tool_name, &self.default.kind),
+        }
+    }
+
+    /// Returns whether `tool_name`'s managed-external start gate should ask.
+    ///
+    /// The facade delegation driver uses this to prefer a parent-injected async
+    /// [`InteractionHandler`] for start approvals when one exists, while keeping
+    /// [`resolve_external_start`](Self::resolve_external_start) as the fallback
+    /// for auto-allow/auto-deny and headless synchronous runs.
+    pub(crate) fn external_start_requires_ask(&self, tool_name: &str) -> bool {
+        let explicit = self
+            .tool_overrides
+            .get(tool_name)
+            .or_else(|| self.per_tool.get(tool_name));
+        match explicit {
+            Some(approval) => approval.kind.is_ask(),
+            None if self.ask_external_agents => true,
+            None => self.default.kind.is_ask(),
         }
     }
 

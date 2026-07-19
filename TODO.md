@@ -200,7 +200,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
   `cargo test --all --all-targets`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 
-### M1-4 [TODO] external-start approval 去留评估与收口（A1 关联，可降级）
+### M1-4 [DONE] external-start approval 去留评估与收口（A1 关联，可降级）
 
 上下文：
 
@@ -225,6 +225,32 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 选 (a)：异步审批 external-start 的测试（allow/deny 两条路径）。
 - 选 (b)：文档落位；现有 sync 行为测试不变。
 - 决策与理由写入完成记录。
+
+完成记录（2026-07-20）：
+
+- 评估结论选择方案 (a)。初始评估发现方案 (b) 的前提不成立：per-delegate external start 工具会被机器
+  tool gate 豁免以避免双重审批，因此仅文档推荐 `ask_tool("ask_<name>")` 不能让启动决策进入父级异步
+  `InteractionHandler`；该问题直接影响 M1-4 目标，故本任务改为实现异步路由。
+- `FacadeApproval` 新增 crate-private `external_start_requires_ask`，用于 drive layer 在不触发同步 handler
+  的情况下判断 external-start effective tier 是否为 ask；auto allow/deny 仍保持同步快速路径。
+- `DelegationToolHandler` 在 managed external delegate 启动前，如策略为 ask 且 supervisor 注入了父级
+  `InteractionHandler`，会构造 `InteractionKind::Approval` 并标注
+  `InteractionOrigin { delegate, depth: ctx.depth() + 1 }` 转发父级 handler；只有 `Approve` 继续启动，
+  `Deny` / `Timeout` / `Cancel` 或 family mismatch 均按启动被拒处理并表面为 `FacadeError::ApprovalDenied`。
+- 父级未注入 handler 时保持既有同步 fallback：同步 `Approval::ask` handler 仍可批准/拒绝；无同步 handler
+  的 headless `ask_external_agents()` 仍 deny，不挂起。
+- 新增离线测试覆盖：`ask_external_agents()` + 父级 recording handler approve 时 external delegate 继续执行且
+  start approval 带 `origin { delegate: "coder", depth: 1 }`；`ask_tool("ask_coder")` + 父级 handler deny
+  时表面为 `ApprovalDenied` 且 external runtime 未被驱动。既有 auto_deny、headless deny、同步 ask handler
+  测试保持通过。
+- 文档同步：`docs/mag-gaps.md` 将 A1 关联节与 C5 标注为 M1-4 已修复；`docs/facade-api.md` 与
+  `docs/managed-external-agent.md` 明确 external-start ask 的异步路由、同步 fallback/headless deny 语义，并修正
+  无 handler 的 `.ask_external_agents()` 示例陷阱。
+- Breaking change：无公开 API 破坏；新增 helper 为 crate-private，行为仅扩展为父级异步 handler 存在时可应答
+  external-start ask。
+- 验证通过：`cargo fmt --all`；`cargo test -p agent-lib --lib facade::delegate`；
+  `cargo clippy --all-targets -- -D warnings`；`cargo test --all --all-targets`；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 
 ### M1-R [TODO] M1 review：委派交互路由收口
 

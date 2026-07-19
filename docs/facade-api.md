@@ -543,6 +543,13 @@ handler 产生 `NeedInteraction`。当 supervisor 通过 `AgentBuilder::interact
 使用自己的同步 `FacadeApproval` fallback 应答,headless ask 仍会 deny；external 子 agent 的 permission
 prompt 则以明确的 `ExternalAgent` 错误失败,避免静默等待。
 
+managed external delegate 的**启动门**也走同一 attended 通道:当 external-start 的 effective approval
+tier 为 ask（例如 `.ask_external_agents()`、`.ask_tool("ask_coder")` 或显式给 `ask_coder` 设置 ask tier）且
+supervisor 注入了 `interaction_handler` 时,facade 在 drive layer 构造一个带 `Interaction.origin` 的
+`InteractionKind::Approval` 交给该 handler。handler 返回 `Approve` 才启动 delegate；`Deny` / `Timeout` /
+`Cancel` 都表面为 `FacadeError::ApprovalDenied`。未注入 handler 时保留同步 fallback:同步
+`Approval::ask` handler 可应答,headless ask deny 而不挂起。
+
 `run` / `run_full` 与 `stream` 都会在调用方提前放弃一次运行时保持 agent 可继续使用:非流式
 future 被 drop(例如外层 `tokio::time::timeout` 或 `select!` 分支取消)时,facade 会同步向
 底层 machine 发送 never-resume/abandon 输入,丢弃未提交的 pending turn;流式 `AgentRunStream`
@@ -702,6 +709,13 @@ ApprovalPolicy::default()
 启动前被审批策略拒绝的路径;这类 delegate 尚未进入普通工具执行相位,没有模型可见的 denied
 tool result 可以回灌。
 
+managed external delegate 启动审批发生在 drive layer,因为模型可见的 `ask_<name>` start tool 被机器
+tool gate 豁免以避免同一次启动双重审批。有效 tier 为 ask 且存在 `AgentBuilder::interaction_handler(..)`
+时,启动审批转成异步 `InteractionKind::Approval`,并用 `origin { delegate, depth }` 标注要启动的 delegate；
+无异步 handler 时才回落到 `FacadeApproval::resolve_external_start` 的同步 `Approval::ask` / headless deny。
+因此 attended 宿主可以用 `.ask_external_agents()` 覆盖全部 external start,也可以用
+`.ask_tool("ask_coder")` 只覆盖单个 per-delegate start tool。
+
 ### 9.3 富化 ApprovalRequest(Milestone 7)
 
 早期 `ApprovalRequest` 只有 `tool_name`,UI 无法渲染有意义的审批框。M7 借其 `#[non_exhaustive]` **纯加
@@ -720,8 +734,9 @@ pub struct ApprovalRequest {
 - `input` 用 `Option<String>`(脱敏、限长的紧凑摘要)而非 `serde_json::Value`,以保住整条投影链的 `Eq`
   并天然 redaction 友好:凭据样式 key(`token`/`secret`/`password`/`api_key`/`auth`/… 大小写不敏感子串)
   的值替换为 `<redacted>`,渲染后按 UTF-8 边界截断到上限;`None` 表示无参数。
-- `call_id` 为 `Some` 时是 framework tool-call id;同步 external-start 审批发生在 framework call id
-  存在之前,因此用 `None` 表达无 id,不再使用空串哨兵。
+- `call_id` 为 `Some` 时是 framework tool-call id;父级异步 handler 处理的 external-start 审批同样携带
+  start tool 的 framework call id。只有无父级 handler 的同步 fallback external-start 路径用便捷构造
+  `ApprovalRequest::for_tool(name)`,其 `call_id` 为 `None`,不再使用空串哨兵。
 - 流式路径的 `TapInteractionHandler` 从底层 `InteractionKind::Approval` 的 `call_id` + `ApprovalRequirement`
   填充字段后再 emit `RunEvent::ApprovalRequested`,同步 external-start 路径用便捷构造 `ApprovalRequest::for_tool(name)`。
 
@@ -826,7 +841,9 @@ let mut agent = Agent::builder()
     .model("gpt-5.5")
     .system("你是主 coding agent,需要改代码时委托 coder。")
     .external_agent("coder", codex)
-    .approval(ApprovalPolicy::default().ask_external_agents())
+    // Headless quick start explicitly allows delegate starts. For attended
+    // approval, combine `.ask_external_agents()` with `.interaction_handler(..)`.
+    .approval(Approval::auto_allow())
     .build()?;
 ```
 
@@ -1337,7 +1354,6 @@ let mut agent = Agent::builder()
     .approval(
         ApprovalPolicy::default()
             .auto_allow_subagents()
-            .ask_external_agents()
             .ask_dangerous_tools(),
     )
     .build()?;

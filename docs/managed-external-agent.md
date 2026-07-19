@@ -708,6 +708,13 @@ child 发出的 `NeedInteraction` 会 pop 到这层外部路由。父级注入 h
 Claude Code 与 ACP adapter 具现的 `PausedForInteraction` 都走这同一路由层；Codex/OpenCode 当前自主运行,无
 host-answerable permission pause。
 
+external delegate **启动前**的 approval 不是 runtime permission bridge,而是 facade drive-layer gate。
+当 `ApprovalPolicy::ask_external_agents()`、`ask_tool("ask_<name>")` 或显式 per-tool ask 让启动门进入
+ask tier,且 supervisor 注入了父级 `InteractionHandler` 时,facade 会先发一个带
+`Interaction.origin { delegate, depth }` 的 `InteractionKind::Approval` 给父级 handler；只有 `Approve`
+才会继续启动 external runtime。父级未注入 handler 时保留同步 fallback:同步 `Approval::ask` handler 可应答,
+headless ask deny 并表面为 `FacadeError::ApprovalDenied`,不会创建 runtime session。
+
 ## 10. 流式输出设计
 
 ### 10.1 两条通道

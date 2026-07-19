@@ -1,35 +1,20 @@
-# Claude Execution Plan
+# 当前执行计划
 
-## Scope
+说明：本文件记录可审计的执行计划和进度更新，不记录私有推理链。
 
-- Follow `TODO.md` as the authoritative task list.
-- Identify and complete exactly the first task whose heading is not prefixed with `[DONE]`.
-- Stop after committing that one task, or after committing any required prerequisite/blocker bookkeeping if the task cannot proceed.
+1. 读取 `TODO.md`，按文件顺序定位第一个标题未以 `[DONE]` 标记的任务。
+2. 查看最近提交信息，判断是否明确提到与该任务直接相关的未完成问题；如有，将其纳入当前任务或作为前置项写入 `TODO.md`。
+3. 阅读当前任务涉及的说明、代码、测试和文档，确认验收标准与依赖。
+4. 以最小正确改动实现当前任务；如遇到阻塞当前任务的规格不匹配或失败测试，先修复，或把必要前置任务插入 `TODO.md` 后停止。
+5. 运行规定验证：先 `cargo fmt --all`，再 `cargo clippy --all-targets -- -D warnings`，再按需运行相关测试或完整测试套件；若只改文档且已有可复用绿色结果，则记录跳过原因。
+6. 更新 `TODO.md`：将完成任务标题加 `[DONE]`，填写完成记录；仅在阶段计划确实改变时更新 `PLAN.md`。
+7. 检查 Git 状态和差异，提交本次任务相关所有变更。
+8. 完成一个任务后停止，不继续处理下一个任务。
 
-## Step-by-Step Plan
+当前状态：已确认最近提交未留下与 `M1-4` 直接相关的未完成事项。进一步核查发现，per-delegate external start 工具会被机器审批门豁免，`ask_tool("ask_<delegate>")` 不能按原文档作为异步工具门；这直接影响本任务的降级前提。计划改为方案 (a)：当父级注入异步 `InteractionHandler` 且 external-start 策略需要 ask 时，把启动审批构造成带 delegate/depth 归因的 approval interaction 转发给父级 handler；无父级 handler 时保持现有同步 `Approval::ask` / headless deny 行为。随后新增 allow/deny 测试，更新文档与 `TODO.md` 完成记录。
 
-1. Read `TODO.md` first to identify the first incomplete task and its validation requirements.
-2. Check the latest commit message only for directly relevant unfinished work tied to that selected task.
-3. Inspect the task-related code and documentation needed to implement the selected task.
-4. Implement the smallest correct change that satisfies the task, avoiding workarounds or scope narrowing.
-5. Add or update focused tests and documentation required by the task.
-6. Run validation in the required order: `cargo fmt --all`, then `cargo clippy --all-targets -- -D warnings`, then `cargo test --all --all-targets` with a timeout no greater than 30 minutes. Run feature-specific clippy if the touched code requires it.
-7. If any unscheduled test failure appears, fix it if in scope or add the minimum prerequisite task to `TODO.md` before the blocked task, then stop after committing.
-8. Mark the selected task as `[DONE]` in `TODO.md` only after implementation and required validation are complete.
-9. Update this file with key progress changes and final validation results.
-10. Inspect git status/diff/log before committing, then commit all intended task changes with a descriptive task-scoped commit message.
+进度更新：已在 `DelegationToolHandler` 的 external-start gate 中加入父级异步 handler 路由，新增 `FacadeApproval::external_start_requires_ask` 用于区分 ask tier 与 auto allow/deny；已新增 allow/deny 离线测试，并同步 `docs/mag-gaps.md`、`docs/facade-api.md`、`docs/managed-external-agent.md`。下一步运行格式化和测试验证。
 
-## Current Progress
+验证更新：`cargo fmt --all` 通过；`cargo test -p agent-lib --lib facade::delegate` 通过；`cargo clippy --all-targets -- -D warnings` 通过；`cargo test --all --all-targets` 通过；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 初次发现公开 rustdoc 链接到 crate-private helper，已修正后重跑通过。下一步更新 `TODO.md` 完成记录并提交。
 
-- New invocation initialized. This file records the actionable plan and progress summary; private reasoning is intentionally not recorded.
-- Selected first incomplete task: `M1-3` (`external 委派路径：NeedInteraction 路由到父级 handler（替换 EmptyExternalScope）`).
-- Planned implementation focus: inspect the external facade drive/scope wiring, preserve existing no-parent-handler failure semantics with a clearer message, route external `NeedInteraction` to the parent-injected async `InteractionHandler` with `InteractionOrigin { delegate, depth }`, map the answer back to `RequirementResult::Interaction`, add offline `external-acp` tests, update managed external/capability docs, validate, mark `TODO.md`, commit, and stop.
-- Latest commit checked: `dad7482 [M1-2] Route local child interactions to parent handler`; it does not state unfinished `M1-3` work.
-- Implementation in progress: replaced the external child drive's empty outer scope with an optional parent-handler interaction route, added delegate/depth origin attribution, preserved explicit no-handler failure, and threaded the parent interaction handler from `DelegationToolHandler` into `drive_external`.
-- Added `external-acp` gated offline facade external tests for parent-handler permission routing and no-parent-handler failure, using the scripted runtime handler rather than a real CLI/network.
-- Documentation draft updated in `docs/facade-api.md`, `docs/managed-external-agent.md`, `docs/capability-matrix.md`, and `docs/mag-gaps.md`.
-- Targeted validation progress: `cargo fmt --all` passed; `cargo test --features external-acp -p agent-lib --lib facade::external` passed without warnings after gating CLI-only process helpers away from ACP-only builds.
-- Validation completed successfully: `cargo clippy --all-targets -- -D warnings`; `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`; `cargo test --all --all-targets`; `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`.
-- `TODO.md` now marks `M1-3` as `[DONE]` with implementation notes, no-breaking-change note, adapter coverage notes, and validation results.
-- Git status/diff/log inspected before commit; changed files are limited to the M1-3 implementation, tests, docs, TODO, and this progress record.
-- Next step: create the task-scoped git commit and stop.
+进度更新：`TODO.md` 已将 `M1-4` 标记为 `[DONE]` 并写入完成记录。下一步检查 `git status`/`git diff`/最近提交，确认变更范围后提交。
