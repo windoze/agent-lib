@@ -84,7 +84,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `cargo test -p agent-lib --lib agent::interaction`；`cargo test --all --all-targets`；
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 
-### M1-2 [TODO] local subagent 路径：子 agent 交互应答路由到父级注入 handler
+### M1-2 [DONE] local subagent 路径：子 agent 交互应答路由到父级注入 handler
 
 上下文：
 
@@ -119,6 +119,28 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - cancel 测试：父 handler 挂起期间 cancel → 子 agent 交互以 deny/abandon 收尾，委派以
   cancelled/failed 结束，不挂死。
 - `cargo test -p agent-lib --lib facade::delegate` 通过。
+
+完成记录（2026-07-20）：
+
+- `DelegationToolHandler` 现在携带可选的父级注入 `InteractionHandler`，并沿 local subagent
+  spawner 传入子 drive；非流式、流式、rules/dispatcher 复用的委派 handler 构造路径均接入。
+- 子 agent 仍用 worker 自己的 `ApprovalPolicy` / `FacadeApproval` 作为工具审批 gate；父级注入
+  handler 存在时，由 `ChildInteractionRouter` 仅接管已暂停交互的 answer 路径，并用
+  `InteractionOrigin { delegate, depth: ctx.depth() }` 标注渲染归因。
+- 父级未注入 handler 时保持旧行为：子 `ChildAgentScope` 继续使用子 `FacadeApproval` fallback，
+  worker 同步 ask handler/headless deny 语义不变。
+- 子 interaction 转发保持 async 暂停点；路由层对 cancellation 做 `select!`，父级 handler 挂起且
+  run cancel 时返回同 family 的取消/deny 结果，避免本地委派卡死。
+- 新增/保留离线测试覆盖：父级 recording handler 收到带 origin 的子工具审批且 worker 同步 ask
+  handler 未消费；无父级 handler 时 worker 同步 ask policy 被调用；父级 handler 永久挂起时 cancel
+  在 2s 测试时限内收尾。
+- 文档同步：`docs/facade-api.md` 说明 local subagent interaction routing 与 gate/answer 分工；
+  `docs/mag-gaps.md` 标注 A1 的 M1-1/M1-2 已修复部分并保留 M1-3/M1-4 后续项。
+- Breaking change：无公开 API 破坏；`DelegationToolHandler::new` 是 crate-private 构造签名调整。
+- 验证通过：`cargo fmt --all`；`cargo test -p agent-lib --lib facade::delegate`；
+  `cargo clippy --all-targets -- -D warnings`；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  `cargo test --all --all-targets`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 
 ### M1-3 [TODO] external 委派路径：`NeedInteraction` 路由到父级 handler（替换 `EmptyExternalScope`）
 

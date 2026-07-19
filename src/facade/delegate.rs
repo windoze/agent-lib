@@ -56,13 +56,14 @@ use serde_json::{Map, Value, json};
 
 use crate::agent::external::ExternalSessionRef;
 use crate::agent::{
-    AgentError, AgentInput, AgentMachine, AgentSpec, AgentSpecRef, AgentState, CancellationToken,
-    DefaultAgentMachine, DrivingSubagentHandler, HandlerScope, Interaction, InteractionHandler,
-    LlmClientHandler, LlmHandler, LoopCursor, LoopPolicy, ModelRef, RequirementResult, RunContext,
-    RunId, ScopePop, SpawnedChild, StepInput, StepOutcome, SubagentHandler, SubagentOutput,
-    SubagentSpawner, TaskEvaluator, ToolFailurePolicy, ToolHandler, ToolRegistry,
-    ToolRegistryHandler, ToolRuntimeError, ToolSetRef, TraceHandle, TraceNodeId, TurnDone,
-    Verifier, WorktreeRef,
+    AgentError, AgentInput, AgentMachine, AgentSpec, AgentSpecRef, AgentState, ApprovalDecision,
+    ApprovalResponse, CancellationToken, DefaultAgentMachine, DrivingSubagentHandler, HandlerScope,
+    Interaction, InteractionHandler, InteractionKind, InteractionOrigin, InteractionResponse,
+    LlmClientHandler, LlmHandler, LoopCursor, LoopPolicy, ModelRef, PermissionResponse,
+    RequirementResult, RunContext, RunId, ScopePop, SpawnedChild, StepInput, StepOutcome,
+    SubagentHandler, SubagentOutput, SubagentSpawner, TaskEvaluator, ToolFailurePolicy,
+    ToolHandler, ToolRegistry, ToolRegistryHandler, ToolRuntimeError, ToolSetRef, TraceHandle,
+    TraceNodeId, TurnDone, Verifier, WorktreeRef,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig, ToolCallId};
@@ -1365,16 +1366,18 @@ impl AgentMachine for RecordingChildMachine {
 }
 
 /// The child's own drain layer: the shared LLM client, a declaration-only tool
-/// registry, and the child's approval handler.
+/// registry, and the child's interaction answer path.
 ///
 /// A subagent stays data-first (declaration-only tools), so the tool handler
 /// only serves declared names; an approval-requiring child tool still pauses on
-/// the child's [`FacadeApproval`] before any execution (§9.2). Requirements this
-/// scope cannot serve pop to the outer [`EmptyScope`].
+/// the child's [`FacadeApproval`] gate before any execution (§9.2). When the
+/// supervisor supplied an async interaction handler, this scope routes the
+/// paused answer there; otherwise it keeps the child's synchronous approval
+/// fallback.
 struct ChildAgentScope {
     llm: LlmClientHandler,
     tool: ToolRegistryHandler,
-    interaction: Arc<FacadeApproval>,
+    interaction: Arc<dyn InteractionHandler>,
 }
 
 impl HandlerScope for ChildAgentScope {
@@ -1391,13 +1394,60 @@ impl HandlerScope for ChildAgentScope {
     }
 }
 
+/// Routes a child interaction to the supervisor's injected handler.
+///
+/// The child machine still uses its own [`FacadeApproval`] as the tool gate; this
+/// handler only decides where the already-paused interaction is answered. It
+/// annotates the forwarded request with display-only delegate attribution so the
+/// parent UI can render which worker asked.
+struct ChildInteractionRouter {
+    delegate: String,
+    parent: Arc<dyn InteractionHandler>,
+}
+
+#[async_trait]
+impl InteractionHandler for ChildInteractionRouter {
+    async fn fulfill(&self, request: &Interaction, ctx: &RunContext) -> RequirementResult {
+        let routed = request
+            .clone()
+            .with_origin(InteractionOrigin::new(self.delegate.clone(), ctx.depth()));
+        tokio::select! {
+            biased;
+            _ = ctx.cancellation().cancelled() => cancelled_interaction_result(&routed),
+            result = self.parent.fulfill(&routed, ctx) => result,
+        }
+    }
+}
+
+/// Builds an in-family interaction result for a child interaction abandoned by
+/// cancellation before the parent handler answered.
+fn cancelled_interaction_result(request: &Interaction) -> RequirementResult {
+    let response = match request.kind() {
+        InteractionKind::Approval { call_id, .. } => {
+            InteractionResponse::Approval(ApprovalResponse::new(
+                request.step_id(),
+                *call_id,
+                ApprovalDecision::Deny,
+                Some("interaction cancelled".to_owned()),
+            ))
+        }
+        InteractionKind::Question { .. } => InteractionResponse::answer(String::new()),
+        InteractionKind::Choice { .. } => InteractionResponse::Choice(0),
+        InteractionKind::Permission { request } => InteractionResponse::Permission(
+            PermissionResponse::cancel(request.action_id().to_owned()),
+        ),
+    };
+    RequirementResult::Interaction(response)
+}
+
 /// An empty outer layer for the child drive.
 ///
-/// The child's own [`ChildAgentScope`] serves every family it emits, so nothing
-/// should pop here; an unexpected pop surfaces as an
+/// The facade installs the child interaction answer path directly in
+/// [`ChildAgentScope`], so no local child requirement should pop here; an
+/// unexpected pop surfaces as an
 /// [`AgentError::UnhandledRequirement`](crate::agent::AgentError), the correct
-/// failure for a child asking for a capability M3-2 does not wire (for example
-/// nested delegation).
+/// failure for a child asking for a capability this local path does not wire
+/// (for example nested delegation).
 #[derive(Default)]
 struct EmptyScope;
 
@@ -1414,6 +1464,7 @@ struct FacadeSubagentSpawner {
     subagent: LocalSubagent,
     client: Arc<dyn LlmClient>,
     supervisor_model: ModelRef,
+    parent_interaction: Option<Arc<dyn InteractionHandler>>,
     ids: FacadeIds,
     task: String,
     cancel: CancellationToken,
@@ -1460,8 +1511,9 @@ impl SubagentSpawner for FacadeSubagentSpawner {
             Conversation::new(self.ids.conversation_id(), ConversationConfig::new(None)),
         );
 
-        // One FacadeApproval bridges the child's ToolApprovalPolicy and its
-        // scope InteractionHandler, so an approval-requiring child tool pauses.
+        // One FacadeApproval remains the child's ToolApprovalPolicy gate. The
+        // answer path is either the supervisor-injected async handler (with
+        // attribution) or this same child approval fallback for headless runs.
         let child_approval = Arc::new(FacadeApproval::new(self.subagent.approval().clone()));
         let child_machine = assemble_machine(child_state, &self.ids, child_approval.clone());
         let recording = RecordingChildMachine {
@@ -1485,10 +1537,18 @@ impl SubagentSpawner for FacadeSubagentSpawner {
         .map_err(|error| AgentError::Other(error.to_string()))?;
         let registry: Arc<dyn ToolRegistry> = Arc::new(registry);
 
+        let interaction: Arc<dyn InteractionHandler> = match &self.parent_interaction {
+            Some(parent) => Arc::new(ChildInteractionRouter {
+                delegate: self.subagent.name().to_owned(),
+                parent: parent.clone(),
+            }),
+            None => child_approval,
+        };
+
         let scope = ChildAgentScope {
             llm: LlmClientHandler::new(self.client.clone()),
             tool: ToolRegistryHandler::new(registry),
-            interaction: child_approval,
+            interaction,
         };
 
         let user = Message {
@@ -1662,6 +1722,7 @@ pub(crate) struct DelegationToolHandler {
     route: DelegationRoute,
     client: Arc<dyn LlmClient>,
     supervisor_model: ModelRef,
+    parent_interaction: Option<Arc<dyn InteractionHandler>>,
     ids: FacadeIds,
     recorder: DelegationRecorder,
     approval: Arc<FacadeApproval>,
@@ -1675,8 +1736,11 @@ impl DelegationToolHandler {
     /// Wraps `base`, routing calls the `route` recognizes through the subagent
     /// path and recording each delegation's trace into `recorder`.
     ///
-    /// `approval` is the run's [`FacadeApproval`]; a managed external delegate is
-    /// gated through its
+    /// `parent_interaction` is present only when the supervisor has an injected
+    /// async [`InteractionHandler`]; local child interactions are then answered
+    /// there with delegate attribution while the child approval policy remains
+    /// the gate. `approval` is the run's [`FacadeApproval`]; a managed external
+    /// delegate is gated through its
     /// [`resolve_external_start`](FacadeApproval::resolve_external_start) before
     /// it is driven (§9.2). `collab` is the facade's provisioned collaboration
     /// substrate (§14); a driven external delegate's collab observations are
@@ -1687,6 +1751,7 @@ impl DelegationToolHandler {
         route: DelegationRoute,
         client: Arc<dyn LlmClient>,
         supervisor_model: ModelRef,
+        parent_interaction: Option<Arc<dyn InteractionHandler>>,
         ids: FacadeIds,
         recorder: DelegationRecorder,
         approval: Arc<FacadeApproval>,
@@ -1697,6 +1762,7 @@ impl DelegationToolHandler {
             route,
             client,
             supervisor_model,
+            parent_interaction,
             ids,
             recorder,
             approval,
@@ -1725,6 +1791,7 @@ impl DelegationToolHandler {
             subagent: subagent.clone(),
             client: self.client.clone(),
             supervisor_model: self.supervisor_model.clone(),
+            parent_interaction: self.parent_interaction.clone(),
             ids: self.ids.clone(),
             task: task.clone(),
             cancel: ctx.cancellation().clone(),
@@ -2260,11 +2327,14 @@ mod model_routed_tests {
     use futures::stream::BoxStream;
     use serde_json::{Map, json};
 
-    use crate::agent::AgentId;
+    use crate::agent::{
+        AgentId, ApprovalResponse, Interaction, InteractionHandler, InteractionKind,
+        InteractionResponse, RequirementResult, RunContext,
+    };
     use crate::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
     use crate::facade::approval::{Approval, ApprovalDecision, ApprovalPolicy};
     use crate::facade::run::{DelegationStatus, RunEvent};
-    use crate::facade::{Agent, AgentBuilder};
+    use crate::facade::{Agent, AgentBuilder, CancelHandle};
     use crate::model::content::ContentBlock;
     use crate::model::message::{Message, Role};
     use crate::model::normalized::StopReason;
@@ -2405,6 +2475,76 @@ mod model_routed_tests {
             name: "shell".to_owned(),
             description: "Run a shell command.".to_owned(),
             input_schema: json!({ "type": "object" }),
+        }
+    }
+
+    fn approval_interaction_result(
+        request: &Interaction,
+        decision: ApprovalDecision,
+    ) -> RequirementResult {
+        match request.kind() {
+            InteractionKind::Approval { call_id, .. } => {
+                RequirementResult::Interaction(InteractionResponse::Approval(
+                    ApprovalResponse::new(request.step_id(), *call_id, decision, None),
+                ))
+            }
+            _ => RequirementResult::Interaction(InteractionResponse::answer(String::new())),
+        }
+    }
+
+    /// Parent-side test handler that records every forwarded interaction before
+    /// returning a fixed approval decision.
+    struct RecordingParentInteractionHandler {
+        decision: ApprovalDecision,
+        seen: Mutex<Vec<Interaction>>,
+    }
+
+    impl RecordingParentInteractionHandler {
+        fn new(decision: ApprovalDecision) -> Self {
+            Self {
+                decision,
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<Interaction> {
+            self.seen.lock().expect("seen mutex").clone()
+        }
+    }
+
+    #[async_trait]
+    impl InteractionHandler for RecordingParentInteractionHandler {
+        async fn fulfill(&self, request: &Interaction, _ctx: &RunContext) -> RequirementResult {
+            self.seen.lock().expect("seen mutex").push(request.clone());
+            approval_interaction_result(request, self.decision)
+        }
+    }
+
+    /// Parent-side handler that proves the routing layer can abandon a parked
+    /// interaction when the run is cancelled, even if the handler never returns.
+    struct ParkingParentInteractionHandler {
+        reached: Mutex<Option<tokio::sync::oneshot::Sender<Interaction>>>,
+    }
+
+    impl ParkingParentInteractionHandler {
+        fn new() -> (Arc<Self>, tokio::sync::oneshot::Receiver<Interaction>) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (
+                Arc::new(Self {
+                    reached: Mutex::new(Some(tx)),
+                }),
+                rx,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl InteractionHandler for ParkingParentInteractionHandler {
+        async fn fulfill(&self, request: &Interaction, _ctx: &RunContext) -> RequirementResult {
+            if let Some(sender) = self.reached.lock().expect("reached mutex").take() {
+                let _ = sender.send(request.clone());
+            }
+            std::future::pending::<RequirementResult>().await
         }
     }
 
@@ -2893,6 +3033,152 @@ mod model_routed_tests {
                 .any(|event| matches!(event, RunEvent::DelegationFinished(_))),
             "a failed external delegation does not emit DelegationFinished"
         );
+    }
+
+    #[tokio::test]
+    async fn child_approval_interaction_routes_to_parent_handler_with_origin() {
+        let client = RoutingClient::new(vec![
+            route(
+                "SUPERVISOR",
+                vec![
+                    tool_call_response(
+                        "del-9",
+                        "ask_reviewer",
+                        json!({ "task": "inspect the tree" }),
+                    ),
+                    text_response("Final: done."),
+                ],
+            ),
+            route(
+                "REVIEWER",
+                vec![
+                    tool_call_response("child-shell-1", "shell", json!({ "cmd": "ls" })),
+                    text_response("I could not run shell; reporting from memory."),
+                ],
+            ),
+        ]);
+
+        let child_sync_called = Arc::new(AtomicBool::new(false));
+        let child_sync_probe = child_sync_called.clone();
+        let child_approval = ApprovalPolicy::new(Approval::ask(move |request| {
+            if request.tool_name == "shell" {
+                child_sync_probe.store(true, Ordering::SeqCst);
+            }
+            ApprovalDecision::Deny
+        }));
+        let reviewer = Agent::worker()
+            .system("You are the REVIEWER.")
+            .tool_declarations(vec![shell_decl()])
+            .approval(child_approval)
+            .build()
+            .expect("worker builds");
+        let parent_handler = Arc::new(RecordingParentInteractionHandler::new(
+            ApprovalDecision::Deny,
+        ));
+
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .interaction_handler(parent_handler.clone())
+            .subagent("reviewer", reviewer)
+            .build()
+            .expect("agent builds");
+
+        let output = agent.run_full("Delegate an inspection.").await.unwrap();
+
+        assert_eq!(output.reply.text(), "Final: done.");
+        assert_eq!(output.delegations.len(), 1);
+        assert_eq!(output.delegations[0].status, DelegationStatus::Completed);
+        assert!(
+            !child_sync_called.load(Ordering::SeqCst),
+            "the child worker policy gates the call, but the parent handler answers it"
+        );
+        let seen = parent_handler.seen();
+        assert_eq!(seen.len(), 1, "the parent handler receives the child ask");
+        let origin = seen[0]
+            .origin()
+            .expect("child interaction carries delegate attribution");
+        assert_eq!(origin.delegate, "reviewer");
+        assert_eq!(origin.depth, 1);
+        assert!(
+            matches!(seen[0].kind(), InteractionKind::Approval { .. }),
+            "the forwarded interaction remains an approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_while_parent_child_interaction_handler_is_parked_does_not_hang() {
+        let client = RoutingClient::new(vec![
+            route(
+                "SUPERVISOR",
+                vec![
+                    tool_call_response(
+                        "del-9",
+                        "ask_reviewer",
+                        json!({ "task": "inspect the tree" }),
+                    ),
+                    text_response("Final: should not be reached."),
+                ],
+            ),
+            route(
+                "REVIEWER",
+                vec![
+                    tool_call_response("child-shell-1", "shell", json!({ "cmd": "ls" })),
+                    text_response("reviewer would continue after an answer"),
+                ],
+            ),
+        ]);
+
+        let reviewer = Agent::worker()
+            .system("You are the REVIEWER.")
+            .tool_declarations(vec![shell_decl()])
+            .approval(ApprovalPolicy::new(Approval::ask(|_| {
+                ApprovalDecision::Deny
+            })))
+            .build()
+            .expect("worker builds");
+        let (parent_handler, reached_rx) = ParkingParentInteractionHandler::new();
+        let mut agent = AgentBuilder::default()
+            .client(client)
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(Approval::auto_allow())
+            .interaction_handler(parent_handler)
+            .subagent("reviewer", reviewer)
+            .build()
+            .expect("agent builds");
+        let cancel = CancelHandle::new();
+        let trigger = cancel.clone();
+
+        let run = agent.run_full_with_cancel("Delegate an inspection.", cancel.clone());
+        let canceller = async move {
+            let interaction = tokio::time::timeout(std::time::Duration::from_secs(1), reached_rx)
+                .await
+                .expect("parent handler should be reached before the test timeout")
+                .expect("parent handler sends the interaction");
+            let origin = interaction
+                .origin()
+                .expect("parked child interaction carries delegate attribution");
+            assert_eq!(origin.delegate, "reviewer");
+            assert_eq!(origin.depth, 1);
+            trigger.cancel();
+        };
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (result, ()) = tokio::join!(run, canceller);
+            result
+        })
+        .await
+        .expect("cancelling a parked child interaction must not hang");
+
+        let error = result.expect_err("the run should stop through cancellation");
+        assert!(
+            matches!(&error, crate::facade::FacadeError::Agent(agent) if agent.to_string().contains("cancelled")),
+            "cancelled run should surface an agent cancellation diagnostic, got {error:?}"
+        );
+        assert!(cancel.is_cancelled());
     }
 
     #[tokio::test]

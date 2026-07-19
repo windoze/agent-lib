@@ -428,6 +428,7 @@ pub(super) fn start(
                 agent.delegation_route(),
                 agent.client.clone(),
                 agent.supervisor_model(),
+                agent.interaction_handler.clone(),
                 agent.ids.clone(),
                 recorder.clone(),
                 agent.approval.clone(),

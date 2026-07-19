@@ -21,11 +21,13 @@
 
 ## Current Progress
 
-- Plan initialized before executing project commands.
-- Selected first incomplete task: `M1-1` (`Interaction` optional delegate origin attribution).
-- Next steps: check latest commit for directly relevant unfinished notes, inspect `src/agent/interaction.rs`, implement the type/API/rustdoc and serde tests, then run the task-specific and required validation commands.
-- Implemented the planned code changes: `InteractionOrigin`, optional `Interaction.origin`, `with_origin`/`origin` APIs, public re-export, and serde compatibility tests.
-- Validation in progress: start with formatting, then clippy, then tests.
-- Feature clippy found `large_enum_variant` in external state enums after `Interaction` grew; adjusted the optional origin storage to `Option<Box<InteractionOrigin>>` so the serde field remains optional while keeping `Interaction` compact.
-- Validation completed successfully: `cargo fmt --all`, default clippy, external feature clippy, `cargo test -p agent-lib --lib agent::interaction`, `cargo test --all --all-targets`, and rustdoc all passed.
-- `TODO.md` was updated to mark `M1-1` as `[DONE]` with implementation notes, validation results, and the source-level breaking-change note for direct `Interaction` struct literals.
+- New invocation initialized. This file records the actionable plan and progress summary; private reasoning is intentionally not recorded.
+- Selected first incomplete task: `M1-2` (`local subagent 路径：子 agent 交互应答路由到父级注入 handler`).
+- Next step: check the latest commit message only for unfinished work directly relevant to `M1-2`, then inspect the local delegation/interaction routing code and tests.
+- Planned implementation focus: preserve each child worker's own `ApprovalPolicy` as the gate, route paused child interactions to the parent-injected async `InteractionHandler` when present, add origin attribution with delegate name and child `RunContext.depth`, preserve current no-parent-handler behavior, and add the specified parent-route/no-parent/cancel tests.
+- Latest commit checked: `[M1-1] Add interaction origin attribution`; it does not state unfinished `M1-2` work.
+- Implementation in progress: `DelegationToolHandler` now carries an optional parent-injected interaction handler into local subagent drives; child scope selects a `ChildInteractionRouter` with origin attribution when present, otherwise keeps the child `FacadeApproval` fallback.
+- Added offline delegate tests covering parent-handler routing with origin, no-parent fallback behavior (existing child approval path), and cancellation while the parent child-interaction handler is parked.
+- Validation progress: `cargo fmt --all` and `cargo test -p agent-lib --lib facade::delegate` passed.
+- Validation completed successfully: default clippy, external feature clippy, full `cargo test --all --all-targets`, and rustdoc all passed.
+- Documentation updated in `docs/facade-api.md` and `docs/mag-gaps.md`; `TODO.md` now marks `M1-2` as `[DONE]` with implementation notes, compatibility notes, and validation results.

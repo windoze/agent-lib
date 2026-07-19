@@ -535,7 +535,11 @@ impl AgentRunStream<'_> {
 ```
 
 `Agent::worker()` 用于构造 local subagent 模板。它可以要求更少 provider 配置,允许继承 supervisor
-的 provider/model/client,也可以显式指定自己的 model。
+的 provider/model/client,也可以显式指定自己的 model。local subagent 的 `ApprovalPolicy` 仍决定
+哪些子工具调用会暂停；当 supervisor 通过 `AgentBuilder::interaction_handler` 注入了异步
+`InteractionHandler` 时,这些已暂停的子交互会转发给该父级 handler,并在 `Interaction.origin`
+中携带 delegate 名与委派深度。未注入父级 handler 时保持旧行为:子 agent 使用自己的同步
+`FacadeApproval` fallback 应答,headless ask 仍会 deny。
 
 `run` / `run_full` 与 `stream` 都会在调用方提前放弃一次运行时保持 agent 可继续使用:非流式
 future 被 drop(例如外层 `tokio::time::timeout` 或 `select!` 分支取消)时,facade 会同步向
@@ -570,6 +574,10 @@ impl AgentBuilder {
     pub fn interaction_handler(self, handler: Arc<dyn InteractionHandler>) -> Self;
 }
 ```
+
+该 handler 是被暂停交互的应答方,但不是 gate:普通 supervisor 工具与 local subagent 工具是否暂停
+仍由各自的 `ApprovalPolicy` 决定。local subagent 转发到父级 handler 的交互会带 `Interaction.origin`,
+用于 UI 渲染「哪个 delegate 在问」;权限主体仍由 `PermissionRequest.actor` 等具体请求字段表示。
 
 `snapshot` / `restore` / `into_parts` / `builder` 用途各异,文档不暗示它们可互相替代:
 
