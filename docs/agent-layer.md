@@ -296,6 +296,13 @@ machine 装配同一个 facade 专用 `ToolRegistryResolver`;queue-time validati
 `ToolRegistryHandler` 也按 `state.current_tool_set()` 安装过滤 registry,所以上一轮移除的工具不会在
 下一轮因为重新构造 registry 而恢复执行能力。声明/执行集合不一致会显式失败,不会静默 mismatch。
 
+M2-4 补齐了 facade 侧 reconfig 的其余准入与持久化交互:`SetModel` 准入校验与
+`AgentBuilder::build` 对齐(非空白 model、有限 temperature、provider_extras 与可推断 provider
+一致);构造全部已支持请求所需的类型(`ToolSetId`、`ToolDecl` 等)均由 facade 重导出,facade-only
+消费者可达;快照把排队未应用的 reconfig 队列作为 `AgentState` 的一部分捕获,restore 后于下一
+turn 边界照常应用;restore 校验重注入工具面覆盖快照可激活的全部 tool set(当前集合 + 排队
+reconfig 的应用结果),不满足即在 build 阶段显式失败,避免恢复出公开 API 无法挽救的锁死 agent。
+
 当前默认机器由 `ReconfigRequest`/`ReconfigQueue` 表达 skill、tool set、system overlay、
 model 与 loop policy 变更,并在 turn 边界原子应用。其中 tool set 变化会 reify 成
 `Requirement{ kind: NeedReconfigRegistry }`,由 driver 端的 `ReconfigHandler` 用

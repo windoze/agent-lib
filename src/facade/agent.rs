@@ -63,7 +63,8 @@ use crate::facade::approval::{ApprovalPolicy, FacadeApproval, enriched_approval_
 use crate::facade::chat::client_for_provider;
 use crate::facade::collab::{CollabBridge, CollabState, Collaboration, resolve};
 use crate::facade::config::{
-    ModelConfig, ProviderConfig, ensure_non_blank_model, ensure_provider_extras_match_provider,
+    ModelConfig, ProviderConfig, ensure_finite_temperature, ensure_non_blank_model,
+    ensure_provider_extras_match_provider,
 };
 use crate::facade::delegate::{
     AgentWorkerBuilder, DISPATCHER_ESCALATE_MARKER, Delegation, DelegationRecorder,
@@ -618,18 +619,52 @@ impl Agent {
     /// The facade supports model, tool-set declaration, system-prompt overlay,
     /// and loop-policy requests. Skill activation requests are rejected because
     /// the facade does not yet expose a skill registry or skill-to-prompt/tool
-    /// expansion layer.
+    /// expansion layer. Every supported request can be constructed from facade
+    /// re-exports alone ([`ModelRef`], [`ToolSetId`](crate::facade::ToolSetId),
+    /// [`ToolSetRef`], [`ToolSetPatch`](crate::facade::ToolSetPatch),
+    /// [`ToolDecl`], [`LoopPolicy`]) — no `agent::` internal imports are needed:
+    ///
+    /// ```
+    /// # fn demo() -> Result<(), Box<dyn std::error::Error>> {
+    /// use agent_lib::facade::{ReconfigRequest, ToolDecl, ToolSetId, ToolSetRef};
+    ///
+    /// let tool_set = ToolSetRef::new(
+    ///     ToolSetId::parse_str("018f0d9c-7b6a-7c12-8f31-1234567890e1")?,
+    ///     vec![ToolDecl {
+    ///         name: "get_weather".to_owned(),
+    ///         description: "Look up the current weather for a city.".to_owned(),
+    ///         input_schema: serde_json::json!({ "type": "object" }),
+    ///     }],
+    /// );
+    /// let request = ReconfigRequest::ReplaceToolSet { tool_set };
+    /// # let _ = request;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A `SetModel` request is validated with the same checks
+    /// [`AgentBuilder::build`] applies to an initial model — a non-blank model
+    /// name, a finite temperature, and provider extras consistent with the
+    /// provider the current model targets when one is inferable — so an invalid
+    /// model can never be queued and rendered into the next request.
     ///
     /// # Errors
     ///
     /// Returns [`FacadeError::InvalidState`] when a turn is in progress or when
     /// the request family is not supported by the facade. Returns
-    /// [`FacadeError::Agent`] when the underlying agent state rejects the request,
-    /// for example because a system-prompt overlay version is stale or a tool-set
-    /// patch targets a non-current tool-set id.
+    /// [`FacadeError::Config`] when a `SetModel` payload fails the builder-level
+    /// model checks (blank name, non-finite temperature, mismatched provider
+    /// extras). Returns [`FacadeError::Agent`] when the underlying agent state
+    /// rejects the request, for example because a system-prompt overlay version
+    /// is stale, a tool-set patch targets a non-current tool-set id, or the
+    /// requested tool set is not backed by the registered facade tool surface.
+    /// On any admission failure nothing is queued.
     pub fn reconfigure(&mut self, request: ReconfigRequest) -> Result<(), FacadeError> {
         ensure_facade_reconfig_request_supported(&request)?;
         ensure_facade_reconfig_rest_boundary(self.machine.cursor())?;
+        if let ReconfigRequest::SetModel { model } = &request {
+            ensure_facade_set_model_valid(model, self.machine.state().current_model())?;
+        }
         self.machine.reconfigure(request)?;
         Ok(())
     }
@@ -1024,6 +1059,16 @@ impl Agent {
     /// substrate is disabled); the delegate slice carries the registered subagent
     /// recipes, and the artifact slice is reserved for a later milestone
     /// (`docs/facade-api.md` §15.2).
+    ///
+    /// A reconfiguration queued through [`reconfigure`](Agent::reconfigure) but
+    /// not yet applied at a turn boundary **is** captured: the pending queue is
+    /// part of the serialized [`AgentState`], and a restored agent re-plans it,
+    /// so the queued change applies at the restored agent's next turn boundary
+    /// exactly as if the snapshot had never been taken. Restore additionally
+    /// requires the re-injected tool surface to cover both the snapshot's
+    /// current tool set and any tool set a queued reconfig would apply; a
+    /// surface that cannot fails the restore explicitly rather than stranding
+    /// the agent (see [`AgentRestoreBuilder::build`]).
     ///
     /// # Errors
     ///
@@ -1893,6 +1938,33 @@ fn ensure_facade_reconfig_request_supported(request: &ReconfigRequest) -> Result
         | ReconfigRequest::SetModel { .. }
         | ReconfigRequest::SetLoopPolicy { .. } => Ok(()),
     }
+}
+
+/// Validates a `SetModel` reconfig payload with the same checks
+/// [`AgentBuilder::build`] applies to an initial model, so a reconfigured model
+/// can never render an invalid request: the model name must be non-blank and
+/// the temperature finite.
+///
+/// Provider extras are checked against the provider the *current* model's
+/// extras target when one is inferable — the facade does not retain the
+/// builder's [`ProviderConfig`] (an injected client has no reliable provider
+/// id), so the current model is the only in-band provider signal. When neither
+/// side carries extras the check passes through, mirroring the builder's
+/// client-only escape hatch where the injected client decides how to handle
+/// provider-specific fields.
+fn ensure_facade_set_model_valid(model: &ModelRef, current: &ModelRef) -> Result<(), FacadeError> {
+    ensure_non_blank_model("agent reconfigure", model.model().to_owned())?;
+    if let Some(temperature) = model.temperature() {
+        ensure_finite_temperature("agent reconfigure", temperature)?;
+    }
+    if let Some(provider_extras) = model.provider_extras() {
+        ensure_provider_extras_match_provider(
+            "agent reconfigure",
+            current.provider_extras().map(|extras| extras.provider),
+            provider_extras,
+        )?;
+    }
+    Ok(())
 }
 
 fn ensure_facade_reconfig_rest_boundary(cursor: &LoopCursor) -> Result<(), FacadeError> {

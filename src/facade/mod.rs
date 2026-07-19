@@ -40,9 +40,15 @@ pub mod run;
 pub mod tool;
 
 pub use crate::agent::{
-    BudgetLimits, LoopPolicy, ModelRef, ReconfigRequest, ToolFailurePolicy, ToolSetPatch,
-    ToolSetRef,
+    BudgetLimits, LoopPolicy, ModelRef, ReconfigRequest, ToolFailurePolicy, ToolSetId,
+    ToolSetPatch, ToolSetRef,
 };
+// The data-only tool *declaration* type a `ToolSetRef` / `ToolSetPatch`
+// carries, re-exported under its facade alias so a facade-only consumer can
+// construct every supported `ReconfigRequest` without importing `agent::` or
+// `model::` internals. It is distinct from [`Tool`], the facade's executable
+// typed tool.
+pub use crate::model::tool::Tool as ToolDecl;
 pub use agent::{
     Agent, AgentBuilder, AgentParts, AgentRestoreBuilder, AgentRunStream, AgentSnapshot,
     AgentStateSnapshot, BlackboardSnapshot, CancelHandle, DelegateSnapshot, DelegationSnapshot,

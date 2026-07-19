@@ -91,7 +91,8 @@ permission/question/choice 仍按 M1-3 路由到父级 handler。
 model / system overlay / tool-set declaration / loop policy 请求,skill 请求显式拒绝；facade 选择
 between-run/rest cursor 准入,active turn 返回 `InvalidState`。流式/非流式 reconfig handler 与
 `ReplaceToolSet` / `PatchToolSet` 的 live registry 一致性已修复（M2-2）；被移除委派工具
-（`ask_<name>`）仍驱动委派的绕过已修复（M2-3）；snapshot/restore 交互仍待 M2-4/M2-R 收口。
+（`ask_<name>`）仍驱动委派的绕过已修复（M2-3）；snapshot/restore 交互、`SetModel` 准入校验与
+facade re-export 完整性已收口（M2-4）。
 
 ### 现状
 
@@ -113,9 +114,23 @@ between-run/rest cursor 准入,active turn 返回 `InvalidState`。流式/非流
   委派路由解析以 slot 中当前 registry 的声明集为准——run 起点过滤与 mid-run swap 共用同一检查点，
   被移除的委派工具调用得到 `UnknownTool` tool result,不记录也不驱动委派；流式 tap 用同一谓词,
   不再发出 `DelegationStarted`。
-- **snapshot/restore 不能替代**：恢复以快照 `AgentState` 为权威，`current_model` / system
-  prompt / `current_tool_set` 声明全部保留（`facade/agent/snapshot.rs:864-869`）；重注入不同
-  工具集只按名字替换执行闭包（`snapshot.rs:656-664`），模型看到的声明仍是旧快照——静默不一致。
+- **snapshot/restore 交互（✅ 已修复，M2-4）**：恢复以快照 `AgentState` 为权威，`current_model` /
+  system prompt / `current_tool_set` 声明全部保留（`facade/agent/snapshot.rs:864-869`），已应用的
+  reconfig 随快照保留（测试钉住）；排队未应用的 reconfig 队列是序列化状态的一部分，被快照捕获并
+  在 restore 后于下一 turn 边界照常应用。restore 曾只查重不校验工具面，快照 `current_tool_set` ⊄
+  重注入工具面时每次 run 都在 drain 前失败、排队矫正 reconfig 永远没机会应用——现在 restore 校验
+  重注入工具面覆盖当前集合与排队 reconfig 的应用结果，不满足即以 `FacadeError::InvalidState` 显式
+  失败（breaking：此前能恢复出的锁死状态现在恢复即报错）。
+- **`SetModel` 准入校验（✅ 已修复，M2-4）**：此前 `SetModel { model: "" }` 或 NaN temperature
+  会被接受并渲染进下一个 `ChatRequest`；现在准入校验与 `AgentBuilder::build` 对齐（非空白 model、
+  有限 temperature、provider_extras 与可推断 provider 一致），非法输入以 `FacadeError::Config`
+  失败、不排队。
+- **facade re-export 完整性（✅ 已修复，M2-4）**：补出 `ToolSetId` 与 `ToolDecl`
+  （`model::tool::Tool` 的 facade 别名），facade-only 消费者可构造全部已支持 reconfig 请求，
+  不再需要 import `agent::` 内部模块（编译级测试钉住）。
+- **分工不变**：restore 是换 provider / client / runtime handler 的路径，reconfigure 是换
+  model / tools / system 的路径；重注入不同工具集只按名字替换执行闭包，模型看到的声明仍以快照
+  为准。
 
 ### 需求
 

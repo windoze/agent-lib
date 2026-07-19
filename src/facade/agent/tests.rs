@@ -576,6 +576,357 @@ async fn reconfigure_patch_tool_set_updates_non_streaming_registry() {
     );
 }
 
+fn weather_tool_decl() -> crate::model::tool::Tool {
+    counting_weather_tool(Arc::new(AtomicUsize::new(0))).declaration()
+}
+
+#[test]
+fn reconfigure_rejects_blank_set_model_at_admission() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let mut agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+
+    let error = agent
+        .reconfigure(ReconfigRequest::SetModel {
+            model: reconfig_model("  "),
+        })
+        .expect_err("blank set-model reconfig is rejected");
+
+    assert!(
+        matches!(error, FacadeError::Config(ref message) if message.contains("blank `model`")),
+        "unexpected error: {error:?}"
+    );
+    assert!(agent.state().queued_reconfigs().is_empty());
+}
+
+#[test]
+fn reconfigure_rejects_non_finite_set_model_temperature_at_admission() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let mut agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    let model = ModelRef::new(
+        "test-model-v2",
+        NonZeroU32::new(321).expect("non-zero max tokens"),
+        Some(f32::NAN),
+        None,
+    );
+
+    let error = agent
+        .reconfigure(ReconfigRequest::SetModel { model })
+        .expect_err("non-finite set-model temperature is rejected");
+
+    assert!(
+        matches!(error, FacadeError::Config(ref message) if message.contains("non-finite `temperature`")),
+        "unexpected error: {error:?}"
+    );
+    assert!(agent.state().queued_reconfigs().is_empty());
+}
+
+#[test]
+fn reconfigure_set_model_provider_extras_must_follow_the_current_provider() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let mut agent = AgentBuilder::default()
+        .client(client)
+        .model("test-model")
+        .provider_extras(provider_extras(ProviderId::Anthropic))
+        .tool(counting_weather_tool(Arc::new(AtomicUsize::new(0))))
+        .approval(Approval::auto_allow())
+        .build()
+        .expect("build agent");
+    let mismatched = ModelRef::new(
+        "test-model-v2",
+        NonZeroU32::new(321).expect("non-zero max tokens"),
+        None,
+        Some(provider_extras(ProviderId::OpenAiResp)),
+    );
+
+    let error = agent
+        .reconfigure(ReconfigRequest::SetModel { model: mismatched })
+        .expect_err("provider extras targeting another provider are rejected");
+
+    assert!(
+        matches!(error, FacadeError::Config(ref message) if message.contains("provider_extras")),
+        "unexpected error: {error:?}"
+    );
+    assert!(agent.state().queued_reconfigs().is_empty());
+
+    let matched = ModelRef::new(
+        "test-model-v2",
+        NonZeroU32::new(321).expect("non-zero max tokens"),
+        None,
+        Some(provider_extras(ProviderId::Anthropic)),
+    );
+    agent
+        .reconfigure(ReconfigRequest::SetModel { model: matched })
+        .expect("provider extras targeting the current provider are accepted");
+    assert_eq!(agent.state().queued_reconfigs().len(), 1);
+}
+
+#[tokio::test]
+async fn snapshot_restore_preserves_applied_model_and_tool_set_reconfig() {
+    let client = ScriptedClient::new(vec![text_response("reconfigured")]);
+    let calendar_calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = agent_with_tools(
+        client,
+        vec![
+            counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+            counting_calendar_tool(calendar_calls.clone()),
+        ],
+        Approval::auto_allow(),
+    );
+    let model = reconfig_model("test-model-v2");
+    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), vec![calendar_tool_decl()]);
+    agent
+        .reconfigure(ReconfigRequest::SetModel {
+            model: model.clone(),
+        })
+        .expect("set-model reconfig is accepted");
+    agent
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement.clone(),
+        })
+        .expect("replace-tool-set reconfig is accepted");
+
+    agent
+        .run("apply the reconfig.")
+        .await
+        .expect("reconfig applies at the run's turn boundary");
+    assert_eq!(agent.state().current_model(), &model);
+    assert_eq!(agent.state().current_tool_set(), &replacement);
+
+    let snapshot = agent
+        .snapshot()
+        .expect("snapshot captures the applied reconfig");
+    let restored_client = ScriptedClient::new(vec![text_response("restored")]);
+    let mut restored = Agent::restore()
+        .snapshot(snapshot)
+        .client(restored_client.clone())
+        .tool(counting_calendar_tool(calendar_calls.clone()))
+        .build()
+        .expect("restore with the reconfigured tool surface");
+
+    assert_eq!(restored.state().current_model(), &model);
+    assert_eq!(restored.state().current_tool_set(), &replacement);
+
+    let reply = restored
+        .run("continue after restore.")
+        .await
+        .expect("restored agent runs on the reconfigured model and tool set");
+    assert_eq!(reply.text(), "restored");
+    assert_eq!(calendar_calls.load(Ordering::SeqCst), 0);
+    let requests = restored_client.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "test-model-v2");
+    assert_eq!(requests[0].max_tokens, 321);
+    assert_eq!(requests[0].temperature, Some(0.25));
+    assert_eq!(tool_names(&requests[0].tools), vec!["read_calendar"]);
+}
+
+#[tokio::test]
+async fn snapshot_captures_queued_unapplied_reconfigs_for_restore() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let mut agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    let model = reconfig_model("test-model-v2");
+    agent
+        .reconfigure(ReconfigRequest::SetModel {
+            model: model.clone(),
+        })
+        .expect("set-model reconfig is accepted");
+    assert_eq!(agent.state().queued_reconfigs().len(), 1);
+    assert_ne!(agent.state().current_model(), &model);
+
+    let snapshot = agent
+        .snapshot()
+        .expect("snapshot captures the queued reconfig");
+    // Round-trip through JSON, since persistence is the snapshot's purpose.
+    let json = serde_json::to_string(&snapshot).expect("snapshot serializes");
+    let snapshot: AgentSnapshot = serde_json::from_str(&json).expect("snapshot deserializes");
+
+    let restored_client = ScriptedClient::new(vec![text_response("applied after restore")]);
+    let mut restored = Agent::restore()
+        .snapshot(snapshot)
+        .client(restored_client.clone())
+        .tool(counting_weather_tool(Arc::new(AtomicUsize::new(0))))
+        .build()
+        .expect("restore replans the captured queue");
+
+    assert_eq!(restored.state().queued_reconfigs().len(), 1);
+    assert_ne!(restored.state().current_model(), &model);
+
+    let reply = restored
+        .run("apply the queued reconfig.")
+        .await
+        .expect("queued reconfig applies at the restored agent's next turn boundary");
+    assert_eq!(reply.text(), "applied after restore");
+    assert_eq!(restored.state().current_model(), &model);
+    assert!(restored.state().queued_reconfigs().is_empty());
+    assert_eq!(restored_client.requests()[0].model, "test-model-v2");
+}
+
+#[test]
+fn restore_rejects_a_surface_missing_current_tool_set_tools() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let agent = agent_with(
+        client,
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+    let snapshot = agent.snapshot().expect("snapshot");
+
+    let error = Agent::restore()
+        .snapshot(snapshot.clone())
+        .client(ScriptedClient::new(vec![text_response("unused")]))
+        .build()
+        .expect_err("restore without the advertised tools fails explicitly");
+    assert!(
+        matches!(error, FacadeError::InvalidState(ref message) if message.contains("current tool set") && message.contains("get_weather")),
+        "unexpected error: {error:?}"
+    );
+
+    // The same snapshot restores cleanly once the surface covers the set.
+    Agent::restore()
+        .snapshot(snapshot)
+        .client(ScriptedClient::new(vec![text_response("unused")]))
+        .tool(counting_weather_tool(Arc::new(AtomicUsize::new(0))))
+        .build()
+        .expect("restore with the full surface succeeds");
+}
+
+#[tokio::test]
+async fn restore_rejects_a_surface_missing_a_queued_reconfig_tool_set() {
+    let client = ScriptedClient::new(vec![text_response("shrunk")]);
+    let mut agent = agent_with_tools(
+        client,
+        vec![
+            counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+            counting_calendar_tool(Arc::new(AtomicUsize::new(0))),
+        ],
+        Approval::auto_allow(),
+    );
+    let shrink = ToolSetPatch::new(
+        agent.state().current_tool_set().id(),
+        reconfig_tool_set_id(1),
+        vec!["get_weather".to_owned()],
+        Vec::new(),
+    )
+    .expect("valid tool-set patch");
+    agent
+        .reconfigure(ReconfigRequest::PatchToolSet { patch: shrink })
+        .expect("patch-tool-set reconfig is accepted");
+    agent
+        .run("apply the shrink.")
+        .await
+        .expect("shrink applies at the run's turn boundary");
+    assert_eq!(
+        tool_names(agent.state().current_tool_set().tools()),
+        vec!["read_calendar"]
+    );
+
+    // Queue (but never apply) a corrective switch to the weather-only set.
+    let queued = ToolSetRef::new(reconfig_tool_set_id(2), vec![weather_tool_decl()]);
+    agent
+        .reconfigure(ReconfigRequest::ReplaceToolSet { tool_set: queued })
+        .expect("replace-tool-set reconfig is accepted");
+    let snapshot = agent
+        .snapshot()
+        .expect("snapshot captures the queued reconfig");
+
+    // The re-injected surface covers the current set (`read_calendar`) but not
+    // the set the queued corrective reconfig would apply (`get_weather`), so
+    // the restore fails instead of stranding the agent on its first run.
+    let error = Agent::restore()
+        .snapshot(snapshot.clone())
+        .client(ScriptedClient::new(vec![text_response("unused")]))
+        .tool(counting_calendar_tool(Arc::new(AtomicUsize::new(0))))
+        .build()
+        .expect_err("restore whose surface misses the queued tool set fails");
+    assert!(
+        matches!(error, FacadeError::InvalidState(ref message) if message.contains("queued reconfig") && message.contains("get_weather")),
+        "unexpected error: {error:?}"
+    );
+
+    // A surface covering both the current and the queued set restores cleanly.
+    Agent::restore()
+        .snapshot(snapshot)
+        .client(ScriptedClient::new(vec![text_response("unused")]))
+        .tool(counting_calendar_tool(Arc::new(AtomicUsize::new(0))))
+        .tool(counting_weather_tool(Arc::new(AtomicUsize::new(0))))
+        .build()
+        .expect("restore with the full surface succeeds");
+}
+
+/// Compile-level proof that a facade-only consumer can construct every
+/// supported reconfig request from facade re-exports alone, without importing
+/// `agent::` internal modules (M2-4).
+mod facade_surface {
+    use std::num::NonZeroU32;
+
+    use crate::facade::{
+        LoopPolicy, ModelRef, ReconfigRequest, ToolDecl, ToolFailurePolicy, ToolSetId,
+        ToolSetPatch, ToolSetRef,
+    };
+
+    fn tool_set_id(literal: &str) -> ToolSetId {
+        ToolSetId::parse_str(literal).expect("tool set id")
+    }
+
+    fn weather_decl() -> ToolDecl {
+        ToolDecl {
+            name: "get_weather".to_owned(),
+            description: "Look up the current weather for a city.".to_owned(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    #[test]
+    fn facade_paths_construct_every_supported_reconfig_request() {
+        let requests = [
+            ReconfigRequest::SetModel {
+                model: ModelRef::new(
+                    "test-model",
+                    NonZeroU32::new(256).expect("non-zero max tokens"),
+                    Some(0.5),
+                    None,
+                ),
+            },
+            ReconfigRequest::set_system_prompt_overlay(Some("overlay".to_owned()), 0),
+            ReconfigRequest::ReplaceToolSet {
+                tool_set: ToolSetRef::new(
+                    tool_set_id("018f0d9c-7b6a-7c12-8f31-1234567890e1"),
+                    vec![weather_decl()],
+                ),
+            },
+            ReconfigRequest::PatchToolSet {
+                patch: ToolSetPatch::new(
+                    tool_set_id("018f0d9c-7b6a-7c12-8f31-1234567890e1"),
+                    tool_set_id("018f0d9c-7b6a-7c12-8f31-1234567890e2"),
+                    Vec::new(),
+                    vec![weather_decl()],
+                )
+                .expect("valid tool-set patch"),
+            },
+            ReconfigRequest::SetLoopPolicy {
+                loop_policy: LoopPolicy::new(
+                    NonZeroU32::new(4).expect("non-zero step budget"),
+                    NonZeroU32::new(1).expect("non-zero parallelism"),
+                    ToolFailurePolicy::ReturnErrorToModel,
+                ),
+            },
+        ];
+        assert_eq!(requests.len(), 5);
+    }
+}
+
 /// Builds a supervisor with two scripted model-routed delegates, `reviewer`
 /// and `researcher`, so a tool-set reconfig can remove one delegation tool
 /// while the other is retained.

@@ -7,7 +7,11 @@
 //! carries the LLM client, provider credentials, tool closures, or the approval
 //! handler — so it is safe to persist and later feed to
 //! [`Agent::restore`](super::Agent::restore), which re-injects those runtime
-//! handles through an [`AgentRestoreBuilder`] (`docs/facade-api.md` §15.2).
+//! handles through an [`AgentRestoreBuilder`] (`docs/facade-api.md` §15.2). The
+//! serialized [`AgentState`] includes any queued-but-unapplied reconfigs, so a
+//! restored agent re-plans them at its next turn boundary; restore fails
+//! explicitly when the re-injected tool surface cannot execute the tool sets
+//! that state can activate (see [`AgentRestoreBuilder::build`]).
 //!
 //! [`Agent::into_parts`](super::Agent::into_parts) is the complementary escape
 //! hatch: it consumes the agent and hands ownership of the assembled parts to a
@@ -36,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::external::{ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionRef};
 use crate::agent::{
     AgentSpec, AgentState, Blackboard, BudgetLimits, InteractionHandler, Mailbox, Plan,
-    PlanSnapshot, ToolRegistry, ToolSetRef, WorktreeRef,
+    PlanSnapshot, ToolRegistry, ToolRegistryResolver, ToolSetRef, WorktreeRef,
 };
 // Re-export the real, data-only collaboration snapshot types (M3-1) so the
 // facade snapshot surface (`AgentSnapshot::mailbox` / `blackboard`) speaks the
@@ -788,7 +792,14 @@ impl AgentRestoreBuilder {
     ///   a restored delegation tool declaration.
     /// - [`FacadeError::InvalidState`] when the captured
     ///   [`AgentStateSnapshot`] cannot be deserialized back into an
-    ///   [`AgentState`].
+    ///   [`AgentState`], or when the re-injected tool surface cannot execute a
+    ///   tool set the restored state can activate — the snapshot's current tool
+    ///   set, or the set a queued-but-unapplied reconfig would apply at the
+    ///   next turn boundary. Because a run resolves its active registry from
+    ///   the current tool set *before* any queued corrective reconfig could
+    ///   apply, admitting such a restore would brick the agent for every
+    ///   public-API path; failing here keeps that state unrepresentable.
+    ///   Re-inject the missing tools and retry.
     pub fn build(self) -> Result<Agent, FacadeError> {
         let snapshot = self
             .snapshot
@@ -862,12 +873,21 @@ impl AgentRestoreBuilder {
             &delegates,
             &external_agents,
         )?;
+        let tools: Arc<[Tool]> = Arc::from(self.tools);
+        let extra_declarations: Arc<[ToolDecl]> = Arc::from(self.extra_declarations);
+        let tool_registry_resolver = Arc::new(FacadeToolRegistryResolver::new(
+            tools.clone(),
+            self.custom_registry.clone(),
+            extra_declarations.clone(),
+            declarations,
+        ));
 
         // The restored state is otherwise authoritative: it preserves the spec,
         // active declarations, loop policy, and loop cursor of the snapshotted
         // agent. A caller-supplied provider_extras override only re-binds the
         // current model's provider-specific request fields for future requests.
         let mut state = snapshot.agent_state.into_state()?;
+        ensure_restored_tool_surface(&tool_registry_resolver, &state)?;
         if let Some(provider_extras) = provider_extras {
             state.override_current_provider_extras(provider_extras);
         }
@@ -917,14 +937,6 @@ impl AgentRestoreBuilder {
         }
 
         let external_tool_names = snapshot.delegation.external_tool_names(&external_agents);
-        let tools: Arc<[Tool]> = Arc::from(self.tools);
-        let extra_declarations: Arc<[ToolDecl]> = Arc::from(self.extra_declarations);
-        let tool_registry_resolver = Arc::new(FacadeToolRegistryResolver::new(
-            tools.clone(),
-            self.custom_registry.clone(),
-            extra_declarations.clone(),
-            declarations,
-        ));
         let approval = build_facade_approval(
             self.approval.unwrap_or_default(),
             &tools,
@@ -990,6 +1002,47 @@ impl AgentRestoreBuilder {
             last_external_sessions,
         })
     }
+}
+
+/// Validates that the re-injected runtime tool surface can execute every tool
+/// set the restored [`AgentState`] can activate.
+///
+/// Restore keeps the snapshot's `AgentState` as the data authority, including
+/// its current tool set and any queued-but-unapplied reconfigs (the queue is
+/// part of the serialized state and is re-planned here). A run resolves its
+/// active registry from the current tool set *before* the drive reaches the
+/// turn boundary where a queued corrective reconfig would apply, so a surface
+/// that cannot cover the current set fails every run up front, and one that
+/// cannot cover the queued post-application set fails the first run at that
+/// boundary — either way the agent is stranded with no public-API recovery.
+/// Failing the restore instead keeps that state unrepresentable: the caller
+/// re-injects the missing tools (or keeps the full surface) and retries.
+fn ensure_restored_tool_surface(
+    resolver: &FacadeToolRegistryResolver,
+    state: &AgentState,
+) -> Result<(), FacadeError> {
+    resolver
+        .resolve_active_registry(state.current_tool_set())
+        .map_err(|error| {
+            FacadeError::InvalidState(format!(
+                "restored tool surface cannot execute the snapshot's current tool set: {error}"
+            ))
+        })?;
+    if let Some(application) = state.queued_reconfig_application().map_err(|error| {
+        FacadeError::InvalidState(format!(
+            "restored reconfig queue cannot be planned: {error}"
+        ))
+    })? {
+        resolver
+            .resolve_tool_set(application.current_tool_set())
+            .map_err(|error| {
+                FacadeError::InvalidState(format!(
+                    "restored tool surface cannot execute the tool set a queued reconfig would \
+                     apply: {error}"
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

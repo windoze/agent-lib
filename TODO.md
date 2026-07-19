@@ -468,7 +468,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - Breaking change：无（仅 `pub(crate)` 可见性调整与行为补齐，公开 API 形状不变；行为变化是让
   文档已承诺的 UnknownTool 语义对委派工具成真）。
 
-### M2-4 [TODO] reconfig 与 snapshot/restore 的交互确认 + 准入校验补齐 + 文档收口
+### M2-4 [DONE] reconfig 与 snapshot/restore 的交互确认 + 准入校验补齐 + 文档收口
 
 上下文：
 
@@ -514,6 +514,67 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - facade-only 路径（不 import `agent::` 内部模块）构造 `ReplaceToolSet` 的编译测试或 doc
   示例。
 - 文档落位，无「机制齐备但 facade 不可达」的过时描述残留。
+
+完成记录（2026-07-20）：
+
+- **restore 锁死修复选型：方案 (a)——restore 时显式校验、失败即报错。** 在
+  `AgentRestoreBuilder::build` 反序列化 `AgentState` 之后、装配 machine 之前，用与 run 路径同一个
+  `FacadeToolRegistryResolver` 校验两块：(1) 快照 `current_tool_set` ⊆ 重注入工具面；(2) 排队未应用
+  reconfig 队列 plan 出的 post-application tool set ⊆ 重注入工具面。任一不满足即以
+  `FacadeError::InvalidState`（带缺失工具名）使 restore 失败。理由：run 起点按 `current_tool_set`
+  解析 active registry 先于任何 turn 边界 drain，方案 (b)（run 起点按 post-application 集合解析）会
+  让快照权威的当前集合被静默跳过、语义上等于restore 偷偷应用了排队 reconfig，且把宿主少注入工具的
+  真实错误掩盖成一次隐式配置变更；fail-fast 更诚实，且与 restore 已有的声明面/查重校验同层同时机。
+  排队 reconfig 的考虑：队列随 `AgentState` 序列化（`queued_reconfigs` 字段），restore 时
+  `from_record` 会重新 plan；方案 (a) 因此必须连 post-application 集合一起校验，否则排队矫正
+  ReplaceToolSet 指向缺失工具时首个 run 仍会在 turn 边界失败——校验已覆盖该路径（测试钉住）。
+  修复后不存在「公开 API 无法恢复」的状态：要么 restore 成功且每个 run 起点/边界都可解析，要么
+  restore 当场报错、调用方补足工具重试。
+- **排队未应用 reconfig 的快照语义（钉死）**：`Agent::snapshot()` **捕获**排队队列——
+  `queued_reconfigs` 是 `AgentState` 序列化记录的一部分，restore 后 agent 保留该队列并在下一次
+  run 的 turn 边界照常应用（不丢弃、不提前应用），行为与从未取过快照一致。已写入
+  `Agent::snapshot` rustdoc、`AgentRestoreBuilder::build` # Errors、snapshot 模块 doc 与
+  `docs/facade-api.md` §8.2/§15.2。
+- **`SetModel` 准入校验**：`Agent::reconfigure` 在 machine 排队前对 `SetModel` 跑与
+  `AgentBuilder::build` 对齐的校验（复用 `ensure_non_blank_model` / `ensure_finite_temperature` /
+  `ensure_provider_extras_match_provider`），非法输入以 `FacadeError::Config` 失败、不排队。
+  provider_extras 的 provider 比对以**当前 model 的 extras 所指 provider** 为可推断基准（facade 不
+  保留 builder 的 `ProviderConfig`，注入 client 无可靠 provider id）；两侧都无 extras 时按 builder
+  client-only 逃生口语义放行，由注入 client 决定。
+- **re-export 补齐**：`agent_lib::facade` 新增 `ToolSetId`（agent 层重导）与
+  `ToolDecl`（`model::tool::Tool` 的 facade 别名，区别于可执行的 typed `Tool`）；facade-only
+  消费者可构造全部五种已支持 reconfig 请求。编译级证明双保险：`Agent::reconfigure` rustdoc 新增
+  facade-path-only 构造 `ReplaceToolSet` 的 doc 示例（doctest 通过），测试内新增
+  `facade_surface` 模块只 import `crate::facade::` 路径构造全部五种请求。
+- 文件：`src/facade/mod.rs`（`ToolSetId` / `ToolDecl` re-export）、`src/facade/agent.rs`
+  （reconfigure 准入加 `ensure_facade_set_model_valid`；reconfigure/snapshot rustdoc 更新 + doc
+  示例）、`src/facade/agent/snapshot.rs`（`ensure_restored_tool_surface`；build 内 resolver 构造
+  前移；build # Errors 与模块 doc 更新）、`src/facade/agent/tests.rs`（8 个新测试 +
+  `weather_tool_decl` helper）、`docs/facade-api.md`（§8.2 reconfig 准入/分工/时机，§15.2 工具面
+  校验与排队捕获语义）、`docs/agent-layer.md`（§4.2 M2-4 段落）、`docs/mag-gaps.md`（A2 状态与
+  三条 ✅ 已修复（M2-4）标注）。
+- 测试（全部离线、ScriptedClient）：`snapshot_restore_preserves_applied_model_and_tool_set_reconfig`
+  （SetModel + ReplaceToolSet → run 应用 → snapshot → restore → 恢复 agent 的 state 与下一 LLM
+  request 都用新 model/工具集）；`snapshot_captures_queued_unapplied_reconfigs_for_restore`（排队
+  SetModel 经 JSON round-trip 后被快照捕获，restore 后队列仍在、下一 run 边界应用）；
+  `restore_rejects_a_surface_missing_current_tool_set_tools`（缺当前集合工具 → InvalidState；
+  补足 → 恢复成功，允许/拒绝两路径）；
+  `restore_rejects_a_surface_missing_a_queued_reconfig_tool_set`（当前集合 ⊆ 工具面但排队矫正
+  ReplaceToolSet 的应用结果 ⊄ → InvalidState；补足 → 成功）；
+  `reconfigure_rejects_blank_set_model_at_admission` /
+  `reconfigure_rejects_non_finite_set_model_temperature_at_admission` /
+  `reconfigure_set_model_provider_extras_must_follow_the_current_provider`（准入失败且不排队 +
+  匹配 provider 放行）；`facade_surface::facade_paths_construct_every_supported_reconfig_request`
+  （facade-only 编译测试）。
+- Breaking change：**restore 对工具面不覆盖快照可激活 tool set 的情形新增强制失败**
+  （`FacadeError::InvalidState`）——此前这类 restore 能build 成功但之后每次 run 都失败（agent 锁死），
+  现在恢复阶段即报错；任何依赖「少注入工具也能 restore 成功」的调用方会观察到行为变化。其余无公开
+  API 形状破坏（只新增 re-export 与准入校验）。
+- 验证通过：`cargo fmt --all`；`cargo test -p agent-lib --lib facade::`（262 passed，+8）；
+  `cargo clippy --all-targets -- -D warnings`；`cargo clippy --all-targets --features
+  "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  `cargo test --all --all-targets`（50 套件全绿）；`RUSTDOCFLAGS="-D warnings" cargo doc
+  --no-deps --workspace`；`cargo test --doc -p agent-lib`（新增 reconfigure doc 示例通过）。
 
 ### M2-R [TODO] M2 review：facade reconfigure 收口
 
