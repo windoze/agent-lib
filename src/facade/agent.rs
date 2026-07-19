@@ -46,14 +46,15 @@ use async_trait::async_trait;
 use crate::agent::requirement::AgentSpecRef;
 use crate::agent::{
     AgentError, AgentInput, AgentMachine, AgentSpec, AgentState, Blackboard, BudgetLimits,
-    Capability, CostTier, DefaultAgentMachine, ErrorCursor, ErrorCursorKind, EscalationError,
-    EscalationOutcome, EscalationRules, EscalationTrigger, Escalator, HandlerScope, HumanGate,
-    ImpactScope, Interaction, InteractionHandler, InteractionKind, LlmClientHandler, LlmHandler,
-    LlmStepMode, LoopCursor, LoopDoneReason, LoopPolicy, Mailbox, ModelRef, Notification,
-    PermissionRisk, Plan, RequirementIds, RequirementResult, RunContext, RunId, ScriptedVerifier,
-    StepInput, TaskDescriptor, TaskEvaluator, ToolApprovalPolicy, ToolExecutionIds,
-    ToolFailurePolicy, ToolHandler, ToolRegistry, ToolRegistryHandler, ToolSetRef, Uncertainty,
-    Verifier, WorkerProfile, WorkerProfileRef, WorkerReport, WorkerRoster, WorktreeRef, drain,
+    CancellationToken, Capability, CostTier, DefaultAgentMachine, ErrorCursor, ErrorCursorKind,
+    EscalationError, EscalationOutcome, EscalationRules, EscalationTrigger, Escalator,
+    HandlerScope, HumanGate, ImpactScope, Interaction, InteractionHandler, InteractionKind,
+    LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor, LoopDoneReason, LoopPolicy, Mailbox,
+    ModelRef, Notification, PermissionRisk, Plan, RequirementIds, RequirementResult, RunContext,
+    RunId, ScriptedVerifier, StepInput, TaskDescriptor, TaskEvaluator, ToolApprovalPolicy,
+    ToolExecutionIds, ToolFailurePolicy, ToolHandler, ToolRegistry, ToolRegistryHandler,
+    ToolSetRef, Uncertainty, Verifier, WorkerProfile, WorkerProfileRef, WorkerReport, WorkerRoster,
+    WorktreeRef, drain,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig};
@@ -96,6 +97,42 @@ pub use stream::AgentRunStream;
 pub(crate) const DEFAULT_MAX_STEPS: u32 = 8;
 /// Default number of tool-call rounds allowed per turn when unset (§8.4).
 pub(crate) const DEFAULT_MAX_TOOL_ROUNDS: u32 = 4;
+
+/// A cooperative cancellation handle for one facade Agent run.
+///
+/// Pass a clone to [`Agent::run_with_cancel`] or
+/// [`Agent::run_full_with_cancel`], then call [`cancel`](Self::cancel) from the
+/// host task that decides the run should stop. Tools invoked during that run see
+/// the same token through [`ToolContext::cancel`](crate::facade::ToolContext::cancel).
+#[derive(Clone, Debug, Default)]
+pub struct CancelHandle {
+    token: CancellationToken,
+}
+
+impl CancelHandle {
+    /// Creates a fresh, not-yet-cancelled handle.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+        }
+    }
+
+    /// Requests cooperative cancellation of the associated run.
+    pub fn cancel(&self) {
+        self.token.cancel();
+    }
+
+    /// Returns whether cancellation has already been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+}
 
 /// A stateful, tool-using agent backed by one live [`DefaultAgentMachine`].
 ///
@@ -293,7 +330,26 @@ impl Agent {
     /// including [`FacadeError::LoopLimitExceeded`] when the loop budget is
     /// exhausted before a final assistant message.
     pub async fn run(&mut self, input: impl IntoUserMessage) -> Result<Reply, FacadeError> {
-        Ok(self.run_full(input).await?.reply)
+        self.run_with_cancel(input, CancelHandle::new()).await
+    }
+
+    /// Runs one agent turn with a caller-owned cancellation handle and returns
+    /// the minimal [`Reply`].
+    ///
+    /// Call [`CancelHandle::cancel`] from another task to request cooperative
+    /// cancellation. The same token is passed to tools through
+    /// [`ToolContext::cancel`](crate::facade::ToolContext::cancel).
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`FacadeError`] produced by
+    /// [`run_full_with_cancel`](Agent::run_full_with_cancel).
+    pub async fn run_with_cancel(
+        &mut self,
+        input: impl IntoUserMessage,
+        cancel: CancelHandle,
+    ) -> Result<Reply, FacadeError> {
+        Ok(self.run_full_with_cancel(input, cancel).await?.reply)
     }
 
     /// Runs one agent turn and returns the full [`RunOutput`].
@@ -333,6 +389,27 @@ impl Agent {
         &mut self,
         input: impl IntoUserMessage,
     ) -> Result<RunOutput, FacadeError> {
+        self.run_full_with_cancel(input, CancelHandle::new()).await
+    }
+
+    /// Runs one agent turn with a caller-owned cancellation handle and returns
+    /// the full [`RunOutput`].
+    ///
+    /// This is the cancellable form of [`run_full`](Agent::run_full). The handle
+    /// is cooperative: cancellation is observed at the same bounded points as the
+    /// lower-level Agent driver, and an interrupted turn is abandoned so the
+    /// `Agent` remains usable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same variants as [`run_full`](Agent::run_full). A cancelled
+    /// run currently surfaces as [`FacadeError::Agent`] with a cancellation
+    /// diagnostic while preserving the committed consistency point.
+    pub async fn run_full_with_cancel(
+        &mut self,
+        input: impl IntoUserMessage,
+        cancel: CancelHandle,
+    ) -> Result<RunOutput, FacadeError> {
         let message = input.into_user_message();
 
         // Rules-routed delegation routes the whole task to a delegate the model
@@ -345,7 +422,7 @@ impl Agent {
                 .map(str::to_owned);
             if let Some(delegate_name) = routed {
                 let task = user_message_text(&message);
-                return self.run_rules_routed(delegate_name, task).await;
+                return self.run_rules_routed(delegate_name, task, cancel).await;
             }
         }
 
@@ -354,14 +431,15 @@ impl Agent {
         // delegate to the model (§13.3).
         if self.delegation.is_dispatcher_routed() {
             let task = user_message_text(&message);
-            return self.run_dispatcher_routed(task).await;
+            return self.run_dispatcher_routed(task, cancel).await;
         }
 
         let run_id = self.ids.run_id();
-        let ctx = RunContext::new_root(
+        let ctx = RunContext::new_root_with_cancellation(
             run_id,
             BudgetLimits::unbounded(),
             self.ids.trace_root("agent-run"),
+            cancel.token(),
         );
 
         // The registry and scope are per-run: a tool must observe this turn's run
@@ -677,12 +755,14 @@ impl Agent {
         &mut self,
         delegate_name: String,
         task: String,
+        cancel: CancelHandle,
     ) -> Result<RunOutput, FacadeError> {
         let run_id = self.ids.run_id();
-        let ctx = RunContext::new_root(
+        let ctx = RunContext::new_root_with_cancellation(
             run_id,
             BudgetLimits::unbounded(),
             self.ids.trace_root("agent-run"),
+            cancel.token(),
         );
         let recorder = new_delegation_recorder();
         let handler = self.build_delegation_handler(run_id, &ctx, recorder.clone())?;
@@ -750,7 +830,11 @@ impl Agent {
     /// approval policy denies fails with [`FacadeError::ApprovalDenied`] (§9.2),
     /// and every external delegate's resumable session facts are retained for a
     /// later [`snapshot`](Agent::snapshot) (§15.2).
-    async fn run_dispatcher_routed(&mut self, task: String) -> Result<RunOutput, FacadeError> {
+    async fn run_dispatcher_routed(
+        &mut self,
+        task: String,
+        cancel: CancelHandle,
+    ) -> Result<RunOutput, FacadeError> {
         let config = self
             .delegation
             .dispatcher_config()
@@ -761,10 +845,11 @@ impl Agent {
                 )
             })?;
         let run_id = self.ids.run_id();
-        let ctx = RunContext::new_root(
+        let ctx = RunContext::new_root_with_cancellation(
             run_id,
             BudgetLimits::unbounded(),
             self.ids.trace_root("agent-run"),
+            cancel.token(),
         );
         let recorder = new_delegation_recorder();
         let handler = self.build_delegation_handler(run_id, &ctx, recorder.clone())?;
@@ -836,7 +921,24 @@ impl Agent {
         &mut self,
         input: impl IntoUserMessage,
     ) -> Result<AgentRunStream<'_>, FacadeError> {
-        stream::start(self, input.into_user_message())
+        self.stream_with_cancel(input, CancelHandle::new()).await
+    }
+
+    /// Starts a streamed run with a caller-owned cancellation handle.
+    ///
+    /// The returned [`AgentRunStream`] also exposes [`AgentRunStream::cancel`]
+    /// and [`AgentRunStream::interject`] for hosts that prefer controlling the
+    /// run through the stream value itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same immediate setup errors as [`stream`](Agent::stream).
+    pub async fn stream_with_cancel(
+        &mut self,
+        input: impl IntoUserMessage,
+        cancel: CancelHandle,
+    ) -> Result<AgentRunStream<'_>, FacadeError> {
+        stream::start(self, input.into_user_message(), cancel)
     }
 
     /// Captures a serializable [`AgentSnapshot`] of the supervisor state.

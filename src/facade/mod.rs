@@ -45,7 +45,7 @@ pub mod tool;
 
 pub use agent::{
     Agent, AgentBuilder, AgentParts, AgentRestoreBuilder, AgentRunStream, AgentSnapshot,
-    AgentStateSnapshot, BlackboardSnapshot, DelegateSnapshot, DelegationSnapshot,
+    AgentStateSnapshot, BlackboardSnapshot, CancelHandle, DelegateSnapshot, DelegationSnapshot,
     ExternalDelegateSnapshot, MailboxSnapshot,
 };
 pub use approval::{Approval, ApprovalDecision, ApprovalPolicy, FacadeApproval};

@@ -34,7 +34,10 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
@@ -47,8 +50,9 @@ use crate::agent::drive::{
 use crate::agent::interaction::{Interaction, InteractionKind};
 use crate::agent::{
     AgentError, AgentInput, AgentMachine, BudgetLimits, DefaultAgentMachine, HandlerScope,
-    InteractionHandler, LlmHandler, LlmStepMode, LoopCursor, LoopDoneReason,
-    RequirementDisposition, RequirementResult, RunContext, StepInput, ToolHandler, ToolRegistry,
+    InteractionHandler, LlmHandler, LlmStepMode, LoopCursor, LoopDoneReason, Notification,
+    PivotMessage, PivotSource, Requirement, RequirementDisposition, RequirementKind,
+    RequirementResult, RunContext, StepInput, StepOutcome, ToolHandler, ToolRegistry,
     ToolRegistryHandler, TurnDone,
 };
 use crate::client::{ChatRequest, ClientError, LlmClient, Response};
@@ -56,7 +60,10 @@ use crate::conversation::ToolCallId;
 use crate::facade::approval::{FacadeApproval, enriched_approval_request};
 use crate::facade::delegate::{DelegationRecorder, DelegationToolHandler, new_delegation_recorder};
 use crate::facade::error::FacadeError;
-use crate::facade::run::{DelegationStatus, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary};
+use crate::facade::ids::FacadeIds;
+use crate::facade::run::{
+    DelegationStatus, IntoUserMessage, Reply, RunEvent, RunOutput, ToolTrace, UsageSummary,
+};
 use crate::facade::tool::{FacadeToolRegistry, ToolContextParts};
 use crate::model::message::Message;
 use crate::model::tool::ToolCall;
@@ -64,7 +71,7 @@ use crate::stream::accumulator::{Accumulator, AccumulatorError};
 use crate::stream::{Delta, StreamEvent};
 
 use super::{
-    Agent, ApprovalRecorder, abandon_in_flight_turn, classify_error, collect_traces,
+    Agent, ApprovalRecorder, CancelHandle, abandon_in_flight_turn, classify_error, collect_traces,
     drive_dispatcher_routed, drive_rules_routed, final_turn_summary, user_message_text,
     weave_approval_events,
 };
@@ -72,6 +79,55 @@ use super::{
 /// A shared sink the tapping handlers push live [`RunEvent`]s into while the
 /// drive future runs, drained in order by [`AgentRunStream::poll_next`].
 type EventSink = Arc<Mutex<VecDeque<RunEvent>>>;
+
+/// Shared run controls that can be used while an [`AgentRunStream`] is live.
+#[derive(Clone, Debug)]
+struct StreamControl {
+    cancel: CancelHandle,
+    pivots: Arc<Mutex<VecDeque<PivotMessage>>>,
+    pivot_window: Arc<AtomicBool>,
+}
+
+impl StreamControl {
+    fn new(cancel: CancelHandle) -> Self {
+        Self {
+            cancel,
+            pivots: Arc::new(Mutex::new(VecDeque::new())),
+            pivot_window: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn open_pivot_window(&self) {
+        self.pivot_window.store(true, Ordering::SeqCst);
+    }
+
+    fn close_pivot_window(&self) {
+        self.pivot_window.store(false, Ordering::SeqCst);
+    }
+
+    fn enqueue_pivot(&self, pivot: PivotMessage) -> Result<(), FacadeError> {
+        if !self.pivot_window.load(Ordering::SeqCst) {
+            return Err(FacadeError::InvalidState(
+                "pivot injection is only accepted at a streamed step boundary".to_owned(),
+            ));
+        }
+        let mut pivots = self.pivots.lock().expect("stream pivot queue poisoned");
+        if !pivots.is_empty() {
+            return Err(FacadeError::InvalidState(
+                "a pivot is already queued for the current streamed step boundary".to_owned(),
+            ));
+        }
+        pivots.push_back(pivot);
+        Ok(())
+    }
+
+    fn pop_pivot(&self) -> Option<PivotMessage> {
+        self.pivots
+            .lock()
+            .expect("stream pivot queue poisoned")
+            .pop_front()
+    }
+}
 
 /// Pushes one event onto the shared sink.
 fn emit(sink: &EventSink, event: RunEvent) {
@@ -83,6 +139,45 @@ fn emit(sink: &EventSink, event: RunEvent) {
 /// Pops the next buffered event from the shared sink, if any.
 fn pop(sink: &EventSink) -> Option<RunEvent> {
     sink.lock().expect("stream event sink poisoned").pop_front()
+}
+
+fn pending_contains_llm(pending: &[Requirement]) -> bool {
+    pending
+        .iter()
+        .any(|requirement| matches!(requirement.kind, RequirementKind::NeedLlm { .. }))
+}
+
+fn outcome_opens_pivot_window(outcome: &StepOutcome) -> bool {
+    outcome
+        .notifications
+        .iter()
+        .any(|notification| matches!(notification, Notification::StepBoundary(_)))
+        && pending_contains_llm(&outcome.requirements)
+}
+
+fn apply_queued_pivot(
+    machine: &MachineCell<'_>,
+    control: &StreamControl,
+    pending: &mut Vec<Requirement>,
+    notifications: &mut Vec<Notification>,
+) -> Result<(), AgentError> {
+    let Some(pivot) = control.pop_pivot() else {
+        return Ok(());
+    };
+
+    let mut guard = machine.borrow_mut();
+    let mut outcome = guard.step(StepInput::External(AgentInput::pivot(pivot)));
+    notifications.append(&mut outcome.notifications);
+    if let Some(reason) = outcome.rejected.take() {
+        abandon_in_flight_turn(&mut guard);
+        return Err(AgentError::Other(format!(
+            "stream pivot injection was rejected: {reason:?}"
+        )));
+    }
+    if !outcome.requirements.is_empty() {
+        *pending = outcome.requirements;
+    }
+    Ok(())
 }
 
 /// A shared, interior-mutable handle to the agent's held machine.
@@ -111,9 +206,11 @@ async fn drive_streamed(
     input: AgentInput,
     scope: &dyn HandlerScope,
     ctx: &RunContext,
+    control: &StreamControl,
 ) -> Result<TurnDone, AgentError> {
     let mut notifications = Vec::new();
     let mut cancelled = false;
+    let mut pivot_window_allowed = false;
 
     let mut pending = {
         let mut guard = machine.borrow_mut();
@@ -148,6 +245,26 @@ async fn drive_streamed(
             }
             cancelled = true;
             break;
+        }
+
+        if pivot_window_allowed && pending_contains_llm(&pending) {
+            control.open_pivot_window();
+            tokio::task::yield_now().await;
+            control.close_pivot_window();
+
+            if ctx.is_cancelled() {
+                for requirement in &pending {
+                    record_requirement(ctx, requirement, 0, RequirementDisposition::NeverResumed);
+                    let mut guard = machine.borrow_mut();
+                    let mut outcome = guard.step(StepInput::Abandon(requirement.id));
+                    notifications.append(&mut outcome.notifications);
+                }
+                cancelled = true;
+                break;
+            }
+
+            apply_queued_pivot(machine, control, &mut pending, &mut notifications)?;
+            pivot_window_allowed = false;
         }
 
         let resolutions = fulfill_batch(&pending, scope, None, ctx).await?;
@@ -186,8 +303,10 @@ async fn drive_streamed(
             );
             let mut guard = machine.borrow_mut();
             let mut outcome = guard.step(StepInput::Resume(resolution));
+            let opens_pivot_window = outcome_opens_pivot_window(&outcome);
             notifications.append(&mut outcome.notifications);
             pending.extend(outcome.requirements);
+            pivot_window_allowed |= opens_pivot_window;
         }
     }
 
@@ -204,6 +323,7 @@ async fn drive_streamed(
 pub(super) fn start(
     agent: &mut Agent,
     message: Message,
+    cancel: CancelHandle,
 ) -> Result<AgentRunStream<'_>, FacadeError> {
     // Rules-routed delegation short-circuits the supervisor loop: if the task
     // text matches a routing rule, the whole turn is handed to the matched
@@ -212,7 +332,7 @@ pub(super) fn start(
     if agent.delegation.is_rules_routed() {
         let task = user_message_text(&message);
         if let Some(delegate_name) = agent.delegation.route_task(&task).map(str::to_owned) {
-            return start_rules_routed(agent, delegate_name, task);
+            return start_rules_routed(agent, delegate_name, task, cancel);
         }
     }
 
@@ -220,14 +340,15 @@ pub(super) fn start(
     // cheap→verify→strong loop with no supervisor LLM step (§13.3).
     if agent.delegation.is_dispatcher_routed() {
         let task = user_message_text(&message);
-        return start_dispatcher_routed(agent, task);
+        return start_dispatcher_routed(agent, task, cancel);
     }
 
     let run_id = agent.ids.run_id();
-    let ctx = RunContext::new_root(
+    let ctx = RunContext::new_root_with_cancellation(
         run_id,
         BudgetLimits::unbounded(),
         agent.ids.trace_root("agent-run"),
+        cancel.token(),
     );
 
     // The registry and scope are per-run: a tool must observe this turn's run id,
@@ -258,6 +379,7 @@ pub(super) fn start(
     let recorder = new_delegation_recorder();
     let approvals: ApprovalRecorder = Arc::new(Mutex::new(Vec::new()));
     let sink: EventSink = Arc::new(Mutex::new(VecDeque::new()));
+    let control = StreamControl::new(cancel);
     let scope = FacadeStreamScope {
         llm: StreamingTapHandler {
             client: agent.client.clone(),
@@ -288,10 +410,19 @@ pub(super) fn start(
     // Share the held machine so the drive future and the stream's `Drop` both reach
     // it: the future steps it through `drive_streamed`, and an early drop abandons
     // any stranded turn synchronously (see `AgentRunStream::abandon`).
+    let stream_ids = agent.ids.clone();
     let machine: MachineCell = Rc::new(RefCell::new(&mut agent.machine));
     let machine_for_future = machine.clone();
+    let control_for_future = control.clone();
     let future = Box::pin(async move {
-        let done = drive_streamed(&machine_for_future, agent_input, &scope, &ctx).await?;
+        let done = drive_streamed(
+            &machine_for_future,
+            agent_input,
+            &scope,
+            &ctx,
+            &control_for_future,
+        )
+        .await?;
         let collected = collect_traces(done.notifications(), &recorder);
         let recorded_approvals = approvals
             .lock()
@@ -352,6 +483,8 @@ pub(super) fn start(
         output: None,
         state: DriveState::Driving,
         machine,
+        control,
+        ids: stream_ids,
     })
 }
 
@@ -372,18 +505,21 @@ fn start_rules_routed(
     agent: &mut Agent,
     delegate_name: String,
     task: String,
+    cancel: CancelHandle,
 ) -> Result<AgentRunStream<'_>, FacadeError> {
     let run_id = agent.ids.run_id();
-    let ctx = RunContext::new_root(
+    let ctx = RunContext::new_root_with_cancellation(
         run_id,
         BudgetLimits::unbounded(),
         agent.ids.trace_root("agent-run"),
+        cancel.token(),
     );
     let recorder = new_delegation_recorder();
     let handler = agent.build_delegation_handler(run_id, &ctx, recorder.clone())?;
     let target = agent.resolve_rules_target(&delegate_name)?;
     let ids = agent.ids.clone();
     let sink: EventSink = Arc::new(Mutex::new(VecDeque::new()));
+    let control = StreamControl::new(cancel);
     let sink_for_future = sink.clone();
     let future = Box::pin(async move {
         let drive = drive_rules_routed(&handler, &recorder, &ids, &target, task, &ctx).await?;
@@ -396,6 +532,7 @@ fn start_rules_routed(
     // The routed drive never steps the held machine, so its cursor stays `Idle` and
     // the stream's `Drop` finds no stranded turn to abandon; the cell is held only to
     // keep the `AgentRunStream` shape uniform across start paths.
+    let stream_ids = agent.ids.clone();
     let machine: MachineCell = Rc::new(RefCell::new(&mut agent.machine));
     Ok(AgentRunStream {
         future,
@@ -403,6 +540,8 @@ fn start_rules_routed(
         output: None,
         state: DriveState::Driving,
         machine,
+        control,
+        ids: stream_ids,
     })
 }
 
@@ -424,6 +563,7 @@ fn start_rules_routed(
 fn start_dispatcher_routed(
     agent: &mut Agent,
     task: String,
+    cancel: CancelHandle,
 ) -> Result<AgentRunStream<'_>, FacadeError> {
     let config = agent
         .delegation
@@ -433,10 +573,11 @@ fn start_dispatcher_routed(
             FacadeError::InvalidState("dispatcher config missing on a dispatcher stream".to_owned())
         })?;
     let run_id = agent.ids.run_id();
-    let ctx = RunContext::new_root(
+    let ctx = RunContext::new_root_with_cancellation(
         run_id,
         BudgetLimits::unbounded(),
         agent.ids.trace_root("agent-run"),
+        cancel.token(),
     );
     let recorder = new_delegation_recorder();
     let handler = agent.build_delegation_handler(run_id, &ctx, recorder.clone())?;
@@ -445,6 +586,7 @@ fn start_dispatcher_routed(
     let verifier = agent.delegation.dispatcher_verifier_hook().cloned();
     let ids = agent.ids.clone();
     let sink: EventSink = Arc::new(Mutex::new(VecDeque::new()));
+    let control = StreamControl::new(cancel);
     let sink_for_future = sink.clone();
     let future = Box::pin(async move {
         let drive = drive_dispatcher_routed(
@@ -459,6 +601,7 @@ fn start_dispatcher_routed(
 
     // As with the rules-routed path, the dispatcher drive never steps the held
     // machine, so `Drop` finds no stranded turn; the cell keeps the shape uniform.
+    let stream_ids = agent.ids.clone();
     let machine: MachineCell = Rc::new(RefCell::new(&mut agent.machine));
     Ok(AgentRunStream {
         future,
@@ -466,6 +609,8 @@ fn start_dispatcher_routed(
         output: None,
         state: DriveState::Driving,
         machine,
+        control,
+        ids: stream_ids,
     })
 }
 
@@ -503,6 +648,10 @@ pub struct AgentRunStream<'a> {
     /// The [`Drop`] guard uses it to abandon a stranded turn when the stream is
     /// dropped before the drive reaches a terminal cursor.
     machine: MachineCell<'a>,
+    /// Shared cancellation and pivot controls for this live stream.
+    control: StreamControl,
+    /// Identity source used to stamp facade-created pivot messages.
+    ids: FacadeIds,
 }
 
 /// Lifecycle of an [`AgentRunStream`]'s drive.
@@ -517,6 +666,57 @@ enum DriveState {
 }
 
 impl AgentRunStream<'_> {
+    /// Returns a clone of this stream's cooperative cancellation handle.
+    #[must_use]
+    pub fn cancel_handle(&self) -> CancelHandle {
+        self.control.cancel.clone()
+    }
+
+    /// Requests cooperative cancellation of this streamed run.
+    pub fn cancel(&self) {
+        self.control.cancel.cancel();
+    }
+
+    /// Queues a human-authored pivot for the currently open streamed step boundary.
+    ///
+    /// The pivot is accepted only during the short boundary window after a tool
+    /// phase has closed and before the next LLM request is fulfilled. The drive
+    /// consumes the queued pivot on the next poll and re-renders that LLM request
+    /// through the lower-level machine pivot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacadeError::InvalidState`] when the stream is not currently at
+    /// a streamed pivot boundary, or [`FacadeError::Agent`] when the supplied
+    /// message is not a user-role message.
+    pub fn interject(&mut self, input: impl IntoUserMessage) -> Result<(), FacadeError> {
+        let pivot = PivotMessage::new(
+            self.ids.message_id(),
+            input.into_user_message(),
+            PivotSource::Human,
+        )
+        .map_err(|error| FacadeError::Agent(AgentError::State(error)))?;
+        self.interject_pivot(pivot)
+    }
+
+    /// Queues a fully specified pivot message for the current streamed boundary.
+    ///
+    /// Use this when the host needs a non-human [`PivotSource`] or externally
+    /// allocated message id. Most callers should use [`interject`](Self::interject).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacadeError::InvalidState`] when the stream is not currently at
+    /// a streamed pivot boundary or another pivot is already queued for it.
+    pub fn interject_pivot(&mut self, pivot: PivotMessage) -> Result<(), FacadeError> {
+        if self.state != DriveState::Driving {
+            return Err(FacadeError::InvalidState(
+                "cannot inject a pivot after the streamed run has finished".to_owned(),
+            ));
+        }
+        self.control.enqueue_pivot(pivot)
+    }
+
     /// Returns the next event, or `None` once the stream is exhausted.
     ///
     /// This is an inherent convenience equivalent to

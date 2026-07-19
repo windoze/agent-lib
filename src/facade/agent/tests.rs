@@ -17,7 +17,7 @@ use futures::stream::BoxStream;
 use serde_json::{Map, Value, json};
 use tokio::sync::oneshot;
 
-use super::{Agent, AgentBuilder, AgentSnapshot};
+use super::{Agent, AgentBuilder, AgentSnapshot, CancelHandle};
 use crate::agent::{
     AgentError, ApprovalResponse, ErrorCursor, ErrorCursorKind, Interaction, InteractionHandler,
     InteractionKind, InteractionResponse, RequirementResult, RunContext,
@@ -620,6 +620,7 @@ fn build_rejects_duplicate_tool_names() {
 struct StreamingScriptedClient {
     scripts: Vec<Vec<StreamEvent>>,
     calls: Mutex<usize>,
+    requests: Mutex<Vec<Vec<Message>>>,
 }
 
 impl StreamingScriptedClient {
@@ -627,11 +628,16 @@ impl StreamingScriptedClient {
         Arc::new(Self {
             scripts,
             calls: Mutex::new(0),
+            requests: Mutex::new(Vec::new()),
         })
     }
 
     fn call_count(&self) -> usize {
         *self.calls.lock().expect("calls mutex")
+    }
+
+    fn requests(&self) -> Vec<Vec<Message>> {
+        self.requests.lock().expect("requests mutex").clone()
     }
 }
 
@@ -649,8 +655,12 @@ impl LlmClient for StreamingScriptedClient {
 
     async fn chat_stream(
         &self,
-        _request: ChatRequest,
+        request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError> {
+        self.requests
+            .lock()
+            .expect("requests mutex")
+            .push(request.messages.clone());
         let mut calls = self.calls.lock().expect("calls mutex");
         let index = (*calls).min(self.scripts.len() - 1);
         *calls += 1;
@@ -790,6 +800,17 @@ fn streamed_text(events: &[RunEvent]) -> String {
         .collect()
 }
 
+fn message_text(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn stream_text_matches_run_full() {
     let usage = Usage {
@@ -876,6 +897,60 @@ async fn stream_tool_round_trip_emits_tool_events() {
         client.call_count(),
         2,
         "one tool-use step plus one final step"
+    );
+}
+
+#[tokio::test]
+async fn stream_interject_injects_a_pivot_at_the_next_step_boundary() {
+    let usage = Usage {
+        input: 11,
+        output: 7,
+        ..Usage::default()
+    };
+    let client = StreamingScriptedClient::new(vec![
+        tool_stream(),
+        text_stream(&["Pivot acknowledged."], usage),
+    ]);
+    let mut agent = agent_with(
+        client.clone(),
+        counting_weather_tool(Arc::new(AtomicUsize::new(0))),
+        Approval::auto_allow(),
+    );
+
+    let mut stream = agent.stream("weather?").await.expect("open stream");
+    let mut events = Vec::new();
+    loop {
+        let event = stream
+            .next()
+            .await
+            .expect("stream reaches the post-tool boundary")
+            .expect("event ok");
+        let finished_tool =
+            matches!(&event, RunEvent::ToolFinished(trace) if trace.name == "get_weather");
+        events.push(event);
+        if finished_tool {
+            break;
+        }
+    }
+
+    stream
+        .interject("Please answer with the pivot in mind.")
+        .expect("tool-step boundary accepts a stream pivot");
+
+    while let Some(item) = stream.next().await {
+        events.push(item.expect("stream item is ok"));
+    }
+
+    assert_eq!(streamed_text(&events), "Pivot acknowledged.");
+    let requests = client.requests();
+    assert_eq!(requests.len(), 2, "tool step plus pivoted final step");
+    let second_request = &requests[1];
+    assert!(
+        second_request.iter().any(|message| {
+            message.role == Role::User
+                && message_text(message).contains("Please answer with the pivot in mind.")
+        }),
+        "the re-rendered LLM request should include the injected pivot user message, got {second_request:?}"
     );
 }
 
@@ -1858,6 +1933,86 @@ async fn timing_out_non_streaming_run_discards_it_and_leaves_agent_runnable() {
     agent
         .snapshot()
         .expect("recovered agent remains snapshot-able");
+}
+
+#[tokio::test]
+async fn cancelling_non_streaming_run_stops_it_and_leaves_agent_runnable() {
+    let client = RunTimeoutClient::new(text_response("recovered."));
+    let mut agent = AgentBuilder::default()
+        .client(client.clone())
+        .model("test-model")
+        .build()
+        .expect("build agent");
+    let cancel = CancelHandle::new();
+    let trigger = cancel.clone();
+
+    let run = agent.run_full_with_cancel("cancel me", cancel.clone());
+    let canceller = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        trigger.cancel();
+    };
+    let (result, ()) = tokio::join!(run, canceller);
+
+    let error = result.expect_err("the run should stop through the cancel handle");
+    assert!(
+        matches!(&error, FacadeError::Agent(agent) if agent.to_string().contains("cancelled")),
+        "cancelled run should surface an agent cancellation diagnostic, got {error:?}"
+    );
+    assert!(cancel.is_cancelled());
+
+    agent
+        .snapshot()
+        .expect("cancelled run returns the machine to a snapshot-able point");
+
+    let reply = agent.run("again").await.expect("run after cancel");
+    assert_eq!(reply.text(), "recovered.");
+    assert_eq!(
+        client.chat_request_lens(),
+        vec![1, 1],
+        "the recovery turn carried only its own user message; the cancelled turn left no residue"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_stream_stops_it_and_leaves_agent_runnable() {
+    let client = DropTestClient::new(partial_text_head("It "), true, text_response("recovered."));
+    let mut agent = AgentBuilder::default()
+        .client(client.clone())
+        .model("test-model")
+        .build()
+        .expect("build agent");
+
+    {
+        let mut stream = agent.stream("cancel stream").await.expect("open stream");
+        let first = stream
+            .next()
+            .await
+            .expect("a first event")
+            .expect("event ok");
+        assert!(
+            matches!(&first, RunEvent::TextDelta(text) if text == "It "),
+            "the first streamed event is the partial text delta, got {first:?}"
+        );
+
+        stream.cancel();
+        let error = stream
+            .next()
+            .await
+            .expect("stream yields a cancellation error")
+            .expect_err("cancelled stream should fail terminally");
+        assert!(
+            matches!(&error, FacadeError::Agent(agent) if agent.to_string().contains("cancelled")),
+            "cancelled stream should surface an agent cancellation diagnostic, got {error:?}"
+        );
+    }
+
+    let reply = agent.run("again").await.expect("run after stream cancel");
+    assert_eq!(reply.text(), "recovered.");
+    assert_eq!(
+        client.chat_request_lens(),
+        vec![1],
+        "the recovery turn carried only its own user message; the cancelled stream left no residue"
+    );
 }
 
 /// Dropping a stream that was never polled leaves the machine untouched, so the

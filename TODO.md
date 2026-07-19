@@ -1313,7 +1313,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - **验证**：`cargo fmt --all`、`cargo test -p agent-lib --lib facade::agent`（52 条全过）、`cargo test -p agent-lib --lib agent::state`（21 条全过）、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`（exit 0，默认离线全量套件全过）、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - **兼容性**：无签名破坏；旧 error cursor 数据可读。带非 `Other` kind 的新 error cursor wire 在旧版本中会因未知字段被拒（pre-1.0 可接受，且当前生产 step-limit 路径仍走 `Done(StepLimitReached)`）。
 
-### M5-4 [TODO] facade 暴露 cancel 与 pivot 入口（M-PROM-2 cancel/pivot 部分）
+### M5-4 [DONE] facade 暴露 cancel 与 pivot 入口（M-PROM-2 cancel/pivot 部分）
 
 上下文：
 
@@ -1332,6 +1332,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：run 进行中调 cancel，run 以取消语义结束，Agent 后续可用。
 - 单元测试：stream 路径 pivot 注入在下个 step 边界生效（事件序列可见注入消息）。
 - `cargo test -p agent-lib --lib facade::` 全过。
+
+完成记录：
+
+- **cancel API 选型与接线**：新增 facade `CancelHandle`（`new` / `cancel` / `is_cancelled`），并新增 `Agent::run_with_cancel`、`run_full_with_cancel`、`stream_with_cancel`；既有 `run` / `run_full` / `stream` 保持兼容，内部创建未暴露的默认 handle。`RunContext` 增加 `new_root_with_cancellation`，三条 facade drive 路径（普通 supervisor、rules-routed、dispatcher-routed，含 streaming 对应路径）均用调用方 token 构造 root context；`ToolContext.cancel` 因此与 run handle 指向同一 token。取消仍复用 M4-5 的 never-resume 语义，facade 层暂以 `FacadeError::Agent` 中的取消诊断返回（专用取消错误面留作后续 API 打磨项）。
+- **stream 控制入口**：`AgentRunStream` 新增 `cancel_handle()` / `cancel()` / `interject(...)` / `interject_pivot(...)`。stream 持有运行中 `&mut Agent` 的 machine 借用，调用方无法同时通过 `Agent::interject` 控制同一 run，因此 pivot 入口放在 stream 对象上。`interject` 自动分配 `MessageId` 并标记 `PivotSource::Human`；`interject_pivot` 接受完整 `PivotMessage` 供高级调用方携带自定义 source / id。
+- **pivot 边界实现**：`drive_streamed` 增加内部 `StreamControl`（cancel handle + pivot FIFO + boundary window）。当 tool phase 关闭并产生下一条 `NeedLlm` 时，drive 在 fulfill 前开放一个短 pivot window 并 `yield_now()`，让调用方在收到 `ToolFinished` 后可调用 `interject`；下一次 poll 消费队列，通过下层 `AgentInput::Pivot` 注入并重渲染同一个 LLM requirement。非流式 `run` / `run_full` 仍是一条 future drive 到终态，没有中途喂输入通道；该限制已写入文档，需 pivot 的调用方使用 stream。
+- **测试**：新增 `cancelling_non_streaming_run_stops_it_and_leaves_agent_runnable`（外部 `CancelHandle` 取消 pending LLM，run 返回取消诊断，随后 `snapshot` 与下一次 `run` 正常且历史干净）、`cancelling_stream_stops_it_and_leaves_agent_runnable`（`AgentRunStream::cancel` 路径同样可恢复）、`stream_interject_injects_a_pivot_at_the_next_step_boundary`（工具完成事件后 `interject`，第二次 streaming LLM 请求包含注入的 user pivot）。`StreamingScriptedClient` 扩展为记录 request messages 以断言 pivot 重渲染。
+- **文档**：`docs/facade-api.md` §8.2 更新 API 形状，说明显式取消、`ToolContext.cancel` 共享 token、stream pivot window 与非流式 pivot 限制；`docs/review-2026-07.md` M-PROM-2 标注 cancel/pivot `✅ 已修复（M5-4）`，同时保留 budget 部分待 M6-2。
+- **验证**：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test -p agent-lib --lib facade::agent`（55 条全过）、`cargo test -p agent-lib --lib facade::`（215 条全过）、`cargo test --all --all-targets`（exit 0，默认离线全量套件全过，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 无 breaking change（新增 API 纯增量；既有 `run` / `run_full` / `stream` 签名与默认行为保持兼容，取消语义只是新增可达控制面）。M-PROM-2 的 budget 旋钮与预算硬出口不在本任务范围，仍按 TODO 顺序由 M6-2 处理。
 
 ### M5-5 [TODO] builder 暴露 `provider_extras`（M-PROM-6）
 

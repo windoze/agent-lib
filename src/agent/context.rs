@@ -63,9 +63,29 @@ impl RunContext {
         budget_limits: BudgetLimits,
         trace_root_id: TraceNodeId,
     ) -> Self {
+        Self::new_root_with_cancellation(
+            run_id,
+            budget_limits,
+            trace_root_id,
+            CancellationToken::new(),
+        )
+    }
+
+    /// Creates a root run context using a caller-supplied cancellation token.
+    ///
+    /// This keeps budget and trace ownership identical to [`new_root`](Self::new_root)
+    /// while allowing facade callers to hold a run-level cancel handle before the
+    /// run future starts.
+    #[must_use]
+    pub fn new_root_with_cancellation(
+        run_id: RunId,
+        budget_limits: BudgetLimits,
+        trace_root_id: TraceNodeId,
+        cancellation: CancellationToken,
+    ) -> Self {
         Self {
             run_id,
-            cancellation: CancellationToken::new(),
+            cancellation,
             budget: BudgetHandle::new(budget_limits),
             trace: TraceHandle::new_root(trace_root_id, run_id),
             depth: 0,
