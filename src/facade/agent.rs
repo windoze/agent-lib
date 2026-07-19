@@ -188,6 +188,8 @@ pub struct Agent {
     delegates: Vec<LocalSubagent>,
     external_agents: Vec<ManagedExternalDelegate>,
     delegation: Delegation,
+    /// Per-run budget limits used to create each [`RunContext`].
+    budget: BudgetLimits,
     /// The resolved collaboration substrate (config plus the live shared
     /// mailbox/blackboard/plan primitives), derived from the delegate topology
     /// or from an explicit [`Collaboration`] (`docs/facade-api.md` §14).
@@ -239,6 +241,7 @@ impl std::fmt::Debug for Agent {
                     .collect::<Vec<_>>(),
             )
             .field("delegation", &self.delegation)
+            .field("budget", &self.budget)
             .field("collaboration", &self.collab.config)
             .finish_non_exhaustive()
     }
@@ -438,7 +441,7 @@ impl Agent {
         let run_id = self.ids.run_id();
         let ctx = RunContext::new_root_with_cancellation(
             run_id,
-            BudgetLimits::unbounded(),
+            self.budget,
             self.ids.trace_root("agent-run"),
             cancel.token(),
         );
@@ -532,6 +535,11 @@ impl Agent {
                 if done_cursor.reason() == LoopDoneReason::StepLimitReached =>
             {
                 Err(FacadeError::LoopLimitExceeded)
+            }
+            LoopCursor::Done(done_cursor)
+                if done_cursor.reason() == LoopDoneReason::BudgetExhausted =>
+            {
+                Err(FacadeError::BudgetExhausted)
             }
             LoopCursor::Done(_) => {
                 let (text, usage, stop_reason) =
@@ -761,7 +769,7 @@ impl Agent {
         let run_id = self.ids.run_id();
         let ctx = RunContext::new_root_with_cancellation(
             run_id,
-            BudgetLimits::unbounded(),
+            self.budget,
             self.ids.trace_root("agent-run"),
             cancel.token(),
         );
@@ -848,7 +856,7 @@ impl Agent {
         let run_id = self.ids.run_id();
         let ctx = RunContext::new_root_with_cancellation(
             run_id,
-            BudgetLimits::unbounded(),
+            self.budget,
             self.ids.trace_root("agent-run"),
             cancel.token(),
         );
@@ -996,8 +1004,9 @@ impl Agent {
     /// declarations, the shared approval bridge, any injected
     /// [`InteractionHandler`], the identity source, the registered local
     /// subagent and managed external delegates, the delegation routing mode, the
-    /// last-known external session facts, and the live collaboration substrate
-    /// (config plus the shared mailbox / blackboard / plan handles) to an
+    /// run budget limits, the last-known external session facts, and the live
+    /// collaboration substrate (config plus the shared mailbox / blackboard /
+    /// plan handles) to an
     /// advanced caller who needs to drive the layers directly or take over the
     /// still-live handles (`docs/facade-api.md` §8.2). No semantically meaningful
     /// state is silently dropped: every field the agent held is surfaced on the
@@ -1026,6 +1035,7 @@ impl Agent {
             delegates: self.delegates,
             external_agents: self.external_agents,
             delegation: self.delegation,
+            budget: self.budget,
             retained_external_sessions: self.last_external_sessions,
             collaboration: collab.config,
             mailbox: collab.mailbox,
@@ -1057,6 +1067,7 @@ pub struct AgentBuilder {
     interaction_handler: Option<Arc<dyn InteractionHandler>>,
     max_steps: Option<u32>,
     max_tool_rounds: Option<u32>,
+    budget: Option<BudgetLimits>,
     tool_failure_policy: Option<ToolFailurePolicy>,
     worktree: Option<WorktreeRef>,
     ids: Option<FacadeIds>,
@@ -1090,6 +1101,7 @@ impl std::fmt::Debug for AgentBuilder {
             )
             .field("max_steps", &self.max_steps)
             .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("budget", &self.budget)
             .field("tool_failure_policy", &self.tool_failure_policy)
             .field(
                 "delegates",
@@ -1270,6 +1282,18 @@ impl AgentBuilder {
     #[must_use]
     pub fn max_tool_rounds(mut self, max_tool_rounds: u32) -> Self {
         self.max_tool_rounds = Some(max_tool_rounds);
+        self
+    }
+
+    /// Sets the run-level budget shared by the supervisor and any child agents.
+    ///
+    /// The default is [`BudgetLimits::unbounded`]. Each facade `run` / `stream`
+    /// creates a fresh [`RunContext`] with these limits, so counters reset between
+    /// top-level runs while subagents and managed delegates within one run share
+    /// the same ledger.
+    #[must_use]
+    pub fn budget(mut self, budget: BudgetLimits) -> Self {
+        self.budget = Some(budget);
         self
     }
 
@@ -1479,6 +1503,7 @@ impl AgentBuilder {
         );
 
         let machine = assemble_machine(state, &ids, approval.clone());
+        let budget = self.budget.unwrap_or_else(BudgetLimits::unbounded);
 
         // Resolve the collaboration substrate from the delegate topology (§14),
         // letting an explicit `Collaboration` override the derived default, then
@@ -1503,6 +1528,7 @@ impl AgentBuilder {
             delegates: self.delegates,
             external_agents: self.external_agents,
             delegation,
+            budget,
             collab,
             last_external_sessions: HashMap::new(),
         })

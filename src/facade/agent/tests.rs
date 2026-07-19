@@ -19,8 +19,8 @@ use tokio::sync::oneshot;
 
 use super::{Agent, AgentBuilder, AgentSnapshot, CancelHandle};
 use crate::agent::{
-    AgentError, ApprovalResponse, ErrorCursor, ErrorCursorKind, Interaction, InteractionHandler,
-    InteractionKind, InteractionResponse, RequirementResult, RunContext,
+    AgentError, ApprovalResponse, BudgetLimits, ErrorCursor, ErrorCursorKind, Interaction,
+    InteractionHandler, InteractionKind, InteractionResponse, RequirementResult, RunContext,
 };
 use crate::client::{
     AuthScheme, Capability, ChatRequest, ClientError, EndpointConfig, LlmClient, Response,
@@ -92,6 +92,10 @@ impl LlmClient for ScriptedClient {
 
 /// Builds an assistant response carrying only the given text.
 fn text_response(text: &str) -> Response {
+    text_response_with_usage(text, 11, 7)
+}
+
+fn text_response_with_usage(text: &str, input: u32, output: u32) -> Response {
     Response {
         message: Message {
             role: Role::Assistant,
@@ -101,8 +105,8 @@ fn text_response(text: &str) -> Response {
             }],
         },
         usage: Usage {
-            input: 11,
-            output: 7,
+            input,
+            output,
             ..Usage::default()
         },
         stop_reason: StopReason::normalize("end_turn"),
@@ -268,6 +272,35 @@ async fn builder_provider_extras_reach_supervisor_request() {
     agent.run("hello").await.expect("run succeeds");
 
     assert_eq!(client.requests()[0].provider_extras, Some(extras));
+}
+
+#[tokio::test]
+async fn builder_budget_limits_supervisor_run_and_leaves_agent_usable() {
+    let client = ScriptedClient::new(vec![
+        text_response_with_usage("too expensive", 11, 7),
+        text_response_with_usage("recovered", 0, 0),
+    ]);
+    let mut agent = AgentBuilder::default()
+        .client(client)
+        .model("test-model")
+        .budget(BudgetLimits::new(None, Some(10), None, None))
+        .build()
+        .expect("build agent");
+
+    let error = agent.run("exceed the token budget").await.unwrap_err();
+    assert!(
+        matches!(error, FacadeError::BudgetExhausted),
+        "token overrun maps to a structured facade budget error, got {error:?}"
+    );
+    agent
+        .snapshot()
+        .expect("budget failure leaves state snapshot-able");
+
+    let reply = agent
+        .run("second run gets a fresh budget ledger")
+        .await
+        .expect("subsequent low-usage run succeeds");
+    assert_eq!(reply.text(), "recovered");
 }
 
 #[test]

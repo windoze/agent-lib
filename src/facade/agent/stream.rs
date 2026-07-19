@@ -50,11 +50,10 @@ use crate::agent::drive::{
 };
 use crate::agent::interaction::{Interaction, InteractionKind};
 use crate::agent::{
-    AgentError, AgentInput, AgentMachine, BudgetLimits, DefaultAgentMachine, HandlerScope,
-    InteractionHandler, LlmHandler, LlmStepMode, LoopCursor, LoopDoneReason, Notification,
-    PivotMessage, PivotSource, Requirement, RequirementDisposition, RequirementKind,
-    RequirementResult, RunContext, StepInput, StepOutcome, ToolHandler, ToolRegistry,
-    ToolRegistryHandler, TurnDone,
+    AgentError, AgentInput, AgentMachine, DefaultAgentMachine, HandlerScope, InteractionHandler,
+    LlmHandler, LlmStepMode, LoopCursor, LoopDoneReason, Notification, PivotMessage, PivotSource,
+    Requirement, RequirementDisposition, RequirementKind, RequirementResult, RunContext, StepInput,
+    StepOutcome, ToolHandler, ToolRegistry, ToolRegistryHandler, TurnDone,
 };
 use crate::client::{ChatRequest, ClientError, LlmClient, Response};
 use crate::conversation::ToolCallId;
@@ -378,7 +377,7 @@ pub(super) fn start(
     let run_id = agent.ids.run_id();
     let ctx = RunContext::new_root_with_cancellation(
         run_id,
-        BudgetLimits::unbounded(),
+        agent.budget,
         agent.ids.trace_root("agent-run"),
         cancel.token(),
     );
@@ -485,6 +484,11 @@ pub(super) fn start(
             {
                 Err(FacadeError::LoopLimitExceeded)
             }
+            LoopCursor::Done(done_cursor)
+                if done_cursor.reason() == LoopDoneReason::BudgetExhausted =>
+            {
+                Err(FacadeError::BudgetExhausted)
+            }
             LoopCursor::Done(_) => {
                 let machine = machine_for_future.borrow();
                 let (text, usage, stop_reason) = final_turn_summary(machine.state().conversation());
@@ -542,7 +546,7 @@ fn start_rules_routed(
     let run_id = agent.ids.run_id();
     let ctx = RunContext::new_root_with_cancellation(
         run_id,
-        BudgetLimits::unbounded(),
+        agent.budget,
         agent.ids.trace_root("agent-run"),
         cancel.token(),
     );
@@ -607,7 +611,7 @@ fn start_dispatcher_routed(
     let run_id = agent.ids.run_id();
     let ctx = RunContext::new_root_with_cancellation(
         run_id,
-        BudgetLimits::unbounded(),
+        agent.budget,
         agent.ids.trace_root("agent-run"),
         cancel.token(),
     );

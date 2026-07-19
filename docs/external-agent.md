@@ -708,9 +708,11 @@ Session root
   cost-first 的非高风险工作 → cheapest;其余中间地带 → evaluator。
 - `TaskEvaluator` trait 是可插拔的第二层(LLM 版实现此 trait,留接口);`ScriptedTaskEvaluator` 供测试与
   宿主固定策略使用。
-- `Dispatcher` 组合两层并叠加预算护栏:`check_*`(`budget().snapshot()` 计算剩余额度,低于
-  `min_budget_headroom_percent`,默认 20% 时降级到 cheapest → `DispatchReason::BudgetDowngrade`)与
-  `charge_*`(每次调用 evaluator 计一个 step,代表其 LLM 成本;若该 charge 触及预算上限则同样降级)。
+- `Dispatcher` 组合两层并叠加预算护栏:若 `RunContext::budget_exhausted()` 已返回某个维度,
+  直接 `DispatchError::BudgetExhausted` 硬停止,不派任何 worker;否则用 `budget().snapshot()`
+  计算剩余额度,低于 `min_budget_headroom_percent`(默认 20%)时降级到 cheapest →
+  `DispatchReason::BudgetDowngrade`;每次调用 evaluator 计一个 step(代表其 LLM 成本),若该 charge
+  触及预算上限也返回 `BudgetExhausted`,不再降级派工。
 - 产物 `WorkerChoice::into_subagent(brief, result_schema)` 生成 `RequirementKind::NeedSubagent`,
   worker 仍由既有 `SubagentHandler` 派生驱动——dispatcher **不**引入新的 orchestration runtime。
   cheap→strong 升级与 verifier 挂点见下方「收敛(Milestone 6-4 已实现)」。

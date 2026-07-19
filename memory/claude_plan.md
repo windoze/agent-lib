@@ -1,31 +1,44 @@
-# 执行计划
+当前任务执行计划
 
-## 范围
+说明：本文件记录可检查的执行计划和进度摘要，不包含私有推理。
 
-- 以 `TODO.md` 为唯一任务排序来源，当前第一个未完成任务是 `M6-1 [TODO] drain/drive_turn 接入预算记账（M-PROM-1 核心）`。
-- 本轮只完成 M6-1；完成实现、验证、记录并提交后停止，不推进 M6-2。
-- 若发现 M6-1 被具体前置问题阻塞，则在 `TODO.md` 插入最小必要前置任务，提交后停止。
+1. 读取 `TODO.md`，按文件顺序找出第一个标题未以 `[DONE]` 开头的任务。
+2. 查看该任务的要求、依赖、验证方式和完成记录；必要时查看最新提交是否直接提到与该任务相关的未完成事项。
+3. 只围绕该任务收集代码上下文，避免无关历史问题排查。
+4. 实现该任务；如果遇到阻塞该任务的真实前置问题，在 `TODO.md` 中插入最小必要前置任务并停止。
+5. 按要求运行格式化、lint 和相关测试；若发现未安排的失败测试，修复或将其明确排入 `TODO.md`。
+6. 更新 `TODO.md`：任务完成时在标题前加 `[DONE]`，并填写完成记录；仅当阶段级计划变化时更新 `PLAN.md`。
+7. 检查工作区差异，提交本次任务相关变更，然后停止，不继续下一个任务。
 
-## 步骤
+进度：已识别第一个未完成任务为 `M6-2 [TODO] facade budget 旋钮 + dispatch 预算硬出口`。
 
-1. 检查最近提交是否明确提到与 M6-1 直接相关的未完成问题。
-2. 阅读预算上下文、drain/streamed drive、默认机器终止语义及相关文档，确定生产接线点。
-3. 实现预算记账：在 step boundary 计步，在 LLM response usage 可得处计 usage，并把超限映射到既有预算终止语义。
-4. 补充测试：小预算超限终止且会话一致；预算充足时累计记账等于各步 usage 之和。
-5. 同步预算非原子窗口选型与 effect-model/agent-layer 文档；标注审查条目中 M-PROM-1 核心部分。
-6. 运行 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、相关定向测试、全量测试和 rustdoc；如出现未排期失败，修复或排入必要前置任务。
-7. 将 `TODO.md` 的 M6-1 标记为 `[DONE]` 并写完成记录，检查 diff 后提交全部相关改动。
+当前任务执行步骤：
 
-## 进度
+1. 核对最新提交是否包含与 M6-2 直接相关的未完成前置；结果：最新提交为 `[M6-1] Wire budget accounting into drain`，与当前任务直接衔接，无需新增前置。
+2. 阅读 facade 构建/run 路径、`RunContext`/`BudgetLimits` 接线，以及 external dispatch 的预算选择逻辑。
+3. 增加 facade builder 的 `budget(BudgetLimits)` 配置入口，并确保每次 run/stream 使用配置的预算限制创建 `RunContext`。
+4. 将预算耗尽终态映射为 facade 用户可识别的结构化错误/事件，避免只暴露普通 agent error。
+5. 在 external dispatch 可用预算为 0 时返回显式预算耗尽结果，不再派 cheapest worker。
+6. 补充单元测试与文档；随后执行 `cargo fmt`、clippy、相关测试、全量测试和 rustdoc。
 
-- 已读取 `TODO.md`，确认 M6-1 是当前第一个未完成任务。
-- 已写入本轮执行计划。
-- 最近提交为 `[M5-7] Review facade commitments`，未发现提交标题中明确声明需在 M6-1 前处理的额外未完成问题。
-- 已阅读预算、drive/streamed drive、默认机器 cursor 语义：`charge_*` 只在 external/test 使用，默认 drive 尚未接线；`BudgetExceeded`/`BudgetExhausted` 仍无生产构造点。
-- 实现选型：在 `AgentMachine` trait 增加预算中断 hook；drive 在新的 LLM spend 前做 exhausted 预检，LLM 成功返回后依次 `charge_step` 与 `charge_usage`，超限时将未恢复 requirement 记为 `NeverResumed` 并让机器停在 `Done(BudgetExhausted)`。该方案保留现有 BudgetHandle 非预扣模型，并在文档中说明预检与实际 charge 之间的非原子窗口。
-- 已实现预算接线与预算中断 hook：`drain` 与流式 `drive_streamed` 都会在 LLM batch 前预检、在 LLM resolution resume 前记账；默认/external/nested machine 覆盖预算中断，默认机器会丢弃未提交 pending 并停在 `Done(BudgetExhausted)`。
-- 已补测试：预算充足时 step/usage 累计；usage 超限时 LLM response 不恢复且 requirement 记 `NeverResumed`；默认机器小 token 预算下当前未提交 turn 被丢弃；subagent shared budget 测试更新为包含 driver 自动 usage charge。
-- 定向验证已通过：`cargo fmt --all`、`cargo test -p agent-lib --lib agent::drive`。
-- 已同步文档：`docs/agent-effect-model.md`、`docs/agent-layer.md`、`docs/TESTABILITY.md`、`docs/review-2026-07.md`。
-- 完整验证已通过：`cargo clippy --all-targets -- -D warnings`、external feature clippy、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`；期间修正了集成测试/agent-testkit 中旧的手动 LLM usage charging 期望，避免与 driver-level charge 双重计费。
-- 已将 `TODO.md` 的 M6-1 标记为 `[DONE]` 并写入完成记录。下一步检查 diff/status 并提交本任务改动。
+进度更新：已完成代码初稿。
+
+- `AgentBuilder` / `AgentRestoreBuilder` 增加 `budget(BudgetLimits)`，`Agent` 持有 per-run budget 并用于普通、rules-routed、dispatcher-routed、streaming run context。
+- facade 将 `LoopDoneReason::BudgetExhausted` 映射为 `FacadeError::BudgetExhausted`。
+- `agent::external::Dispatcher` 在预算已耗尽或 evaluator step charge 超限时返回 `DispatchError::BudgetExhausted`，不再降级派 worker。
+- 已补 facade budget 测试、dispatch 硬出口测试，并同步 facade / agent-layer / external-agent / review 文档。
+
+验证结果：全部通过。
+
+- `cargo fmt --all`
+- `cargo test -p agent-lib --lib facade::`（226 条通过）
+- `cargo test -p agent-lib --lib agent::external::dispatch`（16 条通过）
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
+- `cargo test --all --all-targets`（默认离线全量通过，真实端点/CLI 测试保持 ignored）
+- `cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+
+进度更新：已将 `TODO.md` 的 M6-2 标题标记为 `[DONE]` 并填写完成记录。下一步检查工作区差异并提交本次任务。
+
+最终检查：`git diff --check` 通过；修正文档注释后已重跑 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。准备提交。

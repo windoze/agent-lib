@@ -61,6 +61,18 @@ pub enum FacadeError {
     #[error("agent loop step or tool-round limit exceeded")]
     LoopLimitExceeded,
 
+    /// The configured run budget was exhausted before the turn could complete.
+    ///
+    /// Returned when [`AgentBuilder::budget`](crate::facade::AgentBuilder::budget)
+    /// or [`AgentRestoreBuilder::budget`](crate::facade::AgentRestoreBuilder::budget)
+    /// configured a count-like run budget and the shared driver budget ledger
+    /// refused to start or resume more work. This is distinct from
+    /// [`LoopLimitExceeded`](Self::LoopLimitExceeded), which is the facade's
+    /// per-turn loop guard rather than the cross-cutting [`BudgetLimits`](crate::agent::BudgetLimits)
+    /// ledger.
+    #[error("agent run budget exhausted")]
+    BudgetExhausted,
+
     /// The model returned a tool-use block where none is allowed.
     ///
     /// The Chat facade never executes tools, so a tool-use response is a hard

@@ -23,7 +23,7 @@
 //! ([`SubagentHandler`](crate::agent::SubagentHandler)).
 
 use crate::agent::{
-    context::{RunContext, RunContextError},
+    context::{BudgetDimension, BudgetError, RunContext, RunContextError},
     external::profile::{Capability, WorkerProfile, WorkerProfileRef, WorkerProfileRegistry},
     interaction::Interaction,
     permission::PermissionRisk,
@@ -563,13 +563,14 @@ impl<E: TaskEvaluator> Dispatcher<E> {
     /// Dispatches `task` to a worker drawn from `roster`, honoring the `ctx`
     /// budget.
     ///
-    /// The decision order is: cancellation check, budget downgrade, rule route,
-    /// then evaluator fallback (charged against the budget). See
+    /// The decision order is: cancellation check, exhausted-budget hard stop,
+    /// budget downgrade, rule route, then evaluator fallback (charged against the budget). See
     /// [`DispatchReason`] for how the result is classified.
     ///
     /// # Errors
     ///
     /// Returns [`DispatchError::Context`] when the run is cancelled;
+    /// [`DispatchError::BudgetExhausted`] when the run budget has no headroom;
     /// [`DispatchError::NoCapableWorker`] when a downgrade finds no capable
     /// worker; [`DispatchError::UnknownWorker`] when the evaluator names a worker
     /// absent from the roster; and [`DispatchError::NoWorker`] when neither the
@@ -582,6 +583,10 @@ impl<E: TaskEvaluator> Dispatcher<E> {
     ) -> Result<WorkerChoice, DispatchError> {
         ctx.check_cancelled()?;
 
+        if let Some(dimension) = ctx.budget_exhausted() {
+            return Err(DispatchError::BudgetExhausted { dimension });
+        }
+
         if budget_is_low(ctx, self.min_budget_headroom_percent) {
             return self.downgrade(task, roster);
         }
@@ -591,10 +596,15 @@ impl<E: TaskEvaluator> Dispatcher<E> {
         }
 
         // The evaluator is the expensive path (an LLM call in production); charge
-        // the run for it. If that charge itself exhausts the budget, downgrade.
+        // the run for it. If that charge itself exhausts the budget, stop before
+        // dispatching any worker.
         match ctx.charge_step() {
             Ok(_) => {}
-            Err(RunContextError::Budget(_)) => return self.downgrade(task, roster),
+            Err(RunContextError::Budget(error)) => {
+                return Err(DispatchError::BudgetExhausted {
+                    dimension: budget_error_dimension(&error),
+                });
+            }
             Err(other) => return Err(DispatchError::Context(other)),
         }
 
@@ -631,6 +641,15 @@ impl<E: TaskEvaluator> Dispatcher<E> {
                 worker: worker.clone(),
             })?;
         Ok(WorkerChoice::new(worker, *entry.spec(), reason))
+    }
+}
+
+fn budget_error_dimension(error: &BudgetError) -> BudgetDimension {
+    match error {
+        BudgetError::Exceeded { dimension, .. } | BudgetError::CounterOverflow { dimension } => {
+            *dimension
+        }
+        BudgetError::WallClockExceeded { .. } => BudgetDimension::WallClock,
     }
 }
 
@@ -684,6 +703,12 @@ pub enum DispatchError {
     UnknownWorker {
         /// The unresolved worker reference.
         worker: WorkerProfileRef,
+    },
+    /// The run budget has no remaining headroom, so no worker is dispatched.
+    #[error("{dimension:?} budget exhausted; no worker dispatched")]
+    BudgetExhausted {
+        /// Dimension whose headroom was exhausted.
+        dimension: BudgetDimension,
     },
     /// A run-context operation (cancellation or budget) failed.
     #[error(transparent)]

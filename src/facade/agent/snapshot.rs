@@ -35,8 +35,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::external::{ExternalPermissionMode, ExternalRuntimeKind, ExternalSessionRef};
 use crate::agent::{
-    AgentSpec, AgentState, Blackboard, InteractionHandler, Mailbox, Plan, PlanSnapshot,
-    ToolRegistry, ToolSetRef, WorktreeRef,
+    AgentSpec, AgentState, Blackboard, BudgetLimits, InteractionHandler, Mailbox, Plan,
+    PlanSnapshot, ToolRegistry, ToolSetRef, WorktreeRef,
 };
 // Re-export the real, data-only collaboration snapshot types (M3-1) so the
 // facade snapshot surface (`AgentSnapshot::mailbox` / `blackboard`) speaks the
@@ -463,6 +463,9 @@ pub struct AgentParts {
     pub external_agents: Vec<ManagedExternalDelegate>,
     /// The delegation routing strategy configured on the agent.
     pub delegation: Delegation,
+    /// Per-run budget limits used by the facade when creating each root
+    /// [`RunContext`](crate::agent::RunContext).
+    pub budget: BudgetLimits,
     /// The last-known data-only session facts for each managed external
     /// delegate, keyed by delegate name, refreshed after every `run_full`
     /// drive. Empty until a delegation has actually driven an external runtime;
@@ -519,6 +522,7 @@ impl std::fmt::Debug for AgentParts {
                 "retained_external_sessions",
                 &self.retained_external_sessions.len(),
             )
+            .field("budget", &self.budget)
             .field("collaboration", &self.collaboration)
             .field("has_mailbox", &self.mailbox.is_some())
             .field("has_blackboard", &self.blackboard.is_some())
@@ -556,6 +560,7 @@ pub struct AgentRestoreBuilder {
     external_overrides: Vec<ManagedExternalDelegate>,
     restore_external: RestoreExternal,
     provider_extras: Option<ProviderExtras>,
+    budget: Option<BudgetLimits>,
 }
 
 impl std::fmt::Debug for AgentRestoreBuilder {
@@ -594,6 +599,7 @@ impl std::fmt::Debug for AgentRestoreBuilder {
             )
             .field("restore_external", &self.restore_external)
             .field("provider_extras", &self.provider_extras)
+            .field("budget", &self.budget)
             .finish_non_exhaustive()
     }
 }
@@ -633,6 +639,17 @@ impl AgentRestoreBuilder {
     #[must_use]
     pub fn provider_extras(mut self, provider_extras: ProviderExtras) -> Self {
         self.provider_extras = Some(provider_extras);
+        self
+    }
+
+    /// Sets the run-level budget for the restored agent.
+    ///
+    /// Snapshots are data-only and do not carry live facade run configuration, so
+    /// restored agents default to [`BudgetLimits::unbounded`] unless the host
+    /// re-supplies limits here.
+    #[must_use]
+    pub fn budget(mut self, budget: BudgetLimits) -> Self {
+        self.budget = Some(budget);
         self
     }
 
@@ -905,6 +922,7 @@ impl AgentRestoreBuilder {
             external_tool_names,
         );
         let machine = assemble_machine(state, &ids, approval.clone());
+        let budget = self.budget.unwrap_or_else(BudgetLimits::unbounded);
 
         // Re-derive the collaboration substrate from the restored topology (§14).
         // A snapshot carries no explicit `Collaboration` (§15.2), so restore
@@ -956,6 +974,7 @@ impl AgentRestoreBuilder {
             // policy above (§15.2, §15.3).
             external_agents,
             delegation: snapshot.delegation,
+            budget,
             collab,
             last_external_sessions,
         })

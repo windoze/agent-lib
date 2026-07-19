@@ -569,8 +569,9 @@ impl AgentBuilder {
   用于直接驱动下层或接管仍存活的句柄。`AgentParts` 交出:`AgentState`(持有 live `Conversation`)、
   `LlmClient`、typed tools 与逃生舱声明、共享 approval bridge 与被注入的 `InteractionHandler`、
   identity source、已注册的 local subagent 与 managed external delegates、`Delegation` 路由模式、
-  每个 external delegate 的最近一次 data-only 会话事实(`retained_external_sessions`,不含进程句柄 /
-  凭据),以及 live 协作底座(`Collaboration` config + 共享 `Mailbox` / `Blackboard` / `Plan` 句柄)。
+  run budget limits、每个 external delegate 的最近一次 data-only 会话事实
+  (`retained_external_sessions`,不含进程句柄 / 凭据),以及 live 协作底座(`Collaboration` config +
+  共享 `Mailbox` / `Blackboard` / `Plan` 句柄)。
   它**不会**静默 drop 任何仍有语义价值的字段。它是**拆解逃生舱、不是 restore API**——按原样交出
   live/owned 部件,**不**提供 `AgentParts -> Agent` 的重建 helper;持久化恢复请用 snapshot / restore。
 - **需要常规构造**用 `builder`:`Agent::builder()`(或 `Agent::worker()` 构 subagent 模板)从零装配
@@ -601,6 +602,7 @@ AgentBuilder
 Agent::builder()
     .max_steps(8)
     .max_tool_rounds(4)
+    .budget(BudgetLimits::new(None, Some(100_000), None, None))
     .tool_failure_policy(ToolFailurePolicy::ReturnErrorToModel);
 ```
 
@@ -610,9 +612,18 @@ Agent::builder()
 |---|---|
 | `max_steps` | 8 |
 | `max_tool_rounds` | 4 |
+| `budget` | `BudgetLimits::unbounded()` |
 | `tool_failure_policy` | `ReturnErrorToModel` |
 | `llm_step_mode` | non-streaming,除非调用 `stream` |
 | pending failure | cancel pending,回到上一个 committed 一致点 |
+
+`budget(...)` 是 run 级共享 ledger 配置:每次 `run` / `run_full` / `stream` 都用该
+`BudgetLimits` 创建新的根 `RunContext`,所以顶层 run 之间计数重置;同一次 run 内的 supervisor、
+subagent、managed external delegate 共享同一个 budget handle。LLM response 在回灌 machine 前扣
+step 与 usage;预算预检或 charge 超限时未回灌 requirement 以 `NeverResumed` 留痕,当前未提交 turn
+被丢弃,facade 返回 `FacadeError::BudgetExhausted`。`AgentRestoreBuilder::budget(...)` 用于恢复后
+重新注入同类运行配置;`AgentSnapshot` 是 data-only 状态快照,不携带该运行配置,未设置时恢复 agent
+默认 `BudgetLimits::unbounded()`。
 
 ## 9. Approval 与权限边界
 
@@ -1191,6 +1202,7 @@ pub enum FacadeError {
     PermissionDenied,
     UnexpectedToolUse,
     LoopLimitExceeded,
+    BudgetExhausted,
     UnhandledRequirement(Requirement),
     Delegate(DelegateError),
     ExternalSession(ExternalSessionError),
@@ -1202,6 +1214,10 @@ pub enum FacadeError {
 `LoopLimitExceeded` 的分类来自结构化状态,而不是错误消息文本:正常步数上限落在
 `LoopCursor::Done(StepLimitReached)`,恢复/错误游标路径则读取 `ErrorCursorKind`。`message`
 只作为人类可读诊断,修改措辞不影响 facade 错误类别。
+
+`BudgetExhausted` 来自 run 级 `BudgetLimits` ledger,与 loop policy 的 `LoopLimitExceeded` 分开:
+driver 观察到 `LoopCursor::Done(BudgetExhausted)` 后返回该 variant,调用方无需解析底层
+`AgentError` 文本即可识别预算耗尽。
 
 `send` / `run` 失败时默认行为建议:
 

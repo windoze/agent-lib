@@ -1445,7 +1445,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - **验证**：`cargo fmt --all`、`cargo test -p agent-lib --lib agent::drive`、`cargo test -p agent-lib --lib agent::`、`cargo test --test agent_complex_subagent`、`cargo test --test agent_effect_e2e`、`cargo test -p agent-testkit --lib subagent::tests::child_token_charge_counts_against_parent_budget`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - **兼容性**：`AgentMachine` 新增带默认实现的 public hook（API 增量）；默认 facade 仍使用 `BudgetLimits::unbounded()`，用户可配置 budget 入口未在本任务引入（M6-2）。
 
-### M6-2 [TODO] facade budget 旋钮 + dispatch 预算硬出口（M-PROM-2 budget 部分、L-9）
+### M6-2 [DONE] facade budget 旋钮 + dispatch 预算硬出口（M-PROM-2 budget 部分、L-9）
 
 上下文：
 
@@ -1462,6 +1462,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：facade 设置小预算 → run 超限终止且错误可识别；dispatch 在零预算下不派工。
 - `cargo test -p agent-lib --lib facade:: agent::external::dispatch` 全过（dispatch 部分带 external features）。
 - `docs/facade-api.md`、`docs/agent-layer.md` §1.4 同步。
+
+完成记录：
+
+- **facade budget 配置入口**：`AgentBuilder` 与 `AgentRestoreBuilder` 新增 `.budget(BudgetLimits)`；`Agent` 持有 per-run `BudgetLimits`，普通 supervisor、rules-routed、dispatcher-routed、streaming 四条 run path 创建根 `RunContext` 时都使用该配置。默认仍为 `BudgetLimits::unbounded()`，保持既有行为；每个顶层 run 新建 ledger，run 内 supervisor / subagent / managed external delegate 共享同一个 budget handle。`facade::BudgetLimits` 也重导出，方便 facade 用户就近导入。
+- **结构化 facade budget 错误**：`FacadeError` 新增 `BudgetExhausted`；`run_full` 与 `AgentRunStream` 都把 `LoopCursor::Done(BudgetExhausted)` 映射为该 variant，不再把预算终态误当成功输出或普通 agent error。新增测试 `builder_budget_limits_supervisor_run_and_leaves_agent_usable`：token budget=10、首个 response usage=18 → `FacadeError::BudgetExhausted`，状态仍可 snapshot，下一次低 usage run 成功。
+- **dispatch 硬出口（L-9）**：`Dispatcher::dispatch` 在取消检查后立即检查 `RunContext::budget_exhausted()`；任一维度无 headroom 时返回新增 `DispatchError::BudgetExhausted { dimension }`，不走 rule route、不调 evaluator、不降级 cheapest。evaluator step `charge_step()` 的预算失败也返回同一硬错误；近上限但未耗尽的预算仍保留既有 `BudgetDowngrade` 行为。
+- **测试**：dispatch 新增 `dispatcher_zero_budget_does_not_route_or_evaluate`（零 step budget 下 evaluator panic 闭包未被调用，直接 `BudgetExhausted(Steps)`）并把旧 `dispatcher_charge_failure_downgrades_to_cheapest` 改为 `dispatcher_charge_failure_stops_without_dispatching`。`cargo test -p agent-lib --lib facade::` 226 条通过；`cargo test -p agent-lib --lib agent::external::dispatch` 16 条通过。
+- **文档**：`docs/facade-api.md` 记录 `.budget(...)`、run 间 ledger 重置、run 内共享、restore 默认与 `FacadeError::BudgetExhausted`；`docs/agent-layer.md` §1.4 与 §6.3 记录 facade budget 接线和 dispatch 零预算硬停止；`docs/external-agent.md` 的 dispatcher 预算护栏描述同步；`docs/review-2026-07.md` 已将 M-PROM-1/M-PROM-2 budget 与 L-9 标注为已修复。
+- **验证**：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（默认离线全量，真实端点/CLI 测试保持 ignored，无挂起）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- **Breaking change（pre-1.0，记录在此）**：`DispatchError` 新增 `BudgetExhausted` 变体（该 enum 未标 `#[non_exhaustive]`，外部穷尽 match 需补分支）；`AgentParts` 新增 `budget: BudgetLimits` 字段（struct literal 构造点需补）。`FacadeError` 新增 `BudgetExhausted` 但该 enum 已 `#[non_exhaustive]`；builder 方法为纯增量。
 
 ### M6-3 [TODO] M6 review：预算接线收口
 

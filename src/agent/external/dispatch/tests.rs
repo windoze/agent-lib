@@ -5,7 +5,7 @@ use super::{
 use crate::agent::{
     Capability, CostTier, EscalationRules, Interaction, PermissionRisk, RequirementKind,
     WorkerProfile, WorkerProfileRef,
-    context::{BudgetLimits, RunContext, TraceNodeId},
+    context::{BudgetDimension, BudgetLimits, RunContext, TraceNodeId},
     id::{AgentId, RunId, StepId},
     requirement::AgentSpecRef,
 };
@@ -144,12 +144,13 @@ fn dispatcher_downgrades_when_budget_near_limit() {
 }
 
 #[test]
-fn dispatcher_charge_failure_downgrades_to_cheapest() {
-    let (roster, cheap, _strong) = roster();
+fn dispatcher_charge_failure_stops_without_dispatching() {
+    let (roster, _cheap, _strong) = roster();
     let dispatcher = Dispatcher::new(ScriptedTaskEvaluator::new(|task, roster| {
         roster.strongest_capable(task.task_type())
     }))
-    // Disable headroom downgrade so the flow reaches the evaluator charge.
+    // Disable near-limit downgrade so the flow reaches the evaluator charge;
+    // the fully exhausted budget must still hard-stop rather than dispatch.
     .with_budget_headroom(0);
 
     // Moderate + exploratory: the rule router declines, forcing the evaluator
@@ -164,12 +165,45 @@ fn dispatcher_charge_failure_downgrades_to_cheapest() {
     let ctx = context(BudgetLimits::new(Some(1), None, None, None));
     ctx.charge_step().expect("consume the only step");
 
-    let choice = dispatcher
+    let error = dispatcher
         .dispatch(&task, &roster, &ctx)
-        .expect("exhausted budget downgrades instead of erroring");
+        .expect_err("exhausted budget stops dispatch");
 
-    assert_eq!(choice.reason(), DispatchReason::BudgetDowngrade);
-    assert_eq!(choice.worker(), &cheap);
+    assert_eq!(
+        error,
+        DispatchError::BudgetExhausted {
+            dimension: BudgetDimension::Steps,
+        }
+    );
+}
+
+#[test]
+fn dispatcher_zero_budget_does_not_route_or_evaluate() {
+    let (roster, _cheap, _strong) = roster();
+    let dispatcher = Dispatcher::new(ScriptedTaskEvaluator::new(|_, _| {
+        panic!("evaluator must not run when budget is already exhausted")
+    }));
+
+    // This task would rule-route to the cheap worker if the hard budget guard did
+    // not run first.
+    let task = TaskDescriptor::new(
+        Capability::Shell,
+        ImpactScope::SingleFile,
+        PermissionRisk::Low,
+        Uncertainty::Clear,
+    );
+
+    let ctx = context(BudgetLimits::new(Some(0), None, None, None));
+    let error = dispatcher
+        .dispatch(&task, &roster, &ctx)
+        .expect_err("zero budget stops before routing");
+
+    assert_eq!(
+        error,
+        DispatchError::BudgetExhausted {
+            dimension: BudgetDimension::Steps,
+        }
+    );
 }
 
 #[test]
