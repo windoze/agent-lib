@@ -252,7 +252,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `cargo clippy --all-targets -- -D warnings`；`cargo test --all --all-targets`；
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 
-### M1-R [TODO] M1 review：委派交互路由收口
+### M1-R [DONE] M1 review：委派交互路由收口
 
 - 逐条核对 `docs/mag-gaps.md` A1（含关联节）的落地状态，标注 `✅`/`📄`。
 - 核对归因语义一致性：local 与 external 两条路径的归因形状、`origin=None` 的 root 语义、
@@ -262,6 +262,25 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 文档同步检查：`docs/facade-api.md`（interaction_handler 注入语义更新——从「supervisor
   唯一应答方」扩为「委派链统一应答方」）、`docs/managed-external-agent.md`（Prompt 模式
   端到端）、`docs/agent-layer.md`（如涉 scope 描述）。
+
+完成记录（2026-07-20）：
+
+- 已逐条核对 `docs/mag-gaps.md` A1 与关联 external-start approval：M1-1/M1-2/M1-3/M1-4 均已标注为
+  `✅ 已修复`；C5 也已标注为 M1-4 已修复，无需新增降级项。
+- 已核对归因语义：root `Interaction` 构造路径保持 `origin = None`；local subagent 与 external runtime
+  permission/question/choice/approval 路由均使用 `InteractionOrigin { delegate, depth }`；external-start
+  drive-layer approval 同样带 delegate/depth 归因；`PermissionRequest.actor` 仍仅表示权限主体，不被归因字段污染。
+- 已核对向后兼容：`Interaction` 的 `origin` 字段为 serde 默认/省略字段，旧 JSON 仍反序列化为 `None`；未注入
+  handler 的 local 委派仍走 worker 同步 policy/headless deny，external permission prompt 仍以明确错误失败，external-start
+  仍保留同步 fallback/headless deny。
+- 已核对文档同步：`docs/facade-api.md` 将 `interaction_handler` 语义扩展到 local 与 managed external 委派链，并说明
+  gate/answer 分工；`docs/managed-external-agent.md` 记录 `ExternalPermissionMode::Prompt` 的 parent handler 端到端路由；
+  `docs/agent-layer.md` 保持 scope pop/向上路由语义一致。
+- Breaking change：无，本 review 未改变公开 API 或行为。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  `cargo test --all --all-targets`；`cargo test --features external-acp -p agent-lib --lib facade::external`；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 
 ---
 

@@ -1,20 +1,30 @@
 # 当前执行计划
 
-说明：本文件记录可审计的执行计划和进度更新，不记录私有推理链。
+## 约束说明
 
-1. 读取 `TODO.md`，按文件顺序定位第一个标题未以 `[DONE]` 标记的任务。
-2. 查看最近提交信息，判断是否明确提到与该任务直接相关的未完成问题；如有，将其纳入当前任务或作为前置项写入 `TODO.md`。
-3. 阅读当前任务涉及的说明、代码、测试和文档，确认验收标准与依赖。
-4. 以最小正确改动实现当前任务；如遇到阻塞当前任务的规格不匹配或失败测试，先修复，或把必要前置任务插入 `TODO.md` 后停止。
-5. 运行规定验证：先 `cargo fmt --all`，再 `cargo clippy --all-targets -- -D warnings`，再按需运行相关测试或完整测试套件；若只改文档且已有可复用绿色结果，则记录跳过原因。
-6. 更新 `TODO.md`：将完成任务标题加 `[DONE]`，填写完成记录；仅在阶段计划确实改变时更新 `PLAN.md`。
-7. 检查 Git 状态和差异，提交本次任务相关所有变更。
-8. 完成一个任务后停止，不继续处理下一个任务。
+- 本文件记录可审阅的执行计划、关键决策和进度更新；不会记录不可公开的内部推理细节。
+- 本轮只处理 `TODO.md` 中第一个未完成任务，完成后提交并停止。
+- `TODO.md` 是任务排序、要求、验证和完成记录的权威来源；仅在阶段级计划变化时更新 `PLAN.md`。
 
-当前状态：已确认最近提交未留下与 `M1-4` 直接相关的未完成事项。进一步核查发现，per-delegate external start 工具会被机器审批门豁免，`ask_tool("ask_<delegate>")` 不能按原文档作为异步工具门；这直接影响本任务的降级前提。计划改为方案 (a)：当父级注入异步 `InteractionHandler` 且 external-start 策略需要 ask 时，把启动审批构造成带 delegate/depth 归因的 approval interaction 转发给父级 handler；无父级 handler 时保持现有同步 `Approval::ask` / headless deny 行为。随后新增 allow/deny 测试，更新文档与 `TODO.md` 完成记录。
+## 步骤计划
 
-进度更新：已在 `DelegationToolHandler` 的 external-start gate 中加入父级异步 handler 路由，新增 `FacadeApproval::external_start_requires_ask` 用于区分 ask tier 与 auto allow/deny；已新增 allow/deny 离线测试，并同步 `docs/mag-gaps.md`、`docs/facade-api.md`、`docs/managed-external-agent.md`。下一步运行格式化和测试验证。
+1. 读取 `TODO.md`，按标题是否带 `[DONE]` 判断第一个未完成任务。
+2. 查看最新提交摘要；如果它明确提到与当前任务直接相关的未完成问题，将其纳入当前任务或作为必要前置项记录到 `TODO.md`。
+3. 阅读当前任务相关说明和必要代码/文档，确认范围、依赖、验证要求和是否存在阻塞项。
+4. 若任务可直接完成，则实施最小正确变更；若发现必须先修复的具体前置问题，则把最少的新前置任务插入 `TODO.md`，提交后停止。
+5. 针对变更运行由任务要求和仓库规范决定的验证，顺序优先为 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、相关测试、必要时完整测试/文档构建。
+6. 若出现未被后续任务明确覆盖的测试失败，立即修复；若无法在当前任务中正确修复，则在 `TODO.md` 中加入最小前置/跟进任务并停止。
+7. 完成后将当前任务标题加上 `[DONE]`，更新其完成记录；仅当阶段级计划实际变化时修改 `PLAN.md`。
+8. 检查工作区状态和差异，确认只提交本轮相关变更；如果是恢复未提交任务状态，则按用户要求包含所有当前未提交文件。
+9. 使用包含任务编号的清晰提交信息提交变更。
+10. 停止，不处理下一个任务。
 
-验证更新：`cargo fmt --all` 通过；`cargo test -p agent-lib --lib facade::delegate` 通过；`cargo clippy --all-targets -- -D warnings` 通过；`cargo test --all --all-targets` 通过；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 初次发现公开 rustdoc 链接到 crate-private helper，已修正后重跑通过。下一步更新 `TODO.md` 完成记录并提交。
+## 当前状态
 
-进度更新：`TODO.md` 已将 `M1-4` 标记为 `[DONE]` 并写入完成记录。下一步检查 `git status`/`git diff`/最近提交，确认变更范围后提交。
+- 已创建本计划文件。
+- 已读取 `TODO.md`，第一个未完成任务为 `M1-R [TODO] M1 review：委派交互路由收口`。
+- 最新提交为 `89823ae [M1-4] Route external start approvals`，未明确提到需先处理的未完成问题。
+- 已核对 M1-R 指定的 A1 状态、归因语义、向后兼容和文档同步情况；未发现需要新增前置任务的阻塞项。
+- 已按 M1-R 要求运行全量门禁验证，全部通过。
+- 已将 `TODO.md` 中 M1-R 标题改为 `[DONE]` 并补充完成记录。
+- 下一步：检查工作区差异，确认只包含本轮相关变更，然后提交。
