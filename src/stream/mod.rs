@@ -141,7 +141,15 @@ pub enum StreamEvent {
         /// Complete parsed JSON input for the tool invocation.
         input: Value,
     },
-    /// Reports an intermediate or final token-usage update.
+    /// Reports one additive token-usage segment.
+    ///
+    /// Every `Usage` event is an increment to merge into the response total,
+    /// never a replacement for earlier usage. Adapters that receive cumulative
+    /// provider snapshots must first convert them into non-negative deltas;
+    /// adapters that only receive terminal usage emit one segment containing
+    /// the whole response usage. Direct stream consumers should aggregate these
+    /// events with [`Usage::merge`](crate::model::usage::Usage::merge), or use
+    /// [`accumulator::collect`].
     ///
     /// Corresponds to usage carried by Vercel v5's `finish-step` and `finish`
     /// message-control parts.

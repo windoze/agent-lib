@@ -5,6 +5,24 @@ use crate::model::{content::ContentBlock, normalized::StopReason};
 use serde_json::{Map, Value, json};
 
 #[tokio::test]
+async fn usage_events_are_additive_segments_matching_accumulated_usage() {
+    let events = decode_fixture(REAL_TEXT_STREAM)
+        .await
+        .expect("decode recorded text stream");
+    let folded = fold_events(&events).expect("fold recorded text events");
+    let usage_event_count = events
+        .iter()
+        .filter(|event| matches!(event, StreamEvent::Usage(_)))
+        .count();
+
+    assert!(
+        usage_event_count > 1,
+        "Anthropic fixture should exercise cumulative snapshots converted to deltas"
+    );
+    assert_eq!(aggregate_usage_events(&events), folded.usage);
+}
+
+#[tokio::test]
 async fn real_text_sse_maps_events_and_matches_complete_response_shape() {
     let events = decode_fixture(REAL_TEXT_STREAM)
         .await

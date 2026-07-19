@@ -5,6 +5,24 @@ use crate::model::normalized::{Normalized, StopReason};
 use serde_json::{Map, json};
 
 #[tokio::test]
+async fn usage_events_are_additive_segments_matching_accumulated_usage() {
+    let events = decode_fixture(REAL_TEXT_STREAM)
+        .await
+        .expect("decode recorded text stream");
+    let folded = fold_events(&events).expect("fold recorded text events");
+    let usage_event_count = events
+        .iter()
+        .filter(|event| matches!(event, StreamEvent::Usage(_)))
+        .count();
+
+    assert_eq!(
+        usage_event_count, 1,
+        "OpenAI fixture should exercise terminal usage emitted as one additive segment"
+    );
+    assert_eq!(aggregate_usage_events(&events), folded.usage);
+}
+
+#[tokio::test]
 async fn recorded_text_stream_maps_stable_blocks_usage_and_azure_metadata() {
     let events = decode_fixture(REAL_TEXT_STREAM)
         .await

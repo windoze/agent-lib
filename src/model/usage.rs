@@ -3,7 +3,7 @@
 use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
 use serde_json::{Map, Value};
 
-/// Provider-neutral token accounting for one model response or stream segment.
+/// Provider-neutral token accounting for one model response or additive stream segment.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
     /// Non-cached input tokens reported for the request.
@@ -31,6 +31,10 @@ pub struct Usage {
 
 impl Usage {
     /// Adds another usage record into this one for stream aggregation.
+    ///
+    /// Streaming adapters emit [`StreamEvent::Usage`](crate::stream::StreamEvent::Usage)
+    /// values as additive segments. Folding them with `merge` must therefore
+    /// produce the same final usage as the complete response.
     ///
     /// Token columns saturate at [`u32::MAX`] instead of panicking: usage
     /// counts originate from untrusted provider wire data, and a forged or

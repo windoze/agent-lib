@@ -1517,7 +1517,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo test -p agent-lib --lib client::error`（12 条全过）、`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（默认离线全量，真实端点/CLI 测试保持 ignored，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - 无 breaking change（仅错误分类行为修正；公共类型与签名不变）。
 
-### M7-2 [TODO] `StreamEvent::Usage` 语义契约文档化并断言（M-ADP-1）
+### M7-2 [DONE] `StreamEvent::Usage` 语义契约文档化并断言（M-ADP-1）
 
 上下文：
 
@@ -1532,6 +1532,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：两个 adapter 的 cassette/fixture 流，按文档语义消费得到与 `collect` 相同的最终 usage。
 - `cargo test -p agent-lib --lib adapter:: stream::` 全过。
+
+完成记录：
+
+- 选型：统一并文档化为**所有 `StreamEvent::Usage` 均是可累加增量段**。Anthropic 已把 provider 累计 usage 快照转为相对上一快照的非负增量；OpenAI Responses 当前只在终态发一次完整 usage，该事件作为覆盖整条响应的单个增量段，同样满足契约。直接消费流的上层应逐条 `Usage::merge`，不应把后续 usage 当作替换值。
+- 文档：`src/stream/mod.rs` 的 `StreamEvent::Usage` rustdoc 写明增量语义、provider 累计快照转 delta 的 adapter 责任，以及推荐用 `Usage::merge` 或 `stream::accumulator::collect` 消费；`src/model/usage.rs` 的 `Usage::merge` rustdoc 同步说明流式 usage segment 折叠必须等于完整响应 usage；`docs/review-2026-07.md` M-ADP-1 已标注 `✅ 已修复（M7-2）`。
+- 测试：两个 adapter 的 stream fixture 各新增 `usage_events_are_additive_segments_matching_accumulated_usage`。Anthropic 断言真实 text stream 含多条 usage 事件（覆盖累计快照转增量）且直接 merge usage 事件等于 accumulator 最终 usage；OpenAI 断言真实 text stream 的终态 usage 作为单个增量段，直接 merge 后同样等于 accumulator 最终 usage。
+- 验证：`cargo test -p agent-lib --lib adapter::`（79 条通过）、`cargo test -p agent-lib --lib stream::`（53 条通过）、`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。rustdoc 首次发现一个冗余显式 intra-doc link，已按建议收紧后重跑通过。
+- 无 breaking change（公共类型与 wire 形状不变；本任务仅明确既有语义并补回归断言）。
 
 ### M7-3 [TODO] openai_resp `sequence_number` 校验对兼容端点降级（M-ADP-2）
 

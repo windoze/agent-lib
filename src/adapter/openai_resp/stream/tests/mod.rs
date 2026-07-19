@@ -61,6 +61,17 @@ fn fold_events(events: &[StreamEvent]) -> Result<Response, AccumulatorError> {
     accumulator.finish()
 }
 
+/// Aggregates usage exactly as direct stream consumers are expected to.
+fn aggregate_usage_events(events: &[StreamEvent]) -> Usage {
+    let mut usage = Usage::default();
+    for event in events {
+        if let StreamEvent::Usage(segment) = event {
+            usage.merge(segment.clone());
+        }
+    }
+    usage
+}
+
 /// Parses the complete response embedded in a fixture's terminal event.
 fn parse_terminal_response(fixture: &str) -> Response {
     let response = fixture
