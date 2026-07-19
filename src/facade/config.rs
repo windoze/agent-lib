@@ -405,5 +405,29 @@ impl ModelConfig {
     }
 }
 
+/// Verifies builder-level provider extras target the configured provider.
+///
+/// A builder that only receives an injected client has no reliable provider id:
+/// [`crate::client::Capability`] describes features, not wire protocol. In that
+/// escape-hatch case this helper leaves the extras untouched so the injected
+/// client can decide how to handle them.
+pub(crate) fn ensure_provider_extras_match_provider(
+    builder: &str,
+    provider: Option<ProviderId>,
+    provider_extras: &ProviderExtras,
+) -> Result<(), FacadeError> {
+    let Some(provider) = provider else {
+        return Ok(());
+    };
+    if provider_extras.provider == provider {
+        return Ok(());
+    }
+
+    Err(FacadeError::Config(format!(
+        "{builder} provider_extras target {:?}, but provider is {:?}",
+        provider_extras.provider, provider
+    )))
+}
+
 #[cfg(test)]
 mod tests;

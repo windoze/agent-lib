@@ -1343,7 +1343,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - **验证**：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test -p agent-lib --lib facade::agent`（55 条全过）、`cargo test -p agent-lib --lib facade::`（215 条全过）、`cargo test --all --all-targets`（exit 0，默认离线全量套件全过，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - 无 breaking change（新增 API 纯增量；既有 `run` / `run_full` / `stream` 签名与默认行为保持兼容，取消语义只是新增可达控制面）。M-PROM-2 的 budget 旋钮与预算硬出口不在本任务范围，仍按 TODO 顺序由 M6-2 处理。
 
-### M5-5 [TODO] builder 暴露 `provider_extras`（M-PROM-6）
+### M5-5 [DONE] builder 暴露 `provider_extras`（M-PROM-6）
 
 上下文：
 
@@ -1358,6 +1358,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：builder 设置 extras 后，fake client 收到的 `ChatRequest.provider_extras` 与设置一致。
 - `cargo test -p agent-lib --lib facade::` 全过；`docs/facade-api.md` §7.1 附近同步。
+
+完成记录：
+
+- `ChatBuilder`、`AgentBuilder`、`AgentWorkerBuilder`、`AgentRestoreBuilder` 均新增 `.provider_extras(...)`；Chat 与 Agent 构建路径通过既有 `ModelConfig` 贯通到 `ChatRequest.provider_extras`，worker 显式 pin model 路径通过 `ModelRef` 贯通，restore 路径在恢复 `AgentState` 后覆盖当前有效模型的 provider extras，下一次请求可见。
+- provider 绑定校验：新增 `facade::config::ensure_provider_extras_match_provider`。当 builder 设置了 `ProviderConfig` 时，`ProviderExtras.provider` 必须一致，否则 `build()` 返回 `FacadeError::Config`；纯 `.client(...)` 注入路径无法从 `Capability` 可靠推断 wire provider，按逃生舱语义原样透传给注入 client。继承模型的 worker 继承 supervisor 完整模型配置（含 extras），设置 worker-local extras 但不显式 `.model(...)` 时拒绝而非静默忽略；`inherit_model()` 会清掉先前 worker-local extras。
+- 同类修复：`Agent::supervisor_model()` 改读 `state.current_model()` 而非静态 `spec().model()`，确保 restore 覆盖或既有 reconfig 后的有效模型配置可被继承模型的子 agent 使用。
+- 测试：新增/更新 `builder_provider_extras_reach_chat_request`、`builder_provider_extras_reach_supervisor_request`、`restore_builder_provider_extras_reach_restored_request`、Chat/Agent/restore 三条 provider mismatch 拒绝测试，以及 worker 显式模型 extras 与继承模型拒绝测试；fake client 均断言收到的 `ChatRequest.provider_extras` 与设置一致。
+- 文档：`docs/facade-api.md` §4.2 补充 builder `.provider_extras(...)` 短写、provider 一致性校验、注入 client 逃生舱边界与 worker 继承语义；`docs/review-2026-07.md` M-PROM-6 已标注 `✅ 已修复（M5-5）`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test -p agent-lib --lib facade::`（222 条通过）、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 无 breaking change（新增 builder API 纯增量；默认 provider_extras 仍为 `None`，既有构建路径行为保持兼容）。
 
 ### M5-6 [TODO] restore 路径补齐 build 同级校验（M-ADP-5）
 

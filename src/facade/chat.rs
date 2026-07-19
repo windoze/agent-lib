@@ -32,10 +32,11 @@ use crate::conversation::{
     AssistantFinish, CancelDisposition, Conversation, ConversationConfig, ConversationSnapshot,
     TurnMeta,
 };
-use crate::facade::config::{ModelConfig, ProviderConfig};
+use crate::facade::config::{ModelConfig, ProviderConfig, ensure_provider_extras_match_provider};
 use crate::facade::error::FacadeError;
 use crate::facade::ids::FacadeIds;
 use crate::facade::run::{IntoUserMessage, Reply, RunOutput};
+use crate::model::extras::ProviderExtras;
 
 mod stream;
 
@@ -251,6 +252,7 @@ pub struct ChatBuilder {
     system: Option<String>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    provider_extras: Option<ProviderExtras>,
     ids: Option<FacadeIds>,
 }
 
@@ -311,6 +313,18 @@ impl ChatBuilder {
         self
     }
 
+    /// Sets provider-specific request fields for every generated request.
+    ///
+    /// When this builder also has a [`provider`](Self::provider), the extras'
+    /// [`ProviderId`](crate::model::extras::ProviderId) must match that provider.
+    /// Builders that use only an injected [`client`](Self::client) cannot infer a
+    /// provider id and pass the extras through to the injected client unchanged.
+    #[must_use]
+    pub fn provider_extras(mut self, provider_extras: ProviderExtras) -> Self {
+        self.provider_extras = Some(provider_extras);
+        self
+    }
+
     /// Overrides the built-in identity source (mainly for deterministic tests).
     #[must_use]
     pub fn ids(mut self, ids: FacadeIds) -> Self {
@@ -335,6 +349,16 @@ impl ChatBuilder {
         }
         if let Some(temperature) = self.temperature {
             model = model.temperature(temperature);
+        }
+        if let Some(provider_extras) = &self.provider_extras {
+            ensure_provider_extras_match_provider(
+                "chat",
+                self.provider.as_ref().map(ProviderConfig::provider),
+                provider_extras,
+            )?;
+        }
+        if let Some(provider_extras) = self.provider_extras {
+            model = model.provider_extras(provider_extras);
         }
 
         let client = match (self.client, self.provider) {

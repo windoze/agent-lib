@@ -22,14 +22,18 @@ use crate::agent::{
     AgentError, ApprovalResponse, ErrorCursor, ErrorCursorKind, Interaction, InteractionHandler,
     InteractionKind, InteractionResponse, RequirementResult, RunContext,
 };
-use crate::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
+use crate::client::{
+    AuthScheme, Capability, ChatRequest, ClientError, EndpointConfig, LlmClient, Response,
+};
 use crate::facade::approval::{Approval, ApprovalDecision, ApprovalPolicy};
 use crate::facade::collab::Collaboration;
+use crate::facade::config::ProviderConfig;
 use crate::facade::delegate::Delegation;
 use crate::facade::error::FacadeError;
 use crate::facade::run::{RunEvent, RunOutput};
 use crate::facade::tool::{Tool, ToolContext};
 use crate::model::content::ContentBlock;
+use crate::model::extras::{ProviderExtras, ProviderId};
 use crate::model::message::{Message, Role};
 use crate::model::normalized::{Normalized, StopReason};
 use crate::model::usage::Usage;
@@ -41,6 +45,7 @@ use crate::stream::{BlockId, BlockKind, Delta, StreamEvent};
 struct ScriptedClient {
     responses: Vec<Response>,
     calls: Mutex<usize>,
+    requests: Mutex<Vec<ChatRequest>>,
 }
 
 impl ScriptedClient {
@@ -48,11 +53,16 @@ impl ScriptedClient {
         Arc::new(Self {
             responses,
             calls: Mutex::new(0),
+            requests: Mutex::new(Vec::new()),
         })
     }
 
     fn call_count(&self) -> usize {
         *self.calls.lock().expect("calls mutex")
+    }
+
+    fn requests(&self) -> Vec<ChatRequest> {
+        self.requests.lock().expect("requests mutex").clone()
     }
 }
 
@@ -62,7 +72,8 @@ impl LlmClient for ScriptedClient {
         &crate::client::ANTHROPIC_DEFAULT_CAPABILITY
     }
 
-    async fn chat(&self, _request: ChatRequest) -> Result<Response, ClientError> {
+    async fn chat(&self, request: ChatRequest) -> Result<Response, ClientError> {
+        self.requests.lock().expect("requests mutex").push(request);
         let mut calls = self.calls.lock().expect("calls mutex");
         let index = (*calls).min(self.responses.len() - 1);
         *calls += 1;
@@ -97,6 +108,25 @@ fn text_response(text: &str) -> Response {
         stop_reason: StopReason::normalize("end_turn"),
         extra: Map::new(),
     }
+}
+
+fn provider_extras(provider: ProviderId) -> ProviderExtras {
+    ProviderExtras {
+        provider,
+        fields: Map::from_iter([("reasoning".to_owned(), json!({ "effort": "high" }))]),
+    }
+}
+
+fn provider_config(provider: ProviderId) -> ProviderConfig {
+    ProviderConfig::custom(
+        EndpointConfig {
+            base_url: "https://example.invalid".to_owned(),
+            auth: AuthScheme::None,
+            query_params: Vec::new(),
+            extra_headers: Vec::new(),
+        },
+        provider,
+    )
 }
 
 /// Builds an assistant response that asks to call `get_weather`, carrying the
@@ -222,6 +252,37 @@ async fn run_completes_a_tool_round_trip() {
         2,
         "one tool-use step plus one final step"
     );
+}
+
+#[tokio::test]
+async fn builder_provider_extras_reach_supervisor_request() {
+    let client = ScriptedClient::new(vec![text_response("done")]);
+    let extras = provider_extras(ProviderId::Anthropic);
+    let mut agent = AgentBuilder::default()
+        .client(client.clone())
+        .model("claude-test")
+        .provider_extras(extras.clone())
+        .build()
+        .expect("build agent");
+
+    agent.run("hello").await.expect("run succeeds");
+
+    assert_eq!(client.requests()[0].provider_extras, Some(extras));
+}
+
+#[test]
+fn builder_rejects_provider_extras_for_different_provider() {
+    let error = AgentBuilder::default()
+        .provider(provider_config(ProviderId::OpenAiResp))
+        .model("gpt-test")
+        .provider_extras(provider_extras(ProviderId::Anthropic))
+        .build()
+        .expect_err("provider mismatch is rejected");
+
+    let FacadeError::Config(message) = error else {
+        panic!("expected config error")
+    };
+    assert!(message.contains("provider_extras"));
 }
 
 #[tokio::test]
@@ -1042,6 +1103,53 @@ async fn snapshot_then_restore_continues_history() {
         2,
         "a run after restore appends to the restored history"
     );
+}
+
+#[tokio::test]
+async fn restore_builder_provider_extras_reach_restored_request() {
+    let base_client = ScriptedClient::new(vec![text_response("First.")]);
+    let mut agent = AgentBuilder::default()
+        .client(base_client)
+        .model("claude-test")
+        .build()
+        .expect("build agent");
+    agent.run("one").await.expect("first run");
+    let snapshot = agent.snapshot().expect("snapshot at a committed point");
+
+    let restore_client = ScriptedClient::new(vec![text_response("Second.")]);
+    let extras = provider_extras(ProviderId::Anthropic);
+    let mut restored = Agent::restore()
+        .snapshot(snapshot)
+        .client(restore_client.clone())
+        .provider_extras(extras.clone())
+        .build()
+        .expect("restore agent");
+
+    restored.run("two").await.expect("restored run");
+
+    assert_eq!(restore_client.requests()[0].provider_extras, Some(extras));
+}
+
+#[test]
+fn restore_builder_rejects_provider_extras_for_different_provider() {
+    let agent = AgentBuilder::default()
+        .client(ScriptedClient::new(vec![text_response("x")]))
+        .model("gpt-test")
+        .build()
+        .expect("build agent");
+    let snapshot = agent.snapshot().expect("snapshot");
+
+    let error = Agent::restore()
+        .snapshot(snapshot)
+        .provider(provider_config(ProviderId::OpenAiResp))
+        .provider_extras(provider_extras(ProviderId::Anthropic))
+        .build()
+        .expect_err("provider mismatch is rejected");
+
+    let FacadeError::Config(message) = error else {
+        panic!("expected config error")
+    };
+    assert!(message.contains("provider_extras"));
 }
 
 #[tokio::test]

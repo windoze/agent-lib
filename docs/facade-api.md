@@ -161,7 +161,8 @@ let custom = ProviderConfig::custom(endpoint_config, ProviderId::Anthropic);
 ```rust
 let model = ModelConfig::new("gpt-5.5")
     .max_tokens(1024)
-    .temperature(0.2);
+    .temperature(0.2)
+    .provider_extras(provider_extras);
 ```
 
 Builder 上保留短写:
@@ -170,8 +171,17 @@ Builder 上保留短写:
 Agent::builder()
     .model("gpt-5.5")
     .max_tokens(1024)
-    .temperature(0.2);
+    .temperature(0.2)
+    .provider_extras(provider_extras);
 ```
+
+`provider_extras` 使用现有 `ProviderExtras`，必须显式绑定目标 `ProviderId`。`ChatBuilder`、
+`AgentBuilder`、`AgentWorkerBuilder`（仅显式 pin model 的 worker）与 `AgentRestoreBuilder` 都暴露
+`.provider_extras(...)` 短写，并通过 `ModelConfig` / `ModelRef` 贯通到最终 `ChatRequest.provider_extras`。
+当 builder 同时设置了 `ProviderConfig` 时，extras 的 `provider` 必须与该 provider 一致，否则 build
+返回 `FacadeError::Config`；纯 `.client(...)` 注入路径无法从 `Capability` 可靠推断 wire provider，
+因此保留逃生舱语义，把 extras 原样交给注入的 client。继承模型的 worker 继承 supervisor 的完整
+model config（含 extras），不能额外设置 worker-local extras。
 
 `ModelConfig` 应能转成 agent 层已有 `ModelRef`,也应能构造 Client 层 `ChatRequest` 的公共字段。
 

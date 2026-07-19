@@ -61,7 +61,7 @@ use crate::conversation::{Conversation, ConversationConfig};
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval, enriched_approval_request};
 use crate::facade::chat::client_for_provider;
 use crate::facade::collab::{CollabBridge, CollabState, Collaboration, resolve};
-use crate::facade::config::{ModelConfig, ProviderConfig};
+use crate::facade::config::{ModelConfig, ProviderConfig, ensure_provider_extras_match_provider};
 use crate::facade::delegate::{
     AgentWorkerBuilder, DISPATCHER_ESCALATE_MARKER, Delegation, DelegationRecorder,
     DelegationRoute, DelegationToolHandler, DispatcherConfig, LocalSubagent, RecordedDelegation,
@@ -81,6 +81,7 @@ use crate::facade::tool::{
     ensure_unique_tool_names,
 };
 use crate::model::content::ContentBlock;
+use crate::model::extras::ProviderExtras;
 use crate::model::message::Message;
 use crate::model::tool::Tool as ToolDecl;
 
@@ -663,10 +664,10 @@ impl Agent {
         CollabBridge::from_state(&self.collab)
     }
 
-    /// Returns the supervisor's own model, substituted into any inheriting child
-    /// spec when a delegation is fulfilled (R4).
+    /// Returns the supervisor's effective model, substituted into any inheriting
+    /// child spec when a delegation is fulfilled (R4).
     fn supervisor_model(&self) -> ModelRef {
-        self.machine.state().spec().model().clone()
+        self.machine.state().current_model().clone()
     }
 
     /// Resolves the [`InteractionHandler`] a drive scope answers paused
@@ -1047,6 +1048,7 @@ pub struct AgentBuilder {
     model: Option<String>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    provider_extras: Option<ProviderExtras>,
     system: Option<String>,
     tools: Vec<Tool>,
     custom_registry: Option<Arc<dyn ToolRegistry>>,
@@ -1074,6 +1076,7 @@ impl std::fmt::Debug for AgentBuilder {
             .field("model", &self.model)
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
+            .field("provider_extras", &self.provider_extras)
             .field("system", &self.system)
             .field(
                 "tools",
@@ -1151,6 +1154,18 @@ impl AgentBuilder {
     #[must_use]
     pub fn temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+
+    /// Sets provider-specific request fields for every supervisor LLM request.
+    ///
+    /// When this builder also has a [`provider`](Self::provider), the extras'
+    /// [`ProviderId`](crate::model::extras::ProviderId) must match that provider.
+    /// Builders that use only an injected [`client`](Self::client) cannot infer a
+    /// provider id and pass the extras through to the injected client unchanged.
+    #[must_use]
+    pub fn provider_extras(mut self, provider_extras: ProviderExtras) -> Self {
+        self.provider_extras = Some(provider_extras);
         self
     }
 
@@ -1392,6 +1407,13 @@ impl AgentBuilder {
         let model_name = self.model.ok_or_else(|| {
             FacadeError::Config("agent configuration is missing a `model`".to_owned())
         })?;
+        if let Some(provider_extras) = &self.provider_extras {
+            ensure_provider_extras_match_provider(
+                "agent",
+                self.provider.as_ref().map(ProviderConfig::provider),
+                provider_extras,
+            )?;
+        }
         let client = match (self.client, self.provider) {
             (Some(client), _) => client,
             (None, Some(provider)) => client_for_provider(provider),
@@ -1415,6 +1437,9 @@ impl AgentBuilder {
         }
         if let Some(temperature) = self.temperature {
             model = model.temperature(temperature);
+        }
+        if let Some(provider_extras) = self.provider_extras {
+            model = model.provider_extras(provider_extras);
         }
 
         let ids = self.ids.unwrap_or_default();

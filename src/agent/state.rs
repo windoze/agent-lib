@@ -16,7 +16,7 @@ mod tests;
 use crate::{
     agent::{AgentId, AgentPath, AgentSpec, LoopPolicy, ModelRef, SkillId, ToolSetId, ToolSetRef},
     conversation::{Conversation, ConversationError, ConversationSnapshot, ToolCallId},
-    model::{message::Role, tool::Tool},
+    model::{extras::ProviderExtras, message::Role, tool::Tool},
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser};
 use std::collections::BTreeSet;
@@ -131,6 +131,17 @@ impl AgentState {
     #[must_use]
     pub const fn current_model(&self) -> &ModelRef {
         &self.current_model
+    }
+
+    /// Overrides provider-specific request extras on the effective model.
+    ///
+    /// Restore builders use this to re-bind a data-only snapshot to runtime
+    /// provider settings without changing the restored conversation or tools.
+    pub(crate) fn override_current_provider_extras(&mut self, provider_extras: ProviderExtras) {
+        self.current_model = self
+            .current_model
+            .clone()
+            .with_provider_extras(provider_extras);
     }
 
     /// Returns the currently effective loop policy.

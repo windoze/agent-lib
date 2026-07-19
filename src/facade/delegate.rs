@@ -79,6 +79,7 @@ use crate::facade::ids::FacadeIds;
 use crate::facade::run::{ArtifactRef, DelegationStatus, DelegationTrace};
 use crate::facade::tool::{FacadeToolRegistry, ToolContextParts};
 use crate::model::content::ContentBlock;
+use crate::model::extras::ProviderExtras;
 use crate::model::message::{Message, Role};
 use crate::model::tool::Tool as ToolDecl;
 use crate::model::tool::{ToolCall, ToolResponse, ToolStatus};
@@ -216,6 +217,7 @@ pub struct AgentWorkerBuilder {
     inherit_model: bool,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    provider_extras: Option<ProviderExtras>,
     system: Option<String>,
     approval: Option<ApprovalPolicy>,
     extra_declarations: Vec<ToolDecl>,
@@ -253,6 +255,7 @@ impl AgentWorkerBuilder {
     pub fn inherit_model(mut self) -> Self {
         self.inherit_model = true;
         self.model = None;
+        self.provider_extras = None;
         self
     }
 
@@ -273,6 +276,17 @@ impl AgentWorkerBuilder {
     #[must_use]
     pub fn temperature(mut self, temperature: f32) -> Self {
         self.temperature = Some(temperature);
+        self
+    }
+
+    /// Sets provider-specific request fields for an explicitly pinned worker model.
+    ///
+    /// Inheriting workers use the supervisor's model configuration wholesale,
+    /// including its provider extras. Calling this without an explicit
+    /// [`model`](Self::model) is rejected at build time instead of being ignored.
+    #[must_use]
+    pub fn provider_extras(mut self, provider_extras: ProviderExtras) -> Self {
+        self.provider_extras = Some(provider_extras);
         self
     }
 
@@ -360,6 +374,12 @@ impl AgentWorkerBuilder {
         // An inheriting worker cannot know the supervisor model yet, so its spec
         // records a placeholder that the delegation fulfillment substitutes.
         let model_ref = if inherit_model {
+            if self.provider_extras.is_some() {
+                return Err(FacadeError::Config(
+                    "worker provider_extras require an explicit `model`; inherited workers use the supervisor model extras"
+                        .to_owned(),
+                ));
+            }
             ModelRef::new(
                 INHERITED_MODEL_PLACEHOLDER,
                 nonzero_default_tokens(),
@@ -377,6 +397,9 @@ impl AgentWorkerBuilder {
             }
             if let Some(temperature) = self.temperature {
                 model = model.temperature(temperature);
+            }
+            if let Some(provider_extras) = self.provider_extras {
+                model = model.provider_extras(provider_extras);
             }
             model.to_model_ref()
         };
@@ -1974,9 +1997,11 @@ fn delegation_response(call: &ToolCall, summary: &str) -> ToolResponse {
 mod tests {
     use super::{AgentWorkerBuilder, INHERITED_MODEL_PLACEHOLDER, LocalSubagent};
     use crate::facade::approval::Approval;
+    use crate::facade::error::FacadeError;
     use crate::facade::ids::FacadeIds;
+    use crate::model::extras::{ProviderExtras, ProviderId};
     use crate::model::tool::Tool as ToolDecl;
-    use serde_json::json;
+    use serde_json::{Map, json};
 
     fn worker() -> AgentWorkerBuilder {
         AgentWorkerBuilder::default()
@@ -1990,12 +2015,21 @@ mod tests {
         }
     }
 
+    fn provider_extras() -> ProviderExtras {
+        ProviderExtras {
+            provider: ProviderId::Anthropic,
+            fields: Map::from_iter([("top_k".to_owned(), json!(25))]),
+        }
+    }
+
     #[test]
     fn explicit_model_worker_is_data_only_and_not_inheriting() {
+        let extras = provider_extras();
         let sub = worker()
             .description("Strict reviewer")
             .model("gpt-5.5")
             .temperature(0.1)
+            .provider_extras(extras.clone())
             .system("You review code.")
             .build()
             .expect("worker builds");
@@ -2005,6 +2039,7 @@ mod tests {
         assert!(!sub.inherits_model());
         assert_eq!(sub.spec().model().model(), "gpt-5.5");
         assert_eq!(sub.spec().model().temperature(), Some(0.1));
+        assert_eq!(sub.spec().model().provider_extras(), Some(&extras));
         assert_eq!(sub.spec().system_prompt(), Some("You review code."));
         assert!(sub.tools().tools().is_empty());
 
@@ -2043,6 +2078,19 @@ mod tests {
             inherited.spec().model().model(),
             INHERITED_MODEL_PLACEHOLDER
         );
+    }
+
+    #[test]
+    fn inherited_worker_rejects_provider_extras_without_explicit_model() {
+        let error = worker()
+            .provider_extras(provider_extras())
+            .build()
+            .expect_err("inherited model has no worker-local provider extras slot");
+
+        let FacadeError::Config(message) = error else {
+            panic!("expected config error")
+        };
+        assert!(message.contains("provider_extras"));
     }
 
     #[test]

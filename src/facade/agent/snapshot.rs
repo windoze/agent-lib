@@ -48,7 +48,7 @@ use crate::conversation::{Conversation, ConversationSnapshot};
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval};
 use crate::facade::chat::client_for_provider;
 use crate::facade::collab::{CollabState, Collaboration, resolve};
-use crate::facade::config::ProviderConfig;
+use crate::facade::config::{ProviderConfig, ensure_provider_extras_match_provider};
 use crate::facade::delegate::{Delegation, LocalSubagent};
 use crate::facade::error::FacadeError;
 use crate::facade::external::{
@@ -58,6 +58,7 @@ use crate::facade::external::{
 use crate::facade::ids::FacadeIds;
 use crate::facade::run::ArtifactRef;
 use crate::facade::tool::{Tool, ensure_unique_tool_names};
+use crate::model::extras::ProviderExtras;
 use crate::model::tool::Tool as ToolDecl;
 
 use super::{Agent, assemble_machine, build_facade_approval};
@@ -554,6 +555,7 @@ pub struct AgentRestoreBuilder {
     subagent_overrides: Vec<LocalSubagent>,
     external_overrides: Vec<ManagedExternalDelegate>,
     restore_external: RestoreExternal,
+    provider_extras: Option<ProviderExtras>,
 }
 
 impl std::fmt::Debug for AgentRestoreBuilder {
@@ -591,6 +593,7 @@ impl std::fmt::Debug for AgentRestoreBuilder {
                     .collect::<Vec<_>>(),
             )
             .field("restore_external", &self.restore_external)
+            .field("provider_extras", &self.provider_extras)
             .finish_non_exhaustive()
     }
 }
@@ -618,6 +621,18 @@ impl AgentRestoreBuilder {
     #[must_use]
     pub fn client(mut self, client: Arc<dyn LlmClient>) -> Self {
         self.client = Some(client);
+        self
+    }
+
+    /// Overrides provider-specific request fields on the restored current model.
+    ///
+    /// When this builder also has a [`provider`](Self::provider), the extras'
+    /// [`ProviderId`](crate::model::extras::ProviderId) must match that provider.
+    /// Builders that use only an injected [`client`](Self::client) cannot infer a
+    /// provider id and pass the extras through to the injected client unchanged.
+    #[must_use]
+    pub fn provider_extras(mut self, provider_extras: ProviderExtras) -> Self {
+        self.provider_extras = Some(provider_extras);
         self
     }
 
@@ -759,6 +774,14 @@ impl AgentRestoreBuilder {
         let snapshot = self
             .snapshot
             .ok_or_else(|| FacadeError::Config("agent restore requires a `snapshot`".to_owned()))?;
+        let provider_extras = self.provider_extras;
+        if let Some(provider_extras) = &provider_extras {
+            ensure_provider_extras_match_provider(
+                "agent restore",
+                self.provider.as_ref().map(ProviderConfig::provider),
+                provider_extras,
+            )?;
+        }
         let client = match (self.client, self.provider) {
             (Some(client), _) => client,
             (None, Some(provider)) => client_for_provider(provider),
@@ -775,10 +798,14 @@ impl AgentRestoreBuilder {
             self.custom_registry.as_ref(),
         )?;
 
-        // The restored state is authoritative: it preserves the spec, active
-        // declarations, model, loop policy, and loop cursor of the snapshotted
-        // agent, so a restored run resumes exactly where the snapshot left off.
-        let state = snapshot.agent_state.into_state()?;
+        // The restored state is otherwise authoritative: it preserves the spec,
+        // active declarations, loop policy, and loop cursor of the snapshotted
+        // agent. A caller-supplied provider_extras override only re-binds the
+        // current model's provider-specific request fields for future requests.
+        let mut state = snapshot.agent_state.into_state()?;
+        if let Some(provider_extras) = provider_extras {
+            state.override_current_provider_extras(provider_extras);
+        }
 
         // A snapshot carries no runtime id counter, so continue past every id in
         // the restored history unless the caller pins an explicit source.

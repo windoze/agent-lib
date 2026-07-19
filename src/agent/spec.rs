@@ -197,6 +197,13 @@ impl ModelRef {
     pub const fn provider_extras(&self) -> Option<&ProviderExtras> {
         self.provider_extras.as_ref()
     }
+
+    /// Returns a copy of this model with provider-specific extras replaced.
+    #[must_use]
+    pub(crate) fn with_provider_extras(mut self, provider_extras: ProviderExtras) -> Self {
+        self.provider_extras = Some(provider_extras);
+        self
+    }
 }
 
 /// Static policy knobs used by a future Agent loop.

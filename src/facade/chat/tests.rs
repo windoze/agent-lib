@@ -12,11 +12,15 @@ use futures::stream::BoxStream;
 use serde_json::{Map, json};
 
 use super::{Chat, ChatBuilder, ChatSession};
-use crate::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
+use crate::client::{
+    AuthScheme, Capability, ChatRequest, ClientError, EndpointConfig, LlmClient, Response,
+};
 use crate::conversation::ConversationSnapshot;
+use crate::facade::config::ProviderConfig;
 use crate::facade::error::FacadeError;
 use crate::facade::run::{RunEvent, RunOutput};
 use crate::model::content::ContentBlock;
+use crate::model::extras::{ProviderExtras, ProviderId};
 use crate::model::message::{Message, Role};
 use crate::model::normalized::{Normalized, StopReason};
 use crate::model::usage::Usage;
@@ -89,6 +93,25 @@ fn text_response(text: &str) -> Response {
     }
 }
 
+fn provider_extras(provider: ProviderId) -> ProviderExtras {
+    ProviderExtras {
+        provider,
+        fields: Map::from_iter([("top_k".to_owned(), json!(25))]),
+    }
+}
+
+fn provider_config(provider: ProviderId) -> ProviderConfig {
+    ProviderConfig::custom(
+        EndpointConfig {
+            base_url: "https://example.invalid".to_owned(),
+            auth: AuthScheme::None,
+            query_params: Vec::new(),
+            extra_headers: Vec::new(),
+        },
+        provider,
+    )
+}
+
 /// Builds an assistant response that asks to call a tool.
 fn tool_use_response() -> Response {
     Response {
@@ -156,6 +179,23 @@ async fn ask_full_reports_response_and_supervisor_usage() {
 }
 
 #[tokio::test]
+async fn builder_provider_extras_reach_chat_request() {
+    let client = Arc::new(FakeClient::new(text_response("done")));
+    let extras = provider_extras(ProviderId::Anthropic);
+    let chat = Chat::builder()
+        .client(client.clone())
+        .model("claude-test")
+        .provider_extras(extras.clone())
+        .build()
+        .expect("build chat");
+
+    chat.ask("hi").await.expect("ask succeeds");
+
+    let requests = client.requests.lock().expect("requests mutex");
+    assert_eq!(requests[0].provider_extras, Some(extras));
+}
+
+#[tokio::test]
 async fn tool_use_response_is_rejected() {
     let client = Arc::new(FakeClient::new(tool_use_response()));
     let chat = chat_with(client);
@@ -196,6 +236,21 @@ fn builder_requires_a_client_or_provider() {
         .expect_err("missing client and provider is rejected");
 
     assert!(matches!(error, FacadeError::Config(_)));
+}
+
+#[test]
+fn builder_rejects_provider_extras_for_different_provider() {
+    let error = ChatBuilder::default()
+        .provider(provider_config(ProviderId::OpenAiResp))
+        .model("gpt-test")
+        .provider_extras(provider_extras(ProviderId::Anthropic))
+        .build()
+        .expect_err("provider mismatch is rejected");
+
+    let FacadeError::Config(message) = error else {
+        panic!("expected config error")
+    };
+    assert!(message.contains("provider_extras"));
 }
 
 #[tokio::test]
