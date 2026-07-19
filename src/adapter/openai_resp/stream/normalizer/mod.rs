@@ -329,9 +329,12 @@ impl StreamNormalizer {
         }
     }
 
-    /// Enforces the provider's contiguous zero-based event sequence numbers.
-    fn validate_sequence(&mut self, actual: u64, kind: &str) -> Result<(), ClientError> {
-        if actual != self.next_sequence {
+    /// Enforces contiguous zero-based sequence numbers when the endpoint
+    /// supplies them; compatible endpoints may omit the field entirely.
+    fn validate_sequence(&mut self, actual: Option<u64>, kind: &str) -> Result<(), ClientError> {
+        if let Some(actual) = actual
+            && actual != self.next_sequence
+        {
             return Err(invalid_stream(format!(
                 "event `{kind}` has sequence number {actual}; expected {}",
                 self.next_sequence

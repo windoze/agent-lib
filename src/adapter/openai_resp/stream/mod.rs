@@ -1,4 +1,8 @@
 //! OpenAI Responses SSE transport and normalized event translation.
+//!
+//! OpenAI-compatible endpoints sometimes omit `sequence_number` on SSE
+//! payloads. Missing values are accepted without a continuity check; events
+//! that do include a number must still match the zero-based event position.
 
 use super::OpenAiRespAdapter;
 use crate::{

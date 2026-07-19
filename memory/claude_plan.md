@@ -1,35 +1,35 @@
 # Execution Plan
 
-## Current Status
+I will execute exactly the first incomplete task from `TODO.md` and then stop.
 
-- Invocation started: 2026-07-19.
-- First action: create this progress plan before running project commands.
-- Private reasoning is not recorded here; this file contains the actionable execution plan and progress log.
-- First incomplete task identified: `M7-2 [TODO] StreamEvent::Usage 语义契约文档化并断言（M-ADP-1）`.
+## Current Procedure
 
-## Plan
-
-1. Read `TODO.md` to identify the first incomplete task, where only headings prefixed with `[DONE]` count as complete.
-2. Check the latest commit message for an explicitly unfinished issue relevant to that task.
-3. Inspect the task requirements and any directly relevant code or docs.
-4. Implement the task as written, or add the minimum prerequisite task to `TODO.md` if a concrete blocker makes implementation impossible.
-5. Run required validation in the prescribed order: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, then relevant/full tests as required.
-6. Update `TODO.md` completion record and prefix the completed task heading with `[DONE]` if the task is fully complete.
-7. Commit all task-related changes with a clear task-scoped message.
-8. Stop after completing exactly one task.
+1. Read `TODO.md` and identify the first task whose heading is not prefixed with `[DONE]`.
+2. Check the latest commit message only for unfinished work directly relevant to that selected task.
+3. Read the selected task details, dependencies, validation requirements, and any related design documentation or implementation files.
+4. Implement the selected task completely unless a concrete prerequisite blocker makes that impossible.
+5. If a blocker is found, update `TODO.md` with the minimum prerequisite task in the correct order, record the blocker here, commit, and stop.
+6. Run validation in the required order: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, then relevant/full tests as required by the task and repository guidance.
+7. Address any unscheduled failing tests before marking the task complete, or schedule the minimum prerequisite/follow-up task in `TODO.md` if required by the task policy.
+8. Mark only the completed selected task with `[DONE]` in `TODO.md` and update its completion record.
+9. Commit all intended changes with a task-specific commit message.
+10. Stop without starting the next task.
 
 ## Progress Log
 
-- Created initial execution plan.
-- Read `TODO.md` and selected `M7-2` as the current execution unit. Earlier tasks through `M7-1` are marked `[DONE]`; `M7-2` is the first heading still marked `[TODO]`.
-- Latest commit checked: `ec86516 [M7-1] Update execution log`. It does not mention an unfinished issue directly relevant to `M7-2`.
-- Current implementation direction: inspect `StreamEvent::Usage`, adapter stream normalizers, accumulator behavior, and existing cassette/fixture tests; then document one consistent consumption contract and add tests proving direct event consumption matches `collect`.
-- Implemented the selected contract: every `StreamEvent::Usage` is an additive segment. Updated rustdoc for `StreamEvent::Usage` and `Usage::merge`, and added Anthropic/OpenAI stream fixture tests that merge usage events directly and compare them to accumulator output.
-- Task-specific adapter/stream tests, `cargo fmt --all`, default clippy, and `cargo test --all --all-targets` passed.
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` failed on a redundant explicit intra-doc link in `src/stream/mod.rs`; fix the link and rerun documentation validation.
-- Fixed the redundant rustdoc link and reran `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`; documentation validation passed.
-- Updated `docs/review-2026-07.md` to mark M-ADP-1 fixed in M7-2.
-- Updated `TODO.md`: M7-2 is now `[DONE]` with completion record, validation summary, and compatibility note.
-- Inspected git status, full diff, and recent log; change set is scoped to M7-2. `git diff --check` passed.
-- Created implementation commit: `db5ad25 [M7-2] Document stream usage semantics`.
-- Next step: commit this final execution-log update and stop.
+- Initial execution plan created before running repository commands.
+- Selected task: `M7-3 [TODO] openai_resp sequence_number 校验对兼容端点降级`.
+- Latest commit checked: `[M7-2] Update execution log`; it does not identify unfinished work that blocks M7-3.
+- Implemented the planned M7-3 code path: wire `sequence_number` is optional, missing values skip validation, numbered events remain strictly contiguous, and regression tests cover both cases.
+- Targeted validation `cargo test -p agent-lib --lib adapter::openai_resp` passed after adjusting the new test to allow terminal metadata events.
+- Final validation passed: formatting, default clippy, external-feature clippy, default full test suite, and rustdoc. `TODO.md` now marks M7-3 as `[DONE]` with completion details.
+
+## M7-3 Execution Steps
+
+1. Inspect the OpenAI Responses stream wire event structs and normalizer sequence tracking.
+2. Change wire `sequence_number` fields to optional values with serde defaults.
+3. Preserve strict sequence validation whenever a sequence number is present.
+4. Skip sequence continuity validation for events that omit `sequence_number`, allowing compatible endpoints without this field.
+5. Add regression tests for omitted sequence numbers and numbered gap/ordering errors.
+6. Update the owning documentation for the compatibility behavior.
+7. Run required validation, update `TODO.md` completion record, commit, and stop.

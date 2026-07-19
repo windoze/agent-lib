@@ -1541,7 +1541,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo test -p agent-lib --lib adapter::`（79 条通过）、`cargo test -p agent-lib --lib stream::`（53 条通过）、`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。rustdoc 首次发现一个冗余显式 intra-doc link，已按建议收紧后重跑通过。
 - 无 breaking change（公共类型与 wire 形状不变；本任务仅明确既有语义并补回归断言）。
 
-### M7-3 [TODO] openai_resp `sequence_number` 校验对兼容端点降级（M-ADP-2）
+### M7-3 [DONE] openai_resp `sequence_number` 校验对兼容端点降级（M-ADP-2）
 
 上下文：
 
@@ -1556,6 +1556,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：无 sequence_number 的事件流正常归一化；有号但跳号仍报错。
 - `cargo test -p agent-lib --lib adapter::openai_resp` 全过。
+
+完成记录：
+
+- `src/adapter/openai_resp/stream/wire.rs`：所有 Responses SSE wire event 的 `sequence_number` 改为 `Option<u64>`，并加 `#[serde(default)]`；`WireEvent::sequence_number()` 同步返回 `Option<u64>`。因此第三方兼容端点省略该字段时不再在 serde 反序列化阶段失败。
+- `src/adapter/openai_resp/stream/normalizer/mod.rs`：`validate_sequence` 改为只在事件携带 sequence number 时做严格零基连续校验；缺失值跳过该事件的实际值比较，但内部 expected 仍按收到的事件数推进，所以后续带号事件仍必须匹配真实事件位置，跳号/乱序继续报 `ClientError::Protocol`。
+- 文档：`src/adapter/openai_resp/stream/mod.rs` 模块文档写明兼容端点可省略 `sequence_number`，缺失值会被接受，带号事件仍严格连续；`docs/review-2026-07.md` M-ADP-2 已标注 `✅ 已修复（M7-3）`。
+- 测试：新增 `missing_sequence_numbers_are_accepted_for_compatible_streams` 覆盖完整无 `sequence_number` 的 created/completed 流正常归一化；扩展 `sequence_event_name_and_item_index_mismatches_are_rejected`，增加带号流 `0 → 2` 跳号仍报 `expected 1`。
+- 验证：`cargo fmt --all`、`cargo test -p agent-lib --lib adapter::openai_resp`（33 条全过）、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（默认离线全量通过，真实端点/CLI 测试保持 ignored，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 无 breaking change（wire 字段仅放宽反序列化；公共 API 与归一化事件形状不变）。
 
 ### M7-4 [TODO] 线缆容错批量修复（adapter L2/L3、external L-1、facade L1）
 

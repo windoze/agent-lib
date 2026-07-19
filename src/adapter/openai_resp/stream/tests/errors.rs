@@ -67,6 +67,17 @@ async fn sequence_event_name_and_item_index_mismatches_are_rejected() {
         .expect_err("sequence must begin at zero");
     assert!(error.to_string().contains("expected 0"));
 
+    let bad_gap = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bad\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":[],\"usage\":null},\"sequence_number\":0}\n\n",
+        "event: response.in_progress\n",
+        "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_bad\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":[],\"usage\":null},\"sequence_number\":2}\n\n"
+    );
+    let error = decode_fixture(bad_gap)
+        .await
+        .expect_err("numbered events must remain contiguous");
+    assert!(error.to_string().contains("expected 1"));
+
     let bad_name = concat!(
         "event: response.completed\n",
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bad\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":[],\"usage\":null},\"sequence_number\":0}\n\n"
@@ -88,6 +99,38 @@ async fn sequence_event_name_and_item_index_mismatches_are_rejected() {
         .await
         .expect_err("item id and output index must remain correlated");
     assert!(error.to_string().contains("maps to output index 0, not 3"));
+}
+
+#[tokio::test]
+async fn missing_sequence_numbers_are_accepted_for_compatible_streams() {
+    let fixture = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_compat\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":[],\"usage\":null}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compat\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}}\n\n"
+    );
+
+    let events = decode_fixture(fixture)
+        .await
+        .expect("compatible endpoints may omit sequence_number");
+    assert_eq!(
+        events[0],
+        StreamEvent::MessageStart {
+            role: Role::Assistant,
+        }
+    );
+    assert!(events.iter().any(|event| {
+        event
+            == &StreamEvent::Usage(Usage {
+                input: 2,
+                output: 3,
+                ..Usage::default()
+            })
+    }));
+    assert!(matches!(
+        events.last(),
+        Some(StreamEvent::MessageStop { .. })
+    ));
 }
 
 #[tokio::test]

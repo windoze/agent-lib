@@ -64,8 +64,8 @@ pub(super) enum WireEvent {
 }
 
 impl WireEvent {
-    /// Returns the provider sequence number shared by every Responses event.
-    pub(super) fn sequence_number(&self) -> u64 {
+    /// Returns the provider sequence number when the endpoint supplies one.
+    pub(super) fn sequence_number(&self) -> Option<u64> {
         match self {
             Self::ResponseCreated(event)
             | Self::ResponseInProgress(event)
@@ -94,8 +94,9 @@ impl WireEvent {
 pub(super) struct ResponseEvent {
     /// Complete or in-progress Responses object.
     pub(super) response: Value,
-    /// Monotonic event position within this stream.
-    pub(super) sequence_number: u64,
+    /// Optional monotonic event position within this stream.
+    #[serde(default)]
+    pub(super) sequence_number: Option<u64>,
 }
 
 /// Event carrying one complete or placeholder output item.
@@ -105,8 +106,9 @@ pub(super) struct OutputItemEvent {
     pub(super) output_index: u64,
     /// Provider output item object.
     pub(super) item: Value,
-    /// Monotonic event position within this stream.
-    pub(super) sequence_number: u64,
+    /// Optional monotonic event position within this stream.
+    #[serde(default)]
+    pub(super) sequence_number: Option<u64>,
 }
 
 /// Event carrying one complete or placeholder message content part.
@@ -120,8 +122,9 @@ pub(super) struct ContentPartEvent {
     pub(super) content_index: u64,
     /// Provider content-part object.
     pub(super) part: Value,
-    /// Monotonic event position within this stream.
-    pub(super) sequence_number: u64,
+    /// Optional monotonic event position within this stream.
+    #[serde(default)]
+    pub(super) sequence_number: Option<u64>,
 }
 
 /// Shared shape of text, refusal, reasoning, and argument delta events.
@@ -139,8 +142,9 @@ pub(super) struct DeltaEvent {
     pub(super) summary_index: Option<u64>,
     /// Incremental string supplied by the provider.
     pub(super) delta: String,
-    /// Monotonic event position within this stream.
-    pub(super) sequence_number: u64,
+    /// Optional monotonic event position within this stream.
+    #[serde(default)]
+    pub(super) sequence_number: Option<u64>,
 }
 
 /// Completion event carrying one authoritative text value.
@@ -158,8 +162,9 @@ pub(super) struct TextDoneEvent {
     pub(super) summary_index: Option<u64>,
     /// Complete text value supplied by the provider.
     pub(super) text: String,
-    /// Monotonic event position within this stream.
-    pub(super) sequence_number: u64,
+    /// Optional monotonic event position within this stream.
+    #[serde(default)]
+    pub(super) sequence_number: Option<u64>,
 }
 
 /// Completion event carrying one authoritative refusal value.
@@ -173,8 +178,9 @@ pub(super) struct RefusalDoneEvent {
     pub(super) content_index: u64,
     /// Complete refusal string supplied by the provider.
     pub(super) refusal: String,
-    /// Monotonic event position within this stream.
-    pub(super) sequence_number: u64,
+    /// Optional monotonic event position within this stream.
+    #[serde(default)]
+    pub(super) sequence_number: Option<u64>,
 }
 
 /// Completion event carrying authoritative function-call arguments.
@@ -186,15 +192,17 @@ pub(super) struct ArgumentsDoneEvent {
     pub(super) output_index: u64,
     /// Complete JSON argument text supplied by the provider.
     pub(super) arguments: String,
-    /// Monotonic event position within this stream.
-    pub(super) sequence_number: u64,
+    /// Optional monotonic event position within this stream.
+    #[serde(default)]
+    pub(super) sequence_number: Option<u64>,
 }
 
 /// Minimal shape shared by error and future event kinds.
 #[derive(Debug, Deserialize)]
 pub(super) struct SequencedEvent {
-    /// Monotonic event position within this stream.
-    pub(super) sequence_number: u64,
+    /// Optional monotonic event position within this stream.
+    #[serde(default)]
+    pub(super) sequence_number: Option<u64>,
 }
 
 /// Deserializes a JSON payload according to its `type` discriminator.
