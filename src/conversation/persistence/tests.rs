@@ -2,7 +2,10 @@
 
 mod e2e;
 
-use super::{CONVERSATION_SNAPSHOT_SCHEMA_VERSION, ConversationRows, ConversationSnapshot};
+use super::{
+    CONVERSATION_ROW_SCHEMA_VERSION, CONVERSATION_SNAPSHOT_SCHEMA_VERSION, ConversationRows,
+    ConversationSnapshot,
+};
 use crate::{
     client::Response,
     conversation::{
@@ -1089,6 +1092,187 @@ fn rows_reject_projection_artifact_corruption_and_restore_catches_parent_cycles(
     assert!(matches!(
         Conversation::restore(snapshot).expect_err("restore rejects cycle"),
         ConversationError::Restore(RestoreError::ParentCycle { .. })
+    ));
+}
+
+#[test]
+fn rows_stamp_every_evolving_row_with_the_export_generation() {
+    let mut conversation = conversation(20);
+    let fresh_version = conversation
+        .snapshot()
+        .expect("fresh snapshot")
+        .structural_version();
+    commit_text_turn(&mut conversation, 200);
+    commit_text_turn(&mut conversation, 201);
+
+    let covers = range(&conversation, 0, 1);
+    let produced_by = strategy("rows-generation");
+    let artifact = summary_artifact(
+        &conversation,
+        covers.clone(),
+        20_500,
+        produced_by.clone(),
+        "summary:200",
+    );
+    let plan = CompactionPlan::new(
+        &conversation,
+        vec![CompactionStep::raw(covers, artifact.id(), produced_by)],
+        vec![artifact],
+    );
+    conversation
+        .apply_compaction(&plan)
+        .expect("apply projection before row export");
+
+    let snapshot = conversation.snapshot().expect("snapshot");
+    let rows = snapshot.to_rows().expect("rows");
+    let generation = snapshot.structural_version();
+    assert!(
+        generation > fresh_version,
+        "commit and compaction advance the structural version"
+    );
+    assert_eq!(rows.conversation.structural_version, generation);
+    assert_eq!(
+        rows.conversation.generation, generation,
+        "conversation row generation equals its structural version"
+    );
+    assert!(
+        rows.lineage_turns
+            .iter()
+            .all(|row| row.generation == generation),
+        "every lineage membership row carries the export generation"
+    );
+    assert!(
+        !rows.projection_spans.is_empty(),
+        "compacted projection exports span rows"
+    );
+    assert!(
+        rows.projection_spans
+            .iter()
+            .all(|row| row.generation == generation),
+        "every projection span row carries the export generation"
+    );
+}
+
+#[test]
+fn rows_reject_an_older_row_schema_version() {
+    let mut conversation = conversation(21);
+    commit_text_turn(&mut conversation, 210);
+    let rows = conversation
+        .snapshot()
+        .expect("snapshot")
+        .to_rows()
+        .expect("rows");
+    let old_version = CONVERSATION_ROW_SCHEMA_VERSION - 1;
+
+    let mut old_conversation = rows.clone();
+    old_conversation.conversation.schema_version = old_version;
+    assert!(matches!(
+        old_conversation
+            .into_snapshot()
+            .expect_err("older conversation row schema rejected"),
+        RowMappingError::InvalidRow {
+            path,
+            table: "conversation_records",
+            reason,
+        } if path == "$.conversation.schema_version" && reason.contains("no migration path")
+    ));
+
+    let mut old_projection = rows.clone();
+    old_projection.projection.schema_version = old_version;
+    assert!(matches!(
+        old_projection
+            .into_snapshot()
+            .expect_err("older projection row schema rejected"),
+        RowMappingError::InvalidRow {
+            path,
+            table: "projection_records",
+            reason,
+        } if path == "$.projection.schema_version" && reason.contains("no migration path")
+    ));
+
+    // Rows exported before the generation column existed must fail closed at
+    // deserialization rather than silently defaulting the new key.
+    let mut old_json = serde_json::to_value(&rows).expect("serialize rows");
+    old_json["conversation"]["schema_version"] = json!(old_version);
+    old_json["projection"]["schema_version"] = json!(old_version);
+    old_json["conversation"]
+        .as_object_mut()
+        .expect("conversation object")
+        .remove("generation");
+    for row in old_json["lineage_turns"]
+        .as_array_mut()
+        .expect("lineage rows")
+    {
+        row.as_object_mut()
+            .expect("lineage row object")
+            .remove("generation");
+    }
+    for row in old_json["projection_spans"]
+        .as_array_mut()
+        .expect("span rows")
+    {
+        row.as_object_mut()
+            .expect("span row object")
+            .remove("generation");
+    }
+    let error = serde_json::from_value::<ConversationRows>(old_json)
+        .expect_err("pre-generation rows fail closed at deserialization");
+    assert!(
+        error.to_string().contains("generation"),
+        "deserialization error names the missing generation column: {error}"
+    );
+}
+
+#[test]
+fn rows_reject_inconsistent_generations() {
+    let mut conversation = conversation(22);
+    commit_text_turn(&mut conversation, 220);
+    commit_text_turn(&mut conversation, 221);
+    let rows = conversation
+        .snapshot()
+        .expect("snapshot")
+        .to_rows()
+        .expect("rows");
+
+    let mut bad_conversation = rows.clone();
+    bad_conversation.conversation.generation += 1;
+    assert!(matches!(
+        bad_conversation
+            .into_snapshot()
+            .expect_err("generation/structural_version divergence rejected"),
+        RowMappingError::InvalidRow {
+            path,
+            table: "conversation_records",
+            ..
+        } if path == "$.conversation.generation"
+    ));
+
+    let mut bad_lineage = rows.clone();
+    bad_lineage.lineage_turns[0].generation += 1;
+    assert!(matches!(
+        bad_lineage
+            .into_snapshot()
+            .expect_err("foreign lineage generation rejected"),
+        RowMappingError::InvalidRow {
+            table: "conversation_lineage_turn_records",
+            ..
+        }
+    ));
+
+    let mut bad_span = rows;
+    assert!(
+        !bad_span.projection_spans.is_empty(),
+        "committed conversation exports at least one projection span"
+    );
+    bad_span.projection_spans[0].generation += 1;
+    assert!(matches!(
+        bad_span
+            .into_snapshot()
+            .expect_err("foreign span generation rejected"),
+        RowMappingError::InvalidRow {
+            table: "projection_span_records",
+            ..
+        }
     ));
 }
 

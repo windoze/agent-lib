@@ -31,10 +31,15 @@ use std::{
 
 /// Current DB-neutral row schema version.
 ///
-/// The row schema intentionally tracks the snapshot schema version for now:
-/// rows can be reassembled into the same versioned [`ConversationSnapshot`]
-/// before live restore validation runs.
-pub const CONVERSATION_ROW_SCHEMA_VERSION: u32 = CONVERSATION_SNAPSHOT_SCHEMA_VERSION;
+/// The row schema evolves independently of the snapshot schema: version 2 adds
+/// the `generation` column to the evolving row kinds (conversation, lineage
+/// membership, projection spans) so a Conversation's evolution stays
+/// insert-only. Rows are still reassembled into the current
+/// [`ConversationSnapshot`] data shape before live restore validation runs.
+///
+/// Pre-1.0 there is no migration path: row sets exported with an older schema
+/// version are rejected and must be re-exported with the current crate.
+pub const CONVERSATION_ROW_SCHEMA_VERSION: u32 = 2;
 
 /// A DB-neutral decomposition of one Conversation snapshot.
 ///
@@ -77,6 +82,12 @@ pub struct ConversationRecord {
     pub config: ConversationConfig,
     /// Structural version captured at the committed consistency point.
     pub structural_version: u64,
+    /// Generation key for insert-only evolution.
+    ///
+    /// Always equals `structural_version`: every structural change (commit,
+    /// revert, compaction) mints a new generation, so a later export of the
+    /// same Conversation inserts a new row instead of updating this one.
+    pub generation: u64,
     /// Optional fork provenance for child Conversations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<ForkOrigin>,
@@ -104,6 +115,9 @@ pub struct ConversationTurnRecord {
 pub struct ConversationLineageTurnRecord {
     /// Owning Conversation.
     pub conversation_id: ConversationId,
+    /// Generation this membership row was exported at (the owning
+    /// Conversation's `structural_version` at that consistency point).
+    pub generation: u64,
     /// Dense lineage sequence, starting at zero.
     pub lineage_sequence: u64,
     /// Turn fact at this lineage position.
@@ -188,6 +202,9 @@ pub enum ProjectionSpanKind {
 pub struct ProjectionSpanRecord {
     /// Owning Conversation.
     pub conversation_id: ConversationId,
+    /// Generation this span row was exported at (the owning Conversation's
+    /// `structural_version` at that consistency point).
+    pub generation: u64,
     /// Dense projection span sequence, starting at zero.
     pub span_sequence: u64,
     /// Span rendering mode.
@@ -331,12 +348,16 @@ impl ConversationRows {
     pub fn from_snapshot(snapshot: &ConversationSnapshot) -> Result<Self, RowMappingError> {
         let conversation_id = snapshot.id();
         let history = snapshot.history();
+        // The export consistency point's structural version is the generation
+        // of every evolving row produced here.
+        let generation = snapshot.structural_version();
 
         let conversation = ConversationRecord {
             schema_version: CONVERSATION_ROW_SCHEMA_VERSION,
             conversation_id,
             config: snapshot.config().clone(),
-            structural_version: snapshot.structural_version(),
+            structural_version: generation,
+            generation,
             origin: snapshot.origin(),
             head_turn_count: history.head_turn_count(),
             fork_ceiling_turn_count: history.fork_ceiling_turn_count(),
@@ -395,6 +416,7 @@ impl ConversationRows {
             .enumerate()
             .map(|(lineage_index, turn_id)| ConversationLineageTurnRecord {
                 conversation_id,
+                generation,
                 lineage_sequence: usize_to_u64(lineage_index),
                 turn_id,
             })
@@ -410,7 +432,7 @@ impl ConversationRows {
             .iter()
             .enumerate()
             .map(|(span_index, span)| {
-                ProjectionSpanRecord::from_span(conversation_id, span_index, span)
+                ProjectionSpanRecord::from_span(conversation_id, generation, span_index, span)
             })
             .collect();
         let artifacts = snapshot
@@ -450,6 +472,7 @@ impl ConversationRows {
     pub fn into_snapshot(self) -> Result<ConversationSnapshot, RowMappingError> {
         let owner = self.conversation.conversation_id;
         self.validate_schema_versions()?;
+        self.validate_generations()?;
         self.validate_row_owners(owner)?;
 
         let raw_members = sorted_conversation_turns(&self.raw_turns)?;
@@ -514,8 +537,10 @@ impl ConversationRows {
             self.conversation.head_turn_count,
             self.conversation.fork_ceiling_turn_count,
         );
+        // Row schema versions evolve independently of the snapshot schema;
+        // validated current rows always describe the current snapshot shape.
         Ok(ConversationSnapshot::from_parts(
-            self.conversation.schema_version,
+            CONVERSATION_SNAPSHOT_SCHEMA_VERSION,
             owner,
             self.conversation.config,
             self.conversation.structural_version,
@@ -606,20 +631,58 @@ impl ConversationRows {
     }
 
     /// Ensures row schema versions are supported.
+    ///
+    /// Pre-1.0 there is no migration path: older row sets are rejected
+    /// outright and must be re-exported with the current crate.
     fn validate_schema_versions(&self) -> Result<(), RowMappingError> {
         if self.conversation.schema_version != CONVERSATION_ROW_SCHEMA_VERSION {
             return Err(RowMappingError::InvalidRow {
                 path: "$.conversation.schema_version".to_owned(),
                 table: "conversation_records",
-                reason: "unsupported row schema version",
+                reason: "unsupported row schema version (no migration path pre-1.0; re-export rows with the current crate)",
             });
         }
         if self.projection.schema_version != CONVERSATION_ROW_SCHEMA_VERSION {
             return Err(RowMappingError::InvalidRow {
                 path: "$.projection.schema_version".to_owned(),
                 table: "projection_records",
-                reason: "unsupported row schema version",
+                reason: "unsupported row schema version (no migration path pre-1.0; re-export rows with the current crate)",
             });
+        }
+        Ok(())
+    }
+
+    /// Ensures the generation columns agree with the conversation row.
+    ///
+    /// The in-memory row set holds exactly one conversation row, so every
+    /// evolving association row must belong to that row's generation; mixed
+    /// generations can only enter through a tampered or hand-built set.
+    fn validate_generations(&self) -> Result<(), RowMappingError> {
+        let generation = self.conversation.structural_version;
+        if self.conversation.generation != generation {
+            return Err(RowMappingError::InvalidRow {
+                path: "$.conversation.generation".to_owned(),
+                table: "conversation_records",
+                reason: "generation must equal structural_version",
+            });
+        }
+        for (index, row) in self.lineage_turns.iter().enumerate() {
+            if row.generation != generation {
+                return Err(RowMappingError::InvalidRow {
+                    path: format!("$.lineage_turns[{index}].generation"),
+                    table: "conversation_lineage_turn_records",
+                    reason: "generation does not match the conversation row generation",
+                });
+            }
+        }
+        for (index, row) in self.projection_spans.iter().enumerate() {
+            if row.generation != generation {
+                return Err(RowMappingError::InvalidRow {
+                    path: format!("$.projection_spans[{index}].generation"),
+                    table: "projection_span_records",
+                    reason: "generation does not match the conversation row generation",
+                });
+            }
         }
         Ok(())
     }
@@ -665,11 +728,17 @@ impl ConversationRows {
 
 impl ProjectionSpanRecord {
     /// Copies one projection span into a DB-neutral row.
-    fn from_span(conversation_id: ConversationId, span_index: usize, span: &Span) -> Self {
+    fn from_span(
+        conversation_id: ConversationId,
+        generation: u64,
+        span_index: usize,
+        span: &Span,
+    ) -> Self {
         let range = span.range();
         match span {
             Span::Raw { .. } => Self {
                 conversation_id,
+                generation,
                 span_sequence: usize_to_u64(span_index),
                 kind: ProjectionSpanKind::Raw,
                 start_turn_count: range.start_turn_count(),
@@ -685,6 +754,7 @@ impl ProjectionSpanRecord {
                 ..
             } => Self {
                 conversation_id,
+                generation,
                 span_sequence: usize_to_u64(span_index),
                 kind: ProjectionSpanKind::Compacted,
                 start_turn_count: range.start_turn_count(),

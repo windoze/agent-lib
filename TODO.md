@@ -720,7 +720,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 拆解为 M3-5-1 ~ M3-5-4，按序实施。
 
-#### M3-5-1 [TODO] schema 变更：三类行增加 `generation` 字段 + `to_rows` 写入
+#### M3-5-1 [DONE] schema 变更：三类行增加 `generation` 字段 + `to_rows` 写入
 
 实现要求：
 
@@ -733,6 +733,18 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 现有 persistence 测试按新 schema 更新后全过（允许本任务阶段 `into_snapshot`/diff 暂时沿用旧行为，由 M3-5-2/3 完成语义切换——若中间态难以编译，可与 M3-5-2 合并提交）。
 - 单元测试：旧 schema_version 的行集反序列化/`into_snapshot` 报明确错误。
+
+完成记录：
+
+- 三个 Record（`ConversationRecord`/`ConversationLineageTurnRecord`/`ProjectionSpanRecord`）各新增 `generation: u64`，**无** `#[serde(default)]`——旧版（v1，无 generation 列）行 JSON 在 `deny_unknown_fields` + 缺字段下直接反序列化失败，错误信息点名 `generation` 列，不静默吞旧数据。
+- `CONVERSATION_ROW_SCHEMA_VERSION` 与 snapshot schema 解耦：1 → 2（此前别名 `CONVERSATION_SNAPSHOT_SCHEMA_VERSION`，常量文档改为「独立演进」口径；snapshot 数据形状未变故 `CONVERSATION_SNAPSHOT_SCHEMA_VERSION` 保持 1）。连带修正：`into_snapshot` 重组 snapshot 时从透传 `conversation.schema_version` 改为显式传 `CONVERSATION_SNAPSHOT_SCHEMA_VERSION`——否则 v2 行集重组出的 snapshot 会被 restore 以 `UnsupportedSchemaVersion` 拒绝。
+- `from_snapshot`：以导出一致点的 `snapshot.structural_version()` 为 generation 填充三类行；`ConversationRecord` 的 `structural_version` 与 `generation` 用同一局部变量构造，恒等由构造保证（`from_span` 新增 generation 参数）。
+- `validate_schema_versions`：不接受任何非当前版本，reason 写明 "no migration path pre-1.0; re-export rows with the current crate"（**pre-1.0 不提供迁移路径**，按任务决策记录在此）。
+- 中间态选型（未与 M3-5-2 合并，独立可编译）：`into_snapshot` 新增 `validate_generations()`——`ConversationRows` 内存形状只能持单个 conversation 行，故代次完整性校验为「conversation.generation == structural_version 且全部 lineage/span 行 generation 等于该代次」；混合代次只能来自篡改/手工构造，即报错。这是 M3-5-2「取最大代次」规则在单代次输入下的退化形态，不与其冲突。diff（`insert_set_against`/`diff_rows` key）本阶段未动，同 conversation 二次导出仍 `InsertConflict`（旧行为，M3-5-3 切换）。
+- 测试（persistence 26 条全过，新增 3 条）：`rows_stamp_every_evolving_row_with_the_export_generation`（commit+compaction 后 version 前进，conversation/lineage/span 行 generation 全等于导出一致点的 structural_version）、`rows_reject_an_older_row_schema_version`（conversation/projection 行 schema_version 降级报 `InvalidRow` 含 "no migration path"；剥离 generation 键的 v1 形状 JSON 反序列化失败且错误点名 generation）、`rows_reject_inconsistent_generations`（conversation.generation 偏离 structural_version、lineage/span 行代次不符均报 `InvalidRow`）。
+- 文档：字段级 rustdoc 已写明代次语义；rows 模块文档与 `ConversationRowInsertSet` 文档的代次模型改写、`docs/conversation-core.md` 同步按任务拆解归 M3-5-4，本任务未动。`docs/review-2026-07.md` M-CONV-3 待 M3-5-1~4 全部落地后标注（M3-9 口径）。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::persistence`（26 条全过）、`cargo test --all --all-targets`（exit 0，50 个测试目标）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（exit 0，48 个测试目标）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- Breaking change（pre-1.0，记录在此）：三个 pub Record 新增必填字段（struct literal 构造点需补，serde 旧数据不可读——按任务决策无迁移路径）；`CONVERSATION_ROW_SCHEMA_VERSION` 值变更。
 
 #### M3-5-2 [TODO] `into_snapshot` 重组：按最大代次选取演进行
 
