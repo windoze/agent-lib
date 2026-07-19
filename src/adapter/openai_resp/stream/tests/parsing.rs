@@ -254,3 +254,47 @@ async fn reasoning_text_and_encrypted_content_fold_to_thinking_block() {
     );
     assert_eq!(response.usage.reasoning, 7);
 }
+
+#[tokio::test]
+async fn unknown_message_content_part_stream_folds_to_unknown_variant() {
+    let fixture = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_future\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":[],\"usage\":null},\"sequence_number\":0}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_future\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]},\"sequence_number\":1}\n\n",
+        "event: response.content_part.added\n",
+        "data: {\"type\":\"response.content_part.added\",\"item_id\":\"msg_future\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"future_content\",\"payload\":{\"phase\":\"start\"}},\"sequence_number\":2}\n\n",
+        "event: response.content_part.done\n",
+        "data: {\"type\":\"response.content_part.done\",\"item_id\":\"msg_future\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"future_content\",\"payload\":{\"phase\":\"done\"}},\"sequence_number\":3}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_future\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"future_content\",\"payload\":{\"phase\":\"done\"}}]},\"sequence_number\":4}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_future\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_future\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"future_content\",\"payload\":{\"phase\":\"done\"}}]}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1}},\"sequence_number\":5}\n\n"
+    );
+    let events = decode_fixture(fixture)
+        .await
+        .expect("decode future content stream");
+    let id = BlockId::new("openai-response-item-msg_future-content-0");
+
+    assert!(events.contains(&StreamEvent::BlockStart {
+        id: id.clone(),
+        kind: BlockKind::Unknown {
+            type_name: Some("future_content".to_owned()),
+            raw: json!({ "type": "future_content", "payload": { "phase": "start" } }),
+        },
+    }));
+    assert!(events.contains(&StreamEvent::BlockDelta {
+        id: id.clone(),
+        delta: Delta::Unknown(json!({ "type": "future_content", "payload": { "phase": "done" } })),
+    }));
+    assert!(events.contains(&StreamEvent::BlockStop { id }));
+
+    let response = fold_events(&events).expect("fold future content stream");
+    assert_eq!(
+        response.message.content,
+        vec![ContentBlock::Unknown {
+            type_name: Some("future_content".to_owned()),
+            raw: json!({ "type": "future_content", "payload": { "phase": "done" } }),
+        }]
+    );
+}

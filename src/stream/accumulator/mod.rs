@@ -232,6 +232,11 @@ enum PartialBlock {
         input_available: bool,
         stopped: bool,
     },
+    Unknown {
+        type_name: Option<String>,
+        raw: Value,
+        stopped: bool,
+    },
 }
 
 impl PartialBlock {
@@ -256,6 +261,11 @@ impl PartialBlock {
                 json: String::new(),
                 input: None,
                 input_available: false,
+                stopped: false,
+            },
+            BlockKind::Unknown { type_name, raw } => Self::Unknown {
+                type_name,
+                raw,
                 stopped: false,
             },
         }
@@ -289,6 +299,10 @@ impl PartialBlock {
                     return Err(AccumulatorError::ToolInputAlreadyComplete(id.clone()));
                 }
                 json.push_str(&delta);
+                Ok(())
+            }
+            (Self::Unknown { raw, .. }, Delta::Unknown(delta)) => {
+                apply_unknown_delta(raw, delta);
                 Ok(())
             }
             (block, delta) => Err(AccumulatorError::MismatchedDelta {
@@ -392,6 +406,11 @@ impl PartialBlock {
                     stopped,
                 ))
             }
+            Self::Unknown {
+                type_name,
+                raw,
+                stopped,
+            } => Ok((ContentBlock::Unknown { type_name, raw }, stopped)),
         }
     }
 
@@ -400,14 +419,17 @@ impl PartialBlock {
         match self {
             Self::Text { stopped, .. }
             | Self::Reasoning { stopped, .. }
-            | Self::ToolInput { stopped, .. } => *stopped,
+            | Self::ToolInput { stopped, .. }
+            | Self::Unknown { stopped, .. } => *stopped,
         }
     }
 
     /// Marks a non-tool block stopped after the shared lifecycle check.
     fn set_stopped(&mut self) {
         match self {
-            Self::Text { stopped, .. } | Self::Reasoning { stopped, .. } => *stopped = true,
+            Self::Text { stopped, .. }
+            | Self::Reasoning { stopped, .. }
+            | Self::Unknown { stopped, .. } => *stopped = true,
             Self::ToolInput { .. } => unreachable!("tool blocks are stopped after JSON parsing"),
         }
     }
@@ -418,6 +440,7 @@ impl PartialBlock {
             Self::Text { .. } => "text",
             Self::Reasoning { .. } => "reasoning or reasoning_signature",
             Self::ToolInput { .. } => "json",
+            Self::Unknown { .. } => "unknown",
         }
     }
 }
@@ -430,6 +453,39 @@ impl Delta {
             Self::Json(_) => "json",
             Self::Reasoning(_) => "reasoning",
             Self::ReasoningSignature(_) => "reasoning_signature",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+}
+
+/// Keeps the most complete raw value for an unknown block when a stream later
+/// supplies an authoritative done payload; otherwise records deltas as evidence.
+fn apply_unknown_delta(raw: &mut Value, delta: Value) {
+    let raw_type = raw
+        .as_object()
+        .and_then(|fields| fields.get("type"))
+        .and_then(Value::as_str);
+    let delta_type = delta
+        .as_object()
+        .and_then(|fields| fields.get("type"))
+        .and_then(Value::as_str);
+    if raw_type.is_some() && raw_type == delta_type {
+        *raw = delta;
+        return;
+    }
+
+    match raw {
+        Value::Object(fields) => fields
+            .entry("stream_deltas".to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .expect("stream_deltas was inserted as an array")
+            .push(delta),
+        other => {
+            *other = serde_json::json!({
+                "raw": other.take(),
+                "stream_deltas": [delta],
+            });
         }
     }
 }

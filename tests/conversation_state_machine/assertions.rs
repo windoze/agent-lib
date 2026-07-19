@@ -116,7 +116,8 @@ fn assert_tool_pairings(label: &str, turn: &Turn) {
                 }
                 ContentBlock::Text { .. }
                 | ContentBlock::Image { .. }
-                | ContentBlock::Thinking { .. } => {}
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::Unknown { .. } => {}
             }
         }
     }
@@ -221,7 +222,7 @@ fn block_text_values(block: &ContentBlock) -> Vec<String> {
             content.iter().flat_map(block_text_values).collect()
         }
         ContentBlock::ToolUse { id, name, .. } => vec![format!("tool_use:{name}:{id}")],
-        ContentBlock::Image { .. } => Vec::new(),
+        ContentBlock::Image { .. } | ContentBlock::Unknown { .. } => Vec::new(),
     }
 }
 

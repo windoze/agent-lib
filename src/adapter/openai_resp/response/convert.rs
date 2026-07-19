@@ -114,9 +114,10 @@ fn convert_message_item(
                 });
                 converted.refusal_raw = Some("refusal".to_owned());
             }
-            _ => converted
-                .unmodeled
-                .push(unmodeled_content_part(index, &fields, part_original)),
+            _ => converted.content.push(ContentBlock::Unknown {
+                type_name: Some(part_type),
+                raw: part_original,
+            }),
         }
     }
 
@@ -259,15 +260,6 @@ fn response_block_extra(
     }
 
     Map::from_iter([(RESPONSE_EXTRA_KEY.to_owned(), Value::Object(provider))])
-}
-
-/// Retains an unsupported message content part with its parent item metadata.
-fn unmodeled_content_part(output_index: usize, item: &Map<String, Value>, content: Value) -> Value {
-    let mut fields = Map::new();
-    fields.insert("output_index".to_owned(), Value::from(output_index));
-    fields.insert("item".to_owned(), Value::Object(item.clone()));
-    fields.insert("content".to_owned(), content);
-    Value::Object(fields)
 }
 
 /// Reads `incomplete_details.reason` while leaving the details in `extra`.

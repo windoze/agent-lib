@@ -326,3 +326,41 @@ async fn message_delta_without_usage_is_accepted() {
         stop_reason: StopReason::normalize("end_turn"),
     }));
 }
+
+#[tokio::test]
+async fn unknown_content_block_stream_folds_to_unknown_variant() {
+    let fixture = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":{\"reason\":\"policy\"}}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let events = decode_fixture(fixture)
+        .await
+        .expect("decode unknown content block stream");
+    let id = BlockId::new("anthropic-block-0");
+
+    assert!(events.contains(&StreamEvent::BlockStart {
+        id: id.clone(),
+        kind: BlockKind::Unknown {
+            type_name: Some("redacted_thinking".to_owned()),
+            raw: json!({ "type": "redacted_thinking", "data": { "reason": "policy" } }),
+        },
+    }));
+    assert!(events.contains(&StreamEvent::BlockStop { id }));
+
+    let response = fold_events(&events).expect("fold unknown block stream");
+    assert_eq!(
+        response.message.content,
+        vec![ContentBlock::Unknown {
+            type_name: Some("redacted_thinking".to_owned()),
+            raw: json!({ "type": "redacted_thinking", "data": { "reason": "policy" } }),
+        }]
+    );
+}

@@ -1,39 +1,24 @@
-# Execution Plan
+# 当前执行计划
 
-I will execute exactly the first incomplete task from `TODO.md` and then stop. This file records the actionable plan and progress updates; it does not include private reasoning.
+更新时间：2026-07-19
 
-## Selected Task
+1. 读取 `TODO.md`，只按标题是否带 `[DONE]` 判断完成状态，确定第一个未完成任务。
+2. 查看最新提交信息，只有在其明确提到与该任务直接相关的未完成事项时，才把它纳入当前任务或作为前置项记录到 `TODO.md`。
+3. 针对第一个未完成任务读取必要上下文，避免开放式历史问题扫描。
+4. 如任务可直接完成，做最小正确实现，并补充或调整相关测试与文档。
+5. 按顺序运行验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、必要时 `cargo test --all --all-targets`（完整测试最长 30 分钟）。如代码未变且仅文档/TODO 变更，则复用最近一次绿色结果并在完成记录说明。
+6. 若发现未排期且影响当前任务或测试失败的问题，优先修复；若必须新增前置任务，则更新 `TODO.md`、保持当前任务未完成、提交后停止。
+7. 完成后在 `TODO.md` 中给当前任务标题加 `[DONE]` 并更新完成记录；仅当阶段级计划改变时才更新 `PLAN.md`。
+8. 检查 `git status`、`git diff`、`git log --oneline -10`，提交本次任务相关所有改动，然后停止，不进入下一个任务。
 
-`M7-4 [TODO] 线缆容错批量修复（adapter L2/L3、external L-1、facade L1）`
+当前状态：已识别第一个未完成任务为 `M7-5 ContentBlock 增加反序列化兜底 variant`。最新提交 `M7-4` 明确把未知 `ContentBlock` 兜底留给 M7-5，直接相关且已由任务单排期。
 
-## Required Outcomes
+实施细化：
 
-1. Treat empty OpenAI Responses tool-call `arguments` as `{}` in both streaming and non-streaming paths.
-2. Make Anthropic streaming tolerant of missing optional usage/stop metadata while preserving raw evidence and normalized output.
-3. Make managed CLI decoders tolerate a bounded number of non-JSON noise lines before failing with a protocol error; tolerated diagnostics must not include raw line content.
-4. Make usage detail parsing skip non-object detail fields such as `null` instead of failing the whole usage payload.
-5. Add one focused regression test per required tolerance path.
-6. Update the owning docs/review entry and mark only M7-4 as `[DONE]` after validation passes.
-7. Commit all intended changes with an M7-4-specific message, then stop.
+1. `ContentBlock` 增加 `Unknown { type_name, raw }`，改为手写 `Serialize`/`Deserialize`：未知 `type` 进入 `Unknown`，已知类型仍按既有规则严格校验，`Unknown` 序列化 best-effort 原样输出 `raw`。
+2. 扩展 stream 事件模型与 accumulator：新增未知块 kind/delta，使流式 adapter 可把 provider 未知块折叠为 `ContentBlock::Unknown`。
+3. Anthropic/OpenAI 非流式与流式 adapter 接入未知块保留；请求构造侧对 `Unknown.raw` 直接透传。
+4. conversation validator 允许 assistant 顶层 `Unknown`，用户消息和 tool-result 内容仍按既有语法拒绝，并给出 `unknown` kind。
+5. 补 model、adapter 非流式/流式、conversation validator 测试；更新 `lib.rs`、审查文档和 `TODO.md` 完成记录。
 
-## Execution Steps
-
-1. Check latest commit for directly relevant unfinished M7-4 work and inspect current git status without altering unrelated changes.
-2. Inspect the implementation points listed in `TODO.md`: OpenAI Responses convert/stream normalizer, Anthropic stream wire/normalizer, Claude/Codex/OpenCode decoders, and `Usage` deserialization.
-3. Apply small targeted patches for each tolerance class, re-reading affected sections before edits.
-4. Add/adjust unit tests for the four required behavior classes.
-5. Run targeted tests first where useful, then required validation in order: `cargo fmt --all`, `cargo clippy --all-targets -- -D warnings`, external-feature clippy, `cargo test -p agent-lib --lib`, external feature tests, full suite if needed by observed changes, and rustdoc.
-6. If any failing test appears and is not already explicitly scheduled, fix it or add the minimum prerequisite/follow-up task before marking M7-4 complete.
-7. Update `TODO.md` completion record and `docs/review-2026-07.md` M7-4-related entries after implementation and validation.
-8. Commit all changed files, including this plan file, and stop without starting M7-5.
-
-## Progress Log
-
-- Read `TODO.md` and selected first incomplete task: `M7-4 [TODO] 线缆容错批量修复`.
-- Wrote this updated execution plan before running build, test, or Git commands.
-- Latest commit checked: `[M7-3] Relax OpenAI stream sequence validation`; it does not identify unfinished work that blocks M7-4.
-- Implemented the four M7-4 tolerance classes: empty OpenAI function arguments parse as `{}`, Anthropic missing usage/stop metadata no longer aborts streams, CLI decoders tolerate up to 8 consecutive non-JSON noise lines, and non-object usage details stay in `extra` instead of failing deserialization.
-- Targeted validation passed: `cargo test -p agent-lib --lib adapter::openai_resp`, `cargo test -p agent-lib --lib adapter::anthropic`, `cargo test -p agent-lib --lib model::usage`, and `cargo test -p agent-lib --features "external-claude-code external-codex external-opencode" --lib agent::external`.
-- Full validation passed: `cargo fmt --all`, default clippy, external-feature clippy including ACP, `cargo test -p agent-lib --lib`, `cargo test --all --all-targets`, `cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`, and rustdoc with `-D warnings`.
-- `TODO.md` now marks M7-4 as `[DONE]`; `docs/review-2026-07.md` marks the four M7-4 protocol parsing bullets fixed while leaving the `ContentBlock` Unknown item for M7-5.
-- After final cassette-test adjustments, default clippy, external-feature clippy, and rustdoc were rerun and passed.
+进度更新：代码实现、`lib.rs` 前向兼容文档、`docs/review-2026-07.md` 标注、`TODO.md` `[DONE]` 与完成记录均已完成。验证已通过：`cargo fmt --all`、默认 clippy、external feature clippy、相关定向测试、`cargo test --all --all-targets`、rustdoc。下一步检查 diff/status 并提交本任务改动，然后停止。

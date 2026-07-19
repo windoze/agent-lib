@@ -154,7 +154,7 @@ fn block_texts(block: &ContentBlock) -> Vec<String> {
         }
         ContentBlock::ToolResult { content, .. } => content.iter().flat_map(block_texts).collect(),
         ContentBlock::ToolUse { id, name, .. } => vec![format!("tool_use:{name}:{id}")],
-        ContentBlock::Image { .. } => Vec::new(),
+        ContentBlock::Image { .. } | ContentBlock::Unknown { .. } => Vec::new(),
     }
 }
 

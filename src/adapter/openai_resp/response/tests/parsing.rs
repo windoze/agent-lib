@@ -185,6 +185,12 @@ fn reasoning_refusal_and_unknown_items_preserve_structured_evidence() {
         extra[RESPONSE_EXTRA_KEY]["content"]["provider_refusal_code"],
         json!("policy")
     );
+    let ContentBlock::Unknown { type_name, raw } = &response.message.content[3] else {
+        panic!("future message content should be retained as unknown block");
+    };
+    assert_eq!(type_name.as_deref(), Some("future_content"));
+    assert_eq!(raw["type"], json!("future_content"));
+    assert_eq!(raw["payload"], json!({ "kept": true }));
 
     assert_eq!(response.stop_reason.value, StopReason::Refusal);
     assert_eq!(response.stop_reason.raw.as_deref(), Some("refusal"));
@@ -196,9 +202,8 @@ fn reasoning_refusal_and_unknown_items_preserve_structured_evidence() {
     let unmodeled = response.extra[UNMODELED_OUTPUT_KEY]
         .as_array()
         .expect("unknown output evidence should be an array");
-    assert_eq!(unmodeled.len(), 2);
-    assert_eq!(unmodeled[0]["content"]["type"], json!("future_content"));
-    assert_eq!(unmodeled[1]["type"], json!("web_search_call"));
+    assert_eq!(unmodeled.len(), 1);
+    assert_eq!(unmodeled[0]["type"], json!("web_search_call"));
 }
 
 #[test]

@@ -429,7 +429,8 @@ impl<'a> PairingProviderIdResolver<'a> {
                     }
                     ContentBlock::Text { .. }
                     | ContentBlock::Image { .. }
-                    | ContentBlock::Thinking { .. } => {}
+                    | ContentBlock::Thinking { .. }
+                    | ContentBlock::Unknown { .. } => {}
                 }
             }
         }

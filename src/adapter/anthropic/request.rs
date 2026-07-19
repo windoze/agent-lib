@@ -186,6 +186,7 @@ fn content_to_wire(block: &ContentBlock) -> Value {
             }
             fields
         }
+        ContentBlock::Unknown { raw, .. } => return raw.clone(),
     };
 
     Value::Object(fields)

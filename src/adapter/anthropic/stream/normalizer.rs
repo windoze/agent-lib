@@ -193,6 +193,11 @@ impl StreamNormalizer {
                 },
                 Vec::new(),
             ),
+            ContentBlockStart::Unknown { type_name, raw } => (
+                BlockKind::Unknown { type_name, raw },
+                ActiveBlockKind::Unknown,
+                Vec::new(),
+            ),
         };
 
         self.blocks.insert(
@@ -253,6 +258,9 @@ impl StreamNormalizer {
                 json.push_str(&partial_json);
                 Delta::Json(partial_json)
             }
+            (ActiveBlockKind::Unknown, ContentBlockDelta::Unknown { raw, .. }) => {
+                Delta::Unknown(raw)
+            }
             (kind, _) => {
                 return Err(invalid_stream(format!(
                     "content block index {index} expects {} deltas but received {delta_name}",
@@ -296,7 +304,7 @@ impl StreamNormalizer {
             } else {
                 initial_input.clone()
             }),
-            ActiveBlockKind::Text | ActiveBlockKind::Reasoning => None,
+            ActiveBlockKind::Text | ActiveBlockKind::Reasoning | ActiveBlockKind::Unknown => None,
         };
         block.stopped = true;
 
@@ -367,6 +375,7 @@ enum ActiveBlockKind {
         json: String,
         saw_delta: bool,
     },
+    Unknown,
 }
 
 impl ActiveBlockKind {
@@ -376,6 +385,7 @@ impl ActiveBlockKind {
             Self::Text => "text",
             Self::Reasoning => "thinking or signature",
             Self::ToolInput { .. } => "input_json",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -442,6 +452,7 @@ fn wire_delta_name(delta: &ContentBlockDelta) -> &'static str {
         ContentBlockDelta::InputJson { .. } => "input_json",
         ContentBlockDelta::Thinking { .. } => "thinking",
         ContentBlockDelta::Signature { .. } => "signature",
+        ContentBlockDelta::Unknown { .. } => "unknown",
     }
 }
 

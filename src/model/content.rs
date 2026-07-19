@@ -9,19 +9,18 @@ mod serialization;
 /// A complete provider-neutral message content block.
 ///
 /// Streaming adapters should fold deltas into this shape only after a block is
-/// complete. Unknown provider fields are retained in each variant's `extra`
-/// map for forward compatibility. Tool results serialize one authoritative
-/// [`ToolStatus`]; deserialization also migrates the historical `is_error`
-/// boolean and rejects contradictory dual representations.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// complete. Unknown provider fields are retained in each known variant's
+/// `extra` map for forward compatibility; entirely unknown provider block
+/// types are retained as [`ContentBlock::Unknown`]. Tool results serialize one
+/// authoritative [`ToolStatus`]; deserialization also migrates the historical
+/// `is_error` boolean and rejects contradictory dual representations.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContentBlock {
     /// Plain model- or user-authored text.
     Text {
         /// The text payload.
         text: String,
         /// Provider-specific fields this crate does not model yet.
-        #[serde(default, skip_serializing_if = "Map::is_empty", flatten)]
         extra: Map<String, Value>,
     },
     /// An image supplied either by URL or by inline base64 data.
@@ -29,7 +28,6 @@ pub enum ContentBlock {
         /// The image location or inline bytes.
         source: ImageSource,
         /// Provider-specific fields this crate does not model yet.
-        #[serde(default, skip_serializing_if = "Map::is_empty", flatten)]
         extra: Map<String, Value>,
     },
     /// A request from the model to call a tool.
@@ -39,10 +37,8 @@ pub enum ContentBlock {
         /// Tool name selected by the model.
         name: String,
         /// Fully parsed tool input JSON.
-        #[serde(default)]
         input: Value,
         /// Provider-specific fields this crate does not model yet.
-        #[serde(default, skip_serializing_if = "Map::is_empty", flatten)]
         extra: Map<String, Value>,
     },
     /// The result returned for a prior tool call.
@@ -50,17 +46,10 @@ pub enum ContentBlock {
         /// Identifier of the tool call this result answers.
         tool_use_id: String,
         /// Multimodal result content.
-        #[serde(default)]
         content: Vec<ContentBlock>,
         /// Provider-neutral outcome of attempting the tool call.
         status: ToolStatus,
         /// Provider-specific fields this crate does not model yet.
-        #[serde(
-            default,
-            skip_serializing_if = "Map::is_empty",
-            serialize_with = "serialization::serialize_tool_result_extra",
-            flatten
-        )]
         extra: Map<String, Value>,
     },
     /// Model thinking or reasoning text.
@@ -68,11 +57,20 @@ pub enum ContentBlock {
         /// Thinking/reasoning text.
         text: String,
         /// Provider signature proving or validating the thinking block.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
         /// Provider-specific fields this crate does not model yet.
-        #[serde(default, skip_serializing_if = "Map::is_empty", flatten)]
         extra: Map<String, Value>,
+    },
+    /// A provider content block whose `type` tag is not modeled by this crate.
+    ///
+    /// The original JSON value is preserved for one-way forward compatibility.
+    /// Serializing it writes `raw` back best-effort, but exact round-trip
+    /// fidelity is not part of the public contract.
+    Unknown {
+        /// The original provider `type` tag when it was a string.
+        type_name: Option<String>,
+        /// The complete block JSON as observed at the provider boundary.
+        raw: Value,
     },
 }
 

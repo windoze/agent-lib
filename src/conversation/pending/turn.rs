@@ -227,7 +227,8 @@ impl PendingTurn {
                 ContentBlock::Text { .. }
                 | ContentBlock::Image { .. }
                 | ContentBlock::ToolResult { .. }
-                | ContentBlock::Thinking { .. } => None,
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::Unknown { .. } => None,
             })
             .collect::<Vec<_>>();
 
@@ -430,6 +431,7 @@ fn content_kind(block: &ContentBlock) -> ContentBlockKind {
         ContentBlock::ToolUse { .. } => ContentBlockKind::ToolUse,
         ContentBlock::ToolResult { .. } => ContentBlockKind::ToolResult,
         ContentBlock::Thinking { .. } => ContentBlockKind::Thinking,
+        ContentBlock::Unknown { .. } => ContentBlockKind::Unknown,
     }
 }
 

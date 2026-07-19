@@ -75,14 +75,21 @@ impl ActivePart {
             _ => None,
         };
         let Some(kind) = kind else {
+            let block_id = content_block_id(item_id, content_index);
             return Ok((
                 Self {
                     kind: None,
-                    block_id: None,
+                    block_id: Some(block_id.clone()),
                     text: String::new(),
                     done_part: None,
                 },
-                Vec::new(),
+                vec![StreamEvent::BlockStart {
+                    id: block_id,
+                    kind: BlockKind::Unknown {
+                        type_name: Some(part_type),
+                        raw: part,
+                    },
+                }],
             ));
         };
         let text_key = if kind == PartKind::OutputText {
@@ -186,6 +193,7 @@ impl ActivePart {
             "type",
             &format!("message item `{item_id}` content {content_index}"),
         )?;
+        let mut events = Vec::new();
         if let Some(kind) = self.kind {
             if done_type != kind.wire_name() {
                 return Err(invalid_stream(format!(
@@ -204,14 +212,18 @@ impl ActivePart {
                     "content_part.done for item `{item_id}` content {content_index} disagrees with accumulated text"
                 )));
             }
+        } else if let Some(id) = &self.block_id {
+            events.push(StreamEvent::BlockDelta {
+                id: id.clone(),
+                delta: Delta::Unknown(part.clone()),
+            });
         }
 
         self.done_part = Some(part);
-        Ok(self
-            .block_id
-            .clone()
-            .map(|id| vec![StreamEvent::BlockStop { id }])
-            .unwrap_or_default())
+        if let Some(id) = &self.block_id {
+            events.push(StreamEvent::BlockStop { id: id.clone() });
+        }
+        Ok(events)
     }
 
     /// Checks the final output-message item against `content_part.done`.

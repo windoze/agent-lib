@@ -298,6 +298,31 @@ fn assistant_text_uses_output_vocabulary_and_replays_refusal_kind() {
 }
 
 #[test]
+fn unknown_content_block_request_serializes_raw_value() {
+    let raw = json!({
+        "type": "future_content",
+        "payload": { "kept": true }
+    });
+    let message = Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Unknown {
+            type_name: Some("future_content".to_owned()),
+            raw: raw.clone(),
+        }],
+    };
+
+    let items = message_to_items(0, &message).expect("serialize unknown content block");
+
+    assert_eq!(
+        items,
+        vec![json!({
+            "role": "assistant",
+            "content": [raw]
+        })]
+    );
+}
+
+#[test]
 fn parsed_item_metadata_is_replayed_but_modeled_fields_win() {
     let mut request = minimal_request();
     request.messages = vec![Message {

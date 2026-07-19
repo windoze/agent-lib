@@ -290,7 +290,8 @@ fn reject_final_tool_use(final_message: &FrozenMessage) -> Result<(), CancelErro
                 ContentBlock::Text { .. }
                 | ContentBlock::Image { .. }
                 | ContentBlock::ToolResult { .. }
-                | ContentBlock::Thinking { .. } => None,
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::Unknown { .. } => None,
             })
     {
         return Err(CancelError::FinalAssistantContainsToolUse { provider_call_id });

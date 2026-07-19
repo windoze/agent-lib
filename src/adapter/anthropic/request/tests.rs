@@ -289,6 +289,20 @@ fn each_tool_status_maps_to_anthropic_error_boolean_without_mutating_source() {
 }
 
 #[test]
+fn unknown_content_block_request_serializes_raw_value() {
+    let raw = json!({
+        "type": "future_block",
+        "provider_payload": { "kept": true }
+    });
+    let block = ContentBlock::Unknown {
+        type_name: Some("future_block".to_owned()),
+        raw: raw.clone(),
+    };
+
+    assert_eq!(content_to_wire(&block), raw);
+}
+
+#[test]
 fn optional_fields_are_omitted_and_header_auth_is_applied() {
     let endpoint = EndpointConfig {
         base_url: "https://anthropic.example.test/gateway".to_owned(),

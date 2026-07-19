@@ -1596,7 +1596,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - **文档/审查记录**：`docs/review-2026-07.md` “协议解析边角”中 M7-4 覆盖的四条已标注 `✅ 已修复（M7-4）`；未知 `ContentBlock` 兜底仍未标注，继续由 M7-5 跟进。`PLAN.md` 无阶段级变化，未更新。
 - **验证**：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib`（985 条通过）、`cargo test --all --all-targets`（默认离线全量通过，真实端点/CLI 测试保持 ignored）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（external/acp 全目标通过，真实 CLI 测试 ignored）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。无 breaking change（仅放宽 wire/CLI 容错，公共 API 形状不变）。
 
-### M7-5 [TODO] `ContentBlock` 增加反序列化兜底 variant（facade 报告 M8，单向兼容）
+### M7-5 [DONE] `ContentBlock` 增加反序列化兜底 variant（facade 报告 M8，单向兼容）
 
 上下文：
 
@@ -1616,6 +1616,17 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：含伪造未知 block 类型（如 `{"type": "future_block", "data": ...}`）的 fixture 响应，两个 adapter 的非流式与流式路径均解析成功，block 进入 `ContentBlock::Unknown` 且 `raw` 可读。
 - 单元测试：`Unknown` 序列化输出 JSON 可再次被解析为 `Unknown`。
 - `cargo test -p agent-lib --lib model:: adapter:: conversation::` 全过（validator 相关既有测试不受影响）。
+
+完成记录：
+
+- **模型层兜底**：`ContentBlock` 新增 `Unknown { type_name: Option<String>, raw: Value }`。`content/serialization.rs` 改为手写 `Serialize`/`Deserialize`：未知 `type` 标签进入 `Unknown` 并保留完整 raw JSON；已知标签仍走严格内部 tagged enum 解码与既有 tool-result `status`/`is_error` 迁移，已知但缺字段/字段损坏不会降级为 Unknown。`Unknown` 序列化直接写回 `raw`，文档明确为 best-effort，不承诺 provider wire 完整保真。
+- **流式事件模型**：`BlockKind::Unknown { type_name, raw }` 与 `Delta::Unknown(Value)` 加入 `StreamEvent` taxonomy；`Accumulator` 新增 Unknown partial block，按 start/delta/stop 生命周期折叠为 `ContentBlock::Unknown`。当流式 done payload 与 start payload 同 type 时以 done payload 作为更完整 raw，否则把未知 delta 记录到 `stream_deltas` 证据字段。
+- **adapter 接线**：Anthropic 非流式 `AnthropicContentBlock` 与流式 `ContentBlockStart`/`ContentBlockDelta` 均改为“已知类型严格解析，未知类型保留 raw”；OpenAI Responses 非流式未知 message content part 进入 `ContentBlock::Unknown`（未知 top-level output item 仍保留在 response metadata）；OpenAI stream 未知 content part 通过 Unknown block 事件折叠。两个 request mapper 对 `ContentBlock::Unknown` 直接透传 `raw`，不新增本地拒绝路径。
+- **conversation 与断言工具**：commit/freeze validator 允许 assistant 顶层 `Unknown` 作为 provider 输出证据；user message 与 tool-result nested content 仍按既有 grammar 拒绝未知块，并新增 `ContentBlockKind::Unknown` 诊断分类。补齐 `src/`、`crates/agent-testkit/` 与 `tests/` 中所有 `match ContentBlock` 穷尽点。
+- **测试**：新增/更新模型 unknown serde 测试、已知损坏 block 不降级测试、Anthropic/OpenAI 非流式与流式 unknown block fixture、request raw 透传测试、conversation validator 正向测试；相关定向验证 `model::content`、`stream::accumulator`、`adapter::anthropic`、`adapter::openai_resp`、`conversation::validation` 全部通过。
+- **文档/审查记录**：`src/lib.rs` forward compatibility 段改为明确未知 block 由 `ContentBlock::Unknown` 保留、序列化为 best-effort；`docs/review-2026-07.md` 协议解析边角的未知 `ContentBlock` 条目标注 `✅ 已修复（M7-5）`。阶段级计划未变化，`PLAN.md` 未更新。
+- **验证**：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib model::content`、`cargo test -p agent-lib --lib stream::accumulator`、`cargo test -p agent-lib --lib adapter::anthropic`、`cargo test -p agent-lib --lib adapter::openai_resp`、`cargo test -p agent-lib --lib conversation::validation`、`cargo test --all --all-targets`（默认离线全量，真实端点/CLI 测试保持 ignored，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- **Breaking change（pre-1.0，记录在此）**：`ContentBlock`、`BlockKind`、`Delta`、`ContentBlockKind` 均新增 public variant，外部穷尽 match 需补分支；`ContentBlock` 的已知 variant 仍保持原 serde 形状，未知 block 新数据在旧版本中不可读。
 
 ### M7-6 [TODO] M7 review：adapter 收口
 

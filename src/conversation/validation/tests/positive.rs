@@ -7,6 +7,7 @@ use crate::{
     model::content::ContentBlock,
     model::message::Role,
 };
+use serde_json::json;
 
 #[test]
 fn pure_text_turn_commits_with_all_invariants() {
@@ -22,6 +23,40 @@ fn pure_text_turn_commits_with_all_invariants() {
     assert_eq!(conversation.turns().len(), 1);
     assert_eq!(conversation.turns()[0].parent(), None);
     assert_closed_invariants(&conversation.turns()[0]);
+}
+
+#[test]
+fn assistant_unknown_content_block_commits_as_provider_evidence() {
+    let mut conversation = conversation();
+    let raw = json!({ "type": "future_block", "payload": { "kept": true } });
+    let data = draft(
+        10,
+        None,
+        vec![
+            message(100, Role::User, vec![text("question")]),
+            message(
+                101,
+                Role::Assistant,
+                vec![ContentBlock::Unknown {
+                    type_name: Some("future_block".to_owned()),
+                    raw: raw.clone(),
+                }],
+            ),
+        ],
+        Vec::new(),
+    );
+
+    conversation
+        .commit_draft(data)
+        .expect("assistant unknown block should be retained");
+
+    assert_eq!(
+        conversation.turns()[0].messages()[1].payload().content[0],
+        ContentBlock::Unknown {
+            type_name: Some("future_block".to_owned()),
+            raw,
+        }
+    );
 }
 
 #[test]

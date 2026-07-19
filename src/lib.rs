@@ -245,10 +245,13 @@
 //!
 //! # Forward compatibility
 //!
-//! Unknown provider response fields remain in `extra` maps, unrecognized enum
-//! strings remain in [`model::normalized::Normalized::raw`], and request-only
-//! dialect fields use provider-bound [`model::extras::ProviderExtras`]. This
-//! keeps evidence available without leaking provider wire formats into callers.
+//! Unknown provider response fields remain in `extra` maps, unknown content
+//! block types are retained as [`model::content::ContentBlock::Unknown`] with
+//! their raw JSON, unrecognized enum strings remain in
+//! [`model::normalized::Normalized::raw`], and request-only dialect fields use
+//! provider-bound [`model::extras::ProviderExtras`]. Unknown block serialization
+//! writes the retained raw value back best-effort, but exact provider round-trip
+//! fidelity is not guaranteed.
 
 #![warn(missing_docs)]
 

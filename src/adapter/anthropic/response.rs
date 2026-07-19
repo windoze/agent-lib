@@ -12,7 +12,7 @@ use crate::{
     },
 };
 use reqwest::header::RETRY_AFTER;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Map, Value};
 
 impl AnthropicAdapter {
@@ -118,15 +118,12 @@ enum AnthropicResponseRole {
 }
 
 /// Anthropic assistant-output blocks supported by the normalized model.
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicContentBlock {
     /// Provider text output plus unmodeled block metadata.
     Text {
         /// Generated text.
         text: String,
         /// Fields such as provider-specific citations or annotations.
-        #[serde(default, flatten)]
         extra: Map<String, Value>,
     },
     /// A complete provider tool invocation.
@@ -138,7 +135,6 @@ enum AnthropicContentBlock {
         /// Fully parsed tool input.
         input: Value,
         /// Provider-specific tool-use fields.
-        #[serde(default, flatten)]
         extra: Map<String, Value>,
     },
     /// Extended-thinking output and its replay signature.
@@ -146,12 +142,90 @@ enum AnthropicContentBlock {
         /// Anthropic names the reasoning payload `thinking` on the wire.
         thinking: String,
         /// Signature required when replaying thinking in later requests.
-        #[serde(default)]
         signature: Option<String>,
         /// Provider-specific thinking metadata.
+        extra: Map<String, Value>,
+    },
+    /// A future Anthropic content block retained as raw provider evidence.
+    Unknown {
+        type_name: Option<String>,
+        raw: Value,
+    },
+}
+
+/// Strict decoder for Anthropic block variants modeled by this crate.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicContentBlockData {
+    Text {
+        text: String,
         #[serde(default, flatten)]
         extra: Map<String, Value>,
     },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+        #[serde(default, flatten)]
+        extra: Map<String, Value>,
+    },
+    Thinking {
+        thinking: String,
+        #[serde(default)]
+        signature: Option<String>,
+        #[serde(default, flatten)]
+        extra: Map<String, Value>,
+    },
+}
+
+impl<'de> Deserialize<'de> for AnthropicContentBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let Some(type_name) = value.get("type").and_then(Value::as_str) else {
+            let data = AnthropicContentBlockData::deserialize(value).map_err(D::Error::custom)?;
+            return Ok(Self::from(data));
+        };
+        if !matches!(type_name, "text" | "tool_use" | "thinking") {
+            return Ok(Self::Unknown {
+                type_name: Some(type_name.to_owned()),
+                raw: value,
+            });
+        }
+
+        let data = AnthropicContentBlockData::deserialize(value).map_err(D::Error::custom)?;
+        Ok(Self::from(data))
+    }
+}
+
+impl From<AnthropicContentBlockData> for AnthropicContentBlock {
+    fn from(block: AnthropicContentBlockData) -> Self {
+        match block {
+            AnthropicContentBlockData::Text { text, extra } => Self::Text { text, extra },
+            AnthropicContentBlockData::ToolUse {
+                id,
+                name,
+                input,
+                extra,
+            } => Self::ToolUse {
+                id,
+                name,
+                input,
+                extra,
+            },
+            AnthropicContentBlockData::Thinking {
+                thinking,
+                signature,
+                extra,
+            } => Self::Thinking {
+                thinking,
+                signature,
+                extra,
+            },
+        }
+    }
 }
 
 impl From<AnthropicContentBlock> for ContentBlock {
@@ -179,6 +253,7 @@ impl From<AnthropicContentBlock> for ContentBlock {
                 signature,
                 extra,
             },
+            AnthropicContentBlock::Unknown { type_name, raw } => Self::Unknown { type_name, raw },
         }
     }
 }

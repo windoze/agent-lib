@@ -156,6 +156,35 @@ fn thinking_unknown_stop_and_provider_fields_are_preserved() {
     );
 }
 
+/// Unknown future content block types are retained instead of rejecting the response.
+#[test]
+fn unknown_content_block_maps_to_unknown_variant() {
+    let body = serde_json::to_vec(&json!({
+        "id": "msg_future_block",
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "redacted_thinking",
+            "data": { "reason": "policy" },
+            "provider_trace": "kept"
+        }],
+        "stop_reason": "end_turn",
+        "usage": { "input_tokens": 3, "output_tokens": 1 }
+    }))
+    .expect("serialize unknown-block fixture");
+
+    let response = AnthropicAdapter::parse_response(&body).expect("parse unknown block");
+
+    assert_eq!(response.message.content.len(), 1);
+    let ContentBlock::Unknown { type_name, raw } = &response.message.content[0] else {
+        panic!("future block should be retained as unknown");
+    };
+    assert_eq!(type_name.as_deref(), Some("redacted_thinking"));
+    assert_eq!(raw["type"], json!("redacted_thinking"));
+    assert_eq!(raw["data"], json!({ "reason": "policy" }));
+    assert_eq!(raw["provider_trace"], json!("kept"));
+}
+
 /// Ensures malformed JSON, invalid roles, and conflicting usage fail observably.
 #[test]
 fn malformed_wire_data_returns_protocol_errors() {

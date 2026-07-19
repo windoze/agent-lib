@@ -63,6 +63,13 @@ pub(super) fn message_to_items(index: usize, message: &Message) -> Result<Vec<Va
                 flush_message_item(&mut items, role, &mut message_content);
                 items.push(reasoning_to_wire(block));
             }
+            ContentBlock::Unknown { raw, .. } if message.role == Role::Tool => {
+                flush_message_item(&mut items, role, &mut message_content);
+                items.push(raw.clone());
+            }
+            ContentBlock::Unknown { .. } => {
+                message_content.push(message_content_to_wire(block, role)?);
+            }
             _ => {
                 return Err(invalid_request(format!(
                     "message {index} block {block_index} is not valid for {:?} role",
@@ -124,6 +131,7 @@ fn message_content_to_wire(
                     .to_owned(),
             ));
         }
+        (_, ContentBlock::Unknown { raw, .. }) => return Ok(raw.clone()),
         _ => unreachable!("only message-compatible content reaches this converter"),
     };
 
@@ -279,7 +287,9 @@ fn tool_output_to_wire(content: &[ContentBlock]) -> Result<Value, ClientError> {
         .iter()
         .enumerate()
         .map(|(index, block)| match block {
-            ContentBlock::Text { .. } | ContentBlock::Image { .. } => {
+            ContentBlock::Text { .. }
+            | ContentBlock::Image { .. }
+            | ContentBlock::Unknown { .. } => {
                 message_content_to_wire(block, OpenAiMessageRole::User)
             }
             _ => Err(invalid_request(format!(

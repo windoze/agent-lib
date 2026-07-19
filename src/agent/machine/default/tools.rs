@@ -703,7 +703,8 @@ impl DefaultAgentMachine {
                 ContentBlock::Text { .. }
                 | ContentBlock::Image { .. }
                 | ContentBlock::ToolResult { .. }
-                | ContentBlock::Thinking { .. } => None,
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::Unknown { .. } => None,
             })
             .collect::<Vec<_>>();
 

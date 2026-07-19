@@ -285,6 +285,9 @@ fn describe_content(message: &Message) -> String {
             } => format!("tool_result(id={tool_use_id}, {status:?})"),
             ContentBlock::Thinking { .. } => "thinking".to_owned(),
             ContentBlock::Image { .. } => "image".to_owned(),
+            ContentBlock::Unknown { type_name, .. } => {
+                format!("unknown({})", type_name.as_deref().unwrap_or("<missing>"))
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")

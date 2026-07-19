@@ -214,7 +214,8 @@ fn inspect_message(
             }
             ContentBlock::Text { .. }
             | ContentBlock::Image { .. }
-            | ContentBlock::Thinking { .. } => {}
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::Unknown { .. } => {}
         }
     }
 
@@ -237,6 +238,7 @@ pub(crate) const fn block_allowed_for_role(role: Role, block: &ContentBlock) -> 
             ContentBlock::Text { .. }
                 | ContentBlock::ToolUse { .. }
                 | ContentBlock::Thinking { .. }
+                | ContentBlock::Unknown { .. }
         ) | (Role::Tool, ContentBlock::ToolResult { .. })
     )
 }
@@ -309,5 +311,6 @@ fn content_kind(block: &ContentBlock) -> ContentBlockKind {
         ContentBlock::ToolUse { .. } => ContentBlockKind::ToolUse,
         ContentBlock::ToolResult { .. } => ContentBlockKind::ToolResult,
         ContentBlock::Thinking { .. } => ContentBlockKind::Thinking,
+        ContentBlock::Unknown { .. } => ContentBlockKind::Unknown,
     }
 }

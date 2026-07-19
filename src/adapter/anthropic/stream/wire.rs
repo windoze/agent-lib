@@ -1,7 +1,7 @@
 //! Minimal Anthropic SSE wire types used by the streaming normalizer.
 
 use crate::model::message::Role;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Map, Value};
 
 /// One JSON payload carried by an Anthropic server-sent event.
@@ -90,16 +90,56 @@ pub(super) struct MessageStart {
 }
 
 /// Content-block metadata supplied by `content_block_start`.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug)]
 pub(super) enum ContentBlockStart {
     /// Assistant-visible text, normally empty at block start.
+    Text {
+        text: String,
+        _extra: Map<String, Value>,
+    },
+    /// Extended thinking, normally empty at block start.
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+        _extra: Map<String, Value>,
+    },
+    /// Tool identity plus the provider's initial input placeholder.
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+        _extra: Map<String, Value>,
+    },
+    /// A future provider block retained as raw JSON.
+    Unknown {
+        type_name: Option<String>,
+        raw: Value,
+    },
+}
+
+/// Incremental content carried by `content_block_delta`.
+#[derive(Debug)]
+pub(super) enum ContentBlockDelta {
+    /// Assistant-visible text fragment.
+    Text { text: String },
+    /// Raw, potentially incomplete tool-input JSON fragment.
+    InputJson { partial_json: String },
+    /// Extended-thinking text fragment.
+    Thinking { thinking: String },
+    /// Opaque replay-signature fragment for extended thinking.
+    Signature { signature: String },
+    /// A future provider delta retained as raw JSON.
+    Unknown { raw: Value },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentBlockStartData {
     Text {
         text: String,
         #[serde(default, flatten)]
         _extra: Map<String, Value>,
     },
-    /// Extended thinking, normally empty at block start.
     Thinking {
         thinking: String,
         #[serde(default)]
@@ -107,7 +147,6 @@ pub(super) enum ContentBlockStart {
         #[serde(default, flatten)]
         _extra: Map<String, Value>,
     },
-    /// Tool identity plus the provider's initial input placeholder.
     ToolUse {
         id: String,
         name: String,
@@ -117,22 +156,100 @@ pub(super) enum ContentBlockStart {
     },
 }
 
-/// Incremental content carried by `content_block_delta`.
+impl<'de> Deserialize<'de> for ContentBlockStart {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let Some(type_name) = value.get("type").and_then(Value::as_str) else {
+            let data = ContentBlockStartData::deserialize(value).map_err(D::Error::custom)?;
+            return Ok(Self::from(data));
+        };
+        if !matches!(type_name, "text" | "thinking" | "tool_use") {
+            return Ok(Self::Unknown {
+                type_name: Some(type_name.to_owned()),
+                raw: value,
+            });
+        }
+
+        let data = ContentBlockStartData::deserialize(value).map_err(D::Error::custom)?;
+        Ok(Self::from(data))
+    }
+}
+
+impl From<ContentBlockStartData> for ContentBlockStart {
+    fn from(data: ContentBlockStartData) -> Self {
+        match data {
+            ContentBlockStartData::Text { text, _extra } => Self::Text { text, _extra },
+            ContentBlockStartData::Thinking {
+                thinking,
+                signature,
+                _extra,
+            } => Self::Thinking {
+                thinking,
+                signature,
+                _extra,
+            },
+            ContentBlockStartData::ToolUse {
+                id,
+                name,
+                input,
+                _extra,
+            } => Self::ToolUse {
+                id,
+                name,
+                input,
+                _extra,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(super) enum ContentBlockDelta {
-    /// Assistant-visible text fragment.
+enum ContentBlockDeltaData {
     #[serde(rename = "text_delta")]
     Text { text: String },
-    /// Raw, potentially incomplete tool-input JSON fragment.
     #[serde(rename = "input_json_delta")]
     InputJson { partial_json: String },
-    /// Extended-thinking text fragment.
     #[serde(rename = "thinking_delta")]
     Thinking { thinking: String },
-    /// Opaque replay-signature fragment for extended thinking.
     #[serde(rename = "signature_delta")]
     Signature { signature: String },
+}
+
+impl<'de> Deserialize<'de> for ContentBlockDelta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let Some(type_name) = value.get("type").and_then(Value::as_str) else {
+            let data = ContentBlockDeltaData::deserialize(value).map_err(D::Error::custom)?;
+            return Ok(Self::from(data));
+        };
+        if !matches!(
+            type_name,
+            "text_delta" | "input_json_delta" | "thinking_delta" | "signature_delta"
+        ) {
+            return Ok(Self::Unknown { raw: value });
+        }
+
+        let data = ContentBlockDeltaData::deserialize(value).map_err(D::Error::custom)?;
+        Ok(Self::from(data))
+    }
+}
+
+impl From<ContentBlockDeltaData> for ContentBlockDelta {
+    fn from(data: ContentBlockDeltaData) -> Self {
+        match data {
+            ContentBlockDeltaData::Text { text } => Self::Text { text },
+            ContentBlockDeltaData::InputJson { partial_json } => Self::InputJson { partial_json },
+            ContentBlockDeltaData::Thinking { thinking } => Self::Thinking { thinking },
+            ContentBlockDeltaData::Signature { signature } => Self::Signature { signature },
+        }
+    }
 }
 
 /// Final message metadata supplied before `message_stop`.

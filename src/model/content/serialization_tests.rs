@@ -136,6 +136,41 @@ fn present_but_invalid_status_fields_do_not_acquire_legacy_defaults() {
 }
 
 #[test]
+fn unknown_content_block_preserves_raw_json_best_effort() {
+    let raw = json!({
+        "type": "future_block",
+        "data": { "kept": true },
+        "nested": [{ "x": 1 }]
+    });
+    let block: ContentBlock = serde_json::from_value(raw.clone()).expect("decode unknown block");
+
+    assert_eq!(
+        block,
+        ContentBlock::Unknown {
+            type_name: Some("future_block".to_owned()),
+            raw: raw.clone(),
+        }
+    );
+    let encoded = serde_json::to_value(&block).expect("serialize unknown block");
+    assert_eq!(encoded, raw);
+    assert_eq!(
+        serde_json::from_value::<ContentBlock>(encoded).expect("decode serialized unknown"),
+        block
+    );
+}
+
+#[test]
+fn malformed_known_content_block_is_not_downgraded_to_unknown() {
+    let error = serde_json::from_value::<ContentBlock>(json!({
+        "type": "tool_use",
+        "id": "toolu_missing_name"
+    }))
+    .expect_err("known block with missing required fields must stay invalid");
+
+    assert!(error.to_string().contains("missing field `name`"));
+}
+
+#[test]
 fn modeled_and_legacy_keys_in_extra_cannot_override_normalized_fields() {
     let block = tool_result(
         ToolStatus::Cancelled,

@@ -108,6 +108,7 @@ fn clear_content_extras(blocks: &mut [ContentBlock]) {
                 extra.clear();
                 clear_content_extras(content);
             }
+            ContentBlock::Unknown { .. } => {}
         }
     }
 }

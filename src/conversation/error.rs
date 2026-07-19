@@ -24,6 +24,8 @@ pub enum ContentBlockKind {
     ToolResult,
     /// A model thinking/reasoning block.
     Thinking,
+    /// A provider block type this crate does not model yet.
+    Unknown,
 }
 
 impl fmt::Display for ContentBlockKind {
@@ -34,6 +36,7 @@ impl fmt::Display for ContentBlockKind {
             Self::ToolUse => "tool_use",
             Self::ToolResult => "tool_result",
             Self::Thinking => "thinking",
+            Self::Unknown => "unknown",
         };
         formatter.write_str(name)
     }

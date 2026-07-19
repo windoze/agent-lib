@@ -61,6 +61,14 @@ pub enum BlockKind {
         /// Provider-assigned identifier used to correlate the tool response.
         tool_call_id: String,
     },
+    /// A complete provider block kind this crate does not model yet.
+    Unknown {
+        /// The provider `type` tag when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        type_name: Option<String>,
+        /// The raw provider block value observed at the stream boundary.
+        raw: Value,
+    },
 }
 
 /// Incremental payload emitted for a streaming content block.
@@ -84,6 +92,8 @@ pub enum Delta {
     /// completed [`crate::model::content::ContentBlock::Thinking`] can be sent
     /// back to the provider without losing its signature.
     ReasoningSignature(String),
+    /// Raw provider payload for an unknown block kind.
+    Unknown(Value),
 }
 
 /// A provider-neutral event emitted while an LLM response is streaming.
@@ -222,6 +232,10 @@ mod tests {
                 tool_name: "get_weather".to_owned(),
                 tool_call_id: "call_weather_1".to_owned(),
             },
+            BlockKind::Unknown {
+                type_name: Some("future_block".to_owned()),
+                raw: json!({ "type": "future_block", "payload": true }),
+            },
         ] {
             assert_json_round_trip(kind);
         }
@@ -255,6 +269,7 @@ mod tests {
             Delta::Json("{\"city\":\"Shang".to_owned()),
             Delta::Reasoning("considering weather data".to_owned()),
             Delta::ReasoningSignature("opaque-signature".to_owned()),
+            Delta::Unknown(json!({ "type": "future_delta", "payload": true })),
         ] {
             assert_json_round_trip(delta);
         }

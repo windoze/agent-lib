@@ -2,8 +2,10 @@
 
 use super::{ContentBlock, ImageSource};
 use crate::model::tool::ToolStatus;
-use serde::{Deserialize, Deserializer, Serializer, de::Error as _, ser::SerializeMap};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::Error as _};
 use serde_json::{Map, Value};
+
+const KNOWN_CONTENT_TYPES: &[&str] = &["text", "image", "tool_use", "tool_result", "thinking"];
 
 /// Deserializes every content variant while giving tool results one migration
 /// point for the historical `is_error` representation.
@@ -55,45 +57,145 @@ impl<'de> Deserialize<'de> for ContentBlock {
     where
         D: Deserializer<'de>,
     {
-        let data = ContentBlockData::deserialize(deserializer)?;
+        let value = Value::deserialize(deserializer)?;
+        let Some(type_name) = value.get("type").and_then(Value::as_str) else {
+            let data = ContentBlockData::deserialize(value).map_err(D::Error::custom)?;
+            return content_block_from_data(data).map_err(D::Error::custom);
+        };
+        if !KNOWN_CONTENT_TYPES.contains(&type_name) {
+            return Ok(Self::Unknown {
+                type_name: Some(type_name.to_owned()),
+                raw: value,
+            });
+        }
 
-        match data {
-            ContentBlockData::Text { text, extra } => Ok(Self::Text { text, extra }),
-            ContentBlockData::Image { source, extra } => Ok(Self::Image { source, extra }),
-            ContentBlockData::ToolUse {
+        let data = ContentBlockData::deserialize(value).map_err(D::Error::custom)?;
+        content_block_from_data(data).map_err(D::Error::custom)
+    }
+}
+
+impl Serialize for ContentBlock {
+    /// Encodes known blocks in the normalized schema and writes unknown raw
+    /// provider blocks back best-effort without promising exact fidelity.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let value = match self {
+            Self::Text { text, extra } => {
+                let mut fields = extra.clone();
+                insert_string(&mut fields, "type", "text");
+                insert_string(&mut fields, "text", text);
+                Value::Object(fields)
+            }
+            Self::Image { source, extra } => {
+                let mut fields = extra.clone();
+                insert_string(&mut fields, "type", "image");
+                fields.insert(
+                    "source".to_owned(),
+                    serde_json::to_value(source).map_err(S::Error::custom)?,
+                );
+                Value::Object(fields)
+            }
+            Self::ToolUse {
                 id,
                 name,
                 input,
                 extra,
-            } => Ok(Self::ToolUse {
-                id,
-                name,
-                input,
-                extra,
-            }),
-            ContentBlockData::ToolResult {
+            } => {
+                let mut fields = extra.clone();
+                insert_string(&mut fields, "type", "tool_use");
+                insert_string(&mut fields, "id", id);
+                insert_string(&mut fields, "name", name);
+                fields.insert("input".to_owned(), input.clone());
+                Value::Object(fields)
+            }
+            Self::ToolResult {
                 tool_use_id,
                 content,
                 status,
-                is_error,
                 extra,
-            } => Ok(Self::ToolResult {
-                tool_use_id,
-                content,
-                status: migrate_tool_status(status, is_error).map_err(D::Error::custom)?,
-                extra,
-            }),
-            ContentBlockData::Thinking {
+            } => {
+                let mut fields = extra
+                    .iter()
+                    .filter(|(key, _)| !is_modeled_tool_result_key(key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<Map<_, _>>();
+                insert_string(&mut fields, "type", "tool_result");
+                insert_string(&mut fields, "tool_use_id", tool_use_id);
+                fields.insert(
+                    "content".to_owned(),
+                    serde_json::to_value(content).map_err(S::Error::custom)?,
+                );
+                fields.insert(
+                    "status".to_owned(),
+                    serde_json::to_value(status).map_err(S::Error::custom)?,
+                );
+                Value::Object(fields)
+            }
+            Self::Thinking {
                 text,
                 signature,
                 extra,
-            } => Ok(Self::Thinking {
-                text,
-                signature,
-                extra,
-            }),
-        }
+            } => {
+                let mut fields = extra.clone();
+                insert_string(&mut fields, "type", "thinking");
+                insert_string(&mut fields, "text", text);
+                if let Some(signature) = signature {
+                    insert_string(&mut fields, "signature", signature);
+                } else {
+                    fields.remove("signature");
+                }
+                Value::Object(fields)
+            }
+            Self::Unknown { raw, .. } => raw.clone(),
+        };
+
+        value.serialize(serializer)
     }
+}
+
+fn content_block_from_data(data: ContentBlockData) -> Result<ContentBlock, String> {
+    match data {
+        ContentBlockData::Text { text, extra } => Ok(ContentBlock::Text { text, extra }),
+        ContentBlockData::Image { source, extra } => Ok(ContentBlock::Image { source, extra }),
+        ContentBlockData::ToolUse {
+            id,
+            name,
+            input,
+            extra,
+        } => Ok(ContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            extra,
+        }),
+        ContentBlockData::ToolResult {
+            tool_use_id,
+            content,
+            status,
+            is_error,
+            extra,
+        } => Ok(ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            status: migrate_tool_status(status, is_error)?,
+            extra,
+        }),
+        ContentBlockData::Thinking {
+            text,
+            signature,
+            extra,
+        } => Ok(ContentBlock::Thinking {
+            text,
+            signature,
+            extra,
+        }),
+    }
+}
+
+fn insert_string(fields: &mut Map<String, Value>, key: &str, value: &str) {
+    fields.insert(key.to_owned(), Value::String(value.to_owned()));
 }
 
 /// Distinguishes an absent migration field from a present `null`, so malformed
@@ -129,26 +231,6 @@ fn migrate_tool_status(
         // Historical successful results omitted their default false flag.
         (None, None) => Ok(ToolStatus::Ok),
     }
-}
-
-/// Serializes only unmodeled tool-result fields. Modeled keys and the legacy
-/// boolean can never override or duplicate the normalized status.
-pub(super) fn serialize_tool_result_extra<S>(
-    extra: &Map<String, Value>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let retained = extra
-        .iter()
-        .filter(|(key, _)| !is_modeled_tool_result_key(key))
-        .collect::<Vec<_>>();
-    let mut map = serializer.serialize_map(Some(retained.len()))?;
-    for (key, value) in retained {
-        map.serialize_entry(key, value)?;
-    }
-    map.end()
 }
 
 /// Identifies fields owned by the normalized tool-result schema rather than

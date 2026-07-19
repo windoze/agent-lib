@@ -114,7 +114,8 @@ fn canonical_tool_facts(messages: &[Message]) -> (BTreeSet<String>, BTreeMap<Str
                 }
                 ContentBlock::Text { .. }
                 | ContentBlock::Image { .. }
-                | ContentBlock::Thinking { .. } => {}
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::Unknown { .. } => {}
             }
         }
     }
