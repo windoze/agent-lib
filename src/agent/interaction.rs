@@ -49,13 +49,62 @@ pub struct Interaction {
     pub step_id: StepId,
     /// What is being asked of the "user".
     pub kind: InteractionKind,
+    /// Optional rendering attribution for delegated interactions.
+    ///
+    /// Root-agent interactions leave this empty. Delegated interactions can set
+    /// it to show which delegate asked and at what delegation depth. This is
+    /// only display attribution; privileged-action authority remains on
+    /// [`PermissionRequest::actor`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Box<InteractionOrigin>>,
+}
+
+/// Display attribution for an [`Interaction`] raised by a delegated agent.
+///
+/// `delegate` is the child/delegate name that should be shown to the user, and
+/// `depth` is the delegation depth from [`RunContext`](crate::agent::RunContext).
+/// This attribution answers "who asked through the delegation chain" for
+/// rendering only; it is intentionally separate from
+/// [`PermissionRequest::actor`], which remains the permission subject.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionOrigin {
+    /// Delegate name to display as the interaction origin.
+    pub delegate: String,
+    /// Delegation depth associated with the delegate.
+    pub depth: u32,
+}
+
+impl InteractionOrigin {
+    /// Creates delegated rendering attribution.
+    #[must_use]
+    pub fn new(delegate: impl Into<String>, depth: u32) -> Self {
+        Self {
+            delegate: delegate.into(),
+            depth,
+        }
+    }
 }
 
 impl Interaction {
     /// Creates an interaction addressed to `step_id`.
     #[must_use]
     pub const fn new(step_id: StepId, kind: InteractionKind) -> Self {
-        Self { step_id, kind }
+        Self {
+            step_id,
+            kind,
+            origin: None,
+        }
+    }
+
+    /// Annotates this interaction with delegated rendering attribution.
+    ///
+    /// Use this in routing layers when an interaction raised by a child agent is
+    /// forwarded to a parent handler. Root-agent interactions should keep
+    /// [`origin`](Self::origin) empty.
+    #[must_use]
+    pub fn with_origin(mut self, origin: InteractionOrigin) -> Self {
+        self.origin = Some(Box::new(origin));
+        self
     }
 
     /// Creates a degenerate yes/no approval interaction for one tool call.
@@ -102,6 +151,13 @@ impl Interaction {
     #[must_use]
     pub const fn kind(&self) -> &InteractionKind {
         &self.kind
+    }
+
+    /// Returns delegated rendering attribution, when this interaction was
+    /// raised by a child agent.
+    #[must_use]
+    pub fn origin(&self) -> Option<&InteractionOrigin> {
+        self.origin.as_deref()
     }
 
     /// Checks that `response` is a valid answer to this interaction.
@@ -398,7 +454,9 @@ pub enum InteractionError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Interaction, InteractionError, InteractionKindTag, InteractionResponse};
+    use super::{
+        Interaction, InteractionError, InteractionKindTag, InteractionOrigin, InteractionResponse,
+    };
     use crate::{
         agent::{
             AgentId, StepId,
@@ -410,6 +468,7 @@ mod tests {
         conversation::ToolCallId,
     };
     use serde::{Serialize, de::DeserializeOwned};
+    use serde_json::json;
     use std::fmt::Debug;
 
     fn actor() -> AgentId {
@@ -461,6 +520,46 @@ mod tests {
         let encoded = serde_json::to_value(value).expect("serialize");
         let decoded: T = serde_json::from_value(encoded).expect("deserialize");
         assert_eq!(&decoded, value);
+    }
+
+    #[test]
+    fn interaction_without_origin_omits_origin_and_round_trips() {
+        let interaction = Interaction::question(step_id(), "how?".to_owned());
+
+        assert_eq!(interaction.origin(), None);
+        let encoded = serde_json::to_value(&interaction).expect("serialize");
+        assert!(encoded.get("origin").is_none());
+        let decoded: Interaction = serde_json::from_value(encoded).expect("deserialize");
+        assert_eq!(decoded, interaction);
+        assert_eq!(decoded.origin(), None);
+    }
+
+    #[test]
+    fn interaction_with_origin_round_trips() {
+        let origin = InteractionOrigin::new("codex", 1);
+        let interaction =
+            Interaction::question(step_id(), "approve?".to_owned()).with_origin(origin.clone());
+
+        assert_eq!(interaction.origin(), Some(&origin));
+        let encoded = serde_json::to_value(&interaction).expect("serialize");
+        assert_eq!(
+            encoded.get("origin"),
+            Some(&json!({ "delegate": "codex", "depth": 1 }))
+        );
+        let decoded: Interaction = serde_json::from_value(encoded).expect("deserialize");
+        assert_eq!(decoded, interaction);
+    }
+
+    #[test]
+    fn interaction_deserializes_legacy_json_without_origin() {
+        let decoded: Interaction = serde_json::from_value(json!({
+            "step_id": step_id().to_string(),
+            "kind": { "question": { "prompt": "old" } }
+        }))
+        .expect("deserialize legacy interaction");
+
+        assert_eq!(decoded.origin(), None);
+        assert_eq!(decoded.kind().tag(), InteractionKindTag::Question);
     }
 
     #[test]

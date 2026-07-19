@@ -35,7 +35,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M1：委派交互路由（A1）
 
-### M1-1 [TODO] 交互归因模型：`Interaction` 增加可选 delegate 归因
+### M1-1 [DONE] 交互归因模型：`Interaction` 增加可选 delegate 归因
 
 上下文：
 
@@ -64,6 +64,25 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：带/不带 `origin` 的 `Interaction` serde round-trip；无 `origin` 字段的旧 JSON
   可反序列化为 `None`。
 - `cargo test -p agent-lib --lib agent::interaction` 通过。
+
+完成记录（2026-07-20）：
+
+- 在 `src/agent/interaction.rs` 新增 `InteractionOrigin { delegate: String, depth: u32 }`，并给
+  `Interaction` 增加可选 `origin` 归因字段；root 构造路径保持 `origin = None`，委派路由层可通过
+  `Interaction::with_origin` 标注归因，`Interaction::origin` 读取归因。
+- `origin` 的 wire 形状保持为可选对象字段，使用 `serde(default, skip_serializing_if = "Option::is_none")`；内部存储为
+  `Option<Box<InteractionOrigin>>`，避免新增字段放大 `Interaction` 后触发 feature-gated external 状态枚举的
+  `clippy::large_enum_variant`。
+- rustdoc 明确该归因仅用于渲染「谁通过委派链发问」，不改变权限主体；权限主体仍由
+  `PermissionRequest::actor` 表示。
+- 新增 serde 测试覆盖：无 `origin` 时省略并 round-trip、带 `origin` 时 round-trip、旧 JSON 缺失
+  `origin` 时反序列化为 `None`。
+- Breaking change：`Interaction` 是公开字段结构体，本次新增公开字段会影响外部直接使用结构体字面量构造
+  `Interaction` 的源码；既有 serde 数据向后兼容。
+- 验证通过：`cargo fmt --all`；`cargo clippy --all-targets -- -D warnings`；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  `cargo test -p agent-lib --lib agent::interaction`；`cargo test --all --all-targets`；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 
 ### M1-2 [TODO] local subagent 路径：子 agent 交互应答路由到父级注入 handler
 
