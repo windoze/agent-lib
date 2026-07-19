@@ -54,7 +54,7 @@ artifact diff key 已落地为 `cid#gen#artifact_id`）均已完成。
 - [x] L-3 评估结论记录（放宽 existing 形状 = 签名级 breaking，列入 M9-2 后续项）
 - [x] 全量门禁（fmt/clippy/external clippy/test --all/doc 全过）
 - [x] 更新 TODO.md（M3-5-3 标 DONE + M9-2 增 L-3 后续项）
-- [ ] 提交
+- [x] 提交（0dd60f9）
 
 ## 任务完成总结
 
