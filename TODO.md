@@ -401,6 +401,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `DelegationToolHandler` 的固定 route 先于 `allowed_names` 检查解析，被 reconfig 移除的委派
   工具仍可驱动委派。该需求违反由新增任务 **M2-3** 收口，本任务的「完成」不含委派工具路径。
 
+### M2-3 [DONE] 委派工具移除一致性修复
+
 上下文：
 
 - `DelegationToolHandler::fulfill`（`src/facade/delegate.rs:2136`）经 `self.route.resolve(call)`
@@ -428,6 +430,43 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `DelegationStarted` 事件；保留的委派工具正常驱动。
 - `PatchToolSet` 移除路径同样覆盖（review 指出的测试缺口）。
 - `cargo test -p agent-lib --lib facade::` 通过。
+
+完成记录（2026-07-20）：
+
+- 选型：**解析时查 slot registry**（而非按 active tool set 重建 route）。`DelegationToolHandler`
+  的 base `ToolRegistryHandler` 本就持有共享 `SharedRegistry` slot——run 起点的过滤 registry 与
+  turn 边界 `ReconfigRegistryHandler` 换入的新 registry 是同一个 slot 的不同安装值。在 `fulfill`
+  解析前查一次当前 slot registry 的声明集（`ActiveFacadeToolRegistry::declarations()` 与其
+  `allowed_names` 同源），一个检查点同时覆盖两条路径，不存在「route 忘了重建」的第二份状态；
+  重建 route 方案则需要把 swap 通知从 agent 层 reconfig handler 穿回 facade handler，状态双写，
+  被否。为此把 agent 层 `ToolRegistryHandler::current()` 放宽为 `pub(crate)`（仅 crate 内可见，
+  公开 API 不变）。
+- 行为：`fulfill` 中 `route.is_delegation(&call.name)` 为真但当前 registry 不再声明该名时，直接
+  返回 `ToolRuntimeError::UnknownTool` tool result，不记录 trace、不驱动委派——与普通被移除工具
+  经过滤 registry 得到的结果逐字一致。流式 `TapToolHandler` 换用同一谓词
+  （`DelegationToolHandler::is_active_delegation`），被移除的委派工具落入普通 ToolStarted/
+  ToolFinished 括号，不再发出 `DelegationStarted`/`DelegationFinished`；未移除的委派工具路径
+  逐字节不变（谓词在声明集包含该名时退化为原 `is_delegation`）。
+- 文件：`src/agent/drive/reference.rs`（`current()` 放宽 `pub(crate)`）、
+  `src/facade/delegate.rs`（`fulfill` 前置 active-set 检查；`is_delegation` 换成
+  `is_active_delegation` + 私有 `active_set_declares`；struct rustdoc 记录该语义）、
+  `src/facade/agent/stream.rs`（tap 改用 `is_active_delegation`）、
+  `src/facade/agent/tests.rs`（新增两个测试 + `delegating_agent` fixture）、
+  `docs/mag-gaps.md`（A2 标注 ✅ 已修复（M2-3），并把 snapshot/restore 后续项指向 M2-4）、
+  `docs/facade-api.md`（同上，仅把「M2-3 继续钉住」改为 M2-4；UnknownTool 承诺本就先行，无需改
+  行为描述）。
+- 测试（全部离线、ScriptedClient）：`reconfigure_replace_tool_set_removing_a_delegate_yields_unknown_tool`
+  ——ReplaceToolSet 移除 `ask_reviewer` 后下一 run：首个 LLM request tools 只剩
+  `ask_researcher`，模型调 `ask_reviewer` 的 tool result 为 `unknown tool `ask_reviewer``，事件流
+  无 reviewer 的 DelegationStarted，保留的 `ask_researcher` 仍完成
+  DelegationStarted/Finished 括号；`reconfigure_patch_tool_set_removing_a_delegate_yields_unknown_tool`
+  ——PatchToolSet 移除路径同样钉住 UnknownTool 与零委派事件。
+- 验证通过：`cargo fmt --all`；`cargo test -p agent-lib --lib facade::`（254 passed）；
+  `cargo clippy --all-targets -- -D warnings`；`cargo clippy --all-targets --features
+  "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  `cargo test --all --all-targets`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
+- Breaking change：无（仅 `pub(crate)` 可见性调整与行为补齐，公开 API 形状不变；行为变化是让
+  文档已承诺的 UnknownTool 语义对委派工具成真）。
 
 ### M2-4 [TODO] reconfig 与 snapshot/restore 的交互确认 + 准入校验补齐 + 文档收口
 

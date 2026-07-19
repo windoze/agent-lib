@@ -1717,6 +1717,12 @@ enum Resolved<'a> {
 /// Any other call is delegated to the wrapped
 /// [`ToolRegistryHandler`](crate::agent::ToolRegistryHandler) unchanged, so an
 /// agent with no delegates behaves exactly as before (§10.1, §19).
+///
+/// Route recognition is gated on the **current** active tool set: the route is
+/// fixed per run, but the base registry sits behind a slot a turn-boundary
+/// tool-set reconfig can swap, so a call to a reconfig-removed `ask_<name>`
+/// resolves to the same `UnknownTool` tool result the filtered registry
+/// returns for any other removed tool and never drives a delegation (M2-3).
 pub(crate) struct DelegationToolHandler {
     base: ToolRegistryHandler,
     route: DelegationRoute,
@@ -1772,9 +1778,32 @@ impl DelegationToolHandler {
         }
     }
 
-    /// Reports whether `name` is a registered delegation tool.
-    pub(crate) fn is_delegation(&self, name: &str) -> bool {
-        self.route.is_delegation(name)
+    /// Reports whether `name` is a delegation tool the **current** active tool
+    /// set still declares.
+    ///
+    /// The per-run [`DelegationRoute`] is fixed at build time, but the base
+    /// registry sits behind a swappable slot: a run start filters it by
+    /// `current_tool_set` and a turn-boundary tool-set reconfig swaps a smaller
+    /// registry in. A reconfig-removed `ask_<name>` must therefore stop routing
+    /// even though the fixed route still recognizes the name — event taps use
+    /// this predicate so such a call is bracketed like any other unknown tool,
+    /// not like a delegation (M2-3).
+    pub(crate) fn is_active_delegation(&self, name: &str) -> bool {
+        self.route.is_delegation(name) && self.active_set_declares(name)
+    }
+
+    /// Reports whether the currently-installed base registry declares `name`.
+    ///
+    /// The facade's active registry advertises exactly the active tool set's
+    /// declarations and rejects every other name with `UnknownTool`, so its
+    /// declaration set is the authoritative "still active" check for both the
+    /// run-start filtered registry and a mid-run swapped one (M2-3).
+    fn active_set_declares(&self, name: &str) -> bool {
+        self.base
+            .current()
+            .declarations()
+            .iter()
+            .any(|declaration| declaration.name == name)
     }
 
     /// Drives one delegation to completion and folds its summary back as the
@@ -2133,6 +2162,16 @@ impl ToolHandler for DelegationToolHandler {
         call: &ToolCall,
         ctx: &RunContext,
     ) -> RequirementResult {
+        // The fixed per-run route still recognizes a delegation tool a
+        // tool-set reconfig removed; honor the active registry's declaration
+        // set instead and fold back the same `UnknownTool` the filtered
+        // registry returns for any other removed tool, without recording or
+        // driving a delegation (M2-3).
+        if self.route.is_delegation(&call.name) && !self.active_set_declares(&call.name) {
+            return RequirementResult::Tool(Err(ToolRuntimeError::UnknownTool {
+                name: call.name.clone(),
+            }));
+        }
         match self.route.resolve(call) {
             Resolved::Delegate { subagent, task } => {
                 self.drive_delegation(call_id, call, subagent, task, ctx)

@@ -184,7 +184,11 @@ impl ToolRegistryHandler {
 
     /// Returns the currently-installed registry, cloning the handle out from
     /// under the lock so no guard is held across the tool `await`.
-    fn current(&self) -> Arc<dyn ToolRegistry> {
+    ///
+    /// Crate-internal so wrapping handlers (the facade's delegation router) can
+    /// consult the *live* slot — a turn-boundary reconfig swap is observed here
+    /// immediately, with no separate view to keep in sync.
+    pub(crate) fn current(&self) -> Arc<dyn ToolRegistry> {
         self.registry
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())

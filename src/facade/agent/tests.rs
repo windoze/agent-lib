@@ -576,6 +576,161 @@ async fn reconfigure_patch_tool_set_updates_non_streaming_registry() {
     );
 }
 
+/// Builds a supervisor with two scripted model-routed delegates, `reviewer`
+/// and `researcher`, so a tool-set reconfig can remove one delegation tool
+/// while the other is retained.
+fn delegating_agent(client: Arc<dyn LlmClient>) -> Agent {
+    let reviewer = Agent::worker()
+        .description("Strict code reviewer.")
+        .system("You review code.")
+        .build()
+        .expect("worker builds");
+    let researcher = Agent::worker()
+        .description("Diligent researcher.")
+        .system("You research prior art.")
+        .build()
+        .expect("worker builds");
+    AgentBuilder::default()
+        .client(client)
+        .model("supervisor-model")
+        .system("You are the supervisor.")
+        .approval(Approval::auto_allow())
+        .subagent("reviewer", reviewer)
+        .subagent("researcher", researcher)
+        .build()
+        .expect("agent builds")
+}
+
+#[tokio::test]
+async fn reconfigure_replace_tool_set_removing_a_delegate_yields_unknown_tool() {
+    let client = ScriptedClient::new(vec![
+        tool_use_response_for(
+            "ask_reviewer",
+            "del-1",
+            json!({ "task": "review the diff" }),
+        ),
+        tool_use_response_for(
+            "ask_researcher",
+            "del-2",
+            json!({ "task": "find prior art" }),
+        ),
+        text_response("found three papers"),
+        text_response("reviewer unavailable; researcher reported"),
+    ]);
+    let mut agent = delegating_agent(client.clone());
+    let retained: Vec<_> = agent
+        .state()
+        .current_tool_set()
+        .tools()
+        .iter()
+        .filter(|declaration| declaration.name != "ask_reviewer")
+        .cloned()
+        .collect();
+    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), retained);
+
+    agent
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement.clone(),
+        })
+        .expect("replace-tool-set reconfig is accepted");
+
+    let output = agent
+        .run_full("Review the diff, then research prior art.")
+        .await
+        .expect("run succeeds");
+
+    assert_eq!(
+        output.reply.text(),
+        "reviewer unavailable; researcher reported"
+    );
+    assert_eq!(agent.state().current_tool_set(), &replacement);
+    // The removed delegation tool is filtered out of the advertised set.
+    assert_eq!(
+        tool_names(&client.requests()[0].tools),
+        vec!["ask_researcher"]
+    );
+    // The model's stale call gets the same UnknownTool result any other
+    // removed tool gets, folded back into the next request.
+    assert!(
+        messages_contain_tool_error(
+            &client.requests()[1].messages,
+            "unknown tool `ask_reviewer`"
+        ),
+        "the removed delegation tool yields an UnknownTool result: {:?}",
+        client.requests()[1].messages
+    );
+    // No delegation is recorded or driven for the removed tool, while the
+    // retained delegation tool still drives to completion.
+    let signature = lifecycle_signature(&output.events);
+    assert!(
+        signature
+            .iter()
+            .all(|event| !event.starts_with("DelegationStarted{delegate=reviewer")),
+        "the removed delegation tool emits no DelegationStarted: {signature:?}"
+    );
+    assert_eq!(
+        signature
+            .iter()
+            .filter(|event| event.contains("delegate=researcher"))
+            .collect::<Vec<_>>(),
+        vec![
+            "DelegationStarted{delegate=researcher,status=Completed}",
+            "DelegationFinished{delegate=researcher,status=Completed}",
+        ],
+        "the retained delegation tool still drives: {signature:?}"
+    );
+}
+
+#[tokio::test]
+async fn reconfigure_patch_tool_set_removing_a_delegate_yields_unknown_tool() {
+    let client = ScriptedClient::new(vec![
+        tool_use_response_for(
+            "ask_reviewer",
+            "del-1",
+            json!({ "task": "review the diff" }),
+        ),
+        text_response("reviewer is gone"),
+    ]);
+    let mut agent = delegating_agent(client.clone());
+    let patch = ToolSetPatch::new(
+        agent.state().current_tool_set().id(),
+        reconfig_tool_set_id(2),
+        vec!["ask_reviewer".to_owned()],
+        Vec::new(),
+    )
+    .expect("valid tool-set patch");
+
+    agent
+        .reconfigure(ReconfigRequest::PatchToolSet { patch })
+        .expect("patch-tool-set reconfig is accepted");
+
+    let output = agent
+        .run_full("Review the diff.")
+        .await
+        .expect("run succeeds");
+
+    assert_eq!(output.reply.text(), "reviewer is gone");
+    assert_eq!(
+        tool_names(agent.state().current_tool_set().tools()),
+        vec!["ask_researcher"]
+    );
+    assert!(
+        messages_contain_tool_error(
+            &client.requests()[1].messages,
+            "unknown tool `ask_reviewer`"
+        ),
+        "the patch-removed delegation tool yields an UnknownTool result: {:?}",
+        client.requests()[1].messages
+    );
+    let signature = lifecycle_signature(&output.events);
+    assert!(
+        signature
+            .iter()
+            .all(|event| !event.starts_with("Delegation")),
+        "no delegation events are emitted for the removed tool: {signature:?}"
+    );
+}
+
 #[tokio::test]
 async fn run_completes_a_tool_round_trip() {
     let client = ScriptedClient::new(vec![tool_use_response(), text_response("It is sunny.")]);

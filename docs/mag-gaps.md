@@ -90,8 +90,8 @@ permission/question/choice 仍按 M1-3 路由到父级 handler。
 状态：facade reconfig 入口与准入校验已落地（M2-1）：`Agent::reconfigure(ReconfigRequest)` 支持
 model / system overlay / tool-set declaration / loop policy 请求,skill 请求显式拒绝；facade 选择
 between-run/rest cursor 准入,active turn 返回 `InvalidState`。流式/非流式 reconfig handler 与
-`ReplaceToolSet` / `PatchToolSet` 的 live registry 一致性已修复（M2-2）；snapshot/restore 交互仍待
-M2-3/M2-R 收口。
+`ReplaceToolSet` / `PatchToolSet` 的 live registry 一致性已修复（M2-2）；被移除委派工具
+（`ask_<name>`）仍驱动委派的绕过已修复（M2-3）；snapshot/restore 交互仍待 M2-4/M2-R 收口。
 
 ### 现状
 
@@ -108,6 +108,11 @@ M2-3/M2-R 收口。
   `ToolRegistryResolver`。`ReplaceToolSet` / `PatchToolSet` 的目标声明名字必须来自已注册的 facade
   tool surface,否则准入时显式失败；每个 run 的初始 registry 也按 `state.current_tool_set()` 过滤,
   避免上一轮移除的工具在下一轮重新可执行。
+- **委派工具移除一致性（✅ 已修复，M2-3）**：`DelegationToolHandler` 的 per-run 固定 route 曾先于
+  过滤 registry 的 `allowed_names` 检查解析，被 reconfig 移除的 `ask_<name>` 仍驱动完整委派。现在
+  委派路由解析以 slot 中当前 registry 的声明集为准——run 起点过滤与 mid-run swap 共用同一检查点，
+  被移除的委派工具调用得到 `UnknownTool` tool result,不记录也不驱动委派；流式 tap 用同一谓词,
+  不再发出 `DelegationStarted`。
 - **snapshot/restore 不能替代**：恢复以快照 `AgentState` 为权威，`current_model` / system
   prompt / `current_tool_set` 声明全部保留（`facade/agent/snapshot.rs:864-869`）；重注入不同
   工具集只按名字替换执行闭包（`snapshot.rs:656-664`），模型看到的声明仍是旧快照——静默不一致。

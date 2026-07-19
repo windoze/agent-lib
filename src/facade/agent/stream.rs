@@ -974,7 +974,10 @@ impl LlmHandler for StreamingTapHandler {
 ///
 /// A delegation drives its child synchronously inside `fulfill`, so both live
 /// delegation events are emitted once the child settles, carrying the trace the
-/// handler recorded (its final status and child usage).
+/// handler recorded (its final status and child usage). The delegation branch
+/// keys on the *active* tool set: a delegation tool a turn-boundary reconfig
+/// removed falls into the ordinary bracket instead, so the model's stale call
+/// surfaces as an unknown tool with no delegation events (M2-3).
 struct TapToolHandler {
     inner: DelegationToolHandler,
     recorder: DelegationRecorder,
@@ -989,7 +992,7 @@ impl ToolHandler for TapToolHandler {
         call: &ToolCall,
         ctx: &RunContext,
     ) -> RequirementResult {
-        if self.inner.is_delegation(&call.name) {
+        if self.inner.is_active_delegation(&call.name) {
             let result = self.inner.fulfill(call_id, call, ctx).await;
             if let Some(record) = self
                 .recorder
