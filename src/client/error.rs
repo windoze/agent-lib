@@ -87,16 +87,18 @@ impl ClientError {
             return Self::Timeout;
         }
 
-        if status == 413 || body_contains_any(&body, CONTEXT_LENGTH_MARKERS) {
-            return Self::ContextLengthExceeded;
-        }
-
-        if body_contains_any(&body, CONTENT_FILTER_MARKERS) {
-            return Self::ContentFiltered;
-        }
-
         if matches!(status, 401 | 403) {
             return Self::Auth;
+        }
+
+        if (400..500).contains(&status) {
+            if status == 413 || body_contains_any(&body, CONTEXT_LENGTH_MARKERS) {
+                return Self::ContextLengthExceeded;
+            }
+
+            if body_contains_any(&body, CONTENT_FILTER_MARKERS) {
+                return Self::ContentFiltered;
+            }
         }
 
         Self::Api { status, body }

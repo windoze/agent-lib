@@ -128,7 +128,7 @@ fn context_length_status_and_provider_bodies_are_classified() {
 }
 
 #[test]
-fn content_filter_bodies_are_classified_before_generic_forbidden_status() {
+fn content_filter_bodies_are_classified_for_non_auth_client_errors() {
     let foundry_body = json!({
         "error": {
             "code": "content_filter",
@@ -141,7 +141,7 @@ fn content_filter_bodies_are_classified_before_generic_forbidden_status() {
     .to_string();
 
     assert_eq!(
-        ClientError::from_http_response(403, foundry_body, None),
+        ClientError::from_http_response(400, foundry_body, None),
         ClientError::ContentFiltered
     );
     assert_eq!(
@@ -158,6 +158,32 @@ fn authentication_statuses_are_classified_when_no_policy_error_is_present() {
             ClientError::Auth
         );
     }
+}
+
+#[test]
+fn authentication_statuses_take_precedence_over_body_markers() {
+    for (status, body) in [
+        (401, "too many tokens in the request"),
+        (403, "blocked by content policy"),
+    ] {
+        assert_eq!(
+            ClientError::from_http_response(status, body, None),
+            ClientError::Auth
+        );
+    }
+}
+
+#[test]
+fn server_errors_do_not_use_client_error_body_markers() {
+    let body = "provider echoed: too many tokens for this model";
+
+    assert_eq!(
+        ClientError::from_http_response(500, body, None),
+        ClientError::Api {
+            status: 500,
+            body: body.to_owned(),
+        }
+    );
 }
 
 #[test]

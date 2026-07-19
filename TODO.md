@@ -1493,7 +1493,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M7：adapter 健壮性与协议契约
 
-### M7-1 [TODO] HTTP 错误分类顺序修正（M-ERR-4）
+### M7-1 [DONE] HTTP 错误分类顺序修正（M-ERR-4）
 
 上下文：
 
@@ -1508,6 +1508,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：403 + "content policy" body → `Auth`；500 + "too many tokens" body → 非 `ContextLengthExceeded`；413/真实 context 超限 body 仍正确分类。
 - `cargo test -p agent-lib --lib client::error` 全过。
+
+完成记录：
+
+- `ClientError::from_http_response_at` 分类顺序调整为：429 rate limit 与 408/504 timeout 仍优先；401/403 先归 `Auth`；context/content body marker 只在非认证 4xx 内启用；5xx 不再按 body 文本猜测 `ContextLengthExceeded`/`ContentFiltered`，而是保留为 generic `Api { status, body }`。
+- 测试更新：`content_filter_bodies_are_classified_for_non_auth_client_errors` 改为 400 content-filter body；新增 `authentication_statuses_take_precedence_over_body_markers` 覆盖 401/403 + marker body → `Auth`；新增 `server_errors_do_not_use_client_error_body_markers` 覆盖 500 + `too many tokens` → `Api`；既有 context-length 测试继续覆盖 400 marker、413 status 与 422 prompt-too-long。
+- 文档：`docs/review-2026-07.md` 的 M-ERR-4 已标注 `✅ 已修复（M7-1）`。无需更新 `PLAN.md`，阶段级计划未变化。
+- 验证：`cargo test -p agent-lib --lib client::error`（12 条全过）、`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（默认离线全量，真实端点/CLI 测试保持 ignored，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 无 breaking change（仅错误分类行为修正；公共类型与签名不变）。
 
 ### M7-2 [TODO] `StreamEvent::Usage` 语义契约文档化并断言（M-ADP-1）
 
