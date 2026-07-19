@@ -48,7 +48,7 @@
 - [x] 全量验证全过：fmt、clippy（默认 + external features）、persistence 26 条、
       全量测试 exit 0（50 目标）、external features 测试 exit 0（48 目标）、cargo doc
 - [x] TODO.md M3-5-1 标 [DONE] + 完成记录（review 文档 M-CONV-3 归 M3-5-4 后统一标注）
-- [ ] 提交并停止
+- [x] 提交并停止（e32406a）
 
 ## 结果
 
