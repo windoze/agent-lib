@@ -718,6 +718,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 决策（已定，方案 b）：为**会演进的三类行**（conversation、lineage 关联、projection span）引入代次键 `generation: u64`，主键变为 `(原 key, generation)`；演进 = 插入新一代行而非更新，保持 insert-only 前提成立。代次直接复用 `ConversationRecord.structural_version`（每次结构性变更递增，天然是代次计数器）。事实表保持原样（不可变、insert-only）。
 
+决策修正（M3-5-2 落地时）：审查时「事实表不演进」的判断对 `ArtifactRecord` 不成立——artifact **内容**按 `artifact_id` 不可变，但**保留集合**是代次状态：revert 后 re-compaction 会经 `retained_current_artifacts`（`src/conversation/projection/compaction.rs`）丢弃 provenance 不再匹配 active head 的 artifact，且 `artifact_sequence` 随之重排。因此 `ArtifactRecord` 同样引入 `generation`（row schema v3），diff key 带代次；`TurnRecord`/`MessageRecord`/`ToolPairingRecord` 事实表保持原样。
+
 拆解为 M3-5-1 ~ M3-5-4，按序实施。
 
 #### M3-5-1 [DONE] schema 变更：三类行增加 `generation` 字段 + `to_rows` 写入
@@ -746,7 +748,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::persistence`（26 条全过）、`cargo test --all --all-targets`（exit 0，50 个测试目标）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（exit 0，48 个测试目标）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - Breaking change（pre-1.0，记录在此）：三个 pub Record 新增必填字段（struct literal 构造点需补，serde 旧数据不可读——按任务决策无迁移路径）；`CONVERSATION_ROW_SCHEMA_VERSION` 值变更。
 
-#### M3-5-2 [TODO] `into_snapshot` 重组：按最大代次选取演进行
+#### M3-5-2 [DONE] `into_snapshot` 重组：按最大代次选取演进行
 
 实现要求：
 
@@ -761,12 +763,25 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：同一 conversation 两个代次的行混合的行集，`into_snapshot` 选取最大代次重组出正确 snapshot。
 - 单元测试：代次稀疏/缺行（如只有 gen 1,3 无 2 的当前代次行）报明确 `InvalidRow`。
 
+完成记录：
+
+- **落点说明**：任务文本所称 `ConversationRowInsertSet::into_snapshot` 是新增——现有 `into_snapshot` 在 `ConversationRows` 上（单 conversation 行形状，无法表达多代次行集，M3-5-1 完成记录已注明该中间态）；`ConversationRowInsertSet` 的全 `Vec` 形状天然支持多代次。新增 `ConversationRowInsertSet::into_snapshot`（最大代次选取）+ `merge()`（合并多个导出生成多代次行集）+ `From<ConversationRows>`；选取/去重后构造 `ConversationRows` 委托现有严格路径重组——稠密序列、FK 可达性、owner、projection 形状校验保持单一来源，严格单代次路径行为不变。
+- **选取规则**：conversation 行必须同 owner（`ConversationMismatch`）、schema 为当前版本、`generation == structural_version`；按 `cid#generation` 去重（同键内容冲突 → `DuplicatePrimaryKey`，即「无法确定唯一最大代次」的报错形态）；取最大代次行。lineage/span/artifact 关联行：高于最大代次 → `InvalidRow`（"generation is newer than every conversation row"，store 读取不全的信号）；等于最大代次保留；低于则忽略（历史版本）。raw 非空但选中代次 lineage/span 全缺 → 明确 `InvalidRow`（避免被稠密校验误报为空 lineage/空投影而静默重组出坏 snapshot）。
+- **合并去重**：全表 `dedup_by_key`——相同行折叠（合并两个导出代次合法重复共享事实），同键内容冲突 → `DuplicatePrimaryKey`；owner 校验在代次过滤**之前**对所有行执行，外 owner 行不会被当作历史静默丢弃。
+- **决策修正（class-wide fix）**：`ArtifactRecord` 增加 `generation` 列。审查时把 artifact 归为「不可变事实、不冲突」只对 diff 侧成立；重组侧发现保留集合随代次演进——`retained_current_artifacts`（`src/conversation/projection/compaction.rs`）在 revert + re-compaction 后丢弃 provenance 不再匹配 active head 的 artifact，且 `artifact_sequence` 重排。无代次列时：合并行集两个代次各有 seq 0 → 误报 `DuplicateSequence`；retained artifact 跨代次重导出（sequence 变化）→ 误报 `InsertConflict`。故 artifact membership 与三类演进行同构处理：`CONVERSATION_ROW_SCHEMA_VERSION` 2 → 3（pre-1.0 无迁移路径；v2 仅存在于本 milestone 内部）；`from_artifact` 带 generation；`insert_set_against` 的 artifact diff key 改 `cid#generation#artifact_id`（不改则 retained artifact 重导出必 `InsertConflict`——属本 schema 变更引入的回归，一并修复）；严格路径 `validate_generations` 同步校验 artifact 行。TODO M3-5 决策段与 M3-5-3 任务文本已同步该修正。
+- **L-3 评估（任务要求的顺带项）**：`insert_set_against` 的 `existing` 仍为完整单 conversation `ConversationRows`（两侧都先经严格 `into_snapshot` 校验）。放宽为「多 conversation 行集的子集查询结果」需要改 diff 入口签名（`existing` 改 Vec 形状 + 按 owner 过滤），与 M3-5-3 的 diff 代次键改动同源，记录为 M3-5-3 的连带评估项，本任务不动。
+- **测试**（persistence 30 条全过，新增 4 条 + 扩展 2 条）：`insert_set_into_snapshot_selects_the_maximum_generation`（commit+compaction 演进后合并两代次行集，重组结果 == 最新 snapshot 且可 `Conversation::restore`）；`insert_set_into_snapshot_rejects_a_sparse_selected_generation`（选中代次缺中间 lineage 行 → `SequenceGap`；选中代次 lineage/span 全缺 → 明确 `InvalidRow`）；`insert_set_into_snapshot_rejects_conflicting_and_dangling_rows`（空行集、最大代次冲突 conversation 行、悬空未来代次 lineage 行、冲突事实行、外 owner 行各一条断言）；`insert_set_into_snapshot_survives_artifact_membership_changes_across_generations`（revert + re-compaction 丢弃旧 artifact 的真实演进路径，合并重组 == 最新 snapshot——代次修正的回归测试）；`rows_stamp_every_evolving_row_with_the_export_generation` 扩展 artifact 断言；`rows_reject_inconsistent_generations` 扩展严格路径 artifact 校验。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0，约 32s，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- `docs/review-2026-07.md` M-CONV-3 按既定口径留待 M3-5-1~4 全部落地后（M3-9）标注。
+- Breaking change（pre-1.0，记录在此）：`ArtifactRecord` 新增必填 `generation` 字段（struct literal 构造点需补，serde 旧数据不可读）；`CONVERSATION_ROW_SCHEMA_VERSION` 2 → 3；`insert_set_against` artifact diff key 形状变化（行为修正）。
+
 #### M3-5-3 [TODO] `insert_set_against` 代次键 diff + 演进场景测试
 
 实现要求：
 
 - `diff_single_conversation`（rows.rs:1077-1092）：key 改为 `(conversation_id, generation)`——同 conversation 不同代次不再冲突，作为新行插入；同代次内容不同仍 `InsertConflict`。
 - `diff_rows` 的 lineage/span key 闭包（rows.rs:549、584）加入 generation：`conversation_id#generation#lineage_sequence` / `conversation_id#generation#span_sequence`。
+- artifact 的 diff key 已在 M3-5-2 随 `ArtifactRecord.generation` 落地为 `conversation_id#generation#artifact_id`（本任务确认其行为即可，无需再改）。L-3（放宽 `insert_set_against` 的 existing 为多 conversation 子集查询结果）经 M3-5-2 评估与本任务 diff 改动同源，实施时一并评估；若超范围则记录为后续项。
 - 事实表 diff key 不变。
 
 验证条件（每条一个测试）：

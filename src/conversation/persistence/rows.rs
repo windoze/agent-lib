@@ -34,12 +34,15 @@ use std::{
 /// The row schema evolves independently of the snapshot schema: version 2 adds
 /// the `generation` column to the evolving row kinds (conversation, lineage
 /// membership, projection spans) so a Conversation's evolution stays
-/// insert-only. Rows are still reassembled into the current
-/// [`ConversationSnapshot`] data shape before live restore validation runs.
+/// insert-only; version 3 extends the same column to artifact membership rows
+/// because the retained artifact set is also generation-scoped state (a
+/// revert followed by re-compaction can drop or re-sequence artifacts). Rows
+/// are still reassembled into the current [`ConversationSnapshot`] data shape
+/// before live restore validation runs.
 ///
 /// Pre-1.0 there is no migration path: row sets exported with an older schema
 /// version are rejected and must be re-exported with the current crate.
-pub const CONVERSATION_ROW_SCHEMA_VERSION: u32 = 2;
+pub const CONVERSATION_ROW_SCHEMA_VERSION: u32 = 3;
 
 /// A DB-neutral decomposition of one Conversation snapshot.
 ///
@@ -233,6 +236,14 @@ pub struct ProjectionSpanRecord {
 pub struct ArtifactRecord {
     /// Owning Conversation projection.
     pub conversation_id: ConversationId,
+    /// Generation this membership row was exported at (the owning
+    /// Conversation's `structural_version` at that consistency point).
+    ///
+    /// Artifact *content* is immutable per `artifact_id`, but the retained
+    /// artifact set is generation-scoped membership state: a revert followed
+    /// by re-compaction can drop an artifact or shift its sequence, so the
+    /// membership row is versioned like lineage and span rows.
+    pub generation: u64,
     /// Dense retained artifact sequence, starting at zero.
     pub artifact_sequence: u64,
     /// Artifact primary key.
@@ -263,6 +274,11 @@ pub struct ArtifactRecord {
 /// The set only contains rows that are absent from the existing set. If the
 /// same primary key exists with different immutable facts, construction fails
 /// with [`RowMappingError::InsertConflict`] instead of describing an update.
+///
+/// The all-`Vec` shape can also hold a *merged* multi-generation row set —
+/// for example every row a store accumulated for one Conversation across
+/// several export generations — and [`Self::into_snapshot`] reassembles the
+/// current state from such a set by selecting the maximum generation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConversationRowInsertSet {
@@ -299,6 +315,288 @@ impl ConversationRowInsertSet {
             && self.projections.is_empty()
             && self.projection_spans.is_empty()
             && self.artifacts.is_empty()
+    }
+
+    /// Appends every row of `other` onto this set.
+    ///
+    /// Merging the export generations of one Conversation is the canonical
+    /// way to build the multi-generation row set that
+    /// [`into_snapshot`](Self::into_snapshot) selects the current state from.
+    /// Rows are concatenated as-is; identical duplicates are collapsed during
+    /// reassembly, not here.
+    pub fn merge(&mut self, other: Self) {
+        self.conversations.extend(other.conversations);
+        self.raw_turns.extend(other.raw_turns);
+        self.lineage_turns.extend(other.lineage_turns);
+        self.turns.extend(other.turns);
+        self.messages.extend(other.messages);
+        self.tool_pairings.extend(other.tool_pairings);
+        self.projections.extend(other.projections);
+        self.projection_spans.extend(other.projection_spans);
+        self.artifacts.extend(other.artifacts);
+    }
+
+    /// Reassembles a versioned snapshot from a possibly multi-generation row
+    /// set scoped to one Conversation.
+    ///
+    /// This is the read-side counterpart of the insert-only evolution model:
+    /// a store that accumulated several export generations returns every row,
+    /// and the current state is the **maximum generation** one.
+    ///
+    /// Selection rules:
+    ///
+    /// - Every conversation row must belong to the same Conversation; the row
+    ///   with the maximum `generation` describes the current state. Identical
+    ///   duplicate rows collapse; the same primary key with different content
+    ///   is corrupt and rejected.
+    /// - Lineage, projection span, and artifact rows with `generation` below
+    ///   the maximum are retained history and ignored. Rows *newer* than
+    ///   every conversation row signal an incomplete store read and are
+    ///   rejected.
+    /// - Rows of the selected generation must be present (a Conversation
+    ///   with raw turns must have lineage and span rows at that generation)
+    ///   and densely sequenced from zero; density, FK reachability, and
+    ///   projection shape checks are inherited from
+    ///   [`ConversationRows::into_snapshot`], which this method delegates to
+    ///   after selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RowMappingError`] for an empty or ambiguous conversation row
+    /// set, conflicting rows that share a primary key, foreign-owner rows,
+    /// dangling newer-generation association rows, missing selected-generation
+    /// rows, and every validation [`ConversationRows::into_snapshot`] performs.
+    pub fn into_snapshot(self) -> Result<ConversationSnapshot, RowMappingError> {
+        let Some(first) = self.conversations.first() else {
+            return Err(RowMappingError::InvalidRow {
+                path: "$.conversations".to_owned(),
+                table: "conversation_records",
+                reason: "row set contains no conversation row",
+            });
+        };
+        let owner = first.conversation_id;
+        for (index, row) in self.conversations.iter().enumerate() {
+            ensure_owner(
+                &format!("$.conversations[{index}].conversation_id"),
+                owner,
+                row.conversation_id,
+            )?;
+            if row.schema_version != CONVERSATION_ROW_SCHEMA_VERSION {
+                return Err(RowMappingError::InvalidRow {
+                    path: format!("$.conversations[{index}].schema_version"),
+                    table: "conversation_records",
+                    reason: "unsupported row schema version (no migration path pre-1.0; re-export rows with the current crate)",
+                });
+            }
+            if row.generation != row.structural_version {
+                return Err(RowMappingError::InvalidRow {
+                    path: format!("$.conversations[{index}].generation"),
+                    table: "conversation_records",
+                    reason: "generation must equal structural_version",
+                });
+            }
+        }
+        for (index, row) in self.projections.iter().enumerate() {
+            ensure_owner(
+                &format!("$.projections[{index}].conversation_id"),
+                owner,
+                row.conversation_id,
+            )?;
+            if row.schema_version != CONVERSATION_ROW_SCHEMA_VERSION {
+                return Err(RowMappingError::InvalidRow {
+                    path: format!("$.projections[{index}].schema_version"),
+                    table: "projection_records",
+                    reason: "unsupported row schema version (no migration path pre-1.0; re-export rows with the current crate)",
+                });
+            }
+        }
+        // Owner checks run on every association row *before* generation
+        // filtering so a foreign row is never silently dropped as history.
+        for (index, row) in self.raw_turns.iter().enumerate() {
+            ensure_owner(
+                &format!("$.raw_turns[{index}].conversation_id"),
+                owner,
+                row.conversation_id,
+            )?;
+        }
+        for (index, row) in self.lineage_turns.iter().enumerate() {
+            ensure_owner(
+                &format!("$.lineage_turns[{index}].conversation_id"),
+                owner,
+                row.conversation_id,
+            )?;
+        }
+        for (index, row) in self.projection_spans.iter().enumerate() {
+            ensure_owner(
+                &format!("$.projection_spans[{index}].conversation_id"),
+                owner,
+                row.conversation_id,
+            )?;
+        }
+        for (index, row) in self.artifacts.iter().enumerate() {
+            ensure_owner(
+                &format!("$.artifacts[{index}].conversation_id"),
+                owner,
+                row.conversation_id,
+            )?;
+        }
+
+        // Collapse identical rows per primary key; conflicting duplicates are
+        // corrupt. Merging export generations legitimately repeats shared
+        // facts, so duplicates are only an error when their content diverges.
+        let conversations = dedup_by_key(
+            self.conversations,
+            "conversation_records",
+            "$.conversations",
+            |row| format!("{}#{}", row.conversation_id, row.generation),
+        )?;
+        let projections = dedup_by_key(
+            self.projections,
+            "projection_records",
+            "$.projections",
+            |row| row.conversation_id.to_string(),
+        )?;
+        let raw_turns = dedup_by_key(
+            self.raw_turns,
+            "conversation_turn_records",
+            "$.raw_turns",
+            |row| format!("{}#{}", row.conversation_id, row.raw_sequence),
+        )?;
+        let lineage_turns = dedup_by_key(
+            self.lineage_turns,
+            "conversation_lineage_turn_records",
+            "$.lineage_turns",
+            |row| {
+                format!(
+                    "{}#{}#{}",
+                    row.conversation_id, row.generation, row.lineage_sequence
+                )
+            },
+        )?;
+        let projection_spans = dedup_by_key(
+            self.projection_spans,
+            "projection_span_records",
+            "$.projection_spans",
+            |row| {
+                format!(
+                    "{}#{}#{}",
+                    row.conversation_id, row.generation, row.span_sequence
+                )
+            },
+        )?;
+        let artifacts = dedup_by_key(self.artifacts, "artifact_records", "$.artifacts", |row| {
+            format!(
+                "{}#{}#{}",
+                row.conversation_id, row.generation, row.artifact_id
+            )
+        })?;
+        let turns = dedup_by_key(self.turns, "turn_records", "$.turns", |row| {
+            row.turn_id.to_string()
+        })?;
+        let messages = dedup_by_key(self.messages, "message_records", "$.messages", |row| {
+            row.message_id.to_string()
+        })?;
+        let tool_pairings = dedup_by_key(
+            self.tool_pairings,
+            "tool_pairing_records",
+            "$.tool_pairings",
+            |row| row.call_id.to_string(),
+        )?;
+
+        // The current state is the maximum generation across the
+        // conversation rows; after dedup there is exactly one row per
+        // generation, so the maximum is unique by construction.
+        let generation = conversations
+            .iter()
+            .map(|row| row.generation)
+            .max()
+            .expect("the conversation row set is non-empty");
+        let conversation = conversations
+            .into_iter()
+            .find(|row| row.generation == generation)
+            .expect("the maximum generation comes from a row in the set");
+        let projection =
+            projections
+                .into_iter()
+                .next()
+                .ok_or_else(|| RowMappingError::InvalidRow {
+                    path: "$.projections".to_owned(),
+                    table: "projection_records",
+                    reason: "row set contains no projection row for the conversation",
+                })?;
+
+        // Keep only the selected generation of each evolving association.
+        let lineage_turns = select_generation(
+            lineage_turns,
+            "conversation_lineage_turn_records",
+            "$.lineage_turns",
+            generation,
+            |row| row.generation,
+        )?;
+        let projection_spans = select_generation(
+            projection_spans,
+            "projection_span_records",
+            "$.projection_spans",
+            generation,
+            |row| row.generation,
+        )?;
+        let artifacts = select_generation(
+            artifacts,
+            "artifact_records",
+            "$.artifacts",
+            generation,
+            |row| row.generation,
+        )?;
+
+        // A Conversation with committed turns always exports lineage and span
+        // rows; their absence at the selected generation means the store read
+        // lost rows, and deferring to density checks would mis-report the gap
+        // as an empty lineage or projection.
+        if !raw_turns.is_empty() && lineage_turns.is_empty() {
+            return Err(RowMappingError::InvalidRow {
+                path: "$.lineage_turns".to_owned(),
+                table: "conversation_lineage_turn_records",
+                reason: "no lineage rows at the selected generation",
+            });
+        }
+        if !raw_turns.is_empty() && projection_spans.is_empty() {
+            return Err(RowMappingError::InvalidRow {
+                path: "$.projection_spans".to_owned(),
+                table: "projection_span_records",
+                reason: "no projection span rows at the selected generation",
+            });
+        }
+
+        ConversationRows {
+            conversation,
+            raw_turns,
+            lineage_turns,
+            turns,
+            messages,
+            tool_pairings,
+            projection,
+            projection_spans,
+            artifacts,
+        }
+        .into_snapshot()
+    }
+}
+
+impl From<ConversationRows> for ConversationRowInsertSet {
+    /// Views a single-generation export as an insert set, the starting point
+    /// for [`ConversationRowInsertSet::merge`] multi-generation assemblies.
+    fn from(rows: ConversationRows) -> Self {
+        Self {
+            conversations: vec![rows.conversation],
+            raw_turns: rows.raw_turns,
+            lineage_turns: rows.lineage_turns,
+            turns: rows.turns,
+            messages: rows.messages,
+            tool_pairings: rows.tool_pairings,
+            projections: vec![rows.projection],
+            projection_spans: rows.projection_spans,
+            artifacts: rows.artifacts,
+        }
     }
 }
 
@@ -441,7 +739,7 @@ impl ConversationRows {
             .iter()
             .enumerate()
             .map(|(artifact_index, artifact)| {
-                ArtifactRecord::from_artifact(conversation_id, artifact_index, artifact)
+                ArtifactRecord::from_artifact(conversation_id, generation, artifact_index, artifact)
             })
             .collect();
 
@@ -625,7 +923,15 @@ impl ConversationRows {
                 "$.artifacts",
                 &self.artifacts,
                 &existing.artifacts,
-                |row| row.artifact_id.to_string(),
+                // Artifact membership is generation-scoped like lineage/span
+                // rows: a retained artifact re-exports under the new
+                // generation instead of conflicting with its previous row.
+                |row| {
+                    format!(
+                        "{}#{}#{}",
+                        row.conversation_id, row.generation, row.artifact_id
+                    )
+                },
             )?,
         })
     }
@@ -680,6 +986,15 @@ impl ConversationRows {
                 return Err(RowMappingError::InvalidRow {
                     path: format!("$.projection_spans[{index}].generation"),
                     table: "projection_span_records",
+                    reason: "generation does not match the conversation row generation",
+                });
+            }
+        }
+        for (index, row) in self.artifacts.iter().enumerate() {
+            if row.generation != generation {
+                return Err(RowMappingError::InvalidRow {
+                    path: format!("$.artifacts[{index}].generation"),
+                    table: "artifact_records",
                     reason: "generation does not match the conversation row generation",
                 });
             }
@@ -783,6 +1098,7 @@ impl ArtifactRecord {
     /// Copies one retained artifact into a DB-neutral row.
     fn from_artifact(
         conversation_id: ConversationId,
+        generation: u64,
         artifact_index: usize,
         artifact: &Artifact,
     ) -> Self {
@@ -790,6 +1106,7 @@ impl ArtifactRecord {
         let input_range = provenance.input_range();
         Self {
             conversation_id,
+            generation,
             artifact_sequence: usize_to_u64(artifact_index),
             artifact_id: artifact.id(),
             messages: artifact.messages().to_vec(),
@@ -938,6 +1255,78 @@ where
         }
     }
     Ok(index)
+}
+
+/// Collapses identical rows that share a primary key and rejects conflicting
+/// duplicates.
+///
+/// A merged multi-generation row set legitimately repeats shared rows (two
+/// export generations carry the same immutable facts), so a duplicate key is
+/// only corrupt when the repeated row's content diverges.
+fn dedup_by_key<T, K, F>(
+    rows: Vec<T>,
+    table: &'static str,
+    path: &'static str,
+    key: F,
+) -> Result<Vec<T>, RowMappingError>
+where
+    T: PartialEq,
+    F: Fn(&T) -> K,
+    K: ToString + Eq + Hash,
+{
+    let mut index_by_key: HashMap<String, usize> = HashMap::new();
+    let mut deduped = Vec::with_capacity(rows.len());
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let row_key = key(&row).to_string();
+        match index_by_key.get(&row_key) {
+            Some(&existing_index) => {
+                if deduped[existing_index] != row {
+                    return Err(RowMappingError::DuplicatePrimaryKey {
+                        path: format!("{path}[{row_index}]"),
+                        table,
+                        key: row_key,
+                    });
+                }
+            }
+            None => {
+                index_by_key.insert(row_key, deduped.len());
+                deduped.push(row);
+            }
+        }
+    }
+    Ok(deduped)
+}
+
+/// Keeps the rows of one evolving table that belong to the selected
+/// generation.
+///
+/// Older rows are retained history and ignored; rows newer than every
+/// conversation row signal an incomplete store read and are rejected.
+fn select_generation<T, F>(
+    rows: Vec<T>,
+    table: &'static str,
+    path: &'static str,
+    generation: u64,
+    row_generation: F,
+) -> Result<Vec<T>, RowMappingError>
+where
+    F: Fn(&T) -> u64,
+{
+    let mut selected = Vec::new();
+    for (index, row) in rows.into_iter().enumerate() {
+        let row_generation = row_generation(&row);
+        if row_generation > generation {
+            return Err(RowMappingError::InvalidRow {
+                path: format!("{path}[{index}].generation"),
+                table,
+                reason: "generation is newer than every conversation row",
+            });
+        }
+        if row_generation == generation {
+            selected.push(row);
+        }
+    }
+    Ok(selected)
 }
 
 /// Builds the retained raw Turn id set from raw membership rows.

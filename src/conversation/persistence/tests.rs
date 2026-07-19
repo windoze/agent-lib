@@ -3,8 +3,8 @@
 mod e2e;
 
 use super::{
-    CONVERSATION_ROW_SCHEMA_VERSION, CONVERSATION_SNAPSHOT_SCHEMA_VERSION, ConversationRows,
-    ConversationSnapshot,
+    CONVERSATION_ROW_SCHEMA_VERSION, CONVERSATION_SNAPSHOT_SCHEMA_VERSION,
+    ConversationRowInsertSet, ConversationRows, ConversationSnapshot,
 };
 use crate::{
     client::Response,
@@ -1151,6 +1151,16 @@ fn rows_stamp_every_evolving_row_with_the_export_generation() {
             .all(|row| row.generation == generation),
         "every projection span row carries the export generation"
     );
+    assert!(
+        !rows.artifacts.is_empty(),
+        "compacted projection exports artifact membership rows"
+    );
+    assert!(
+        rows.artifacts
+            .iter()
+            .all(|row| row.generation == generation),
+        "every artifact membership row carries the export generation"
+    );
 }
 
 #[test]
@@ -1274,6 +1284,372 @@ fn rows_reject_inconsistent_generations() {
             ..
         }
     ));
+
+    // A compacted conversation stamps artifact membership rows with the same
+    // generation; a divergent artifact generation is rejected as well.
+    // (`self::` bypasses the local `conversation` binding shadowing the
+    // module-level fixture constructor.)
+    let mut compacted = self::conversation(22_000);
+    commit_text_turn(&mut compacted, 222);
+    let covers = range(&compacted, 0, 1);
+    let produced_by = strategy("artifact-generation");
+    let artifact = summary_artifact(
+        &compacted,
+        covers.clone(),
+        22_500,
+        produced_by.clone(),
+        "summary:222",
+    );
+    let plan = CompactionPlan::new(
+        &compacted,
+        vec![CompactionStep::raw(covers, artifact.id(), produced_by)],
+        vec![artifact],
+    );
+    compacted.apply_compaction(&plan).expect("compaction");
+    let mut bad_artifact = compacted
+        .snapshot()
+        .expect("snapshot")
+        .to_rows()
+        .expect("rows");
+    assert!(
+        !bad_artifact.artifacts.is_empty(),
+        "compacted conversation exports artifact membership rows"
+    );
+    bad_artifact.artifacts[0].generation += 1;
+    assert!(matches!(
+        bad_artifact
+            .into_snapshot()
+            .expect_err("foreign artifact generation rejected"),
+        RowMappingError::InvalidRow {
+            table: "artifact_records",
+            ..
+        }
+    ));
+}
+
+/// Builds the merged multi-generation row set a store would return after two
+/// export generations of the same Conversation were accumulated.
+fn merged_generations(
+    first: ConversationRows,
+    second: ConversationRows,
+) -> ConversationRowInsertSet {
+    let mut merged = ConversationRowInsertSet::from(first);
+    merged.merge(second.into());
+    merged
+}
+
+#[test]
+fn insert_set_into_snapshot_selects_the_maximum_generation() {
+    let mut conversation = conversation(23);
+    commit_text_turn(&mut conversation, 230);
+    commit_text_turn(&mut conversation, 231);
+    let first = conversation
+        .snapshot()
+        .expect("first snapshot")
+        .to_rows()
+        .expect("first rows");
+    let first_generation = first.conversation.generation;
+
+    // Evolve every generation-scoped row kind: commits advance the lineage,
+    // compaction rewrites spans and artifact membership.
+    commit_text_turn(&mut conversation, 232);
+    let covers = range(&conversation, 0, 1);
+    let produced_by = strategy("merged-generation");
+    let artifact = summary_artifact(
+        &conversation,
+        covers.clone(),
+        23_500,
+        produced_by.clone(),
+        "summary:230",
+    );
+    let plan = CompactionPlan::new(
+        &conversation,
+        vec![CompactionStep::raw(covers, artifact.id(), produced_by)],
+        vec![artifact],
+    );
+    conversation
+        .apply_compaction(&plan)
+        .expect("compaction evolves the export generation");
+
+    let latest_snapshot = conversation.snapshot().expect("latest snapshot");
+    let second = latest_snapshot.to_rows().expect("second rows");
+    assert!(
+        second.conversation.generation > first_generation,
+        "commit plus compaction advances the generation"
+    );
+
+    let merged = merged_generations(first, second);
+    let reassembled = merged
+        .into_snapshot()
+        .expect("merged generations reassemble the latest state");
+    assert_eq!(
+        reassembled, latest_snapshot,
+        "the maximum generation describes the current state"
+    );
+    Conversation::restore(reassembled).expect("selected snapshot restores");
+}
+
+#[test]
+fn insert_set_into_snapshot_rejects_a_sparse_selected_generation() {
+    let mut conversation = conversation(25);
+    commit_text_turn(&mut conversation, 250);
+    commit_text_turn(&mut conversation, 251);
+    let first = conversation
+        .snapshot()
+        .expect("first snapshot")
+        .to_rows()
+        .expect("first rows");
+    commit_text_turn(&mut conversation, 252);
+    let second = conversation
+        .snapshot()
+        .expect("second snapshot")
+        .to_rows()
+        .expect("second rows");
+    let max_generation = second.conversation.generation;
+
+    // A missing lineage row inside the selected generation is a density gap.
+    let mut sparse = merged_generations(first.clone(), second.clone());
+    sparse
+        .lineage_turns
+        .retain(|row| !(row.generation == max_generation && row.lineage_sequence == 1));
+    assert!(matches!(
+        sparse
+            .into_snapshot()
+            .expect_err("a missing selected-generation lineage row is a gap"),
+        RowMappingError::SequenceGap {
+            table: "conversation_lineage_turn_records",
+            ..
+        }
+    ));
+
+    // No lineage rows at all at the selected generation is an explicit error,
+    // not a vacuously dense empty lineage.
+    let mut missing = merged_generations(first.clone(), second.clone());
+    missing
+        .lineage_turns
+        .retain(|row| row.generation != max_generation);
+    assert!(matches!(
+        missing
+            .into_snapshot()
+            .expect_err("a selected generation without lineage rows is invalid"),
+        RowMappingError::InvalidRow {
+            path,
+            table: "conversation_lineage_turn_records",
+            ..
+        } if path == "$.lineage_turns"
+    ));
+
+    // Same for projection span rows of the selected generation.
+    let mut missing_spans = merged_generations(first, second);
+    missing_spans
+        .projection_spans
+        .retain(|row| row.generation != max_generation);
+    assert!(matches!(
+        missing_spans
+            .into_snapshot()
+            .expect_err("a selected generation without span rows is invalid"),
+        RowMappingError::InvalidRow {
+            path,
+            table: "projection_span_records",
+            ..
+        } if path == "$.projection_spans"
+    ));
+}
+
+#[test]
+fn insert_set_into_snapshot_rejects_conflicting_and_dangling_rows() {
+    let mut conversation = conversation(27);
+    commit_text_turn(&mut conversation, 270);
+    commit_text_turn(&mut conversation, 271);
+    let first = conversation
+        .snapshot()
+        .expect("first snapshot")
+        .to_rows()
+        .expect("first rows");
+    commit_text_turn(&mut conversation, 272);
+    let second = conversation
+        .snapshot()
+        .expect("second snapshot")
+        .to_rows()
+        .expect("second rows");
+    let max_generation = second.conversation.generation;
+
+    assert!(matches!(
+        ConversationRowInsertSet::default()
+            .into_snapshot()
+            .expect_err("an empty row set has no generation to select"),
+        RowMappingError::InvalidRow {
+            path,
+            table: "conversation_records",
+            ..
+        } if path == "$.conversations"
+    ));
+
+    // Two distinct conversation rows at the maximum generation make the
+    // current state ambiguous.
+    let mut conflicting = merged_generations(first.clone(), second.clone());
+    let mut tampered = conflicting
+        .conversations
+        .iter()
+        .find(|row| row.generation == max_generation)
+        .expect("maximum generation conversation row")
+        .clone();
+    tampered.head_turn_count += 1;
+    conflicting.conversations.push(tampered);
+    assert!(matches!(
+        conflicting
+            .into_snapshot()
+            .expect_err("conflicting rows at the maximum generation are ambiguous"),
+        RowMappingError::DuplicatePrimaryKey {
+            table: "conversation_records",
+            ..
+        }
+    ));
+
+    // Association rows newer than every conversation row signal an incomplete
+    // store read.
+    let mut dangling = merged_generations(first.clone(), second.clone());
+    let mut future = dangling
+        .lineage_turns
+        .iter()
+        .find(|row| row.generation == max_generation)
+        .expect("selected generation lineage row")
+        .clone();
+    future.generation = max_generation + 1;
+    dangling.lineage_turns.push(future);
+    assert!(matches!(
+        dangling
+            .into_snapshot()
+            .expect_err("association rows newer than every conversation row dangle"),
+        RowMappingError::InvalidRow {
+            table: "conversation_lineage_turn_records",
+            reason,
+            ..
+        } if reason.contains("newer")
+    ));
+
+    // A shared fact key with diverging content is corrupt even though merged
+    // generations legitimately repeat identical facts.
+    let mut conflicted_facts = merged_generations(first.clone(), second.clone());
+    let mut forged = conflicted_facts.messages[0].clone();
+    forged.payload = user("forged");
+    conflicted_facts.messages.push(forged);
+    assert!(matches!(
+        conflicted_facts
+            .into_snapshot()
+            .expect_err("conflicting fact rows are rejected"),
+        RowMappingError::DuplicatePrimaryKey {
+            table: "message_records",
+            ..
+        }
+    ));
+
+    // Foreign-owner rows are never silently dropped as history.
+    let mut foreign = merged_generations(first, second);
+    foreign.lineage_turns[0].conversation_id = conversation_id(27_999);
+    assert!(matches!(
+        foreign
+            .into_snapshot()
+            .expect_err("foreign-owner rows are rejected before generation filtering"),
+        RowMappingError::ConversationMismatch { .. }
+    ));
+}
+
+#[test]
+fn insert_set_into_snapshot_survives_artifact_membership_changes_across_generations() {
+    let mut conversation = conversation(26);
+    commit_text_turn(&mut conversation, 260);
+    commit_text_turn(&mut conversation, 261);
+    commit_text_turn(&mut conversation, 262);
+
+    let covers = range(&conversation, 0, 2);
+    let produced_by = strategy("artifact-evolution");
+    let first_artifact = summary_artifact(
+        &conversation,
+        covers.clone(),
+        26_500,
+        produced_by.clone(),
+        "summary:260-261",
+    );
+    let plan = CompactionPlan::new(
+        &conversation,
+        vec![CompactionStep::raw(
+            covers,
+            first_artifact.id(),
+            produced_by.clone(),
+        )],
+        vec![first_artifact.clone()],
+    );
+    conversation
+        .apply_compaction(&plan)
+        .expect("first compaction");
+    let first = conversation
+        .snapshot()
+        .expect("first snapshot")
+        .to_rows()
+        .expect("first rows");
+    assert!(
+        first
+            .artifacts
+            .iter()
+            .any(|row| row.artifact_id == first_artifact.id()),
+        "first generation retains the first artifact"
+    );
+
+    // Revert behind the compacted range and grow a new branch: the old
+    // artifact's provenance no longer matches the active head, so the next
+    // compaction drops it from the retained set.
+    let boundary = conversation.valid_boundaries()[1];
+    conversation
+        .revert_to(boundary)
+        .expect("revert behind the compacted range");
+    commit_text_turn(&mut conversation, 263);
+    commit_text_turn(&mut conversation, 264);
+
+    let new_covers = range(&conversation, 0, 3);
+    let second_artifact = summary_artifact(
+        &conversation,
+        new_covers.clone(),
+        26_501,
+        produced_by.clone(),
+        "summary:new-branch",
+    );
+    let new_plan = CompactionPlan::new(
+        &conversation,
+        vec![CompactionStep::spans(
+            new_covers,
+            second_artifact.id(),
+            produced_by,
+        )],
+        vec![second_artifact.clone()],
+    );
+    conversation
+        .apply_compaction(&new_plan)
+        .expect("consolidating compaction on the new branch");
+
+    let latest_snapshot = conversation.snapshot().expect("latest snapshot");
+    let second = latest_snapshot.to_rows().expect("second rows");
+    assert!(
+        second
+            .artifacts
+            .iter()
+            .all(|row| row.artifact_id != first_artifact.id()),
+        "the stale artifact is dropped from the new generation"
+    );
+    assert!(
+        second
+            .artifacts
+            .iter()
+            .any(|row| row.artifact_id == second_artifact.id()),
+        "the new branch's artifact is retained"
+    );
+
+    let merged = merged_generations(first, second);
+    let reassembled = merged
+        .into_snapshot()
+        .expect("artifact membership changes across generations stay reassemblable");
+    assert_eq!(reassembled, latest_snapshot);
+    Conversation::restore(reassembled).expect("selected snapshot restores");
 }
 
 #[test]
