@@ -32,8 +32,8 @@ pub use blackboard::{Blackboard, BlackboardSnapshot, BoardMessage, DEFAULT_CHANN
 pub use mailbox::{MailMessage, Mailbox, MailboxSnapshot};
 pub use plan::{Plan, PlanError, PlanSnapshot, TaskSnapshot, TaskStatus};
 pub use tools::{
-    ArtifactSink, BLACKBOARD_POST, BLACKBOARD_READ, CollabToolHandler, PLAN_ADD_TASK, PLAN_CLAIM,
-    PLAN_CLAIM_FIRST_AVAILABLE, PLAN_READ, PLAN_UPDATE, REPORT_ARTIFACT, RUN_HOST_TOOL,
+    ArtifactSink, BLACKBOARD_POST, BLACKBOARD_READ, CollabToolHandler, MAILBOX_READ, PLAN_ADD_TASK,
+    PLAN_CLAIM, PLAN_CLAIM_FIRST_AVAILABLE, PLAN_READ, PLAN_UPDATE, REPORT_ARTIFACT, RUN_HOST_TOOL,
     RecordingArtifactSink, SEND_MESSAGE, SPAWN_AGENT, SpawnAgentRequest, ToolAdapterError,
     bridge_tool_declarations, bridge_tool_set,
 };

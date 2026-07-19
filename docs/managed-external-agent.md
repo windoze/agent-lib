@@ -571,7 +571,7 @@ ExternalAgentMachine::new(state, requirement_ids)   // 默认 config = 与旧行
 - `agent::collab::bridge_tool_declarations()`:
   - `plan_*`
   - `blackboard_*`
-  - `send_message`
+  - `send_message` / `mailbox_read`
   - `report_artifact`
   - `run_host_tool`
   - `spawn_agent`

@@ -941,7 +941,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M4：Agent 状态机与 drive 语义
 
-### M4-1 [TODO] 修复 `blackboard_read` 丢弃正文 + 补 mailbox 读工具（H-STATE-6）
+### M4-1 [DONE] 修复 `blackboard_read` 丢弃正文 + 补 mailbox 读工具（H-STATE-6）
 
 上下文：
 
@@ -960,6 +960,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：post 两条消息后 `blackboard_read` 返回内容包含两条正文；mailbox send 后读工具能取到。
 - `cargo test -p agent-lib --lib agent::collab` 全过。
 - `docs/agent-layer.md` §6.4 如需更新则同步。
+
+完成记录：
+
+- **`blackboard_read` 返回正文**：`src/agent/collab/tools.rs` 的 `blackboard_read` 不再计数即丢——输出头部行（保留原有 "read N message(s) from `channel` offset F" 前缀措辞，既有断言不受影响）+ 每消息一行 `#<offset> <sender>: <body>`。长度控制双管齐下：新增可选 `limit` 参数（默认 `DEFAULT_READ_LIMIT = 50`）做分页，超限附 resume 提示行「… K more; resume with from=<next cursor>」；单条正文按字符截断至 `MAX_MESSAGE_BODY_CHARS = 200` 并附 `… [truncated]` 标注（`truncate_body`，char 边界安全）。两个读工具共享 `format_read_page`/`read_limit` helper，输出风格一致。
+- **新增 `mailbox_read` 工具**：读**调用方自己的**收件箱——收件人恒为注入的 identity（与 send/claim/post 同一身份注入原则），模型无法提供 recipient 参数，结构性不可能读他人邮件；语义对齐 `Mailbox::read_from(identity, from)`（seq 游标分页 + 同一 `limit`/截断设施）。已注册进 `bridge_tool_declarations`/`dispatch`，常量 `MAILBOX_READ` 经 `collab/mod.rs` 导出。模块文档补身份与分页两条不变量说明。
+- **`plan_read` 补 owner/depends_on**（低成本，按任务授权一并做）：每任务条目 `id=status` 后追加 `@owner`（已认颈时）与 ` deps:[..]`（有依赖时），无 owner/deps 时输出与旧格式逐字一致（既有测试断言原样通过），读者一次往返即可看到归属与阻塞关系。
+- **测试**（`agent::collab` 32 条全过，新增 4 条）：`tool_adapter_blackboard_read_returns_message_bodies`（post 两条后读到两条带 offset/sender 的正文 + `from` 游标只读尾部）；`tool_adapter_blackboard_read_paginates_and_truncates_bodies`（limit=2 截页 + resume 提示 from=2；500 字符正文截断带标注）；`tool_adapter_mailbox_read_returns_own_inbox_messages`（send 两条后读到带 seq/sender 的正文、`from` 游标只读新邮件、bystander 读到空收件箱）；`tool_adapter_plan_read_reports_owner_and_dependencies`（`design=in_progress@alice`、`impl=todo deps:[design]`）。declarations 覆盖测试补 `MAILBOX_READ`。
+- **文档**：`docs/external-agent.md` §3.4 工具表新增 `mailbox_read` 行；`docs/managed-external-agent.md` §8.1 tool source 清单改 `send_message` / `mailbox_read`；`docs/agent-layer.md` §6.4 核对为 blackboard 原语设计章、不枚举桥接工具面，无需更新；`docs/review-2026-07.md` H-STATE-6 已标注 `✅ 已修复（M4-1）`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib agent::collab`（32 条全过）、`cargo test --all --all-targets`（exit 0，约 31s，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 无 breaking change（纯增量：新工具常量/声明/参数；`blackboard_read` 输出在保留原前缀的前提下追加正文行——行为修复）。
 
 ### M4-2 [TODO] `AwaitingReconfig` 期间的新 reconfigure 不再静默丢失（H-STATE-5）
 

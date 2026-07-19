@@ -13,7 +13,12 @@
 //! - `plan_claim` enforces dependency completion through [`Plan::claim`]
 //!   (design §6.2), so a dependency-blocked claim changes nothing.
 //! - `send_message` writes the library [`Mailbox`], not an external runtime's
-//!   private inbox (design §3.5).
+//!   private inbox (design §3.5); `mailbox_read` reads the **calling** agent's
+//!   own inbox — the recipient identity is the injected one, so an agent cannot
+//!   read someone else's mail.
+//! - `blackboard_read` / `mailbox_read` paginate by cursor (`from`) and page
+//!   size (`limit`), and truncate long message bodies, so a busy board or a
+//!   huge post cannot blow up the model's context window.
 //!
 //! `spawn_agent` is special: spawning a child *deepens the scope chain*, which a
 //! plain tool execution cannot do. It is therefore modeled as a **translation**
@@ -69,10 +74,20 @@ pub const BLACKBOARD_POST: &str = "blackboard_post";
 pub const BLACKBOARD_READ: &str = "blackboard_read";
 /// Tool name: send a direct message to another agent's mailbox.
 pub const SEND_MESSAGE: &str = "send_message";
+/// Tool name: read the calling agent's own mailbox inbox.
+pub const MAILBOX_READ: &str = "mailbox_read";
 /// Tool name: record a produced artifact (patch / diff / test result / file).
 pub const REPORT_ARTIFACT: &str = "report_artifact";
 /// Tool name: invoke a host-registered tool under the run's guards.
 pub const RUN_HOST_TOOL: &str = "run_host_tool";
+
+/// Default page size (in messages) for `blackboard_read` / `mailbox_read` when
+/// the call carries no explicit `limit`.
+const DEFAULT_READ_LIMIT: usize = 50;
+
+/// Maximum body characters shown per message in a read page; longer bodies are
+/// truncated so a single huge post cannot flood the model's context window.
+const MAX_MESSAGE_BODY_CHARS: usize = 200;
 
 // ----- tool declarations ---------------------------------------------------
 
@@ -185,7 +200,8 @@ pub fn bridge_tool_declarations() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "from": { "type": "integer", "minimum": 0 },
-                    "channel": { "type": "string" }
+                    "channel": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 0 }
                 }
             }),
         ),
@@ -199,6 +215,17 @@ pub fn bridge_tool_declarations() -> Vec<Tool> {
                     "text": { "type": "string" }
                 },
                 "required": ["to", "text"]
+            }),
+        ),
+        tool(
+            MAILBOX_READ,
+            "Read your own mailbox inbox at or after a sequence number.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "integer", "minimum": 0 },
+                    "limit": { "type": "integer", "minimum": 0 }
+                }
             }),
         ),
         tool(
@@ -475,6 +502,7 @@ impl CollabToolHandler {
             BLACKBOARD_POST => self.blackboard_post(id, input),
             BLACKBOARD_READ => self.blackboard_read(id, input),
             SEND_MESSAGE => self.send_message(id, input),
+            MAILBOX_READ => self.mailbox_read(id, input),
             REPORT_ARTIFACT => self.report_artifact(id, input),
             RUN_HOST_TOOL => return self.run_host_tool(call_id, id, input).await,
             SPAWN_AGENT => {
@@ -508,6 +536,10 @@ impl CollabToolHandler {
     }
 
     /// Dispatches [`PLAN_READ`].
+    ///
+    /// Each task entry is `id=status` plus `@owner` when claimed and
+    /// ` deps:[..]` when it declares dependencies, so a reader can see who owns
+    /// what and which tasks are still blocked without a second round trip.
     fn plan_read(&self, call_id: &str) -> ToolResponse {
         let snapshot = self.plan.snapshot();
         let tasks: Vec<String> = snapshot
@@ -515,7 +547,14 @@ impl CollabToolHandler {
             .iter()
             .map(|id| {
                 let task = &snapshot.tasks[id];
-                format!("{id}={}", task.status.label())
+                let mut entry = format!("{id}={}", task.status.label());
+                if let Some(owner) = &task.owner {
+                    entry.push_str(&format!("@{owner}"));
+                }
+                if !task.depends_on.is_empty() {
+                    entry.push_str(&format!(" deps:[{}]", task.depends_on.join(",")));
+                }
+                entry
             })
             .collect();
         tool_ok(
@@ -583,16 +622,30 @@ impl CollabToolHandler {
         })
     }
 
-    /// Dispatches [`BLACKBOARD_READ`].
+    /// Dispatches [`BLACKBOARD_READ`], returning the message bodies (not just
+    /// a count) as a cursor-paginated, length-capped page.
     fn blackboard_read(&self, call_id: &str, input: &Value) -> ToolResponse {
         guarded(call_id, || {
             let from = opt_u64_arg(input, "from")?.unwrap_or(0);
             let channel = opt_str_arg(input, "channel")?
                 .unwrap_or_else(|| super::blackboard::DEFAULT_CHANNEL.to_owned());
+            let limit = read_limit(input)?;
             let messages = self.blackboard.read_from(&channel, from);
-            Ok(Ok(format!(
-                "read {} message(s) from `{channel}` offset {from}",
-                messages.len()
+            let entries: Vec<(u64, &str, &str)> = messages
+                .iter()
+                .map(|message| {
+                    (
+                        message.offset,
+                        message.sender.as_str(),
+                        message.text.as_str(),
+                    )
+                })
+                .collect();
+            Ok(Ok(format_read_page(
+                |shown| format!("read {shown} message(s) from `{channel}` offset {from}"),
+                from,
+                limit,
+                &entries,
             )))
         })
     }
@@ -604,6 +657,28 @@ impl CollabToolHandler {
             let text = str_arg(input, "text")?;
             let seq = self.mailbox.send(self.identity.clone(), to.clone(), text);
             Ok(Ok(format!("message to `{to}` delivered as #{seq}")))
+        })
+    }
+
+    /// Dispatches [`MAILBOX_READ`], reading the **injected identity's own**
+    /// inbox as a cursor-paginated, length-capped page — the recipient is never
+    /// a model-supplied argument, so an agent cannot read someone else's mail.
+    fn mailbox_read(&self, call_id: &str, input: &Value) -> ToolResponse {
+        guarded(call_id, || {
+            let from = opt_u64_arg(input, "from")?.unwrap_or(0);
+            let limit = read_limit(input)?;
+            let messages = self.mailbox.read_from(&self.identity, from);
+            let entries: Vec<(u64, &str, &str)> = messages
+                .iter()
+                .map(|message| (message.seq, message.from.as_str(), message.text.as_str()))
+                .collect();
+            let identity = &self.identity;
+            Ok(Ok(format_read_page(
+                |shown| format!("read {shown} message(s) from `{identity}`'s inbox at seq {from}"),
+                from,
+                limit,
+                &entries,
+            )))
         })
     }
 
@@ -723,6 +798,60 @@ fn guarded(
         Err(arg_error) => tool_error(call_id, &arg_error),
         Ok(Ok(summary)) => tool_ok(call_id, &summary),
         Ok(Err(primitive_error)) => tool_error(call_id, &primitive_error),
+    }
+}
+
+/// Extracts the optional `limit` argument of a read tool, falling back to
+/// [`DEFAULT_READ_LIMIT`].
+fn read_limit(input: &Value) -> Result<usize, String> {
+    Ok(
+        opt_u64_arg(input, "limit")?.map_or(DEFAULT_READ_LIMIT, |n| {
+            usize::try_from(n).unwrap_or(usize::MAX)
+        }),
+    )
+}
+
+/// Shared formatter for the `blackboard_read` / `mailbox_read` pages: the
+/// `header` line (built from the number of shown messages), one
+/// `#<cursor> <sender>: <body>` line per message with bodies truncated to
+/// [`MAX_MESSAGE_BODY_CHARS`], and a resume hint naming the `from` cursor to
+/// continue from when the page limit held back further messages.
+///
+/// `messages` is `(cursor, sender, body)` triples in read order, already
+/// filtered to the requested `from` cursor by the primitive.
+fn format_read_page(
+    header: impl FnOnce(usize) -> String,
+    from: u64,
+    limit: usize,
+    messages: &[(u64, &str, &str)],
+) -> String {
+    let shown = messages.len().min(limit);
+    let page = &messages[..shown];
+    let mut text = header(shown);
+    if !page.is_empty() {
+        text.push(':');
+        for (cursor, sender, body) in page {
+            text.push_str(&format!("\n#{cursor} {sender}: {}", truncate_body(body)));
+        }
+    }
+    if messages.len() > shown {
+        let next = page.last().map_or(from, |(cursor, ..)| cursor + 1);
+        text.push_str(&format!(
+            "\n… {} more; resume with from={next}",
+            messages.len() - shown
+        ));
+    }
+    text
+}
+
+/// Truncates a message body for tool output, keeping a read page bounded
+/// regardless of how large a single posted message was.
+fn truncate_body(text: &str) -> String {
+    if text.chars().count() <= MAX_MESSAGE_BODY_CHARS {
+        text.to_owned()
+    } else {
+        let head: String = text.chars().take(MAX_MESSAGE_BODY_CHARS).collect();
+        format!("{head}… [truncated]")
     }
 }
 

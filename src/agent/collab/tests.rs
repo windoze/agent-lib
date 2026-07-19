@@ -21,7 +21,7 @@ use super::blackboard::{Blackboard, BlackboardSnapshot, DEFAULT_CHANNEL};
 use super::mailbox::{MailMessage, Mailbox, MailboxSnapshot};
 use super::plan::{Plan, PlanError, PlanSnapshot, TaskStatus};
 use super::tools::{
-    BLACKBOARD_POST, BLACKBOARD_READ, CollabToolHandler, PLAN_ADD_TASK, PLAN_CLAIM,
+    BLACKBOARD_POST, BLACKBOARD_READ, CollabToolHandler, MAILBOX_READ, PLAN_ADD_TASK, PLAN_CLAIM,
     PLAN_CLAIM_FIRST_AVAILABLE, PLAN_READ, PLAN_UPDATE, REPORT_ARTIFACT, RUN_HOST_TOOL,
     SEND_MESSAGE, SPAWN_AGENT, SpawnAgentRequest, ToolAdapterError, bridge_tool_declarations,
     bridge_tool_set,
@@ -376,6 +376,70 @@ async fn tool_adapter_blackboard_post_uses_injected_identity_as_sender() {
     assert!(text_of(&read).contains("read 1 message"));
 }
 
+/// `blackboard_read` returns the message **bodies** (H-STATE-6: it previously
+/// counted and discarded them), each line attributed with offset and sender,
+/// and a cursored read returns only the tail.
+#[tokio::test]
+async fn tool_adapter_blackboard_read_returns_message_bodies() {
+    let board = blackboard();
+    board.post(DEFAULT_CHANNEL, "alice", "first message");
+    board.post(DEFAULT_CHANNEL, "bob", "second message");
+    let handler = CollabToolHandler::new("reader", plan(), board.clone(), mailbox());
+
+    let response = run(&handler, &call(BLACKBOARD_READ, json!({}))).await;
+    assert_eq!(response.status, ToolStatus::Ok);
+    let text = text_of(&response);
+    assert!(text.contains("read 2 message(s)"), "unexpected: {text}");
+    assert!(
+        text.contains("#0 alice: first message"),
+        "unexpected: {text}"
+    );
+    assert!(
+        text.contains("#1 bob: second message"),
+        "unexpected: {text}"
+    );
+
+    // A cursored read returns only the tail, keeping original offsets.
+    let tail = run(&handler, &call(BLACKBOARD_READ, json!({ "from": 1 }))).await;
+    let text = text_of(&tail);
+    assert!(text.contains("read 1 message(s)"), "unexpected: {text}");
+    assert!(
+        text.contains("#1 bob: second message"),
+        "unexpected: {text}"
+    );
+    assert!(!text.contains("first message"), "unexpected: {text}");
+}
+
+/// A read page is bounded: `limit` holds back further messages and reports the
+/// cursor to resume from, and an over-long body is truncated.
+#[tokio::test]
+async fn tool_adapter_blackboard_read_paginates_and_truncates_bodies() {
+    let board = blackboard();
+    board.post(DEFAULT_CHANNEL, "a", "m0");
+    board.post(DEFAULT_CHANNEL, "a", "m1");
+    board.post(DEFAULT_CHANNEL, "a", "m2");
+    let long = "x".repeat(500);
+    board.post(DEFAULT_CHANNEL, "a", &long);
+    let handler = CollabToolHandler::new("reader", plan(), board.clone(), mailbox());
+
+    let page = run(&handler, &call(BLACKBOARD_READ, json!({ "limit": 2 }))).await;
+    let text = text_of(&page);
+    assert!(text.contains("read 2 message(s)"), "unexpected: {text}");
+    assert!(text.contains("#0 a: m0"), "unexpected: {text}");
+    assert!(text.contains("#1 a: m1"), "unexpected: {text}");
+    assert!(!text.contains("#2 a: m2"), "unexpected: {text}");
+    assert!(
+        text.contains("resume with from=2"),
+        "expected a resume hint, got: {text}"
+    );
+
+    // The 500-char body is truncated with a marker instead of flooding output.
+    let read = run(&handler, &call(BLACKBOARD_READ, json!({ "from": 3 }))).await;
+    let text = text_of(&read);
+    assert!(text.contains("[truncated]"), "unexpected: {text}");
+    assert!(!text.contains(&long), "body was not truncated: {text}");
+}
+
 // ----- Mailbox primitive ---------------------------------------------------
 
 /// Mailbox delivery is directed (only the recipient's inbox grows) and every
@@ -419,6 +483,64 @@ async fn tool_adapter_send_message_delivers_via_library_mailbox() {
     assert_eq!(inbox.len(), 1);
     assert_eq!(inbox[0].from, "coordinator");
     assert_eq!(inbox[0].text, "please claim review");
+}
+
+/// The `mailbox_read` tool (H-STATE-6: the mailbox previously had no read
+/// bridge) returns the calling agent's own inbox messages, attributed with seq
+/// and sender; the recipient identity is the injected one, so a bystander reads
+/// an empty inbox, and a `from` cursor returns only newer mail.
+#[tokio::test]
+async fn tool_adapter_mailbox_read_returns_own_inbox_messages() {
+    let mail = mailbox();
+    let sender = CollabToolHandler::new("coordinator", plan(), blackboard(), mail.clone());
+    run(
+        &sender,
+        &call(
+            SEND_MESSAGE,
+            json!({ "to": "worker-1", "text": "please claim review" }),
+        ),
+    )
+    .await;
+    run(
+        &sender,
+        &call(
+            SEND_MESSAGE,
+            json!({ "to": "worker-1", "text": "design landed" }),
+        ),
+    )
+    .await;
+
+    let reader = CollabToolHandler::new("worker-1", plan(), blackboard(), mail.clone());
+    let response = run(&reader, &call(MAILBOX_READ, json!({}))).await;
+    assert_eq!(response.status, ToolStatus::Ok);
+    let text = text_of(&response);
+    assert!(text.contains("read 2 message(s)"), "unexpected: {text}");
+    assert!(
+        text.contains("#0 coordinator: please claim review"),
+        "unexpected: {text}"
+    );
+    assert!(
+        text.contains("#1 coordinator: design landed"),
+        "unexpected: {text}"
+    );
+
+    // A cursored read returns only newer mail.
+    let tail = run(&reader, &call(MAILBOX_READ, json!({ "from": 1 }))).await;
+    let text = text_of(&tail);
+    assert!(text.contains("read 1 message(s)"), "unexpected: {text}");
+    assert!(
+        text.contains("#1 coordinator: design landed"),
+        "unexpected: {text}"
+    );
+    assert!(!text.contains("please claim review"), "unexpected: {text}");
+
+    // A bystander cannot read someone else's mail: the recipient identity is
+    // the injected one, never a model-supplied argument.
+    let bystander = CollabToolHandler::new("bystander", plan(), blackboard(), mail.clone());
+    let response = run(&bystander, &call(MAILBOX_READ, json!({}))).await;
+    let text = text_of(&response);
+    assert!(text.contains("read 0 message(s)"), "unexpected: {text}");
+    assert!(!text.contains("coordinator"), "unexpected: {text}");
 }
 
 // ----- spawn_agent translation ---------------------------------------------
@@ -585,6 +707,31 @@ async fn tool_adapter_plan_read_reports_version_and_tasks() {
     assert!(text.contains("t=todo"), "unexpected: {text}");
 }
 
+/// `plan_read` also reports each task's owner and dependencies, so a reader
+/// can see who owns what and which tasks are still blocked without extra
+/// round trips.
+#[tokio::test]
+async fn tool_adapter_plan_read_reports_owner_and_dependencies() {
+    let plan = plan();
+    plan.add_task("design", Vec::<String>::new())
+        .expect("add design");
+    plan.add_task("impl", ["design"]).expect("add impl");
+    plan.claim("design", "alice", plan.version())
+        .expect("claim design");
+    let handler = CollabToolHandler::new("agent", plan.clone(), blackboard(), mailbox());
+
+    let response = run(&handler, &call(PLAN_READ, json!({}))).await;
+    let text = text_of(&response);
+    assert!(
+        text.contains("design=in_progress@alice"),
+        "unexpected: {text}"
+    );
+    assert!(
+        text.contains("impl=todo deps:[design]"),
+        "unexpected: {text}"
+    );
+}
+
 /// `plan_add_task` via the tool adapter appends a task and bumps the version.
 #[tokio::test]
 async fn tool_adapter_plan_add_task_via_tool_appends() {
@@ -730,6 +877,7 @@ async fn tool_adapter_bridge_declarations_cover_every_tool() {
         BLACKBOARD_POST,
         BLACKBOARD_READ,
         SEND_MESSAGE,
+        MAILBOX_READ,
         REPORT_ARTIFACT,
         RUN_HOST_TOOL,
     ] {

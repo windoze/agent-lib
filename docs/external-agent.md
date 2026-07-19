@@ -201,6 +201,7 @@ External agent 可以被注入工具,但这些工具应是宿主能力的薄 ada
 |---|---|
 | `spawn_agent` | 转成 `NeedSubagent`,由 `SubagentHandler` 派生 child context |
 | `send_message` | 写入本库 mailbox / blackboard,不是直接写 CC 私有 mailbox |
+| `mailbox_read` | 读取本库 mailbox 中自己的收件箱(收件人恒为注入的 identity) |
 | `plan_claim` / `plan_claim_first_available` / `plan_update` | 操作本库 plan API;claim 必须检查依赖已完成 |
 | `blackboard_post` / `blackboard_read` | 操作本库 blackboard API |
 | `report_artifact` | 把 diff、patch、测试结果、文件路径记录为 artifact/notification |
