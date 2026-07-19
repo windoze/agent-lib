@@ -24,4 +24,5 @@
 - 已更新 `docs/facade-api.md` restore 校验说明、`docs/review-2026-07.md` M-ADP-5 修复标记，并在 `TODO.md` 将 M5-6 标记为 `[DONE]`、追加完成记录。
 - 下一步：检查 git status/diff/log，确认变更范围后提交。
 - 提交前检查：`git status --short` 仅显示 M5-6 相关文件；`git diff --check` 无输出；最近提交为 `[M5-5] Expose facade provider extras builders`。
-- 下一步：提交本次 M5-6 变更后停止。
+- 已提交本次 M5-6 代码/测试/文档/任务记录变更：`1db7dbe [M5-6] Align restore build validation`。
+- 最终步骤：提交本进度文件更新后停止，不进入 M5-7。
