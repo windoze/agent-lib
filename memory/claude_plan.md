@@ -36,4 +36,10 @@
 - [x] 验证全过：fmt、clippy（默认 + external features）、conversation:: 162 条（0.63s）、
       全量 `cargo test --all --all-targets`（exit 0，无 FAILED）、cargo doc
 - [x] `docs/review-2026-07.md` M-CONV-2 标注 ✅；TODO.md M3-4 标 [DONE] + 完成记录
-- [ ] external features 测试确认 + 提交
+- [x] external features 测试确认（48 目标全 ok）+ 提交（739b01e）
+
+## 结果
+
+M3-4 完成：三处长链递归全部迭代化 + 两个手工 Drop 摘链；`root_of` 备忘录化（行为保持的同类
+修复）；4 条 10 万级链测试 < 1s。全量门禁通过，commit 739b01e。停止，等待下一次调用
+（下一个任务 M3-5-1：rows 代次键 schema 变更）。
