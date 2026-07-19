@@ -1,13 +1,13 @@
 # TODO：2026-07 审查收口任务单
 
-本任务单对应 [PLAN.md](PLAN.md) 和 [docs/review-2026-07.md](docs/review-2026-07.md)。旧任务单已归档到 [docs/archive/2026-07-19-refine/TODO.md](docs/archive/2026-07-19-refine/TODO.md)。
+本任务单对应 [PLAN.md](PLAN.md) 和 [docs/review-2026-07.md](../../review-2026-07.md)。旧任务单已归档到 [docs/archive/2026-07-19-refine/TODO.md](../2026-07-19-refine/TODO.md)。
 
 执行规则：
 
 - 严格按编号顺序实现，除非当前任务明确要求先补充前置信息。
 - 每个标题中的 `[TODO]` 表示尚未完成。完成后把 `[TODO]` 改成 `[DONE]`，并在任务下方追加"完成记录"，写明关键实现决策、验证结果和（如有）breaking change。
 - 不要跳过每个 milestone 末尾的 review 任务。
-- 审查条目编号（H-SEC-1 等）定义见 [docs/review-2026-07.md](docs/review-2026-07.md)；修复后在该文档对应条目上标注 `✅ 已修复（M*-*)` 或 `📄 已降级（文档承认现状，M*-*）`。
+- 审查条目编号（H-SEC-1 等）定义见 [docs/review-2026-07.md](../../review-2026-07.md)；修复后在该文档对应条目上标注 `✅ 已修复（M*-*)` 或 `📄 已降级（文档承认现状，M*-*）`。
 - 修改行为时同步修改拥有该行为的文档，至少检查 `README.md`、`AGENTS.md`、`docs/facade-api.md`、`docs/managed-external-agent.md`、`docs/capability-matrix.md`、`docs/conversation-core.md`、`docs/agent-effect-model.md`、`docs/agent-layer.md`。
 - 默认测试必须离线可跑，不依赖真实 provider、真实 CLI login、网络或用户本机配置。
 - 行号引用自审查时点（2026-07-19），随后续修复可能漂移，以符号名为准。
@@ -1848,7 +1848,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。全量测试与 clippy 按任务政策跳过：本任务只改 markdown 与 rustdoc 注释，不改变编译产物或运行行为；沿用 M9-3 的全量绿色结果。
 - 无 breaking change（仅文档与 rustdoc 注释）。
 
-### M9-5 [TODO] 终审 review：全计划收口
+### M9-5 [DONE] 终审 review：全计划收口
 
 检查项：
 
@@ -1857,3 +1857,13 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 全量门禁命令通过（含全部 external features）。
 - `cargo test --all --all-targets` 无挂起、无 ignore 泄漏（默认离线）。
 - 收尾：PLAN.md/TODO.md 归档到 `docs/archive/2026-07-19-review-fixes/`（本计划完成后）。
+
+完成记录：
+
+- 最近提交核对：`[M9-4] Synchronize documentation review closeout` 未提到与 M9-5 直接相关的未完成事项，无需新增前置任务。
+- 审查报告核对：`docs/review-2026-07.md` 所有 `####` 审查条目均已有最终状态标注；低严重度列表也已逐项标为 `✅ 已修复`、`📄 已降级/部分收敛` 或 `📄 不做` 并说明理由，无未标注条目。
+- PLAN 五个目标达成情况已写入 `PLAN.md` 的“最终收口结论（M9-5）”：高严重度问题已修复/降级，设计承诺与实现已对齐，错误/取消语义已结构化，LLM/CLI adapter 复制代码已收敛，owned 文档与默认离线测试策略已同步。
+- 全量门禁全部通过：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
+- 测试说明：默认全量测试与 external feature 全目标测试均通过；真实 endpoint / 真实 CLI 测试保持 `ignored`，符合本计划非目标与默认离线要求；未发现挂起测试。
+- 收尾归档：本完成记录写入后，根 `PLAN.md` 与 `TODO.md` 归档到 `docs/archive/2026-07-19-review-fixes/`。本任务是最终任务，归档后创建 `endtag`。
+- 无 breaking change（终审与归档任务，不改生产代码）。

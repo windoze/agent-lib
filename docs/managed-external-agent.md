@@ -1613,7 +1613,8 @@ cargo test --test agent_external_real_e2e -- --ignored --nocapture
 ## 21. 落地里程碑
 
 > **编号说明**:本节是设计初稿的里程碑拆分,与实际执行的里程碑编号(见
-> [`PLAN.md`](../PLAN.md) / [`TODO.md`](../TODO.md))并非一一对应。执行侧已落地:sequenced
+> [`PLAN.md`](archive/2026-07-19-review-fixes/PLAN.md) /
+> [`TODO.md`](archive/2026-07-19-review-fixes/TODO.md))并非一一对应。执行侧已落地:sequenced
 > observations(执行 M1)、`ExternalAgentMachine` tool parity(执行 M2)、subagent / interaction
 > parity(执行 M3,含 `spawn_agent` tool-bridge 特判)、sequenced live sink(执行 M4-1)、capability model
 > (执行 M4-2:`ExternalRuntimeCapabilities` / `ExternalCapability` / `UnsupportedCapability`,设计见

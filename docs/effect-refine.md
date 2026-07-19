@@ -273,7 +273,7 @@ fn inject_pivot(&mut self, pivot: PivotMessage) -> Result<StepOutcome, StepError
 
 ### 4.1 现状:一个 effect = 分散在 8 处的样板
 
-新增一个 effect(如正在做的 `NeedExternalSession`,见 [`PLAN.md`](../PLAN.md))要同步改:
+新增一个 effect(如正在做的 `NeedExternalSession`,见 [`PLAN.md`](archive/2026-07-19-review-fixes/PLAN.md))要同步改:
 
 | # | 位置 | 改什么 |
 |---|---|---|
@@ -373,7 +373,7 @@ handler trait 在 `drive.rs` 解析,两个模块互不需要对方的 import。*
 | (B) cursor/scratch 合一 | `machine/default/`、`state/cursor.rs` | 无(落点 2)/ 需迁移(落点 1) | 落点 2 无 / 落点 1 有 | (C) 之后 |
 | (A) effect 宏 | `requirement.rs`、`drive.rs` | 无(要求等价性测试) | 无 | external-agent 变体稳定后 |
 
-每刀单独一个 PR,单独走 [`PLAN.md`](../PLAN.md) 的默认验证序列(fmt / 聚焦测试 / clippy /
+每刀单独一个 PR,单独走 [`PLAN.md`](archive/2026-07-19-review-fixes/PLAN.md) 的默认验证序列(fmt / 聚焦测试 / clippy /
 全量测试 / doc / `git diff --check`)。三刀之间无强依赖,可按上表顺序增量推进;若只做一刀,
 做 (C)——它性价比最高、风险最低,做完即可直观看到 `default/mod.rs` 的噪音下降多少。
 

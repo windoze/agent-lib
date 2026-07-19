@@ -1,13 +1,13 @@
 # 实施计划：2026-07 审查收口
 
-本计划以 [docs/review-2026-07.md](docs/review-2026-07.md) 为唯一输入，目标是把全库审查发现的问题按依赖顺序落地修复，并在过程中保持测试、文档与实现同步。
+本计划以 [docs/review-2026-07.md](../../review-2026-07.md) 为唯一输入，目标是把全库审查发现的问题按依赖顺序落地修复，并在过程中保持测试、文档与实现同步。
 
 旧版计划和任务单已归档到：
 
-- [docs/archive/2026-07-19-refine/PLAN.md](docs/archive/2026-07-19-refine/PLAN.md)
-- [docs/archive/2026-07-19-refine/TODO.md](docs/archive/2026-07-19-refine/TODO.md)
+- [docs/archive/2026-07-19-refine/PLAN.md](../2026-07-19-refine/PLAN.md)
+- [docs/archive/2026-07-19-refine/TODO.md](../2026-07-19-refine/TODO.md)
 
-审查发现按编号引用（如 H-SEC-1、M-CONV-3），定义见 [docs/review-2026-07.md](docs/review-2026-07.md)。
+审查发现按编号引用（如 H-SEC-1、M-CONV-3），定义见 [docs/review-2026-07.md](../../review-2026-07.md)。
 
 ## 目标
 
@@ -159,3 +159,24 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 3. 拥有该行为的文档已同步（至少检查 `README.md`、`AGENTS.md`、`docs/facade-api.md`、`docs/managed-external-agent.md`、`docs/capability-matrix.md`、`docs/conversation-core.md`、`docs/agent-effect-model.md`、`docs/agent-layer.md`）。
 4. `docs/review-2026-07.md` 中对应条目已标注修复状态。
+
+## 最终收口结论（M9-5）
+
+本计划已完成，五个目标逐项达成：
+
+1. 高严重度问题已收口：M1-M7 修复或文档化了凭证泄露、wire 数据 panic、HTTP/CLI 超时、process-group kill、worktree cleanup、Conversation 投影/持久化一致性、Agent/facade 毒化和静默丢数据等条目；`docs/review-2026-07.md` 中对应 H-* 条目均有最终状态。
+2. 设计承诺与实现已对齐：budget、cancel、pivot、approval、session policy、provider_extras、worktree isolation、dispatcher budget hard stop 等要么已实现，要么在 owned 文档中明确降级边界。
+3. 错误与取消语义已修正：默认机器软拒绝与硬失败分离，取消有界并完整记录 trace，facade 使用结构化错误 kind 与 `FacadeError::BudgetExhausted` 等可识别出口。
+4. 复制代码已收敛：两个 LLM adapter 共享 `src/adapter/common/`，CLI/ACP 进程生命周期共享 `src/agent/external/process/`，M1-M7 修复后的行为由单一实现承载。
+5. 文档与验证已同步：README、AGENTS 与关键 docs 已在 M9-4 核对；M9-5 全量门禁通过，默认测试保持离线，真实端点/真实 CLI 测试仍按设计 ignored。
+
+最终验证（M9-5）全部通过：
+
+- `cargo fmt --all`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
+- `cargo test --all --all-targets`
+- `cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+
+收尾归档：本计划与任务单在 M9-5 完成后归档到 `docs/archive/2026-07-19-review-fixes/`。
