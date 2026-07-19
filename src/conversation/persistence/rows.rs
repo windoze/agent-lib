@@ -4,6 +4,11 @@
 //! committed consistency point as [`ConversationSnapshot`], but split it into
 //! database-friendly immutable fact tables plus per-Conversation association
 //! rows. They do not bind to SQL, a migration runner, or a concrete driver.
+//!
+//! Message fact rows carry the full [`ConversationMessage`] envelope — the
+//! provider-neutral payload plus envelope-local [`MessageMeta`] — so a
+//! `to_rows → into_snapshot` round trip preserves injected-message metadata
+//! (for example a pivot source label) instead of silently dropping it.
 
 use super::{
     CONVERSATION_SNAPSHOT_SCHEMA_VERSION, ConversationSnapshot, ConversationSnapshotHistory,
@@ -11,8 +16,8 @@ use super::{
 use crate::{
     conversation::{
         Artifact, ArtifactId, ArtifactProvenance, CheckedTurnRange, ConversationConfig,
-        ConversationId, ConversationMessage, ForkOrigin, MessageId, Projection, RowMappingError,
-        Span, StrategyRef, TokenAccounting, ToolCallId, TurnId, TurnMeta,
+        ConversationId, ConversationMessage, ForkOrigin, MessageId, MessageMeta, Projection,
+        RowMappingError, Span, StrategyRef, TokenAccounting, ToolCallId, TurnId, TurnMeta,
         turn::{ToolPairingData, TurnCompletion, TurnData},
     },
     model::message::Message,
@@ -130,6 +135,12 @@ pub struct MessageRecord {
     pub message_sequence: u64,
     /// Provider-neutral complete Client message payload.
     pub payload: Message,
+    /// Envelope-local metadata frozen with the message, when any.
+    ///
+    /// Rows exported before this column existed deserialize with `None`,
+    /// matching the envelope's own absent-metadata representation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<MessageMeta>,
 }
 
 /// Immutable tool pairing fact row.
@@ -353,6 +364,7 @@ impl ConversationRows {
                     turn_id: turn.id,
                     message_sequence: usize_to_u64(message_index),
                     payload: message.payload().clone(),
+                    meta: message.meta().cloned(),
                 });
             }
             for (pairing_index, pairing) in turn.pairings.iter().enumerate() {
@@ -972,7 +984,14 @@ fn messages_for_turn(
     }
     Ok(sorted
         .into_iter()
-        .map(|row| ConversationMessage::new(row.message_id, row.payload.clone()))
+        .map(|row| match &row.meta {
+            Some(meta) => ConversationMessage::new_with_meta(
+                row.message_id,
+                row.payload.clone(),
+                meta.clone(),
+            ),
+            None => ConversationMessage::new(row.message_id, row.payload.clone()),
+        })
         .collect())
 }
 

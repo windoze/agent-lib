@@ -2,7 +2,9 @@
 
 use super::*;
 use crate::{
-    conversation::{CancelDisposition, CancelOutcome, CancelledToolResult, ToolCallLocationKind},
+    conversation::{
+        CancelDisposition, CancelOutcome, CancelledToolResult, MessageMeta, ToolCallLocationKind,
+    },
     model::tool::ToolStatus,
 };
 
@@ -305,6 +307,70 @@ fn commit_parallel_tool_turn(conversation: &mut Conversation, seed: u128) {
     conversation
         .commit_pending(explicit_meta(seed, "parallel-fixture"))
         .expect("commit parallel tool turn");
+}
+
+/// Commits a tool turn that carries one user message injected at the closed
+/// tool-result step boundary with envelope metadata, returning the injected
+/// message id and metadata for later assertions.
+fn commit_injected_user_turn(
+    conversation: &mut Conversation,
+    seed: u128,
+) -> (MessageId, MessageMeta) {
+    let provider_call = format!("call-inject-{seed}");
+    begin(conversation, seed);
+    finish_requires_mappings(
+        conversation,
+        assistant_response(
+            vec![text("injected lookup"), tool_use(&provider_call)],
+            6,
+            3,
+            StopReason::ToolUse,
+            "injected-tool",
+        ),
+        seed * 10 + 1,
+    );
+    conversation
+        .register_tool_calls(vec![ToolCallMapping::new(
+            &provider_call,
+            call_id(seed * 100 + 1),
+        )])
+        .expect("register injected turn call");
+    conversation
+        .append_tool_response(
+            message_id(seed * 10 + 2),
+            tool_response(&provider_call, "injected tool result"),
+        )
+        .expect("append injected turn result");
+
+    let injected_id = message_id(seed * 10 + 3);
+    let injected_meta = MessageMeta::new(
+        Some("pivot:human".to_owned()),
+        Map::from_iter([("injected_by".to_owned(), json!("fixture"))]),
+    );
+    conversation
+        .inject_user_message(
+            conversation.head(),
+            injected_id,
+            user(format!("injected constraint:{seed}")),
+            injected_meta.clone(),
+        )
+        .expect("inject user message at closed tool-result boundary");
+
+    finish_ready(
+        conversation,
+        assistant_response(
+            vec![text(format!("injected final:{seed}"))],
+            4,
+            2,
+            StopReason::EndTurn,
+            "injected-final",
+        ),
+        seed * 10 + 4,
+    );
+    conversation
+        .commit_pending(explicit_meta(seed, "injected-fixture"))
+        .expect("commit injected user turn");
+    (injected_id, injected_meta)
 }
 
 fn compact_raw_range(
@@ -613,4 +679,60 @@ fn pending_snapshot_rejection_can_be_followed_by_cancel_commit_or_discard_then_r
             .any(|text| text == "final after cancellation")
     );
     assert_persistence_paths_restore("commit after pending snapshot rejection", &commit);
+}
+
+#[test]
+fn rows_round_trip_preserves_injected_user_message_meta() {
+    let mut conversation = conversation(330);
+    commit_text_turn(&mut conversation, 331);
+    let (injected_id, injected_meta) = commit_injected_user_turn(&mut conversation, 332);
+
+    let injected = conversation
+        .raw_turn(turn_id(332))
+        .expect("injected turn")
+        .messages()
+        .iter()
+        .find(|message| message.id() == injected_id)
+        .expect("injected message retained");
+    assert_eq!(injected.meta(), Some(&injected_meta));
+
+    // The full persistence acceptance (snapshot JSON, rows, scrambled rows,
+    // restore) must carry the envelope metadata end to end.
+    assert_persistence_paths_restore("injected user message meta", &conversation);
+
+    let snapshot = conversation.snapshot().expect("snapshot");
+    let rows = snapshot.to_rows().expect("rows");
+    let row = rows
+        .messages
+        .iter()
+        .find(|row| row.message_id == injected_id)
+        .expect("injected message row");
+    assert_eq!(row.meta, Some(injected_meta.clone()));
+
+    let encoded = serde_json::to_string(&rows).expect("encode rows");
+    assert!(
+        encoded.contains("pivot:human"),
+        "rows JSON carries the injected message meta source"
+    );
+
+    // Rows exported before the `meta` column existed still deserialize, with
+    // the metadata defaulting to absent.
+    let mut legacy_json: Value = serde_json::from_str(&encoded).expect("rows JSON value");
+    for message in legacy_json["messages"]
+        .as_array_mut()
+        .expect("message row array")
+    {
+        message
+            .as_object_mut()
+            .expect("message row object")
+            .remove("meta");
+    }
+    let legacy_rows: ConversationRows =
+        serde_json::from_value(legacy_json).expect("legacy rows decode without meta");
+    let legacy_row = legacy_rows
+        .messages
+        .iter()
+        .find(|row| row.message_id == injected_id)
+        .expect("injected legacy row");
+    assert_eq!(legacy_row.meta, None);
 }

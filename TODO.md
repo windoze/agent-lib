@@ -623,7 +623,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过；`cargo test -p agent-lib --lib conversation::projection` 26 条全过。
 - Breaking change（pre-1.0，记录在此）：`ProjectionError` 新增 `CompactionOnRevertedHead` 变体，外部对该枚举的穷尽 match 需补分支（该枚举未标 `#[non_exhaustive]`）。
 
-### M3-2 [TODO] `MessageRecord` 增加 `meta` 字段（H-STATE-2）
+### M3-2 [DONE] `MessageRecord` 增加 `meta` 字段（H-STATE-2）
 
 上下文：
 
@@ -641,6 +641,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - e2e 夹具增加一条经 `inject_user_message` 注入的消息（带 source meta），断言 `to_rows → into_snapshot` round-trip 相等。
 - `cargo test -p agent-lib --lib conversation::persistence` 与 `cargo test --test conversation_persistence*`（按现有测试目标名）全过。
+
+完成记录：
+
+- `MessageRecord`（`src/conversation/persistence/rows.rs`）新增 `meta: Option<MessageMeta>`，`#[serde(default, skip_serializing_if = "Option::is_none")]`——旧行数据（无 `meta` 键）在 `deny_unknown_fields` 下仍可反序列化为 `None`，新导出的行仅在有 meta 时落列；`CONVERSATION_ROW_SCHEMA_VERSION` 不变（向后兼容的增量列，非破坏性 schema 变更）。
+- 双向携带：`from_snapshot` 以 `message.meta().cloned()` 写入行；`into_snapshot` 的 `messages_for_turn` 对 `Some(meta)` 走 `ConversationMessage::new_with_meta` 还原（`None` 仍走 `new`），envelope 构造单一入口保留。`insert_set_against` 的 message diff key（`message_id`）不变，meta 现在是不可变事实的一部分，同 id 不同 meta 仍 `InsertConflict`（语义正确）。
+- 文档：rows 模块文档补「消息事实行携带完整 envelope（payload + MessageMeta），round-trip 不丢注入消息元数据」；`MessageRecord::meta` rustdoc 写明旧行缺省语义；`docs/conversation-core.md` §10 的 messages 行形态补 `meta` 列。"与 snapshot 描述同一一致点"的承诺恢复成立。
+- 测试：e2e 新增 `rows_round_trip_preserves_injected_user_message_meta`——夹具 `commit_injected_user_turn` 在闭合 tool-result 步边界经 `inject_user_message` 注入一条带 `source: "pivot:human"` + extra 的用户消息并提交；断言运行时 envelope meta、行分解 `meta` 列、行 JSON 含 source 字样；完整 `assert_persistence_paths_restore`（快照 JSON / rows / 乱序 rows / restore 全路径 round-trip 相等）；另断言剥离 `meta` 键的旧行 JSON 反序列化为 `None`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::persistence`（19 条全过，含新 e2e）、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。无 `conversation_persistence*` 集成测试目标，persistence 测试均在 lib 内（按现有测试目标名执行）。
+- `docs/review-2026-07.md` H-STATE-2 已标注 `✅ 已修复（M3-2）`。无 breaking change（serde 向后兼容增量字段；struct literal 构造点仅库内一处已同步）。
 
 ### M3-3 [TODO] 修复 restore 派生索引的空校验（M-CONV-1）
 
