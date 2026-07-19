@@ -1,66 +1,60 @@
 # 执行计划
 
-## 当前任务：M3-5-3 `insert_set_against` 代次键 diff + 演进场景测试
+## 当前任务：M3-5-4 rows 代次模型文档同步（纯文档任务）
 
-任务来源：`TODO.md` M3-5-3。前置状态：M3-5-1（三类行 generation + schema v2）、
-M3-5-2（insert set into_snapshot 最大代次选取 + ArtifactRecord generation + schema v3，
-artifact diff key 已落地为 `cid#gen#artifact_id`）均已完成。
+任务来源：`TODO.md` M3-5-4。前置状态：M3-5-1（schema v3：三类演进行 + artifact 的
+generation 列）、M3-5-2（insert set 最大代次选取重组 + merge）、M3-5-3（diff key 代次化）
+均已完成。
+
+### 结构修复（前置）
+
+M3-5-4 的标题行 `#### M3-5-4 [TODO] rows 代次模型文档同步` 在 M3-5-3 提交（0dd60f9）中
+被误删，其「实现要求/验证条件」正文成为孤儿段落（TODO.md:810-818）。经 git 历史核对
+（7938f25 中标题完好、正文未变），先恢复标题行再执行任务。
 
 ### 任务要求（来自 TODO.md）
 
-1. `diff_single_conversation`：key 改为 `(conversation_id, generation)`——同 conversation
-   不同代次不再冲突，作为新行插入；同代次内容不同仍 `InsertConflict`。
-2. `diff_rows` 的 lineage/span key 闭包加入 generation：
-   `conversation_id#generation#lineage_sequence` / `conversation_id#generation#span_sequence`。
-3. artifact diff key 已在 M3-5-2 落地，本任务确认行为即可。
-4. L-3（放宽 `insert_set_against` 的 existing 为多 conversation 子集查询结果）
-   与本任务 diff 改动同源，实施时一并评估；若超范围记录为后续项。
-5. 事实表 diff key 不变。
+1. `rows.rs` 模块文档与 `ConversationRowInsertSet` 文档改写为代次模型描述：
+   事实表 insert-only；演进表按代次版本化；"当前状态 = 最大代次"；
+   `structural_version` 即代次。
+2. `docs/conversation-core.md` 持久化节同步；DESIGN.md §10 如有相关描述一并核对。
+3. 文档中给出演进时序示例：commit → gen 1 行集；revert → gen 2 行集；
+   查询当前状态取 gen 2。
 
-### 验证条件（每条一个测试）
+### 验证条件
 
-- commit 演进：导出 gen N → 再 commit → 导出 gen N+1 → `insert_set_against` 成功，
-  insert set 只含新 conversation 行 + 新 lineage 行 + 新 turn/message 事实行。
-- revert 演进：导出 → revert → 导出 → 不冲突，新 lineage 行以新代次共存。
-- compaction 演进：导出 → apply_compaction → 导出 → 不冲突，新 span 行以新代次共存。
-- 同代次篡改：手工改同 generation 行的内容 → 仍 `InsertConflict`。
-- round-trip：两次导出的行集合并后 `into_snapshot` 得到最新状态（与 M3-5-2 联动）。
-- `cargo test -p agent-lib --lib conversation::persistence` 全过。
+- 文档与 M3-5-1~3 实现一致（以代码为准核对措辞）。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
+- 纯文档/rustdoc 注释改动，不影响编译输出 → 按既定政策跳过全量测试套件
+  （沿用 M3-5-3 的绿色结果），但 rustdoc 改动必须跑 cargo doc 与 fmt/clippy 快检。
 
 ### 执行步骤
 
-1. 读 `src/conversation/persistence/rows.rs` 现状：`insert_set_against`、
-   `diff_single_conversation`、`diff_rows` 及 key 闭包、现有 diff 测试。
-2. 修改 diff key：
-   - conversation 行 key：`conversation_id` → `(conversation_id, generation)`。
-   - lineage/span key 闭包加 generation 段。
-   - 事实表 key 不动。
-3. 评估 L-3：`insert_set_against(existing: ConversationRows, ...)` 的 existing 形状
-   是否需要放宽；若签名改动超范围，记录为后续项。
-4. 新增 5 条验证条件测试（commit/revert/compaction 演进、同代次篡改、合并 round-trip）。
-5. 门禁：`cargo fmt --all` → `cargo clippy --all-targets -- -D warnings` →
-   external features clippy → `cargo test -p agent-lib --lib conversation::persistence` →
-   `cargo test --all --all-targets` → `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
-6. 更新 `TODO.md`（M3-5-3 标 [DONE] + 完成记录）。
-7. 提交：`[M3-5-3] ...`，含本计划文件更新。
+1. 恢复 TODO.md 中 M3-5-4 标题行（结构修复）。
+2. 读 `src/conversation/persistence/rows.rs` 模块文档与 `ConversationRowInsertSet` 现状。
+3. 读 `docs/conversation-core.md` 持久化节与 `DESIGN.md` §10。
+4. 改写 rows.rs 两处 rustdoc 为代次模型（含演进时序示例）。
+5. 同步 `docs/conversation-core.md`；DESIGN.md §10 按需核对。
+6. 门禁：fmt → clippy（默认 + external features）→ cargo doc（-D warnings）。
+7. 更新 TODO.md（M3-5-4 标 [DONE] + 完成记录）。
+8. 提交：`[M3-5-4] ...`，含本计划文件。
 
 ### 进度记录
 
-- [x] 读取 TODO.md，确定当前任务为 M3-5-3
-- [x] 阅读 rows.rs diff 代码现状
-- [x] 实现 diff key 代次化（conversation key 加 generation；lineage/span key 闭包加 generation；artifact 已在 M3-5-2 就位；`insert_set_against` rustdoc 补代次演进说明）
-- [x] 新增演进场景测试（5 条：commit/revert/compaction 演进、同代次篡改+分叉克隆冲突、insert-set 合并 round-trip；persistence 35 条全过）
-  - 测试中发现：无 compaction 的导出也有 projection span 行（raw span 集合），断言已按此修正；`Conversation` 不实现 Clone，分叉场景改用确定性构造函数 `conversation(seed)` 双实例重放
-- [x] L-3 评估结论记录（放宽 existing 形状 = 签名级 breaking，列入 M9-2 后续项）
-- [x] 全量门禁（fmt/clippy/external clippy/test --all/doc 全过）
-- [x] 更新 TODO.md（M3-5-3 标 DONE + M9-2 增 L-3 后续项）
-- [x] 提交（0dd60f9）
+- [x] 读取 TODO.md，发现 M3-5-4 标题行在 M3-5-3 提交中被误删（正文孤儿化）
+- [x] git 历史核对：7938f25 中标题与正文完好，0dd60f9 误删标题行
+- [x] 恢复 TODO.md 中 M3-5-4 标题行（结构修复）
+- [x] rows.rs 模块文档新增「Generation model (insert-only evolution)」节（两类行、structural_version 即代次、当前状态 = 最大代次、时序示例）
+- [x] `ConversationRowInsertSet` rustdoc 补代次键口径
+- [x] `docs/conversation-core.md` §10 新增代次模型条目；DESIGN.md 核对（无 §10、无 rows 描述，无需更新）
+- [x] 门禁：fmt / clippy（默认 + external features）/ cargo doc（-D warnings）全过；全量测试套件按政策跳过（纯文档/rustdoc 注释变更）
+- [x] 更新 TODO.md（M3-5-4 标 [DONE] + 完成记录）
 
 ## 任务完成总结
 
-M3-5-3 已完成并标 `[DONE]`。核心交付：
-1. `diff_single_conversation` 主键改 `(conversation_id, generation)`；lineage/span diff key 加 generation 段，与 M3-5-2 的 artifact key 同构——同 conversation 演进后重导出从必然 `InsertConflict` 变为合法 insert-only。
-2. 5 条演进场景测试（commit/revert/compaction 演进、同代次篡改+分叉克隆冲突、insert-set 合并 round-trip），persistence 35 条全过。
-3. L-3（放宽 `insert_set_against` existing 形状）评估为签名级 breaking，已列入 M9-2。
-4. 全量门禁（fmt/clippy/external-clippy/test/doc）全过。
-下一任务：M3-5-4（rows 代次模型文档同步，纯文档任务）。
+M3-5-4 已完成并标 `[DONE]`。核心交付：
+1. 结构修复：恢复被 M3-5-3 提交误删的 M3-5-4 标题行。
+2. rows.rs 模块文档 + `ConversationRowInsertSet` rustdoc 改写为代次模型描述（含演进时序示例）。
+3. `docs/conversation-core.md` §10 同步代次模型条目；DESIGN.md 无需更新。
+4. 门禁（fmt/clippy×2/doc）全过；测试套件按纯文档政策跳过。
+至此 M3-5-1~4 全部落地，M-CONV-3 的标注留待 M3-9 review。下一任务：M3-6（finish_assistant 前置块级校验）。

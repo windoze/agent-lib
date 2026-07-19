@@ -5,6 +5,38 @@
 //! database-friendly immutable fact tables plus per-Conversation association
 //! rows. They do not bind to SQL, a migration runner, or a concrete driver.
 //!
+//! # Generation model (insert-only evolution)
+//!
+//! Row kinds split into two classes:
+//!
+//! - **Immutable fact rows** — turns, messages, and tool pairings keyed by
+//!   stable ids, plus the append-only raw-membership association and the
+//!   projection header. Once inserted they never change, so every export
+//!   shares them.
+//! - **Evolving, generation-versioned rows** — the conversation row, lineage
+//!   membership, projection spans, and artifact membership. Every structural
+//!   change (commit, revert, compaction) bumps the Conversation's
+//!   `structural_version`, and that version *is* the generation: a re-export
+//!   stamps every evolving row with the export consistency point's
+//!   `structural_version` and inserts it as a new row instead of updating the
+//!   stored one. The store therefore stays insert-only — no UPDATE, no
+//!   DELETE.
+//!
+//! The current state of a Conversation is the **maximum generation**: reading
+//! back means returning every stored row and reassembling through
+//! [`ConversationRowInsertSet::into_snapshot`], which selects the maximum
+//! generation and treats older ones as retained history.
+//!
+//! Timeline — a Conversation commits (generation 1), then reverts and
+//! re-commits (generation 2):
+//!
+//! ```text
+//! commit → export gen 1 row set: conversation(v1), lineage/span/artifact @gen 1
+//! revert → export gen 2 row set: conversation(v2), lineage/span/artifact @gen 2
+//!          (both generations coexist; immutable fact rows are shared)
+//! read   → select the gen 2 rows → current snapshot
+//! ```
+//!
 //! Message fact rows carry the full [`ConversationMessage`] envelope — the
 //! provider-neutral payload plus envelope-local [`MessageMeta`] — so a
 //! `to_rows → into_snapshot` round trip preserves injected-message metadata
@@ -274,6 +306,12 @@ pub struct ArtifactRecord {
 /// The set only contains rows that are absent from the existing set. If the
 /// same primary key exists with different immutable facts, construction fails
 /// with [`RowMappingError::InsertConflict`] instead of describing an update.
+/// Evolving rows (conversation, lineage membership, projection spans, and
+/// artifact membership) are keyed by `(key, generation)` where the generation
+/// is the Conversation's `structural_version` at the export consistency
+/// point, so re-exporting an evolved Conversation contributes the new
+/// generation's rows alongside the stored ones while immutable fact rows
+/// stay shared by stable id.
 ///
 /// The all-`Vec` shape can also hold a *merged* multi-generation row set —
 /// for example every row a store accumulated for one Conversation across

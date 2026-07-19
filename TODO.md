@@ -807,6 +807,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::persistence`（35 条全过）、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - `docs/review-2026-07.md` M-CONV-3 按既定口径留待 M3-5-1~4 全部落地后（M3-9）标注。无 breaking change（diff key 形状变化是行为修正——同 conversation 二次导出从必然 `InsertConflict` 变为合法插入；函数签名未变）。
 
+#### M3-5-4 [DONE] rows 代次模型文档同步
+
 实现要求：
 
 - `rows.rs` 模块文档（rows.rs:1-40 附近）与 `ConversationRowInsertSet` 文档（rows.rs:233-237）：改写为代次模型描述——事实表 insert-only；演进表按代次版本化；"当前状态 = 最大代次"；`structural_version` 即代次。
@@ -816,6 +818,17 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 验证条件：
 
 - 文档与 M3-5-1~3 实现一致；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
+
+完成记录：
+
+- **结构修复（前置）**：M3-5-4 的标题行在 M3-5-3 提交（0dd60f9）中被误删，正文成为孤儿段落；经 git 历史核对（7938f25 中标题与正文完好）后先恢复 `#### M3-5-4` 标题行再执行，正文未动。
+- `rows.rs` 模块文档新增「Generation model (insert-only evolution)」节：行分两类——不可变事实行（turn/message/tool_pairing 稳定 id 主键 + raw membership append-only + projection 头，各次导出共享）与会演进的代次版本化行（conversation / lineage / span / artifact，重导出以新代次插入新行而非 UPDATE）；`structural_version` 即代次；当前状态 = 最大代次（经 `ConversationRowInsertSet::into_snapshot` 选取）；含 commit(gen 1) → revert(gen 2) → 读回取 gen 2 的时序示例。
+- `ConversationRowInsertSet` rustdoc 补代次键口径：演进行按 `(key, generation)` 键控（generation = 导出一致点的 structural_version），演进后重导出与已存行共存，事实行仍按稳定 id 共享。
+- `docs/conversation-core.md` §10 新增「行模型（rows）按代次演进，全程 insert-only」条目，与 rustdoc 同口径（两类行、structural_version 即代次、当前状态 = 最大代次、时序示例、pre-1.0 旧 schema 无迁移路径），与同节「message 表 immutable」条目衔接。
+- DESIGN.md 核对：无 §10（其章节仅到 §6），「序列化边界」节只讲 wire data/config serde 与运行时资源分界，不含 rows 代次模型描述，无需更新。
+- 文档与实现一致性核对：演进表清单（conversation/lineage/span/artifact 四类）、事实表清单、`generation == structural_version`、最大代次选取、合并重组均与 M3-5-1~3 代码（`from_snapshot` 填充、`insert_set_against` 代次键、`ConversationRowInsertSet::into_snapshot` 选取规则）一致。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。全量测试套件按既定政策跳过——自 M3-5-3 绿色全量运行以来仅 rustdoc 注释与 markdown 文档变更，不影响编译输出，沿用前次绿色结果。
+- `docs/review-2026-07.md` M-CONV-3 按既定口径留待 M3-5-1~4 全部落地后由 M3-9 标注（本任务完成后 M3-5-1~4 已全部落地，M3-9 复验时标注）。无 breaking change（纯文档）。
 
 ### M3-6 [TODO] `finish_assistant` 前置块级校验（M-CONV-5）
 
