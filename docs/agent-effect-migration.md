@@ -391,6 +391,9 @@ cancel 不是单独机制,是 handler 行为(effect-model §6.3)。落地:
 **resume 还是 never-resume**(effect-model §8)。接现有 `TraceHandle` / `TraceNodeKind`,
 新增 `TraceNodeKind::Requirement { resolved_at_scope, disposition }`。
 
+记录是 best-effort(H-STATE-4):pivot 以同一 requirement id 重发时,后续 settle 记在派生
+node id `<id>#attempt-N` 下;任何 trace 记录失败都不中止 drain(详见 effect-model §8)。
+
 ---
 
 ## 12. 仍需拍板的决策(每条带默认建议)

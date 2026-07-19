@@ -82,8 +82,8 @@ use crate::{
     agent::{
         AgentError, AgentInput, AgentMachine, LlmStepMode, LoopCursor, LoopCursorKind,
         Notification, Requirement, RequirementDisposition, RequirementId, RequirementKind,
-        RequirementResolution, RequirementResult, RunContext, RunContextError, StepInput,
-        ToolSetRef, TraceNodeId,
+        RequirementResolution, RequirementResult, RunContext, StepInput, ToolSetRef, TraceError,
+        TraceNodeId,
         effect_manifest::{define_effect_fan_out, with_effect_manifest},
         external::ExternalSessionRequest,
         interaction::Interaction,
@@ -404,7 +404,7 @@ where
         // layer (`resolved_at_scope == 0`) with a `NeverResumed` disposition.
         if ctx.is_cancelled() {
             if let Some(requirement) = pending.first() {
-                record_requirement(ctx, requirement, 0, RequirementDisposition::NeverResumed)?;
+                record_requirement(ctx, requirement, 0, RequirementDisposition::NeverResumed);
                 let mut outcome = machine.step(StepInput::Abandon(requirement.id));
                 notifications.append(&mut outcome.notifications);
             }
@@ -427,7 +427,7 @@ where
                 &resolution,
                 resolved_at_scope,
                 RequirementDisposition::Resumed,
-            )?;
+            );
             let mut outcome = machine.step(StepInput::Resume(resolution));
             notifications.append(&mut outcome.notifications);
             pending.extend(outcome.requirements);
@@ -442,19 +442,23 @@ where
 ///
 /// The trace node id reuses the host-minted requirement id, keeping the library
 /// out of the id-minting business (mirroring every other Agent identity).
+///
+/// Recording is best-effort: the trace is purely observational, so a recording
+/// failure never aborts the drive (H-STATE-4). See [`record_requirement_node`]
+/// for how a re-emitted (pivot) requirement id is disambiguated.
 pub(crate) fn record_requirement(
     ctx: &RunContext,
     requirement: &Requirement,
     resolved_at_scope: u32,
     disposition: RequirementDisposition,
-) -> Result<(), AgentError> {
+) {
     record_requirement_node(
         ctx,
         requirement.tag(),
         requirement.id,
         resolved_at_scope,
         disposition,
-    )
+    );
 }
 
 /// Records a settled requirement identified by its [`RequirementResolution`].
@@ -463,34 +467,50 @@ pub(crate) fn record_requirement_resolution(
     resolution: &RequirementResolution,
     resolved_at_scope: u32,
     disposition: RequirementDisposition,
-) -> Result<(), AgentError> {
+) {
     record_requirement_node(
         ctx,
         resolution.tag(),
         resolution.id,
         resolved_at_scope,
         disposition,
-    )
+    );
 }
 
-/// Appends a `Requirement` trace node, mapping a trace failure to an
-/// [`AgentError`].
+/// Appends a `Requirement` trace node on a best-effort basis.
+///
+/// A pivot re-emits the outstanding requirement under the *same* id, so the
+/// plain node id is already taken when the re-emission settles: the settle is
+/// then recorded under the derived id `<id>#attempt-N` (N counting up from 2),
+/// keeping every settle on the trace instead of dropping it. Any other
+/// recording failure (for example an [`UnknownParent`](TraceError::UnknownParent)
+/// from a structurally broken trace tree) drops the node rather than aborting
+/// the drive — observability must never kill the work it observes (H-STATE-4).
 fn record_requirement_node(
     ctx: &RunContext,
     kind_tag: RequirementKindTag,
     id: RequirementId,
     resolved_at_scope: u32,
     disposition: RequirementDisposition,
-) -> Result<(), AgentError> {
-    ctx.trace()
-        .record_requirement(
-            TraceNodeId::new(id.to_string()),
+) {
+    let base = id.to_string();
+    let mut node_id = TraceNodeId::new(base.clone());
+    let mut attempt = 2u32;
+    loop {
+        match ctx.trace().record_requirement(
+            node_id.clone(),
             kind_tag,
             resolved_at_scope,
             disposition,
-        )
-        .map_err(|error| AgentError::from(RunContextError::from(error)))?;
-    Ok(())
+        ) {
+            Ok(_) => return,
+            Err(TraceError::DuplicateNodeId { .. }) => {
+                node_id = TraceNodeId::new(format!("{base}#attempt-{attempt}"));
+                attempt += 1;
+            }
+            Err(TraceError::UnknownParent { .. }) => return,
+        }
+    }
 }
 
 /// Returns whether `cursor` marks the end of a turn.
@@ -1631,6 +1651,107 @@ mod tests {
             requirement_trace(&ctx, requirement_id_n(7), RequirementKindTag::Tool),
             (0, RequirementDisposition::NeverResumed)
         );
+    }
+
+    // ----- M4-3: pivot re-emission vs trace node id dedup (H-STATE-4) -----
+
+    /// A machine that re-emits its outstanding requirement under the *same* id
+    /// once — mirroring the default machine's pivot path, which re-renders the
+    /// LLM request without minting a new requirement id — then completes on the
+    /// second resume.
+    struct PivotReemitMachine {
+        cursor: LoopCursor,
+        requirement: Requirement,
+        reemitted: bool,
+        resumes: usize,
+    }
+
+    impl PivotReemitMachine {
+        fn new(requirement: Requirement) -> Self {
+            Self {
+                cursor: LoopCursor::default(),
+                requirement,
+                reemitted: false,
+                resumes: 0,
+            }
+        }
+    }
+
+    impl AgentMachine for PivotReemitMachine {
+        fn step(&mut self, input: StepInput) -> StepOutcome {
+            match input {
+                StepInput::External(_) => {
+                    self.cursor = LoopCursor::streaming_step(step_id(), None);
+                    StepOutcome::new(Vec::new(), vec![self.requirement.clone()], true)
+                }
+                StepInput::Resume(_) => {
+                    self.resumes += 1;
+                    if self.reemitted {
+                        self.cursor = LoopCursor::done(LoopDoneReason::Completed);
+                        StepOutcome::new(Vec::new(), Vec::new(), true)
+                    } else {
+                        // Pivot: re-emit the outstanding requirement under the
+                        // same id so it is fulfilled a second time.
+                        self.reemitted = true;
+                        StepOutcome::new(Vec::new(), vec![self.requirement.clone()], true)
+                    }
+                }
+                StepInput::Abandon(_) => StepOutcome::default(),
+            }
+        }
+
+        fn cursor(&self) -> &LoopCursor {
+            &self.cursor
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_records_pivot_reemission_under_a_derived_trace_id() {
+        let tool = CountingToolHandler::default();
+        let scope = TestScope {
+            tool: Some(tool.clone()),
+            ..TestScope::default()
+        };
+        let mut machine = PivotReemitMachine::new(tool_requirement(5, 0));
+        let ctx = run_context();
+
+        let done = drain(&mut machine, external_input(), &scope, None, &ctx)
+            .await
+            .expect("a pivot re-emission must not kill the drain");
+
+        // The turn ran to completion and the re-emitted requirement really was
+        // fulfilled twice.
+        assert!(matches!(done.cursor(), LoopCursor::Done(_)));
+        assert_eq!(machine.resumes, 2);
+        assert_eq!(tool.calls.load(Ordering::SeqCst), 2);
+
+        // The first settle is recorded under the plain requirement id.
+        assert_eq!(
+            requirement_trace(&ctx, requirement_id_n(5), RequirementKindTag::Tool),
+            (0, RequirementDisposition::Resumed)
+        );
+        // The re-emitted settle is kept on the trace under the derived
+        // `<id>#attempt-2` node id instead of failing the drain.
+        let derived_id = format!("{}#attempt-2", requirement_id_n(5));
+        let records = ctx.trace().records();
+        let derived = records
+            .iter()
+            .find(|record| record.id().as_str() == derived_id)
+            .expect("the re-emitted settle is recorded under a derived node id");
+        match derived.kind() {
+            TraceNodeKind::Requirement {
+                kind_tag,
+                resolved_at_scope,
+                disposition,
+            } => {
+                assert_eq!(kind_tag, RequirementKindTag::Tool);
+                assert_eq!(
+                    (resolved_at_scope, disposition),
+                    (0, RequirementDisposition::Resumed)
+                );
+            }
+            other => panic!("expected a requirement trace node, got {other:?}"),
+        }
     }
 
     // --- Generated drive fan-out routing (design points 5–7) -----------------

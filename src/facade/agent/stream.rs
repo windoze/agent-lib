@@ -138,7 +138,7 @@ async fn drive_streamed(
         // [`AgentRunStream::abandon`]); this mirrors `drain` for a cancelled `ctx`.
         if ctx.is_cancelled() {
             if let Some(requirement) = pending.first() {
-                record_requirement(ctx, requirement, 0, RequirementDisposition::NeverResumed)?;
+                record_requirement(ctx, requirement, 0, RequirementDisposition::NeverResumed);
                 let mut guard = machine.borrow_mut();
                 let mut outcome = guard.step(StepInput::Abandon(requirement.id));
                 notifications.append(&mut outcome.notifications);
@@ -159,7 +159,7 @@ async fn drive_streamed(
                 &resolution,
                 resolved_at_scope,
                 RequirementDisposition::Resumed,
-            )?;
+            );
             let mut guard = machine.borrow_mut();
             let mut outcome = guard.step(StepInput::Resume(resolution));
             notifications.append(&mut outcome.notifications);

@@ -359,6 +359,14 @@ perform 的同类 effect"造成即时环:
 这与 `agent-layer.md` §1.4 / `TODO.md` M5-2 的 trace tree 对齐:run → step →
 llm/tool/sub-agent 一棵可重建的树,此处只是补上"requirement 的作用域归属与恢复处置"。
 
+两条边界规则(H-STATE-4 收口):
+
+- **pivot 同 id 重发**:pivot 会以**同一个 requirement id** 重新 perform 未决的
+  requirement,因此同一个 id 会被 settle(并记录)多次。除首次外,后续 settle 记录在
+  派生 node id `<id>#attempt-N`(N 从 2 递增)下,trace 上的每次 settle 仍然完整可查。
+- **trace 记录是 best-effort**:trace 是纯观测侧设施,记录失败(含重复 id、缺失父
+  节点)绝不中止 drain;无法在 trace 上留痕的失败直接丢弃该节点,驱动照常推进。
+
 ## 9. 收敛规则(单条)
 
 > 每层 drain 是一个 **handler scope**,带一组 requirement handler。agent step

@@ -1,22 +1,42 @@
-# 执行计划：M4-2 `AwaitingReconfig` 期间的新 reconfigure 不再静默丢失（H-STATE-5）
+# 当前任务：M4-3 pivot 重发的 requirement id 与 trace 去重解耦（H-STATE-4）
 
-## 状态：✅ 已完成（待提交）
+## 任务来源
+`TODO.md` 中第一个未完成任务是 **M4-3**（M4-1、M4-2 已 [DONE]）。
 
-## 执行结果
+## 问题描述
+- `src/agent/machine/default/mod.rs:614-623`：pivot 路径用同一 requirement id 重发 LLM 请求。
+- `src/agent/drive.rs:445-494`：drain 把 requirement id 直接当 trace node id；`TraceHandle::record_node` 对重复 id 返回 `TraceError::DuplicateNodeId`（`src/agent/context/trace.rs:379-382`），经 `?` 中止整个 drain（`drive.rs:425-430`）。
+- 广义问题：观测侧（trace）失败杀死实际驱动。
 
-1. 探索：完成（explore subagent）。定位 `reconfigure`（mod.rs:314）、`AwaitingReconfig` cursor、
-   resume 路径（`apply_reconfig_application` 无条件 clear）、`AgentStateError`、测试模式。
-2. 选型：方案 (a)——park 期间拒绝（resume 重 plan 会让已确认的 registry swap 与实际应用不符）。
-3. 实现：完成。
-   - `src/agent/state.rs`：新增 `AgentStateError::ReconfigWhileAwaitingRegistry` +
-     单一来源准入规则 `ensure_reconfig_admission()`；`queue_reconfig`（pub 入口，class-wide）
-     同步接守卫。
-   - `src/agent/machine/default/mod.rs`：`reconfigure` 在 plan 前调准入守卫；rustdoc `# Errors` 同步。
-   - M4-4 衔接：M4-4 未落地，走既有 `AgentError` 通道（`AgentErrorKind::AgentState`），已记录。
-4. 测试：`reconfigure_during_awaiting_reconfig_is_rejected_and_can_be_retried`
-   （复现报告场景：R2 被拒、队列不动、resume 应用 A1、R2 可重提交）；
-   `agent::` 444 条全过。
-5. 文档：`docs/agent-layer.md` §4.2 补拒绝+重试口径；`docs/review-2026-07.md` H-STATE-5 标注 ✅。
-6. 验证全过：fmt、clippy（默认 + external features）、`cargo test --all --all-targets`（exit 0，33s）、doc。
-7. TODO.md：M4-2 标 [DONE] + 完成记录（含 breaking change 记录：AgentStateError 新增变体）。
-   下一步：commit 后停止。
+## 实现要求
+- trace 记录改 best-effort：`record_node` 失败（含 DuplicateNodeId）记录 warning 类痕迹但不中止 drain；或 drain 对 pivot 重发生成派生 node id（如 `<id>#attempt-2`）。选型写入完成记录；effect-model 文档对 trace 完整性的承诺需同步修订。
+- 检查 `NeverResumed` 等其他 trace 失败点同样不致命。
+
+## 验证条件
+- 单元测试：手写 driver 触发 pivot 重发同 id requirement + 开启 trace，drain 不再因 DuplicateNodeId 失败，turn 正常完成。
+- `cargo test -p agent-lib --lib agent::` 全过。
+
+## 执行计划
+1. 阅读 `src/agent/drive.rs`（425-499）、`src/agent/context/trace.rs`（record_node / NeverResumed 路径）、`src/agent/machine/default/mod.rs`（pivot 重发处）。
+2. 选型：倾向 "best-effort trace 记录"（trace 失败只记 warning，不中止 drain），因为这才是 "观测侧失败杀死实际驱动" 的根本修复；派生 id 只解决 DuplicateNodeId 一种情况。需要看代码后决定。
+3. 实现改动。
+4. 添加单元测试（手写 driver + trace 触发 pivot 重发）。
+5. 同步修订 `docs/agent-effect-model.md` 中 trace 完整性承诺。
+6. `cargo fmt` → `cargo clippy --all-targets -- -D warnings` → `cargo test --all --all-targets`（超时 ≤ 30min）→ 可能加 doc 检查。
+7. 更新 `TODO.md`（标 [DONE] + 完成记录），提交 git，停止。
+
+## 选型决定
+采用**混合方案**（以派生 node id 为主，best-effort 兜底）：
+- `record_requirement_node`（drive.rs）不再返回 `Result`；drain / drive_streamed 四处调用点全部非致命。
+- `DuplicateNodeId`（pivot 同 id 重发）→ 派生 `<id>#attempt-N`（N 从 2 递增）重试，直至记录成功——trace 完整性保留，每次 settle 都有节点。
+- 其余 `TraceError`（UnknownParent，结构性 bug）→ 丢弃该节点但不中止 drain（观测侧失败不杀驱动；crate 无 log facade，沿用 budget.rs:308 `let _ =` 的既有 best-effort 先例）。
+- 文档同步：`docs/agent-effect-model.md` §8 + `docs/agent-effect-migration.md` §11。
+
+## 进度日志
+- [x] 读取 TODO.md，确认 M4-3 为第一个未完成任务。
+- [x] 代码探索（drive.rs / stream.rs / trace.rs / 评审报告 H-STATE-4 / effect-model §8）
+- [x] 实现（record_requirement_node 非致命化 + 派生 `<id>#attempt-N`；stream.rs 同步）
+- [x] 测试（新增 drain_records_pivot_reemission_under_a_derived_trace_id；agent:: 445 全过；
+  fmt/clippy 干净；cargo test --all --all-targets 全绿；cargo doc -D warnings 通过）
+- [x] 文档（effect-model §8 + effect-migration §11）+ TODO.md 标 [DONE]
+- [ ] 提交

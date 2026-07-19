@@ -999,7 +999,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - **验证**：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib agent::`（444 条全过，含新测试）、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - **Breaking change**（pre-1.0，记录在此）：`AgentStateError` 新增 `ReconfigWhileAwaitingRegistry` 变体，外部对该枚举的穷尽 match 需补分支（该枚举未标 `#[non_exhaustive]`）；`AgentState::queue_reconfig` 在 `AwaitingReconfig` cursor 下从静默接受变为报错（行为修复，无生产调用方）。
 
-### M4-3 [TODO] pivot 重发的 requirement id 与 trace 去重解耦（H-STATE-4）
+### M4-3 [DONE] pivot 重发的 requirement id 与 trace 去重解耦（H-STATE-4）
 
 上下文：
 
@@ -1016,6 +1016,32 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：手写 driver 触发 pivot 重发同 id requirement + 开启 trace，drain 不再因 DuplicateNodeId 失败，turn 正常完成。
 - `cargo test -p agent-lib --lib agent::` 全过。
+
+完成记录：
+
+- 选型：**混合方案（派生 node id 为主 + best-effort 兜底）**。`record_requirement_node`
+  （`src/agent/drive.rs`）不再返回 `Result`：遇 `DuplicateNodeId`（pivot 同 id 重发）
+  派生 `<id>#attempt-N`（N 从 2 递增）重试直至记录成功——trace 完整性保留，每次
+  settle 都有节点；其余 `TraceError`（`UnknownParent`，结构性 trace 树损坏）丢弃该
+  节点但不中止 drain（crate 无 log facade，沿用 `external/budget.rs` `let _ =` 的
+  既有 best-effort 先例）。`record_requirement` / `record_requirement_resolution`
+  签名相应改为返回 `()`。
+- 四处调用点全部非致命化：`drain`（drive.rs 的 Resumed + NeverResumed 两处）与
+  `drive_streamed`（facade/agent/stream.rs 同样两处），取消路径的 `NeverResumed`
+  记录因此同享非致命语义。
+- 其他 trace 记录点核查：`RunContext::derive_child` 的 `record_sub_agent` 保持
+  fallible——它是建立子 trace parentage 的结构性步骤而非逐次 settle 的观测记录，
+  不属于本任务的"观测侧失败杀驱动"类别。
+- 文档同步：`docs/agent-effect-model.md` §8 增加两条边界规则（pivot 同 id 重发的
+  派生 id 约定 + trace 记录 best-effort 承诺）；`docs/agent-effect-migration.md`
+  §11 同步该约定。
+- 单元测试：`drain_records_pivot_reemission_under_a_derived_trace_id`（drive.rs）
+  用手写 `PivotReemitMachine` 重发同 id requirement + 开启 trace，断言 drain 正常
+  完成、requirement 被兑现两次、trace 同时含 `<id>` 与 `<id>#attempt-2` 两个
+  Resumed 节点。
+- 验证：`cargo test -p agent-lib --lib agent::` 445 全过；`cargo fmt` /
+  `cargo clippy --all-targets -- -D warnings` 干净；`cargo test --all --all-targets`
+  全绿。
 
 ### M4-4 [TODO] 引入非破坏性 step 错误出口（软拒绝）（M-ERR-1 及连带项）
 
