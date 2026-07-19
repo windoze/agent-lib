@@ -422,19 +422,33 @@ impl AcpSession {
 
     /// Reads agent lines, servicing client requests inline, until the turn settles
     /// on a decision or pauses for a permission interaction.
+    ///
+    /// Each line read is raced against run cancellation (M3-1): a silent agent
+    /// must not hold a cancel hostage until a line arrives or the read timeout
+    /// fires. The configured read timeout stays armed inside
+    /// [`read_line`](Self::read_line) as the last-resort error for a genuinely
+    /// dead peer, so a slow-but-alive agent is unaffected.
     async fn read_to_decision(
         &mut self,
         mut collected: Vec<ExternalObservedEvent>,
         ctx: &RunContext,
     ) -> Result<RuntimeDecisionPoint, ExternalAgentError> {
         loop {
-            if ctx.is_cancelled() {
+            // `biased` lets an already-landed cancel win over a simultaneously
+            // ready line; `CancellationToken::cancelled` resolves immediately
+            // for a pre-cancelled run, so no separate pre-check is needed.
+            let line = tokio::select! {
+                biased;
+                () = ctx.cancellation().cancelled() => None,
+                line = self.read_line() => Some(line?),
+            };
+            let Some(line) = line else {
                 return Err(ExternalAgentError::SessionLost {
                     session: self.maybe_session_ref(),
                     detail: "acp session advance was cancelled".to_owned(),
                 });
-            }
-            let Some(line) = self.read_line().await? else {
+            };
+            let Some(line) = line else {
                 return Err(ExternalAgentError::SessionLost {
                     session: self.maybe_session_ref(),
                     detail: "acp connection closed before reaching a decision point".to_owned(),
@@ -1527,6 +1541,103 @@ mod tests {
                 );
             }
             other => panic!("expected SessionLost, got {other:?}"),
+        }
+    }
+
+    /// An async reader that serves scripted bytes and then pends forever,
+    /// modelling a live but silent agent that never writes another line.
+    struct ScriptedThenSilent {
+        scripted: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncRead for ScriptedThenSilent {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            #[allow(clippy::cast_possible_truncation)]
+            if self.scripted.position() < self.scripted.get_ref().len() as u64 {
+                return Pin::new(&mut self.scripted).poll_read(cx, buf);
+            }
+            Poll::Pending
+        }
+    }
+
+    /// A fake launcher whose agent answers the handshake from a script and
+    /// then stays silent forever.
+    struct SilentTurnLauncher {
+        handshake: Mutex<Option<String>>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SilentTurnLauncher {
+        fn new(lines: &[&str]) -> Self {
+            // Every scripted line must be newline-terminated: the reader never
+            // reports EOF, so an unterminated tail would pend forever.
+            Self {
+                handshake: Mutex::new(Some(format!("{}\n", lines.join("\n")))),
+                written: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AcpLauncher for SilentTurnLauncher {
+        async fn launch(&self, _config: &AcpConfig) -> Result<SpawnedAcpAgent, ExternalAgentError> {
+            let script = self.handshake.lock().unwrap().take().unwrap_or_default();
+            let reader = ScriptedThenSilent {
+                scripted: std::io::Cursor::new(script.into_bytes()),
+            };
+            let writer = SharedWriter(Arc::clone(&self.written));
+            // A read timeout far beyond the test's settle bound: settling fast
+            // proves cancellation — not the IO timeout — ended the wait.
+            Ok(SpawnedAcpAgent::new(
+                writer,
+                reader,
+                Duration::from_secs(60),
+            ))
+        }
+    }
+
+    /// M3-1: a cancel landing while the agent is silent settles the advance in
+    /// seconds through the cancellation path, not after the read timeout.
+    #[tokio::test]
+    async fn acp_adapter_cancel_settles_a_silent_advance_promptly() {
+        let launcher = Arc::new(SilentTurnLauncher::new(&[
+            &init_line(true),
+            &new_session_line(),
+        ]));
+        let adapter =
+            AcpAdapter::with_launcher(AcpConfig::opencode_acp(), launcher as Arc<dyn AcpLauncher>);
+        let ctx = run_context();
+        let mut session = match adapter.start(&start_request(Vec::new()), &ctx, None).await {
+            Ok(session) => session,
+            Err(error) => panic!("handshake, got {error:?}"),
+        };
+
+        let token = ctx.cancellation().clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token.cancel();
+        });
+        let settled = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.advance(&start_request(Vec::new()).input, &ctx),
+        )
+        .await
+        .expect("a cancelled advance settles well before the read timeout");
+        canceller.await.expect("canceller task");
+
+        match settled {
+            Err(ExternalAgentError::SessionLost { session, detail }) => {
+                assert!(detail.contains("cancelled"), "detail: {detail}");
+                assert_eq!(
+                    session.and_then(|s| s.session_id).as_deref(),
+                    Some(SESSION_ID)
+                );
+            }
+            other => panic!("expected a cancellation SessionLost, got {other:?}"),
         }
     }
 

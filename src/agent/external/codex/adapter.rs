@@ -578,13 +578,23 @@ impl<L: CodexLauncher> ExternalRuntimeSession for CodexSession<L> {
         }
 
         loop {
-            if ctx.is_cancelled() {
+            // Race the frame read against cancellation (M3-1): a silent CLI
+            // must not hold a cancel hostage until the per-line idle timeout
+            // fires; the idle timeout stays armed inside `read_line` as the
+            // last-resort error for a genuinely dead CLI. `biased` lets an
+            // already-landed cancel win over a simultaneously ready frame.
+            let line = tokio::select! {
+                biased;
+                () = ctx.cancellation().cancelled() => None,
+                line = self.read_line() => Some(line?),
+            };
+            let Some(line) = line else {
                 return Err(ExternalAgentError::SessionLost {
                     session: self.maybe_session_ref(),
                     detail: "codex session advance was cancelled".to_owned(),
                 });
-            }
-            match self.read_line().await? {
+            };
+            match line {
                 Some(line) => {
                     let decision = self.decoder.push_line(&line)?;
                     collected.extend(self.drain_and_emit());
@@ -959,6 +969,9 @@ mod tests {
         close_disposition: ExternalSessionShutdown,
         /// Line replayed forever once `lines` drains (prelude-deadline tests).
         repeat: Option<String>,
+        /// When set, reads pend forever once `lines` drains (silent-peer
+        /// cancellation tests).
+        pending: bool,
     }
 
     #[async_trait]
@@ -966,6 +979,7 @@ mod tests {
         async fn read_frame(&mut self) -> std::io::Result<Option<String>> {
             match self.lines.pop_front() {
                 Some(line) => Ok(Some(line)),
+                None if self.pending => std::future::pending().await,
                 None => Ok(self.repeat.clone()),
             }
         }
@@ -988,6 +1002,9 @@ mod tests {
         close_sequence: Mutex<VecDeque<ExternalSessionShutdown>>,
         /// Line replayed forever by every spawned turn (prelude-deadline tests).
         repeat: Option<String>,
+        /// When set, every spawned turn's reads pend forever once its canned
+        /// lines drain (silent-peer cancellation tests).
+        pending: bool,
         fail_kind: Option<std::io::ErrorKind>,
     }
 
@@ -999,6 +1016,7 @@ mod tests {
                 default_close: ExternalSessionShutdown::Graceful,
                 close_sequence: Mutex::new(VecDeque::new()),
                 repeat: None,
+                pending: false,
                 fail_kind: None,
             }
         }
@@ -1023,6 +1041,13 @@ mod tests {
         /// Every spawned turn replays `line` forever once its canned lines drain.
         fn repeating(mut self, line: String) -> Self {
             self.repeat = Some(line);
+            self
+        }
+
+        /// Every spawned turn's reads pend forever once its canned lines drain,
+        /// modelling a live but silent CLI.
+        fn silent_after_script(mut self) -> Self {
+            self.pending = true;
             self
         }
 
@@ -1051,6 +1076,7 @@ mod tests {
                 lines: lines.into_iter().collect(),
                 close_disposition,
                 repeat: self.repeat.clone(),
+                pending: self.pending,
             }))
         }
     }
@@ -1139,6 +1165,45 @@ mod tests {
             seqs.windows(2).all(|w| w[0] < w[1]),
             "seq is monotonic: {seqs:?}"
         );
+    }
+
+    /// M3-1: a cancel landing while the CLI is silent settles the advance in
+    /// seconds through the cancellation path, not after the read idle timeout.
+    #[tokio::test]
+    async fn codex_adapter_cancel_settles_a_silent_advance_promptly() {
+        let launcher =
+            FakeLauncher::new(vec![vec![thread_started(THREAD_ID)]]).silent_after_script();
+        let mut session = session_over(launcher, None);
+        let ctx = run_context();
+        session
+            .begin(
+                &fresh_spec("investigate the failing test"),
+                FirstLaunch::Fresh,
+                &ctx,
+                PRELUDE_TIMEOUT,
+            )
+            .await
+            .expect("begin launches the first turn and reads thread.started");
+
+        let token = ctx.cancellation().clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token.cancel();
+        });
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            session.advance(&start_request(Vec::new()).input, &ctx),
+        )
+        .await
+        .expect("a cancelled advance settles well before the read idle timeout");
+        canceller.await.expect("canceller task");
+
+        match settled {
+            Err(ExternalAgentError::SessionLost { detail, .. }) => {
+                assert!(detail.contains("cancelled"), "detail: {detail}");
+            }
+            other => panic!("expected a cancellation SessionLost, got {other:?}"),
+        }
     }
 
     #[tokio::test]

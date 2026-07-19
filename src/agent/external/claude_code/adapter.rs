@@ -446,13 +446,23 @@ impl<Io: ClaudeSessionIo> ExternalRuntimeSession for ClaudeCodeSession<Io> {
         }
 
         loop {
-            if ctx.is_cancelled() {
+            // Race the frame read against cancellation (M3-1): a silent CLI
+            // must not hold a cancel hostage until the per-line idle timeout
+            // fires; the idle timeout stays armed inside `read_line` as the
+            // last-resort error for a genuinely dead CLI. `biased` lets an
+            // already-landed cancel win over a simultaneously ready frame.
+            let line = tokio::select! {
+                biased;
+                () = ctx.cancellation().cancelled() => None,
+                line = self.read_line() => Some(line?),
+            };
+            let Some(line) = line else {
                 return Err(ExternalAgentError::SessionLost {
                     session: self.maybe_session_ref(),
                     detail: "claude code session advance was cancelled".to_owned(),
                 });
-            }
-            match self.read_line().await? {
+            };
+            match line {
                 Some(line) => {
                     let decision = self.decoder.push_line(&line)?;
                     collected.extend(self.drain_and_emit());
@@ -817,6 +827,9 @@ mod tests {
         closed: Arc<Mutex<Option<ExternalSessionShutdown>>>,
         /// Line replayed forever once `lines` drains (prelude-deadline tests).
         repeat: Option<String>,
+        /// When set, reads pend forever once `lines` drains (silent-peer
+        /// cancellation tests).
+        pending: bool,
     }
 
     impl FakeIo {
@@ -828,6 +841,7 @@ mod tests {
                 close_disposition: ExternalSessionShutdown::Graceful,
                 closed: Arc::new(Mutex::new(None)),
                 repeat: None,
+                pending: false,
             };
             (io, written)
         }
@@ -843,6 +857,13 @@ mod tests {
             self.repeat = Some(line);
             self
         }
+
+        /// Reads pend forever once the canned lines drain, modelling a live but
+        /// silent CLI.
+        fn silent_after_script(mut self) -> Self {
+            self.pending = true;
+            self
+        }
     }
 
     #[async_trait]
@@ -855,6 +876,7 @@ mod tests {
         async fn read_frame(&mut self) -> std::io::Result<Option<String>> {
             match self.lines.pop_front() {
                 Some(line) => Ok(Some(line)),
+                None if self.pending => std::future::pending().await,
                 None => Ok(self.repeat.clone()),
             }
         }
@@ -1118,6 +1140,46 @@ mod tests {
                 assert!(detail.contains("cancelled"), "detail: {detail}");
             }
             other => panic!("expected SessionLost, got {other:?}"),
+        }
+    }
+
+    /// M3-1: a cancel landing while the CLI is silent settles the advance in
+    /// seconds through the cancellation path, not after the read idle timeout.
+    #[tokio::test]
+    async fn claude_code_adapter_cancel_settles_a_silent_advance_promptly() {
+        let (io, _written) = FakeIo::new(vec![init_frame()]);
+        let io = io.silent_after_script();
+        let context = ClaudeCodeAdapter::decode_context(&run_context(), &start_request(Vec::new()));
+        let mut session = ClaudeCodeSession::new(io, context, None, implemented_capabilities());
+        let ctx = run_context();
+        session
+            .begin(
+                Some(&start_request(Vec::new()).input),
+                None,
+                &ctx,
+                PRELUDE_TIMEOUT,
+            )
+            .await
+            .expect("start prelude");
+
+        let token = ctx.cancellation().clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            token.cancel();
+        });
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            session.advance(&start_request(Vec::new()).input, &ctx),
+        )
+        .await
+        .expect("a cancelled advance settles well before the read idle timeout");
+        canceller.await.expect("canceller task");
+
+        match settled {
+            Err(ExternalAgentError::SessionLost { detail, .. }) => {
+                assert!(detail.contains("cancelled"), "detail: {detail}");
+            }
+            other => panic!("expected a cancellation SessionLost, got {other:?}"),
         }
     }
 

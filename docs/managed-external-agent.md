@@ -125,7 +125,7 @@ scope wiring 决定 attended / headless 行为。
 | user question | `NeedInteraction(Question)` | runtime question -> `NeedInteraction(Question)` | 已落地:runtime question/choice → `NeedInteraction`(M3-2) |
 | subagent | `NeedSubagent` | runtime spawn request -> `NeedSubagent` | 已落地:`PausedForSubagent`→`NeedSubagent`(M3-1)+ `spawn_agent` tool-bridge 特判(M3-3);real DeepSeek 协调器派生 Claude/Codex child(M9-4) |
 | tool failure policy | `ToolFailurePolicy` | external tool result error 回灌或 fail turn | 已落地(M4-3):`ExternalToolFailurePolicy`(`ReturnErrorToRuntime` 默认 / `StopRun`) |
-| cancel | `StepInput::Abandon` closes pending | abandon marks cleanup + handler kills session | 已落地:registry `cleanup`/`cleanup_agent` 强制关 live session 并返回 `ExternalSessionShutdown` disposition(M5);force-close 为进程组级 SIGTERM→SIGKILL(M2-1,unix),adapter `kill_on_drop` 兜底 |
+| cancel | `StepInput::Abandon` closes pending | abandon marks cleanup + handler kills session | 已落地:registry `cleanup`/`cleanup_agent` 强制关 live session 并返回 `ExternalSessionShutdown` disposition(M5);force-close 为进程组级 SIGTERM→SIGKILL(M2-1,unix),adapter `kill_on_drop` 兜底;advance 读循环与 cancellation `select!`(M3-1),对端静默时 cancel 秒级生效 |
 | budget | handler/driver charge tokens/cost | runtime usage/cost event charge | 已落地(M9-2):`ExternalUsageChargingHandler` 把 runtime usage/cost 计入 run budget,见 §17 |
 | trace | requirement + tool + subagent nodes | external events + shutdown + artifacts | 部分已有:requirement/subagent/shutdown 节点已接;artifact 追踪见下 |
 | artifact | tool/model output | patch/diff/test/file artifact refs | 部分已有:见 §18 |
@@ -956,7 +956,9 @@ live session，见 M6-2/M6-3）：
   检查 `ctx.is_cancelled()`，与 `advance` 循环口径一致）。
 - `read_idle_timeout`（默认 10 min）：live session 的**每行 stdout 空闲上限**。CLI 跑长静默命令
   （构建/测试套件）数分钟无帧属正常，绝不复用 30s 的 launch 超时，否则长静默 turn 会被误判
-  `SessionLost` 杀掉。
+  `SessionLost` 杀掉。该超时只作为「对端真死」的兜底：`advance` 读循环把每次行读与
+  cancellation 做 `select!`（M3-1，四个 adapter 口径一致，ACP 侧是其 120s `read_timeout`），
+  对端静默时 cancel 也在秒级生效，不等满空闲/读超时。
 - `shutdown_grace`（默认 30s）：close 时丢弃 stdin 发 EOF 后等待 CLI 自行退出的上限，超时后
   进入进程组级强杀（unix 下先向**整个进程组**发 SIGTERM、2s 升级窗口后 SIGKILL，见 §16
   「进程组级 kill」）→ `ForcedKill`。

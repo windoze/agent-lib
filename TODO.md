@@ -637,7 +637,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M3：cancel 强化（A3 + A4）
 
-### M3-1 [TODO] ACP read loop 取消响应（不再等满 120s）
+### M3-1 [DONE] ACP read loop 取消响应（不再等满 120s）
 
 上下文：
 
@@ -662,6 +662,40 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   秒级（测试用短时限，如 2s）内以 cancelled 收尾，不等读超时。
 - 正常路径回归：scripted ACP server 正常应答的测试不受影响。
 - `cargo test --features external-acp -p agent-lib --lib agent::external::acp` 通过。
+
+完成记录（2026-07-20）：
+
+- **机制选型：`tokio::select!`（biased）行读 vs `CancellationToken::cancelled()`。** 四个 adapter 的
+  `advance` 读循环统一改为：`select! { biased; () = ctx.cancellation().cancelled() => 取消,
+  line = self.read_line() => 行 }`；取消分支返回与原行间检查完全相同的
+  `ExternalAgentError::SessionLost { detail: "<runtime> session advance was cancelled" }`，
+  因此取消仍沿既有链路传导——advance 快速返回 → `fulfill_batch` 落定 → drain 复査
+  `is_cancelled()` → `StepInput::Abandon` → machine `abandon` 置 `cleanup_required`（语义不变，
+  由 facade 既有测试 `drive_external_marks_cleanup_on_cancel` 钉住）。`biased` 保证已落地 cancel
+  优先于同时就绪的行；`cancelled()` 对预取消 token 立即就绪，行间预检随之冗余而移除。读/空闲
+  超时原样保留在 `read_line` 内部，仍是对端真死的最后错误路径；慢但存活的对端行为不变。
+- **CLI adapter 核查结论：三者存在同一结构性缺陷且更严重，按「clearly warranted」一并修复。**
+  claude_code/codex/opencode 的 advance 循环与 ACP 同构（只在行间查 `is_cancelled()`），且其
+  `read_idle_timeout` 默认 600s（故意拉长以免把长静默构建误判为死 CLI）——静默 CLI 上 cancel
+  最坏阻塞 600s，比 ACP 的 120s 更糟。修复形状与 ACP 完全一致、错误类型与文案不变、空闲超时
+  语义不动，故同补丁收口而非留尾巴。begin/prelude 循环未改：它们已受 launch timeout 总
+  deadline（默认 30s）约束并逐轮查取消，cancel 延迟有界，不属于本次的稳态读循环缺陷。
+- 文件：`src/agent/external/acp/adapter.rs`（`read_to_decision` 改 select! + 测试）、
+  `src/agent/external/claude_code/adapter.rs` / `codex/adapter.rs` / `opencode/adapter.rs`
+  （advance 读循环改 select! + 各自 fake 增加「脚本耗尽后永久 pend」模式 + 测试）、
+  `docs/managed-external-agent.md`（能力矩阵 cancel 行与 §12.1 `read_idle_timeout` 段补 M3-1
+  口径）、`docs/mag-gaps.md`（A3 第 1 条标 ✅ 已修复（M3-1），第 2 条留 M3-2）。
+- 测试：每 adapter 各 1 个静默对端取消测试（ACP 用 `ScriptedThenSilent` 内存 reader + 60s 读
+  超时反衬；三 CLI 用各自 FakeIo/FakeTurn 的 `silent_after_script` 模式）——handshake 正常完成后
+  advance 挂起，50ms 后 cancel，断言 2s 内以 `SessionLost`（detail 含 "cancelled"）收尾，证明走的
+  是取消路径而非读超时。正常路径回归：ACP 39 个测试、external 全特性 375 个测试全绿。
+- 门禁：`cargo fmt --all` ✅；`cargo test --features external-acp -p agent-lib --lib
+  agent::external::acp` ✅（39 passed）；`cargo clippy --all-targets -- -D warnings` ✅；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode
+  external-acp" -- -D warnings` ✅；`cargo test --all --all-targets` ✅（全 suite 0 失败）；
+  `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✅。
+- Breaking change：无（公有 API 形状未动，仅 advance 在取消时的返回时机提前；取消时返回的错误
+  类型与 detail 文案与改动前一致）。
 
 ### M3-2 [TODO] cancel/abandon 时 external session 清理（子进程不泄漏）
 

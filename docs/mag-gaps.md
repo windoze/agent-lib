@@ -171,7 +171,7 @@ facade re-export 完整性已收口（M2-4）。
 1. **read loop 取消响应**：ACP adapter 的读循环对 cancellation 做 `select!`（或等价机制），
    子进程静默时 cancel 也能在**有界短时间**内生效（目标：秒级，不再等满 120s IO 超时）。
    其余三个 CLI adapter 的读循环同样核查（它们的行读带独立超时，语义不同，按现状评估
-   是否需要同样处理）。
+   是否需要同样处理）。✅ 已修复（M3-1）
 2. **abandoned session 清理**：cancel/流 drop 导致 external drive abandon（`cleanup_required`）
    时，facade 驱动路径负责触发对应 session 的清理（`session/cancel` + transport close +
    进程组终止），或在 facade 暴露**一等清理入口**让宿主在 cancel 后调用。二选一，以
