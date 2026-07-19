@@ -676,7 +676,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::persistence`（19 条全过）、`cargo test --all --all-targets`（exit 0）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - `docs/review-2026-07.md` M-CONV-1 已标注 `✅ 已修复（M3-3）`。
 
-### M3-4 [TODO] 消除长链递归（restore 校验 + History drop）（M-CONV-2）
+### M3-4 [DONE] 消除长链递归（restore 校验 + History drop）（M-CONV-2）
 
 上下文：
 
@@ -694,6 +694,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：构造 100_000+ turn 的链（可用最小 payload），restore 校验与 drop 均正常完成不溢出（注意测试时长 < 1 min，payload 尽量小）。
 - `cargo test -p agent-lib --lib conversation::` 全过。
+
+完成记录：
+
+- `visit_parent` → `check_parent_chain`（snapshot.rs）：父图是函数图（每 turn 至多一个父），迭代沿链走并用显式 path 向量标记，`Visiting` 重遇即报 `ParentCycle`——报错节点（重遇目标）与递归版完全一致；`root_of` 改为按 index 备忘根（同函数内、同属长链缺陷类）：原实现对每个 turn 沿父链走到根，O(chain²)，不改它 100k 验证测试无法在时限内完成；备忘后连通性检查 O(N)，错误变体、首个断连 turn 的报告顺序逐位保持。
+- `build_restored_node`（history.rs）改迭代：显式栈上攀到最近的已建祖先，再反向自顶向下构建（父先于子插入），已建节点直接克隆返回，语义与递归版一致。
+- 手工 `Drop` 加在链节点类型上：`HistoryNode::drop` 与 `RawEntry::drop` 各自循环 `Arc::try_unwrap` 摘链，遇共享引用（try_unwrap 失败）即停——共享节点由其余 owner 保活。两类型均无 by-value 移动字段的使用点，加 Drop 安全（已 grep 确认）。
+- 范围说明（如实记录）：`validate_raw_turns` 的跨 turn 身份校验（`validate_turn_identity`/`retained_message_ids`/`validate_tool_call_ids`）仍是 O(N²)——它与 commit 门禁共享同一验证器（单一来源原则），不是递归、不栈溢出，改它需拆分共享验证路径、规则漂移风险大，不在 M-CONV-2 范围内。因此 100k 测试以单元级直测 `validate_parent_graph` + `History::from_restored` + drop（覆盖三处原递归点），而非全量 `Conversation::restore`。
+- 测试（新增 `src/conversation/persistence/snapshot/tests.rs`，4 条，合计 < 1s）：夹具用 `validate_turn_data(data, empty, parent)` 逐链 O(1) 认证最小双消息 turn（绕过跨 turn O(N²) 检查）。`parent_graph_validation_handles_a_long_chain_iteratively`（100_000 链校验通过）、`parent_graph_validation_reports_a_cycle_spanning_a_long_chain`（首尾相接成全链环，迭代走完整链后在重遇根处报 `ParentCycle`）、`restored_long_chain_builds_and_drops_iteratively`（from_restored 重建 100k 链后结构断言 + drop）、`dropping_a_shared_long_chain_preserves_the_surviving_handle`（fork 共享全部节点并扩展自己的 lineage，drop 原 handle 在共享链接处停链，fork 完好可读、再 drop）。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::`（162 条全过，含 4 条新测试 0.63s）、`cargo test --all --all-targets`（exit 0，无 FAILED）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- `docs/review-2026-07.md` M-CONV-2 已标注 `✅ 已修复（M3-4）`。无可观察行为变化，无 breaking change。
 
 ### M3-5 [TODO] rows 引入代次（generation）键支持会话演进（M-CONV-3，方案 b）
 

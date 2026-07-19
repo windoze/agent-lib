@@ -385,15 +385,18 @@ fn validate_parent_graph(
 
     let mut marks = vec![VisitMark::Unvisited; turns.len()];
     for index in 0..turns.len() {
-        visit_parent(index, turns, raw_index, &mut marks)?;
+        check_parent_chain(index, turns, raw_index, &mut marks)?;
     }
 
     let root = turns
         .iter()
         .find(|turn| turn.parent().is_none())
         .map(Turn::id);
+    // Memoized per-index roots keep the connectivity check linear on long
+    // chains: each chain segment is walked once instead of once per turn.
+    let mut roots = vec![None; turns.len()];
     for (index, turn) in turns.iter().enumerate() {
-        if root_of(turn, turns, raw_index) != root {
+        if root_of(index, turns, raw_index, &mut roots) != root {
             return Err(RestoreError::DisconnectedRawTurn {
                 path: format!("$.history.raw_turns[{index}].parent"),
                 turn_id: turn.id(),
@@ -413,44 +416,80 @@ enum VisitMark {
     Done,
 }
 
-/// Recursively checks parent pointers for cycles.
-fn visit_parent(
+/// Iteratively checks one parent chain for cycles.
+///
+/// The parent graph is functional (every turn has at most one parent), so the
+/// check walks each chain with an explicit path vector and marks it done on
+/// the way back. Recursing would make the call-stack depth equal to the chain
+/// length and let a long untrusted snapshot overflow the stack (M3-4).
+fn check_parent_chain(
     index: usize,
     turns: &[Turn],
     raw_index: &HashMap<TurnId, usize>,
     marks: &mut [VisitMark],
 ) -> Result<(), RestoreError> {
-    match marks[index] {
-        VisitMark::Done => return Ok(()),
-        VisitMark::Visiting => {
-            return Err(RestoreError::ParentCycle {
-                path: format!("$.history.raw_turns[{index}].parent"),
-                turn_id: turns[index].id(),
-            });
+    let mut path = Vec::new();
+    let mut current = index;
+    loop {
+        match marks[current] {
+            VisitMark::Done => break,
+            VisitMark::Visiting => {
+                return Err(RestoreError::ParentCycle {
+                    path: format!("$.history.raw_turns[{current}].parent"),
+                    turn_id: turns[current].id(),
+                });
+            }
+            VisitMark::Unvisited => {}
         }
-        VisitMark::Unvisited => {}
+        marks[current] = VisitMark::Visiting;
+        path.push(current);
+        let Some(parent_index) = turns[current]
+            .parent()
+            .and_then(|parent| raw_index.get(&parent).copied())
+        else {
+            break;
+        };
+        current = parent_index;
     }
-
-    marks[index] = VisitMark::Visiting;
-    if let Some(parent) = turns[index].parent()
-        && let Some(parent_index) = raw_index.get(&parent).copied()
-    {
-        visit_parent(parent_index, turns, raw_index, marks)?;
+    for visited in path {
+        marks[visited] = VisitMark::Done;
     }
-    marks[index] = VisitMark::Done;
     Ok(())
 }
 
 /// Returns the root reached by following a turn's parent pointers.
-fn root_of(turn: &Turn, turns: &[Turn], raw_index: &HashMap<TurnId, usize>) -> Option<TurnId> {
-    let mut current = turn;
-    while let Some(parent) = current.parent() {
-        let parent_index = raw_index
-            .get(&parent)
-            .expect("parent existence was checked before root lookup");
-        current = &turns[*parent_index];
+///
+/// Resolved roots are memoized per index so validating a long chain stays
+/// linear instead of quadratic (M3-4). The cycle check above already proved
+/// the parent graph acyclic, so every walk terminates at a parentless turn.
+fn root_of(
+    index: usize,
+    turns: &[Turn],
+    raw_index: &HashMap<TurnId, usize>,
+    roots: &mut [Option<Option<TurnId>>],
+) -> Option<TurnId> {
+    // Walk to the nearest ancestor with a known root, recording the path.
+    let mut path = Vec::new();
+    let mut current = index;
+    let root = loop {
+        if let Some(cached) = roots[current] {
+            break cached;
+        }
+        match turns[current].parent() {
+            Some(parent) => {
+                current = raw_index
+                    .get(&parent)
+                    .copied()
+                    .expect("parent existence was checked before root lookup");
+                path.push(current);
+            }
+            None => break Some(turns[current].id()),
+        }
+    };
+    for visited in path {
+        roots[visited] = Some(root);
     }
-    Some(current.id())
+    root
 }
 
 /// Validates the addressable lineage, logical head, and fork ceiling.
@@ -576,3 +615,6 @@ fn u64_to_usize(value: u64, path: &'static str) -> Result<usize, RestoreError> {
         value,
     })
 }
+
+#[cfg(test)]
+mod tests;

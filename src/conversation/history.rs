@@ -259,6 +259,24 @@ struct HistoryNode {
     parent: Option<Arc<HistoryNode>>,
 }
 
+impl Drop for HistoryNode {
+    /// Unchains uniquely owned ancestors iteratively.
+    ///
+    /// Dropping the last handle to a long lineage tip would otherwise recurse
+    /// through one `Arc` drop per ancestor and overflow the stack on long
+    /// histories (M3-4). The walk stops at the first shared node, whose
+    /// remaining owners keep it alive.
+    fn drop(&mut self) {
+        let mut cursor = self.parent.take();
+        while let Some(strong) = cursor {
+            match Arc::try_unwrap(strong) {
+                Ok(mut node) => cursor = node.parent.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 /// A materialized current-lineage view shared by history clones and forks.
 #[derive(Default)]
 struct Lineage {
@@ -355,26 +373,67 @@ struct RawEntry {
     previous: Option<Arc<RawEntry>>,
 }
 
-/// Recursively recreates a parent-pointer node from validated turn facts.
+impl Drop for RawEntry {
+    /// Unchains uniquely owned cons cells iteratively.
+    ///
+    /// Dropping a long local raw log would otherwise recurse through one `Arc`
+    /// drop per entry and overflow the stack on long histories (M3-4). The
+    /// walk stops at the first shared entry, whose remaining owners keep it
+    /// alive.
+    fn drop(&mut self) {
+        let mut cursor = self.previous.take();
+        while let Some(strong) = cursor {
+            match Arc::try_unwrap(strong) {
+                Ok(mut entry) => cursor = entry.previous.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// Iteratively recreates a parent-pointer node from validated turn facts.
+///
+/// The walk climbs to the nearest already-built ancestor with an explicit
+/// stack, then builds back down so every parent exists before its child.
+/// Recursing would make the call-stack depth equal to the chain length and
+/// overflow the stack on long restored histories (M3-4).
 fn build_restored_node(
     turn_id: TurnId,
     turns_by_id: &HashMap<TurnId, Turn>,
     nodes_by_id: &mut HashMap<TurnId, Arc<HistoryNode>>,
 ) -> Arc<HistoryNode> {
-    if let Some(node) = nodes_by_id.get(&turn_id) {
-        return node.clone();
+    // Climb to the nearest built ancestor, recording the unbuilt chain.
+    let mut pending = Vec::new();
+    let mut cursor = turn_id;
+    while !nodes_by_id.contains_key(&cursor) {
+        pending.push(cursor);
+        let turn = turns_by_id
+            .get(&cursor)
+            .expect("restore validation made every parent reference a raw turn");
+        let Some(parent) = turn.parent() else {
+            break;
+        };
+        cursor = parent;
     }
-
-    let turn = turns_by_id
+    // Build back down so every parent is inserted before its child.
+    for id in pending.into_iter().rev() {
+        let turn = turns_by_id
+            .get(&id)
+            .expect("restore validation made every parent reference a raw turn")
+            .clone();
+        let parent = turn.parent().map(|parent_id| {
+            nodes_by_id
+                .get(&parent_id)
+                .expect("parents are built before their children")
+                .clone()
+        });
+        let node = Arc::new(HistoryNode { turn, parent });
+        nodes_by_id.insert(id, node);
+    }
+    nodes_by_id
         .get(&turn_id)
-        .expect("restore validation made every parent reference a raw turn")
-        .clone();
-    let parent = turn
-        .parent()
-        .map(|parent_id| build_restored_node(parent_id, turns_by_id, nodes_by_id));
-    let node = Arc::new(HistoryNode { turn, parent });
-    nodes_by_id.insert(turn_id, node.clone());
-    node
+        .expect("the requested node was built above")
+        .clone()
 }
 
 #[cfg(test)]

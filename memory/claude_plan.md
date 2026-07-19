@@ -1,44 +1,39 @@
-# 执行计划：M3-3 修复 restore 派生索引的空校验（M-CONV-1）
+# 执行计划：M3-4 消除长链递归（restore 校验 + History drop）（M-CONV-2）
 
 ## 任务定位
 
-- TODO.md 首个未完成任务：**M3-3**（M3-1、M3-2 已 DONE，M3-3 行 654 起）。
-- 问题：`src/conversation/persistence/snapshot.rs:566-575` 在 restore 时对同一纯函数
-  `ToolCallIndex::rebuild(turns, None)` 调两次再比较相等，`RestoreError::DerivedIndexMismatch`
-  结构性不可达 —— 空校验，无检测价值。
+- TODO.md 首个未完成任务：**M3-4**（M3-1/2/3 已 DONE，M3-4 行 679 起）。
+- 三处递归：
+  1. `src/conversation/persistence/snapshot.rs` `visit_parent`：restore 环检测，递归深度 = 父链长。
+  2. `src/conversation/history.rs` `build_restored_node`：restore 重建节点，同样递归。
+  3. `RawEntry` cons 链表与 `HistoryNode.parent` 链递归 drop——长会话析构 `History` 栈溢出。
 
-## 选型（任务推荐 (a)）
+## 关键探索结论
 
-采用方案 (a)：**删除该校验与不可达错误变体**，restore 直接 `rebuild`。
-理由：纯函数重建对同一输入必得同一输出，比较无校验价值；若选 (b)（增量 vs 全量比较）
-需要论证增量路径是生产实际使用的路径，而 restore 本身就是全量重建路径，无增量对照意义。
+- `Turn` 无公开构造器，唯一认证入口是 `validation::validate_turn_data`（`pub(super)`，conversation 子孙模块可用）。
+- **额外发现**：除递归外还有两处 O(N²) 长链问题——
+  1. `validate_parent_graph` 的连通性检查对每个 turn 调 `root_of` 沿父链走到根（O(chain) per turn）；
+  2. `validate_raw_turns` 的跨 turn 身份校验每 turn 扫全部 retained——commit 路径同构，属既有设计成本模型。
+  - 决策：`root_of` 备忘录化（同函数内、行为完全保持、同属长链缺陷类，且 100k 验证测试需要）；`validate_raw_turns` 的 O(N²) 身份校验**不改**（commit 共享验证器，规则漂移风险，超出 M-CONV-2 递归范围），完成记录如实说明。因此 100k 测试直测 `validate_parent_graph` + `History::from_restored` + drop，而非全量 `Conversation::restore`。
+- `HistoryNode`/`RawEntry` 无 by-value 移动字段的使用点，加 `impl Drop` 安全。
+- 测试落点：新建 `src/conversation/persistence/snapshot/tests.rs`（可同时访问私有 `validate_parent_graph`/`raw_turn_index` 与 `pub(crate)` 的 `History::from_restored`）。
 
-## 执行步骤
+## 实施内容
 
-1. 阅读 `src/conversation/persistence/snapshot.rs`（重点 566-575 及 `RestoreError` 定义/使用点）。
-2. 检查 `RestoreError` 是否 `#[non_exhaustive]`，确认删除变体的 breaking 面并记录。
-3. grep `DerivedIndexMismatch` 全部使用点（构造、match、测试、文档）。
-4. 删除空校验代码，restore 直接 `rebuild`；删除错误变体并同步文档注释。
-5. 运行验证：
-   - `cargo test -p agent-lib --lib conversation::persistence`
-   - `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`
-   - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
-   - `cargo test --all --all-targets`
-   - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
-6. 更新 `docs/review-2026-07.md` M-CONV-1 条目标注 `✅ 已修复（M3-3）`。
-7. TODO.md：M3-3 标题加 `[DONE]`，写完成记录（含 breaking change 说明）。
-8. 提交 git commit：`[M3-3] ...`。
+1. `visit_parent` → `check_parent_chain`：迭代链走 + 显式 path 标记，ParentCycle 报错语义逐位保持。
+2. `root_of`：按 index 备忘根，连通性检查 O(N²) → O(N)，错误顺序/字段不变。
+3. `build_restored_node`：显式栈上攀到已建祖先再反向构建。
+4. `HistoryNode::drop` / `RawEntry::drop`：循环 `Arc::try_unwrap` 摘链，共享引用即停。
+5. 4 条 100_000 链测试（合计 < 1s）：长链校验通过、全链环报错、from_restored + drop、共享链 drop 后 fork 完好。
 
 ## 进度
 
-- [x] 读取 TODO.md 定位任务（M3-3）
-- [x] 阅读 snapshot.rs 相关代码，确认空校验与不可达变体
-- [x] 实施修复：删 `rebuild_tool_call_index` 包装 + `DerivedIndexMismatch` 变体，restore 直接 `rebuild`，文档同步
-- [x] 验证全过：fmt、clippy（默认 + external features）、conversation::persistence 19 条、全量测试 exit 0、cargo doc
-- [x] `docs/review-2026-07.md` M-CONV-1 标注 ✅ 已修复（M3-3）；TODO.md M3-3 标 [DONE] + 完成记录（含 breaking change 说明）
-- [x] 提交（a46490a）
-
-## 结果
-
-M3-3 完成（方案 a）：空校验与 `DerivedIndexMismatch` 变体删除，restore 直接
-`ToolCallIndex::rebuild`。全量门禁通过，commit a46490a。停止，等待下一次调用（下一个任务 M3-4）。
+- [x] 读取 TODO.md 定位任务（M3-4），写计划
+- [x] 阅读代码，确认改动面与测试方案
+- [x] `visit_parent` 迭代化 + `root_of` 备忘录化（snapshot.rs）
+- [x] `build_restored_node` 迭代化 + 两个手工 Drop（history.rs）
+- [x] 10 万级链测试（persistence/snapshot/tests.rs，4 条）
+- [x] 验证全过：fmt、clippy（默认 + external features）、conversation:: 162 条（0.63s）、
+      全量 `cargo test --all --all-targets`（exit 0，无 FAILED）、cargo doc
+- [x] `docs/review-2026-07.md` M-CONV-2 标注 ✅；TODO.md M3-4 标 [DONE] + 完成记录
+- [ ] external features 测试确认 + 提交
