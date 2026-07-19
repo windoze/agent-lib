@@ -46,9 +46,9 @@ use error::StepError;
 use crate::{
     agent::{
         AgentError, AgentInput, AgentMachine, AgentPath, AgentState, AgentUserInput,
-        CancelRecoveryReason, CursorRequirement, DeclaredOnlyToolRegistryResolver, LlmStepMode,
-        LoopCursor, LoopDoneReason, NoApprovalPolicy, NoToolExecutionIds, Notification,
-        PivotMessage, ReconfigRequest, Requirement, RequirementId, RequirementIds, RequirementKind,
+        CancelRecoveryReason, CursorRequirement, LlmStepMode, LoopCursor, LoopDoneReason,
+        NoApprovalPolicy, NoToolExecutionIds, NoToolRegistryResolver, Notification, PivotMessage,
+        ReconfigRequest, Requirement, RequirementId, RequirementIds, RequirementKind,
         RequirementKindTag, RequirementResolution, RequirementResult, StepBoundary, StepId,
         StepInput, StepOutcome, StepRejectReason, ToolApprovalPolicy, ToolExecutionIds,
         ToolRegistryResolver, ToolRuntimeError,
@@ -192,13 +192,18 @@ pub struct DefaultAgentMachine {
     /// from those that must first emit a `NeedInteraction`. Defaults to
     /// [`NoApprovalPolicy`] (never pauses).
     approval_policy: Arc<dyn ToolApprovalPolicy>,
-    /// Host-supplied resolver used only by the host-facing
+    /// Host-supplied resolver consulted by the host-facing
     /// [`reconfigure`](Self::reconfigure) entry to validate a queued tool-set
     /// change (resolve the requested set and confirm its declarations) before
     /// admitting it to the queue. The apply-time registry swap is reified as a
     /// [`RequirementKind::NeedReconfigRegistry`] effect, so the machine itself
-    /// never holds a live registry. Defaults to
-    /// [`DeclaredOnlyToolRegistryResolver`].
+    /// never holds a live registry; the drive layer re-resolves through *this
+    /// same* resolver instance (obtained via
+    /// [`tool_registry_resolver`](Self::tool_registry_resolver)) so queue-time
+    /// validation and apply-time resolution cannot diverge (M-ERR-3).
+    /// Defaults to the fail-closed [`NoToolRegistryResolver`], so a tool-set
+    /// reconfiguration without an explicitly configured resolver is rejected
+    /// with an explicit error instead of silently succeeding.
     tool_registry_resolver: Arc<dyn ToolRegistryResolver>,
     /// Single mid-turn scratch whose phase is isomorphic to the [`LoopCursor`]
     /// phase (effect-refine doc §3, 落点 2). It carries the current turn's
@@ -234,7 +239,7 @@ impl DefaultAgentMachine {
             requirement_ids,
             tool_ids: Arc::new(NoToolExecutionIds),
             approval_policy: Arc::new(NoApprovalPolicy),
-            tool_registry_resolver: Arc::new(DeclaredOnlyToolRegistryResolver),
+            tool_registry_resolver: Arc::new(NoToolRegistryResolver),
             scratch: TurnScratch::None,
         }
     }
@@ -255,6 +260,10 @@ impl DefaultAgentMachine {
 
     /// Sets the resolver used by [`reconfigure`](Self::reconfigure) to validate a
     /// queued tool-set change before it is admitted to the queue.
+    ///
+    /// This is the single source of resolution for a tool-set reconfiguration:
+    /// the reference drive layer re-resolves through the same instance at apply
+    /// time (see [`tool_registry_resolver`](Self::tool_registry_resolver)).
     #[must_use]
     pub fn with_tool_registry_resolver(
         mut self,
@@ -262,6 +271,17 @@ impl DefaultAgentMachine {
     ) -> Self {
         self.tool_registry_resolver = tool_registry_resolver;
         self
+    }
+
+    /// Returns the resolver this machine validates queued tool-set changes with.
+    ///
+    /// The drive layer clones this handle into its reconfig fulfillment path so
+    /// the apply-time registry swap resolves through the same instance the
+    /// queue-time validation used — there is no second, independently
+    /// configurable resolver that could disagree with it (M-ERR-3).
+    #[must_use]
+    pub fn tool_registry_resolver(&self) -> Arc<dyn ToolRegistryResolver> {
+        Arc::clone(&self.tool_registry_resolver)
     }
 
     /// Returns the LLM transport mode requested by this machine.

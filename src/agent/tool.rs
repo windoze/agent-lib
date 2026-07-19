@@ -117,9 +117,11 @@ pub trait ToolExecutionIds: Send + Sync + fmt::Debug {
 
 /// Registry that can advertise declarations but has no executable tools.
 ///
-/// The default machine constructor uses this to preserve the static `AgentSpec`
-/// request shape. Hosts that expect tool execution should pass a real registry
-/// through the driver's [`ToolHandler`](crate::agent::ToolHandler).
+/// This preserves the static `AgentSpec` request shape for loops that only
+/// need to *advertise* tools; every `execute` fails with
+/// [`ToolRuntimeError::UnknownTool`]. Hosts that expect tool execution should
+/// pass a real registry through the driver's
+/// [`ToolHandler`](crate::agent::ToolHandler).
 #[derive(Clone, Debug, Default)]
 pub struct DeclaredOnlyToolRegistry {
     declarations: Vec<Tool>,
@@ -135,8 +137,12 @@ impl DeclaredOnlyToolRegistry {
 
 /// Resolver that creates declared-only registries from supplied declarations.
 ///
-/// This is appropriate for loops that only need to advertise tools. Hosts that
-/// need executable callbacks should supply a stricter resolver.
+/// This is appropriate for loops that only need to advertise tools, and it is
+/// an explicit opt-in: the resolved registry echoes the requested declarations
+/// back (so the declaration-match check always passes) but every `execute`
+/// fails with [`ToolRuntimeError::UnknownTool`]. Hosts that need executable
+/// callbacks must supply a real resolver instead; neither the machine nor the
+/// reference driver defaults to this resolver (M-ERR-3).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeclaredOnlyToolRegistryResolver;
 
@@ -148,6 +154,28 @@ impl ToolRegistryResolver for DeclaredOnlyToolRegistryResolver {
         Ok(Arc::new(DeclaredOnlyToolRegistry::new(
             tool_set.tools().to_vec(),
         )))
+    }
+}
+
+/// Fail-closed resolver used when no resolver has been configured.
+///
+/// Resolving any tool set fails with [`ToolRuntimeError::UnknownToolSet`], so a
+/// tool-set reconfiguration under the default wiring is rejected with an
+/// explicit error at queue time rather than appearing to succeed against a
+/// registry that cannot execute anything (M-ERR-3). Hosts opt into real
+/// resolution via
+/// [`with_tool_registry_resolver`](crate::agent::DefaultAgentMachine::with_tool_registry_resolver)
+/// (executable registries) or [`DeclaredOnlyToolRegistryResolver`]
+/// (advertise-only loops).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoToolRegistryResolver;
+
+impl ToolRegistryResolver for NoToolRegistryResolver {
+    fn resolve_tool_set(
+        &self,
+        tool_set: &ToolSetRef,
+    ) -> Result<Arc<dyn ToolRegistry>, ToolRuntimeError> {
+        Err(ToolRuntimeError::UnknownToolSet { id: tool_set.id() })
     }
 }
 

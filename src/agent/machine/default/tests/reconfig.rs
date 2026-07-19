@@ -14,8 +14,8 @@
 
 use super::*;
 use crate::agent::{
-    AgentErrorKind, DeclaredOnlyToolRegistry, ReconfigRequest, StaticToolRegistryResolver,
-    ToolExecutionIds, ToolRuntimeError, ToolSetId,
+    AgentErrorKind, DeclaredOnlyToolRegistry, DeclaredOnlyToolRegistryResolver, ReconfigRequest,
+    StaticToolRegistryResolver, ToolExecutionIds, ToolRuntimeError, ToolSetId,
 };
 use crate::conversation::ToolCallId;
 use crate::model::tool::{Tool, ToolCall, ToolResponse, ToolStatus};
@@ -204,6 +204,9 @@ fn state_with_weather() -> AgentState {
     )
 }
 
+/// Builds a machine whose queue-time tool-set validation uses the declared-only
+/// opt-in resolver: these tests exercise queue/defer/commit mechanics, not
+/// registry resolution, so the advertised-only registry is sufficient.
 fn reconfig_machine(state: AgentState) -> DefaultAgentMachine {
     DefaultAgentMachine::new(
         state,
@@ -211,6 +214,7 @@ fn reconfig_machine(state: AgentState) -> DefaultAgentMachine {
         Arc::new(ScriptedRequirementIds::new()),
     )
     .with_tool_execution_ids(Arc::new(ScriptedToolIds::new()))
+    .with_tool_registry_resolver(Arc::new(DeclaredOnlyToolRegistryResolver))
 }
 
 fn tool_ok(provider_id: &str, text: &str) -> ToolResponse {
@@ -580,4 +584,41 @@ fn conflicting_reconfig_requests_are_rejected_atomically() {
         strict_machine.state().current_tool_set().id(),
         tool_set_id()
     );
+}
+
+/// M-ERR-3: a machine whose resolver was never explicitly configured fails
+/// closed — the default `NoToolRegistryResolver` rejects a tool-set
+/// reconfiguration at queue time with an explicit `UnknownToolSet` tool error
+/// instead of optimistically admitting it against a registry that could never
+/// execute anything. Reconfigurations that leave the tool set untouched need
+/// no resolution and still queue.
+#[test]
+fn default_machine_rejects_tool_set_reconfig_without_a_resolver() {
+    let mut machine = DefaultAgentMachine::new(
+        state(),
+        LlmStepMode::NonStreaming,
+        Arc::new(ScriptedRequirementIds::new()),
+    );
+
+    let error = machine
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement_tool_set(),
+        })
+        .expect_err("tool-set reconfig without a configured resolver is rejected");
+    assert_eq!(error.kind(), AgentErrorKind::Tool);
+    assert!(matches!(
+        error,
+        crate::agent::AgentError::Tool(ToolRuntimeError::UnknownToolSet { .. })
+    ));
+    assert!(machine.state().queued_reconfigs().is_empty());
+
+    // A reconfiguration that does not change the active tool set validates
+    // trivially and queues without any resolver.
+    machine
+        .reconfigure(ReconfigRequest::set_system_prompt_overlay(
+            Some("overlay".to_owned()),
+            0,
+        ))
+        .expect("overlay reconfig needs no registry resolution");
+    assert_eq!(machine.state().queued_reconfigs().len(), 1);
 }

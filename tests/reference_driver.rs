@@ -41,9 +41,10 @@ use agent_testkit::prelude::*;
 
 use agent_lib::agent::ApprovalInteractionHandler;
 use agent_lib::agent::{
-    AgentError, AgentErrorKind, ApprovalRequirement, LoopCursor, LoopCursorKind, Notification,
-    ReconfigRequest, ReferenceScope, RequirementKindTag, RequirementResult,
-    StaticToolRegistryResolver, ToolApprovalPolicy, ToolSetRef, drain, drive_turn,
+    AgentError, AgentErrorKind, ApprovalRequirement, DeclaredOnlyToolRegistryResolver, LoopCursor,
+    LoopCursorKind, Notification, ReconfigRequest, ReferenceScope, RequirementKindTag,
+    RequirementResult, StaticToolRegistryResolver, ToolApprovalPolicy, ToolSetRef, drain,
+    drive_turn,
 };
 use agent_lib::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
 use agent_lib::conversation::ToolCallId;
@@ -759,10 +760,13 @@ async fn reference_idle_queued_reconfig_applies_at_next_turn_start() {
         LlmStep::text("done").with_usage(usage(3, 5))
     ]));
     let registry = idle_registry();
+    // The declared-only opt-in resolver arms the queue-time validation; the
+    // scope derives the same instance from the machine for the apply-time swap.
     let mut machine = default_machine(
         &ids,
         agent_state(&ids, agent_spec_with_tools(&ids, vec![weather_tool()])),
-    );
+    )
+    .with_tool_registry_resolver(Arc::new(DeclaredOnlyToolRegistryResolver));
     let replacement = ToolSetRef::new(ids.tool_set_id(), vec![calendar_tool()]);
 
     // Queue the reconfiguration while idle, before the turn opens.
@@ -778,7 +782,7 @@ async fn reference_idle_queued_reconfig_applies_at_next_turn_start() {
         })
         .expect("tool set reconfig queued");
 
-    let scope = ReferenceScope::new(client.clone(), registry);
+    let scope = ReferenceScope::new(client.clone(), registry).with_machine_tool_resolver(&machine);
     let ctx = root_context(&ids);
     let done = drive_turn(&mut machine, user_input(&ids, "hello"), &scope, &ctx)
         .await
@@ -820,7 +824,9 @@ async fn reference_idle_queued_reconfig_applies_at_next_turn_start() {
 /// reference driver resolves the queued set through a
 /// [`StaticToolRegistryResolver`], installs the resolved registry into the shared
 /// slot, and the ensuing tool call runs against the new registry while the old
-/// one is never touched.
+/// one is never touched. The resolver lives only on the machine (single source,
+/// M-ERR-3): the queue-time validation and the apply-time swap resolve through
+/// the same instance, which the scope clones off the machine.
 #[tokio::test]
 async fn reference_reconfig_swaps_executable_registry_end_to_end() {
     let ids = SeqIds::new();
@@ -855,7 +861,8 @@ async fn reference_reconfig_swaps_executable_registry_end_to_end() {
         .insert(replacement.id(), new_registry.clone())
         .expect("replacement registry inserted");
 
-    let mut machine = default_machine(&ids, agent_state(&ids, spec));
+    let mut machine = default_machine(&ids, agent_state(&ids, spec))
+        .with_tool_registry_resolver(Arc::new(resolver));
     machine
         .reconfigure(ReconfigRequest::ReplaceToolSet {
             tool_set: replacement.clone(),
@@ -863,7 +870,7 @@ async fn reference_reconfig_swaps_executable_registry_end_to_end() {
         .expect("tool set reconfig queued while idle");
 
     let scope = ReferenceScope::new(client.clone(), old_registry.clone())
-        .with_tool_registry_resolver(Arc::new(resolver));
+        .with_machine_tool_resolver(&machine);
     let ctx = root_context(&ids);
     let done = drive_turn(&mut machine, user_input(&ids, "hello"), &scope, &ctx)
         .await
@@ -881,4 +888,51 @@ async fn reference_reconfig_swaps_executable_registry_end_to_end() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].tools, vec![calendar_tool()]);
     assert_eq!(machine.state().current_tool_set(), &replacement);
+}
+
+/// M-ERR-3: a [`ReferenceScope`] never armed with the machine's resolver fails
+/// closed at apply time. Instead of silently installing a declared-only
+/// registry that cannot execute anything (the old default), the unarmed scope
+/// resolves nothing: the `Reconfig(Err)` fails the boundary, the machine parks
+/// on an error cursor naming the unresolved tool set, and the queued change is
+/// never applied.
+#[tokio::test]
+async fn unarmed_reference_scope_rejects_registry_swap_explicitly() {
+    let ids = SeqIds::new();
+    let client = Arc::new(ScriptedLlmClient::from_steps([LlmStep::text(
+        "unreachable",
+    )
+    .with_usage(usage(1, 1))]));
+    let registry = idle_registry();
+    let mut machine = default_machine(
+        &ids,
+        agent_state(&ids, agent_spec_with_tools(&ids, vec![weather_tool()])),
+    )
+    .with_tool_registry_resolver(Arc::new(DeclaredOnlyToolRegistryResolver));
+    let replacement = ToolSetRef::new(ids.tool_set_id(), vec![calendar_tool()]);
+    machine
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement.clone(),
+        })
+        .expect("tool set reconfig queued while idle");
+
+    // The scope is deliberately *not* armed with the machine's resolver.
+    let scope = ReferenceScope::new(client.clone(), registry);
+    let ctx = root_context(&ids);
+    let done = drive_turn(&mut machine, user_input(&ids, "hello"), &scope, &ctx)
+        .await
+        .expect("the failed swap still settles the drain");
+
+    let LoopCursor::Error(error) = done.cursor() else {
+        panic!("expected an error cursor, got {:?}", done.cursor());
+    };
+    assert!(
+        error.message().contains("unknown tool set"),
+        "unexpected error message: {}",
+        error.message()
+    );
+
+    // The reconfiguration was never applied, and no LLM call was ever made.
+    assert_ne!(machine.state().current_tool_set(), &replacement);
+    assert!(client.requests().is_empty());
 }

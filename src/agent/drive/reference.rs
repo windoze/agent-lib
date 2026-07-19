@@ -40,8 +40,9 @@ use super::{
 use crate::{
     agent::{
         AgentError, AgentInput, AgentMachine, ApprovalDecision, ApprovalResponse,
-        DeclaredOnlyToolRegistryResolver, LlmStepMode, PermissionResponse, RequirementResult,
-        RunContext, ToolRegistry, ToolRegistryResolver, ToolRuntimeError, ToolSetRef,
+        DefaultAgentMachine, LlmStepMode, NoToolRegistryResolver, PermissionResponse,
+        RequirementResult, RunContext, ToolRegistry, ToolRegistryResolver, ToolRuntimeError,
+        ToolSetRef,
         interaction::{Interaction, InteractionKind, InteractionResponse},
     },
     client::{ChatRequest, ClientError, LlmClient},
@@ -194,6 +195,12 @@ impl ToolHandler for ToolRegistryHandler {
 /// [`ToolRegistryHandler`] reads. The confirmation (or a resolution /
 /// declaration-mismatch failure) rides back inside
 /// [`RequirementResult::Reconfig`].
+///
+/// The resolver is the *same instance* the machine validated the queued change
+/// with: [`ReferenceScope`] derives it from the machine via
+/// [`with_machine_tool_resolver`](ReferenceScope::with_machine_tool_resolver),
+/// so queue-time validation and apply-time resolution cannot be configured to
+/// disagree (M-ERR-3).
 #[derive(Clone)]
 pub struct ReconfigRegistryHandler {
     resolver: Arc<dyn ToolRegistryResolver>,
@@ -319,12 +326,14 @@ impl InteractionHandler for ApprovalInteractionHandler {
 /// Wraps an [`LlmClient`] and a [`ToolRegistry`] into their handlers, plus an
 /// optional [`ApprovalInteractionHandler`]. The tool registry lives in a shared,
 /// swappable slot so a turn-boundary reconfiguration is fulfilled by resolving
-/// and installing a new registry through a [`ToolRegistryResolver`] (defaulting
-/// to [`DeclaredOnlyToolRegistryResolver`]; override with
-/// [`with_tool_registry_resolver`](Self::with_tool_registry_resolver)). With an
-/// interaction backend the layer is attended (approvals resolve here); without
-/// one it is headless and approvals pop outward. Pass it to [`drain`] (or
-/// [`drive_turn`]).
+/// and installing a new registry through the machine's own
+/// [`ToolRegistryResolver`] (wired via
+/// [`with_machine_tool_resolver`](Self::with_machine_tool_resolver); until then
+/// the fail-closed [`NoToolRegistryResolver`] rejects any tool-set swap with an
+/// explicit error, so an unwired scope can never install a registry the machine
+/// did not validate). With an interaction backend the layer is attended
+/// (approvals resolve here); without one it is headless and approvals pop
+/// outward. Pass it to [`drain`] (or [`drive_turn`]).
 pub struct ReferenceScope {
     llm: LlmClientHandler,
     tool: ToolRegistryHandler,
@@ -336,19 +345,17 @@ impl ReferenceScope {
     /// Wires `client` and `registry` into a scope with no interaction backend.
     ///
     /// The registry is installed into a shared slot; queued reconfigurations
-    /// resolve through a [`DeclaredOnlyToolRegistryResolver`] until a stricter
-    /// resolver is supplied via
-    /// [`with_tool_registry_resolver`](Self::with_tool_registry_resolver).
+    /// resolve through the machine's resolver once
+    /// [`with_machine_tool_resolver`](Self::with_machine_tool_resolver) clones it
+    /// in, and fail with an explicit [`ToolRuntimeError::UnknownToolSet`] until
+    /// then.
     #[must_use]
     pub fn new(client: Arc<dyn LlmClient>, registry: Arc<dyn ToolRegistry>) -> Self {
         let slot: SharedRegistry = Arc::new(Mutex::new(registry));
         Self {
             llm: LlmClientHandler::new(client),
             tool: ToolRegistryHandler::from_slot(slot.clone()),
-            reconfig: ReconfigRegistryHandler::new(
-                Arc::new(DeclaredOnlyToolRegistryResolver),
-                slot,
-            ),
+            reconfig: ReconfigRegistryHandler::new(Arc::new(NoToolRegistryResolver), slot),
             interaction: None,
         }
     }
@@ -360,10 +367,17 @@ impl ReferenceScope {
         self
     }
 
-    /// Sets the resolver used to fulfill `NeedReconfigRegistry` requirements.
+    /// Sets the resolver used to fulfill `NeedReconfigRegistry` requirements to
+    /// the machine's own resolver.
+    ///
+    /// This is the only way to arm registry swaps on this scope, and it takes
+    /// the resolver from the machine rather than a free-standing value: the
+    /// machine validated the queued tool-set change with this same instance, so
+    /// the apply-time re-resolution here can never disagree with the queue-time
+    /// validation (M-ERR-3).
     #[must_use]
-    pub fn with_tool_registry_resolver(mut self, resolver: Arc<dyn ToolRegistryResolver>) -> Self {
-        self.reconfig.resolver = resolver;
+    pub fn with_machine_tool_resolver(mut self, machine: &DefaultAgentMachine) -> Self {
+        self.reconfig.resolver = machine.tool_registry_resolver();
         self
     }
 }

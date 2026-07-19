@@ -1183,7 +1183,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0，无挂起）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（exit 0）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`（默认与 external features 各一遍）全部通过；`cargo test -p agent-lib --lib agent::drive` 31 条全过。
 - **Breaking change**（pre-1.0，记录在此）：`TurnDone` 新增字段与 `cancelled()`/`with_cancelled` API（`new` 签名不变）；取消语义行为修正——drain 在批次 fulfil 后新增截停点，取消比以往更早生效（被取消批次的结果不再回灌进机器）；facade 取消路径错误消息措辞变化。
 
-### M4-6 [TODO] 统一 reconfig 的 resolver 来源，修复默认 resolver footgun（M-ERR-3）
+### M4-6 [DONE] 统一 reconfig 的 resolver 来源，修复默认 resolver footgun（M-ERR-3）
 
 上下文：
 
@@ -1199,6 +1199,18 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：配置"queue 通过 apply 失败"的 resolver 组合不再可能（单一来源）；默认接线下 tool-set reconfig 给出显式错误而非假成功。
 - `cargo test -p agent-lib --lib agent::` 全过。
+
+完成记录：
+
+- **单一来源（选型：机器持有、`ReferenceScope` 只能从机器派生，而非 trait hook 或改造 `ReconfigHandler` 签名——后者会波及 testkit 的 scripted/cassette/recording 全部实现，爆炸半径过大）**：`DefaultAgentMachine` 新增 `tool_registry_resolver()` getter（克隆内部 Arc）；`ReferenceScope::with_tool_registry_resolver(Arc<dyn ToolRegistryResolver>)`（独立配置点）**移除**，替换为 `with_machine_tool_resolver(&DefaultAgentMachine)`——scope 的 reconfig resolver 只能从机器克隆同一实例，参考接线下"queue 通过、apply 失败"在构造上不可能。`ReconfigHandler` trait、requirement 形状（serde）、drain 路由均不变。
+- **默认 fail-closed**：新增 `NoToolRegistryResolver`（`src/agent/tool.rs`，`resolve_tool_set` 恒 `Err(UnknownToolSet)`），同时作为 `DefaultAgentMachine::new` 与 `ReferenceScope::new` 的默认 resolver——默认接线下 tool-set reconfig 在 queue 时即以显式 `AgentError::Tool(UnknownToolSet)` 被拒，未 arm resolver 的 scope 在 apply 时同样显式失败（registry 槽永不装入死 registry）。`DeclaredOnlyToolRegistryResolver` 保留为显式 opt-in（只需 advertise tools 的 loop），rustdoc 显著标注其 declared-only 语义（declarations 回声 + `execute` 恒 `UnknownTool`）。
+- **测试**：
+  - machine 新增 `default_machine_rejects_tool_set_reconfig_without_a_resolver`：默认机器 tool-set reconfig 报 `AgentErrorKind::Tool`/`UnknownToolSet`、队列为空；不动 tool set 的 overlay reconfig 无需 resolver 照常入队。
+  - 集成新增 `unarmed_reference_scope_rejects_registry_swap_explicitly`：机器 arm 了 resolver（queue 通过）但 scope 未 `with_machine_tool_resolver` → apply 显式失败，机器停在 Error cursor（消息含 "unknown tool set"）、reconfig 未应用、零 LLM 调用——对照旧默认"假成功装死 registry"。
+  - 行为收紧的必然跟进（非 workaround）：`reconfig_machine`/`restore.rs` 测试夹具显式 opt-in `DeclaredOnlyToolRegistryResolver`；`reference_idle_queued_reconfig_applies_at_next_turn_start` 机器 arm declared-only resolver、scope 从机器派生；`reference_reconfig_swaps_executable_registry_end_to_end` 改为 resolver 只挂机器、scope 克隆机器实例（单一来源的端到端演示）。
+- **文档**：`docs/agent-layer.md` §4.2 补单一来源与 fail-closed 默认段落；`NoToolRegistryResolver`/`DeclaredOnlyToolRegistryResolver`/`with_machine_tool_resolver`/机器字段与 `with_tool_registry_resolver` 的 rustdoc 同步。`docs/review-2026-07.md` M-ERR-3 状态标注归 M4-7 review。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D warnings`、`cargo test --all --all-targets`（exit 0）、`cargo test --features "external-claude-code external-codex external-opencode external-acp facade-schema" --all-targets`（exit 0）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过；`cargo test -p agent-lib --lib agent::` 461 条全过。
+- **Breaking change**（pre-1.0，记录在此）：`ReferenceScope::with_tool_registry_resolver` 移除（由 `with_machine_tool_resolver(&machine)` 取代）；`DefaultAgentMachine` 与 `ReferenceScope` 的默认 reconfig resolver 由假成功的 `DeclaredOnlyToolRegistryResolver` 改为 fail-closed 的 `NoToolRegistryResolver`——未显式配置 resolver 的 tool-set reconfig 现在显式报错。
 
 ### M4-7 [TODO] M4 review：Agent 语义收口
 

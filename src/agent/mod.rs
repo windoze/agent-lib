@@ -98,6 +98,6 @@ pub use state::{
 };
 pub use tool::{
     DeclaredOnlyToolRegistry, DeclaredOnlyToolRegistryResolver, NoToolExecutionIds,
-    StaticToolRegistryResolver, ToolExecutionIds, ToolExecutor, ToolRegistry, ToolRegistryResolver,
-    ToolRuntimeError,
+    NoToolRegistryResolver, StaticToolRegistryResolver, ToolExecutionIds, ToolExecutor,
+    ToolRegistry, ToolRegistryResolver, ToolRuntimeError,
 };

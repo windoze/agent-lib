@@ -269,7 +269,14 @@ skill 启停、tool 增删、system prompt 变更都改的是 config/projection,
 model 与 loop policy 变更,并在 turn 边界原子应用。其中 tool set 变化会 reify 成
 `Requirement{ kind: NeedReconfigRegistry }`,由 driver 端的 `ReconfigHandler` 用
 `ToolRegistryResolver` 把新的 `ToolSetRef` 解析为 live registry 再换入;解析或版本校验
-失败会分类返回且不部分应用(当前 turn 的 registry snapshot 保持恒定)。机器 park 在
+失败会分类返回且不部分应用(当前 turn 的 registry snapshot 保持恒定)。resolver 是
+**单一来源**(M-ERR-3 / M4-6):机器在 queue 时用自身持有的 resolver 做准入校验,
+`ReferenceScope` 只能经 `with_machine_tool_resolver(&machine)` 克隆同一实例供 apply 时
+重解析,不存在第二个可独立配置的 resolver,因此"queue 通过、apply 失败"的窗口在参考
+接线下不成立。未显式配置 resolver 时两侧默认都是 fail-closed 的
+`NoToolRegistryResolver`:tool-set reconfig 在 queue 时即以显式 `UnknownToolSet` 错误
+被拒,而非对着无法执行的 registry 假成功;只需 advertise tools 的 loop 可显式 opt-in
+`DeclaredOnlyToolRegistryResolver`。机器 park 在
 `AwaitingReconfig`(等待 registry 换入确认)期间,新的 `reconfigure` 请求会被**拒绝**
 (`AgentErrorKind::AgentState`)而非入队——resume 只应用 park 时 plan 好的 application 并
 清空队列,此时入队的请求会被静默丢弃;调用方在 outstanding reconfig requirement 解决后

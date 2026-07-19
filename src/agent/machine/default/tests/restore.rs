@@ -14,8 +14,8 @@
 use super::super::{PendingReconfig, TurnScratch};
 use super::*;
 use crate::agent::{
-    ApprovalRequirement, NoApprovalPolicy, ReconfigRequest, ToolApprovalPolicy, ToolExecutionIds,
-    ToolRuntimeError, ToolSetId,
+    ApprovalRequirement, DeclaredOnlyToolRegistryResolver, NoApprovalPolicy, ReconfigRequest,
+    ToolApprovalPolicy, ToolExecutionIds, ToolRuntimeError, ToolSetId,
 };
 use crate::conversation::ToolCallId;
 use crate::model::tool::{Tool, ToolCall, ToolResponse, ToolStatus};
@@ -311,12 +311,15 @@ fn rebuild_at_continuation_streaming_step_aligns_in_flight_scratch() {
 fn rebuild_at_awaiting_reconfig_round_trips_the_commit() {
     let replacement = replacement_tool_set();
 
-    // Drive a first machine to the deferred reconfiguration boundary.
+    // Drive a first machine to the deferred reconfiguration boundary. The
+    // tool-set change needs a resolver to pass queue-time validation; the
+    // declared-only opt-in is enough for this restore-focused test.
     let mut driven = DefaultAgentMachine::new(
         state(),
         LlmStepMode::NonStreaming,
         Arc::new(RestoreRequirementIds::new()),
-    );
+    )
+    .with_tool_registry_resolver(Arc::new(DeclaredOnlyToolRegistryResolver));
     let outcome = driven.step(StepInput::external(user_input()));
     let llm_id = outcome.requirements[0].id;
     driven
