@@ -2,6 +2,7 @@
 
 mod begin;
 mod commit;
+mod finish;
 mod identity;
 mod mapping;
 mod results;
@@ -12,7 +13,7 @@ use super::{
 };
 use crate::{
     conversation::{
-        CommitError, ContentBlockKind, ConversationError, PendingTurnError, PendingTurnPhase,
+        ContentBlockKind, ConversationError, PendingTurnError, PendingTurnPhase,
         ToolCallMapping, TurnMeta,
     },
     model::{

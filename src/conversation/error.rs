@@ -403,6 +403,28 @@ pub enum PendingTurnError {
         block: ContentBlockKind,
     },
 
+    /// An assistant response contained content forbidden by the canonical grammar.
+    ///
+    /// Raised by the freeze pre-check so an illegal block fails at
+    /// `finish_assistant` instead of surfacing as a commit-time
+    /// `InvalidRoleBlock` that can only be escaped by discarding the turn.
+    #[error("a pending assistant response cannot contain a {block} block")]
+    InvalidAssistantBlock {
+        /// Rejected top-level content category.
+        block: ContentBlockKind,
+    },
+
+    /// An assistant response carried a tool use that cannot be invoked.
+    ///
+    /// Raised by the freeze pre-check with the same completeness rule commit
+    /// validation applies, so an incomplete tool use fails early instead of
+    /// poisoning the turn at commit time.
+    #[error("a pending assistant response has an incomplete tool-use block: {detail}")]
+    IncompleteToolUse {
+        /// Shared completeness rule violation.
+        detail: &'static str,
+    },
+
     /// The operation is not legal in the pending turn's current phase.
     #[error("cannot {operation}: expected {expected}, found {actual:?}")]
     InvalidTransition {

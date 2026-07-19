@@ -176,19 +176,7 @@ fn inspect_message(
     let role = message.payload().role;
 
     for block in &message.payload().content {
-        let allowed = matches!(
-            (role, block),
-            (
-                Role::User,
-                ContentBlock::Text { .. } | ContentBlock::Image { .. }
-            ) | (
-                Role::Assistant,
-                ContentBlock::Text { .. }
-                    | ContentBlock::ToolUse { .. }
-                    | ContentBlock::Thinking { .. }
-            ) | (Role::Tool, ContentBlock::ToolResult { .. })
-        );
-        if !allowed {
+        if !block_allowed_for_role(role, block) {
             return Err(CommitError::InvalidRoleBlock {
                 message_id: message.id(),
                 role,
@@ -233,22 +221,53 @@ fn inspect_message(
     Ok(message_facts)
 }
 
+/// Reports whether one top-level block is legal in a message of this role.
+///
+/// This allowlist is the single source for the canonical block grammar:
+/// commit validation ([`inspect_message`]) and the pending-turn freeze
+/// pre-check both consult it, so the two paths cannot drift apart.
+pub(crate) const fn block_allowed_for_role(role: Role, block: &ContentBlock) -> bool {
+    matches!(
+        (role, block),
+        (
+            Role::User,
+            ContentBlock::Text { .. } | ContentBlock::Image { .. }
+        ) | (
+            Role::Assistant,
+            ContentBlock::Text { .. }
+                | ContentBlock::ToolUse { .. }
+                | ContentBlock::Thinking { .. }
+        ) | (Role::Tool, ContentBlock::ToolResult { .. })
+    )
+}
+
+/// Returns why one tool-use block cannot represent a complete invocation.
+///
+/// Shared by commit validation and the pending-turn freeze pre-check so an
+/// incomplete tool use is rejected with the same rule at both boundaries.
+pub(crate) fn incomplete_tool_use_detail(
+    provider_call_id: &str,
+    name: &str,
+) -> Option<&'static str> {
+    if provider_call_id.is_empty() {
+        return Some("a tool-use block has no provider call id");
+    }
+    if name.is_empty() {
+        return Some("a tool-use block has no tool name");
+    }
+    None
+}
+
 /// Rejects tool-use fields that cannot represent a complete invocation.
 fn validate_complete_tool_use(
     message_id: MessageId,
     provider_call_id: &str,
     name: &str,
 ) -> Result<(), CommitError> {
-    if provider_call_id.is_empty() {
+    if let Some(detail) = incomplete_tool_use_detail(provider_call_id, name) {
         return Err(CommitError::IncompleteContent {
             message_id: Some(message_id),
-            detail: "a tool-use block has no provider call id",
-        });
-    }
-    if name.is_empty() {
-        return Err(CommitError::IncompleteContent {
-            message_id: Some(message_id),
-            detail: "a tool-use block has no tool name",
+            detail,
         });
     }
     Ok(())

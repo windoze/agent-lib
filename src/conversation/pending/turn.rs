@@ -192,6 +192,12 @@ impl PendingTurn {
     }
 
     /// Freezes the active assistant and advances according to its tool uses.
+    ///
+    /// The frozen response passes the same block-level rules commit
+    /// validation applies (canonical role grammar, complete tool uses,
+    /// unique provider call ids) before any state changes. Rejecting here
+    /// keeps an illegal response from surfacing at commit time, where the
+    /// only escape would be discarding the whole turn.
     pub(in crate::conversation) fn finish_assistant(
         &mut self,
         message_id: MessageId,
@@ -211,6 +217,7 @@ impl PendingTurn {
         };
         let frozen = pending.finish(message_id)?;
         let (message, usage, stop_reason, extra) = frozen.into_parts();
+        validate_assistant_blocks(&message, &self.tool_calls)?;
         let provider_call_ids = message
             .payload()
             .content
@@ -375,6 +382,44 @@ enum PendingTurnState {
     AwaitingToolCallMappings { provider_call_ids: Vec<String> },
     AwaitingToolResults,
     ReadyToCommit,
+}
+
+/// Rejects a frozen assistant response that commit validation would refuse.
+///
+/// Shares its rules with `validation::sequence` (block allowlist and tool-use
+/// completeness) so the two boundaries cannot drift. Provider call ids must
+/// also be unique within the response and against every call registered by
+/// earlier steps of this turn; the phase machine guarantees all previously
+/// frozen tool uses are already registered, so `registered` covers them.
+fn validate_assistant_blocks(
+    message: &ConversationMessage,
+    registered: &[PendingToolCall],
+) -> Result<(), PendingTurnError> {
+    let mut seen = std::collections::HashSet::with_capacity(message.payload().content.len());
+    for block in &message.payload().content {
+        if !crate::conversation::validation::block_allowed_for_role(Role::Assistant, block) {
+            return Err(PendingTurnError::InvalidAssistantBlock {
+                block: content_kind(block),
+            });
+        }
+        if let ContentBlock::ToolUse { id, name, .. } = block {
+            if let Some(detail) =
+                crate::conversation::validation::incomplete_tool_use_detail(id, name)
+            {
+                return Err(PendingTurnError::IncompleteToolUse { detail });
+            }
+            if !seen.insert(id.as_str())
+                || registered
+                    .iter()
+                    .any(|call| call.provider_call_id.as_str() == id.as_str())
+            {
+                return Err(PendingTurnError::DuplicateProviderCallId {
+                    provider_call_id: id.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Maps a content value to the category used in classified errors.

@@ -159,38 +159,3 @@ fn missing_duplicate_unknown_and_reused_result_ids_leave_pending_unchanged() {
         .commit_pending(TurnMeta::default())
         .expect("retry commits without poisoned state");
 }
-
-#[test]
-fn duplicated_provider_ids_in_frozen_tool_uses_cannot_be_synthetically_paired() {
-    let mut conversation = conversation();
-    begin(&mut conversation, 82, 820);
-    freeze_response(
-        &mut conversation,
-        assistant_response(
-            vec![tool_use("duplicate"), tool_use("duplicate")],
-            1,
-            1,
-            StopReason::ToolUse,
-            "req-duplicate-provider",
-        ),
-        821,
-    );
-    let pending_before = pending_view(&conversation);
-    let committed_before = committed_view(&conversation);
-
-    assert_eq!(
-        conversation
-            .cancel_pending(CancelDisposition::ResumeTurn {
-                cancelled_results: vec![cancelled_result("duplicate", 970, 822)],
-            })
-            .expect_err("one provider id cannot identify two frozen calls"),
-        ConversationError::Cancel(CancelError::DuplicateProviderCallId {
-            provider_call_id: "duplicate".to_owned(),
-        })
-    );
-    assert_eq!(pending_view(&conversation), pending_before);
-    assert_eq!(committed_view(&conversation), committed_before);
-    conversation
-        .cancel_pending(CancelDisposition::DiscardTurn)
-        .expect("ambiguous pending turn remains discardable");
-}

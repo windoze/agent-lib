@@ -171,6 +171,14 @@ struct PendingMessage {
 ⇒ committed(turns)自始至终满足不变量 ⇒ "cancel 后仍可 feed" 天然成立
 ```
 
+**finish 时的块级预检(M3-6):** assistant 响应 freeze 进 pending turn 时即过与 commit
+同一来源的块级规则——角色语法 allowlist(`validation::sequence::block_allowed_for_role`)、
+tool_use 完整性(空 id/空 name,`incomplete_tool_use_detail`)、provider call id 在消息内与
+本轮已注册调用间的唯一性。非法响应在 `finish_assistant` 即报错(`InvalidAssistantBlock`/
+`IncompleteToolUse`/`DuplicateProviderCallId`),不会拖到 commit 才暴露——那时 `ReadyToCommit`
+只剩 DiscardTurn,整轮已冻结的 tool 往返只能作废。预检失败后 pending turn 保持原状,可正常
+DiscardTurn 并继续 feed。
+
 ## 6. Projection:compaction / truncation 的家
 
 发给 LLM 的不是 raw turns,而是 raw 经 projection 计算的有效视图。

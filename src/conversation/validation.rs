@@ -16,6 +16,10 @@ use self::{
     pairing::validate_pairings,
     sequence::validate_role_sequence,
 };
+
+// The pending-turn freeze pre-check shares the canonical block grammar and
+// tool-use completeness rule with commit validation through these helpers.
+pub(crate) use self::sequence::{block_allowed_for_role, incomplete_tool_use_detail};
 use crate::conversation::{CommitError, Turn, TurnId, turn::TurnData};
 
 /// A validator-issued certificate whose field cannot be forged by siblings.

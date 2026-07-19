@@ -63,33 +63,3 @@ fn tool_call_mapping_errors_are_atomic_and_retryable() {
         PendingTurnPhase::AwaitingToolResults
     );
 }
-
-#[test]
-fn duplicate_provider_calls_are_rejected_before_open_call_registration() {
-    let mut conversation = conversation();
-    begin(&mut conversation, 21, 210);
-    freeze_response(
-        &mut conversation,
-        assistant_response(
-            vec![tool_use("same-call"), tool_use("same-call")],
-            1,
-            1,
-            StopReason::ToolUse,
-            "req-duplicate-provider",
-        ),
-        211,
-    );
-    let before = pending_view(&conversation);
-
-    let error = conversation
-        .register_tool_calls(vec![mapping("same-call", 510)])
-        .expect_err("duplicate provider ids cannot be mapped safely");
-
-    assert_eq!(
-        error,
-        ConversationError::PendingTurn(PendingTurnError::DuplicateProviderCallId {
-            provider_call_id: "same-call".to_owned(),
-        })
-    );
-    assert_eq!(pending_view(&conversation), before);
-}

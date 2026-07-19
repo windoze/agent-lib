@@ -268,6 +268,11 @@ impl Conversation {
     /// A tool-free response makes the transaction ready to commit. A response
     /// containing tool uses freezes first, then requires an exact call to
     /// [`register_tool_calls`](Self::register_tool_calls).
+    ///
+    /// The response is pre-checked with the same block-level rules commit
+    /// validation applies: illegal block kinds, incomplete tool uses, and
+    /// duplicate provider call ids are rejected here, while the turn can
+    /// still be discarded cheaply.
     pub fn finish_assistant(
         &mut self,
         message_id: MessageId,

@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn final_tool_use_cannot_commit_and_validator_failure_keeps_both_states() {
+fn final_tool_use_cannot_commit_and_failed_commit_keeps_both_states() {
     let mut tool_turn = conversation();
     begin(&mut tool_turn, 60, 600);
     freeze_response(
@@ -29,41 +29,6 @@ fn final_tool_use_cannot_commit_and_validator_failure_keeps_both_states() {
     ));
     assert_eq!(pending_view(&tool_turn), tool_pending);
     assert_eq!(committed_view(&tool_turn), tool_committed);
-
-    let mut invalid_content = conversation();
-    begin(&mut invalid_content, 61, 610);
-    freeze_response(
-        &mut invalid_content,
-        assistant_response(
-            vec![ContentBlock::Image {
-                source: ImageSource::Url {
-                    url: "https://example.test/not-assistant.png".to_owned(),
-                    extra: Map::new(),
-                },
-                extra: Map::new(),
-            }],
-            1,
-            1,
-            StopReason::EndTurn,
-            "req-invalid",
-        ),
-        611,
-    );
-    let pending_before = pending_view(&invalid_content);
-    let committed_before = committed_view(&invalid_content);
-    let validation_error = invalid_content
-        .commit_pending(TurnMeta::default())
-        .expect_err("M1 validator rejects invalid assistant content");
-    assert_eq!(
-        validation_error,
-        ConversationError::Commit(CommitError::InvalidRoleBlock {
-            message_id: message_id(611),
-            role: Role::Assistant,
-            block: ContentBlockKind::Image,
-        })
-    );
-    assert_eq!(pending_view(&invalid_content), pending_before);
-    assert_eq!(committed_view(&invalid_content), committed_before);
 }
 
 #[test]

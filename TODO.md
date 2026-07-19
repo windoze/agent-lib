@@ -830,7 +830,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。全量测试套件按既定政策跳过——自 M3-5-3 绿色全量运行以来仅 rustdoc 注释与 markdown 文档变更，不影响编译输出，沿用前次绿色结果。
 - `docs/review-2026-07.md` M-CONV-3 按既定口径留待 M3-5-1~4 全部落地后由 M3-9 标注（本任务完成后 M3-5-1~4 已全部落地，M3-9 复验时标注）。无 breaking change（纯文档）。
 
-### M3-6 [TODO] `finish_assistant` 前置块级校验（M-CONV-5）
+### M3-6 [DONE] `finish_assistant` 前置块级校验（M-CONV-5）
 
 上下文：
 
@@ -845,6 +845,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：含重复 tool_use id 的 assistant 响应在 `finish_assistant` 即报错；含 Image 块的 assistant 响应同样即时报错；报错后 pending turn 可正常 DiscardTurn 并继续 feed。
 - `cargo test -p agent-lib --lib conversation::pending` 全过。
+
+完成记录：
+
+- **单一来源（规则抽取）**：`src/conversation/validation/sequence.rs` 新增两个 `pub(crate)` helper——`block_allowed_for_role(role, block)`（`inspect_message` 的 role/block allowlist 抽出为 `const fn`，`inspect_message` 改调它）与 `incomplete_tool_use_detail(id, name)`（tool_use 完整性规则本体，`validate_complete_tool_use` 包装成 `CommitError`）；经 `validation.rs` re-export 给 pending 预检使用。commit 边界与 freeze 边界的块级规则由此无法漂移。
+- **预检接入**：`pending/turn.rs` 新增 `validate_assistant_blocks(&message, &self.tool_calls)`，在 `finish_assistant` 中 freeze 成功、`into_parts` 之后、任何状态突变（usage merge/push message/改 state）之前执行。三类拒绝：非法块类型（Image/ToolResult）→ 新变体 `PendingTurnError::InvalidAssistantBlock { block }`（镜像既有 `InvalidUserBlock`）；tool_use 空 id/空 name → 新变体 `PendingTurnError::IncompleteToolUse { detail }`（class-wide 补全：同类 commit 时 `IncompleteContent` 卡死路径）；消息内重复或与本轮已注册调用重复（状态机保证前序 step 的 provider id 都在 `self.tool_calls`，全覆盖）→ 复用 `PendingTurnError::DuplicateProviderCallId`。预检失败无可观察状态变化（`pending_view` 不变），turn 停在 AssistantInProgress 可 DiscardTurn——wire 内容不可修复，重试必然同败，语义正确。`register_tool_calls` 的重复检查保留为防御（不再可达）。
+- **连带影响（如实记录）**：cancel 路径 `prepare.rs:66-70` 的 `CancelError::DuplicateProviderCallId`（针对 frozen tool_use 重复）经公共 API 已不可构造，对应测试 `duplicated_provider_ids_in_frozen_tool_uses_cannot_be_synthetically_paired` 删除，防御代码保留；`errors/commit.rs` 的 Image 块 commit 时 `InvalidRoleBlock` 用例同样不再可达，该半段移入新的 finish 边界测试（commit 级 `InvalidRoleBlock`/`DuplicateProviderCallId`/`IncompleteContent` 覆盖仍由 `validation/tests` 经外部 TurnData 路径钉住）；`errors/mapping.rs` 的 register 时重复拒绝测试由 finish 边界测试取代。
+- **测试**（新增 `pending/turn/tests/errors/finish.rs`，4 条）：`duplicate_provider_call_ids_are_rejected_at_the_freeze_boundary`（同消息重复 id 即报 + 状态不变 + DiscardTurn 后新 turn 正常 commit）；`illegal_assistant_blocks_are_rejected_at_the_freeze_boundary`（Image 与 ToolResult 两块枚举）；`incomplete_tool_uses_are_rejected_at_the_freeze_boundary`（空 id / 空 name 两条 detail 断言）；`a_provider_call_id_registered_by_an_earlier_step_cannot_be_reused`（第二 step 重用已注册 id 即报，已闭合的第一 step 三消息完好）。每条均断言报错后可 DiscardTurn 并继续 feed 至 commit。
+- **文档**：`finish_assistant`（pending/turn.rs 与 conversation/mod.rs）rustdoc 补预检说明；新错误变体 rustdoc 写明「freeze 预检尽早失败」动机；`docs/conversation-core.md` §5 新增「finish 时的块级预检（M3-6）」段；`docs/review-2026-07.md` M-CONV-5 已标注 `✅ 已修复（M3-6）`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::pending`（50 条全过）、`cargo test --all --all-targets`（exit 0，50 个测试目标）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（exit 0）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- Breaking change（pre-1.0，记录在此）：`PendingTurnError` 新增 `InvalidAssistantBlock` 与 `IncompleteToolUse` 两个变体（该枚举未标 `#[non_exhaustive]`，外部穷尽 match 需补分支）；含重复 tool_use id / 非法块 / 不完整 tool_use 的 assistant 响应从「freeze 放行、后续卡死」变为「finish_assistant 即报错」——行为修正。
 
 ### M3-7 [TODO] `resolved_provider_call_id` 按 claimed 排除语义重推导（M-CONV-6）
 
