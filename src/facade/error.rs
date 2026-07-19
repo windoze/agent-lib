@@ -68,14 +68,13 @@ pub enum FacadeError {
     #[error("model returned an unexpected tool-use block")]
     UnexpectedToolUse,
 
-    /// A tool call was refused by the approval policy (or by a headless run with
-    /// no interaction handler to service an `ask`).
+    /// A managed external delegate start was refused by the approval policy.
     ///
-    /// Surfaced when [`crate::facade::Approval::auto_deny`] is in effect, when an
-    /// `ask` handler returns a non-approving [`crate::facade::ApprovalDecision`],
-    /// or when a tool requires approval in a headless run that has no handler to
-    /// answer it (see `docs/facade-api.md` §9.2, §16). A denial never blocks: the
-    /// run fails fast rather than waiting for input that cannot arrive.
+    /// Ordinary typed-tool denials do not use this variant: the machine feeds a
+    /// denied tool result back to the model and the run continues. This variant is
+    /// reserved for external delegate starts refused by `auto_deny`, a
+    /// non-approving `ask` handler, or a headless `ask` with no handler (see
+    /// `docs/facade-api.md` §9.2, §16).
     #[error("tool execution was denied by the approval policy")]
     ApprovalDenied,
 

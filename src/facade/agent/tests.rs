@@ -27,7 +27,7 @@ use crate::facade::approval::{Approval, ApprovalDecision, ApprovalPolicy};
 use crate::facade::collab::Collaboration;
 use crate::facade::delegate::Delegation;
 use crate::facade::error::FacadeError;
-use crate::facade::run::RunEvent;
+use crate::facade::run::{RunEvent, RunOutput};
 use crate::facade::tool::{Tool, ToolContext};
 use crate::model::content::ContentBlock;
 use crate::model::message::{Message, Role};
@@ -747,6 +747,14 @@ async fn drain_agent_stream(agent: &mut Agent, input: &str) -> Vec<RunEvent> {
         events.push(item.expect("stream item is ok"));
     }
     events
+}
+
+/// Returns the terminal [`RunOutput`] carried by a fully drained stream.
+fn terminal_output(events: &[RunEvent]) -> &RunOutput {
+    let Some(RunEvent::Done(output)) = events.last() else {
+        panic!("the stream ends with a terminal Done, got {events:?}");
+    };
+    output.as_ref()
 }
 
 /// The aggregated assistant text carried by every `TextDelta` in `events`.
@@ -2100,6 +2108,12 @@ async fn stream_and_run_full_agree_on_plain_tool_lifecycle() {
         Approval::auto_allow(),
     );
     let stream_events = drain_agent_stream(&mut stream_agent, "weather?").await;
+    let done_output = terminal_output(&stream_events);
+
+    assert_eq!(
+        &done_output.events, &run_full.events,
+        "streaming Done.events matches the non-streaming RunOutput.events"
+    );
 
     assert_eq!(
         lifecycle_signature(&run_full.events),
@@ -2150,6 +2164,20 @@ async fn stream_and_run_full_agree_on_approved_tool_lifecycle() {
         Approval::ask(|_request| ApprovalDecision::Approve),
     );
     let stream_events = drain_agent_stream(&mut stream_agent, "weather?").await;
+    let done_output = terminal_output(&stream_events);
+
+    assert_eq!(
+        &done_output.events, &run_full.events,
+        "streaming Done.events matches the non-streaming RunOutput.events, including approvals"
+    );
+    assert!(
+        done_output
+            .events
+            .iter()
+            .any(|event| matches!(event, RunEvent::ApprovalRequested(request) if request.tool_name == "get_weather")),
+        "streaming Done.events contains the approval request, got {:?}",
+        done_output.events
+    );
 
     let signature = lifecycle_signature(&run_full.events);
     assert_eq!(
@@ -2199,6 +2227,12 @@ async fn stream_and_run_full_agree_on_denied_tool_lifecycle() {
         Approval::auto_deny(),
     );
     let stream_events = drain_agent_stream(&mut stream_agent, "weather?").await;
+    let done_output = terminal_output(&stream_events);
+
+    assert_eq!(
+        &done_output.events, &run_full.events,
+        "streaming Done.events matches the non-streaming RunOutput.events for a denied approval"
+    );
 
     let signature = lifecycle_signature(&run_full.events);
     assert_eq!(

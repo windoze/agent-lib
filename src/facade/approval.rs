@@ -187,10 +187,13 @@ impl Approval {
         }
     }
 
-    /// Denies every tool call before it executes.
+    /// Denies every typed-tool call before it executes.
     ///
-    /// A denied call never runs; the run surfaces
-    /// [`FacadeError::ApprovalDenied`](crate::facade::FacadeError::ApprovalDenied).
+    /// A denied typed-tool call never runs; the agent feeds a denied tool result
+    /// back to the model and continues the turn. The run-level
+    /// [`FacadeError::ApprovalDenied`](crate::facade::FacadeError::ApprovalDenied)
+    /// is reserved for managed external delegate starts refused by the approval
+    /// policy.
     #[must_use]
     pub fn auto_deny() -> Self {
         Self {

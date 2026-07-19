@@ -64,8 +64,9 @@ use crate::stream::accumulator::{Accumulator, AccumulatorError};
 use crate::stream::{Delta, StreamEvent};
 
 use super::{
-    Agent, abandon_in_flight_turn, classify_error, collect_traces, drive_dispatcher_routed,
-    drive_rules_routed, final_turn_summary, user_message_text,
+    Agent, ApprovalRecorder, abandon_in_flight_turn, classify_error, collect_traces,
+    drive_dispatcher_routed, drive_rules_routed, final_turn_summary, user_message_text,
+    weave_approval_events,
 };
 
 /// A shared sink the tapping handlers push live [`RunEvent`]s into while the
@@ -255,6 +256,7 @@ pub(super) fn start(
     )?;
 
     let recorder = new_delegation_recorder();
+    let approvals: ApprovalRecorder = Arc::new(Mutex::new(Vec::new()));
     let sink: EventSink = Arc::new(Mutex::new(VecDeque::new()));
     let scope = FacadeStreamScope {
         llm: StreamingTapHandler {
@@ -278,6 +280,7 @@ pub(super) fn start(
         interaction: TapInteractionHandler {
             approval: agent.approval.clone(),
             inner: agent.interaction_handler(),
+            recorder: approvals.clone(),
             sink: sink.clone(),
         },
     };
@@ -290,6 +293,10 @@ pub(super) fn start(
     let future = Box::pin(async move {
         let done = drive_streamed(&machine_for_future, agent_input, &scope, &ctx).await?;
         let collected = collect_traces(done.notifications(), &recorder);
+        let recorded_approvals = approvals
+            .lock()
+            .expect("approval recorder poisoned")
+            .clone();
         // A denied external delegate surfaces as a run-level error, matching
         // `run_full` (§9.2). Retention of external session facts is not possible
         // on the streaming path (the future holds the machine for the stream's
@@ -328,7 +335,7 @@ pub(super) fn start(
                     tool_calls: collected.tool_calls,
                     delegations: collected.delegations,
                     artifacts: collected.artifacts,
-                    events: collected.events,
+                    events: weave_approval_events(collected.events, recorded_approvals),
                 })
             }
             LoopCursor::Error(error) => Err(classify_error(error.message())),
@@ -760,7 +767,8 @@ impl ToolHandler for TapToolHandler {
 }
 
 /// Fulfills a `NeedInteraction` (approval) by delegating to the resolved
-/// [`InteractionHandler`], emitting a live [`RunEvent::ApprovalRequested`] first.
+/// [`InteractionHandler`], emitting a live [`RunEvent::ApprovalRequested`] first
+/// and recording the same request for the terminal [`RunOutput::events`].
 ///
 /// The delegate `inner` is the host-injected handler when one was supplied to
 /// [`AgentBuilder::interaction_handler`](crate::facade::AgentBuilder::interaction_handler),
@@ -774,6 +782,7 @@ impl ToolHandler for TapToolHandler {
 struct TapInteractionHandler {
     approval: Arc<FacadeApproval>,
     inner: Arc<dyn InteractionHandler>,
+    recorder: ApprovalRecorder,
     sink: EventSink,
 }
 
@@ -791,6 +800,10 @@ impl InteractionHandler for TapInteractionHandler {
             // interaction so the emit reflects exactly what the machine paused
             // on, even under an injected handler.
             let approval_request = enriched_approval_request(&self.approval, *call_id, requirement);
+            self.recorder
+                .lock()
+                .expect("approval recorder poisoned")
+                .push(approval_request.clone());
             emit(&self.sink, RunEvent::ApprovalRequested(approval_request));
         }
         self.inner.fulfill(request, ctx).await

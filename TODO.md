@@ -1261,7 +1261,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 文档：`docs/facade-api.md` §8.2 补充 `run` / `run_full` / `stream` 在 timeout/drop 后自动 abandon 未提交 turn、回到上一 committed 一致点；`docs/review-2026-07.md` H-STATE-3 已标注 `✅ 已修复（M5-1）`。
 - 验证：`cargo test -p agent-lib --lib facade::agent`（51 条全过）、`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`（默认离线套件全过，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。无 breaking change（内部 guard 与私有 helper；公共行为仅从 timeout/drop 后带病状态修正为可恢复）。
 
-### M5-2 [TODO] 审批行为与文档对齐 + 流式 `Done.events` 审批事件补齐（M-PROM-4、M-ADP-3）
+### M5-2 [DONE] 审批行为与文档对齐 + 流式 `Done.events` 审批事件补齐（M-PROM-4、M-ADP-3）
 
 上下文：
 
@@ -1278,6 +1278,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：带审批的 run，流式 `Done.events` 含 `ApprovalRequested`，与非流式逐条相等。
 - `cargo test -p agent-lib --lib facade::` 全过；`docs/facade-api.md` 审批节同步。
+
+完成记录：
+
+- **审批语义选型：采用方案 (a)，只修文档不改 typed-tool deny 行为**。普通 typed tool 被拒绝时仍不执行工具，机器合成模型可见的 denied tool result 并继续下一轮模型调用；`FacadeError::ApprovalDenied` 明确限定为 managed external delegate 启动前被审批策略拒绝的路径。理由：typed-tool deny 当前行为合理且已有 `auto_deny_skips_tool_execution` / interaction deny 等测试钉住；external delegate 尚未进入普通工具执行相位，无法回灌模型可见 tool result，保持 run-level error 语义。
+- **流式 `Done.events` 修复**：`src/facade/agent/stream.rs` 的 `TapInteractionHandler` 新增 `ApprovalRecorder`，在实时 `emit(RunEvent::ApprovalRequested)` 的同时记录同一个 `ApprovalRequest`；流式 terminal `RunOutput` 构造改为 `weave_approval_events(collected.events, recorded_approvals)`，与非流式 `run_full` 使用同一编织逻辑。实时 stream yield 序列不变，终态 `Done.events` 现在包含审批生命周期事件。
+- **测试**：`src/facade/agent/tests.rs` 新增 `terminal_output` helper，并扩展三条 stream/run_full parity 测试。`stream_and_run_full_agree_on_approved_tool_lifecycle` 断言流式 `Done.events` 与非流式 `RunOutput.events` 逐条相等且包含 `ApprovalRequested`；plain/denied 两条同样比较 `Done.events`，覆盖无审批与被拒审批场景。
+- **文档**：`src/facade/approval.rs` 与 `src/facade/error.rs` rustdoc 同步 typed-tool deny / `ApprovalDenied` 触发范围；`docs/facade-api.md` §6.2.1 补充流式 `Done.events` 使用同一审批记录 + `weave_approval_events` 重建生命周期序列，§9.2 补充 typed-tool deny 继续 run、external delegate deny 才抛 `ApprovalDenied`；`docs/review-2026-07.md` M-PROM-4 与 M-ADP-3 已标注 `✅ 已修复（M5-2）`。
+- 验证：`cargo fmt --all`、`cargo test -p agent-lib --lib facade::`（211 条全过）、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0，无挂起）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（exit 0，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 无 breaking change（typed-tool deny 行为未变；流式 `Done.events` 仅补齐已承诺的生命周期事件）。
 
 ### M5-3 [TODO] 结构化错误 kind 替代字符串匹配分类（M-ERR-5）
 

@@ -336,8 +336,9 @@ yield 的事件遵循同一条**生命周期事件契约**:
 - 终态 `RunEvent::Done` 仅由 `stream` 作为最后一个事件 yield;`run_full` 直接返回
   `RunOutput`,其 `events` 不含 `Done`。
 - 两条路径共享同一套事件采集机制:non-streaming 由 facade 内部的
-  `collect_traces` + `weave_approval_events`(把审批记录编织回工具/委派事件流)产出,
-  streaming 由 `TapToolHandler` / `TapInteractionHandler` 实时 emit;二者被上述契约
+  `collect_traces` + `weave_approval_events`(把审批记录编织回工具/委派事件流)产出;
+  streaming 由 `TapToolHandler` / `TapInteractionHandler` 实时 emit,并在终态
+  `Done.events` 中用同一审批记录 + `weave_approval_events` 重建完整生命周期序列。二者被上述契约
   与 `facade::agent` 的 parity 回归测试锁定一致。
 
 ### 6.3 RunEvent
@@ -606,6 +607,13 @@ ApprovalPolicy::default()
 
 理由:local subagent 仍在同一 effect 模型内,权限会沿工具/interaction 继续受控;managed external agent
 可能启动外部 runtime、写文件、运行命令或消耗大量资源,默认必须更保守。
+
+普通 typed tool 的 deny 不会让 `Agent::run` / `run_full` 返回
+`FacadeError::ApprovalDenied`:机器会合成一个模型可见的 denied tool result,跳过实际工具执行,
+然后继续下一轮模型调用。`ApprovalRequested` 仍会出现在事件序列中,但被拒工具不会产生
+`ToolStarted` / `ToolFinished`。`FacadeError::ApprovalDenied` 只用于 managed external delegate
+启动前被审批策略拒绝的路径;这类 delegate 尚未进入普通工具执行相位,没有模型可见的 denied
+tool result 可以回灌。
 
 ### 9.3 富化 ApprovalRequest(Milestone 7)
 
