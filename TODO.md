@@ -1212,7 +1212,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode" -- -D warnings`、`cargo test --all --all-targets`（exit 0）、`cargo test --features "external-claude-code external-codex external-opencode external-acp facade-schema" --all-targets`（exit 0）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过；`cargo test -p agent-lib --lib agent::` 461 条全过。
 - **Breaking change**（pre-1.0，记录在此）：`ReferenceScope::with_tool_registry_resolver` 移除（由 `with_machine_tool_resolver(&machine)` 取代）；`DefaultAgentMachine` 与 `ReferenceScope` 的默认 reconfig resolver 由假成功的 `DeclaredOnlyToolRegistryResolver` 改为 fail-closed 的 `NoToolRegistryResolver`——未显式配置 resolver 的 tool-set reconfig 现在显式报错。
 
-### M4-7 [TODO] M4 review：Agent 语义收口
+### M4-7 [DONE] M4 review：Agent 语义收口
 
 检查项：
 
@@ -1220,6 +1220,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 重点复验：协议违规软拒绝后 turn 完好；取消延迟有界且 trace 完整；协作工具双向可用。
 - `docs/agent-effect-model.md`、`docs/agent-layer.md` 同步。
 - 全量门禁命令通过。
+
+完成记录：
+
+- 条目核对：`docs/review-2026-07.md` 六条均已标注——H-STATE-6（M4-1）、H-STATE-5（M4-2）、H-STATE-4（M4-3）、M-ERR-1（M4-4）、M-ERR-2（M4-4 第 4 条 + M4-5 其余）、M-ERR-3（M4-6）。本任务补齐了 H-STATE-4 与 M-ERR-3 的 `✅ 已修复` 标注，并把 H-STATE-5 的标注并入标题行，后续可直接 grep 标题核对。
+- 代码点位抽查确认修复在场：协作读工具 `MAILBOX_READ` 与 blackboard/mailbox 正文读取测试；`AgentState::ensure_reconfig_admission` / `ReconfigWhileAwaitingRegistry`；`record_requirement_node` 的 `<id>#attempt-N` 派生 trace id 与 best-effort 兜底；`StepOutcome.rejected` / `StepRejectReason` 软拒绝出口与 `LoopDoneReason::StepLimitReached`；`settle_cancelled`、双取消观测点与 `TurnDone.cancelled()`；`NoToolRegistryResolver` 默认 fail-closed 与 `ReferenceScope::with_machine_tool_resolver` 单一 resolver 来源。
+- 重点复验：`cargo test -p agent-lib --lib agent::` 461 条全过，覆盖协议违规软拒绝后 turn 完好、pivot trace 去重解耦、取消后批内全部 `NeverResumed` 留痕、飞行中 LLM 取消有界返回、协作工具双向读写、reconfig park 拒绝与 resolver fail-closed 默认。
+- 文档核对：`docs/agent-effect-model.md` §2.4 / §8 已描述软拒绝与硬失败边界、trace best-effort、pivot 派生 id、取消双观测点和 `TurnDone.cancelled()` 契约；`docs/agent-layer.md` §3 / §4.2 已描述 cancel/pivot/reconfig 的落地语义、`AwaitingReconfig` 期间拒绝、during-turn reconfig abandon 保全文本、resolver 单一来源与 fail-closed 默认。
+- 全量门禁：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0，真实端点/CLI 测试保持 ignored，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 本任务为 review 收口，无生产代码改动；仅更新审查报告标注、任务单完成记录与执行计划文件。无 breaking change。
 
 ---
 
