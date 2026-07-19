@@ -596,7 +596,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M3：Conversation 正确性
 
-### M3-1 [TODO] 禁止在 reverted head 上 compaction（H-STATE-1）
+### M3-1 [DONE] 禁止在 reverted head 上 compaction（H-STATE-1）
 
 上下文：
 
@@ -613,6 +613,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 回归测试（精确复现报告路径）：5 turn + compact 0..5 → revert_to(3) → apply_compaction 返回新错误而非成功；redo revert_to(5) 后 `effective_view()` 仍含全部 5 turn。
 - 现有 projection/compaction 测试全过：`cargo test -p agent-lib --lib conversation::projection`。
 - `docs/conversation-core.md` compaction 节补充该约束。
+
+完成记录：
+
+- 选型：新增 `ProjectionError::CompactionOnRevertedHead { head, lineage_len }` 变体（`src/conversation/error.rs`），不复用 `CompactionHeadMismatch`——后者表达"plan 记录的 head 与当前 head 不一致"（stale plan），而新校验表达"head 不在 lineage 末尾"（会话状态非法），语义轴不同，调用方需要区分处理（redo 后可重试）。错误消息明确说明 "redo to the lineage tip first"。
+- 校验位置：`validate_compaction_plan_header`（`src/conversation/projection/compaction.rs`）在 plan head 校验之后增加 `active_len == lineage_len` 检查；放在 head 校验之后是因为 reverted head 上旧 plan 会先以 `CompactionHeadMismatch` 被拒（stale 语义优先），只有针对当前 reverted head 新准备的 plan 才落到新错误。校验在 `apply_compaction` 唯一入口内，所有 compaction 路径（含 strategy 模块）自动覆盖。
+- 回归测试 `apply_compaction_rejects_a_reverted_head_and_redo_keeps_every_turn`（`projection/tests.rs`）精确复现报告路径：5 turn + compact 0..5（tip 上仍合法）→ revert_to(3)（视图正确裁剪为前 3 turn raw）→ 在 reverted head 上 prepare 的 plan 被拒、返回新错误且投影原子不变 → redo revert_to(5) 后 `effective_view()` 仍经未动的投影渲染全部 5 turn 的摘要、raw history 五轮完好。
+- 文档：`docs/conversation-core.md` §6.1 新增 "reverted head 上不可 compaction" 约束段（含破坏机理与 redo 前置要求）；`apply_compaction` / `validate_compaction_plan_header` rustdoc 同步；`docs/review-2026-07.md` H-STATE-1 已标注 `✅ 已修复（M3-1）`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过；`cargo test -p agent-lib --lib conversation::projection` 26 条全过。
+- Breaking change（pre-1.0，记录在此）：`ProjectionError` 新增 `CompactionOnRevertedHead` 变体，外部对该枚举的穷尽 match 需补分支（该枚举未标 `#[non_exhaustive]`）。
 
 ### M3-2 [TODO] `MessageRecord` 增加 `meta` 字段（H-STATE-2）
 

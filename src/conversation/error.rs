@@ -698,6 +698,22 @@ pub enum ProjectionError {
         current_head: u64,
     },
 
+    /// A compaction plan was applied while the head sits below the lineage tip.
+    ///
+    /// Compacting a reverted head would build a projection that only covers the
+    /// active prefix; redoing to the lineage tip afterwards would then silently
+    /// drop the tail turns from the effective view. Redo to the lineage tip
+    /// before compacting.
+    #[error(
+        "compaction is not allowed on a reverted head ({head} of {lineage_len} turns active); redo to the lineage tip first"
+    )]
+    CompactionOnRevertedHead {
+        /// Current logical head size (turns at or before the head).
+        head: u64,
+        /// Total turns in the current lineage (the lineage tip).
+        lineage_len: u64,
+    },
+
     /// A compaction plan must contain at least one replacement step.
     #[error("compaction plan has no steps")]
     EmptyCompactionPlan,

@@ -209,6 +209,12 @@ enum Span {
 
 > 一句话:compaction 只认 turn 边界,soft limit 触发推迟到下个 turn 边界;turn 内 hard limit 保护归 agent loop 层。
 
+**reverted head 上不可 compaction(M3-1 / H-STATE-1):** `apply_compaction` 要求 head 位于
+lineage 末尾(`active_len == lineage_len`),否则返回 `CompactionOnRevertedHead`。
+若在 reverted head 上压缩,新投影只覆盖 `[0, head)`,而 redo 不触碰投影——`effective_view()`
+会静默丢失 `head..lineage_len` 的 turn,且无法自愈。要压缩 reverted 的状态,先 redo 到
+lineage 末尾再应用 plan。
+
 ## 7. Identity 与 id 策略
 
 ```rust

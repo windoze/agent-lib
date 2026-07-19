@@ -204,9 +204,10 @@ impl Conversation {
     /// # Errors
     ///
     /// Returns classified projection errors for stale plans, pending state,
-    /// invalid targets, artifact/provenance mismatches, overlapping steps, or
-    /// final projection inconsistency. Every error leaves the previous
-    /// projection, artifacts, history, head, index, and version unchanged.
+    /// a reverted head, invalid targets, artifact/provenance mismatches,
+    /// overlapping steps, or final projection inconsistency. Every error
+    /// leaves the previous projection, artifacts, history, head, index, and
+    /// version unchanged.
     pub fn apply_compaction(&mut self, plan: &CompactionPlan) -> Result<(), ConversationError> {
         self.validate_compaction_plan_header(plan)?;
         let next_version =
@@ -222,7 +223,7 @@ impl Conversation {
         Ok(())
     }
 
-    /// Checks plan-level owner, version, head, pending, and non-empty state.
+    /// Checks plan-level owner, version, head, pending, tip, and non-empty state.
     fn validate_compaction_plan_header(
         &self,
         plan: &CompactionPlan,
@@ -253,6 +254,17 @@ impl Conversation {
             return Err(ProjectionError::CompactionHeadMismatch {
                 plan_head: plan.head_turn_count,
                 current_head,
+            }
+            .into());
+        }
+        // Compacting a reverted head would rebuild the projection over the
+        // active prefix only; a later redo to the lineage tip would then
+        // silently drop the tail turns from the effective view.
+        let lineage_len = usize_to_u64(self.history.lineage_len());
+        if current_head != lineage_len {
+            return Err(ProjectionError::CompactionOnRevertedHead {
+                head: current_head,
+                lineage_len,
             }
             .into());
         }

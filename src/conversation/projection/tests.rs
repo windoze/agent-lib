@@ -782,6 +782,80 @@ fn commit_after_compaction_preserves_overlay_and_adds_raw_tail() {
 }
 
 #[test]
+fn apply_compaction_rejects_a_reverted_head_and_redo_keeps_every_turn() {
+    // H-STATE-1 regression: compacting on a reverted head used to rebuild the
+    // projection over the active prefix only, so redoing to the lineage tip
+    // silently dropped the tail turns from the effective view.
+    let mut conversation = conversation(21);
+    for seed in 211..=215 {
+        commit_text_turn(&mut conversation, seed);
+    }
+    let raw_before = raw_history_snapshot(&conversation);
+
+    // Compaction at the lineage tip is still legal.
+    let whole = range(&conversation, 0, 5);
+    let (tip_plan, _) = raw_compaction_plan(
+        &conversation,
+        whole,
+        2110,
+        strategy("tip"),
+        "turns 211-215 summary",
+    );
+    conversation
+        .apply_compaction(&tip_plan)
+        .expect("compaction at the lineage tip applies");
+
+    let boundaries = conversation.valid_boundaries();
+    let redo = conversation
+        .revert_to(boundaries[3])
+        .expect("revert to a mid-lineage head")
+        .old_head();
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![
+            (Role::User, "question:211".to_owned()),
+            (Role::Assistant, "answer:211".to_owned()),
+            (Role::User, "question:212".to_owned()),
+            (Role::Assistant, "answer:212".to_owned()),
+            (Role::User, "question:213".to_owned()),
+            (Role::Assistant, "answer:213".to_owned()),
+        ]
+    );
+
+    // A plan prepared against the reverted head must be rejected, atomically.
+    let reverted = range(&conversation, 0, 3);
+    let (reverted_plan, _) = raw_compaction_plan(
+        &conversation,
+        reverted,
+        2111,
+        strategy("reverted"),
+        "reverted head summary",
+    );
+    let projection_before = conversation.projection().clone();
+    assert_eq!(
+        conversation
+            .apply_compaction(&reverted_plan)
+            .expect_err("compaction on a reverted head is rejected"),
+        ConversationError::Projection(ProjectionError::CompactionOnRevertedHead {
+            head: 3,
+            lineage_len: 5,
+        })
+    );
+    assert_eq!(conversation.projection(), &projection_before);
+
+    // Redoing to the lineage tip still renders every turn through the
+    // untouched projection, and the raw history keeps all five turns.
+    conversation
+        .revert_to(redo)
+        .expect("redo to the lineage tip");
+    assert_eq!(
+        message_labels(conversation.effective_view().messages()),
+        vec![(Role::Assistant, "turns 211-215 summary".to_owned())]
+    );
+    assert_eq!(raw_history_snapshot(&conversation), raw_before);
+}
+
+#[test]
 fn apply_compaction_rejects_stale_pending_and_invalid_plan_shapes_atomically() {
     let mut conversation = conversation(19);
     commit_text_turn(&mut conversation, 191);
