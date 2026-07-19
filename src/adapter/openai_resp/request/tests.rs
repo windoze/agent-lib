@@ -4,6 +4,7 @@ use super::input::message_to_items;
 use super::*;
 use crate::{
     adapter::openai_resp::RESPONSE_EXTRA_KEY,
+    client::{AuthScheme, EndpointConfig},
     model::{
         content::{ContentBlock, ImageSource},
         extras::ProviderExtras,
@@ -11,7 +12,10 @@ use crate::{
         tool::{Tool, ToolStatus},
     },
 };
-use reqwest::{Method, Request, header::AUTHORIZATION};
+use reqwest::{
+    Method, Request,
+    header::{AUTHORIZATION, CONTENT_TYPE},
+};
 use serde_json::{Map, Value, json};
 
 /// Creates an empty provider-field map for concise fixtures.

@@ -1,6 +1,12 @@
 use super::*;
-use crate::model::{extras::ProviderExtras, message::Message, tool::ToolStatus};
-use reqwest::{Method, header::AUTHORIZATION};
+use crate::{
+    client::{AuthScheme, EndpointConfig},
+    model::{extras::ProviderExtras, message::Message, tool::ToolStatus},
+};
+use reqwest::{
+    Method,
+    header::{AUTHORIZATION, CONTENT_TYPE},
+};
 use serde_json::{Map, json};
 
 /// Creates an empty provider-field map for concise content fixtures.

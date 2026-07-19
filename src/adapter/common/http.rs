@@ -4,7 +4,7 @@
 //! bare `reqwest::Client` with no timeouts and read error bodies without any
 //! size or time bound, so a peer that kept a connection open without sending
 //! data could hang a request forever. This module holds the default limits
-//! that close that hole, plus the bounded error-body reader used by all four
+//! that close that hole, plus the bounded error-body reader used by all adapter
 //! non-2xx paths.
 //!
 //! Deliberate design choices:
@@ -21,7 +21,10 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use reqwest::Response;
+use reqwest::{
+    Request, Response,
+    header::{CONTENT_TYPE, HeaderValue, RETRY_AFTER},
+};
 
 use crate::client::ClientError;
 
@@ -93,6 +96,104 @@ pub(crate) fn map_transport_error(error: reqwest::Error) -> ClientError {
         None => error.to_string(),
     };
     ClientError::Network(message)
+}
+
+/// Executes one complete JSON request under the default total request timeout.
+///
+/// The timeout covers connection, response headers, successful body read, and
+/// provider JSON parsing. Non-2xx bodies use the shared bounded error reader.
+pub(crate) async fn execute_json_response<T, F>(
+    client: &reqwest::Client,
+    request: Request,
+    parse: F,
+) -> Result<T, ClientError>
+where
+    F: FnOnce(&[u8]) -> Result<T, ClientError>,
+{
+    match tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, async move {
+        let response = client.execute(request).await.map_err(map_transport_error)?;
+        let response = ensure_success(response).await?;
+        let body = response.bytes().await.map_err(map_transport_error)?;
+        parse(&body)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(ClientError::Timeout),
+    }
+}
+
+/// Executes one streaming request through response-header validation.
+///
+/// Only the connect + response-header phase is bounded. The returned response
+/// body remains unbounded so healthy long-lived SSE streams are not killed.
+pub(crate) async fn execute_sse_response<F>(
+    client: &reqwest::Client,
+    request: Request,
+    invalid_stream: F,
+) -> Result<Response, ClientError>
+where
+    F: Fn(String) -> ClientError,
+{
+    let response = tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, client.execute(request))
+        .await
+        .map_err(|_elapsed| ClientError::Timeout)?
+        .map_err(map_transport_error)?;
+    let response = ensure_success(response).await?;
+    validate_event_stream_content_type(response.headers().get(CONTENT_TYPE), invalid_stream)?;
+    Ok(response)
+}
+
+/// Converts an HTTP error status into a retry-aware [`ClientError`].
+async fn ensure_success(response: Response) -> Result<Response, ClientError> {
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    let body = read_error_body(response).await?;
+    Err(ClientError::from_http_response(
+        status.as_u16(),
+        body,
+        retry_after.as_deref(),
+    ))
+}
+
+/// Validates that a successful streaming response is actually SSE.
+fn validate_event_stream_content_type<F>(
+    content_type: Option<&HeaderValue>,
+    invalid_stream: F,
+) -> Result<(), ClientError>
+where
+    F: Fn(String) -> ClientError,
+{
+    let Some(content_type) = content_type else {
+        return Err(invalid_stream(
+            "successful response omitted the content-type header".to_owned(),
+        ));
+    };
+    let content_type = content_type
+        .to_str()
+        .map_err(|error| invalid_stream(format!("invalid content-type header: {error}")))?;
+    let media_type = content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+
+    if !media_type.eq_ignore_ascii_case("text/event-stream") {
+        return Err(invalid_stream(format!(
+            "successful streaming response used content type `{content_type}`"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Returns `url` with its entire query string replaced by [`REDACTED_QUERY`],

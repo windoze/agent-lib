@@ -2,14 +2,13 @@
 
 use super::OpenAiRespAdapter;
 use crate::{
-    adapter::http,
+    adapter::common,
     client::{ChatRequest, ClientError, Response},
     model::{
         message::{Message, Role},
         usage::Usage,
     },
 };
-use reqwest::header::RETRY_AFTER;
 use serde_json::{Map, Value};
 
 mod convert;
@@ -51,14 +50,6 @@ impl OpenAiRespAdapter {
     /// phase and non-2xx error bodies have their own tighter limits (see
     /// [`OpenAiRespAdapter::new`]).
     pub async fn chat(&self, request: ChatRequest) -> Result<Response, ClientError> {
-        match tokio::time::timeout(http::DEFAULT_REQUEST_TIMEOUT, self.chat_inner(request)).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(ClientError::Timeout),
-        }
-    }
-
-    /// Executes the unbounded body of [`OpenAiRespAdapter::chat`].
-    async fn chat_inner(&self, request: ChatRequest) -> Result<Response, ClientError> {
         if request.stream {
             return Err(invalid_response(
                 "non-streaming chat requires ChatRequest.stream to be false".to_owned(),
@@ -66,29 +57,7 @@ impl OpenAiRespAdapter {
         }
 
         let request = self.build_request(&request)?;
-        let response = self
-            .http_client
-            .execute(request)
-            .await
-            .map_err(http::map_transport_error)?;
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-
-        if !status.is_success() {
-            let body = http::read_error_body(response).await?;
-            return Err(ClientError::from_http_response(
-                status.as_u16(),
-                body,
-                retry_after.as_deref(),
-            ));
-        }
-
-        let body = response.bytes().await.map_err(http::map_transport_error)?;
-        Self::parse_response(&body)
+        common::execute_json_response(&self.http_client, request, Self::parse_response).await
     }
 }
 
@@ -132,7 +101,7 @@ pub(super) fn parse_response_value(value: Value) -> Result<Response, ClientError
         converted.refusal_raw = Some("content_filter".to_owned());
     }
     if !converted.unmodeled.is_empty() {
-        insert_preserving_collision(
+        common::insert_preserving_collision(
             &mut wire,
             UNMODELED_OUTPUT_KEY,
             Value::Array(converted.unmodeled),
@@ -161,15 +130,6 @@ fn take_usage(wire: &mut Map<String, Value>) -> Result<Usage, ClientError> {
         None | Some(Value::Null) => Ok(Usage::default()),
         Some(value) => serde_json::from_value(value)
             .map_err(|error| invalid_response(format!("invalid usage object: {error}"))),
-    }
-}
-
-/// Inserts adapter-owned evidence without discarding a colliding provider key.
-fn insert_preserving_collision(fields: &mut Map<String, Value>, key: &str, value: Value) {
-    if let Some(existing) = fields.remove(key) {
-        fields.insert(key.to_owned(), Value::Array(vec![existing, value]));
-    } else {
-        fields.insert(key.to_owned(), value);
     }
 }
 

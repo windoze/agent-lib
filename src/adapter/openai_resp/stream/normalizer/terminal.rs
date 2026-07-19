@@ -2,9 +2,11 @@
 
 use super::{StreamNormalizer, invalid_stream};
 use crate::{
-    adapter::openai_resp::response::parse_response_value, client::ClientError, stream::StreamEvent,
+    adapter::{common, openai_resp::response::parse_response_value},
+    client::ClientError,
+    stream::StreamEvent,
 };
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use super::super::wire::ResponseEvent;
 
@@ -24,7 +26,7 @@ impl StreamNormalizer {
         self.validate_terminal_output(&event.response)?;
         let mut response = parse_response_value(event.response)?;
         if !self.unmodeled_events.is_empty() {
-            insert_preserving_collision(
+            common::insert_preserving_collision(
                 &mut response.extra,
                 UNMODELED_STREAM_EVENTS_KEY,
                 Value::Array(std::mem::take(&mut self.unmodeled_events)),
@@ -211,15 +213,6 @@ pub(super) fn validate_created_placeholders(response: &Value) -> Result<(), Clie
         ));
     }
     Ok(())
-}
-
-/// Inserts adapter-owned evidence without discarding a colliding provider key.
-fn insert_preserving_collision(fields: &mut Map<String, Value>, key: &str, value: Value) {
-    if let Some(existing) = fields.remove(key) {
-        fields.insert(key.to_owned(), Value::Array(vec![existing, value]));
-    } else {
-        fields.insert(key.to_owned(), value);
-    }
 }
 
 /// Classifies a provider error event or failed response while retaining its

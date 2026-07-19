@@ -1,28 +1,22 @@
-# 本轮执行计划
+# 执行计划
 
-## 约束
-- 以 `TODO.md` 为唯一任务排序与完成状态来源。
-- 只完成第一个标题未带 `[DONE]` 的任务，完成后提交并停止。
-- 若遇到阻塞当前任务的缺陷或未排期失败测试，先修复或在 `TODO.md` 中插入最小必要前置任务并提交停止。
-- 不因任务较大而拆分；仅在确有无法一起落地的前置依赖时才最小化拆分。
-- 不改动无关用户变更，不回滚未由我产生的工作区内容。
+状态：已定位当前任务。
 
-## 步骤
-1. 读取 `TODO.md`，定位第一个标题未带 `[DONE]` 的任务，并确认其要求、依赖和验证标准。
-2. 检查最近提交信息；若明确指出与当前任务直接相关的未完成问题，则纳入当前任务或作为前置任务记录。
-3. 读取与当前任务相关的源码、测试和文档，限定范围内建立实现上下文。
-4. 按任务要求做最小正确实现；如果计划发生实质变化，更新本文件。
-5. 运行必要验证，顺序优先为 `cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、相关测试，再根据任务影响决定是否运行完整测试；完整 Rust 测试不超过 30 分钟超时。
-6. 若测试失败且未被明确排期，修复失败或在 `TODO.md` 插入最小必要前置任务并停止。
-7. 更新 `TODO.md`：给完成任务标题加 `[DONE]`，补充完成记录和验证结果；仅当阶段计划真实变化时更新 `PLAN.md`。
-8. 检查 `git status`、`git diff`、最近提交，确认只提交本轮相关改动；如本轮是恢复未提交任务，则按要求包含当前未提交文件。
-9. 使用清晰的任务编号提交信息提交变更，然后停止，不继续下一个任务。
+计划：
+1. 阅读 `TODO.md`，按标题是否带 `[DONE]` 判断第一个未完成任务。
+2. 检查最近提交是否直接说明该任务相关的未完成问题；只处理与当前任务直接相关或阻塞当前任务的问题。
+3. 阅读当前任务相关的源码、测试和文档，确认要求、依赖和验证方式。
+4. 以最小正确改动实现当前任务；如果发现必须先修复的具体前置问题，则更新 `TODO.md` 并停止。
+5. 按要求运行格式化、lint 和相关测试；如有未安排的失败测试，修复或在 `TODO.md` 中安排到当前任务完成前。
+6. 将当前任务标题标记为 `[DONE]`，更新完成记录；仅在阶段计划变化时更新 `PLAN.md`。
+7. 检查 git 状态和差异，提交本次任务相关的所有改动，然后停止，不推进下一项任务。
 
-## 当前状态
-- 已定位第一个未完成任务：`M7-6 [TODO] M7 review：adapter 收口`。
-- 最近提交为 `[M7-5] Add ContentBlock unknown fallback`，与当前 M7 review 直接相关；本轮将把 M7-1 ~ M7-5 的收口核对纳入审查。
-- 已核对 `docs/review-2026-07.md`：M-ERR-4、M-ADP-1、M-ADP-2 均为 `✅ 已修复`；协议解析边角中空 arguments、Anthropic 可选字段、CLI 非 JSON 噪声、未知 `ContentBlock`、非对象 usage details 均分别标注 M7-4/M7-5 已修复。
-- 已抽查代码/测试覆盖点：HTTP 误分类测试、`StreamEvent::Usage` 增量语义文档、OpenAI 缺失 sequence number 测试、M7-4 容错测试、`ContentBlock::Unknown` 兜底测试均在场。
-- 已完成 M7 review 全量门禁：`cargo fmt --all`、默认 clippy、external feature clippy、`cargo test --all --all-targets`、rustdoc 全部通过。
-- 已将 `TODO.md` 中 `M7-6` 标记为 `[DONE]` 并写入完成记录。
-- 提交前检查结果：工作区仅有 `TODO.md` 与 `memory/claude_plan.md` 两个本轮相关改动；准备提交 `[M7-6] Review adapter fixes`。
+进度记录：
+- 已创建初始执行计划。
+- 已读取 `TODO.md`，第一个未完成任务为 `M8-1 [TODO] 两个 LLM adapter 收敛公共传输/解码模块（adapter 报告 M4）`。
+- 当前执行范围限定为 M8-1：抽取两个 LLM adapter 的公共 SSE decoder、HTTP 传输样板、错误映射、header/URL 工具与同 crate 内重复 helper；不推进 M8-2。
+- 已实现 `src/adapter/common/`：移动既有 HTTP 安全 helper，新增公共 SSE decoder、endpoint URL/header helper、JSON collision helper；Anthropic/OpenAI adapter 已改为薄接线。
+- 已完成验证：`cargo fmt --all`、`cargo test -p agent-lib --lib adapter::`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets` 均通过。下一步补跑 external feature Clippy 与 rustdoc。
+- 已完成补充验证：`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings` 与 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 均通过。
+- 已更新 `docs/review-2026-07.md` 的 LLM adapter 复制代码条目，并将 `TODO.md` 的 M8-1 标记为 `[DONE]`，写入完成记录。
+- 下一步：检查最终 diff / git 状态，提交 M8-1 后停止。

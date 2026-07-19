@@ -1646,7 +1646,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M8：复制代码收敛
 
-### M8-1 [TODO] 两个 LLM adapter 收敛公共传输/解码模块（adapter 报告 M4）
+### M8-1 [DONE] 两个 LLM adapter 收敛公共传输/解码模块（adapter 报告 M4）
 
 上下文：
 
@@ -1662,6 +1662,17 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 全部现有 adapter 测试原样通过（不重写断言）：`cargo test -p agent-lib --lib adapter::` 与 `cargo test --all --all-targets`。
 - `cargo clippy --all-targets -- -D warnings`；无重复实现残留（人工 diff 两 adapter 目录）。
+
+完成记录：
+
+- **公共模块落地**：新增 `src/adapter/common/`，并将原 `src/adapter/http.rs` 移入 `common/http.rs`。公共模块现在承载四类共享设施：HTTP 安全/传输 helper（默认 client、query 脱敏、错误 body 上限/超时、`execute_json_response`、`execute_sse_response`）、泛型 SSE decoder（`SseNormalizer` + `normalize_sse`）、endpoint URL/header 构造（`endpoint_url` / `endpoint_headers`）、JSON escape-hatch collision 保留 helper（`insert_preserving_collision`）。`src/adapter/mod.rs` 改为 crate-private `mod common`，公共 API 不变。
+- **两个 LLM adapter 接线**：Anthropic/OpenAI 的 `new()` 改用 `common::default_http_client`；非流式 `chat()` 仅保留 `ChatRequest.stream` 校验、`build_request` 与 provider parse，HTTP execute/status/retry-after/错误 body/成功 body 读取全部走 `common::execute_json_response`；流式 `chat_stream()` 仅保留 stream 校验、请求构造与 SSE bytes 接入，建连+响应头超时、非 2xx 分类、content-type 校验全部走 `common::execute_sse_response`。
+- **SSE decoder 收敛**：两份 87/88 行同构 decoder 状态机删除，保留各自 `decoder.rs` 的薄适配层（实现 `SseNormalizer` 以注入 provider-specific `invalid_stream` 文案与 normalizer 类型）。实际 lazy SSE framing、pending queue、terminal-on-error、UTF-8/parser/transport 错误分类只剩 `common/sse.rs` 一份实现。
+- **request/helper 收敛**：两 adapter 的 `messages_url`/`responses_url`、`endpoint_headers`、`append_header` 删除，统一走 `common/request.rs`，仍由各 adapter 的 `invalid_endpoint` 注入原有错误前缀；OpenAI response 与 stream terminal 内重复的 `insert_preserving_collision` 删除，统一走 `common/json.rs`。
+- **重复残留检查**：grep `fn validate_event_stream_content_type|fn insert_preserving_collision|fn endpoint_headers|fn append_header|fn messages_url|fn responses_url|struct DecoderState|fn map_event_stream_error` 只命中 `src/adapter/common/*` 中的单一实现；两个 adapter 目录只剩薄接线与 provider-specific 编解码逻辑。行为按 M1-M7 修复后的语义保持零变化。
+- **文档/审查记录**：`docs/review-2026-07.md` “复制代码”中两个 LLM adapter 重复项已标注 `✅ 已修复（M8-1）`。阶段级计划未变化，`PLAN.md` 无需更新。
+- **验证**：`cargo fmt --all`、`cargo test -p agent-lib --lib adapter::`（88 条通过）、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`（默认离线全量通过，真实端点/CLI 测试保持 ignored，无挂起）、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 无 breaking change（crate-private 重构；公共类型、函数签名、serde/wire 行为不变）。
 
 ### M8-2 [TODO] 三个 CLI adapter 收敛共享 child-process 模块（external 报告 L-12）
 

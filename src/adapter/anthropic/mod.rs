@@ -39,7 +39,7 @@ impl AnthropicAdapter {
     /// Use [`AnthropicAdapter::with_http_client`] to supply stricter
     /// client-level timeouts, proxies, or connection-pool settings.
     pub fn new(endpoint: EndpointConfig) -> Self {
-        Self::with_http_client(endpoint, super::http::default_http_client())
+        Self::with_http_client(endpoint, super::common::default_http_client())
     }
 
     /// Creates an adapter with a caller-configured reusable HTTP client.

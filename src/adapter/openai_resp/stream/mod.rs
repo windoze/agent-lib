@@ -6,12 +6,11 @@
 
 use super::OpenAiRespAdapter;
 use crate::{
-    adapter::http,
+    adapter::common,
     client::{ChatRequest, ClientError},
     stream::StreamEvent,
 };
 use futures::stream::BoxStream;
-use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
 
 mod decoder;
 mod normalizer;
@@ -40,62 +39,13 @@ impl OpenAiRespAdapter {
         }
 
         let request = self.build_request(&request)?;
-        let response = tokio::time::timeout(
-            http::DEFAULT_REQUEST_TIMEOUT,
-            self.http_client.execute(request),
-        )
-        .await
-        .map_err(|_elapsed| ClientError::Timeout)?
-        .map_err(http::map_transport_error)?;
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-
-        if !status.is_success() {
-            let body = http::read_error_body(response).await?;
-            return Err(ClientError::from_http_response(
-                status.as_u16(),
-                body,
-                retry_after.as_deref(),
-            ));
-        }
-
-        validate_event_stream_content_type(response.headers().get(CONTENT_TYPE))?;
+        let response =
+            common::execute_sse_response(&self.http_client, request, invalid_stream).await?;
         Ok(normalize_sse(
             response.bytes_stream(),
-            http::map_transport_error,
+            common::map_transport_error,
         ))
     }
-}
-
-/// Validates that a successful streaming response is actually SSE.
-fn validate_event_stream_content_type(
-    content_type: Option<&reqwest::header::HeaderValue>,
-) -> Result<(), ClientError> {
-    let Some(content_type) = content_type else {
-        return Err(invalid_stream(
-            "successful response omitted the content-type header".to_owned(),
-        ));
-    };
-    let content_type = content_type
-        .to_str()
-        .map_err(|error| invalid_stream(format!("invalid content-type header: {error}")))?;
-    let media_type = content_type
-        .split(';')
-        .next()
-        .map(str::trim)
-        .unwrap_or_default();
-
-    if !media_type.eq_ignore_ascii_case("text/event-stream") {
-        return Err(invalid_stream(format!(
-            "successful streaming response used content type `{content_type}`"
-        )));
-    }
-
-    Ok(())
 }
 
 /// Adds Responses stream context to protocol conversion failures.
