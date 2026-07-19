@@ -506,7 +506,7 @@ impl Agent {
         // lifecycle it gated (or at the tail when the tool never started).
         let recorded_approvals = approvals
             .lock()
-            .expect("approval recorder poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .clone();
 
         // Refresh the retained per-delegate external session facts so a later
@@ -1713,7 +1713,7 @@ impl InteractionHandler for RecordingInteractionHandler {
             let approval_request = enriched_approval_request(&self.approval, *call_id, requirement);
             self.recorder
                 .lock()
-                .expect("approval recorder poisoned")
+                .unwrap_or_else(|poison| poison.into_inner())
                 .push(approval_request);
         }
         self.inner.fulfill(request, ctx).await
@@ -1862,7 +1862,7 @@ pub(crate) fn collect_traces(
 ) -> CollectedTraces {
     let recorded = recorder
         .lock()
-        .expect("delegation recorder poisoned")
+        .unwrap_or_else(|poison| poison.into_inner())
         .clone();
     let mut tool_calls = Vec::new();
     let mut delegations = Vec::new();
@@ -2021,7 +2021,7 @@ async fn run_one_delegation(
 
     let record = recorder
         .lock()
-        .expect("delegation recorder poisoned")
+        .unwrap_or_else(|poison| poison.into_inner())
         .get(&key)
         .cloned()
         .ok_or_else(|| {

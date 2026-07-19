@@ -804,9 +804,15 @@ pub(crate) async fn fulfill_batch(
         let tag = requirement.tag();
         if tag != RequirementKindTag::Subagent && scope_handles(scope, tag) {
             local.push(async move {
-                let result = fulfill_with_scope(&requirement.kind, scope, ctx)
-                    .await
-                    .expect("scope_handles confirmed a handler for this family");
+                let Some(result) = fulfill_with_scope(&requirement.kind, scope, ctx).await else {
+                    debug_assert!(
+                        false,
+                        "scope_handles confirmed a handler for {tag:?}, but none was available"
+                    );
+                    return Err(AgentError::Other(format!(
+                        "scope advertised a handler for {tag:?} but returned no fulfillment"
+                    )));
+                };
                 validate(requirement, &result)?;
                 Ok::<_, AgentError>(Resolved {
                     resolution: RequirementResolution::new(requirement.id, result),
@@ -1525,7 +1531,10 @@ mod tests {
             for _ in 0..delay {
                 tokio::task::yield_now().await;
             }
-            self.completed.lock().expect("completion log").push(call_id);
+            self.completed
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(call_id);
             RequirementResult::Tool(Ok(ok_tool_response(call)))
         }
     }
@@ -1791,7 +1800,10 @@ mod tests {
         assert!(matches!(done.cursor(), LoopCursor::Done(_)));
 
         // Every requirement was fulfilled exactly once, regardless of order.
-        let completed = delay_tool.completed.lock().expect("completion log");
+        let completed = delay_tool
+            .completed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let completed_set: BTreeSet<ToolCallId> = completed.iter().copied().collect();
         let expected_set: BTreeSet<ToolCallId> =
             [tool_call_id_n(1), tool_call_id_n(2), tool_call_id_n(3)]

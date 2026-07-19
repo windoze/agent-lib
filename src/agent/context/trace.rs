@@ -210,7 +210,10 @@ impl TraceHandle {
     /// Returns [`TraceError::UnknownParent`] when `parent` is not present in
     /// the shared trace record list.
     pub fn with_parent(&self, parent: TraceNodeId) -> Result<Self, TraceError> {
-        let records = self.records.lock().expect("trace mutex poisoned");
+        let records = self
+            .records
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if !records.iter().any(|record| record.id == parent) {
             return Err(TraceError::UnknownParent { parent });
         }
@@ -231,7 +234,10 @@ impl TraceHandle {
     /// Returns a serializable snapshot of all trace records.
     #[must_use]
     pub fn records(&self) -> Vec<TraceRecord> {
-        self.records.lock().expect("trace mutex poisoned").clone()
+        self.records
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     /// Records an Agent loop step node under the current parent.
@@ -376,7 +382,10 @@ impl TraceHandle {
         kind: TraceNodeKind,
         label: Option<String>,
     ) -> Result<TraceRecord, TraceError> {
-        let mut records = self.records.lock().expect("trace mutex poisoned");
+        let mut records = self
+            .records
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if records.iter().any(|record| record.id == id) {
             return Err(TraceError::DuplicateNodeId { node_id: id });
         }

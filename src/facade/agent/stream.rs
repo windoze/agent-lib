@@ -111,7 +111,10 @@ impl StreamControl {
                 "pivot injection is only accepted at a streamed step boundary".to_owned(),
             ));
         }
-        let mut pivots = self.pivots.lock().expect("stream pivot queue poisoned");
+        let mut pivots = self
+            .pivots
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if !pivots.is_empty() {
             return Err(FacadeError::InvalidState(
                 "a pivot is already queued for the current streamed step boundary".to_owned(),
@@ -124,7 +127,7 @@ impl StreamControl {
     fn pop_pivot(&self) -> Option<PivotMessage> {
         self.pivots
             .lock()
-            .expect("stream pivot queue poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .pop_front()
     }
 }
@@ -132,13 +135,15 @@ impl StreamControl {
 /// Pushes one event onto the shared sink.
 fn emit(sink: &EventSink, event: RunEvent) {
     sink.lock()
-        .expect("stream event sink poisoned")
+        .unwrap_or_else(|poison| poison.into_inner())
         .push_back(event);
 }
 
 /// Pops the next buffered event from the shared sink, if any.
 fn pop(sink: &EventSink) -> Option<RunEvent> {
-    sink.lock().expect("stream event sink poisoned").pop_front()
+    sink.lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .pop_front()
 }
 
 fn pending_contains_llm(pending: &[Requirement]) -> bool {
@@ -457,7 +462,7 @@ pub(super) fn start(
         let collected = collect_traces(done.notifications(), &recorder);
         let recorded_approvals = approvals
             .lock()
-            .expect("approval recorder poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .clone();
         // A denied external delegate surfaces as a run-level error, matching
         // `run_full` (§9.2). Retention of external session facts is not possible
@@ -970,7 +975,7 @@ impl ToolHandler for TapToolHandler {
             if let Some(record) = self
                 .recorder
                 .lock()
-                .expect("delegation recorder poisoned")
+                .unwrap_or_else(|poison| poison.into_inner())
                 .get(&call_id.to_string())
                 .cloned()
             {
@@ -1038,7 +1043,7 @@ impl InteractionHandler for TapInteractionHandler {
             let approval_request = enriched_approval_request(&self.approval, *call_id, requirement);
             self.recorder
                 .lock()
-                .expect("approval recorder poisoned")
+                .unwrap_or_else(|poison| poison.into_inner())
                 .push(approval_request.clone());
             emit(&self.sink, RunEvent::ApprovalRequested(approval_request));
         }

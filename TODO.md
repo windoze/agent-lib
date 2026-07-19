@@ -1723,7 +1723,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M9：低严重度清扫与文档收尾
 
-### M9-1 [TODO] panic/poison 策略统一
+### M9-1 [DONE] panic/poison 策略统一
 
 上下文：
 
@@ -1739,6 +1739,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - `grep -rn 'expect("' src/ | grep -i poison` 清零（或仅剩文档化例外）。
 - 全量测试通过。
+
+完成记录：
+
+- 统一策略：生产路径所有标准库 `Mutex::lock()` 站点改为中毒恢复（`unwrap_or_else(|poison| poison.into_inner())`），覆盖 `TraceHandle`、`BudgetHandle`、`ExternalSessionRegistry`、reference tool registry slot、facade approval/delegation/external recorder/slot、stream pivot/event sink 等；内联测试替身中的同类锁也同步改为恢复，避免测试夹具保留相反示例。
+- 任务单点名的 `drive.rs:603` 旧不变量点位已被 M6 预算接线替换，当前仍存在的 `fulfill_batch` handler-presence 不变量从 `expect("scope_handles confirmed...")` 改为 `debug_assert!` + `AgentError::Other` 防御分支，避免 handler 宣称可处理但返回 `None` 时 panic。
+- 文档：`AGENTS.md` Conventions 新增锁中毒恢复约定，并要求少量真实不变量 panic 带具体上下文或优先采用 `debug_assert!` + 防御错误分支；`docs/review-2026-07.md` 并发 / 资源中的 Mutex poison 条目标注 `✅ 已修复（M9-1）`。`PLAN.md` 阶段级计划未变化，未更新。
+- 验证：`cargo fmt --all`；`rg 'expect\("' src | rg -i 'poison'`（无输出）；`rg '\.lock\(\)\.expect' src --glob '!**/tests/**' --glob '!**/tests.rs'`（无输出）；`cargo clippy --all-targets -- -D warnings`；`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；`cargo test --all --all-targets`；`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 无 breaking change（内部错误处理策略收紧；公共 API 与 serde/wire 形状不变）。
 
 ### M9-2 [TODO] API 打磨批
 

@@ -133,7 +133,7 @@ mod tests {
         fn emit(&self, event: &ExternalObservedEvent) {
             self.seen
                 .lock()
-                .expect("sink mutex poisoned")
+                .unwrap_or_else(|poison| poison.into_inner())
                 .push(event.clone());
         }
     }
@@ -151,7 +151,11 @@ mod tests {
             buffered.push(observed);
         }
 
-        let recorded = sink.seen.lock().expect("sink mutex poisoned").clone();
+        let recorded = sink
+            .seen
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
 
         // The sink captured exactly the events it was offered, preserving the
         // runtime `seq` order — this is the marker a host aligns replay against.

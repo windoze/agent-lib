@@ -444,7 +444,10 @@ Options:
         assert!(!caps.host_subagents);
 
         // All three subcommands were probed, version first, then both help pages.
-        let seen = exec.seen_args.lock().expect("args");
+        let seen = exec
+            .seen_args
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         assert_eq!(
             seen.as_slice(),
             &[

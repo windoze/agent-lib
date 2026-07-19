@@ -168,7 +168,10 @@ impl ToolRegistryHandler {
     /// Returns the currently-installed registry, cloning the handle out from
     /// under the lock so no guard is held across the tool `await`.
     fn current(&self) -> Arc<dyn ToolRegistry> {
-        self.registry.lock().expect("tool registry slot").clone()
+        self.registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 }
 
@@ -224,7 +227,11 @@ impl ReconfigRegistryHandler {
                 ),
             });
         }
-        *self.registry.lock().expect("tool registry slot") = registry;
+        let mut slot = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *slot = registry;
         Ok(())
     }
 }

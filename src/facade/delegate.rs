@@ -1303,8 +1303,11 @@ impl AgentMachine for RecordingChildMachine {
         let outcome = self.inner.step(input);
         if matches!(self.inner.cursor(), LoopCursor::Done(_)) {
             let (text, usage, _stop_reason) = final_turn_summary(self.inner.state().conversation());
-            *self.slot.lock().expect("child summary slot poisoned") =
-                Some(ChildSummary { text, usage });
+            let mut slot = self
+                .slot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            *slot = Some(ChildSummary { text, usage });
         }
         outcome
     }
@@ -1467,7 +1470,7 @@ impl SubagentSpawner for FacadeSubagentSpawner {
         let summary = self
             .slot
             .lock()
-            .expect("child summary slot poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .as_ref()
             .map(|captured| captured.text.clone())
             .unwrap_or_default();
@@ -1694,7 +1697,7 @@ impl DelegationToolHandler {
 
         let child_usage = slot
             .lock()
-            .expect("child summary slot poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .as_ref()
             .map(|captured| captured.usage.clone())
             .unwrap_or_default();
@@ -1733,7 +1736,7 @@ impl DelegationToolHandler {
     fn record(&self, call_id: &ToolCallId, delegate: &str, status: DelegationStatus, usage: Usage) {
         self.recorder
             .lock()
-            .expect("delegation recorder poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .insert(
                 call_id.to_string(),
                 RecordedDelegation {
@@ -1862,7 +1865,7 @@ impl DelegationToolHandler {
     ) {
         self.recorder
             .lock()
-            .expect("delegation recorder poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .insert(
                 call_id.to_string(),
                 RecordedDelegation {
@@ -2221,7 +2224,10 @@ mod model_routed_tests {
                 .iter()
                 .find(|route| system.contains(route.marker))
                 .expect("a route matches the request system prompt");
-            let mut calls = route.calls.lock().expect("route calls");
+            let mut calls = route
+                .calls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             let index = (*calls).min(route.responses.len() - 1);
             *calls += 1;
             route.responses[index].clone()

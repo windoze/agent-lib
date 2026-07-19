@@ -157,5 +157,5 @@ fn missing_duplicate_unknown_and_reused_result_ids_leave_pending_unchanged() {
     );
     conversation
         .commit_pending(TurnMeta::default())
-        .expect("retry commits without poisoned state");
+        .expect("retry commits without corrupting state");
 }

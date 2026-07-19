@@ -119,6 +119,6 @@ fn result_errors_and_open_call_gates_leave_pending_repairable() {
     );
     conversation
         .commit_pending(TurnMeta::default())
-        .expect("errors did not poison the turn");
+        .expect("errors did not corrupt the turn");
     assert_eq!(conversation.turns().len(), 1);
 }

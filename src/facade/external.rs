@@ -1516,7 +1516,11 @@ impl AgentMachine for RecordingExternalMachine {
         let completed = matches!(self.inner.cursor(), LoopCursor::Done(_));
         let (summary, usage, _stop) = final_turn_summary(state.conversation());
         let artifacts = state.artifacts().iter().map(map_artifact).collect();
-        *self.slot.lock().expect("external outcome slot poisoned") = Some(ExternalDriveOutcome {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *slot = Some(ExternalDriveOutcome {
             summary,
             usage,
             artifacts,
@@ -1650,7 +1654,7 @@ impl SubagentSpawner for FacadeExternalSpawner {
         let summary = self
             .slot
             .lock()
-            .expect("external outcome slot poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .as_ref()
             .map(|captured| captured.summary.clone())
             .unwrap_or_default();
@@ -1729,7 +1733,7 @@ pub(crate) async fn drive_external(
 
     let captured = slot
         .lock()
-        .expect("external outcome slot poisoned")
+        .unwrap_or_else(|poison| poison.into_inner())
         .clone()
         .unwrap_or_default();
 

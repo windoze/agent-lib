@@ -384,7 +384,10 @@ Usage: claude [options]
         assert!(!caps.host_subagents);
 
         // Both subcommands were probed, version first.
-        let seen = exec.seen_args.lock().expect("args");
+        let seen = exec
+            .seen_args
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         assert_eq!(seen.as_slice(), &[vec!["--version"], vec!["--help"]]);
     }
 

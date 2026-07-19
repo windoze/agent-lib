@@ -646,7 +646,7 @@ impl FacadeApproval {
         };
         self.pending
             .lock()
-            .expect("approval pending map poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .insert(call_id, decision);
     }
 
@@ -662,7 +662,7 @@ impl FacadeApproval {
     pub fn pending_tool_name(&self, call_id: ToolCallId) -> Option<String> {
         self.pending
             .lock()
-            .expect("approval pending map poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .get(&call_id)
             .map(|decision| decision.tool_name().to_owned())
     }
@@ -679,7 +679,7 @@ impl FacadeApproval {
     pub fn pending_request(&self, call_id: ToolCallId) -> Option<ApprovalRequest> {
         self.pending
             .lock()
-            .expect("approval pending map poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .get(&call_id)
             .map(|decision| decision.request().clone())
     }
@@ -751,7 +751,7 @@ impl InteractionHandler for FacadeApproval {
                 let pending = self
                     .pending
                     .lock()
-                    .expect("approval pending map poisoned")
+                    .unwrap_or_else(|poison| poison.into_inner())
                     .remove(call_id);
                 let (decision, message) = match pending {
                     Some(PendingDecision::Deny { message, .. }) => {

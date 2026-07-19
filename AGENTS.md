@@ -145,5 +145,10 @@ cargo test --features "external-claude-code external-codex" \
 - Keep `ExternalAgentMachine` (and the other machines) sans-io: all IO lives in
   handlers/adapters.
 - Prefer small, targeted patches; re-read a section between edits.
+- Recover poisoned standard-library locks in library code with
+  `unwrap_or_else(|poison| poison.into_inner())` unless the protected data has a
+  documented invariant that a panic can corrupt. Keep true invariant panics rare
+  and give them specific context, or prefer `debug_assert!` plus a defensive
+  error branch.
 - Update the doc that owns a behavior when you change it; the managed docs above
   are kept in sync with the code as of milestone M9-5.

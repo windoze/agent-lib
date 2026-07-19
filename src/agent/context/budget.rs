@@ -232,7 +232,10 @@ impl BudgetHandle {
     /// Returns the current serializable budget snapshot.
     #[must_use]
     pub fn snapshot(&self) -> BudgetSnapshot {
-        *self.inner.lock().expect("budget mutex poisoned")
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Returns the first configured count-like dimension that has no headroom.
@@ -268,7 +271,10 @@ impl BudgetHandle {
     /// Returns [`BudgetError::Exceeded`] for a configured limit breach or
     /// [`BudgetError::CounterOverflow`] for `u64` addition overflow.
     pub fn try_charge(&self, charge: BudgetCharge) -> Result<BudgetSnapshot, BudgetError> {
-        let mut snapshot = self.inner.lock().expect("budget mutex poisoned");
+        let mut snapshot = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let used = snapshot.used;
         let limits = snapshot.limits;
 
@@ -343,7 +349,10 @@ impl BudgetHandle {
     /// Returns [`BudgetError::WallClockExceeded`] when `elapsed` is greater
     /// than the configured wall-clock limit.
     pub fn check_wall_clock(&self, elapsed: Duration) -> Result<(), BudgetError> {
-        let snapshot = self.inner.lock().expect("budget mutex poisoned");
+        let snapshot = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if let Some(limit) = snapshot.limits.max_wall_time
             && elapsed > limit
         {

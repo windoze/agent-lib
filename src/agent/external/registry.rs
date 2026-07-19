@@ -192,7 +192,10 @@ impl ExternalSessionRegistry {
     /// Returns the number of live sessions currently registered.
     #[must_use]
     pub fn live_len(&self) -> usize {
-        self.live.lock().expect("registry mutex poisoned").len()
+        self.live
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len()
     }
 
     /// Returns the live handle for `session` without starting or resuming it.
@@ -209,7 +212,7 @@ impl ExternalSessionRegistry {
         let key = LiveSessionKey::new(agent_id, session)?;
         self.live
             .lock()
-            .expect("registry mutex poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .get(&key)
             .map(|entry| entry.handle.clone())
     }
@@ -368,7 +371,10 @@ impl ExternalSessionRegistry {
             return Err(RegisterError::MissingSessionId);
         };
         let handle: LiveSessionHandle = Arc::new(AsyncMutex::new(session));
-        let mut live = self.live.lock().expect("registry mutex poisoned");
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // Re-check under the lock so a concurrent start does not leak a handle.
         if let Some(existing) = live.get(&key) {
             return Ok(existing.handle.clone());
@@ -408,7 +414,7 @@ impl ExternalSessionRegistry {
         let entry = self
             .live
             .lock()
-            .expect("registry mutex poisoned")
+            .unwrap_or_else(|poison| poison.into_inner())
             .remove(&key);
         match entry {
             Some(entry) => {
@@ -441,7 +447,10 @@ impl ExternalSessionRegistry {
     /// [`cleanup`](Self::cleanup) does for a single session.
     pub async fn cleanup_agent(&self, agent_id: AgentId) -> Vec<ExternalSessionShutdown> {
         let mut entries: Vec<(String, LiveEntry)> = {
-            let mut live = self.live.lock().expect("registry mutex poisoned");
+            let mut live = self
+                .live
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             let keys: Vec<LiveSessionKey> = live
                 .keys()
                 .filter(|key| key.agent_id == agent_id)
@@ -639,7 +648,7 @@ mod tests {
         fn observe(&self, request: &ExternalSessionRequest) {
             self.observed_session_dirs
                 .lock()
-                .expect("observed dirs poisoned")
+                .unwrap_or_else(|poison| poison.into_inner())
                 .push(request.session_dir.clone());
         }
     }
@@ -712,11 +721,17 @@ mod tests {
         }
 
         fn prepares(&self) -> Vec<(AgentId, WorktreeRef, WorktreeIsolation)> {
-            self.prepares.lock().expect("prepares poisoned").clone()
+            self.prepares
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
         }
 
         fn cleanups(&self) -> Vec<(WorktreeRef, ExternalSessionShutdown)> {
-            self.cleanups.lock().expect("cleanups poisoned").clone()
+            self.cleanups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
         }
 
         /// The prepared path the `n`-th prepare call handed out.
@@ -740,7 +755,10 @@ mod tests {
                     detail: "stub prepare failure".to_owned(),
                 });
             }
-            let mut prepares = self.prepares.lock().expect("prepares poisoned");
+            let mut prepares = self
+                .prepares
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             let path = Self::prepared_path(prepares.len());
             prepares.push((agent_id, base.clone(), isolation));
             Ok(PreparedWorktree::new(agent_id, isolation, path, true).with_base_repo(base.clone()))
@@ -760,7 +778,7 @@ mod tests {
             }
             self.cleanups
                 .lock()
-                .expect("cleanups poisoned")
+                .unwrap_or_else(|poison| poison.into_inner())
                 .push((prepared.worktree().clone(), disposition));
             Ok(WorktreeCleanupOutcome::new(
                 prepared.isolation(),
@@ -1006,7 +1024,10 @@ mod tests {
             "prepare ran with the request's agent, base worktree, and isolation"
         );
         assert_eq!(
-            observed.lock().expect("observed poisoned").as_slice(),
+            observed
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_slice(),
             &[Some(StubWorktreeManager::prepared_path(0))],
             "the adapter received the prepared path as session_dir"
         );
@@ -1055,7 +1076,10 @@ mod tests {
 
         assert_eq!(stub.prepares().len(), 1, "resume prepares a worktree");
         assert_eq!(
-            observed.lock().expect("observed poisoned").as_slice(),
+            observed
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_slice(),
             &[Some(StubWorktreeManager::prepared_path(0))],
             "the adapter received the prepared path as session_dir"
         );
