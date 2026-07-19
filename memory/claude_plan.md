@@ -76,4 +76,12 @@
 - [x] 新增/更新测试（4 新增 + 2 扩展，persistence 30 条全过）
 - [x] 全量门禁（fmt/clippy/external clippy/test --all/doc 全过）
 - [x] 更新 TODO.md（M3-5-2 标 DONE + M3-5 决策修正 + M3-5-3 文本同步）
-- [ ] 提交
+- [x] 提交（7938f25）
+
+## 任务完成总结
+
+M3-5-2 已完成并标 `[DONE]`。核心交付：
+1. `ConversationRowInsertSet::into_snapshot`——多代次行集按最大代次重组（选取/过滤/去重后委托严格单代次路径）。
+2. 同类修复：`ArtifactRecord` 增加 `generation` 列（row schema v3），修正审查时「artifact 是 append-only 事实」的误判——revert+recompact 会丢弃/重排 artifact 成员。
+3. 4 条新测试 + 2 条扩展，全量门禁（fmt/clippy/external-clippy/test/doc）全过。
+4. L-3 评估记录为 M3-5-3 连带项。下一任务：M3-5-3（diff 代次键 + 演进场景测试）。
