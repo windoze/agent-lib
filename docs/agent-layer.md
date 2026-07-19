@@ -269,7 +269,11 @@ skill 启停、tool 增删、system prompt 变更都改的是 config/projection,
 model 与 loop policy 变更,并在 turn 边界原子应用。其中 tool set 变化会 reify 成
 `Requirement{ kind: NeedReconfigRegistry }`,由 driver 端的 `ReconfigHandler` 用
 `ToolRegistryResolver` 把新的 `ToolSetRef` 解析为 live registry 再换入;解析或版本校验
-失败会分类返回且不部分应用(当前 turn 的 registry snapshot 保持恒定)。
+失败会分类返回且不部分应用(当前 turn 的 registry snapshot 保持恒定)。机器 park 在
+`AwaitingReconfig`(等待 registry 换入确认)期间,新的 `reconfigure` 请求会被**拒绝**
+(`AgentErrorKind::AgentState`)而非入队——resume 只应用 park 时 plan 好的 application 并
+清空队列,此时入队的请求会被静默丢弃;调用方在 outstanding reconfig requirement 解决后
+重试即可(H-STATE-5 / M4-2)。
 
 ## 5. 垂直功能:API-first,tool 只是 adapter
 

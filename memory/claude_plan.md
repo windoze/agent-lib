@@ -1,16 +1,22 @@
-# 执行计划：M4-1 修复 `blackboard_read` 丢弃正文 + 补 mailbox 读工具（H-STATE-6）
+# 执行计划：M4-2 `AwaitingReconfig` 期间的新 reconfigure 不再静默丢失（H-STATE-5）
 
 ## 状态：✅ 已完成（待提交）
 
 ## 执行结果
 
-1. 探索代码：完成。定位 `src/agent/collab/tools.rs`（blackboard_read 只计数、无 mailbox 读工具、plan_read 缺 owner/deps）、`blackboard.rs`/`mailbox.rs`（`read_from` 游标 API）、`collab/tests.rs`（tool_adapter 测试模式）、文档枚举点（`docs/external-agent.md` §3.4 表、`docs/managed-external-agent.md` §8.1 清单）。
-2. 实现：完成。
-   - `blackboard_read` 返回正文：头部行保留原前缀 + 每消息 `#<offset> <sender>: <body>`；新增 `limit` 参数（默认 50）+ resume 提示 + 单条正文 200 字符截断（`… [truncated]`）。
-   - 新增 `mailbox_read` 工具：读注入 identity 自己的收件箱（recipient 不可由模型提供），seq 游标分页 + 同一截断设施；注册进 declarations/dispatch，常量经 `collab/mod.rs` 导出。
-   - `plan_read` 补 `@owner` 与 ` deps:[..]`（无 owner/deps 时输出与旧格式逐字一致）。
-   - 共享 helper：`read_limit` / `format_read_page` / `truncate_body`。
-3. 测试：新增 4 条（blackboard 正文、分页+截断、mailbox 读+bystander 空收件箱、plan owner/deps）+ declarations 清单补 MAILBOX_READ；`agent::collab` 32 条全过。
-4. 文档：`docs/external-agent.md` §3.4 表加 mailbox_read 行；`docs/managed-external-agent.md` §8.1 清单同步；`docs/agent-layer.md` §6.4 不枚举工具面无需更新；`docs/review-2026-07.md` H-STATE-6 标注 `✅ 已修复（M4-1）`。
-5. 验证全过：fmt、clippy（默认 + external features）、`cargo test --all --all-targets`（exit 0，31s）、doc。
-6. TODO.md：M4-1 标 [DONE] + 完成记录。下一步：commit 后停止。
+1. 探索：完成（explore subagent）。定位 `reconfigure`（mod.rs:314）、`AwaitingReconfig` cursor、
+   resume 路径（`apply_reconfig_application` 无条件 clear）、`AgentStateError`、测试模式。
+2. 选型：方案 (a)——park 期间拒绝（resume 重 plan 会让已确认的 registry swap 与实际应用不符）。
+3. 实现：完成。
+   - `src/agent/state.rs`：新增 `AgentStateError::ReconfigWhileAwaitingRegistry` +
+     单一来源准入规则 `ensure_reconfig_admission()`；`queue_reconfig`（pub 入口，class-wide）
+     同步接守卫。
+   - `src/agent/machine/default/mod.rs`：`reconfigure` 在 plan 前调准入守卫；rustdoc `# Errors` 同步。
+   - M4-4 衔接：M4-4 未落地，走既有 `AgentError` 通道（`AgentErrorKind::AgentState`），已记录。
+4. 测试：`reconfigure_during_awaiting_reconfig_is_rejected_and_can_be_retried`
+   （复现报告场景：R2 被拒、队列不动、resume 应用 A1、R2 可重提交）；
+   `agent::` 444 条全过。
+5. 文档：`docs/agent-layer.md` §4.2 补拒绝+重试口径；`docs/review-2026-07.md` H-STATE-5 标注 ✅。
+6. 验证全过：fmt、clippy（默认 + external features）、`cargo test --all --all-targets`（exit 0，33s）、doc。
+7. TODO.md：M4-2 标 [DONE] + 完成记录（含 breaking change 记录：AgentStateError 新增变体）。
+   下一步：commit 后停止。

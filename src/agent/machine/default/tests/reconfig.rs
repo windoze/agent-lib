@@ -397,6 +397,69 @@ fn reconfig_during_tool_turn_keeps_current_turn_tools() {
     assert_eq!(machine.state().current_tool_set(), &replacement);
 }
 
+/// H-STATE-5 / M4-2: while the machine is parked on `AwaitingReconfig`, a new
+/// reconfiguration is rejected instead of silently dropped by the resume's
+/// queue clear. The parked queue stays exactly the set the parked application
+/// was planned from, and the rejected request can be resubmitted once the
+/// outstanding requirement resolves.
+#[test]
+fn reconfigure_during_awaiting_reconfig_is_rejected_and_can_be_retried() {
+    let mut machine = reconfig_machine(state());
+    let replacement = replacement_tool_set();
+
+    // A tool-set change queued mid-turn parks the commit behind the registry
+    // effect.
+    let outcome = machine.step(StepInput::external(user_input()));
+    let llm_id = outcome.requirements[0].id;
+    machine
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement.clone(),
+        })
+        .expect("tool set reconfig queued");
+    let outcome = machine.step(StepInput::resume(RequirementResolution::new(
+        llm_id,
+        RequirementResult::Llm(Ok(text_response("first"))),
+    )));
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::AwaitingReconfig);
+    let reconfig_id = outcome.requirements[0].id;
+
+    // A reconfigure arriving during the park is rejected, never queued.
+    let rejected = machine
+        .reconfigure(ReconfigRequest::set_system_prompt_overlay(
+            Some("late overlay".to_owned()),
+            0,
+        ))
+        .expect_err("reconfigure during AwaitingReconfig is rejected");
+    assert_eq!(rejected.kind(), AgentErrorKind::AgentState);
+    assert!(matches!(
+        rejected,
+        crate::agent::AgentError::State(
+            crate::agent::AgentStateError::ReconfigWhileAwaitingRegistry
+        )
+    ));
+    // The parked queue is untouched: still exactly the planned set.
+    assert_eq!(machine.state().queued_reconfigs().len(), 1);
+
+    // Resuming applies the parked application and clears the queue.
+    let outcome = machine.step(StepInput::resume(RequirementResolution::new(
+        reconfig_id,
+        RequirementResult::Reconfig(Ok(())),
+    )));
+    assert!(outcome.is_quiescent());
+    assert_eq!(machine.cursor().kind(), LoopCursorKind::Done);
+    assert!(machine.state().queued_reconfigs().is_empty());
+    assert_eq!(machine.state().current_tool_set(), &replacement);
+
+    // The rejected request can be resubmitted once the park resolves.
+    machine
+        .reconfigure(ReconfigRequest::set_system_prompt_overlay(
+            Some("late overlay".to_owned()),
+            0,
+        ))
+        .expect("rejected reconfig can be resubmitted after resume");
+    assert_eq!(machine.state().queued_reconfigs().len(), 1);
+}
+
 /// Conflicting reconfigurations are rejected eagerly and atomically at queue
 /// time, leaving the queue and state untouched. A duplicate skill and a stale
 /// overlay version fail as [`AgentErrorKind::AgentState`]; an unresolvable tool

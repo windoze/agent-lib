@@ -971,7 +971,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib agent::collab`（32 条全过）、`cargo test --all --all-targets`（exit 0，约 31s，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - 无 breaking change（纯增量：新工具常量/声明/参数；`blackboard_read` 输出在保留原前缀的前提下追加正文行——行为修复）。
 
-### M4-2 [TODO] `AwaitingReconfig` 期间的新 reconfigure 不再静默丢失（H-STATE-5）
+### M4-2 [DONE] `AwaitingReconfig` 期间的新 reconfigure 不再静默丢失（H-STATE-5）
 
 上下文：
 
@@ -988,6 +988,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：复现上述场景，R2 不再静默丢失（被拒绝并可在 resume 后重新提交，或被一并应用）。
 - `cargo test -p agent-lib --lib agent::machine` 全过。
+
+完成记录：
+
+- **选型：方案 (a)**——`reconfigure` 在 `AwaitingReconfig` cursor 下拒绝。resume 重新 plan 整个队列的方案 (b) 未选：park 时发出的 `NeedReconfigRegistry` requirement 携带的是按 R1 plan 的 tool set，resume 时改应用 R1+R2 的 application 会让已确认的 registry swap 与实际应用的 tool set 不一致；(a) 让队列恒等于 parked application 的 plan 输入，语义清晰且调用方有明确重试点。
+- **实现**：新增 `AgentStateError::ReconfigWhileAwaitingRegistry`（`src/agent/state.rs`，错误消息明确“retry after the outstanding reconfig requirement resolves”）；准入规则收敛为单一来源 `AgentState::ensure_reconfig_admission()`（cursor 为 `LoopCursor::AwaitingReconfig` 即拒绝），两个入队入口共享——`DefaultAgentMachine::reconfigure`（plan 之前，拒绝原子、队列不动）与 pub 的 `AgentState::queue_reconfig`（class-wide 修复：同一静默丢失洞的另一入口，此前无生产调用方）。`reconfigure` rustdoc `# Errors` 与新变体 rustdoc 同步。
+- **M4-4 衔接**（任务要求记录）：M4-4（非破坏性 step 错误出口）尚未落地（排在 M4-2 之后），本任务走既有 `Result<(), AgentError>` 错误通道（分类 `AgentErrorKind::AgentState`）；`reconfigure` 是 host-facing 入口而非 sans-io `step` 路径，M4-4 落地后无需迁移本拒绝（它本就不产生 step 失败）。
+- **测试**：`reconfig::reconfigure_during_awaiting_reconfig_is_rejected_and_can_be_retried`——精确复现报告场景（[R1=ReplaceToolSet] park → `reconfigure(R2=overlay)` 被拒为 `AgentError::State(ReconfigWhileAwaitingRegistry)`、队列仍恰为 [R1]）→ resume 应用 A1 并清空队列 → R2 重新提交成功入队。
+- **文档**：`docs/agent-layer.md` §4.2 补 park 期间拒绝 + 重试口径；`docs/review-2026-07.md` H-STATE-5 已标注 `✅ 已修复（M4-2）`。其余应检文档（README/AGENTS/facade-api/managed-external-agent/capability-matrix/conversation-core/agent-effect-model/effect-refine）不描述 reconfigure 准入语义或只讲 external 机器的独立 timing 模型，无需更新。
+- **验证**：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib agent::`（444 条全过，含新测试）、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- **Breaking change**（pre-1.0，记录在此）：`AgentStateError` 新增 `ReconfigWhileAwaitingRegistry` 变体，外部对该枚举的穷尽 match 需补分支（该枚举未标 `#[non_exhaustive]`）；`AgentState::queue_reconfig` 在 `AwaitingReconfig` cursor 下从静默接受变为报错（行为修复，无生产调用方）。
 
 ### M4-3 [TODO] pivot 重发的 requirement id 与 trace 去重解耦（H-STATE-4）
 

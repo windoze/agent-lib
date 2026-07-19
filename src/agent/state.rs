@@ -164,12 +164,32 @@ impl AgentState {
     ///
     /// # Errors
     ///
-    /// Returns a classified [`AgentStateError`] when the request or the full
-    /// pending queue would conflict with the current Agent state.
+    /// Returns [`AgentStateError::ReconfigWhileAwaitingRegistry`] when the
+    /// cursor is [`LoopCursor::AwaitingReconfig`] (a previous reconfiguration
+    /// is parked behind the registry effect; the caller may retry once that
+    /// requirement resolves). Returns a classified [`AgentStateError`] when
+    /// the request or the full pending queue would conflict with the current
+    /// Agent state.
     pub fn queue_reconfig(&mut self, reconfig: QueuedReconfig) -> Result<(), AgentStateError> {
+        self.ensure_reconfig_admission()?;
         let queue = self.queued_reconfigs.with_pushed(reconfig);
         let _application = self.plan_reconfig_requests(queue.as_slice())?;
         self.queued_reconfigs = queue;
+        Ok(())
+    }
+
+    /// Gates reconfiguration admission while a previous one is parked.
+    ///
+    /// While the cursor is [`LoopCursor::AwaitingReconfig`], the resume path
+    /// applies the application planned at park time and clears the queue, so
+    /// any request admitted during the park would be silently dropped without
+    /// ever being applied. Rejecting at admission keeps the queue exactly the
+    /// set the parked application was planned from; the caller retries once
+    /// the outstanding reconfig requirement resolves (H-STATE-5 / M4-2).
+    pub(crate) fn ensure_reconfig_admission(&self) -> Result<(), AgentStateError> {
+        if matches!(self.loop_cursor, LoopCursor::AwaitingReconfig(_)) {
+            return Err(AgentStateError::ReconfigWhileAwaitingRegistry);
+        }
         Ok(())
     }
 
@@ -565,6 +585,13 @@ pub enum AgentStateError {
     /// An error cursor did not carry stable diagnostic text.
     #[error("error cursor message must not be empty")]
     EmptyCursorError,
+    /// A reconfiguration was requested while a previous one is parked awaiting
+    /// registry resolution.
+    #[error(
+        "cannot queue a reconfiguration while the cursor is `AwaitingReconfig`; \
+         retry after the outstanding reconfig requirement resolves"
+    )]
+    ReconfigWhileAwaitingRegistry,
 }
 
 fn ensure_unique_skill_ids(skill_ids: &[SkillId]) -> Result<(), AgentStateError> {

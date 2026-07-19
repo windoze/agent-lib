@@ -308,10 +308,15 @@ impl DefaultAgentMachine {
     /// # Errors
     ///
     /// Returns [`AgentError::State`] when the request conflicts with current
-    /// state (for example a duplicate skill or a stale overlay version) and
+    /// state (for example a duplicate skill or a stale overlay version), when
+    /// the cursor is [`LoopCursor::AwaitingReconfig`] — a request admitted
+    /// during the park would be silently dropped by the resume's queue clear,
+    /// so it is rejected up front and may be retried once the outstanding
+    /// reconfig requirement resolves (H-STATE-5 / M4-2) — and
     /// [`AgentError::Tool`] when the new tool set cannot be resolved or its
     /// registry declarations do not match the requested set.
     pub fn reconfigure(&mut self, request: ReconfigRequest) -> Result<(), AgentError> {
+        self.state.ensure_reconfig_admission()?;
         let application = self.state.plan_reconfig_with(&request)?;
         self.validate_reconfig_registry(&application)?;
         self.state.queue_prevalidated_reconfig(request);
