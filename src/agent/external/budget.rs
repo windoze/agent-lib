@@ -142,22 +142,7 @@ fn limit_exceeded(error: RunContextError) -> ExternalAgentError {
 /// here because it needs a caller-supplied elapsed time.
 #[must_use]
 pub fn budget_exhausted(ctx: &RunContext) -> Option<BudgetDimension> {
-    let snapshot = ctx.budget().snapshot();
-    let limits = snapshot.limits();
-    let used = snapshot.used();
-
-    let exhausted =
-        |limit: Option<u64>, used: u64| -> bool { limit.is_some_and(|limit| used >= limit) };
-
-    if exhausted(limits.max_steps(), used.steps()) {
-        Some(BudgetDimension::Steps)
-    } else if exhausted(limits.max_tokens(), used.tokens()) {
-        Some(BudgetDimension::Tokens)
-    } else if exhausted(limits.max_cost_micros(), used.cost_micros()) {
-        Some(BudgetDimension::CostMicros)
-    } else {
-        None
-    }
+    ctx.budget_exhausted()
 }
 
 /// Stops a live external session when the budget-charging layer must abandon it.

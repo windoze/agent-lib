@@ -14,6 +14,8 @@
 >   `src/agent/drive.rs`;subagent 派生与作用域强制:`src/agent/drive/subagent.rs`。
 > - never-resume cancel 接 `Conversation::cancel_pending`:`src/agent/context/cancel.rs` +
 >   `src/agent/drive.rs`;`RunContext` 派生:`src/agent/context.rs`。
+> - budget ledger 与 driver enforcement:`src/agent/context/budget.rs`、`src/agent/drive.rs`;
+>   预算耗尽终态由 `AgentMachine::interrupt_budget_exhausted` 闭合。
 >
 > 本模型复用而非重造 Conversation 层已落地的 committed log + pending + `Boundary` +
 > `cancel_pending` 裂缝闭合 + `fork_at` 共享前缀能力。分阶段迁移与接口形状见
@@ -310,6 +312,29 @@ turn、半开的 tool 配对(悬空 tool_use)。never-resume 必须触发那个 
 result 或丢弃 pending。**"zero-shot 什么都没发生"会漏掉这步清理;"never-resume 有个
 已知挂起态要收尾"会记得它。** 这也正是"cancel 后 conversation 仍可 feed"这条硬性验收
 的实现基础:never-resume 是**受控丢弃 + 闭合**,不是撒手不管。
+
+### 6.4 budget = driver 记账 + 预算耗尽中断
+
+budget 也不是状态机内部的 IO。预算 ledger 活在 `RunContext`,由 driver 在 effect 边界消费:
+
+- **预检只阻止新的 LLM spend**:`drain` / `drive_streamed` 在兑现 `NeedLlm` batch 前查询
+  `RunContext::budget_exhausted()`。该检查不是 reservation / pre-deduct;兄弟 context
+  可能在预检与真实 charge 之间消费同一个共享 ledger,所以 driver 仍必须处理 charge 失败。
+- **LLM response 在 resume 前记账**:handler 成功返回 `Response` 后,driver 先
+  `charge_step()` 再 `charge_usage(&response.usage)`。只有两个 charge 都通过,该
+  `RequirementResolution` 才会以 `Resumed` 写入 trace 并喂回机器。若 usage charge 超限,
+  已发生的 step charge 保留;超限的 token charge 按 `BudgetHandle` 现有语义原子拒绝。
+- **超限是 never-resume + 终态**:预算预检失败或 charge 失败时,本批尚未回灌的
+  requirement 全部以 `NeverResumed` 记 trace,随后调用
+  `AgentMachine::interrupt_budget_exhausted()`。默认机器丢弃当前未提交 pending turn(已
+  committed 历史保持完好),经 `CancelRecovery(BudgetExceeded)` 闭合,最终停在
+  `LoopCursor::Done(BudgetExhausted)`。这与 cancel 的 feedable `Idle` 不同:budget
+  exhausted 是本 feed segment 的自然终止原因。
+- **子 agent 共享 ledger**:`RunContext::derive_child` 克隆父 `BudgetHandle`,所以子 agent
+  的 driver-level LLM usage/step charge 与 handler 自行上报的 token/cost 都计入父预算。
+
+external runtime 仍通过 `ExternalUsageChargingHandler` 处理 runtime-reported usage/cost;
+facade 的用户可配置 budget 入口另见 M6-2。
 
 ## 7. Hierarchy:嵌套的 handler scope
 

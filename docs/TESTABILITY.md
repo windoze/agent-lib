@@ -983,11 +983,11 @@ cassette 记录的是 agent effect 边界的 provider-neutral req/resp,不是 HT
 
 - 中途 pause/restore 语义:当前 `AgentState` 序列化依赖 `Conversation::snapshot`,pending turn 会拒绝。testkit 应先能测试 committed-boundary restore;mid-requirement restore 需等设计闭合。
 - `NestedMachine` 与 `DrivingSubagentHandler` 的模型关系:一个是 parent-contained tree,一个是 handler 内 ephemeral child drain。testkit 可先覆盖当前行为,但不应把未定语义包装成稳定 DSL。
-- budget enforcement:当前 `RunContext` 有 charge API,但 reference driver 不统一 charge usage/step。testkit 可提供 charging handler 并补覆盖,同时帮助识别是否需要 driver-level charge。
+- budget enforcement:reference driver 已统一在 LLM response resume 前 charge step/usage(M6-1)。testkit 仍应覆盖预算继承、handler 自行上报 token/cost、预检与 charge 竞态等场景。
 - trace granularity:当前重点记录 requirement disposition,完整 run -> step -> llm/tool/subagent trace 仍需补。testkit 的 `assert_trace` 应从现有能力开始,逐步扩展。
 - streaming tee:当前 `LlmHandler` 多数场景返回 folded `Response`;token delta UI sink 尚未落地。testkit 暂不模拟 provider SSE,后续等 sink 接口定型再加 token-level 场景。
 - `max_parallel_tools`:字段存在,但当前 tool phase 会吐出 auto-approved batch,driver 会并发兑现本地 batch。testkit 应增加覆盖来钉住预期,随后决定实现 limit 或调整语义。
-- cancel all outstanding:当前 `drain` cancel 时 abandon pending 的第一个 requirement。单机 tool phase 能闭合整批;未来 hierarchy 聚合多节点时需测试是否要 abandon 全部 affected subtree。
+- cancel all outstanding:`drain` 已在取消时对批内全部 outstanding requirement 留痕并 abandon(M4-5)。testkit 后续应继续覆盖 hierarchy 聚合多节点时的 affected subtree 行为。
 
 ## 12. 验收标准
 

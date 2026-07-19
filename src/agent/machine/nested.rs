@@ -345,6 +345,20 @@ impl AgentMachine for NestedMachine {
     fn cursor(&self) -> &LoopCursor {
         self.own.cursor()
     }
+
+    fn interrupt_budget_exhausted(&mut self) -> StepOutcome {
+        let mut notifications = Vec::new();
+
+        let mut own = self.own.interrupt_budget_exhausted();
+        notifications.append(&mut own.notifications);
+
+        for child in self.children.values_mut() {
+            let mut outcome = child.machine.interrupt_budget_exhausted();
+            notifications.append(&mut outcome.notifications);
+        }
+
+        StepOutcome::new(notifications, Vec::new(), true)
+    }
 }
 
 /// Stamps requirements freshly emitted by a node's own machine with `path`,

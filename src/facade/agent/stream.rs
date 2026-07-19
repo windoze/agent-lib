@@ -45,7 +45,8 @@ use futures::stream::BoxStream;
 use futures::{Stream, StreamExt};
 
 use crate::agent::drive::{
-    Resolved, fulfill_batch, is_terminal, record_requirement, record_requirement_resolution,
+    Resolved, budget_precheck_exhausted, charge_resolution_budget, fulfill_batch, is_terminal,
+    record_requirement, record_requirement_resolution,
 };
 use crate::agent::interaction::{Interaction, InteractionKind};
 use crate::agent::{
@@ -247,6 +248,16 @@ async fn drive_streamed(
             break;
         }
 
+        if budget_precheck_exhausted(ctx, &pending) {
+            for requirement in &pending {
+                record_requirement(ctx, requirement, 0, RequirementDisposition::NeverResumed);
+            }
+            let mut guard = machine.borrow_mut();
+            let mut outcome = guard.interrupt_budget_exhausted();
+            notifications.append(&mut outcome.notifications);
+            break;
+        }
+
         if pivot_window_allowed && pending_contains_llm(&pending) {
             control.open_pivot_window();
             tokio::task::yield_now().await;
@@ -290,11 +301,32 @@ async fn drive_streamed(
         }
 
         pending = Vec::new();
-        for Resolved {
-            resolution,
-            resolved_at_scope,
-        } in resolutions
-        {
+        let mut resolutions = resolutions.into_iter();
+        while let Some(resolved) = resolutions.next() {
+            if charge_resolution_budget(ctx, &resolved.resolution).is_err() {
+                record_requirement_resolution(
+                    ctx,
+                    &resolved.resolution,
+                    0,
+                    RequirementDisposition::NeverResumed,
+                );
+                for remaining in resolutions {
+                    record_requirement_resolution(
+                        ctx,
+                        &remaining.resolution,
+                        0,
+                        RequirementDisposition::NeverResumed,
+                    );
+                }
+                let mut guard = machine.borrow_mut();
+                let mut outcome = guard.interrupt_budget_exhausted();
+                notifications.append(&mut outcome.notifications);
+                break;
+            }
+            let Resolved {
+                resolution,
+                resolved_at_scope,
+            } = resolved;
             record_requirement_resolution(
                 ctx,
                 &resolution,

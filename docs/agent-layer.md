@@ -104,6 +104,8 @@ pub trait AgentMachine {
     fn step(&mut self, input: StepInput) -> StepOutcome;
     /// 只读查看当前 cursor(effect 模型下等价于查看 loop cursor)。
     fn cursor(&self) -> &LoopCursor;
+    /// driver 观察到共享 run budget 耗尽后,同步关闭当前未提交工作。
+    fn interrupt_budget_exhausted(&mut self) -> StepOutcome;
 }
 
 pub enum StepInput {
@@ -163,6 +165,13 @@ struct RunContext {
 }
 ```
 
+预算执行落在 driver 边界而不是机器内部:在启动新的 `NeedLlm` batch 前,driver 查询
+`RunContext::budget_exhausted()` 做非预扣预检;LLM `Response` 成功返回后、`Resume` 回机器前,
+driver 依次 `charge_step()` 与 `charge_usage(&response.usage)`。若预检或 charge 失败,本批
+未回灌 requirement 以 `NeverResumed` 留痕,机器经 `interrupt_budget_exhausted()` 关闭当前未
+提交 turn,默认机器停在 `Done(BudgetExhausted)`。预检与真实 charge 之间没有 reservation,
+共享 ledger 的并发消费仍以 charge 结果为准。
+
 ## 2. Agent 推进模型(Layer A 复用点)
 
 一个 turn 通常跨多个 LLM 轮次(call→tool→call…):driver 反复 `step`,机器每次同步走到
@@ -180,6 +189,11 @@ struct RunContext {
 
 **别各挖各的洞**:上面全部挂在"conversation 暴露的边界事件"这一个点上,呼应
 `DESIGN.md` 下向约束第 3 条(Boundary 被 agent 层复用)。
+
+预算边界的实际粒度是 LLM requirement:预检发生在新的 LLM spend 之前,step/usage charge
+发生在 LLM response 被 handler fold 完成之后且恢复进机器之前。tool / reconfig 自身不新增
+token spend,不会被预算预检提前拦截;如果下一次 LLM spend 已无预算,driver 会在该 LLM
+requirement 前以 `BudgetExhausted` 终止。
 
 ## 3. 审批 / pivot / cancel:同一 requirement + handler 机制的三种表现
 

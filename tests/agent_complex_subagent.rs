@@ -37,15 +37,13 @@ mod complex_support;
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde_json::json;
 
 use agent_lib::agent::{
-    InteractionKind, LlmHandler, LoopCursorKind, PlanId, Requirement, RequirementId,
-    RequirementKind, RequirementKindTag, RequirementResult, RunContext, ScopePop, SubagentHandler,
-    ToolHandler, TraceNodeKind, TraceRecord, drain,
+    InteractionKind, LoopCursorKind, PlanId, Requirement, RequirementId, RequirementKind,
+    RequirementKindTag, RequirementResult, RunContext, ScopePop, SubagentHandler, ToolHandler,
+    TraceNodeKind, TraceRecord, drain,
 };
-use agent_lib::client::ChatRequest;
 use agent_lib::model::content::ContentBlock;
 use agent_lib::model::message::Message;
 
@@ -71,35 +69,6 @@ fn plan_id() -> PlanId {
 /// Total child model usage across the four scripted LLM steps:
 /// `(5 + 3) + (4 + 2) + (6 + 3) + (3 + 2)`.
 const CHILD_TOKENS: u64 = 28;
-
-/// An [`LlmHandler`] that delegates to an inner scripted handler and charges the
-/// response usage against the run context.
-///
-/// Charging usage is a host responsibility — neither the scripted testkit
-/// handler nor the reference client handler touches the budget — so this thin
-/// wrapper is what proves the child's consumption lands on the parent's shared
-/// ledger through the derived child context.
-struct ChargingLlm {
-    inner: Arc<dyn LlmHandler>,
-}
-
-#[async_trait]
-impl LlmHandler for ChargingLlm {
-    async fn fulfill(
-        &self,
-        request: &ChatRequest,
-        mode: LlmStepMode,
-        ctx: &RunContext,
-    ) -> RequirementResult {
-        let result = self.inner.fulfill(request, mode, ctx).await;
-        if let RequirementResult::Llm(Ok(response)) = &result {
-            let tokens = u64::from(response.usage.input) + u64::from(response.usage.output);
-            ctx.charge_tokens(tokens)
-                .expect("charge child usage on the shared parent ledger");
-        }
-        result
-    }
-}
 
 /// Seeds `store` with a `design -> review -> implement` dependency chain in which
 /// `design` is already completed, and returns the plan version after seeding.
@@ -213,9 +182,6 @@ async fn complex_subagent_updates_shared_plan_and_pops_approval_to_parent() {
         LlmStep::response(assistant_text("review complete", usage(3, 2))),
     ]);
     let child_llm_log = Arc::clone(child_llm_inner.log());
-    let charging = ChargingLlm {
-        inner: Arc::new(child_llm_inner),
-    };
 
     let tool_handler = complex_tool_handler(Arc::clone(&store));
     let child_tool: Arc<dyn ToolHandler> = tool_handler.clone();
@@ -226,7 +192,7 @@ async fn complex_subagent_updates_shared_plan_and_pops_approval_to_parent() {
         .machine(complex_agent_machine(&ids))
         .scope(
             headless_child_scope()
-                .llm(Arc::new(charging))
+                .llm(Arc::new(child_llm_inner))
                 .tool(child_tool)
                 .build(),
         )

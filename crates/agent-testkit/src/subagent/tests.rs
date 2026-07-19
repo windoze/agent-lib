@@ -342,8 +342,9 @@ async fn child_token_charge_counts_against_parent_budget() {
     assert!(matches!(result, RequirementResult::Subagent(Ok(_))));
     // The child fulfilled its one LLM requirement and completed.
     assert_eq!(child_log.resume_tags(), vec![RequirementKindTag::Llm]);
-    // The child's charge is visible on the parent context's shared ledger.
-    assert_eq!(ctx.budget().snapshot().used().tokens(), CHILD_TOKENS);
+    // The child's explicit charge and the driver's response usage charge are
+    // both visible on the parent context's shared ledger.
+    assert_eq!(ctx.budget().snapshot().used().tokens(), CHILD_TOKENS + 2);
 }
 
 /// An attended child answers its own `NeedInteraction` in place, so it never

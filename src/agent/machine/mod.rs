@@ -63,6 +63,18 @@ pub trait AgentMachine {
     ///
     /// This is the effect-model equivalent of inspecting the loop cursor.
     fn cursor(&self) -> &LoopCursor;
+
+    /// Closes the current in-flight work because the shared run budget is spent.
+    ///
+    /// Drivers call this after a budget preflight or charge fails. Implementations
+    /// should leave committed history intact, discard or coherently close any
+    /// uncommitted pending work, and settle on
+    /// [`BudgetExhausted`](crate::agent::LoopDoneReason::BudgetExhausted) when
+    /// they own a feed segment. The default is a no-op for test or wrapper
+    /// machines that do not own budgeted state directly.
+    fn interrupt_budget_exhausted(&mut self) -> StepOutcome {
+        StepOutcome::new(Vec::new(), Vec::new(), true)
+    }
 }
 
 /// Input to one [`AgentMachine::step`]: an external input or a requirement's

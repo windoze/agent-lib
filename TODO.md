@@ -1415,7 +1415,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M6：预算端到端接线
 
-### M6-1 [TODO] drain/drive_turn 接入预算记账（M-PROM-1 核心）
+### M6-1 [DONE] drain/drive_turn 接入预算记账（M-PROM-1 核心）
 
 上下文：
 
@@ -1434,6 +1434,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：配置小额 token 预算的 run 在超限后以 BudgetExhausted 终止，conversation 状态一致（已 committed 部分完好）。
 - 单元测试：预算充足时记账值与各步 usage 之和一致。
 - `cargo test -p agent-lib --lib agent::` 全过。
+
+完成记录：
+
+- **核心接线**：`drain` 与流式镜像 `drive_streamed` 在启动新的 `NeedLlm` batch 前用 `RunContext::budget_exhausted()` 做 count-like budget 预检；LLM handler 成功返回 `Response` 后、`StepInput::Resume` 回机器前依次调用 `charge_step()` 与 `charge_usage(&response.usage)`。预检不是 reservation/pre-deduct，charge 仍是最终判定点；若 usage charge 超限，已实际发生的 step charge 保留，超限 token charge 按 `BudgetHandle` 现有原子拒绝语义不落账。
+- **预算耗尽终止**：`AgentMachine` 新增默认 hook `interrupt_budget_exhausted()`；`DefaultAgentMachine` 覆盖该 hook，丢弃当前未提交 pending turn（已 committed history 不动），经 `CancelRecovery(BudgetExceeded)` 闭合并停在 `LoopCursor::Done(BudgetExhausted)`；`NestedMachine` 对整棵树传播预算中断；`ExternalAgentMachine` 同步停在 `Done(BudgetExhausted)` 并标记 cleanup required（外部 runtime 预算 usage/cost 仍由 `ExternalUsageChargingHandler` 负责）。预算超限时未恢复的 requirement 全部以 `NeverResumed` 记 trace。
+- **预算预检共享**：`BudgetHandle::exhausted_dimension()` / `RunContext::budget_exhausted()` 成为预检单一来源；external budget helper 改为复用该查询。M-PROM-1 中 `CancelRecoveryReason::BudgetExceeded` / `LoopDoneReason::BudgetExhausted` 已有生产构造路径，不再是死变体。
+- **测试**：新增 `drain_charges_steps_and_usage_for_successful_llm_responses`、`drain_stops_on_usage_budget_exhaustion_without_resuming_the_response`、`drain_budget_exhaustion_discards_the_default_machine_uncommitted_turn`；更新 subagent/shared-budget 测试，移除/调整旧手动 LLM usage charging wrapper，避免与 driver-level charge 双重计费。覆盖预算充足累计、token 超限终止、trace `NeverResumed`、默认机器 conversation 一致性（pending 为空、over-budget turn 不提交）、子 agent 共享 ledger。
+- **文档**：`docs/agent-effect-model.md` 新增 budget driver enforcement 语义；`docs/agent-layer.md` 同步 `interrupt_budget_exhausted` 与 LLM 边界预算粒度；`docs/TESTABILITY.md` 修正 driver-level budget/cancel 现状；`docs/review-2026-07.md` M-PROM-1 标注 `核心 ✅ 已修复（M6-1）；facade budget 入口待 M6-2`。M-PROM-2 的 facade budget 旋钮与 dispatch 零预算硬出口仍按 TODO 顺序留给 M6-2。
+- **验证**：`cargo fmt --all`、`cargo test -p agent-lib --lib agent::drive`、`cargo test -p agent-lib --lib agent::`、`cargo test --test agent_complex_subagent`、`cargo test --test agent_effect_e2e`、`cargo test -p agent-testkit --lib subagent::tests::child_token_charge_counts_against_parent_budget`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- **兼容性**：`AgentMachine` 新增带默认实现的 public hook（API 增量）；默认 facade 仍使用 `BudgetLimits::unbounded()`，用户可配置 budget 入口未在本任务引入（M6-2）。
 
 ### M6-2 [TODO] facade budget 旋钮 + dispatch 预算硬出口（M-PROM-2 budget 部分、L-9）
 

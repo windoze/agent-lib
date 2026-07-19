@@ -194,6 +194,15 @@ impl RunContext {
             .map_err(RunContextError::from)
     }
 
+    /// Returns the first configured count-like budget dimension with no headroom.
+    ///
+    /// This is a preflight signal only; it does not reserve budget. Callers must
+    /// still apply the eventual charge and handle a race with sibling contexts.
+    #[must_use]
+    pub fn budget_exhausted(&self) -> Option<BudgetDimension> {
+        self.budget.exhausted_dimension()
+    }
+
     /// Checks externally measured wall-clock elapsed time against the budget.
     ///
     /// The context does not read the system clock; callers pass elapsed time so

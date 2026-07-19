@@ -1092,6 +1092,61 @@ impl DefaultAgentMachine {
         Ok(StepOutcome::new(Vec::new(), Vec::new(), true))
     }
 
+    /// Budget exhaustion closes the in-flight turn without committing new work.
+    ///
+    /// Unlike cooperative cancellation, this is a terminal run outcome rather
+    /// than a feedable idle rest point: the driver has decided no further budgeted
+    /// work may run in this feed segment. The transient `CancelRecovery` marker
+    /// preserves the existing recovery taxonomy while the final cursor makes the
+    /// public terminal reason explicit.
+    fn finish_budget_exhausted(&mut self) -> StepOutcome {
+        let cursor = self.state.loop_cursor().clone();
+        if matches!(cursor, LoopCursor::Done(_) | LoopCursor::Error(_)) {
+            return StepOutcome::new(Vec::new(), Vec::new(), true);
+        }
+
+        let step_id = match &cursor {
+            LoopCursor::StreamingStep(cursor) => Some(cursor.step_id()),
+            LoopCursor::AwaitingTool(cursor) => Some(cursor.step_id()),
+            LoopCursor::AwaitingApproval(cursor) => Some(cursor.step_id()),
+            LoopCursor::AwaitingReconfig(cursor) => cursor.step_id(),
+            LoopCursor::Idle | LoopCursor::CancelRecovery(_) => None,
+            LoopCursor::Done(_) | LoopCursor::Error(_) => unreachable!(),
+        };
+
+        if self.state.conversation().pending().is_some()
+            && let Err(error) = self
+                .state
+                .conversation_mut()
+                .cancel_pending(CancelDisposition::DiscardTurn)
+        {
+            return self.fail(format!(
+                "budget exhaustion cleanup failed while discarding pending turn: {error}"
+            ));
+        }
+
+        self.scratch = TurnScratch::None;
+        if !matches!(cursor, LoopCursor::Idle | LoopCursor::CancelRecovery(_))
+            && let Err(error) = self.state.transition_cursor(LoopCursor::cancel_recovery(
+                step_id,
+                CancelRecoveryReason::BudgetExceeded,
+            ))
+        {
+            return self.fail(format!(
+                "budget exhaustion recovery transition failed: {error}"
+            ));
+        }
+        if let Err(error) = self
+            .state
+            .transition_cursor(LoopCursor::done(LoopDoneReason::BudgetExhausted))
+        {
+            return self.fail(format!(
+                "budget exhaustion terminal transition failed: {error}"
+            ));
+        }
+        StepOutcome::new(Vec::new(), Vec::new(), true)
+    }
+
     /// Discards any dangling pending turn and parks the machine on a classified
     /// error cursor. `step` cannot return `Result`, so runtime failures during a
     /// step surface as an [`LoopCursor::Error`] with a quiescent outcome.
@@ -1173,6 +1228,10 @@ impl AgentMachine for DefaultAgentMachine {
 
     fn cursor(&self) -> &LoopCursor {
         self.state.loop_cursor()
+    }
+
+    fn interrupt_budget_exhausted(&mut self) -> StepOutcome {
+        self.finish_budget_exhausted()
     }
 }
 

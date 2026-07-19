@@ -235,6 +235,30 @@ impl BudgetHandle {
         *self.inner.lock().expect("budget mutex poisoned")
     }
 
+    /// Returns the first configured count-like dimension that has no headroom.
+    ///
+    /// This is a best-effort preflight check for drivers before they start new
+    /// spend. It is not a reservation: another holder of the same budget can
+    /// still consume headroom before the eventual charge is applied.
+    #[must_use]
+    pub fn exhausted_dimension(&self) -> Option<BudgetDimension> {
+        let snapshot = self.snapshot();
+        let limits = snapshot.limits();
+        let used = snapshot.used();
+        let exhausted =
+            |limit: Option<u64>, used: u64| -> bool { limit.is_some_and(|limit| used >= limit) };
+
+        if exhausted(limits.max_steps(), used.steps()) {
+            Some(BudgetDimension::Steps)
+        } else if exhausted(limits.max_tokens(), used.tokens()) {
+            Some(BudgetDimension::Tokens)
+        } else if exhausted(limits.max_cost_micros(), used.cost_micros()) {
+            Some(BudgetDimension::CostMicros)
+        } else {
+            None
+        }
+    }
+
     /// Applies a multi-dimensional charge atomically.
     ///
     /// No counter is changed if any charged dimension would exceed its limit.

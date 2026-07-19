@@ -55,27 +55,25 @@ use std::sync::{
 
 // ----- host handlers kept local to the acceptance -----
 
-/// An [`LlmHandler`] that delegates to an inner scripted handler and charges the
-/// response usage against the run context, so a child's model consumption lands
-/// on the shared ledger.
+/// An [`LlmHandler`] that delegates to an inner scripted handler and records the
+/// response usage it observed.
 ///
-/// Charging usage is a *host* responsibility: neither the scripted testkit
-/// handler nor the reference [`LlmClientHandler`](agent_lib::agent::LlmClientHandler)
-/// touches the budget, so this thin wrapper is what keeps the budget-aggregation
-/// half of the acceptance honest while still scripting the effect boundary.
-struct ChargingLlmHandler {
+/// Driver-level budget charging happens in `drain` before the response is
+/// resumed into the child machine. This wrapper only gives the assertion a
+/// handler-side log of what the scripted child consumed.
+struct ObservingLlmHandler {
     inner: Arc<dyn LlmHandler>,
     charged: Arc<AtomicU64>,
 }
 
-impl ChargingLlmHandler {
+impl ObservingLlmHandler {
     fn new(inner: Arc<dyn LlmHandler>, charged: Arc<AtomicU64>) -> Self {
         Self { inner, charged }
     }
 }
 
 #[async_trait]
-impl LlmHandler for ChargingLlmHandler {
+impl LlmHandler for ObservingLlmHandler {
     async fn fulfill(
         &self,
         request: &ChatRequest,
@@ -86,8 +84,6 @@ impl LlmHandler for ChargingLlmHandler {
         if let RequirementResult::Llm(Ok(response)) = &result {
             let tokens = u64::from(response.usage.input) + u64::from(response.usage.output);
             self.charged.fetch_add(tokens, Ordering::SeqCst);
-            ctx.charge_tokens(tokens)
-                .expect("charge child usage on the shared ledger");
         }
         result
     }
@@ -186,7 +182,7 @@ async fn attended_parent_serves_headless_child_via_pop() {
     let child_llm = approval_round_trip_llm();
     let child_llm_log = Arc::clone(child_llm.log());
     let child_charged = Arc::new(AtomicU64::new(0));
-    let charging = ChargingLlmHandler::new(Arc::new(child_llm), Arc::clone(&child_charged));
+    let charging = ObservingLlmHandler::new(Arc::new(child_llm), Arc::clone(&child_charged));
 
     let child_registry = weather_registry();
     let child_registry_log = Arc::clone(child_registry.log());
@@ -389,7 +385,7 @@ async fn parent_cancel_propagates_and_abandons_child() {
     let child_llm = approval_round_trip_llm();
     let child_llm_log = Arc::clone(child_llm.log());
     let child_charged = Arc::new(AtomicU64::new(0));
-    let charging = ChargingLlmHandler::new(Arc::new(child_llm), Arc::clone(&child_charged));
+    let charging = ObservingLlmHandler::new(Arc::new(child_llm), Arc::clone(&child_charged));
 
     let child_registry = weather_registry();
     let child_registry_log = Arc::clone(child_registry.log());

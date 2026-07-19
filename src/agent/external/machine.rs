@@ -1650,6 +1650,25 @@ impl AgentMachine for ExternalAgentMachine {
     fn cursor(&self) -> &LoopCursor {
         &self.loop_cursor
     }
+
+    fn interrupt_budget_exhausted(&mut self) -> StepOutcome {
+        if self.state.cursor().has_outstanding_requirement() {
+            self.state.mark_cleanup_required();
+        }
+        if self.state.conversation().pending().is_some() {
+            let _ = self
+                .state
+                .conversation_mut()
+                .cancel_pending(CancelDisposition::DiscardTurn);
+        }
+        self.in_flight = None;
+        self.pending_tool_batch = None;
+        self.settle(
+            ExternalAgentCursor::Done,
+            LoopCursor::done(LoopDoneReason::BudgetExhausted),
+        );
+        StepOutcome::new(Vec::new(), Vec::new(), true)
+    }
 }
 
 /// Maps an [`ExternalAgentCursor`] to the driver-facing [`LoopCursor`] view a

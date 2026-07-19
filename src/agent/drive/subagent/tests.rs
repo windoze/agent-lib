@@ -601,6 +601,7 @@ async fn child_token_charge_counts_against_parent_budget() {
     // The child fulfilled its one LLM requirement and completed.
     assert_eq!(child_llm_calls.load(Ordering::SeqCst), 1);
     assert_eq!(child_log.resumed.load(Ordering::SeqCst), 1);
-    // The child's charge is visible on the parent context's shared ledger.
-    assert_eq!(ctx.budget().snapshot().used().tokens(), CHILD_TOKENS);
+    // The child's explicit charge and the driver's LLM response usage charge are
+    // both visible on the parent context's shared ledger.
+    assert_eq!(ctx.budget().snapshot().used().tokens(), CHILD_TOKENS + 2);
 }

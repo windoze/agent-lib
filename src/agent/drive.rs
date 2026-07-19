@@ -82,8 +82,8 @@ use crate::{
     agent::{
         AgentError, AgentInput, AgentMachine, LlmStepMode, LoopCursor, LoopCursorKind,
         Notification, Requirement, RequirementDisposition, RequirementId, RequirementKind,
-        RequirementResolution, RequirementResult, RunContext, StepInput, ToolSetRef, TraceError,
-        TraceNodeId,
+        RequirementResolution, RequirementResult, RunContext, RunContextError, StepInput,
+        ToolSetRef, TraceError, TraceNodeId,
         effect_manifest::{define_effect_fan_out, with_effect_manifest},
         external::ExternalSessionRequest,
         interaction::Interaction,
@@ -452,6 +452,11 @@ where
             break;
         }
 
+        if budget_precheck_exhausted(ctx, &pending) {
+            settle_budget_exhausted(machine, ctx, pending.iter(), &mut notifications);
+            break;
+        }
+
         let resolutions = fulfill_batch(&pending, scope, parent.as_deref_mut(), ctx).await?;
 
         // Re-check cancellation between the batch settling and feeding the
@@ -472,11 +477,31 @@ where
         }
 
         pending = Vec::new();
-        for Resolved {
-            resolution,
-            resolved_at_scope,
-        } in resolutions
-        {
+        let mut resolutions = resolutions.into_iter();
+        while let Some(resolved) = resolutions.next() {
+            if charge_resolution_budget(ctx, &resolved.resolution).is_err() {
+                record_requirement_resolution(
+                    ctx,
+                    &resolved.resolution,
+                    0,
+                    RequirementDisposition::NeverResumed,
+                );
+                for remaining in resolutions {
+                    record_requirement_resolution(
+                        ctx,
+                        &remaining.resolution,
+                        0,
+                        RequirementDisposition::NeverResumed,
+                    );
+                }
+                let mut outcome = machine.interrupt_budget_exhausted();
+                notifications.append(&mut outcome.notifications);
+                break;
+            }
+            let Resolved {
+                resolution,
+                resolved_at_scope,
+            } = resolved;
             // Every resolution here was settled by a handler and will be fed
             // back, so it is recorded `Resumed` at the scope distance that
             // fulfilled it (migration doc §8).
@@ -549,6 +574,53 @@ fn settle_cancelled<M, I>(
         let mut outcome = machine.step(StepInput::Abandon(item.id()));
         notifications.append(&mut outcome.notifications);
     }
+}
+
+/// Returns whether this batch would start new budgeted model work after a
+/// count-like budget dimension has no headroom left.
+pub(crate) fn budget_precheck_exhausted(ctx: &RunContext, requirements: &[Requirement]) -> bool {
+    requirements.iter().any(requirement_consumes_budget) && ctx.budget_exhausted().is_some()
+}
+
+fn requirement_consumes_budget(requirement: &Requirement) -> bool {
+    matches!(&requirement.kind, RequirementKind::NeedLlm { .. })
+}
+
+/// Charges the budget dimensions represented by a fulfilled requirement before
+/// it is resumed into the machine.
+///
+/// For LLM completions, the driver charges one logical step first and then the
+/// provider-reported token usage. The two charges are intentionally not a
+/// reservation: a sibling context can still consume budget between the preflight
+/// check and these charges, and a successful step charge remains counted even if
+/// the subsequent usage charge trips the token limit.
+pub(crate) fn charge_resolution_budget(
+    ctx: &RunContext,
+    resolution: &RequirementResolution,
+) -> Result<(), RunContextError> {
+    if let RequirementResult::Llm(Ok(response)) = &resolution.result {
+        ctx.charge_step()?;
+        ctx.charge_usage(&response.usage)?;
+    }
+    Ok(())
+}
+
+/// Settles a budget-stopped batch without resuming any of its requirements.
+fn settle_budget_exhausted<M, I>(
+    machine: &mut M,
+    ctx: &RunContext,
+    settled: I,
+    notifications: &mut Vec<Notification>,
+) where
+    M: AgentMachine + ?Sized,
+    I: IntoIterator,
+    I::Item: SettledRef,
+{
+    for item in settled {
+        item.record_never_resumed(ctx);
+    }
+    let mut outcome = machine.interrupt_budget_exhausted();
+    notifications.append(&mut outcome.notifications);
 }
 
 /// Records a settled requirement (identified by its own `Requirement`) in the
@@ -772,11 +844,13 @@ mod tests {
     };
     use crate::{
         agent::{
-            AgentError, AgentErrorKind, AgentId, AgentInput, AgentMachine, ApprovalDecision,
-            ApprovalRequirement, ApprovalResponse, BudgetLimits, LlmStepMode, LoopCursor,
-            LoopCursorKind, LoopDoneReason, Requirement, RequirementDisposition, RequirementId,
-            RunContext, RunId, StepInput, StepOutcome, SubagentOutput, ToolApprovalPolicy,
-            ToolSetId, ToolSetRef, TraceNodeId, TraceNodeKind,
+            AgentError, AgentErrorKind, AgentId, AgentInput, AgentMachine, AgentSpec, AgentState,
+            ApprovalDecision, ApprovalRequirement, ApprovalResponse, BudgetLimits,
+            DefaultAgentMachine, LlmStepMode, LoopCursor, LoopCursorKind, LoopDoneReason,
+            LoopPolicy, ModelRef, Requirement, RequirementDisposition, RequirementError,
+            RequirementId, RequirementIds, RunContext, RunId, StepInput, StepOutcome,
+            SubagentOutput, ToolApprovalPolicy, ToolFailurePolicy, ToolSetId, ToolSetRef,
+            TraceNodeId, TraceNodeKind,
             external::{
                 ExternalAgentOutput, ExternalPermissionMode, ExternalRuntimeKind,
                 ExternalSessionInput, ExternalSessionPolicy, ExternalSessionRef,
@@ -789,7 +863,9 @@ mod tests {
             tool::{ToolRegistry, ToolRuntimeError},
         },
         client::{Capability, ChatRequest, ClientError, LlmClient, Response},
-        conversation::{MessageId, ToolCallId, TurnId},
+        conversation::{
+            Conversation, ConversationConfig, ConversationId, MessageId, ToolCallId, TurnId,
+        },
         model::{
             content::ContentBlock,
             message::{Message, Role},
@@ -807,11 +883,19 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn nz(value: u32) -> std::num::NonZeroU32 {
+        std::num::NonZeroU32::new(value).expect("non-zero fixture value")
+    }
+
     fn run_context() -> RunContext {
+        run_context_with_budget(BudgetLimits::default())
+    }
+
+    fn run_context_with_budget(limits: BudgetLimits) -> RunContext {
         let run_id: RunId = "018f0d9c-7b6a-7c12-8f31-1234567890a1"
             .parse()
             .expect("run id");
-        RunContext::new_root(run_id, BudgetLimits::default(), TraceNodeId::new("root"))
+        RunContext::new_root(run_id, limits, TraceNodeId::new("root"))
     }
 
     fn step_id() -> crate::agent::StepId {
@@ -863,6 +947,50 @@ mod tests {
         "018f0d9c-7b6a-7c12-8f31-1234567890d1"
             .parse()
             .expect("agent id")
+    }
+
+    fn conversation_id() -> ConversationId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890d2"
+            .parse()
+            .expect("conversation id")
+    }
+
+    fn tool_set_id() -> ToolSetId {
+        "018f0d9c-7b6a-7c12-8f31-1234567890d3"
+            .parse()
+            .expect("tool set id")
+    }
+
+    #[derive(Debug)]
+    struct FixedRequirementIds(RequirementId);
+
+    impl RequirementIds for FixedRequirementIds {
+        fn next_requirement_id(
+            &self,
+            _kind_tag: RequirementKindTag,
+        ) -> Result<RequirementId, RequirementError> {
+            Ok(self.0)
+        }
+    }
+
+    fn default_machine() -> DefaultAgentMachine {
+        let spec = AgentSpec::new(
+            agent_id(),
+            WorktreeRef::new("/repo/agent-lib"),
+            None,
+            ToolSetRef::new(tool_set_id(), Vec::new()),
+            ModelRef::new("gpt-5.5", nz(512), Some(0.1), None),
+            LoopPolicy::new(nz(8), nz(1), ToolFailurePolicy::ReturnErrorToModel),
+        );
+        let state = AgentState::new(
+            spec,
+            Conversation::new(conversation_id(), ConversationConfig::default()),
+        );
+        DefaultAgentMachine::new(
+            state,
+            LlmStepMode::NonStreaming,
+            Arc::new(FixedRequirementIds(requirement_id_n(8))),
+        )
     }
 
     fn external_session_request() -> ExternalSessionRequest {
@@ -1192,6 +1320,16 @@ mod tests {
         )
     }
 
+    fn llm_requirement(n: u8) -> Requirement {
+        Requirement::at_root(
+            requirement_id_n(n),
+            RequirementKind::NeedLlm {
+                request: chat_request(),
+                mode: LlmStepMode::NonStreaming,
+            },
+        )
+    }
+
     fn interaction_requirement(n: u8) -> Requirement {
         Requirement::at_root(
             requirement_id_n(n),
@@ -1266,6 +1404,12 @@ mod tests {
 
         fn cursor(&self) -> &LoopCursor {
             &self.cursor
+        }
+
+        fn interrupt_budget_exhausted(&mut self) -> StepOutcome {
+            self.outstanding.clear();
+            self.cursor = LoopCursor::done(LoopDoneReason::BudgetExhausted);
+            StepOutcome::new(Vec::new(), Vec::new(), true)
         }
     }
 
@@ -1672,6 +1816,76 @@ mod tests {
 
         // Terminal state is reached regardless of the reordering.
         assert_eq!(machine.cursor().kind(), LoopCursorKind::Done);
+    }
+
+    #[tokio::test]
+    async fn drain_charges_steps_and_usage_for_successful_llm_responses() {
+        let scope = wrapped_scope();
+        let mut machine = BatchMachine::new(vec![llm_requirement(5)]);
+        let ctx = run_context_with_budget(BudgetLimits::new(Some(2), Some(10), None, None));
+
+        let done = drain(&mut machine, external_input(), &scope, None, &ctx)
+            .await
+            .expect("budgeted drain completes");
+
+        assert!(matches!(done.cursor(), LoopCursor::Done(_)));
+        assert_eq!(machine.resume_order, vec![requirement_id_n(5)]);
+        let budget = ctx.budget().snapshot();
+        assert_eq!(budget.used().steps(), 1);
+        assert_eq!(budget.used().tokens(), 2);
+    }
+
+    #[tokio::test]
+    async fn drain_stops_on_usage_budget_exhaustion_without_resuming_the_response() {
+        let scope = wrapped_scope();
+        let mut machine = BatchMachine::new(vec![llm_requirement(6)]);
+        let ctx = run_context_with_budget(BudgetLimits::new(Some(4), Some(1), None, None));
+
+        let done = drain(&mut machine, external_input(), &scope, None, &ctx)
+            .await
+            .expect("budget exhaustion is a terminal drain outcome");
+
+        match done.cursor() {
+            LoopCursor::Done(done) => assert_eq!(done.reason(), LoopDoneReason::BudgetExhausted),
+            other => panic!("expected budget exhausted terminal cursor, got {other:?}"),
+        }
+        assert!(!done.cancelled(), "budget exhaustion is not cancellation");
+        assert!(machine.resume_order.is_empty());
+
+        let budget = ctx.budget().snapshot();
+        assert_eq!(budget.used().steps(), 1);
+        assert_eq!(
+            budget.used().tokens(),
+            0,
+            "the over-limit usage charge is rejected atomically"
+        );
+        assert_eq!(
+            requirement_trace(&ctx, requirement_id_n(6), RequirementKindTag::Llm),
+            (0, RequirementDisposition::NeverResumed)
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_budget_exhaustion_discards_the_default_machine_uncommitted_turn() {
+        let scope = wrapped_scope();
+        let mut machine = default_machine();
+        let ctx = run_context_with_budget(BudgetLimits::new(Some(4), Some(1), None, None));
+
+        let done = drain(&mut machine, external_input(), &scope, None, &ctx)
+            .await
+            .expect("budget exhaustion is a terminal drain outcome");
+
+        match done.cursor() {
+            LoopCursor::Done(done) => assert_eq!(done.reason(), LoopDoneReason::BudgetExhausted),
+            other => panic!("expected budget exhausted terminal cursor, got {other:?}"),
+        }
+        let conversation = machine.state().conversation();
+        assert!(conversation.pending().is_none());
+        assert_eq!(
+            conversation.turns().len(),
+            0,
+            "the over-budget response never commits the user turn"
+        );
     }
 
     // ----- M5-3: trace records resolved-by-scope and disposition -----
