@@ -32,4 +32,6 @@
 - 已完成门禁：`cargo fmt --all`、默认 clippy、external feature clippy、`cargo test --all --all-targets`、`cargo doc` 全部通过。
 - 已更新 `docs/review-2026-07.md`：M-ERR-4 标注 `✅ 已修复（M7-1）`。
 - 已更新 `TODO.md`：M7-1 标题改为 `[DONE]` 并写入完成记录。
-- 下一步检查 diff/status 并提交本轮变更。
+- 已检查 diff/status，确认改动范围仅限 M7-1 相关代码、测试、审查标注、任务记录与本计划文件。
+- 已提交本轮实现提交：`dca0633 [M7-1] Fix HTTP error classification`。
+- 本轮任务完成；补写本最终进度记录后停止，不继续 M7-2。
