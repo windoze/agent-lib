@@ -169,7 +169,12 @@ fn convert_function_call_item(
         "arguments",
         &format!("function_call item {index}"),
     )?;
-    let input = serde_json::from_str(&arguments).map_err(|error| {
+    let input_json = if arguments.is_empty() {
+        "{}"
+    } else {
+        arguments.as_str()
+    };
+    let input = serde_json::from_str(input_json).map_err(|error| {
         invalid_response(format!(
             "function_call item {index} has invalid JSON arguments: {error}"
         ))

@@ -16,10 +16,11 @@
 //!   frame reproduces the frozen observations and per-turn decision, covering
 //!   text, a shell command, a file patch, an MCP tool call, a policy-declined
 //!   (permission) command, completion, and a failed turn;
-//! - **tolerance / errors** — blank, `turn.started`, top-level `error`,
-//!   `item.updated`, and unknown frames are tolerated while malformed frames
-//!   classify as [`Protocol`](agent_lib::agent::external::ExternalAgentError::Protocol),
-//!   and a `turn.failed` decodes to a classified failure;
+//! - **tolerance / errors** — blank, bounded non-JSON runtime noise,
+//!   `turn.started`, top-level `error`, `item.updated`, and unknown frames are
+//!   tolerated while malformed frames classify as
+//!   [`Protocol`](agent_lib::agent::external::ExternalAgentError::Protocol), and a
+//!   `turn.failed` decodes to a classified failure;
 //! - **redaction** — the committed fixture is free of credential-shaped text.
 //!
 //! The fixture under `tests/fixtures/external/codex/` is the committed source of
@@ -446,8 +447,16 @@ fn codex_cassette_tolerates_unknown_and_blank_frames() {
 /// Corrupt frames classify as [`ExternalAgentError::Protocol`], never a panic.
 #[test]
 fn codex_cassette_rejects_malformed_frames() {
+    let mut decoder = CodexStreamDecoder::new(decode_context());
+    for _ in 0..8 {
+        assert_eq!(decoder.push_line("this is not json"), Ok(None));
+    }
+    match decoder.push_line("this is not json") {
+        Err(ExternalAgentError::Protocol { .. }) => {}
+        other => panic!("expected Protocol after too much non-json noise, got {other:?}"),
+    }
+
     let malformed = [
-        "this is not json",
         &json!([1, 2, 3]).to_string(),
         &json!({ "no_type": true }).to_string(),
         &json!({ "type": 7 }).to_string(),

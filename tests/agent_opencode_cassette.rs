@@ -17,10 +17,11 @@
 //!   text, a shell command, a file patch, a plain tool call, a `task` subagent, a
 //!   permission-rejected tool, a `tool-calls` step that continues the agentic
 //!   loop, a terminal `step_finish` completion, and a failed turn;
-//! - **tolerance / errors** — blank, `step_start`, `reasoning`, a `tool-calls`
-//!   `step_finish`, and unknown frames are tolerated while malformed frames
-//!   classify as [`Protocol`](agent_lib::agent::external::ExternalAgentError::Protocol),
-//!   and an `error` frame decodes to a classified failure;
+//! - **tolerance / errors** — blank, bounded non-JSON runtime noise,
+//!   `step_start`, `reasoning`, a `tool-calls` `step_finish`, and unknown frames
+//!   are tolerated while malformed frames classify as
+//!   [`Protocol`](agent_lib::agent::external::ExternalAgentError::Protocol), and an
+//!   `error` frame decodes to a classified failure;
 //! - **redaction** — the committed fixture is free of credential-shaped text.
 //!
 //! The fixture under `tests/fixtures/external/opencode/` is the committed source of
@@ -602,8 +603,16 @@ fn opencode_cassette_tolerates_unknown_and_blank_frames() {
 /// Corrupt frames classify as [`ExternalAgentError::Protocol`], never a panic.
 #[test]
 fn opencode_cassette_rejects_malformed_frames() {
+    let mut decoder = OpenCodeStreamDecoder::new(decode_context());
+    for _ in 0..8 {
+        assert_eq!(decoder.push_line("this is not json"), Ok(None));
+    }
+    match decoder.push_line("this is not json") {
+        Err(ExternalAgentError::Protocol { .. }) => {}
+        other => panic!("expected Protocol after too much non-json noise, got {other:?}"),
+    }
+
     let malformed = [
-        "this is not json",
         &json!([1, 2, 3]).to_string(),
         &json!({ "no_type": true }).to_string(),
         &json!({ "type": 7 }).to_string(),

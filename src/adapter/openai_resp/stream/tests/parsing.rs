@@ -139,6 +139,41 @@ async fn recorded_tool_stream_keeps_fragments_and_parses_only_at_done() {
 }
 
 #[tokio::test]
+async fn empty_function_arguments_stream_parse_as_empty_object() {
+    let fixture = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_empty_args\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":[],\"usage\":null},\"sequence_number\":0}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc_empty\",\"type\":\"function_call\",\"name\":\"ping\",\"call_id\":\"call_empty\",\"arguments\":\"\"},\"sequence_number\":1}\n\n",
+        "event: response.function_call_arguments.done\n",
+        "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_empty\",\"output_index\":0,\"arguments\":\"\",\"sequence_number\":2}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"fc_empty\",\"type\":\"function_call\",\"name\":\"ping\",\"call_id\":\"call_empty\",\"arguments\":\"\"},\"sequence_number\":3}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_empty_args\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"id\":\"fc_empty\",\"type\":\"function_call\",\"name\":\"ping\",\"call_id\":\"call_empty\",\"arguments\":\"\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}},\"sequence_number\":4}\n\n"
+    );
+    let events = decode_fixture(fixture)
+        .await
+        .expect("decode empty function arguments stream");
+    let input = events.iter().find_map(|event| match event {
+        StreamEvent::ToolInputAvailable { input, .. } => Some(input),
+        _ => None,
+    });
+
+    assert_eq!(input, Some(&json!({})));
+    let response = fold_events(&events).expect("fold empty function arguments stream");
+    assert_eq!(
+        response.message.content,
+        vec![ContentBlock::ToolUse {
+            id: "call_empty".to_owned(),
+            name: "ping".to_owned(),
+            input: json!({}),
+            extra: Map::new(),
+        }]
+    );
+}
+
+#[tokio::test]
 async fn interleaved_function_items_remain_correlated_by_item_id_and_index() {
     let fixture = concat!(
         "event: response.created\n",

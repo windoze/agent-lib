@@ -347,7 +347,12 @@ impl ActiveItem {
                 self.id
             )));
         }
-        let input: Value = serde_json::from_str(&complete).map_err(|error| {
+        let input_json = if complete.is_empty() {
+            "{}"
+        } else {
+            complete.as_str()
+        };
+        let input: Value = serde_json::from_str(input_json).map_err(|error| {
             invalid_stream(format!(
                 "function arguments for item `{}` are invalid JSON: {error}",
                 self.id

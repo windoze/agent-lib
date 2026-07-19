@@ -149,6 +149,7 @@ impl<'de> Deserialize<'de> for Usage {
 }
 
 /// Extracts a normalized counter from a provider-specific nested details map.
+/// Non-object detail values are retained in `extra` as unmodeled provider data.
 fn merge_detail_alias<E>(
     current: u32,
     fields: &mut Map<String, Value>,
@@ -164,9 +165,8 @@ where
     };
 
     let Value::Object(mut details) = details else {
-        return Err(E::custom(format!(
-            "usage field `{detail_key}` must be an object"
-        )));
+        fields.insert(detail_key.to_owned(), details);
+        return Ok(current);
     };
 
     let merged = merge_aliased_value(current, &mut details, aliases, normalized_field)?;
@@ -356,6 +356,27 @@ mod tests {
                 .and_then(Value::as_object)
                 .and_then(|details| details.get("accepted_prediction_tokens")),
             Some(&json!(1))
+        );
+    }
+
+    #[test]
+    fn skips_non_object_provider_details_instead_of_failing() {
+        let usage: Usage = serde_json::from_value(json!({
+            "prompt_tokens": 4,
+            "completion_tokens": 2,
+            "prompt_tokens_details": null,
+            "completion_tokens_details": "not an object"
+        }))
+        .expect("deserialize usage with non-object detail fields");
+
+        assert_eq!(usage.input, 4);
+        assert_eq!(usage.output, 2);
+        assert_eq!(usage.cache_read, 0);
+        assert_eq!(usage.reasoning, 0);
+        assert_eq!(usage.extra.get("prompt_tokens_details"), Some(&Value::Null));
+        assert_eq!(
+            usage.extra.get("completion_tokens_details"),
+            Some(&json!("not an object"))
         );
     }
 

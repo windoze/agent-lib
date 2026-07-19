@@ -300,3 +300,29 @@ async fn interleaved_provider_indices_keep_stable_ids_and_start_order() {
         ]
     );
 }
+
+#[tokio::test]
+async fn message_delta_without_usage_is_accepted() {
+    let fixture = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+    let events = decode_fixture(fixture)
+        .await
+        .expect("decode message_delta without usage");
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::Usage(_)))
+            .count(),
+        1
+    );
+    assert!(events.contains(&StreamEvent::MessageStop {
+        stop_reason: StopReason::normalize("end_turn"),
+    }));
+}

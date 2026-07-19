@@ -1128,8 +1128,9 @@ mod tests {
 
     #[tokio::test]
     async fn claude_code_adapter_advance_propagates_protocol_error_on_malformed_frame() {
-        let (mut session, _written) =
-            session_over(vec![init_frame(), "{ not json".to_owned()], None);
+        let mut frames = vec![init_frame()];
+        frames.extend((0..=8).map(|_| "{ not json".to_owned()));
+        let (mut session, _written) = session_over(frames, None);
         session
             .begin(
                 Some(&start_request(Vec::new()).input),
@@ -1143,7 +1144,7 @@ mod tests {
         let error = session
             .advance(&start_request(Vec::new()).input, &ctx)
             .await
-            .expect_err("a corrupt frame is a protocol error");
+            .expect_err("too much non-json noise is a protocol error");
         assert!(matches!(error, ExternalAgentError::Protocol { .. }));
     }
 

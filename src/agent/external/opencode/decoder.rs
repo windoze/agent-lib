@@ -62,13 +62,13 @@
 //! The decoder is deliberately forgiving of forward-compatible drift but strict
 //! about corruption, so a scheduler sees a stable classification:
 //!
-//! - a blank line, a `step_start` boundary frame, a `reasoning` frame, an
-//!   unknown item `tool`, and an **unknown** top-level `type` are *tolerated* (no
-//!   observation, no error);
-//! - a line that is not valid JSON, not a JSON object, missing a string `type`,
-//!   or a `text` / `tool_use` / `step_finish` frame whose `part` is absent or not
-//!   an object is a real protocol violation and returns
-//!   [`ExternalAgentError::Protocol`].
+//! - a blank line, a bounded run of non-JSON runtime noise, a `step_start`
+//!   boundary frame, a `reasoning` frame, an unknown item `tool`, and an
+//!   **unknown** top-level `type` are *tolerated* (no observation, no error);
+//! - too many consecutive non-JSON lines, a JSON value that is not an object,
+//!   missing a string `type`, or a `text` / `tool_use` / `step_finish` frame
+//!   whose `part` is absent or not an object is a real protocol violation and
+//!   returns [`ExternalAgentError::Protocol`].
 //!
 //! Every diagnostic is a fixed string; no prompt text, command line, tool output,
 //! or credential is ever folded into an error message. The raw runtime-reported
@@ -91,6 +91,8 @@ use crate::agent::external::{
 };
 use crate::model::tool::ToolStatus;
 use crate::model::usage::Usage;
+
+const MAX_CONSECUTIVE_NON_JSON_LINES: usize = 8;
 
 /// Host-supplied context the decoder needs while turning `opencode run --format
 /// json` frames into observations.
@@ -162,6 +164,7 @@ pub struct OpenCodeStreamDecoder {
     usage: Usage,
     cost_micros: u64,
     pending: Vec<ExternalObservedEvent>,
+    consecutive_non_json_lines: usize,
 }
 
 impl OpenCodeStreamDecoder {
@@ -176,6 +179,7 @@ impl OpenCodeStreamDecoder {
             usage: Usage::default(),
             cost_micros: 0,
             pending: Vec::new(),
+            consecutive_non_json_lines: 0,
         }
     }
 
@@ -217,9 +221,10 @@ impl OpenCodeStreamDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`ExternalAgentError::Protocol`] for a line that is not valid
-    /// JSON, is not a JSON object, is missing a string `type`, or is a `text` /
-    /// `tool_use` / `step_finish` frame whose `part` is absent or not an object.
+    /// Returns [`ExternalAgentError::Protocol`] after too many consecutive
+    /// non-JSON lines, or for a JSON line that is not an object, is missing a
+    /// string `type`, or is a `text` / `tool_use` / `step_finish` frame whose
+    /// `part` is absent or not an object.
     pub fn push_line(
         &mut self,
         line: &str,
@@ -229,8 +234,13 @@ impl OpenCodeStreamDecoder {
             return Ok(None);
         }
 
-        let value: Value = serde_json::from_str(trimmed)
-            .map_err(|error| protocol(format!("invalid opencode run json frame: {error}")))?;
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => {
+                self.consecutive_non_json_lines = 0;
+                value
+            }
+            Err(_) => return self.tolerate_non_json_line(),
+        };
         let Some(frame) = value.as_object() else {
             return Err(protocol("opencode run json frame is not a JSON object"));
         };
@@ -266,6 +276,17 @@ impl OpenCodeStreamDecoder {
             self.reset_turn();
         }
         Ok(decision)
+    }
+
+    fn tolerate_non_json_line(&mut self) -> Result<Option<OpenCodeDecision>, ExternalAgentError> {
+        self.consecutive_non_json_lines = self.consecutive_non_json_lines.saturating_add(1);
+        if self.consecutive_non_json_lines <= MAX_CONSECUTIVE_NON_JSON_LINES {
+            return Ok(None);
+        }
+        Err(protocol(format!(
+            "too many consecutive non-json opencode run json lines ({}/{})",
+            self.consecutive_non_json_lines, MAX_CONSECUTIVE_NON_JSON_LINES
+        )))
     }
 
     /// Buffers `event` under the next monotonic sequence number.
@@ -557,4 +578,33 @@ fn protocol(detail: impl Into<String>) -> ExternalAgentError {
 fn is_permission_rejection(error: &str) -> bool {
     error.contains("rejected permission to use this specific tool call")
         || error.contains("prevents you from using this specific tool call")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_json_noise_is_bounded_and_does_not_leak_line_contents() {
+        let mut decoder = OpenCodeStreamDecoder::new(OpenCodeDecodeContext::new());
+        for _ in 0..MAX_CONSECUTIVE_NON_JSON_LINES {
+            assert_eq!(decoder.push_line("runtime warning: warming up"), Ok(None));
+        }
+
+        decoder
+            .push_line(r#"{"type":"step_start","sessionID":"session-1"}"#)
+            .expect("valid JSON resets noise counter");
+        assert_eq!(decoder.session_id(), Some("session-1"));
+
+        for _ in 0..MAX_CONSECUTIVE_NON_JSON_LINES {
+            assert_eq!(decoder.push_line("SECRET=sk-test warning"), Ok(None));
+        }
+        let error = decoder
+            .push_line("SECRET=sk-test warning")
+            .expect_err("too many consecutive non-json lines fail");
+        assert!(matches!(error, ExternalAgentError::Protocol { .. }));
+        let message = error.to_string();
+        assert!(message.contains("too many consecutive non-json"));
+        assert!(!message.contains("sk-test"));
+    }
 }

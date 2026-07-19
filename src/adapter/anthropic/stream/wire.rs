@@ -34,10 +34,11 @@ pub(super) enum WireEvent {
         #[serde(default, flatten)]
         _extra: Map<String, Value>,
     },
-    /// Reports final message metadata and a cumulative usage snapshot.
+    /// Reports final message metadata and an optional cumulative usage snapshot.
     MessageDelta {
         delta: MessageDelta,
-        usage: StreamUsage,
+        #[serde(default)]
+        usage: Option<StreamUsage>,
         #[serde(default, flatten)]
         extra: Map<String, Value>,
     },
@@ -81,6 +82,7 @@ pub(super) struct MessageStart {
     /// Provider-reported response role.
     pub(super) role: Role,
     /// Initial cumulative usage snapshot.
+    #[serde(default)]
     pub(super) usage: StreamUsage,
     /// Response identifiers, model names, and other provider metadata.
     #[serde(default, flatten)]
@@ -145,7 +147,7 @@ pub(super) struct MessageDelta {
 }
 
 /// Anthropic usage counters are cumulative snapshots, not additive chunks.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub(super) struct StreamUsage {
     #[serde(default)]
     pub(super) input_tokens: Option<u32>,

@@ -1339,10 +1339,9 @@ mod tests {
 
     #[tokio::test]
     async fn codex_adapter_advance_propagates_protocol_error_on_malformed_frame() {
-        let launcher = FakeLauncher::new(vec![vec![
-            thread_started(THREAD_ID),
-            "{ not json".to_owned(),
-        ]]);
+        let mut frames = vec![thread_started(THREAD_ID)];
+        frames.extend((0..=8).map(|_| "{ not json".to_owned()));
+        let launcher = FakeLauncher::new(vec![frames]);
         let mut session = session_over(launcher, None);
         session
             .begin(
@@ -1358,7 +1357,7 @@ mod tests {
         let error = session
             .advance(&start_request(Vec::new()).input, &ctx)
             .await
-            .expect_err("a corrupt frame is a protocol error");
+            .expect_err("too much non-json noise is a protocol error");
         assert!(matches!(error, ExternalAgentError::Protocol { .. }));
     }
 

@@ -38,12 +38,13 @@
 //! The decoder is deliberately forgiving of forward-compatible drift but strict
 //! about corruption, so a scheduler sees a stable classification:
 //!
-//! - a blank line, a `stream_event` partial-message frame, an **unknown** `type`,
-//!   an unknown content block, or an uncorrelated `tool_result` is *tolerated*
-//!   (no observation, no error);
-//! - a line that is not valid JSON, not a JSON object, missing a string `type`,
-//!   or a **known** frame whose required inner object is absent is a real
-//!   protocol violation and returns [`ExternalAgentError::Protocol`].
+//! - a blank line, a bounded run of non-JSON runtime noise, a `stream_event`
+//!   partial-message frame, an **unknown** `type`, an unknown content block, or an
+//!   uncorrelated `tool_result` is *tolerated* (no observation, no error);
+//! - too many consecutive non-JSON lines, a JSON value that is not an object,
+//!   missing a string `type`, or a **known** frame whose required inner object is
+//!   absent is a real protocol violation and returns
+//!   [`ExternalAgentError::Protocol`].
 //!
 //! Every diagnostic is a fixed string; no prompt text, tool input, or credential
 //! is ever folded into an error message. The raw runtime-reported text of a
@@ -72,6 +73,8 @@ use crate::agent::interaction::Interaction;
 use crate::agent::permission::{PermissionCategory, PermissionRequest, PermissionRisk};
 use crate::model::tool::ToolStatus;
 use crate::model::usage::Usage;
+
+const MAX_CONSECUTIVE_NON_JSON_LINES: usize = 8;
 
 /// Host-supplied identities the decoder needs to mint a permission
 /// [`Interaction`] when Claude Code asks to use a gated tool.
@@ -158,6 +161,7 @@ pub struct ClaudeStreamDecoder {
     cwd: Option<String>,
     pending: Vec<ExternalObservedEvent>,
     active_tools: BTreeMap<String, ActiveTool>,
+    consecutive_non_json_lines: usize,
 }
 
 impl ClaudeStreamDecoder {
@@ -172,6 +176,7 @@ impl ClaudeStreamDecoder {
             cwd: None,
             pending: Vec::new(),
             active_tools: BTreeMap::new(),
+            consecutive_non_json_lines: 0,
         }
     }
 
@@ -214,17 +219,22 @@ impl ClaudeStreamDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`ExternalAgentError::Protocol`] for a line that is not valid
-    /// JSON, is not a JSON object, is missing a string `type`, or is a known
-    /// frame missing a required inner object.
+    /// Returns [`ExternalAgentError::Protocol`] after too many consecutive
+    /// non-JSON lines, or for a JSON line that is not an object, is missing a
+    /// string `type`, or is a known frame missing a required inner object.
     pub fn push_line(&mut self, line: &str) -> Result<Option<ClaudeDecision>, ExternalAgentError> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return Ok(None);
         }
 
-        let value: Value = serde_json::from_str(trimmed)
-            .map_err(|error| protocol(format!("invalid claude stream-json frame: {error}")))?;
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => {
+                self.consecutive_non_json_lines = 0;
+                value
+            }
+            Err(_) => return self.tolerate_non_json_line(),
+        };
         let Some(frame) = value.as_object() else {
             return Err(protocol("claude stream-json frame is not a JSON object"));
         };
@@ -255,6 +265,17 @@ impl ClaudeStreamDecoder {
             self.active_tools.clear();
         }
         Ok(decision)
+    }
+
+    fn tolerate_non_json_line(&mut self) -> Result<Option<ClaudeDecision>, ExternalAgentError> {
+        self.consecutive_non_json_lines = self.consecutive_non_json_lines.saturating_add(1);
+        if self.consecutive_non_json_lines <= MAX_CONSECUTIVE_NON_JSON_LINES {
+            return Ok(None);
+        }
+        Err(protocol(format!(
+            "too many consecutive non-json claude stream-json lines ({}/{})",
+            self.consecutive_non_json_lines, MAX_CONSECUTIVE_NON_JSON_LINES
+        )))
     }
 
     /// Buffers `event` under the next monotonic sequence number.
@@ -645,4 +666,40 @@ fn parse_usage(value: Option<&Value>) -> Option<Usage> {
         total: None,
         extra: Map::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decoder() -> ClaudeStreamDecoder {
+        let step_id = StepId::parse_str("018f0d9c-7b6a-7c12-8f31-1234567890a3").expect("step id");
+        let agent_id =
+            AgentId::parse_str("018f0d9c-7b6a-7c12-8f31-1234567890a1").expect("agent id");
+        ClaudeStreamDecoder::new(ClaudeDecodeContext::new(step_id, agent_id))
+    }
+
+    #[test]
+    fn non_json_noise_is_bounded_and_does_not_leak_line_contents() {
+        let mut decoder = decoder();
+        for _ in 0..MAX_CONSECUTIVE_NON_JSON_LINES {
+            assert_eq!(decoder.push_line("runtime warning: warming up"), Ok(None));
+        }
+
+        decoder
+            .push_line(r#"{"type":"system","subtype":"init","session_id":"s1"}"#)
+            .expect("valid JSON resets noise counter");
+        assert_eq!(decoder.session_id(), Some("s1"));
+
+        for _ in 0..MAX_CONSECUTIVE_NON_JSON_LINES {
+            assert_eq!(decoder.push_line("SECRET=sk-test warning"), Ok(None));
+        }
+        let error = decoder
+            .push_line("SECRET=sk-test warning")
+            .expect_err("too many consecutive non-json lines fail");
+        assert!(matches!(error, ExternalAgentError::Protocol { .. }));
+        let message = error.to_string();
+        assert!(message.contains("too many consecutive non-json"));
+        assert!(!message.contains("sk-test"));
+    }
 }

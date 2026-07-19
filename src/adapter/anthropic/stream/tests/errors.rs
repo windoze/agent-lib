@@ -148,8 +148,13 @@ async fn block_lifecycle_and_message_stop_requirements_are_enforced() {
         "event: message_stop\n",
         "data: {\"type\":\"message_stop\"}\n\n"
     );
-    let error = decode_fixture(missing_reason)
+    let events = decode_fixture(missing_reason)
         .await
-        .expect_err("message stop without a reason must fail");
-    assert!(error.to_string().contains("without a stop reason"));
+        .expect("message stop without a reason falls back to Other");
+    assert!(events.contains(&StreamEvent::MessageStop {
+        stop_reason: crate::model::normalized::Normalized {
+            value: crate::model::normalized::StopReason::Other,
+            raw: None,
+        },
+    }));
 }

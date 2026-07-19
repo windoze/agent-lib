@@ -320,3 +320,32 @@ fn malformed_wire_data_returns_contextual_protocol_errors() {
         );
     }
 }
+
+#[test]
+fn empty_function_arguments_response_parse_as_empty_object() {
+    let fixture = json!({
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_empty",
+            "name": "ping",
+            "arguments": ""
+        }]
+    });
+    let bytes = serde_json::to_vec(&fixture).expect("serialize response fixture");
+    let response = OpenAiRespAdapter::parse_response(&bytes)
+        .expect("empty function arguments should parse as an empty object");
+
+    let [
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        },
+    ] = response.message.content.as_slice()
+    else {
+        panic!("expected one tool-use block");
+    };
+    assert_eq!(id, "call_empty");
+    assert_eq!(name, "ping");
+    assert_eq!(input, &json!({}));
+}

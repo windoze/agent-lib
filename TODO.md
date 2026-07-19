@@ -1566,7 +1566,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo test -p agent-lib --lib adapter::openai_resp`（33 条全过）、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（默认离线全量通过，真实端点/CLI 测试保持 ignored，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - 无 breaking change（wire 字段仅放宽反序列化；公共 API 与归一化事件形状不变）。
 
-### M7-4 [TODO] 线缆容错批量修复（adapter L2/L3、external L-1、facade L1）
+### M7-4 [DONE] 线缆容错批量修复（adapter L2/L3、external L-1、facade L1）
 
 上下文：
 
@@ -1586,6 +1586,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 每处一条单元测试（空 arguments 流/响应正常、缺 usage 的 message_delta 正常、N 行 noise 后 session 存活、null details 解析成功）。
 - `cargo test -p agent-lib --lib` 与 external feature 测试全过。
+
+完成记录：
+
+- **OpenAI Responses 空 `arguments`**：流式 `response.function_call_arguments.done` 与非流式 `function_call` 转换均把空字符串按 `{}` 解析；非空非法 JSON 仍保留原 Protocol 错误。新增 `empty_function_arguments_stream_parse_as_empty_object` 与 `empty_function_arguments_response_parse_as_empty_object`，分别覆盖 stream/fold 与 complete response 两条路径。
+- **Anthropic stream 可选字段**：`MessageDelta.usage` 改为 `Option<StreamUsage>` + serde default，缺失时不发 usage 段、不终止流；`MessageStart.usage` 补 default，`StreamUsage` 派生 `Default`；`message_stop` 缺 `stop_reason` 时输出 `Normalized { value: StopReason::Other, raw: None }`，不伪造 provider raw 值。新增 `message_delta_without_usage_is_accepted`，并把缺 stop_reason 的既有错误断言改为 fallback 断言。
+- **CLI decoder 非 JSON 噪声**：Claude Code / Codex / OpenCode 三个 decoder 各新增连续非 JSON 行计数，最多容忍 8 行并返回 `Ok(None)`；第 9 行返回固定 `Protocol` 诊断，消息只含计数与 runtime 名，不包含原始行内容。有效 JSON 帧会重置计数。decoder 文档与 cassette suite 顶部说明同步；三套 adapter/cassette 旧的“单行非 JSON 必失败”测试改为“超过上限才失败”，并新增 decoder 级断言证明噪声后 session 仍存活、错误不泄露 `sk-test`。
+- **Usage details 容错**：`Usage` 反序列化遇到非对象 details（如 `prompt_tokens_details: null`）不再报错，而是把原值留在 `extra` 并跳过归一化别名提取。新增 `skips_non_object_provider_details_instead_of_failing`。
+- **文档/审查记录**：`docs/review-2026-07.md` “协议解析边角”中 M7-4 覆盖的四条已标注 `✅ 已修复（M7-4）`；未知 `ContentBlock` 兜底仍未标注，继续由 M7-5 跟进。`PLAN.md` 无阶段级变化，未更新。
+- **验证**：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib`（985 条通过）、`cargo test --all --all-targets`（默认离线全量通过，真实端点/CLI 测试保持 ignored）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（external/acp 全目标通过，真实 CLI 测试 ignored）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。无 breaking change（仅放宽 wire/CLI 容错，公共 API 形状不变）。
 
 ### M7-5 [TODO] `ContentBlock` 增加反序列化兜底 variant（facade 报告 M8，单向兼容）
 

@@ -112,7 +112,10 @@ impl StreamNormalizer {
 
                 let mut metadata = delta.extra;
                 metadata.extend(extra);
-                let mut events = vec![StreamEvent::Usage(self.usage.incremental(usage)?)];
+                let mut events = Vec::new();
+                if let Some(usage) = usage {
+                    events.push(StreamEvent::Usage(self.usage.incremental(usage)?));
+                }
                 push_metadata(&mut events, metadata);
                 Ok(events)
             }
@@ -123,9 +126,10 @@ impl StreamNormalizer {
                         "message_stop arrived before content block index {index} stopped"
                     )));
                 }
-                let stop_reason = self.stop_reason.clone().ok_or_else(|| {
-                    invalid_stream("message_stop arrived without a stop reason".to_owned())
-                })?;
+                let stop_reason = self.stop_reason.clone().unwrap_or(Normalized {
+                    value: StopReason::Other,
+                    raw: None,
+                });
                 self.terminal = true;
                 let mut events = Vec::with_capacity(2);
                 push_metadata(&mut events, extra);

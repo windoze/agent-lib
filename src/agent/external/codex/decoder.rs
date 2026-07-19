@@ -52,15 +52,15 @@
 //! The decoder is deliberately forgiving of forward-compatible drift but strict
 //! about corruption, so a scheduler sees a stable classification:
 //!
-//! - a blank line, a `turn.started` frame, a top-level `error` notice, an
-//!   `item.updated` progress frame, an **unknown** top-level `type`, and an
-//!   unknown or absent item `type` (`reasoning`, `web_search`, `todo_list`,
-//!   `collab_tool_call`, an error item, …) are *tolerated* (no observation, no
-//!   error);
-//! - a line that is not valid JSON, not a JSON object, missing a string `type`,
-//!   a `thread.started` without a `thread_id`, or an `item.*` frame whose `item`
-//!   is absent or not an object is a real protocol violation and returns
-//!   [`ExternalAgentError::Protocol`].
+//! - a blank line, a bounded run of non-JSON runtime noise, a `turn.started`
+//!   frame, a top-level `error` notice, an `item.updated` progress frame, an
+//!   **unknown** top-level `type`, and an unknown or absent item `type`
+//!   (`reasoning`, `web_search`, `todo_list`, `collab_tool_call`, an error item,
+//!   …) are *tolerated* (no observation, no error);
+//! - too many consecutive non-JSON lines, a JSON value that is not an object,
+//!   missing a string `type`, a `thread.started` without a `thread_id`, or an
+//!   `item.*` frame whose `item` is absent or not an object is a real protocol
+//!   violation and returns [`ExternalAgentError::Protocol`].
 //!
 //! Every diagnostic is a fixed string; no prompt text, command line, tool output,
 //! or credential is ever folded into an error message. The raw runtime-reported
@@ -83,6 +83,8 @@ use crate::agent::external::{
 };
 use crate::model::tool::ToolStatus;
 use crate::model::usage::Usage;
+
+const MAX_CONSECUTIVE_NON_JSON_LINES: usize = 8;
 
 /// Host-supplied context the decoder needs while turning `codex exec --json`
 /// frames into observations.
@@ -152,6 +154,7 @@ pub struct CodexStreamDecoder {
     session_id: Option<String>,
     last_message: Option<String>,
     pending: Vec<ExternalObservedEvent>,
+    consecutive_non_json_lines: usize,
 }
 
 impl CodexStreamDecoder {
@@ -164,6 +167,7 @@ impl CodexStreamDecoder {
             session_id: None,
             last_message: None,
             pending: Vec::new(),
+            consecutive_non_json_lines: 0,
         }
     }
 
@@ -206,18 +210,23 @@ impl CodexStreamDecoder {
     ///
     /// # Errors
     ///
-    /// Returns [`ExternalAgentError::Protocol`] for a line that is not valid
-    /// JSON, is not a JSON object, is missing a string `type`, is a
-    /// `thread.started` without a `thread_id`, or is an `item.*` frame whose
-    /// `item` is absent or not an object.
+    /// Returns [`ExternalAgentError::Protocol`] after too many consecutive
+    /// non-JSON lines, or for a JSON line that is not an object, is missing a
+    /// string `type`, is a `thread.started` without a `thread_id`, or is an
+    /// `item.*` frame whose `item` is absent or not an object.
     pub fn push_line(&mut self, line: &str) -> Result<Option<CodexDecision>, ExternalAgentError> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return Ok(None);
         }
 
-        let value: Value = serde_json::from_str(trimmed)
-            .map_err(|error| protocol(format!("invalid codex exec json frame: {error}")))?;
+        let value: Value = match serde_json::from_str(trimmed) {
+            Ok(value) => {
+                self.consecutive_non_json_lines = 0;
+                value
+            }
+            Err(_) => return self.tolerate_non_json_line(),
+        };
         let Some(frame) = value.as_object() else {
             return Err(protocol("codex exec json frame is not a JSON object"));
         };
@@ -256,6 +265,17 @@ impl CodexStreamDecoder {
             self.last_message = None;
         }
         Ok(decision)
+    }
+
+    fn tolerate_non_json_line(&mut self) -> Result<Option<CodexDecision>, ExternalAgentError> {
+        self.consecutive_non_json_lines = self.consecutive_non_json_lines.saturating_add(1);
+        if self.consecutive_non_json_lines <= MAX_CONSECUTIVE_NON_JSON_LINES {
+            return Ok(None);
+        }
+        Err(protocol(format!(
+            "too many consecutive non-json codex exec json lines ({}/{})",
+            self.consecutive_non_json_lines, MAX_CONSECUTIVE_NON_JSON_LINES
+        )))
     }
 
     /// Buffers `event` under the next monotonic sequence number.
@@ -529,4 +549,33 @@ fn parse_usage(value: Option<&Value>) -> Option<Usage> {
         total: None,
         extra: Map::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_json_noise_is_bounded_and_does_not_leak_line_contents() {
+        let mut decoder = CodexStreamDecoder::new(CodexDecodeContext::new());
+        for _ in 0..MAX_CONSECUTIVE_NON_JSON_LINES {
+            assert_eq!(decoder.push_line("runtime warning: warming up"), Ok(None));
+        }
+
+        decoder
+            .push_line(r#"{"type":"thread.started","thread_id":"thread-1"}"#)
+            .expect("valid JSON resets noise counter");
+        assert_eq!(decoder.session_id(), Some("thread-1"));
+
+        for _ in 0..MAX_CONSECUTIVE_NON_JSON_LINES {
+            assert_eq!(decoder.push_line("SECRET=sk-test warning"), Ok(None));
+        }
+        let error = decoder
+            .push_line("SECRET=sk-test warning")
+            .expect_err("too many consecutive non-json lines fail");
+        assert!(matches!(error, ExternalAgentError::Protocol { .. }));
+        let message = error.to_string();
+        assert!(message.contains("too many consecutive non-json"));
+        assert!(!message.contains("sk-test"));
+    }
 }
