@@ -58,6 +58,7 @@
 **Fork(从某点分叉新对话)**:本质是 clone 前缀 + 新建分支。
 - **id 冲突是关键**:provider 分配的 `tool_call_id` 一般不冲突;但框架**内部**生成的 id(message id、分支内序号)在 clone 时必须**重新分配**,否则两分支撞 id,持久化/回放无法区分。
 - **fork 需要 identity**:每条分支有自己的 `ConversationId` / `BranchId`,可选记录 `parent_id + fork_point`,以重建分支树(调试、A/B、agent 多路径探索)。
+- **projection 不随 fork 继承**:child 从共享前缀重建全 raw 投影,父的 compaction 成果(已付费 summary artifact)不回携——取舍与理由见 [docs/conversation-core.md](docs/conversation-core.md) §6.2。
 
 **设计落点:**
 - Conversation 内部不只是 `Vec<Message>`,而要能识别**轮次边界**(或提供"index 归属哪个 turn、turn 是否完整"的查询)。边界检测建立在轮次之上。

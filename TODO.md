@@ -705,7 +705,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::`（162 条全过，含 4 条新测试 0.63s）、`cargo test --all --all-targets`（exit 0，无 FAILED）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - `docs/review-2026-07.md` M-CONV-2 已标注 `✅ 已修复（M3-4）`。无可观察行为变化，无 breaking change。
 
-### M3-5 [TODO] rows 引入代次（generation）键支持会话演进（M-CONV-3，方案 b）
+### M3-5 [DONE] rows 引入代次（generation）键支持会话演进（M-CONV-3，方案 b）
 
 上下文：
 
@@ -721,6 +721,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 决策修正（M3-5-2 落地时）：审查时「事实表不演进」的判断对 `ArtifactRecord` 不成立——artifact **内容**按 `artifact_id` 不可变，但**保留集合**是代次状态：revert 后 re-compaction 会经 `retained_current_artifacts`（`src/conversation/projection/compaction.rs`）丢弃 provenance 不再匹配 active head 的 artifact，且 `artifact_sequence` 随之重排。因此 `ArtifactRecord` 同样引入 `generation`（row schema v3），diff key 带代次；`TurnRecord`/`MessageRecord`/`ToolPairingRecord` 事实表保持原样。
 
 拆解为 M3-5-1 ~ M3-5-4，按序实施。
+
+父任务完成记录：M3-5-1 ~ M3-5-4 已全部落地（各子任务完成记录见下），代次模型（schema v3、最大代次重组、代次键 diff、文档同步）完整生效；`docs/review-2026-07.md` M-CONV-3 的标注按既定口径留待 M3-9 复验时进行。
 
 #### M3-5-1 [DONE] schema 变更：三类行增加 `generation` 字段 + `to_rows` 写入
 
@@ -883,7 +885,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 文档：新 resolver 的 rustdoc 写明两趟规则与「逐 pairing 内容顺序会抢夺显式 sibling 已 claim 的 id」的失败机理；`docs/conversation-core.md` 未覆盖该派生细节（`ToolCallIndex` 在文中仅标注「派生、非事实来源」），无需更新；`docs/review-2026-07.md` M-CONV-6 已标注 `✅ 已修复（M3-7）`。
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::history`（8 条全过）、`cargo test --all --all-targets`（exit 0，约 44s，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。无 breaking change（crate 私有实现修正，pub 类型与 serde 形状未变）。
 
-### M3-8 [TODO] fork 不继承 compaction projection 的文档化（M-CONV-7，方案 a）
+### M3-8 [DONE] fork 不继承 compaction projection 的文档化（M-CONV-7，方案 a）
 
 上下文：
 
@@ -902,6 +904,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 文档措辞与 `fork.rs:92-95` 实现一致（人工核对）。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
 - `cargo test -p agent-lib --lib conversation::boundary` 全过（无行为变化，原样通过）。
+
+完成记录：
+
+- **顺手 bookkeeping**：`TODO.md` M3-5 父标题仍标 `[TODO]` 但其全部子任务 M3-5-1 ~ M3-5-4 均已 `[DONE]` 且 M3-5 自身无独立工作（任务文本明确拆解为四个子任务按序实施），本任务先将父标题补标 `[DONE]` 并附一行父级完成记录；`docs/review-2026-07.md` M-CONV-3 的标注仍按既定口径留待 M3-9。
+- **`src/conversation/boundary/fork.rs`**：模块文档补一段总述（fork 永不继承父 compaction projection，child 以共享前缀的全 raw 投影起步）；`fork_at` doc comment 新增 “# Projection is not inherited” 节——写明取舍（已压缩区间在 child 回退 raw 渲染、父 summary artifact 不回携）、理由（compacted span 与 artifact provenance 经 `CheckedTurnRange` 锚定父 `ConversationId`，继承需逐条重新锚定 + 对 child 重验证，成本不低于重新投影；raw 回退在共享不可变前缀上永远正确）与影响（child 首次请求渲染 token 可能高于父投影视图，需要压缩时对 child 重新 compact，产物归属 child）。实现核对：`fork.rs:92-95` child 无条件 `Projection::raw_for_active_turns`（全 raw spans + 空 artifacts 向量，`projection/mod.rs:404-417`），`CheckedTurnRange` 确携带 `conversation_id` owner 锚点（`projection/mod.rs:150-154`）——文档与实现一致。私有 `raw_for_active_turns` 不做 intra-doc link（M1-2 已知 `-D warnings` 下私有链接报错），以明文引用。
+- **`docs/conversation-core.md`**：新增 §6.2 “fork 不继承 compaction projection（M3-8 / M-CONV-7，已定方案 a）”，与 rustdoc 同口径（两点理由 + 影响 + 对 child 重新 compact 的指引）。TODO 文本所称 “§7（compaction/projection 相关节）” 按括号内意图定位到当前的 compaction/projection 章（§6），以 §6.2 落位（行号漂移，任务单头部已声明以符号为准）。
+- **DESIGN.md**：§Revert / Fork 的 Fork 段补一条交叉引用 bullet（projection 不随 fork 继承，指向 conversation-core.md §6.2）。
+- **`docs/review-2026-07.md`**：M-CONV-7 标注 `📄 已降级（文档承认现状，M3-8）`——决策为方案 a（行为不变、文档承认现状），是本任务单首个 📄 标注；审查原文 “语义正确但成本高，文档未说明此取舍” 的文档缺口由本次三处文档补齐。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::boundary`（23 条全过，无行为变化）、`cargo test -p agent-lib --doc`（12 条全过，含 `fork_at` doctest）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。全量测试套件按既定政策跳过——自 M3-7 绿色全量运行以来仅 rustdoc 注释与 markdown 文档变更，不影响编译输出，沿用前次绿色结果。
+- 无 breaking change（纯文档）。
 
 ### M3-9 [TODO] M3 review：Conversation 正确性收口
 

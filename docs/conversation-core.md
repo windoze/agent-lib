@@ -223,6 +223,21 @@ lineage 末尾(`active_len == lineage_len`),否则返回 `CompactionOnRevertedHe
 会静默丢失 `head..lineage_len` 的 turn,且无法自愈。要压缩 reverted 的状态,先 redo 到
 lineage 末尾再应用 plan。
 
+### 6.2 fork 不继承 compaction projection(M3-8 / M-CONV-7,已定方案 a)
+
+`fork_at` 创建的 child **不继承**父的 compacted span 与 summary artifact:child 的 projection
+以共享前缀整体重建为 raw span(见 `src/conversation/boundary/fork.rs`),父已压缩的区间在
+child 中回退为 raw 渲染。理由:
+
+1. **owner 身份独立**:compacted span 的 `covers`/`turns` 是锚定父 `ConversationId` 的
+   `CheckedTurnRange`,artifact provenance 同样按 owner 校验;继承需要对每条 span 与 artifact
+   重新锚定并对 child 重验证,成本不低于重新投影。
+2. **raw 回退永远正确**:raw turns 不可变且经 fork O(1) 共享,child 以 raw 渲染共享前缀不依赖
+   任何跨 conversation 校验。
+
+影响:child 首次请求的渲染 token 数可能高于父的投影视图(已付费的压缩成果不随 fork 转移)。
+child 需要压缩时应对 child 自身重新 compact,产出的 artifact 归属 child。
+
 ## 7. Identity 与 id 策略
 
 ```rust

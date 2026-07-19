@@ -1,4 +1,10 @@
 //! Checked O(1) fork creation from a complete-Turn boundary.
+//!
+//! A fork never inherits the parent's compaction projection: the child starts
+//! with an all-raw projection over the shared prefix, so ranges the parent had
+//! already compacted fall back to raw rendering in the child, and the parent's
+//! summary artifacts are not carried over. See [`Conversation::fork_at`] for
+//! the trade-off and its cost implications.
 
 use super::{Boundary, Conversation};
 use crate::conversation::{ConversationError, ConversationId, ForkError};
@@ -45,6 +51,22 @@ impl Conversation {
     /// parent suffixes above the fork point are not child facts, boundaries, or
     /// raw turns. Later parent and child commits, cancels, reverts, and derived
     /// index updates are independent.
+    ///
+    /// # Projection is not inherited
+    ///
+    /// The child does **not** inherit the parent's compaction projection: its
+    /// projection is rebuilt as raw spans over the shared prefix, so a range
+    /// the parent had already compacted renders as raw turns in the child and
+    /// the parent's summary artifacts are not carried over. This is a
+    /// deliberate trade-off. Compacted spans and artifact provenance are
+    /// anchored to the parent's [`ConversationId`] through `CheckedTurnRange`
+    /// owner checks, so inheriting them would require re-anchoring and
+    /// re-validating every span and artifact against the child — as expensive
+    /// as re-projecting — while the raw fallback is always correct over the
+    /// shared immutable prefix. The consequence: the child's first request may
+    /// render more tokens than the parent's projected view. If the child needs
+    /// a compacted overlay, compact the child itself; the artifacts it
+    /// produces belong to the child.
     ///
     /// ```
     /// use agent_lib::conversation::{Conversation, ConversationConfig, ConversationId};
