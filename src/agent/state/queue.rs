@@ -228,9 +228,6 @@ pub enum ReconfigRequest {
     },
 }
 
-/// Backwards-compatible name for a queued reconfiguration request.
-pub type QueuedReconfig = ReconfigRequest;
-
 impl ReconfigRequest {
     /// Creates a checked active-skill replacement intent.
     ///

@@ -78,6 +78,7 @@ fn call(name: &str, input: Value) -> ToolCall {
         id: "provider-call-1".to_owned(),
         name: name.to_owned(),
         input,
+        extra: Map::new(),
     }
 }
 

@@ -199,7 +199,7 @@ fn closed_turn_has_ordered_messages_parallel_pairings_parent_and_meta() {
         CALL_MSG_ID
     );
     assert_eq!(
-        turn.meta().responses()[1].stop_reason().value,
+        *turn.meta().responses()[1].stop_reason().value(),
         StopReason::EndTurn
     );
 }

@@ -694,11 +694,15 @@ impl DefaultAgentMachine {
             .iter()
             .filter_map(|block| match block {
                 ContentBlock::ToolUse {
-                    id, name, input, ..
+                    id,
+                    name,
+                    input,
+                    extra,
                 } => Some(ToolCall {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
+                    extra: extra.clone(),
                 }),
                 ContentBlock::Text { .. }
                 | ContentBlock::Image { .. }

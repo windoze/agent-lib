@@ -32,7 +32,9 @@ use crate::conversation::{
     AssistantFinish, CancelDisposition, Conversation, ConversationConfig, ConversationSnapshot,
     TurnMeta,
 };
-use crate::facade::config::{ModelConfig, ProviderConfig, ensure_provider_extras_match_provider};
+use crate::facade::config::{
+    ModelConfig, ProviderConfig, ensure_non_blank_model, ensure_provider_extras_match_provider,
+};
 use crate::facade::error::FacadeError;
 use crate::facade::ids::FacadeIds;
 use crate::facade::run::{IntoUserMessage, Reply, RunOutput};
@@ -342,13 +344,14 @@ impl ChatBuilder {
         let model_name = self.model.ok_or_else(|| {
             FacadeError::Config("chat configuration is missing a `model`".to_owned())
         })?;
+        let model_name = ensure_non_blank_model("chat", model_name)?;
 
         let mut model = ModelConfig::new(model_name);
         if let Some(max_tokens) = self.max_tokens {
             model = model.max_tokens(max_tokens);
         }
         if let Some(temperature) = self.temperature {
-            model = model.temperature(temperature);
+            model = model.temperature(temperature)?;
         }
         if let Some(provider_extras) = &self.provider_extras {
             ensure_provider_extras_match_provider(
@@ -627,7 +630,9 @@ impl ChatSession {
 ///
 /// The builder inherits the originating [`Chat`]'s client, model, identity
 /// source, and system prompt. Use [`system`](ChatSessionBuilder::system) to
-/// override the inherited system prompt for this session only.
+/// override the inherited system prompt for this session only, or
+/// [`clear_system`](ChatSessionBuilder::clear_system) to explicitly start without
+/// one.
 #[derive(Clone)]
 pub struct ChatSessionBuilder {
     chat: Chat,
@@ -662,6 +667,14 @@ impl ChatSessionBuilder {
     #[must_use]
     pub fn system(mut self, system: impl Into<String>) -> Self {
         self.system = Some(system.into());
+        self.system_overridden = true;
+        self
+    }
+
+    /// Clears the inherited system prompt for this session.
+    #[must_use]
+    pub fn clear_system(mut self) -> Self {
+        self.system = None;
         self.system_overridden = true;
         self
     }

@@ -93,8 +93,8 @@ pub use spec::{AgentSpec, LoopPolicy, ModelRef, ToolFailurePolicy, ToolSetRef, W
 pub use state::{
     AgentRuntimeHandles, AgentState, AgentStateError, ApprovalCursor, CancelRecoveryCursor,
     CancelRecoveryReason, CursorRequirement, DoneCursor, ErrorCursor, ErrorCursorKind, LoopCursor,
-    LoopCursorKind, LoopDoneReason, PivotSource, QueuedPivot, QueuedReconfig, ReconfigCursor,
-    ReconfigQueue, ReconfigRequest, StepCursor, ToolSetPatch, ToolWaitCursor, ToolWaitRequirements,
+    LoopCursorKind, LoopDoneReason, PivotSource, QueuedPivot, ReconfigCursor, ReconfigQueue,
+    ReconfigRequest, StepCursor, ToolSetPatch, ToolWaitCursor, ToolWaitRequirements,
 };
 pub use tool::{
     DeclaredOnlyToolRegistry, DeclaredOnlyToolRegistryResolver, NoToolExecutionIds,

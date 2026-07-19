@@ -15,6 +15,11 @@
 //!   classified errors, requests, responses, and the dyn-safe client trait.
 //! - [`adapter`] implements the Anthropic Messages and OpenAI Responses HTTP
 //!   and SSE protocols.
+//! - [`facade`] is the batteries-included assembly layer most applications should
+//!   start with: it wires provider/client config, one-shot [`facade::Chat`],
+//!   stateful [`facade::ChatSession`], tool-using [`facade::Agent`], typed tools,
+//!   approvals, delegation, managed external agents, cancellation, budgets, and
+//!   snapshot/restore without hiding the lower layers.
 //! - [`agent`] defines data-only Agent identity/static configuration, the
 //!   single-Conversation [`agent::AgentState`] and [`agent::LoopCursor`]
 //!   recovery boundary, run-level cancellation, budget, and trace context

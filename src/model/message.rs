@@ -65,6 +65,7 @@ mod tests {
             id: "toolu_weather_1".to_owned(),
             name: "get_weather".to_owned(),
             input: json!({ "city": "Shanghai" }),
+            extra: empty_extra(),
         };
         let response = ToolResponse {
             tool_call_id: call.id.clone(),

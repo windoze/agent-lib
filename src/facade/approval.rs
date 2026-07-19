@@ -615,7 +615,7 @@ impl FacadeApproval {
     fn record_pending(&self, call_id: ToolCallId, call: &ToolCall, reason: Option<String>) {
         let request = ApprovalRequest {
             tool_name: call.name.clone(),
-            call_id: call_id.to_string(),
+            call_id: Some(call_id.to_string()),
             reason,
             input: summarize_tool_input(&call.input),
         };
@@ -683,6 +683,18 @@ impl FacadeApproval {
             .get(&call_id)
             .map(|decision| decision.request().clone())
     }
+
+    /// Clears any pending approval decisions left by a completed or abandoned run.
+    ///
+    /// Host-injected interaction handlers answer approvals without consuming the
+    /// fallback [`FacadeApproval`] entry, so each facade run drops residual entries
+    /// at its boundary rather than letting them leak into later runs.
+    pub(crate) fn clear_pending(&self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
+    }
 }
 
 /// Builds the enriched [`ApprovalRequest`] a paused approval interaction should
@@ -707,7 +719,7 @@ pub(crate) fn enriched_approval_request(
     let mut request = approval
         .pending_request(call_id)
         .unwrap_or_else(|| ApprovalRequest::for_tool(String::new()));
-    request.call_id = call_id.to_string();
+    request.call_id = Some(call_id.to_string());
     request.reason = requirement.reason().map(ToOwned::to_owned);
     request
 }
@@ -811,7 +823,7 @@ mod tests {
     };
     use crate::conversation::ToolCallId;
     use crate::model::tool::ToolCall;
-    use serde_json::json;
+    use serde_json::{Map, json};
     use uuid::Uuid;
 
     fn uuid(seed: u128) -> Uuid {
@@ -831,6 +843,7 @@ mod tests {
             id: format!("call-{name}"),
             name: name.to_owned(),
             input: json!({}),
+            extra: Map::new(),
         }
     }
 
@@ -1087,6 +1100,7 @@ mod tests {
             id: "call-x".to_owned(),
             name: "deploy".to_owned(),
             input: json!({ "region": "us", "api_key": "sk-secret", "token": "abc" }),
+            extra: Map::new(),
         };
         bridge.approval_requirement(id, &call);
 
@@ -1094,7 +1108,8 @@ mod tests {
             .pending_request(id)
             .expect("a pending require-approval decision was recorded");
         assert_eq!(request.tool_name, "deploy");
-        assert_eq!(request.call_id, id.to_string());
+        let id_text = id.to_string();
+        assert_eq!(request.call_id.as_deref(), Some(id_text.as_str()));
         assert_eq!(
             request.reason.as_deref(),
             Some("approve execution of tool `deploy`")
@@ -1133,6 +1148,19 @@ mod tests {
     }
 
     #[test]
+    fn clear_pending_drops_unconsumed_decisions() {
+        let bridge = FacadeApproval::new(ApprovalPolicy::new(Approval::auto_deny()));
+        let id = call_id();
+        bridge.approval_requirement(id, &call("shell"));
+        assert!(bridge.pending_request(id).is_some());
+
+        bridge.clear_pending();
+
+        assert!(bridge.pending_request(id).is_none());
+        assert!(bridge.pending_tool_name(id).is_none());
+    }
+
+    #[test]
     fn input_summary_is_size_bounded() {
         let bridge = FacadeApproval::new(ApprovalPolicy::new(Approval::auto_deny()));
         let id = call_id();
@@ -1141,6 +1169,7 @@ mod tests {
             id: "call-big".to_owned(),
             name: "write".to_owned(),
             input: json!({ "blob": big }),
+            extra: Map::new(),
         };
         bridge.approval_requirement(id, &call);
 

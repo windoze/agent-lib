@@ -293,6 +293,7 @@ mod tests {
             id: "call-weather".to_owned(),
             name: "get_weather".to_owned(),
             input: json!({ "city": "Shanghai" }),
+            extra: Map::new(),
         }
     }
 

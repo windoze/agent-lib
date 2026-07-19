@@ -345,10 +345,14 @@ impl ModelConfig {
     }
 
     /// Sets the sampling temperature.
-    #[must_use]
-    pub fn temperature(mut self, temperature: f32) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacadeError::Config`] when `temperature` is `NaN` or infinite.
+    pub fn temperature(mut self, temperature: f32) -> Result<Self, FacadeError> {
+        ensure_finite_temperature("model", temperature)?;
         self.temperature = Some(temperature);
-        self
+        Ok(self)
     }
 
     /// Sets provider-specific request extras, bound to their target provider.
@@ -403,6 +407,30 @@ impl ModelConfig {
         request.temperature = self.temperature;
         request.provider_extras = self.provider_extras.clone();
     }
+}
+
+/// Verifies a model or deployment identifier is not blank.
+pub(crate) fn ensure_non_blank_model(builder: &str, model: String) -> Result<String, FacadeError> {
+    if model.trim().is_empty() {
+        return Err(FacadeError::Config(format!(
+            "{builder} configuration has a blank `model`"
+        )));
+    }
+    Ok(model)
+}
+
+/// Verifies a sampling temperature can be serialized as a finite JSON number.
+pub(crate) fn ensure_finite_temperature(
+    builder: &str,
+    temperature: f32,
+) -> Result<f32, FacadeError> {
+    if temperature.is_finite() {
+        return Ok(temperature);
+    }
+
+    Err(FacadeError::Config(format!(
+        "{builder} configuration has a non-finite `temperature`"
+    )))
 }
 
 /// Verifies builder-level provider extras target the configured provider.

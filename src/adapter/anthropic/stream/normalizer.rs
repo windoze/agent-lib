@@ -126,10 +126,10 @@ impl StreamNormalizer {
                         "message_stop arrived before content block index {index} stopped"
                     )));
                 }
-                let stop_reason = self.stop_reason.clone().unwrap_or(Normalized {
-                    value: StopReason::Other,
-                    raw: None,
-                });
+                let stop_reason = self
+                    .stop_reason
+                    .clone()
+                    .unwrap_or_else(|| Normalized::without_raw(StopReason::Other));
                 self.terminal = true;
                 let mut events = Vec::with_capacity(2);
                 push_metadata(&mut events, extra);

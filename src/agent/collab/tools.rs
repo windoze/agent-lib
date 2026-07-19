@@ -723,6 +723,7 @@ impl CollabToolHandler {
             id: outer_call_id.to_owned(),
             name,
             input: inner_input,
+            extra: Map::new(),
         };
         let mut response = host_tools.execute(call_id, inner_call).await?;
         // Re-pair the response with the outer provider call id so the model

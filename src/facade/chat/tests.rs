@@ -229,6 +229,35 @@ fn builder_requires_a_model() {
 }
 
 #[test]
+fn builder_rejects_blank_model() {
+    let error = ChatBuilder::default()
+        .client(Arc::new(FakeClient::new(text_response("x"))))
+        .model("   ")
+        .build()
+        .expect_err("blank model is rejected");
+
+    let FacadeError::Config(message) = error else {
+        panic!("expected config error")
+    };
+    assert!(message.contains("model"));
+}
+
+#[test]
+fn builder_rejects_non_finite_temperature() {
+    let error = ChatBuilder::default()
+        .client(Arc::new(FakeClient::new(text_response("x"))))
+        .model("test-model")
+        .temperature(f32::NAN)
+        .build()
+        .expect_err("non-finite temperature is rejected");
+
+    let FacadeError::Config(message) = error else {
+        panic!("expected config error")
+    };
+    assert!(message.contains("temperature"));
+}
+
+#[test]
 fn builder_requires_a_client_or_provider() {
     let error = ChatBuilder::default()
         .model("test-model")
@@ -297,6 +326,22 @@ async fn session_system_override_replaces_inherited_prompt() {
 
     let requests = client.requests.lock().expect("requests mutex");
     assert_eq!(requests[0].system.as_deref(), Some("Only speak French."));
+}
+
+#[tokio::test]
+async fn session_clear_system_removes_inherited_prompt() {
+    let client = Arc::new(FakeClient::new(text_response("ok")));
+    let chat = chat_with(client.clone());
+    let mut session = chat
+        .session()
+        .clear_system()
+        .build()
+        .expect("build session");
+
+    session.send("hello").await.expect("send");
+
+    let requests = client.requests.lock().expect("requests mutex");
+    assert_eq!(requests[0].system, None);
 }
 
 #[tokio::test]

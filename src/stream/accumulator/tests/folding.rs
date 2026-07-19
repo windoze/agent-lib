@@ -112,7 +112,7 @@ fn folds_interleaved_blocks_and_three_tool_json_fragments_in_start_order() {
     assert_eq!(response.usage.input, 10);
     assert_eq!(response.usage.output, 4);
     assert_eq!(response.usage.reasoning, 1);
-    assert_eq!(response.stop_reason.value, StopReason::ToolUse);
+    assert_eq!(*response.stop_reason.value(), StopReason::ToolUse);
     assert!(response.extra.is_empty());
 }
 

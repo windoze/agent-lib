@@ -15,11 +15,10 @@
 //! - [`IntoUserMessage`] — the input conversion used by every `ask`/`send`
 //!   entry point.
 //!
-//! Milestone 1 only produces the [`RunEvent::TextDelta`], [`RunEvent::Done`],
-//! [`RunEvent::RawStream`], and [`RunEvent::RawNotification`] variants and the
-//! supervisor slice of [`UsageSummary`]; the delegation- and tool-related
-//! variants and trace types are defined now (so the enum shape is stable) but
-//! are populated by later milestones. See `docs/facade-api.md` §5.2 and §6.
+//! Current facade drives populate text, tool, approval, delegation, escalation,
+//! raw, and terminal events as applicable. The public event enums are explicitly
+//! non-exhaustive; UI and cross-process hosts should include a fallback arm when
+//! matching them. See `docs/facade-api.md` §5.2 and §6.
 
 use serde::{Deserialize, Serialize};
 
@@ -95,7 +94,7 @@ impl From<&Response> for Reply {
         Self {
             text: aggregate_text(&response.message.content),
             usage: Some(response.usage.clone()),
-            stop_reason: Some(response.stop_reason.value),
+            stop_reason: Some(*response.stop_reason.value()),
         }
     }
 }
@@ -121,8 +120,9 @@ fn aggregate_text(content: &[ContentBlock]) -> String {
 /// have no one-to-one LLM `Response` yet still report a `reply`, `delegations`,
 /// `artifacts`, and `events` (see `docs/facade-api.md` §6.2).
 ///
-/// Milestone 1 leaves `tool_calls`, `delegations`, `artifacts`, and `events`
-/// empty; later milestones populate them.
+/// The concrete run path determines which trace and event collections are filled:
+/// plain chat usually leaves them empty, while agent runs can populate tool,
+/// approval, delegation, artifact, and escalation lifecycle data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunOutput {
     /// The minimal successful result.
@@ -222,8 +222,9 @@ pub struct WireRunOutput {
 ///
 /// The facade separates usage reported by the supervisor model, by local
 /// subagents, and by external runtimes so a caller can attribute cost. Use
-/// [`UsageSummary::total`] for the combined figure. Milestone 1 only fills the
-/// `supervisor` slice.
+/// [`UsageSummary::total`] for the combined figure. Plain supervisor runs fill
+/// the `supervisor` slice; local subagent and managed external delegation paths
+/// fill their respective slices.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageSummary {
     /// Usage reported by the top-level supervisor model.
@@ -279,10 +280,8 @@ impl UsageSummary {
 /// derive `serde` (see `PLAN.md` R7); the normalized leaf types (for example
 /// [`Reply`] and [`UsageSummary`]) remain serializable on their own.
 ///
-/// Milestone 1 only produces [`RunEvent::TextDelta`], [`RunEvent::Done`],
-/// [`RunEvent::RawStream`], and [`RunEvent::RawNotification`]. The remaining
-/// tool- and delegation-related variants are defined now so the enum shape is
-/// stable, and are produced by later milestones.
+/// The enum is non-exhaustive. Downstream renderers should include a wildcard arm
+/// so new lifecycle events can be added without forcing a lockstep update.
 ///
 /// # Streaming vs non-streaming
 ///
@@ -296,6 +295,7 @@ impl UsageSummary {
 /// [`Done`](RunEvent::Done) are **streaming-only**; the non-streaming path never
 /// fabricates token deltas (see `docs/facade-api.md` §6.2.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RunEvent {
     /// An incremental chunk of assistant text.
     ///
@@ -416,6 +416,7 @@ pub enum RawEventKind {
 /// `snake_case`), matching [`Notification`]'s wire shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum WireRunEvent {
     /// An incremental chunk of assistant text.
     TextDelta(String),
@@ -454,7 +455,6 @@ pub enum WireRunEvent {
 
 /// Placeholder trace for a single tool invocation.
 ///
-/// Milestone 1 never produces this; the Agent facade (Milestone 2) fills it in.
 /// The field set is minimal and may grow (the type is `#[non_exhaustive]`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -475,8 +475,8 @@ pub struct ToolTrace {
 ///
 /// - [`tool_name`](Self::tool_name) — the tool whose execution is paused.
 /// - [`call_id`](Self::call_id) — the framework tool-call id the decision must
-///   address, stringified. Empty only for the synchronous external-delegate
-///   start path (which has no framework call id).
+///   address, stringified. `None` only for the synchronous external-delegate
+///   start path, which has no framework call id.
 /// - [`reason`](Self::reason) — the stable, model-visible reason carried by the
 ///   underlying [`ApprovalRequirement`](crate::agent::ApprovalRequirement), if
 ///   any.
@@ -493,9 +493,10 @@ pub struct ApprovalRequest {
     pub tool_name: String,
     /// Framework tool-call id the approval decision must address (stringified).
     ///
-    /// Empty for the synchronous external-delegate start path, which is gated
+    /// `None` for the synchronous external-delegate start path, which is gated
     /// before any framework call id exists.
-    pub call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     /// Stable, model-visible reason for the pause, if the requirement carried one.
     pub reason: Option<String>,
     /// Compact, redaction-safe summary of the tool arguments (never the raw
@@ -514,7 +515,7 @@ impl ApprovalRequest {
     pub fn for_tool(tool_name: impl Into<String>) -> Self {
         Self {
             tool_name: tool_name.into(),
-            call_id: String::new(),
+            call_id: None,
             reason: None,
             input: None,
         }

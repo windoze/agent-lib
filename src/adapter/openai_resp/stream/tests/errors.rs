@@ -197,7 +197,7 @@ async fn incomplete_response_maps_stop_reason_and_unknown_events_are_retained() 
         .expect("decode incomplete response with extension event");
     let response = fold_events(&events).expect("fold incomplete response");
 
-    assert_eq!(response.stop_reason.value, StopReason::MaxTokens);
+    assert_eq!(*response.stop_reason.value(), StopReason::MaxTokens);
     assert_eq!(response.usage.input, 7);
     assert_eq!(response.usage.output, 4);
     assert_eq!(

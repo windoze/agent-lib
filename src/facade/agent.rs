@@ -61,7 +61,9 @@ use crate::conversation::{Conversation, ConversationConfig};
 use crate::facade::approval::{ApprovalPolicy, FacadeApproval, enriched_approval_request};
 use crate::facade::chat::client_for_provider;
 use crate::facade::collab::{CollabBridge, CollabState, Collaboration, resolve};
-use crate::facade::config::{ModelConfig, ProviderConfig, ensure_provider_extras_match_provider};
+use crate::facade::config::{
+    ModelConfig, ProviderConfig, ensure_non_blank_model, ensure_provider_extras_match_provider,
+};
 use crate::facade::delegate::{
     AgentWorkerBuilder, DISPATCHER_ESCALATE_MARKER, Delegation, DelegationRecorder,
     DelegationRoute, DelegationToolHandler, DispatcherConfig, LocalSubagent, RecordedDelegation,
@@ -304,6 +306,24 @@ impl Drop for RunFullDropGuard {
     }
 }
 
+/// Clears approval decisions recorded during a facade run at every exit path.
+struct ApprovalPendingGuard {
+    approval: Arc<FacadeApproval>,
+}
+
+impl ApprovalPendingGuard {
+    fn new(approval: Arc<FacadeApproval>) -> Self {
+        approval.clear_pending();
+        Self { approval }
+    }
+}
+
+impl Drop for ApprovalPendingGuard {
+    fn drop(&mut self) {
+        self.approval.clear_pending();
+    }
+}
+
 impl Agent {
     /// Starts a fluent [`AgentBuilder`].
     #[must_use]
@@ -414,6 +434,7 @@ impl Agent {
         input: impl IntoUserMessage,
         cancel: CancelHandle,
     ) -> Result<RunOutput, FacadeError> {
+        let _approval_guard = ApprovalPendingGuard::new(self.approval.clone());
         let message = input.into_user_message();
 
         // Rules-routed delegation routes the whole task to a delegate the model
@@ -1431,6 +1452,7 @@ impl AgentBuilder {
         let model_name = self.model.ok_or_else(|| {
             FacadeError::Config("agent configuration is missing a `model`".to_owned())
         })?;
+        let model_name = ensure_non_blank_model("agent", model_name)?;
         if let Some(provider_extras) = &self.provider_extras {
             ensure_provider_extras_match_provider(
                 "agent",
@@ -1453,7 +1475,7 @@ impl AgentBuilder {
             model = model.max_tokens(max_tokens);
         }
         if let Some(temperature) = self.temperature {
-            model = model.temperature(temperature);
+            model = model.temperature(temperature)?;
         }
         if let Some(provider_extras) = self.provider_extras {
             model = model.provider_extras(provider_extras);
@@ -1602,6 +1624,8 @@ fn validate_delegation_references(
     delegates: &[LocalSubagent],
     external_agents: &[ManagedExternalDelegate],
 ) -> Result<(), FacadeError> {
+    delegation.validate_configuration()?;
+
     // Rules-routed delegation names delegates by string; a name no agent
     // registered can never route, so reject it up front (§13.2).
     if let Some(unknown) = delegation.first_unknown_rule_delegate(delegates, external_agents) {
@@ -1745,7 +1769,7 @@ fn weave_approval_events(events: Vec<RunEvent>, approvals: Vec<ApprovalRequest>)
             // call, so any earlier denied approvals keep their relative order.
             if let Some(offset) = approvals[next..]
                 .iter()
-                .position(|approval| approval.call_id == call_id)
+                .position(|approval| approval.call_id.as_deref() == Some(call_id))
             {
                 let through = next + offset;
                 for approval in &approvals[next..=through] {
@@ -2057,7 +2081,7 @@ fn build_rules_routed_output(record: &RecordedDelegation, summary: String) -> Ru
         }
     }
     RunOutput {
-        reply: Reply::from_parts(summary, Some(crate::model::usage::Usage::default()), None),
+        reply: Reply::from_parts(summary, None, None),
         response: None,
         usage,
         tool_calls: Vec::new(),
@@ -2234,11 +2258,7 @@ pub(crate) async fn drive_dispatcher_routed(
     }
 
     let output = RunOutput {
-        reply: Reply::from_parts(
-            final_summary,
-            Some(crate::model::usage::Usage::default()),
-            None,
-        ),
+        reply: Reply::from_parts(final_summary, None, None),
         response: None,
         usage: acc.usage,
         tool_calls: Vec::new(),
@@ -2496,7 +2516,7 @@ pub(crate) fn final_turn_summary(
         .meta()
         .responses()
         .last()
-        .map(|response| response.stop_reason().value);
+        .map(|response| *response.stop_reason().value());
     (text, usage, stop_reason)
 }
 

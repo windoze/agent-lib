@@ -162,7 +162,7 @@ async fn openai_responses_non_streaming_text_returns_content_and_usage() {
         });
     assert!(text.is_some(), "response should contain non-empty text");
     assert_eq!(response.message.role, Role::Assistant);
-    assert_eq!(response.stop_reason.value, StopReason::EndTurn);
+    assert_eq!(*response.stop_reason.value(), StopReason::EndTurn);
     assert!(response.usage.input > 0);
     assert!(response.usage.output > 0);
     assert!(response.extra.contains_key("content_filters"));
@@ -210,7 +210,7 @@ async fn openai_responses_streaming_text_yields_foldable_events() {
 
     let response = fold_events(&events).expect("fold real text stream");
     assert_eq!(response.message.role, Role::Assistant);
-    assert_eq!(response.stop_reason.value, StopReason::EndTurn);
+    assert_eq!(*response.stop_reason.value(), StopReason::EndTurn);
     assert!(response.message.content.iter().any(|block| matches!(
         block,
         ContentBlock::Text { text, .. } if !text.is_empty()
@@ -266,7 +266,7 @@ async fn openai_responses_streaming_tool_call_yields_complete_input() {
     )));
 
     let response = fold_events(&events).expect("fold real tool stream");
-    assert_eq!(response.stop_reason.value, StopReason::ToolUse);
+    assert_eq!(*response.stop_reason.value(), StopReason::ToolUse);
     assert!(response.message.content.iter().any(|block| matches!(
         block,
         ContentBlock::ToolUse { id, name, input, .. }

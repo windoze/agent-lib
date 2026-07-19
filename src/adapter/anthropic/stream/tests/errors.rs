@@ -152,9 +152,8 @@ async fn block_lifecycle_and_message_stop_requirements_are_enforced() {
         .await
         .expect("message stop without a reason falls back to Other");
     assert!(events.contains(&StreamEvent::MessageStop {
-        stop_reason: crate::model::normalized::Normalized {
-            value: crate::model::normalized::StopReason::Other,
-            raw: None,
-        },
+        stop_reason: crate::model::normalized::Normalized::without_raw(
+            crate::model::normalized::StopReason::Other,
+        ),
     }));
 }

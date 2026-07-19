@@ -20,16 +20,12 @@
 //!   [`ChatSession`] / [`ChatSessionBuilder`] for stateful multi-turn chat with
 //!   snapshot/restore and an incremental [`RunStream`] ([`chat`]).
 //!
-//! Later milestones add the `Agent`/`AgentSession`, subagent,
-//! managed-external-agent, dispatcher, and collaboration facades on top of these
-//! foundations. Milestone 2 begins with the typed function tool surface
-//! ([`Tool`], [`ToolContext`], [`ToolResult`], [`IntoToolResult`]) in [`tool`],
-//! then the approval surface ([`Approval`], [`ApprovalPolicy`],
-//! [`ApprovalDecision`]) in [`approval`]. Milestone 3 adds the local subagent
-//! surface ([`Agent::worker`], [`LocalSubagent`], [`Delegation`]) in
-//! [`delegate`]. Milestone 4 begins the managed-external-agent surface
-//! ([`ManagedExternalAgent`], [`ExternalRunMode`], [`ExternalAgentCapabilities`])
-//! in [`external`].
+//! The stateful [`Agent`] facade is the tool-using counterpart to
+//! [`ChatSession`]: it owns an [`AgentState`](crate::agent::AgentState), exposes
+//! `run` / `run_full` / `stream`, and snapshots through [`AgentSnapshot`]. Local
+//! subagents, managed external agents, dispatcher routing, collaboration
+//! primitives, cancellation, provider extras, and budgets all build on that same
+//! `Agent` type rather than a separate `AgentSession` wrapper.
 
 pub mod agent;
 pub mod approval;

@@ -60,7 +60,7 @@ use crate::{
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use thiserror::Error;
 
 #[cfg(feature = "external-acp")]
@@ -359,6 +359,7 @@ impl ExternalToolCall {
             id: self.provider_call_id.clone(),
             name: self.name.clone(),
             input: self.input.clone(),
+            extra: Map::new(),
         }
     }
 }
@@ -1638,6 +1639,7 @@ mod tests {
                 id: "call_provider_1".to_owned(),
                 name: "apply_patch".to_owned(),
                 input: json!({ "path": "src/parser.rs" }),
+                extra: Map::new(),
             }
         );
     }

@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Normalized<T> {
     /// The provider-neutral value used by the rest of the client layer.
-    pub value: T,
+    value: T,
     /// The raw provider value that produced `value`, when one was available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw: Option<String>,
+    raw: Option<String>,
 }
 
 impl<T> Normalized<T> {
@@ -20,6 +20,23 @@ impl<T> Normalized<T> {
             value,
             raw: Some(raw.into()),
         }
+    }
+
+    /// Builds a normalized value that had no provider raw string.
+    pub(crate) fn without_raw(value: T) -> Self {
+        Self { value, raw: None }
+    }
+
+    /// Returns the provider-neutral value.
+    #[must_use]
+    pub const fn value(&self) -> &T {
+        &self.value
+    }
+
+    /// Returns the raw provider value that produced [`value`](Self::value), if any.
+    #[must_use]
+    pub fn raw(&self) -> Option<&str> {
+        self.raw.as_deref()
     }
 }
 
@@ -86,16 +103,16 @@ mod tests {
     fn normalizes_known_stop_reason_and_keeps_raw() {
         let reason = StopReason::normalize("tool_use");
 
-        assert_eq!(reason.value, StopReason::ToolUse);
-        assert_eq!(reason.raw.as_deref(), Some("tool_use"));
+        assert_eq!(reason.value(), &StopReason::ToolUse);
+        assert_eq!(reason.raw(), Some("tool_use"));
     }
 
     #[test]
     fn normalizes_unknown_stop_reason_to_other_and_keeps_raw() {
         let reason = StopReason::normalize("weird");
 
-        assert_eq!(reason.value, StopReason::Other);
-        assert_eq!(reason.raw.as_deref(), Some("weird"));
+        assert_eq!(reason.value(), &StopReason::Other);
+        assert_eq!(reason.raw(), Some("weird"));
     }
 
     #[test]

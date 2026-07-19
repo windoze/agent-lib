@@ -18,8 +18,8 @@ fn recorded_text_response_maps_to_complete_response() {
     assert_eq!(text, "Hi there friend.");
     assert!(extra.is_empty());
 
-    assert_eq!(response.stop_reason.value, StopReason::EndTurn);
-    assert_eq!(response.stop_reason.raw.as_deref(), Some("end_turn"));
+    assert_eq!(*response.stop_reason.value(), StopReason::EndTurn);
+    assert_eq!(response.stop_reason.raw(), Some("end_turn"));
     assert_eq!(response.usage.input, 14);
     assert_eq!(response.usage.output, 7);
     assert_eq!(response.usage.cache_write, 0);
@@ -62,8 +62,8 @@ fn recorded_tool_response_maps_tool_use_and_usage() {
     assert_eq!(name, "get_weather");
     assert_eq!(input, &json!({ "city": "Tokyo" }));
     assert!(extra.is_empty());
-    assert_eq!(response.stop_reason.value, StopReason::ToolUse);
-    assert_eq!(response.stop_reason.raw.as_deref(), Some("tool_use"));
+    assert_eq!(*response.stop_reason.value(), StopReason::ToolUse);
+    assert_eq!(response.stop_reason.raw(), Some("tool_use"));
     assert_eq!(response.usage.input, 571);
     assert_eq!(response.usage.output, 54);
 }
@@ -130,11 +130,8 @@ fn thinking_unknown_stop_and_provider_fields_are_preserved() {
         Some(&json!([{ "kind": "provider_citation", "offset": 0 }]))
     );
 
-    assert_eq!(response.stop_reason.value, StopReason::Other);
-    assert_eq!(
-        response.stop_reason.raw.as_deref(),
-        Some("future_provider_reason")
-    );
+    assert_eq!(*response.stop_reason.value(), StopReason::Other);
+    assert_eq!(response.stop_reason.raw(), Some("future_provider_reason"));
     assert_eq!(response.usage.input, 29);
     assert_eq!(response.usage.output, 11);
     assert_eq!(response.usage.cache_write, 7);

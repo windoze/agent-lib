@@ -27,9 +27,7 @@ pub use cursor::{
     ErrorCursor, ErrorCursorKind, LoopCursor, LoopCursorKind, LoopDoneReason, ReconfigCursor,
     StepCursor, ToolWaitCursor, ToolWaitRequirements,
 };
-pub use queue::{
-    PivotSource, QueuedPivot, QueuedReconfig, ReconfigQueue, ReconfigRequest, ToolSetPatch,
-};
+pub use queue::{PivotSource, QueuedPivot, ReconfigQueue, ReconfigRequest, ToolSetPatch};
 pub(crate) use queue::{reconfig_boundary_metadata, reconfig_boundary_records};
 pub use runtime::AgentRuntimeHandles;
 
@@ -105,7 +103,7 @@ impl AgentState {
 
     /// Returns queued reconfiguration intents waiting for a turn boundary.
     #[must_use]
-    pub fn queued_reconfigs(&self) -> &[QueuedReconfig] {
+    pub fn queued_reconfigs(&self) -> &[ReconfigRequest] {
         self.queued_reconfigs.as_slice()
     }
 
@@ -181,7 +179,7 @@ impl AgentState {
     /// requirement resolves). Returns a classified [`AgentStateError`] when
     /// the request or the full pending queue would conflict with the current
     /// Agent state.
-    pub fn queue_reconfig(&mut self, reconfig: QueuedReconfig) -> Result<(), AgentStateError> {
+    pub fn queue_reconfig(&mut self, reconfig: ReconfigRequest) -> Result<(), AgentStateError> {
         self.ensure_reconfig_admission()?;
         let queue = self.queued_reconfigs.with_pushed(reconfig);
         let _application = self.plan_reconfig_requests(queue.as_slice())?;

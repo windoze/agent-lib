@@ -402,7 +402,7 @@ mod tests {
         },
         model::tool::ToolCall,
     };
-    use serde_json::json;
+    use serde_json::{Map, json};
     use std::collections::HashSet;
 
     fn sample_call() -> ToolCall {
@@ -410,6 +410,7 @@ mod tests {
             id: "provider-1".to_owned(),
             name: "weather".to_owned(),
             input: json!({}),
+            extra: Map::new(),
         }
     }
 

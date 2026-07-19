@@ -49,7 +49,9 @@ async fn main() -> ExampleResult<()> {
     }
     eprintln!(
         "folded stop={:?}, input_tokens={}, output_tokens={}",
-        response.stop_reason.value, response.usage.input, response.usage.output
+        response.stop_reason.value(),
+        response.usage.input,
+        response.usage.output
     );
     Ok(())
 }

@@ -132,7 +132,7 @@ async fn recorded_tool_stream_keeps_fragments_and_parses_only_at_done() {
 
     let folded = fold_events(&events).expect("fold recorded tool events");
     assert_eq!(folded, parse_terminal_response(REAL_TOOL_STREAM));
-    assert_eq!(folded.stop_reason.value, StopReason::ToolUse);
+    assert_eq!(*folded.stop_reason.value(), StopReason::ToolUse);
     assert_eq!(folded.usage.input, 53);
     assert_eq!(folded.usage.output, 18);
     assert!(folded.extra.contains_key("content_filters"));

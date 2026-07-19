@@ -237,7 +237,7 @@ mod tests {
         ToolApprovalPolicy,
     };
     use crate::{conversation::ToolCallId, model::tool::ToolCall};
-    use serde_json::json;
+    use serde_json::{Map, json};
 
     fn step_id() -> crate::agent::StepId {
         "018f0d9c-7b6a-7c12-8f31-123456789008"
@@ -256,6 +256,7 @@ mod tests {
             id: "call-weather".to_owned(),
             name: "get_weather".to_owned(),
             input: json!({ "city": "Shanghai" }),
+            extra: Map::new(),
         }
     }
 

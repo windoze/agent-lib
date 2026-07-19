@@ -245,7 +245,8 @@ fn model_config_builder_and_defaults() {
 
     let config = ModelConfig::new("gpt-5.5")
         .max_tokens(2048)
-        .temperature(0.2);
+        .temperature(0.2)
+        .expect("finite temperature is accepted");
     assert_eq!(config.max_tokens_value(), NonZeroU32::new(2048).unwrap());
     assert_eq!(config.temperature_value(), Some(0.2));
 }
@@ -265,6 +266,7 @@ fn to_model_ref_maps_every_field() {
     let config = ModelConfig::new("claude-test")
         .max_tokens(4096)
         .temperature(0.7)
+        .expect("finite temperature is accepted")
         .provider_extras(extras.clone());
 
     let model_ref = config.to_model_ref();
@@ -284,6 +286,7 @@ fn apply_to_request_overwrites_only_shared_fields() {
     let config = ModelConfig::new("gpt-5.5")
         .max_tokens(1500)
         .temperature(0.4)
+        .expect("finite temperature is accepted")
         .provider_extras(extras.clone());
 
     let mut request = ChatRequest {
@@ -306,4 +309,15 @@ fn apply_to_request_overwrites_only_shared_fields() {
     // Untouched fields survive.
     assert_eq!(request.system.as_deref(), Some("stay concise"));
     assert!(request.stream);
+}
+
+#[test]
+fn model_config_rejects_non_finite_temperature() {
+    for temperature in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let error = ModelConfig::new("gpt-5.5")
+            .temperature(temperature)
+            .expect_err("non-finite temperature is rejected");
+
+        assert!(matches!(error, crate::facade::FacadeError::Config(_)));
+    }
 }

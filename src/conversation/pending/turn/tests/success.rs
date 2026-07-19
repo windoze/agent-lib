@@ -66,7 +66,7 @@ fn pure_text_turn_commits_atomically_with_response_metadata() {
     assert_eq!(turn.meta().responses().len(), 1);
     assert_eq!(turn.meta().responses()[0].message_id(), message_id(101));
     assert_eq!(
-        turn.meta().responses()[0].stop_reason().value,
+        *turn.meta().responses()[0].stop_reason().value(),
         StopReason::EndTurn
     );
     assert_eq!(

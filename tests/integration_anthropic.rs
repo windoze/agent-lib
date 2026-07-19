@@ -162,7 +162,7 @@ async fn anthropic_streaming_count_emits_text_events_and_folds() {
             "streamed text should contain {number}"
         );
     }
-    assert_eq!(response.stop_reason.value, StopReason::EndTurn);
+    assert_eq!(*response.stop_reason.value(), StopReason::EndTurn);
     assert!(response.usage.input > 0);
     assert!(response.usage.output > 0);
 }
@@ -238,7 +238,7 @@ async fn anthropic_streaming_weather_tool_preserves_tokyo_input() {
     let (tool_id, input) = tool.expect("folded response should contain get_weather");
     assert!(!tool_id.is_empty());
     assert_eq!(input["city"], json!("Tokyo"));
-    assert_eq!(response.stop_reason.value, StopReason::ToolUse);
+    assert_eq!(*response.stop_reason.value(), StopReason::ToolUse);
     assert!(response.usage.input > 0);
     assert!(response.usage.output > 0);
 }

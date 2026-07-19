@@ -10,7 +10,9 @@
 //! [`uuid::Uuid`] via [`uuid::Uuid::from_u128`]. A single [`FacadeIds`] is
 //! cheaply clonable (it shares one atomic counter), so the same source can be
 //! handed to a machine, a handler, and the facade driver simultaneously while
-//! still producing globally unique ids.
+//! avoiding collisions within that source and its clones. Separate fresh
+//! [`FacadeIds`] instances intentionally restart at `1`; use
+//! [`FacadeIds::continuing_after`] when continuing from restored history.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,9 +27,10 @@ use crate::model::tool::ToolCall;
 
 /// A cloneable, monotonic identity source for the facade layer.
 ///
-/// Clones share the same underlying counter, so ids stay globally unique across
-/// every clone. The counter starts at `1`, guaranteeing no minted id is the nil
-/// UUID.
+/// Clones share the same underlying counter, so ids stay unique across every
+/// clone of the same source. The counter starts at `1`, guaranteeing no minted id
+/// is the nil UUID. Fresh, unrelated [`FacadeIds`] instances are not globally
+/// unique with respect to each other.
 #[derive(Clone, Debug)]
 pub struct FacadeIds {
     counter: Arc<AtomicU64>,
@@ -233,6 +236,7 @@ mod tests {
             id: "provider-call-1".to_owned(),
             name: "noop".to_owned(),
             input: Value::Object(Map::new()),
+            extra: Map::new(),
         }
     }
 

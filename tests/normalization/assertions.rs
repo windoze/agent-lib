@@ -25,16 +25,15 @@ pub(super) fn assert_common_response(
     if response.message.content.is_empty() {
         return Err("normalized assistant content was empty".to_owned());
     }
-    if response.stop_reason.value != expected_stop {
+    if *response.stop_reason.value() != expected_stop {
         return Err(format!(
             "normalized stop reason was {:?}, expected {expected_stop:?}",
-            response.stop_reason.value
+            response.stop_reason.value()
         ));
     }
     if response
         .stop_reason
-        .raw
-        .as_deref()
+        .raw()
         .is_none_or(|raw| raw.trim().is_empty())
     {
         return Err("normalized stop reason did not preserve a raw value".to_owned());

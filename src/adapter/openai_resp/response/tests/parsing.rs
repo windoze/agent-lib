@@ -45,8 +45,8 @@ fn recorded_text_response_maps_items_usage_and_azure_metadata() {
     );
     assert_eq!(extra[RESPONSE_EXTRA_KEY]["content"]["logprobs"], json!([]));
 
-    assert_eq!(response.stop_reason.value, StopReason::EndTurn);
-    assert_eq!(response.stop_reason.raw.as_deref(), Some("completed"));
+    assert_eq!(*response.stop_reason.value(), StopReason::EndTurn);
+    assert_eq!(response.stop_reason.raw(), Some("completed"));
     assert_eq!(response.usage.input, 13);
     assert_eq!(response.usage.output, 26);
     assert_eq!(response.usage.cache_read, 4);
@@ -88,8 +88,8 @@ fn recorded_tool_response_maps_call_id_arguments_and_tool_stop() {
         extra[RESPONSE_EXTRA_KEY]["item"]["status"],
         json!("completed")
     );
-    assert_eq!(response.stop_reason.value, StopReason::ToolUse);
-    assert_eq!(response.stop_reason.raw.as_deref(), Some("completed"));
+    assert_eq!(*response.stop_reason.value(), StopReason::ToolUse);
+    assert_eq!(response.stop_reason.raw(), Some("completed"));
     assert_eq!(response.usage.input, 56);
     assert_eq!(response.usage.output, 18);
     assert_eq!(response.usage.reasoning, 0);
@@ -192,8 +192,8 @@ fn reasoning_refusal_and_unknown_items_preserve_structured_evidence() {
     assert_eq!(raw["type"], json!("future_content"));
     assert_eq!(raw["payload"], json!({ "kept": true }));
 
-    assert_eq!(response.stop_reason.value, StopReason::Refusal);
-    assert_eq!(response.stop_reason.raw.as_deref(), Some("refusal"));
+    assert_eq!(*response.stop_reason.value(), StopReason::Refusal);
+    assert_eq!(response.stop_reason.raw(), Some("refusal"));
     assert_eq!(response.usage, Usage::default());
     assert_eq!(
         response.extra["provider_top_level"],
@@ -218,11 +218,8 @@ fn incomplete_and_filtered_responses_map_specific_stop_reasons() {
     .expect("serialize incomplete fixture");
     let response = OpenAiRespAdapter::parse_response(&incomplete)
         .expect("parse max-output incomplete response");
-    assert_eq!(response.stop_reason.value, StopReason::MaxTokens);
-    assert_eq!(
-        response.stop_reason.raw.as_deref(),
-        Some("max_output_tokens")
-    );
+    assert_eq!(*response.stop_reason.value(), StopReason::MaxTokens);
+    assert_eq!(response.stop_reason.raw(), Some("max_output_tokens"));
     assert_eq!(
         response.extra["incomplete_details"],
         json!({ "reason": "max_output_tokens" })
@@ -237,8 +234,8 @@ fn incomplete_and_filtered_responses_map_specific_stop_reasons() {
     }))
     .expect("serialize filtered fixture");
     let response = OpenAiRespAdapter::parse_response(&filtered).expect("parse filtered response");
-    assert_eq!(response.stop_reason.value, StopReason::Refusal);
-    assert_eq!(response.stop_reason.raw.as_deref(), Some("content_filter"));
+    assert_eq!(*response.stop_reason.value(), StopReason::Refusal);
+    assert_eq!(response.stop_reason.raw(), Some("content_filter"));
 
     let future = serde_json::to_vec(&json!({
         "object": "response",
@@ -247,11 +244,8 @@ fn incomplete_and_filtered_responses_map_specific_stop_reasons() {
     }))
     .expect("serialize future-status fixture");
     let response = OpenAiRespAdapter::parse_response(&future).expect("parse future status");
-    assert_eq!(response.stop_reason.value, StopReason::Other);
-    assert_eq!(
-        response.stop_reason.raw.as_deref(),
-        Some("paused_by_provider")
-    );
+    assert_eq!(*response.stop_reason.value(), StopReason::Other);
+    assert_eq!(response.stop_reason.raw(), Some("paused_by_provider"));
 }
 
 #[test]

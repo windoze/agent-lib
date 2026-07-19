@@ -401,6 +401,27 @@ fn single_auto_tool_call_runs_then_model_finishes() {
 }
 
 #[test]
+fn tool_use_extra_is_preserved_on_need_tool_call() {
+    let mut machine = tool_machine(Arc::new(NoApprovalPolicy));
+    let llm_id = park_on_need_llm(&mut machine);
+    let mut extra = Map::new();
+    extra.insert("provider_call_type".to_owned(), json!("server_tool"));
+    let response = tool_use_response_with(vec![ContentBlock::ToolUse {
+        id: "call-weather".to_owned(),
+        name: "get_weather".to_owned(),
+        input: json!({}),
+        extra: extra.clone(),
+    }]);
+
+    let outcome = resume_llm(&mut machine, llm_id, response);
+
+    let RequirementKind::NeedTool { call, .. } = &outcome.requirements[0].kind else {
+        panic!("expected NeedTool requirement");
+    };
+    assert_eq!(call.extra, extra);
+}
+
+#[test]
 fn parallel_tool_batch_resumes_out_of_order() {
     let mut machine = tool_machine(Arc::new(NoApprovalPolicy));
     let llm_id = park_on_need_llm(&mut machine);

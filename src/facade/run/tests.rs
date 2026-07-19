@@ -175,6 +175,24 @@ fn usage_summary_from_supervisor_and_add_helpers_accumulate() {
     assert_eq!(total.reasoning, 9);
 }
 
+#[test]
+fn approval_request_uses_option_for_missing_call_id() {
+    let request = ApprovalRequest::for_tool("ask_coder");
+    assert_eq!(request.tool_name, "ask_coder");
+    assert_eq!(request.call_id, None);
+
+    let json = serde_json::to_value(&request).expect("serialize approval request");
+    assert!(json.get("call_id").is_none());
+
+    let decoded: ApprovalRequest = serde_json::from_value(json!({
+        "tool_name": "ask_coder",
+        "reason": null,
+        "input": null
+    }))
+    .expect("missing call_id defaults to None");
+    assert_eq!(decoded.call_id, None);
+}
+
 /// Serializes a wire event to JSON, deserializes it back, and asserts the
 /// projection is faithful under a full `serde_json` round-trip.
 fn assert_wire_round_trips(wire: &WireRunEvent) {
@@ -217,13 +235,13 @@ fn normalized_run_events_project_losslessly_and_round_trip() {
         (
             RunEvent::ApprovalRequested(ApprovalRequest {
                 tool_name: "get_weather".to_owned(),
-                call_id: "call-1".to_owned(),
+                call_id: Some("call-1".to_owned()),
                 reason: Some("approve execution of tool `get_weather`".to_owned()),
                 input: Some("{\"city\":\"Shanghai\"}".to_owned()),
             }),
             WireRunEvent::ApprovalRequested(ApprovalRequest {
                 tool_name: "get_weather".to_owned(),
-                call_id: "call-1".to_owned(),
+                call_id: Some("call-1".to_owned()),
                 reason: Some("approve execution of tool `get_weather`".to_owned()),
                 input: Some("{\"city\":\"Shanghai\"}".to_owned()),
             }),

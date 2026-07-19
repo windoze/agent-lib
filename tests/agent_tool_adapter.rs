@@ -193,6 +193,7 @@ async fn tool_adapter_spawn_agent_derives_child_via_subagent_handler() {
             "brief": "review the proposed patch",
             "result_schema": schema,
         }),
+        extra: Map::new(),
     };
 
     // 2. The host translates it into a structured request, then a requirement.

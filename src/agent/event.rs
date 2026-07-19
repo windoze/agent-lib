@@ -578,6 +578,7 @@ mod tests {
             id: "provider-call-1".to_owned(),
             name: "get_weather".to_owned(),
             input: json!({ "city": "Shanghai" }),
+            extra: Map::new(),
         }
     }
 

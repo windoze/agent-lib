@@ -63,7 +63,9 @@ async fn main() -> ExampleResult<()> {
     println!("{text}");
     eprintln!(
         "stop={:?}, input_tokens={}, output_tokens={}",
-        final_response.stop_reason.value, final_response.usage.input, final_response.usage.output
+        final_response.stop_reason.value(),
+        final_response.usage.input,
+        final_response.usage.output
     );
     Ok(())
 }

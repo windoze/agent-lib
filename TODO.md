@@ -1748,7 +1748,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`；`rg 'expect\("' src | rg -i 'poison'`（无输出）；`rg '\.lock\(\)\.expect' src --glob '!**/tests/**' --glob '!**/tests.rs'`（无输出）；`cargo clippy --all-targets -- -D warnings`；`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；`cargo test --all --all-targets`；`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - 无 breaking change（内部错误处理策略收紧；公共 API 与 serde/wire 形状不变）。
 
-### M9-2 [TODO] API 打磨批
+### M9-2 [DONE] API 打磨批
 
 上下文（逐项小改，逐一勾选）：
 
@@ -1773,6 +1773,24 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 验证条件：
 
 - 每项至少一条测试或编译期保证；`cargo test --all --all-targets` 通过；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
+
+完成记录：
+
+- `ApprovalRequest::call_id` 从空串哨兵改为 `Option<String>`，`None` 表示同步 external-start 审批发生在 framework call id 存在之前；字段带 `serde(default, skip_serializing_if)`，`ApprovalRequest::for_tool` 返回 `None`，普通 tool approval 走 `Some(call_id)`。`weave_approval_events`、stream/non-stream approval recorder、wire projection 与测试同步。
+- `Normalized<T>` 的 `value`/`raw` 字段改私有，新增只读访问器 `value()` / `raw()` 与 crate 内部 `without_raw` 构造器；内部、examples、integration tests 全部改用访问器，消除外部随意构造 value/raw 矛盾值的主路径。
+- prelude/API 文档打磨：`model/mod.rs` 根级 re-export 高频模型类型；`prelude` 新增 `FacadeError`、`BudgetLimits` 与常用 model 类型；`src/lib.rs` 增加 facade 层说明；`facade/mod.rs` 与 `docs/facade-api.md` 去掉过期 milestone 叙事和不存在的 `AgentSession`，明确当前采用 stateful `Agent`。
+- 配置校验：`ChatBuilder`/`AgentBuilder`/显式模型 `AgentWorkerBuilder` 拒绝空白 model；`ModelConfig::temperature` 改为返回 `Result<Self, FacadeError>` 并拒绝 `NaN`/正负无穷，builder `.temperature(...)` 在 `build()` 时返回 config error；delegation 配置在 build/restore 共享校验中拒绝空 single-tool 名、空 rules keyword 列表、空白 keyword、空白 rules delegate。
+- `FacadeApproval.pending` 新增 run-boundary 清理：`FacadeApproval::clear_pending`、non-streaming `ApprovalPendingGuard`、`AgentRunStream` start/drop/terminal/error 清理，避免 host-injected approval handler 不消费 fallback pending entry 后跨 run 泄漏。
+- `ChatSessionBuilder::clear_system()` 新增，允许显式清除继承自 `Chat` 的 system prompt；新增 session 请求断言确认 `system == None`。
+- delegate-only 输出 usage 语义统一：rules-routed / dispatcher-routed 没有 supervisor LLM response，`Reply::usage()` 改为 `None`，实际 child/external usage 仍归入 `UsageSummary.subagents` / `UsageSummary.external`；新增 rules-routed 回归测试。
+- `FacadeIds` 文档从“globally unique”改为“同一 source 及其 clone 内唯一”，明确新 `FacadeIds::new()` 会从 1 重新开始，恢复历史应使用 `continuing_after`。
+- 删除 pre-1.0 兼容别名 `QueuedReconfig`，agent state API 与测试统一使用 `ReconfigRequest`。
+- `RunEvent` 与 `WireRunEvent` 增加 `#[non_exhaustive]`，并把 rustdoc / facade API 文档从“shape stable / milestone 占位”改为非穷尽匹配口径。
+- `ToolCall` 新增 `extra: Map<String, Value>`（serde default + skip empty），与 `ContentBlock::ToolUse.extra` 对齐；默认机器从 assistant ToolUse 生成 NeedTool 时保留 extra，agent-testkit scenario/fixtures 同步。ExternalToolCall 的 `raw` 仍按既有安全口径不注入 host tool execution path。
+- `ConversationRows::insert_set_against` 放宽 `existing: &ConversationRows` 为多 conversation 子集查询结果：本批显式不做。理由：需要把 public API 从严格单 conversation `ConversationRows` 改成 Vec/InsertSet 形状并新增 owner 过滤，是签名级 breaking + 存储查询契约重写；M3-5 已修复同 conversation 演进代次冲突，本项属于更宽的 API ergonomics，不阻塞当前正确性。
+- 文档/审查记录：`docs/facade-api.md` 同步 prelude、ModelConfig temperature、ApprovalRequest Option、RunEvent non-exhaustive、stateful Agent 命名决策；`docs/review-2026-07.md` 对应 API/文档打磨项与 `FacadeApproval.pending` 泄漏项已标注已修复/已降级。
+- 验证：`cargo fmt --all`、`cargo test -p agent-lib --lib`（1008 条）、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- Breaking change（pre-1.0，记录在此）：`ApprovalRequest::call_id` 类型改为 `Option<String>`；`Normalized<T>` 字段私有化；`ModelConfig::temperature` 签名改为 `Result<Self, FacadeError>`；`RunEvent`/`WireRunEvent` 变为 `#[non_exhaustive]`；`ToolCall` 新增 pub 字段 `extra`；`QueuedReconfig` 别名删除。
 
 ### M9-3 [TODO] 性能小项批
 

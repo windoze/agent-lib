@@ -24,6 +24,9 @@ pub struct ToolCall {
     pub name: String,
     /// Fully parsed JSON input supplied by the model.
     pub input: Value,
+    /// Provider-specific fields this crate does not model yet.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
 }
 
 /// A complete response to a prior tool call.
@@ -155,7 +158,20 @@ mod tests {
             id: "call_123".to_owned(),
             name: "get_weather".to_owned(),
             input: json!({ "city": "Shanghai" }),
+            extra: Map::new(),
         });
+    }
+
+    #[test]
+    fn tool_call_preserves_provider_extra_fields() {
+        let call = ToolCall {
+            id: "call_123".to_owned(),
+            name: "get_weather".to_owned(),
+            input: json!({ "city": "Shanghai" }),
+            extra: Map::from_iter([("provider_call_type".to_owned(), json!("server_tool"))]),
+        };
+
+        assert_json_round_trip(call);
     }
 
     #[test]

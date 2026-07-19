@@ -137,6 +137,7 @@ pub fn tool_call(provider_id: &str, name: &str, input: Value) -> ToolCall {
         id: provider_id.to_owned(),
         name: name.to_owned(),
         input,
+        extra: Map::new(),
     }
 }
 

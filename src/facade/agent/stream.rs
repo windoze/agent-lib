@@ -361,6 +361,7 @@ pub(super) fn start(
     message: Message,
     cancel: CancelHandle,
 ) -> Result<AgentRunStream<'_>, FacadeError> {
+    agent.approval.clear_pending();
     // Rules-routed delegation short-circuits the supervisor loop: if the task
     // text matches a routing rule, the whole turn is handed to the matched
     // delegate and no LLM step is taken (`docs/facade-api.md` §13.2). A
@@ -447,6 +448,7 @@ pub(super) fn start(
     // it: the future steps it through `drive_streamed`, and an early drop abandons
     // any stranded turn synchronously (see `AgentRunStream::abandon`).
     let stream_ids = agent.ids.clone();
+    let approval = agent.approval.clone();
     let machine: MachineCell = Rc::new(RefCell::new(&mut agent.machine));
     let machine_for_future = machine.clone();
     let control_for_future = control.clone();
@@ -526,6 +528,7 @@ pub(super) fn start(
         machine,
         control,
         ids: stream_ids,
+        approval,
     })
 }
 
@@ -574,6 +577,7 @@ fn start_rules_routed(
     // the stream's `Drop` finds no stranded turn to abandon; the cell is held only to
     // keep the `AgentRunStream` shape uniform across start paths.
     let stream_ids = agent.ids.clone();
+    let approval = agent.approval.clone();
     let machine: MachineCell = Rc::new(RefCell::new(&mut agent.machine));
     Ok(AgentRunStream {
         future,
@@ -583,6 +587,7 @@ fn start_rules_routed(
         machine,
         control,
         ids: stream_ids,
+        approval,
     })
 }
 
@@ -643,6 +648,7 @@ fn start_dispatcher_routed(
     // As with the rules-routed path, the dispatcher drive never steps the held
     // machine, so `Drop` finds no stranded turn; the cell keeps the shape uniform.
     let stream_ids = agent.ids.clone();
+    let approval = agent.approval.clone();
     let machine: MachineCell = Rc::new(RefCell::new(&mut agent.machine));
     Ok(AgentRunStream {
         future,
@@ -652,6 +658,7 @@ fn start_dispatcher_routed(
         machine,
         control,
         ids: stream_ids,
+        approval,
     })
 }
 
@@ -693,6 +700,8 @@ pub struct AgentRunStream<'a> {
     control: StreamControl,
     /// Identity source used to stamp facade-created pivot messages.
     ids: FacadeIds,
+    /// Approval bridge whose per-run pending decisions are cleared on stream exit.
+    approval: Arc<FacadeApproval>,
 }
 
 /// Lifecycle of an [`AgentRunStream`]'s drive.
@@ -786,6 +795,7 @@ impl AgentRunStream<'_> {
             return;
         }
         self.state = DriveState::Done;
+        self.approval.clear_pending();
 
         // The drive future releases its machine borrow before every `await`, so a
         // drop that lands while it is parked can take the machine here. `try` keeps
@@ -823,6 +833,7 @@ impl Stream for AgentRunStream<'_> {
                     }
                     Poll::Ready(Err(error)) => {
                         this.state = DriveState::Done;
+                        this.approval.clear_pending();
                         return Poll::Ready(Some(Err(error)));
                     }
                     Poll::Pending => {
@@ -836,6 +847,7 @@ impl Stream for AgentRunStream<'_> {
                 },
                 DriveState::Draining => {
                     this.state = DriveState::Done;
+                    this.approval.clear_pending();
                     let output = this.output.take().expect("terminal output present");
                     return Poll::Ready(Some(Ok(RunEvent::Done(Box::new(output)))));
                 }

@@ -25,7 +25,7 @@ fn interleaved_stream_and_complete_response_freeze_identically() {
     assert_eq!(streamed.message().payload().role, Role::Assistant);
     assert_eq!(streamed.usage(), &expected_response.usage);
     assert_eq!(streamed.stop_reason(), &expected_response.stop_reason);
-    assert_eq!(streamed.stop_reason().value, StopReason::ToolUse);
+    assert_eq!(*streamed.stop_reason().value(), StopReason::ToolUse);
     assert_eq!(streamed.extra(), &expected_response.extra);
 }
 

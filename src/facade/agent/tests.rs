@@ -318,6 +318,80 @@ fn builder_rejects_provider_extras_for_different_provider() {
     assert!(message.contains("provider_extras"));
 }
 
+#[test]
+fn builder_rejects_blank_model() {
+    let error = AgentBuilder::default()
+        .client(ScriptedClient::new(vec![text_response("done")]))
+        .model("\t  ")
+        .build()
+        .expect_err("blank model is rejected");
+
+    let FacadeError::Config(message) = error else {
+        panic!("expected config error")
+    };
+    assert!(message.contains("model"));
+}
+
+#[test]
+fn builder_rejects_non_finite_temperature() {
+    let error = AgentBuilder::default()
+        .client(ScriptedClient::new(vec![text_response("done")]))
+        .model("test-model")
+        .temperature(f32::INFINITY)
+        .build()
+        .expect_err("non-finite temperature is rejected");
+
+    let FacadeError::Config(message) = error else {
+        panic!("expected config error")
+    };
+    assert!(message.contains("temperature"));
+}
+
+#[test]
+fn builder_rejects_blank_delegation_tool_name() {
+    let error = AgentBuilder::default()
+        .client(ScriptedClient::new(vec![text_response("done")]))
+        .model("test-model")
+        .delegation(Delegation::single_tool(" "))
+        .build()
+        .expect_err("blank delegation tool name is rejected");
+
+    let FacadeError::Config(message) = error else {
+        panic!("expected config error")
+    };
+    assert!(message.contains("tool name"));
+}
+
+#[test]
+fn builder_rejects_invalid_rules_routing_entries() {
+    for (delegation, expected) in [
+        (
+            Delegation::rules().when_task_contains(Vec::<String>::new(), "coder"),
+            "keywords",
+        ),
+        (
+            Delegation::rules().when_task_contains(["fix", "  "], "coder"),
+            "keyword",
+        ),
+        (
+            Delegation::rules().when_task_contains(["fix"], " "),
+            "delegate",
+        ),
+    ] {
+        let error = AgentBuilder::default()
+            .client(ScriptedClient::new(vec![text_response("done")]))
+            .model("test-model")
+            .delegation(delegation)
+            .build()
+            .expect_err("invalid rules entry is rejected");
+
+        let FacadeError::Config(message) = error else {
+            panic!("expected config error")
+        };
+        assert!(message.contains(expected), "{message}");
+    }
+}
+
 #[tokio::test]
 async fn run_full_records_tool_calls_and_events() {
     let client = ScriptedClient::new(vec![tool_use_response(), text_response("It is sunny.")]);
@@ -441,7 +515,7 @@ async fn run_full_records_ask_approval_then_tool_lifecycle() {
         unreachable!("indexed an ApprovalRequested position");
     };
     assert!(
-        !request.call_id.is_empty(),
+        request.call_id.is_some(),
         "the approval carries the pending call id, got {request:?}"
     );
     assert_eq!(
@@ -459,7 +533,8 @@ async fn run_full_records_ask_approval_then_tool_lifecycle() {
         unreachable!("indexed a ToolStarted position");
     };
     assert_eq!(
-        started.call_id, request.call_id,
+        Some(started.call_id.as_str()),
+        request.call_id.as_deref(),
         "the approval gates the same call that started"
     );
 }
@@ -509,7 +584,7 @@ async fn run_full_records_approval_when_injected_handler_denies() {
         "the approval names the denied tool"
     );
     assert!(
-        !approval.call_id.is_empty(),
+        approval.call_id.is_some(),
         "the approval carries the pending call id, got {approval:?}"
     );
     // A denied tool never starts, so it emits no `ToolStarted`; and since it
@@ -576,7 +651,7 @@ async fn run_full_records_approval_for_headless_ask_without_handler() {
         "the approval names the pending tool"
     );
     assert!(
-        !approval.call_id.is_empty(),
+        approval.call_id.is_some(),
         "the approval carries the pending call id, got {approval:?}"
     );
 }
@@ -1078,7 +1153,7 @@ async fn stream_reports_approval_request() {
         "the ApprovalRequested event names the pending tool, got {events:?}"
     );
     assert!(
-        !approval.call_id.is_empty(),
+        approval.call_id.is_some(),
         "the ApprovalRequested event carries the pending call id, got {approval:?}"
     );
     assert_eq!(
@@ -1291,6 +1366,27 @@ fn registered_subagents_appear_in_the_delegate_table() {
         "reviewer-model"
     );
     assert!(agent.subagents()[1].inherits_model());
+}
+
+#[tokio::test]
+async fn rules_routed_delegate_output_has_no_supervisor_reply_usage() {
+    let client = ScriptedClient::new(vec![text_response_with_usage("delegated", 3, 4)]);
+    let reviewer = Agent::worker().system("review").build().expect("worker");
+    let mut agent = AgentBuilder::default()
+        .client(client)
+        .model("test-model")
+        .subagent("reviewer", reviewer)
+        .delegation(Delegation::rules().when_task_contains(["route"], "reviewer"))
+        .build()
+        .expect("build agent");
+
+    let output = agent.run_full("please route this").await.expect("run");
+
+    assert_eq!(output.reply.text(), "delegated");
+    assert_eq!(output.reply.usage(), None);
+    assert_eq!(output.usage.supervisor, Usage::default());
+    assert_eq!(output.usage.subagents.input, 3);
+    assert_eq!(output.usage.subagents.output, 4);
 }
 
 #[test]
@@ -2347,7 +2443,10 @@ fn canonical_lifecycle_event(event: &RunEvent) -> Option<String> {
         | RunEvent::RawNotification(_) => None,
         RunEvent::ApprovalRequested(request) => Some(format!(
             "ApprovalRequested{{tool={},call_id={},reason={:?},input={:?}}}",
-            request.tool_name, request.call_id, request.reason, request.input
+            request.tool_name,
+            request.call_id.as_deref().unwrap_or("<none>"),
+            request.reason,
+            request.input
         )),
         RunEvent::ToolStarted(trace) => Some(format!(
             "ToolStarted{{name={},call_id={}}}",

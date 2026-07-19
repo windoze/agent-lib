@@ -1,7 +1,7 @@
 use super::{
     AgentRuntimeHandles, AgentState, AgentStateError, CursorRequirement, ErrorCursorKind,
-    LoopCursor, LoopCursorKind, LoopDoneReason, PivotSource, QueuedPivot, QueuedReconfig,
-    ReconfigRequest, ToolSetPatch, ToolWaitRequirements,
+    LoopCursor, LoopCursorKind, LoopDoneReason, PivotSource, QueuedPivot, ReconfigRequest,
+    ToolSetPatch, ToolWaitRequirements,
 };
 use crate::{
     agent::{
@@ -158,7 +158,7 @@ fn agent_state_serde_round_trips_through_conversation_snapshot() {
         .replace_active_skills(vec![skill_id(2), skill_id(3)])
         .expect("active skills are unique");
     state
-        .queue_reconfig(QueuedReconfig::ActivateSkill {
+        .queue_reconfig(ReconfigRequest::ActivateSkill {
             skill_id: skill_id(4),
         })
         .expect("queue reconfig");
@@ -318,7 +318,7 @@ fn queued_pivot_accepts_only_user_messages() {
 
 #[test]
 fn queued_reconfig_rejects_duplicate_replacement_skills() {
-    let error = QueuedReconfig::replace_active_skills(vec![skill_id(2), skill_id(2)])
+    let error = ReconfigRequest::replace_active_skills(vec![skill_id(2), skill_id(2)])
         .expect_err("duplicate replacement skills must fail");
 
     assert_eq!(

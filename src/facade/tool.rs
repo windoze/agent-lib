@@ -718,6 +718,7 @@ mod tests {
             id: "call-1".to_owned(),
             name: name.to_owned(),
             input,
+            extra: Map::new(),
         }
     }
 

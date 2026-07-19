@@ -387,16 +387,18 @@ impl AgentWorkerBuilder {
                 None,
             )
         } else {
-            let mut model = ModelConfig::new(
+            let model_name = crate::facade::config::ensure_non_blank_model(
+                "worker",
                 self.model
                     .clone()
                     .expect("explicit model present when not inheriting"),
-            );
+            )?;
+            let mut model = ModelConfig::new(model_name);
             if let Some(max_tokens) = self.max_tokens {
                 model = model.max_tokens(max_tokens);
             }
             if let Some(temperature) = self.temperature {
-                model = model.temperature(temperature);
+                model = model.temperature(temperature)?;
             }
             if let Some(provider_extras) = self.provider_extras {
                 model = model.provider_extras(provider_extras);
@@ -881,6 +883,43 @@ impl Delegation {
                     && !external.iter().any(|e| e.name() == rule.delegate)
             })
             .map(|rule| rule.delegate.clone())
+    }
+
+    /// Validates delegation configuration that cannot be checked by the builder
+    /// methods themselves because they are infallible chaining APIs.
+    pub(crate) fn validate_configuration(&self) -> Result<(), FacadeError> {
+        match &self.mode {
+            DelegationMode::SingleTool { tool_name } if tool_name.trim().is_empty() => {
+                Err(FacadeError::Config(
+                    "single-tool delegation requires a non-empty tool name".to_owned(),
+                ))
+            }
+            DelegationMode::Rules { rules } => {
+                for (index, rule) in rules.iter().enumerate() {
+                    if rule.delegate.trim().is_empty() {
+                        return Err(FacadeError::Config(format!(
+                            "rules-routed delegation rule {index} has a blank delegate name"
+                        )));
+                    }
+                    if rule.keywords.is_empty() {
+                        return Err(FacadeError::Config(format!(
+                            "rules-routed delegation rule {index} has no keywords"
+                        )));
+                    }
+                    if rule
+                        .keywords
+                        .iter()
+                        .any(|keyword| keyword.trim().is_empty())
+                    {
+                        return Err(FacadeError::Config(format!(
+                            "rules-routed delegation rule {index} has a blank keyword"
+                        )));
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Dispatcher-routed delegation: a fixed cheap→verify→strong escalation loop
@@ -1937,6 +1976,7 @@ fn synthetic_delegation_call(call_id: &ToolCallId, delegate_name: &str, task: &s
         id: call_id.to_string(),
         name: delegation_tool_name(delegate_name),
         input: json!({ "task": task }),
+        extra: Map::new(),
     }
 }
 
@@ -2094,6 +2134,33 @@ mod tests {
             panic!("expected config error")
         };
         assert!(message.contains("provider_extras"));
+    }
+
+    #[test]
+    fn explicit_worker_rejects_blank_model() {
+        let error = worker()
+            .model("  ")
+            .build()
+            .expect_err("blank model is rejected");
+
+        let FacadeError::Config(message) = error else {
+            panic!("expected config error")
+        };
+        assert!(message.contains("model"));
+    }
+
+    #[test]
+    fn explicit_worker_rejects_non_finite_temperature() {
+        let error = worker()
+            .model("gpt-5.5")
+            .temperature(f32::NEG_INFINITY)
+            .build()
+            .expect_err("non-finite temperature is rejected");
+
+        let FacadeError::Config(message) = error else {
+            panic!("expected config error")
+        };
+        assert!(message.contains("temperature"));
     }
 
     #[test]

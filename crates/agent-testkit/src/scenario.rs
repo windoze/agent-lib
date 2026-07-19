@@ -72,6 +72,7 @@ use agent_lib::model::content::ContentBlock;
 use agent_lib::model::message::Role;
 use agent_lib::model::tool::{Tool, ToolCall, ToolStatus};
 use serde::{Deserialize, Serialize};
+use serde_json::Map;
 
 use crate::fixtures::{agent_spec_with_tools, agent_state, default_machine, root_context, usage};
 use crate::handlers::{
@@ -209,6 +210,9 @@ pub struct ScenarioToolCall {
     /// The parsed tool input.
     #[serde(default)]
     pub input: serde_json::Value,
+    /// Provider-specific fields carried on the scripted tool call.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, serde_json::Value>,
 }
 
 /// A scripted tool execution result.
@@ -568,6 +572,7 @@ fn llm_step(step: &ScenarioLlmStep) -> LlmStep {
                     id: call.id.clone(),
                     name: call.name.clone(),
                     input: call.input.clone(),
+                    extra: call.extra.clone(),
                 })
                 .collect();
             LlmStep::tool_use(calls).with_usage(usage(u.input, u.output))
@@ -684,6 +689,7 @@ mod tests {
     use agent_lib::agent::LoopCursorKind;
     use agent_lib::model::message::Role;
     use agent_lib::model::tool::ToolStatus;
+    use serde_json::Map;
 
     const CALL_ID: &str = "call-weather";
 
@@ -740,6 +746,7 @@ mod tests {
                             id: CALL_ID.to_owned(),
                             name: "get_weather".to_owned(),
                             input: serde_json::json!({ "city": "Shanghai" }),
+                            extra: Map::new(),
                         }],
                         usage: ScenarioUsage {
                             input: 5,
@@ -796,6 +803,7 @@ mod tests {
                             id: CALL_ID.to_owned(),
                             name: "get_weather".to_owned(),
                             input: serde_json::json!({ "city": "Shanghai" }),
+                            extra: Map::new(),
                         }],
                         usage: ScenarioUsage::default(),
                     },
