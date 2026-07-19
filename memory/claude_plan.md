@@ -39,4 +39,4 @@
 - [x] 测试（新增 drain_records_pivot_reemission_under_a_derived_trace_id；agent:: 445 全过；
   fmt/clippy 干净；cargo test --all --all-targets 全绿；cargo doc -D warnings 通过）
 - [x] 文档（effect-model §8 + effect-migration §11）+ TODO.md 标 [DONE]
-- [ ] 提交
+- [x] 提交（cd0b39a [M4-3]）——任务完成，停止。
