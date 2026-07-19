@@ -2437,6 +2437,51 @@ mod tests {
         }
     }
 
+    /// M3-R: a parent handler that parks forever, proving the external
+    /// interaction route abandons a parked interaction when the run is
+    /// cancelled (mirrors `ParkingParentInteractionHandler` in
+    /// `facade::delegate` for the local path).
+    #[cfg(feature = "external-acp")]
+    struct ParkingParentInteractionHandler {
+        reached: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<crate::agent::Interaction>>>,
+    }
+
+    #[cfg(feature = "external-acp")]
+    impl ParkingParentInteractionHandler {
+        fn new() -> (
+            std::sync::Arc<Self>,
+            tokio::sync::oneshot::Receiver<crate::agent::Interaction>,
+        ) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (
+                std::sync::Arc::new(Self {
+                    reached: std::sync::Mutex::new(Some(tx)),
+                }),
+                rx,
+            )
+        }
+    }
+
+    #[cfg(feature = "external-acp")]
+    #[async_trait::async_trait]
+    impl crate::agent::InteractionHandler for ParkingParentInteractionHandler {
+        async fn fulfill(
+            &self,
+            request: &crate::agent::Interaction,
+            _ctx: &crate::agent::RunContext,
+        ) -> crate::agent::RequirementResult {
+            if let Some(sender) = self
+                .reached
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+            {
+                let _ = sender.send(request.clone());
+            }
+            std::future::pending::<crate::agent::RequirementResult>().await
+        }
+    }
+
     /// A capturing `AsyncWrite` recording every byte the ACP session writes.
     #[cfg(feature = "external-acp")]
     struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -2822,6 +2867,79 @@ mod tests {
             }
             other => panic!("expected RespondInteraction, got {other:?}"),
         }
+    }
+
+    /// M3-R (C9): cancelling while the parent interaction handler is parked
+    /// forever must not deadlock the external delegation — the route selects
+    /// on the cancellation token, the drive settles in seconds, and the
+    /// abandoned session is marked for cleanup (mirrors the M1-2 local test
+    /// `cancelling_while_parent_child_interaction_handler_is_parked_does_not_hang`).
+    #[cfg(feature = "external-acp")]
+    #[tokio::test]
+    async fn drive_external_cancel_while_parent_handler_parked_does_not_hang() {
+        use super::drive_external;
+        use crate::agent::InteractionHandler;
+        use crate::facade::collab::CollabBridge;
+        use crate::facade::ids::FacadeIds;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let ids = FacadeIds::seeded(14);
+        let (interaction, _actor) = acp_permission_interaction(&ids);
+        let runtime = ScriptedExternalHandler::new([acp_permission_pause(interaction)]);
+        let external_log = runtime.log();
+
+        let (parent, reached_rx) = ParkingParentInteractionHandler::new();
+        let parent_handler: Arc<dyn InteractionHandler> = parent;
+
+        let agent = ManagedExternalAgent::opencode_acp()
+            .session_handler(Arc::new(runtime))
+            .build()
+            .expect("managed ACP external agent builds");
+        let ctx = external_root_context(&ids);
+        let token = ctx.cancellation().clone();
+        let bridge = CollabBridge::default();
+
+        let drive = drive_external(
+            "coder",
+            &agent,
+            &ids,
+            "refactor".to_owned(),
+            &bridge,
+            Some(parent_handler),
+            &ctx,
+        );
+        let canceller = async move {
+            let interaction = tokio::time::timeout(Duration::from_secs(1), reached_rx)
+                .await
+                .expect("parent handler should be reached before the test timeout")
+                .expect("parent handler sends the interaction");
+            let origin = interaction
+                .origin()
+                .expect("parked external interaction carries delegate attribution");
+            assert_eq!(origin.delegate, "coder");
+            assert_eq!(origin.depth, 1);
+            token.cancel();
+        };
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), async {
+            let (outcome, ()) = tokio::join!(drive, canceller);
+            outcome
+        })
+        .await
+        .expect("cancelling a parked external interaction must not hang")
+        .expect("a cancelled drive still returns its captured outcome");
+
+        assert!(outcome.cleanup_required);
+        assert!(!outcome.completed);
+
+        // The cancellation won the route before any answer came back, so the
+        // runtime only ever observed the session start — no RespondInteraction.
+        let external_records = external_log
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        assert_eq!(external_records.len(), 1);
     }
 
     #[cfg(feature = "external-acp")]

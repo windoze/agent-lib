@@ -1,15 +1,15 @@
 # 实施计划：mag 缺口收口（委派交互路由 / facade reconfigure / cancel 强化）
 
-> **唯一设计输入**：[`docs/mag-gaps.md`](docs/mag-gaps.md)（mag 对 agent-lib 的缺口需求，
-> 含现状锚点与验收方向）。上游需求方：mag 仓库 [`docs/CLI.md`](../mag/docs/CLI.md)（mag 的
+> **唯一设计输入**：[`docs/mag-gaps.md`](../../mag-gaps.md)（mag 对 agent-lib 的缺口需求，
+> 含现状锚点与验收方向）。上游需求方：mag 仓库 [`docs/CLI.md`](../../../../mag/docs/CLI.md)（mag 的
 > CLI 里程碑设计，§5A 是本轮评估结论）。
 >
 > 旧版计划和任务单已归档（最近一轮）：
 >
-> - [docs/archive/2026-07-19-review-fixes/PLAN.md](docs/archive/2026-07-19-review-fixes/PLAN.md)
-> - [docs/archive/2026-07-19-review-fixes/TODO.md](docs/archive/2026-07-19-review-fixes/TODO.md)
+> - [docs/archive/2026-07-19-review-fixes/PLAN.md](../2026-07-19-review-fixes/PLAN.md)
+> - [docs/archive/2026-07-19-review-fixes/TODO.md](../2026-07-19-review-fixes/TODO.md)
 >
-> 缺口按编号引用（A1–A4、C1–C6），定义见 [`docs/mag-gaps.md`](docs/mag-gaps.md)。
+> 缺口按编号引用（A1–A4、C1–C6），定义见 [`docs/mag-gaps.md`](../../mag-gaps.md)。
 > 逐任务清单见 [`TODO.md`](TODO.md)。
 
 ## 目标
@@ -139,3 +139,53 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 5. mag 侧验收线索：M1 完成后 mag 可用「ACP 子 agent 权限请求 → root handler 应答 → 委派
    继续」的离线 e2e 验证；M2 完成后 `apply_config` 可在 turn 边界换 model/tools/system；
    M3 完成后 cancel 一个静默 ACP 子进程秒级返回且无子进程泄漏。
+
+## 最终收口结论（M3-R）
+
+本计划已完成（2026-07-20），四个目标逐项达成：
+
+1. **委派交互路由（A1）✅**：`Interaction` 归因模型落地（M1-1，可选 `origin { delegate,
+   depth }`，serde 向后兼容，`PermissionRequest.actor` 语义不污染）；local subagent 的已暂停
+   交互经 `ChildInteractionRouter` 路由到父级注入 handler（M1-2，gate 仍属 worker policy，
+   未注入时保持同步 fallback）；external 委派路径以 `ExternalInteractionScope` /
+   `ExternalInteractionRouter` 替换 `EmptyExternalScope`，`ExternalPermissionMode::Prompt`
+   端到端打通（M1-3，无 handler 时明确失败而非 hang）；external-start ask 在父级注入 handler
+   存在时走同一异步通道并带归因（M1-4，同步 fallback/headless deny 保留）。mag 验收线索
+   「ACP 子 agent 权限请求 → root handler 应答 → 委派继续」由 `external-acp` 离线测试钉住。
+2. **facade reconfigure（A2）✅**：`Agent::reconfigure(ReconfigRequest)` 透出（M2-1，
+   between-run/rest cursor 准入，skill 请求显式拒绝）；流式/非流式 reconfig handler 与
+   `ReplaceToolSet` / `PatchToolSet` 的 live registry 一致性接线（M2-2）；被移除委派工具
+   仍驱动委派的绕过修复（M2-3）；snapshot/restore 交互、restore 工具面校验、`SetModel`
+   准入校验与 facade re-export 补齐（M2-4）。`apply_config` 所需的 turn 边界换
+   model/tools/system 全部可达。
+3. **cancel 强化（A3/A4）✅**：四个 adapter 的 advance 读循环与 cancellation `select!`
+   （M3-1，静默对端 cancel 秒级生效，不等满 120s/600s 超时）；facade 驱动路径在未
+   committed 收尾时自动经 `ExternalSessionHandler::cleanup_agent` sweep 本 drive 的 live
+   session 与 ephemeral worktree（M3-2，宿主不做额外动作也不泄漏子进程；drop 语义 rustdoc
+   化）；tool/interaction 批级等待可被 cancel 抢占（M3-3，`fulfill_batch_cancellable` +
+   2s `CANCEL_UNWIND_GRACE` 宽限后 drop/detach，长工具须自行 select 取消令牌的约定写入
+   rustdoc 与文档）。mag 验收线索「cancel 静默 ACP 子进程秒级返回、无子进程泄漏」与
+   「阻塞 tool 不再冻结 run」均有钉住测试。
+4. **文档同步与离线测试 ✅**：每个行为变更同步更新了拥有该行为的文档
+   （`docs/facade-api.md`、`docs/managed-external-agent.md`、`docs/agent-layer.md`、
+   `docs/agent-effect-model.md`、`docs/capability-matrix.md`、`docs/mag-gaps.md`）；M3-R 终检
+   修正了 `agent-effect-model.md` 滞留的「两个观测点 / tool 不中途打断」旧口径，三个取消
+   机制（读循环 select、session 自动清扫、批抢占）在各文档口径一致。默认测试保持离线可跑，
+   真实 CLI 联调测试仍 `#[ignore]`。
+
+M1 review 遗留项（`docs/mag-gaps.md` C7–C9）处置：C7 保持登记不修（mag 自行发事件，修复
+需 origin-aware 富化 pending 表，收益不成比例）；C8 文档化为已知限制（`facade-api.md`
+§10.2 补注 SingleTool 双重 gate）；C9 部分收口（auto-deny 可应答语义已文档化于
+`facade-api.md` §9.1，external cancel-while-parked 与 family-mismatch 两个测试缺口已补，
+Claude Code 路径结构性覆盖保持登记）。C 组可选项 C1–C6 按原计划不做（C5 已由 M1-4 修复）。
+
+最终验证（M3-R，2026-07-20）全部通过：
+
+- `cargo fmt --all`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
+- `cargo test --all --all-targets`（50 套件 0 失败）
+- `cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（48 套件 0 失败）
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
+
+收尾归档：本计划与任务单在 M3-R 完成后归档到 `docs/archive/2026-07-20-mag-gaps/`。

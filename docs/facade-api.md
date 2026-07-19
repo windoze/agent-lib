@@ -626,7 +626,10 @@ stream;需要从其他 task 触发取消时,传递 `CancelHandle` 或调用 `can
 never-resume 当前 outstanding requirement;批级等待可被抢占(M3-3)——阻塞中的
 tool/interaction fulfill future 在一个有界 unwind 宽限(2s,供合作 handler 跑清理尾)后被
 drop(detach),不再冻结整个 run,工具看到同一个 token (`ToolContext.cancel`),长工具必须自行
-select 它。完成后 agent 回到可继续使用的一致点。当前取消在 facade 层仍以
+select 它。委派到 managed external agent 的 run 在同一令牌下同样秒级响应:external advance
+读循环与 cancellation `select!`(M3-1,对端静默也不等满 IO/空闲超时),drive 以 cancel/abandon
+或失败收尾时 facade 自动 sweep 该 drive 的 live session(M3-2,见 §11.2「清理责任」),宿主不做
+额外动作也不泄漏子进程。完成后 agent 回到可继续使用的一致点。当前取消在 facade 层仍以
 `FacadeError::Agent` 中的取消诊断返回;专用 `FacadeError::Cancelled` 可作为后续 API 打磨项。
 
 流式 pivot 使用 `AgentRunStream::interject(...)`。由于 `AgentRunStream` 持有 `&mut Agent` 的
@@ -746,6 +749,14 @@ ApprovalPolicy::default()
     .ask_worktree_write()
 ```
 
+**auto-deny 是「默认拒绝的 gate」,不是终局判决**(C9-a,M3-R 文档化):ask 与 auto_deny
+两个 tier 都会让调用**暂停**;注入了 `interaction_handler` 时,被暂停交互的唯一应答方是该
+handler——它可以把一个 auto_deny 暂停的调用改判 `Approve`。这是有意设计的逃生口:「deny
+作为默认 gate(无 handler 时安全拒绝),handler 作为唯一应答权威」。该语义在 supervisor 与委派
+链子 agent 两层一致:local subagent 的 worker policy、managed external delegate 的启动门与
+permission bridge 里,子 policy 的 auto-deny 同样只是 gate,父级注入 handler 可改判;未注入
+handler 时 auto_deny 同步 deny,headless ask 也 deny 而不挂起(见 §8.2)。
+
 ### 9.2 默认权限语义
 
 建议默认:
@@ -863,6 +874,12 @@ ask_fixer(task)
 ```
 
 统一工具适合 worker 数量动态变化或需要外层 policy 接管路由的场景。
+
+已知限制(C8,登记于 `docs/mag-gaps.md`):SingleTool 模式下所有 delegate 共用一个统一工具名,
+机器 tool gate 无法按 delegate 豁免 external start tool(§9.2 的豁免只覆盖 PerSubagentTool 模式的
+`ask_<name>`)。因此统一工具名配了 ask tier(如 `.ask_tool("delegate")` 或默认 ask)时,同一次
+external start 会被 gate 两次:模型可见的 tool gate 先暂停一次(无 delegate 归因),批准后 drive 层的
+start-ask 再问一次(带 `Interaction.origin` 归因)。PerSubagentTool 模式不存在该双重 gate。
 
 ### 10.3 Worker spec
 

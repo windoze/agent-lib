@@ -2657,6 +2657,33 @@ mod model_routed_tests {
         }
     }
 
+    /// M3-R (C9): a parent handler that answers every interaction with a
+    /// wrong-family response, proving a mismatched answer to the
+    /// external-start ask is treated as a denial rather than a start.
+    struct MismatchedFamilyParentHandler {
+        seen: Mutex<Vec<Interaction>>,
+    }
+
+    impl MismatchedFamilyParentHandler {
+        fn new() -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<Interaction> {
+            self.seen.lock().expect("seen mutex").clone()
+        }
+    }
+
+    #[async_trait]
+    impl InteractionHandler for MismatchedFamilyParentHandler {
+        async fn fulfill(&self, request: &Interaction, _ctx: &RunContext) -> RequirementResult {
+            self.seen.lock().expect("seen mutex").push(request.clone());
+            RequirementResult::Interaction(InteractionResponse::answer(String::new()))
+        }
+    }
+
     #[tokio::test]
     async fn model_routed_delegation_drives_child_and_folds_result() {
         let client = RoutingClient::new(vec![
@@ -3854,6 +3881,43 @@ mod model_routed_tests {
                 .iter()
                 .any(|text| text == "refactor complete"),
             "a denied external delegate is not driven"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_start_ask_family_mismatched_answer_surfaces_approval_denied() {
+        // M3-R (C9): a parent handler that answers the external-start approval
+        // with a wrong-family response must not start the delegate — the
+        // mismatched answer is treated as a denial.
+        let parent_handler = Arc::new(MismatchedFamilyParentHandler::new());
+        let mut agent = AgentBuilder::default()
+            .client(external_supervisor_client())
+            .model("supervisor-model")
+            .system("You are the SUPERVISOR.")
+            .approval(ApprovalPolicy::from(Approval::auto_allow()).ask_external_agents())
+            .interaction_handler(parent_handler.clone())
+            .external_agent("coder", completed_coder())
+            .build()
+            .expect("agent builds");
+
+        let error = agent
+            .run_full("Please refactor.")
+            .await
+            .expect_err("a wrong-family answer to the start ask denies the start");
+        assert!(
+            matches!(error, crate::facade::FacadeError::ApprovalDenied),
+            "family-mismatched start answer surfaces ApprovalDenied, got {error:?}"
+        );
+        assert_eq!(
+            parent_handler.seen().len(),
+            1,
+            "the parent handler still received the start ask"
+        );
+        assert!(
+            !tool_result_texts(&agent)
+                .iter()
+                .any(|text| text == "refactor complete"),
+            "a mismatched-answer external delegate is not driven"
         );
     }
 

@@ -241,15 +241,27 @@ facade re-export 完整性已收口（M2-4）。
   tap/recorder：两条 run 路径把裸 handler 传给 `DelegationToolHandler`，子 agent 审批不产生
   `RunEvent::ApprovalRequested`、不进 `RunOutput.events`，与 supervisor 层口径不一致。对 mag
   无害（`IpcApproval` 自行发事件）；修复需注意 `enriched_approval_request` 只看 supervisor
-  pending 表，需 origin-aware  enrichment。M3-R 评估收口与否。
+  pending 表，需 origin-aware  enrichment。**M3-R 结论（2026-07-20）：保持登记，不修。**
+  mag（消费方）从自己注入的 handler 自行发事件，该不一致对 mag 不可见；朴素修复需要对
+  supervisor pending 表做 origin-aware 富化，爆炸半径与收益不成比例。继续登记为已知不一致项。
 - **C8**（2026-07-20 review 登记）SingleTool 委派模式下 external start 被双重 gate：机器 tool
   gate 对统一工具名暂停一次（无归因），驱动层 start-ask 再问一次（有归因）。PerSubagentTool
   模式的豁免是真实的（`facade/approval.rs:778-780`），SingleTool 模式不在豁免内
   （`facade/delegate.rs:1213`）。mag 用 PerSubagentTool 模式，不受影响。
+  **M3-R 结论（2026-07-20）：文档化，保持登记为已知限制。** `docs/facade-api.md` §10.2 已补注：
+  SingleTool 模式下统一工具名配 ask tier 时，模型可见 tool gate 与 drive 层 start-ask 各 fire
+  一次；PerSubagentTool 模式把 `ask_<name>` start tool 豁免出机器 gate，不存在双重 gate。
 - **C9**（2026-07-20 review 登记）语义文档与测试缺口：(a) child 的 auto-deny 层会暂停且父
   handler 可改判 Approve——与 supervisor 层设计一致（mag 依赖此兜底模式），但子 policy 的
   「deny 可应答」语义未文档化；(b) M1-3 external 路径缺 cancel-while-parked 测试、M1-4 缺
-  family-mismatch 测试、Claude Code 路径只有结构性覆盖。M3-R 评估收口与否。
+  family-mismatch 测试、Claude Code 路径只有结构性覆盖。**M3-R 结论（2026-07-20）：部分收口。**
+  (a) ✅ 已文档化：`docs/facade-api.md` §9.1 补「auto-deny 是默认拒绝的 gate、注入 handler 是
+  唯一应答权威、可改判 Approve」段落，supervisor 与子 agent 两层语义一致。(b) ✅ 两个廉价
+  测试缺口已补：M1-3 external 路径 cancel-while-parked 测试
+  （`drive_external_cancel_while_parent_handler_parked_does_not_hang`，镜像 M1-2 local 测试）、
+  M1-4 family-mismatch 测试（`external_start_ask_family_mismatched_answer_surfaces_approval_denied`，
+  父 handler 以错误 family 应答 start-ask → `FacadeError::ApprovalDenied`）。(c) Claude Code 路径
+  覆盖保持登记：仍只有结构性覆盖，真实 permission pause 的端到端覆盖待真实 CLI 联调。
 
 ## 使用约束（mag 侧已知晓的陷阱，非缺口）
 

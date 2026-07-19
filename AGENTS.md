@@ -1,9 +1,9 @@
 # AGENTS.md
 
 Operational guide for working in **agent-lib**. It complements the design docs
-under [`docs/`](docs/) and the archived review-fix task ledgers
-([`PLAN.md`](docs/archive/2026-07-19-review-fixes/PLAN.md),
-[`TODO.md`](docs/archive/2026-07-19-review-fixes/TODO.md)); read those for
+under [`docs/`](docs/) and the archived task ledgers (most recent:
+[`PLAN.md`](docs/archive/2026-07-20-mag-gaps/PLAN.md),
+[`TODO.md`](docs/archive/2026-07-20-mag-gaps/TODO.md)); read those for
 architecture and roadmap. This file is the short "how to build, test, and run
 things" reference.
 

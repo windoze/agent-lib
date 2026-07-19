@@ -1,7 +1,7 @@
 # TODO：mag 缺口收口任务单（委派交互路由 / facade reconfigure / cancel 强化）
 
-本任务单对应 [PLAN.md](PLAN.md) 和 [docs/mag-gaps.md](docs/mag-gaps.md)（唯一设计输入）。
-旧任务单已归档（最近一轮）：[docs/archive/2026-07-19-review-fixes/TODO.md](docs/archive/2026-07-19-review-fixes/TODO.md)。
+本任务单对应 [PLAN.md](PLAN.md) 和 [docs/mag-gaps.md](../../mag-gaps.md)（唯一设计输入）。
+旧任务单已归档（最近一轮）：[docs/archive/2026-07-19-review-fixes/TODO.md](../2026-07-19-review-fixes/TODO.md)。
 
 执行规则：
 
@@ -9,7 +9,7 @@
 - 每个标题中的 `[TODO]` 表示尚未完成。完成后把 `[TODO]` 改成 `[DONE]`，并在任务下方追加
   "完成记录"，写明关键实现决策、验证结果和（如有）breaking change。
 - 不要跳过每个 milestone 末尾的 review 任务。
-- 缺口编号（A1–A4、C1–C6）定义见 [docs/mag-gaps.md](docs/mag-gaps.md)；修复后在该文档对应
+- 缺口编号（A1–A4、C1–C6）定义见 [docs/mag-gaps.md](../../mag-gaps.md)；修复后在该文档对应
   条目上标注 `✅ 已修复（M*-*）` 或 `📄 已降级（文档承认现状，M*-*）`。
 - 修改行为时同步修改拥有该行为的文档，至少检查 `README.md`、`AGENTS.md`、
   `docs/facade-api.md`、`docs/managed-external-agent.md`、`docs/capability-matrix.md`、
@@ -888,7 +888,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   `cargo test --all --all-targets`(50 套件全绿);`RUSTDOCFLAGS="-D warnings" cargo doc
   --no-deps --workspace`。
 
-### M3-R [TODO] M3 review：cancel 强化收口 + 全计划终检
+### M3-R [DONE] M3 review：cancel 强化收口 + 全计划终检
 
 - 逐条核对 `docs/mag-gaps.md` A3/A4 落地状态并标注；C 组确认保持「不做」。
 - 核对 mag 验收线索：cancel 一个静默 ACP 子进程秒级返回、无子进程泄漏；阻塞 tool 不再
@@ -902,3 +902,51 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 全量门禁通过（含 external features 的 clippy 与测试）。
 - 终检：PLAN.md 四个目标逐项核对；本计划与任务单归档到
   `docs/archive/<完成日期>-mag-gaps/`。
+
+完成记录（2026-07-20）：
+
+- **A3/A4 逐条核对**：`docs/mag-gaps.md` A3 三条（read loop select M3-1、自动 session 清理
+  M3-2、文档同步 M3-2）与 A4 四条（批抢占、drop+宽限语义、流式/非流式一致、测试与文档口径，
+  均 M3-3）的 ✅ 标注逐条核实无误；C 组 C1–C6 保持「不做」（C5 已由 M1-4 修复并标注，符合
+  M1-R 结论），C7–C9 处置见下。
+- **mag 验收线索核对**：cancel 静默 ACP 子进程秒级返回由 M3-1 各 adapter 静默对端取消测试
+  （`acp_adapter_cancel_settles_a_silent_advance_promptly` 等，2s 断言反衬 60s/读超时）钉住；
+  无子进程泄漏由 M3-2 `drive_external_cancel_sweeps_live_session_and_worktree`（`session/cancel`
+  到达、registry 无残留句柄、worktree 按 disposition 清扫、trace 留痕）钉住；阻塞 tool 不再
+  冻结 run 由 M3-3 `drain_preempts_a_blocked_tool_and_interaction_batch_on_cancel` 与 facade 两侧
+  `cancelling_a_run_blocked_in_a_tool_detaches_it_and_leaves_agent_runnable`（非流式/流式）钉住。
+  无验收线索缺钉住测试，未新增本项测试。
+- **取消口径一致性**：核查 `docs/agent-effect-model.md`、`docs/agent-layer.md`、
+  `docs/managed-external-agent.md`、`docs/facade-api.md` 取消章节。发现并修正一处滞留旧口径：
+  `agent-effect-model.md` §8 仍写「两个观测点」与「tool 执行有意不中途打断」，与 M3-3 矛盾——
+  已改为三个观测点（批前/批等待期间/批后 resume 前）与「批等待可抢占、最坏延迟 ≈ 2s unwind
+  宽限」，并互引 §6.3。`facade-api.md` 取消段补一句把 external 侧两机制（M3-1 读循环 select、
+  M3-2 自动 sweep，指 §11.2）纳入同一取消叙事。三机制（read loop select、session 清理、批
+  抢占 + `CANCEL_UNWIND_GRACE`）在四文档口径一致；行为未动。
+- **C7 处置：保持登记，不修。** mag（消费方）从自己注入的 handler 自行发事件，委派审批不进
+  tap/recorder 对 mag 不可见；朴素修复需对 supervisor pending 表做 origin-aware 富化，爆炸半径
+  与收益不成比例。C7 条目已记录该决策。
+- **C8 处置：文档化，保持登记为已知限制。** `docs/facade-api.md` §10.2 补注：SingleTool 模式
+  统一工具名配 ask tier 时，模型可见 tool gate 与 drive 层 start-ask 各 fire 一次（双重 gate）；
+  PerSubagentTool 模式把 `ask_<name>` start tool 豁免出机器 gate，不存在双重 gate。C8 条目已
+  加指向该注的结论。
+- **C9 处置：部分收口。** (a) `docs/facade-api.md` §9.1 补「auto-deny 是默认拒绝的 gate、注入
+  handler 是唯一应答权威、可改判 Approve」段落，supervisor 与子 agent（worker policy、external
+  启动门/permission bridge）两层语义一致；(b) 两个廉价测试缺口已补——M1-3 external 路径
+  cancel-while-parked 测试 `drive_external_cancel_while_parent_handler_parked_does_not_hang`
+  （父 handler 永久 park + cancel，2s 内 settle、`cleanup_required && !completed`、runtime 只
+  观察到 session start，镜像 M1-2 local 测试），M1-4 family-mismatch 测试
+  `external_start_ask_family_mismatched_answer_surfaces_approval_denied`（父 handler 以错误
+  family 应答 start-ask → `FacadeError::ApprovalDenied`、delegate 未驱动）；(c) Claude Code 路径
+  覆盖保持登记于 C9（仍结构性覆盖，真实 permission pause 端到端待真实 CLI 联调）。C9 条目
+  已按「部分收口」更新。
+- **全量门禁**：`cargo fmt --all` ✅；`cargo clippy --all-targets -- -D warnings` ✅；
+  `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode
+  external-acp" -- -D warnings` ✅；`cargo test --all --all-targets` ✅（50 套件 0 失败）；
+  `cargo test --features "external-claude-code external-codex external-opencode external-acp"
+  --all-targets` ✅（48 套件 0 失败）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --workspace` ✅。
+- **终检**：PLAN.md 四个目标逐项核对达成，结论写入 PLAN.md「最终收口结论（M3-R）」；本计划
+  与任务单归档到 `docs/archive/2026-07-20-mag-gaps/`，归档内相对链接已修正，AGENTS.md 的
+  ledger 引用已指向新归档。
+- Breaking change：无（本 review 仅文档措辞修正 + 新增 2 个离线测试，无 API 或行为变化）。
