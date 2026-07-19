@@ -1473,13 +1473,21 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - **验证**：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（默认离线全量，真实端点/CLI 测试保持 ignored，无挂起）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - **Breaking change（pre-1.0，记录在此）**：`DispatchError` 新增 `BudgetExhausted` 变体（该 enum 未标 `#[non_exhaustive]`，外部穷尽 match 需补分支）；`AgentParts` 新增 `budget: BudgetLimits` 字段（struct literal 构造点需补）。`FacadeError` 新增 `BudgetExhausted` 但该 enum 已 `#[non_exhaustive]`；builder 方法为纯增量。
 
-### M6-3 [TODO] M6 review：预算接线收口
+### M6-3 [DONE] M6 review：预算接线收口
 
 检查项：
 
 - 核对 M-PROM-1、L-8、L-9 状态，`docs/review-2026-07.md` 已标注。
 - 确认 `BudgetExhausted`/`BudgetExceeded` 变体不再是死代码（grep 有生产路径构造点）。
 - 全量门禁命令通过。
+
+完成记录：
+
+- 条目核对：`docs/review-2026-07.md` 中 `M-PROM-1` 已标注 `✅ 已修复（M6-1/M6-2）`；`M-PROM-2` 已标注 cancel/pivot 由 M5-4 修复、budget 部分由 M6-2 修复；低严重度资源条目中 `L-8`（预算预检与 charge 非原子窗口）已记录为可接受且已文档化，`L-9`（dispatch 预算耗尽仍派工）已标注 `✅ 已修复，M6-2`。
+- 生产路径核对：`drain` 与流式 `drive_streamed` 均在预算预检命中或 LLM response 后 `charge_step`/`charge_usage` 超限时调用 `interrupt_budget_exhausted`；`DefaultAgentMachine::finish_budget_exhausted` 会构造 `CancelRecoveryReason::BudgetExceeded` 与 `LoopDoneReason::BudgetExhausted`；`ExternalAgentMachine::interrupt_budget_exhausted` 会构造 `LoopDoneReason::BudgetExhausted`；facade `run_full`/stream terminal 路径会把 `Done(BudgetExhausted)` 映射为 `FacadeError::BudgetExhausted`；`Dispatcher::dispatch` 在零预算或 evaluator step charge 超限时返回 `DispatchError::BudgetExhausted`。预算相关变体不再是死代码。
+- 文档/计划核对：M6-1/M6-2 已分别同步 `docs/agent-effect-model.md`、`docs/agent-layer.md`、`docs/facade-api.md` 与 `docs/external-agent.md` 的预算语义；本 review 未改变阶段级计划，`PLAN.md` 无需更新。
+- 全量门禁：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（默认离线全量，真实端点/CLI 测试保持 ignored，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- 本任务为 review 收口，无生产代码改动；仅更新任务单完成记录与执行计划文件。无 breaking change。
 
 ---
 
