@@ -57,7 +57,9 @@ use agent_lib::agent::external::{
     ExternalSessionRequest, ExternalSessionShutdown, ExternalSubagentRequest, ExternalToolBatchId,
     ExternalToolCall, RuntimeDecisionPoint,
 };
-use agent_lib::agent::{ExternalSessionHandler, Interaction, RequirementResult, RunContext};
+use agent_lib::agent::{
+    AgentId, ExternalSessionHandler, Interaction, RequirementResult, RunContext,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1006,6 +1008,12 @@ impl ExternalSessionHandler for CassetteRuntimeExternalSessionHandler {
         let result = RequirementResult::ExternalSession(Box::new(self.advance(request, ctx).await));
         self.log.complete(ticket, result.clone());
         result
+    }
+
+    /// Sweeps through the real registry so cassette drives share the
+    /// production cancel/abandon cleanup shape (M3-2).
+    async fn cleanup_agent(&self, agent_id: AgentId) -> Vec<ExternalSessionShutdown> {
+        self.registry.cleanup_agent(agent_id).await
     }
 }
 

@@ -80,12 +80,12 @@
 
 use crate::{
     agent::{
-        AgentError, AgentInput, AgentMachine, LlmStepMode, LoopCursor, LoopCursorKind,
+        AgentError, AgentId, AgentInput, AgentMachine, LlmStepMode, LoopCursor, LoopCursorKind,
         Notification, Requirement, RequirementDisposition, RequirementId, RequirementKind,
         RequirementResolution, RequirementResult, RunContext, RunContextError, StepInput,
         ToolSetRef, TraceError, TraceNodeId,
         effect_manifest::{define_effect_fan_out, with_effect_manifest},
-        external::ExternalSessionRequest,
+        external::{ExternalSessionRequest, ExternalSessionShutdown},
         interaction::Interaction,
         requirement::{AgentSpecRef, RequirementKindTag},
     },
@@ -230,6 +230,32 @@ pub trait ExternalSessionHandler: Send + Sync {
         request: &ExternalSessionRequest,
         ctx: &RunContext,
     ) -> RequirementResult;
+
+    /// Force-closes every live session this handler started for `agent_id`,
+    /// returning each session's [`ExternalSessionShutdown`] disposition.
+    ///
+    /// Cancelling an external agent is never-resume (design §6.4): an
+    /// abandoned drive is not stepped again, so it can never emit a graceful
+    /// [`Shutdown`](crate::agent::ExternalSessionInput::Shutdown) — the machine
+    /// only flags
+    /// [`cleanup_required`](crate::agent::ExternalAgentState::cleanup_required)
+    /// and the handle layer must close the live runtime. The facade drive path
+    /// calls this hook automatically whenever a drive ends without a committed
+    /// session (cancel-abandoned *or* failed), so a host whose handler owns
+    /// real runtime IO leaks no subprocess without doing anything extra (M3-2).
+    ///
+    /// The default is a no-op, which is correct for handlers that own no live
+    /// runtime state (scripted or cassette stand-ins). A handler that *does*
+    /// own live runtime IO **must** override this to force-close the agent's
+    /// sessions — the shipped
+    /// [`RegistryExternalSessionHandler`](crate::agent::external::RegistryExternalSessionHandler)
+    /// forwards it to its registry — or a cancelled drive silently leaks
+    /// whatever the runtime holds (a CLI child, an SDK client, a reader task)
+    /// until the handler itself is dropped.
+    async fn cleanup_agent(&self, agent_id: AgentId) -> Vec<ExternalSessionShutdown> {
+        let _ = agent_id;
+        Vec::new()
+    }
 }
 
 /// Outcome of draining one machine to the end of a turn.
@@ -1512,6 +1538,17 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             RequirementResult::ExternalSession(Box::new(external_session_result()))
         }
+    }
+
+    #[tokio::test]
+    async fn external_session_handler_default_cleanup_agent_is_a_no_op() {
+        // A handler that owns no live runtime state needs no override: the
+        // default sweep reports nothing and touches nothing (M3-2).
+        let handler = CountingExternalSessionHandler::default();
+        let agent_id: AgentId = "018f0d9c-7b6a-7c12-8f31-1234567890f0"
+            .parse()
+            .expect("agent id");
+        assert!(handler.cleanup_agent(agent_id).await.is_empty());
     }
 
     /// Records the completion order of a concurrent tool batch, delaying each

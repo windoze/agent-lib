@@ -1023,13 +1023,16 @@ const DEFAULT_EXTERNAL_IO_TIMEOUT: Duration = Duration::from_secs(120);
 /// session start/resume and cleaned up with the session's shutdown disposition
 /// (M2-7, `docs/managed-external-agent.md` §16). The returned handler is ready
 /// to inject with
-/// [`ManagedExternalAgentBuilder::session_handler`]. Because it returns the
-/// concrete [`RegistryExternalSessionHandler`] (which coerces to
-/// `Arc<dyn ExternalSessionHandler>` at the injection point), a host keeps the
-/// [`registry`](RegistryExternalSessionHandler::registry) accessor to
-/// force-close the session with
-/// [`cleanup_agent`](ExternalSessionRegistry::cleanup_agent) once a drive is
-/// done.
+/// [`ManagedExternalAgentBuilder::session_handler`]. A cancelled or failed
+/// facade drive is force-closed automatically through
+/// [`ExternalSessionHandler::cleanup_agent`] (M3-2), so a host that does
+/// nothing extra leaks no subprocess; because this returns the concrete
+/// [`RegistryExternalSessionHandler`] (which coerces to
+/// `Arc<dyn ExternalSessionHandler>` at the injection point), a host also
+/// keeps the [`registry`](RegistryExternalSessionHandler::registry) accessor
+/// to force-close a *completed* session it is done with, or to sweep ahead of
+/// teardown, with
+/// [`cleanup_agent`](ExternalSessionRegistry::cleanup_agent).
 ///
 /// Each runtime arm is gated on its `external-*` feature. The ACP arm builds the
 /// single shared ACP adapter and lets the live `initialize` handshake negotiate
@@ -1740,6 +1743,23 @@ impl SubagentSpawner for FacadeExternalSpawner {
 /// abandon the outstanding session step, so the returned outcome carries the
 /// runtime cleanup marker.
 ///
+/// # Automatic session cleanup (M3-2)
+///
+/// A drive that ends without a committed session — cancel-abandoned
+/// ([`cleanup_required`](ExternalDriveOutcome::cleanup_required)) or failed
+/// before reaching its terminal cursor — may have left a live runtime in the
+/// handler's registry, so this helper force-closes it before returning:
+/// [`ExternalSessionHandler::cleanup_agent`] is called with the drive's
+/// freshly minted agent id, which scopes the sweep to exactly this drive's
+/// sessions. The shipped registry-backed handler forwards that to
+/// [`ExternalSessionRegistry::cleanup_agent`], running the adapter's shutdown
+/// (a best-effort `session/cancel` plus transport close, process-group
+/// termination for a real child) and feeding each session's disposition into
+/// the registry's worktree policy; the dispositions are also recorded into the
+/// run trace (best effort). A host that does nothing extra therefore leaks no
+/// subprocess. A *committed* drive keeps its live session untouched — the
+/// clean-teardown / dirty-retention worktree policy is unchanged.
+///
 /// # Errors
 ///
 /// Returns [`FacadeError::ExternalAgent`] when the delegate has no session
@@ -1753,7 +1773,7 @@ pub(crate) async fn drive_external(
     parent_interaction: Option<Arc<dyn InteractionHandler>>,
     ctx: &RunContext,
 ) -> Result<ExternalDriveOutcome, FacadeError> {
-    let Some(handler) = agent.session_handler() else {
+    let Some(session_handler) = agent.session_handler() else {
         return Err(FacadeError::ExternalAgent {
             name: name.to_owned(),
             message: "no runtime session handler is attached; call \
@@ -1781,7 +1801,7 @@ pub(crate) async fn drive_external(
         runtime: agent.runtime().clone(),
         worktree,
         policy,
-        handler: handler.clone(),
+        handler: session_handler.clone(),
         ids: ids.clone(),
         task: task.clone(),
         slot: slot.clone(),
@@ -1803,6 +1823,22 @@ pub(crate) async fn drive_external(
         .unwrap_or_else(|poison| poison.into_inner())
         .clone()
         .unwrap_or_default();
+
+    // M3-2: a drive that did not commit its session — cancel-abandoned
+    // (`cleanup_required`) or failed before reaching a terminal cursor — may
+    // have left a live runtime in the handler's registry; sweep it so a host
+    // that does nothing extra leaks no subprocess. The freshly minted
+    // `agent_id` scopes the sweep to exactly this drive's sessions, and a
+    // committed drive is left untouched (worktree teardown/retention policy
+    // unchanged). Each swept session's disposition is recorded into the run
+    // trace, best effort, mirroring the adapter mid-session close audit.
+    if !captured.completed {
+        let dispositions = session_handler.cleanup_agent(agent_id).await;
+        for (seq, disposition) in dispositions.into_iter().enumerate() {
+            let id = TraceNodeId::new(format!("external-cleanup-sweep/{}/{seq}", ctx.run_id()));
+            let _ = ctx.trace().record_external_shutdown(id, disposition);
+        }
+    }
 
     match result {
         RequirementResult::Subagent(Ok(_output)) => Ok(captured),
@@ -2399,6 +2435,301 @@ mod tests {
                 ),
             )
         }
+    }
+
+    /// A capturing `AsyncWrite` recording every byte the ACP session writes.
+    #[cfg(feature = "external-acp")]
+    struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(feature = "external-acp")]
+    impl tokio::io::AsyncWrite for SharedWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// An async reader that serves scripted bytes and then pends forever,
+    /// modelling a live but silent ACP agent that never writes another line.
+    #[cfg(feature = "external-acp")]
+    struct ScriptedThenSilent {
+        scripted: std::io::Cursor<Vec<u8>>,
+    }
+
+    #[cfg(feature = "external-acp")]
+    impl tokio::io::AsyncRead for ScriptedThenSilent {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            #[allow(clippy::cast_possible_truncation)]
+            if self.scripted.position() < self.scripted.get_ref().len() as u64 {
+                return std::pin::Pin::new(&mut self.scripted).poll_read(cx, buf);
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A fake ACP launcher whose agent answers the handshake from a script and
+    /// then stays silent forever, capturing every written frame.
+    #[cfg(feature = "external-acp")]
+    struct SilentTurnLauncher {
+        handshake: std::sync::Mutex<Option<String>>,
+        written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    #[cfg(feature = "external-acp")]
+    impl SilentTurnLauncher {
+        fn new(lines: &[&str]) -> Self {
+            // Every scripted line must be newline-terminated: the reader never
+            // reports EOF, so an unterminated tail would pend forever.
+            Self {
+                handshake: std::sync::Mutex::new(Some(format!("{}\n", lines.join("\n")))),
+                written: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn written(&self) -> String {
+            String::from_utf8(
+                self.written
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone(),
+            )
+            .expect("utf8 frames")
+        }
+    }
+
+    #[cfg(feature = "external-acp")]
+    #[async_trait::async_trait]
+    impl crate::agent::external::AcpLauncher for SilentTurnLauncher {
+        async fn launch(
+            &self,
+            _config: &crate::agent::external::AcpConfig,
+        ) -> Result<
+            crate::agent::external::SpawnedAcpAgent,
+            crate::agent::external::ExternalAgentError,
+        > {
+            let script = self
+                .handshake
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+                .unwrap_or_default();
+            let reader = ScriptedThenSilent {
+                scripted: std::io::Cursor::new(script.into_bytes()),
+            };
+            let writer = SharedWriter(std::sync::Arc::clone(&self.written));
+            // A read timeout far beyond the test's settle bound: settling fast
+            // proves cancellation — not the IO timeout — ended the wait.
+            Ok(crate::agent::external::SpawnedAcpAgent::new(
+                writer,
+                reader,
+                std::time::Duration::from_secs(60),
+            ))
+        }
+    }
+
+    /// A worktree manager that hands out synthetic prepared paths and records
+    /// every cleanup call, so the test can watch the sweep's worktree wiring
+    /// without touching a real filesystem.
+    #[cfg(feature = "external-acp")]
+    struct RecordingWorktreeManager {
+        cleanups: std::sync::Mutex<
+            Vec<(
+                crate::agent::WorktreeRef,
+                crate::agent::external::ExternalSessionShutdown,
+            )>,
+        >,
+    }
+
+    #[cfg(feature = "external-acp")]
+    impl RecordingWorktreeManager {
+        fn new() -> Self {
+            Self {
+                cleanups: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn cleanups(
+            &self,
+        ) -> Vec<(
+            crate::agent::WorktreeRef,
+            crate::agent::external::ExternalSessionShutdown,
+        )> {
+            self.cleanups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+        }
+    }
+
+    #[cfg(feature = "external-acp")]
+    #[async_trait::async_trait]
+    impl crate::agent::external::WorktreeManager for RecordingWorktreeManager {
+        async fn prepare(
+            &self,
+            agent_id: crate::agent::AgentId,
+            base: &crate::agent::WorktreeRef,
+            isolation: crate::agent::external::WorktreeIsolation,
+        ) -> Result<crate::agent::external::PreparedWorktree, crate::agent::external::WorktreeError>
+        {
+            Ok(crate::agent::external::PreparedWorktree::new(
+                agent_id,
+                isolation,
+                base.clone(),
+                true,
+            )
+            .with_base_repo(base.clone()))
+        }
+
+        async fn cleanup(
+            &self,
+            prepared: crate::agent::external::PreparedWorktree,
+            disposition: crate::agent::external::ExternalSessionShutdown,
+        ) -> Result<
+            crate::agent::external::WorktreeCleanupOutcome,
+            crate::agent::external::WorktreeError,
+        > {
+            self.cleanups
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push((prepared.worktree().clone(), disposition));
+            Ok(crate::agent::external::WorktreeCleanupOutcome::new(
+                prepared.isolation(),
+                prepared.worktree().clone(),
+                true,
+                disposition.leaves_residual_side_effects(),
+            ))
+        }
+    }
+
+    /// M3-2: a cancelled facade drive force-closes the abandoned session
+    /// through the handler's registry with no host involvement — the runtime
+    /// observes `session/cancel`, the live handle is deregistered (no dangling
+    /// handle, no leaked subprocess), and the ephemeral worktree is swept with
+    /// the session's shutdown disposition.
+    #[cfg(feature = "external-acp")]
+    #[tokio::test]
+    async fn drive_external_cancel_sweeps_live_session_and_worktree() {
+        use super::drive_external;
+        use crate::agent::external::{
+            AcpAdapter, AcpLauncher, ExternalRuntimeAdapter, ExternalSessionRegistry,
+            ExternalSessionShutdown, WorktreeManager,
+        };
+        use crate::agent::{BudgetLimits, RunContext, TraceNodeKind};
+        use crate::facade::collab::CollabBridge;
+        use crate::facade::ids::FacadeIds;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let launcher = Arc::new(SilentTurnLauncher::new(&[
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}"#,
+        ]));
+        let adapter = AcpAdapter::with_launcher(
+            crate::agent::external::AcpConfig::opencode_acp(),
+            Arc::clone(&launcher) as Arc<dyn AcpLauncher>,
+        );
+        let worktrees = Arc::new(RecordingWorktreeManager::new());
+        let registry = Arc::new(ExternalSessionRegistry::with_worktree_manager(
+            Arc::new(adapter) as Arc<dyn ExternalRuntimeAdapter>,
+            Arc::clone(&worktrees) as Arc<dyn WorktreeManager>,
+        ));
+        let session_handler = Arc::new(
+            crate::agent::external::RegistryExternalSessionHandler::new(Arc::clone(&registry)),
+        );
+
+        let agent = ManagedExternalAgent::opencode_acp()
+            .session_handler(session_handler)
+            .build()
+            .expect("managed ACP external agent builds");
+
+        let ids = FacadeIds::seeded(13);
+        let ctx = RunContext::new_root(
+            ids.run_id(),
+            BudgetLimits::unbounded(),
+            ids.trace_root("external-cancel-sweep"),
+        );
+        let token = ctx.cancellation().clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_external(
+                "coder",
+                &agent,
+                &ids,
+                "refactor".to_owned(),
+                &CollabBridge::default(),
+                None,
+                &ctx,
+            ),
+        )
+        .await
+        .expect("a cancelled drive settles in seconds, not after the read timeout")
+        .expect("a cancelled drive still returns its captured outcome");
+        canceller.await.expect("canceller task");
+
+        assert!(
+            outcome.cleanup_required,
+            "a cancelled external session leaves a cleanup marker"
+        );
+        assert!(!outcome.completed);
+
+        // The abandoned session was force-closed with no host involvement: the
+        // adapter's shutdown sent session/cancel and closed the transport, and
+        // the registry deregistered the live handle.
+        assert!(
+            launcher.written().contains(r#""method":"session/cancel""#),
+            "the sweep reached the live runtime: {}",
+            launcher.written()
+        );
+        assert_eq!(
+            registry.live_len(),
+            0,
+            "no dangling handle after the cancelled drive"
+        );
+
+        // The ephemeral worktree was swept exactly once with the session's
+        // shutdown disposition (the childless stand-in closes gracefully).
+        let cleanups = worktrees.cleanups();
+        assert_eq!(cleanups.len(), 1, "one swept session, one worktree cleanup");
+        assert_eq!(cleanups[0].1, ExternalSessionShutdown::Graceful);
+
+        // The sweep's disposition was audited into the run trace.
+        let shutdown_nodes = ctx
+            .trace()
+            .records()
+            .into_iter()
+            .filter(|record| matches!(record.kind(), TraceNodeKind::ExternalShutdown { .. }))
+            .count();
+        assert_eq!(shutdown_nodes, 1, "the sweep is recorded in the trace");
     }
 
     #[cfg(feature = "external-acp")]

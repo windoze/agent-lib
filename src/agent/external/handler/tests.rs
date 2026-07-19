@@ -296,6 +296,27 @@ async fn advances_through_pause_resume_then_force_closes() {
 }
 
 #[tokio::test]
+async fn cleanup_agent_trait_method_sweeps_through_the_registry() {
+    // M3-2: the trait-level cleanup hook the facade drive calls on a
+    // cancelled/failed drive forwards to the registry's force-close, so no
+    // live handle or runtime IO is left dangling.
+    let adapter = Arc::new(ScriptAdapter::new());
+    let shutdowns = Arc::clone(&adapter.shutdowns);
+    let registry = Arc::new(ExternalSessionRegistry::new(adapter));
+    let handler = RegistryExternalSessionHandler::new(Arc::clone(&registry));
+    let ctx = run_context();
+    let agent = agent_id();
+
+    handler.fulfill(&start_request(agent), &ctx).await;
+    assert_eq!(registry.live_len(), 1);
+
+    let dispositions = handler.cleanup_agent(agent).await;
+    assert_eq!(dispositions, vec![ExternalSessionShutdown::Graceful]);
+    assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.live_len(), 0, "no dangling handle after the sweep");
+}
+
+#[tokio::test]
 async fn launch_failure_folds_to_failed_result() {
     let registry = Arc::new(ExternalSessionRegistry::new(Arc::new(
         ScriptAdapter::failing(),

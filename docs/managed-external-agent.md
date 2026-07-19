@@ -125,7 +125,7 @@ scope wiring 决定 attended / headless 行为。
 | user question | `NeedInteraction(Question)` | runtime question -> `NeedInteraction(Question)` | 已落地:runtime question/choice → `NeedInteraction`(M3-2) |
 | subagent | `NeedSubagent` | runtime spawn request -> `NeedSubagent` | 已落地:`PausedForSubagent`→`NeedSubagent`(M3-1)+ `spawn_agent` tool-bridge 特判(M3-3);real DeepSeek 协调器派生 Claude/Codex child(M9-4) |
 | tool failure policy | `ToolFailurePolicy` | external tool result error 回灌或 fail turn | 已落地(M4-3):`ExternalToolFailurePolicy`(`ReturnErrorToRuntime` 默认 / `StopRun`) |
-| cancel | `StepInput::Abandon` closes pending | abandon marks cleanup + handler kills session | 已落地:registry `cleanup`/`cleanup_agent` 强制关 live session 并返回 `ExternalSessionShutdown` disposition(M5);force-close 为进程组级 SIGTERM→SIGKILL(M2-1,unix),adapter `kill_on_drop` 兜底;advance 读循环与 cancellation `select!`(M3-1),对端静默时 cancel 秒级生效 |
+| cancel | `StepInput::Abandon` closes pending | abandon marks cleanup + handler kills session | 已落地:registry `cleanup`/`cleanup_agent` 强制关 live session 并返回 `ExternalSessionShutdown` disposition(M5);force-close 为进程组级 SIGTERM→SIGKILL(M2-1,unix),adapter `kill_on_drop` 兜底;advance 读循环与 cancellation `select!`(M3-1),对端静默时 cancel 秒级生效;facade 驱动路径在 drive cancel/abandon/失败时自动调 `ExternalSessionHandler::cleanup_agent` 完成清扫(M3-2),宿主不做额外动作也不泄漏子进程 |
 | budget | handler/driver charge tokens/cost | runtime usage/cost event charge | 已落地(M9-2):`ExternalUsageChargingHandler` 把 runtime usage/cost 计入 run budget,见 §17 |
 | trace | requirement + tool + subagent nodes | external events + shutdown + artifacts | 部分已有:requirement/subagent/shutdown 节点已接;artifact 追踪见下 |
 | artifact | tool/model output | patch/diff/test/file artifact refs | 部分已有:见 §18 |
@@ -874,6 +874,18 @@ Claude/Codex/OpenCode adapter（M6-M8）只需在 adapter 层填 parser + proces
     支持 → `resume`；否则 `ResumeUnavailable`。
   - `cleanup(agent_id, session)` / `cleanup_agent(agent_id)`：cancel/drop 清扫，返回 `ExternalSessionShutdown`。
   - `get` / `live_len` / `kind` / `capabilities`。
+- `ExternalSessionHandler::cleanup_agent(agent_id)`（M3-2 新增的 trait 级清扫钩子，默认 no-op）：
+  registry-backed handler 与 testkit scripted/cassette handler 都把它转发给自己持有的 registry；
+  `ExternalUsageChargingHandler` 透明转发给 inner。**清理责任归属（自 M3-2 起）**：facade 驱动路径
+  （`drive_external`）在 drive 未 committed 收尾（cancel/abandon 置 `cleanup_required`，或抵达终态前失败）时
+  自动调用该钩子——shutdown（best-effort `session/cancel` + transport close + 进程组终止）与 ephemeral
+  worktree 按 disposition 的处置随之完成，sweep disposition best-effort 记入 run trace，**宿主不做任何
+  额外动作也不泄漏子进程**；正常 committed 的 session 保持 live 供复用（worktree 干净拆除/脏保留策略不
+  变），用完仍由宿主经 `.registry()` 显式关闭。facade `Agent` drop 时 registry 随之 drop：直接子进程有
+  `kill_on_drop` 兜底回收，但不跑 `session/cancel`/disposition 分类/进程组终止/worktree 清扫，孙进程与
+  worktree 可能残留——需要分类化 teardown 的宿主必须在 drop 前显式 sweep（见 `Agent` rustdoc）。持有真实
+  runtime IO 的自定义 handler **必须** override `cleanup_agent`，否则 cancel 的 drive 会泄漏其资源直到
+  handler 自身 drop。
 - `RuntimeDecisionPoint`（`advance` 的成功返回）五路：`Completed` / `PausedForInteraction` /
   `PausedForToolCalls` / `PausedForSubagent`，外加 `Err` → machine 折成 `ExternalSessionResult::Failed`。每路都带
   buffered `observations`（machine 按 `seq` dedup 后转 `Notification::ExternalAgent`）。

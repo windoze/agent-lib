@@ -970,9 +970,20 @@ pub async fn default_external_session_handler_with_capabilities(
   point(`Completed` / `Paused*` / `Failed`),复用既有 capability-gated resume 与 worktree cleanup;launch
   失败与 advance 失败都折叠为 `ExternalSessionResult::Failed`,绝不串到别的 requirement family。
 - 宿主 `.session_handler(default_external_session_handler(&agent).await?)` 直接注入;返回具体类型以保留
-  `.registry()`(宿主用 `cleanup_agent` / `cleanup` 强制关闭)。更顺手的一步式装配是
+  `.registry()`(`cleanup_agent` / `cleanup` 强制关闭)。更顺手的一步式装配是
   `ManagedExternalAgentBuilder::build_with_default_session_handler().await?`,它在 build 时探测本机
   runtime 并接上同一个 registry-backed handler(已手工 `.session_handler(..)` 时短路 probe、honor 自定义 handler)。
+- **清理责任(M3-2)**:drive 以 cancel/abandon(`cleanup_required`)或失败收尾时,facade 驱动路径自动调
+  `ExternalSessionHandler::cleanup_agent`(registry-backed handler 转发给 registry 的 `cleanup_agent`)——
+  adapter `shutdown()`(best-effort `session/cancel` + transport close + 进程组终止)与 ephemeral worktree
+  按 disposition 的处置全部自动完成,**宿主不做任何额外动作也不泄漏子进程**;sweep disposition 同时
+  best-effort 记入 run trace。正常结束(committed)的 session 保持 live 供复用,worktree 干净拆除/脏保留
+  策略不变;宿主用完一个 completed session(如 Attachable)时仍经 `.registry()` 显式关闭。drop facade
+  `Agent` 时 registry 随之 drop:子进程有 `kill_on_drop` 兜底(直接子进程会被回收),但不跑
+  `session/cancel`/disposition 分类/进程组终止/worktree 清扫——需要分类化 teardown 的宿主必须在 drop 前
+  经 `.registry().cleanup_agent(..)` 显式 sweep(详见 `Agent` rustdoc)。自定义
+  `ExternalSessionHandler` 若持有真实 runtime IO,**必须** override `cleanup_agent`(默认 no-op),否则
+  cancel 的 drive 会泄漏其持有的资源直到 handler 自身 drop。
 - **probe 结果折入真实能力视图(§11.3)**:一步式装配用
   `default_external_session_handler_with_capabilities` 把 CLI probe 探到的能力集折回 agent 的
   `ExternalAgentCapabilities`,来源标 `CapabilitySource::Probed`,取代构造时的 `Declared` 基线;因为 probed

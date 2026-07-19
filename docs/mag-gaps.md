@@ -175,8 +175,11 @@ facade re-export 完整性已收口（M2-4）。
 2. **abandoned session 清理**：cancel/流 drop 导致 external drive abandon（`cleanup_required`）
    时，facade 驱动路径负责触发对应 session 的清理（`session/cancel` + transport close +
    进程组终止），或在 facade 暴露**一等清理入口**让宿主在 cancel 后调用。二选一，以
-   「宿主不做任何额外动作也不泄漏子进程」为验收标准。
+   「宿主不做任何额外动作也不泄漏子进程」为验收标准。✅ 已修复（M3-2，选自动清理：
+   `ExternalSessionHandler` 新增 trait 级 `cleanup_agent` 钩子，facade 驱动路径在未
+   committed 收尾时自动调用；drop 语义见 `Agent` rustdoc）
 3. 语义文档同步：`docs/managed-external-agent.md`（cancel 传导、清理责任归属）。
+   ✅ 已修复（M3-2，同步 `managed-external-agent.md` §3/§11.4、`facade-api.md` §11.2）
 
 ---
 

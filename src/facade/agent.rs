@@ -175,6 +175,28 @@ impl CancelHandle {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Managed external sessions and teardown (M3-2)
+///
+/// A drive of a managed external delegate that ends cancelled or failed is
+/// force-closed automatically by the facade — session cancel, transport close,
+/// process termination, and the ephemeral-worktree policy all run — so a host
+/// that does nothing extra leaks no subprocess. A *completed* drive keeps its
+/// live session for reuse.
+///
+/// Dropping the `Agent` drops the delegate's session handler and its registry
+/// with it. Every managed runtime child was spawned with `kill_on_drop`, so
+/// the direct child process is reaped even then; however no `session/cancel`
+/// notification or classified shutdown disposition runs, grandchildren the
+/// child spawned are **not** reaped (process-group termination only runs on
+/// the explicit close path), and an ephemeral worktree is left behind. A host
+/// that needs a classified teardown — or must not leave grandchildren or
+/// worktrees — must sweep **before** dropping, through the handler's registry
+/// ([`RegistryExternalSessionHandler::registry`](crate::facade::RegistryExternalSessionHandler::registry)
+/// →
+/// [`ExternalSessionRegistry::cleanup_agent`](crate::agent::external::ExternalSessionRegistry::cleanup_agent)).
+/// Dropping without that sweep is a best-effort backstop, never a silent clean
+/// teardown.
 pub struct Agent {
     machine: DefaultAgentMachine,
     client: Arc<dyn LlmClient>,

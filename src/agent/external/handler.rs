@@ -37,9 +37,13 @@
 //! # Cleanup
 //!
 //! The machine never emits a `Shutdown` effect — force-closing a live session is
-//! a handle-layer concern (design §16). A host force-closes a finished (or
-//! abandoned) session through the [`registry`](RegistryExternalSessionHandler::registry)
-//! accessor with
+//! a handle-layer concern (design §16). The facade drive path force-closes
+//! automatically: when a managed drive ends cancelled or failed it calls
+//! [`cleanup_agent`](ExternalSessionHandler::cleanup_agent), which this handler
+//! forwards to [`ExternalSessionRegistry::cleanup_agent`], so a host that does
+//! nothing extra leaks no subprocess (M3-2). A *completed* session is left live
+//! for reuse; a host force-closes it (or sweeps ahead of teardown) through the
+//! [`registry`](RegistryExternalSessionHandler::registry) accessor with
 //! [`cleanup_agent`](ExternalSessionRegistry::cleanup_agent) /
 //! [`cleanup`](ExternalSessionRegistry::cleanup) so no orphaned runtime process
 //! is left behind.
@@ -48,13 +52,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::agent::RunContext;
 use crate::agent::drive::ExternalSessionHandler;
 use crate::agent::requirement::RequirementResult;
+use crate::agent::{AgentId, RunContext};
 
 use super::{
     ExternalEventSink, ExternalSessionRegistry, ExternalSessionRequest, ExternalSessionResult,
-    RuntimeDecisionPoint,
+    ExternalSessionShutdown, RuntimeDecisionPoint,
 };
 
 /// A production-shaped [`ExternalSessionHandler`] that advances managed external
@@ -117,10 +121,14 @@ impl RegistryExternalSessionHandler {
 
     /// Returns the registry that owns this handler's live sessions.
     ///
-    /// A host uses this to force-close finished or abandoned sessions with
+    /// A host uses this to force-close a *completed* session it is done with
+    /// (or to sweep ahead of teardown) with
     /// [`cleanup_agent`](ExternalSessionRegistry::cleanup_agent) /
-    /// [`cleanup`](ExternalSessionRegistry::cleanup) once a drive is done (the
-    /// machine never emits a shutdown effect, so cleanup is host-driven).
+    /// [`cleanup`](ExternalSessionRegistry::cleanup). Cancelled or failed
+    /// facade drives are already swept automatically through
+    /// [`cleanup_agent`](ExternalSessionHandler::cleanup_agent) (M3-2); the
+    /// machine never emits a shutdown effect, so completed-session cleanup
+    /// stays host-driven.
     #[must_use]
     pub fn registry(&self) -> &Arc<ExternalSessionRegistry> {
         &self.registry
@@ -158,6 +166,10 @@ impl ExternalSessionHandler for RegistryExternalSessionHandler {
         ctx: &RunContext,
     ) -> RequirementResult {
         RequirementResult::ExternalSession(Box::new(self.advance(request, ctx).await))
+    }
+
+    async fn cleanup_agent(&self, agent_id: AgentId) -> Vec<ExternalSessionShutdown> {
+        self.registry.cleanup_agent(agent_id).await
     }
 }
 

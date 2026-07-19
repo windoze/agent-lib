@@ -123,6 +123,7 @@ fn completed(session_id: &str, output: ExternalAgentOutput) -> ExternalSessionRe
 struct ScriptedHandler {
     result: std::sync::Mutex<Option<ExternalSessionResult>>,
     calls: AtomicUsize,
+    cleanups: Arc<std::sync::Mutex<Vec<AgentId>>>,
 }
 
 impl ScriptedHandler {
@@ -130,6 +131,7 @@ impl ScriptedHandler {
         Self {
             result: std::sync::Mutex::new(Some(result)),
             calls: AtomicUsize::new(0),
+            cleanups: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -153,6 +155,11 @@ impl ExternalSessionHandler for ScriptedHandler {
             .take()
             .expect("scripted handler fulfilled more than once");
         RequirementResult::ExternalSession(Box::new(result))
+    }
+
+    async fn cleanup_agent(&self, agent_id: AgentId) -> Vec<ExternalSessionShutdown> {
+        self.cleanups.lock().expect("cleanup log").push(agent_id);
+        vec![ExternalSessionShutdown::ForcedKill]
     }
 }
 
@@ -491,4 +498,22 @@ fn external_budget_registry_is_a_session_sweeper() {
     // contract the charging handler depends on for cleanup.
     fn assert_sweeper<S: ExternalSessionSweeper>() {}
     assert_sweeper::<crate::agent::external::ExternalSessionRegistry>();
+}
+
+#[test]
+fn external_budget_cleanup_agent_is_forwarded_to_inner() {
+    // M3-2: the facade drive sweeps through the trait-level cleanup hook; the
+    // charging wrapper must forward it to the wrapped handler (the runtime
+    // owner), not swallow it behind the default no-op.
+    let inner = ScriptedHandler::new(completed("s1", output_with(None, None)));
+    let cleanups = Arc::clone(&inner.cleanups);
+    let handler = ExternalUsageChargingHandler::<_, NoSweep>::new(inner);
+
+    let dispositions = block_on(handler.cleanup_agent(agent_id()));
+    assert_eq!(dispositions, vec![ExternalSessionShutdown::ForcedKill]);
+    assert_eq!(
+        *cleanups.lock().expect("cleanup log"),
+        vec![agent_id()],
+        "the sweep reached the wrapped handler exactly once"
+    );
 }

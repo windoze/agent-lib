@@ -374,6 +374,16 @@ where
             other => RequirementResult::ExternalSession(Box::new(other)),
         }
     }
+
+    /// Forwards the cancel/abandon sweep to the wrapped handler (M3-2).
+    ///
+    /// The charging wrapper owns no runtime connection, so teardown belongs to
+    /// `inner` exactly as [`fulfill`](ExternalSessionHandler::fulfill)
+    /// delegation does; the configured [`ExternalSessionSweeper`] only covers
+    /// the budget-breach stop above.
+    async fn cleanup_agent(&self, agent_id: AgentId) -> Vec<ExternalSessionShutdown> {
+        self.inner.cleanup_agent(agent_id).await
+    }
 }
 
 /// Packages an [`ExternalSessionResult::Failed`] as a [`RequirementResult`].

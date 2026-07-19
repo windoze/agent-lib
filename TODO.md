@@ -697,7 +697,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - Breaking change：无（公有 API 形状未动，仅 advance 在取消时的返回时机提前；取消时返回的错误
   类型与 detail 文案与改动前一致）。
 
-### M3-2 [TODO] cancel/abandon 时 external session 清理（子进程不泄漏）
+### M3-2 [DONE] cancel/abandon 时 external session 清理（子进程不泄漏）
 
 上下文：
 
@@ -726,6 +726,70 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试（`external-acp`，fake ACP server 子进程或内存替身）：drive cancel → 断言
   收到 `session/cancel`/transport 关闭，registry 中 session 终态正确，无残留句柄。
 - worktree 策略回归测试不受影响。
+
+完成记录（2026-07-20）：
+
+- **选型：自动清理（非一等入口 + 文档强制）。** 机制是在 `ExternalSessionHandler`
+  （`src/agent/drive.rs`）新增 trait 级清扫钩子 `cleanup_agent(agent_id) ->
+  Vec<ExternalSessionShutdown>`（默认 no-op，向后兼容），facade 驱动路径 `drive_external`
+  在 drive **未 committed 收尾**时自动调用它。理由：(a) 验收标准是「宿主不做任何额外动作
+  也不泄漏子进程」，文档强制的入口依赖宿主记得调用，达不到该标准；(b) 钩子挂在
+  handler 而非 facade 新类型上，是因为 live runtime 的所有权本来就在 handler 层
+  （「force-close 是 handle 层职责」，design §16），facade 只持有 `Arc<dyn
+  ExternalSessionHandler>`，trait 默认方法让既有自定义 handler 无需改动即可编译；
+  (c) sweep 条件取 `!completed` 而非仅 `cleanup_required`——cancel 落在无 outstanding
+  requirement 的窗口（session 已 Completed 但 drive 未收尾）时机器不会置标记，而
+  never-resume 语义下该 session 同样该杀；drive 失败（如无 interaction handler 应答
+  permission）遗留的 live session 因 agent_id 是每次 drive 新铸、宿主无从知晓，本来
+  就是不可达的泄漏，一并扫掉。committed drive 完全不触碰（live session 保留供
+  Attachable 复用，worktree 干净拆除/脏保留策略不变）。
+- **接线**：`RegistryExternalSessionHandler::cleanup_agent` 转发 registry
+  `cleanup_agent`（shutdown = best-effort `session/cancel` + transport close + 进程组
+  终止 + worktree 按 disposition 处置，全部复用既有 registry 路径）；
+  `ExternalUsageChargingHandler` 透明转发 inner（否则包装后清扫被默认 no-op 吞掉）；
+  testkit `ScriptedRuntimeExternalSessionHandler` / `CassetteRuntimeExternalSessionHandler`
+  同样转发各自 registry，保持「production 形状」。sweep 的每个 disposition best-effort
+  记入 run trace（`external-cleanup-sweep/{run_id}/{seq}` 节点），与 design §6.4/§10
+  「handle 层记录 disposition」一致。agent_id 每次 drive 新铸，sweep 精确限定本 drive
+  的 session。
+- **Drop 语义（文档化，非自动）**：facade `Agent` rustdoc 新增「Managed external
+  sessions and teardown (M3-2)」一节——drop 时 registry 随之 drop，直接子进程有
+  `kill_on_drop` 兜底回收（不静默泄漏直接子进程），但不跑 `session/cancel`/
+  disposition 分类/进程组终止（孙进程可能残留）/worktree 清扫；需要分类化 teardown
+  的宿主必须在 drop 前经 `RegistryExternalSessionHandler::registry().cleanup_agent(..)`
+  显式 sweep。异步 cleanup 无法在 `Drop` 里可靠执行（无 runtime 保证），故按任务书
+  允许的「rustdoc 明确要求宿主 sweep」处理。
+- **文件**：`src/agent/drive.rs`（trait 钩子 + 默认 no-op 测试）、
+  `src/agent/external/handler.rs`（override + 模块/registry() 清理文档更新）、
+  `src/agent/external/budget.rs`（charging wrapper 转发）、
+  `src/agent/external/budget/tests.rs`（转发测试 + ScriptedHandler 记录 cleanup）、
+  `src/agent/external/handler/tests.rs`（trait 钩子转发测试）、
+  `src/facade/external.rs`（`drive_external` 自动 sweep + trace 审计 + rustdoc；
+  `default_external_session_handler` rustdoc 清理责任更新；新增 ACP 内存替身测试脚手架
+  `SilentTurnLauncher`/`ScriptedThenSilent`/`SharedWriter`/`RecordingWorktreeManager`）、
+  `src/facade/agent.rs`（`Agent` drop 语义 rustdoc）、
+  `crates/agent-testkit/src/external/{runtime,cassette}.rs`（两 handler 转发）、
+  `docs/managed-external-agent.md`（§3 cancel 行 + §11.4 清理责任归属段）、
+  `docs/facade-api.md`（§11.2 清理责任条目）、`docs/mag-gaps.md`（A3 第 2、3 条标
+  ✅ 已修复（M3-2））。
+- **测试**：新增 4 个——`drive_external_cancel_sweeps_live_session_and_worktree`
+  （`external-acp`，内存 ACP 替身 handshake 后永久静默：50ms 后 cancel，断言 outcome
+  `cleanup_required && !completed`、written 帧含 `session/cancel`、registry
+  `live_len()==0` 无残留句柄、ephemeral worktree 以 session disposition 清扫一次、
+  sweep disposition 记入 trace）；`cleanup_agent_trait_method_sweeps_through_the_registry`
+  （handler 层转发）；`external_budget_cleanup_agent_is_forwarded_to_inner`（charging
+  wrapper 不吞清扫）；`external_session_handler_default_cleanup_agent_is_a_no_op`
+  （默认 no-op 契约）。worktree 策略回归：registry/worktree 全部既有测试不受影响
+  （`external_runtime_registry_cleanup_agent_sweeps_each_prepared_worktree` 等全绿）。
+- **门禁**：`cargo fmt --all` ✅；`cargo test --features external-acp -p agent-lib --lib`
+  ✅（1090 passed）；`cargo clippy --all-targets -- -D warnings` ✅；
+  `cargo clippy --all-targets --features "external-claude-code external-codex
+  external-opencode external-acp" -- -D warnings` ✅；`cargo test --all --all-targets`
+  ✅（50 套件 0 失败）；`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` ✅。
+- Breaking change：无公开 API 形状破坏（`ExternalSessionHandler` 新增带默认实现的
+  方法，既有实现者无需改动）。行为变化（有意）：facade external drive 未 committed
+  收尾时会 force-close 本 drive 的 live session——此前该 session 泄漏至 registry
+  drop；committed drive 语义不变。
 
 ### M3-3 [TODO] tool/interaction 批的 cancel 抢占
 
