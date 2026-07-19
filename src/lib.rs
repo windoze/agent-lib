@@ -92,22 +92,22 @@
 //!   Turn/message facts; row reassembly returns a snapshot that still must pass
 //!   normal restore validation.
 //!
-//! Automatic budget scheduling and multi-agent orchestration are still separate
-//! future runtime layers. The [`agent`] module currently exposes serde-friendly
-//! static configuration and identity data, [`agent::AgentState`] persistence
-//! through Conversation snapshots, [`agent::RunContext`] handles for
-//! cancellation, budget, and trace propagation, the sans-io
-//! [`agent::AgentMachine`] `step` contract that reifies effects as addressable
-//! [`agent::Requirement`] values, minimal live [`agent::ToolRegistry`]/
-//! [`agent::ToolExecutor`] boundaries, [`agent::ToolApprovalPolicy`] and
-//! [`agent::Interaction`] approval boundaries, a
-//! [`agent::ToolRegistryResolver`] for turn-boundary tool-set replacement, and
-//! the [`agent::DefaultAgentMachine`] state machine with
-//! `reconfigure` turn-boundary config application, approval requirements, and
-//! cancellation closure, the [`agent::drive`] reference driver
-//! ([`agent::HandlerScope`] plus [`agent::drain`]/[`agent::Pop`] routing), and
-//! the [`agent::NestedMachine`]/[`agent::SubagentHandler`] parent/child agent
-//! tree, without making live handles part of persisted state.
+//! Lower-level agent APIs remain public for hosts that need custom driving or
+//! storage boundaries instead of the facade defaults. The [`agent`] module
+//! exposes serde-friendly static configuration and identity data,
+//! [`agent::AgentState`] persistence through Conversation snapshots,
+//! [`agent::RunContext`] handles for cancellation, shared budget ledgers, and
+//! trace propagation, the sans-io [`agent::AgentMachine`] `step` contract that
+//! reifies effects as addressable [`agent::Requirement`] values, live
+//! [`agent::ToolRegistry`] / [`agent::ToolExecutor`] boundaries,
+//! [`agent::ToolApprovalPolicy`] and [`agent::Interaction`] approval boundaries,
+//! turn-boundary [`agent::ToolRegistryResolver`] reconfiguration, the
+//! [`agent::drive`] reference driver ([`agent::HandlerScope`] plus
+//! [`agent::drain`] / [`agent::Pop`] routing), and the
+//! [`agent::NestedMachine`] / [`agent::SubagentHandler`] parent/child agent tree.
+//! Policy choices such as dispatcher routing, managed external delegation, and
+//! facade run budgets are explicit runtime wiring, not hidden global scheduler
+//! state, and live handles remain outside persisted state.
 //!
 //! # Conversation Core example
 //!

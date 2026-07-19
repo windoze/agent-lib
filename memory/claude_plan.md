@@ -1,43 +1,27 @@
-# 当前执行计划
+# 执行计划
 
-## 约束
+当前调用目标：完成 `TODO.md` 中第一个未完成任务 `M9-4 文档同步与审查报告勾销`，然后停止。
 
-- 以 TODO.md 为任务顺序、要求、依赖、验证和完成记录的唯一权威来源。
-- 只完成第一个标题未标记 `[DONE]` 的任务，完成后停止。
-- 若遇到阻塞当前任务的真实前置问题，优先修复；无法直接修复时，在 TODO.md 中插入最小必要前置任务并停止。
-- 不使用规避、降级或改变规格的方式推进任务。
-- 变更完成后按要求更新 TODO.md，必要时才更新 PLAN.md。
-- 代码变更需要先格式化和 lint，再运行相关测试；完整测试套件超时时间不超过 30 分钟。
-- 完成或阻塞记录都需要提交 Git commit。
+步骤：
+1. 检查 `TODO.md`，确定第一个未完成任务及其验证要求。
+2. 检查相关代码、文档和测试，只围绕当前任务建立必要上下文。
+3. 如发现当前任务被具体前置问题阻塞，按要求在 `TODO.md` 中加入最小前置任务并停止；否则实现当前任务。
+4. 运行格式化、lint 和相关测试；如观察到未被排期的失败测试，修复或将其加入正确的 TODO 顺序。
+5. 更新 `TODO.md`：给完成任务标题添加 `[DONE]` 并填写完成记录。
+6. 仅在阶段计划实际变化时更新 `PLAN.md`。
+7. 检查 git 状态与 diff，提交本次任务涉及的全部变更。
+8. 提交后停止，不处理下一个任务。
 
-## 步骤
+进度：已确认 `M9-4` 是第一个未完成任务；最新提交 `[M9-3] Optimize performance hot spots` 未留下直接相关的未完成事项。审查报告仍有未标最终状态的条目（如 `M-PROM-3`、`M-EXT-2`、`M-ADP-4` 与若干低严重度尾项），下一步逐条核对代码/文档并补齐状态与文档说明。
 
-1. 读取 TODO.md，定位第一个标题未带 `[DONE]` 的任务。
-2. 检查最新提交是否明确提到与该任务直接相关的未完成问题；若有，将其纳入当前任务或作为前置任务记录。
-3. 读取该任务相关文档、源码和测试，确定任务边界与验证要求。
-4. 按任务要求做最小且完整的实现；若发现必须先修的具体阻塞问题，更新 TODO.md 和本计划后提交并停止。
-5. 运行 `cargo fmt --all`。
-6. 运行 `cargo clippy --all-targets -- -D warnings`，如果涉及外部适配器特性，再运行对应 feature 的 clippy。
-7. 运行任务要求的相关测试；若无更窄验证足够，则运行 `cargo test --all --all-targets`，超时不超过 30 分钟。
-8. 修复所有观察到且未被明确排期的失败测试；若不能在当前任务中修复，按规则在 TODO.md 插入前置任务并停止。
-9. 将当前任务标题加 `[DONE]`，更新完成记录，说明实现内容和验证命令。
-10. 检查 git 状态和 diff，提交所有本轮相关变更，提交信息包含任务编号和简短说明。
-11. 停止，不开始下一个任务。
+已完成关键步骤：
+- `docs/review-2026-07.md` 已补齐所有未标最终状态条目，并选择保留在 `docs/`、不移动归档。
+- `src/lib.rs` crate 文档已去除过时的“预算/多 agent 编排仍是 future layer”措辞，保持与 facade/agent 现状一致。
+- `docs/facade-api.md` 与 `AgentRunStream` rustdoc 已声明 stream 的 `!Send` / 运行中 `&mut Agent` 借用限制。
+- `docs/managed-external-agent.md` 与 `AGENTS.md` 已补 CLI 环境继承边界，并同步 `external-acp` feature 说明。
 
-## 当前状态
+下一步：运行 `cargo fmt --all` 与 rustdoc 验证；随后记录 10 条人工抽查结论并更新 `TODO.md` 完成记录。
 
-- 已读取 TODO.md，首个未完成任务为 `M9-3 [TODO] 性能小项批`。
-- 最新提交 `[M9-2] Polish facade and model APIs` 未提示与 M9-3 直接相关的未完成事项。
-- 已完成 M9-3 主要代码改动：trace 节点 id 索引化、plan add_task 虚拟插入环检测、History message id 索引、rows insert diff 借用校验、Agent 运行期工具/声明共享 Arc 切片、OpenAI stream terminal 校验后释放 item 缓存。
-- 已补轻量回归/计数断言：trace 1000 节点记录、plan 坏快照环防御、history 512 turn message id 重复检测。
-- 已完成验证：`cargo fmt --all`、默认与 external feature clippy、定向 history 回归、默认全量测试、external feature 全目标测试、rustdoc 门禁均通过。
-- 已更新 TODO.md，将 M9-3 标记 `[DONE]` 并写入完成记录；已同步 `docs/review-2026-07.md` 的 M-CONV-4 与性能清单状态。
-- 下一步：检查 diff / status / log，提交本轮变更后停止。
+验证与记录：`cargo fmt --all` 和 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 已通过；`TODO.md` 已将 `M9-4` 标为 `[DONE]` 并写入 10 条人工一致性抽查、验证结果与跳过全量测试/Clippy 的理由。
 
-## 当前任务 M9-3 初步执行计划
-
-1. 检查最新提交与当前 worktree 状态，确认是否有直接关联的未完成事项或并发变更。
-2. 阅读 M9-3 涉及的代码点：trace 节点去重、collab plan 环检测、facade run 工具声明拷贝、conversation message id 查找、rows diff 校验、OpenAI stream normalizer raw 保留。
-3. 对每个小项做最小正确处理：能低风险优化的直接实现并补测试/计数断言；较大且会影响进度的项按任务要求显式记录暂不优化理由，必要时在 TODO.md 单列后续任务。
-4. 更新相关文档或完成记录，运行格式化、lint、测试和 doc 验证。
-5. 将 M9-3 标记 `[DONE]`，写入完成记录并提交。
+下一步：检查 git diff/status，确认变更范围后提交 `[M9-4] Synchronize documentation review closeout`。

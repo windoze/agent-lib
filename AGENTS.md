@@ -36,14 +36,15 @@ cargo test --all --all-targets
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 ```
 
-The default build pulls in **no** CLI-adapter machinery: the three managed
-runtime adapters are behind off-by-default features (on unix they add only the
-`libc` crate, used for process-group signalling), so run their clippy pass
-separately when you touch them:
+The default build pulls in **no** managed external-runtime machinery: the three
+CLI adapters and the ACP adapter are behind off-by-default features. The CLI
+features add only the unix-only `libc` crate for process-group signalling; ACP
+adds its optional protocol crates. Run their clippy pass separately when you
+touch them:
 
 ```bash
 cargo clippy --all-targets \
-  --features "external-claude-code external-codex external-opencode" -- -D warnings
+  --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
 ```
 
 Every test must finish in well under a minute; a test that hangs is a bug to fix
@@ -56,9 +57,12 @@ immediately, not to wait out.
 | `external-claude-code` | Managed Claude Code adapter (config + probe + decoder + live session) |
 | `external-codex` | Managed Codex adapter |
 | `external-opencode` | Managed OpenCode adapter |
+| `external-acp` | Managed ACP adapter (Agent Client Protocol runtime + schema crates) |
+| `facade-schema` | JSON-schema derivation for typed facade tools |
 
-All three are **off by default**. Enabling them adds no heavy dependency (the
-probes reuse tokio's process support).
+All are **off by default**. The three CLI features are intentionally light;
+`external-acp` and `facade-schema` pull their named optional crates only when
+requested.
 
 ## Managed external agents
 
@@ -135,6 +139,12 @@ cargo test --features "external-claude-code external-codex" \
   arguments guarded by a `--` separator (Claude Code uses stdin frames); argv is
   visible to same-host `ps`, so prompts must not carry secrets
   (`docs/managed-external-agent.md` §16).
+- **CLI environment inheritance** — Claude Code, Codex, and OpenCode children
+  inherit the host process environment, then apply adapter-specific overrides;
+  this preserves each CLI's login, PATH, HOME, and tool configuration but also
+  passes unrelated host secrets to the child process. Run `agent-lib` under a
+  pruned environment/container when that is not acceptable, or use the ACP
+  adapter's explicit `inherit_env`/`env_clear` controls.
 - **Unsupported-capability fallback** — a missing CLI or a failed capability
   probe becomes a non-secret **skip** (exit 0), and a request for a capability
   the runtime has not opted into (for example host tools) is rejected with an
@@ -151,4 +161,4 @@ cargo test --features "external-claude-code external-codex" \
   and give them specific context, or prefer `debug_assert!` plus a defensive
   error branch.
 - Update the doc that owns a behavior when you change it; the managed docs above
-  are kept in sync with the code as of milestone M9-5.
+  are kept in sync with the code as of milestone M9-4.

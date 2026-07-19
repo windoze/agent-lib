@@ -673,6 +673,12 @@ fn start_dispatcher_routed(
 /// drive reaches it, then ends with exactly one [`RunEvent::Done`] carrying the
 /// complete [`RunOutput`]. On failure it yields a single `Err` and then ends.
 ///
+/// The stream borrows the originating [`Agent`](super::Agent) mutably for the
+/// whole run and stores that borrow behind local drop/cancellation guards. It is
+/// therefore intentionally not `Send`; poll it on the task that created it. Use
+/// [`cancel_handle`](AgentRunStream::cancel_handle) when another task needs to
+/// request cancellation.
+///
 /// The turn is committed to the agent's [`Conversation`](crate::conversation::Conversation)
 /// only when the drive reaches its terminal `Done`. If the stream is dropped before
 /// then — including before it is ever polled — its [`Drop`] implementation abandons

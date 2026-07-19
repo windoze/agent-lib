@@ -1824,7 +1824,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::history::tests::retention::retained_message_id_index_covers_long_histories`、`cargo test --all --all-targets`（默认离线全量，1011 lib 测试 + 所有集成/示例目标通过，真实 endpoint/CLI 测试保持 ignored，无挂起）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（1178 lib 测试 + external/acp 目标通过，真实 CLI 测试 ignored）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - 无 breaking change（新增字段/入口均 crate-private 或公开兼容保留；公共类型、函数签名、serde/wire 形状不变）。
 
-### M9-4 [TODO] 文档同步与审查报告勾销
+### M9-4 [DONE] 文档同步与审查报告勾销
 
 实现要求：
 
@@ -1836,6 +1836,17 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
 - 抽查 10 条文档声明与代码行为一致（人工）。
+
+完成记录：
+
+- `docs/review-2026-07.md`：选择**保留在 `docs/` 并标注已收口**，不移动到 archive；报告顶部新增 M9-4 收口状态。所有未标最终状态的条目已补齐：`M-PROM-3` 标为 `✅ 已修复（M5-4）`，`M-EXT-2` 标为 `📄 已降级（文档承认现状，M9-4）`，`M-ADP-4` 标为 `📄 已降级（文档声明现状，M9-4）`；低严重度尾项逐条标注为已修复、已降级或不做并给出理由（nested detach、escape-hatch 覆盖、worktree deterministic root、OpenCode 权限模式、`max_decision_loops` 口径）。
+- `src/lib.rs`：crate 级文档已与 README 的 facade 推荐入口一致；移除“预算调度/多 agent 编排仍是 future layer”的旧措辞，改为描述当前 facade、budget ledger、nested/subagent、dispatcher/managed external 运行时接线均为显式 runtime wiring，live handles 不进入持久化状态。
+- `docs/facade-api.md` 与 `src/facade/agent/stream.rs`：补充 `AgentRunStream` 的 `!Send` / 运行中 `&mut Agent` 借用限制，说明跨 task 取消应传递 `CancelHandle`，不要把 stream 本体移入 `tokio::spawn`。
+- `docs/managed-external-agent.md`：顶部状态表从旧“真实 CLI adapter 待 M6-M8”改为 as-built 状态；新增 §16 “CLI 环境继承”安全边界，说明 Claude Code / Codex / OpenCode 继承宿主环境、ACP 才有显式 `inherit_env` / `env_clear` 控制面；保留继承策略并文档化理由。
+- `AGENTS.md`：同步 `external-acp` 与 `facade-schema` feature 表、external feature clippy 命令、CLI 环境继承 safety property，并把 managed docs 同步点标为 M9-4。
+- 人工一致性抽查 10 条：README Quick Start 与 `src/lib.rs` 都把 facade 定位为推荐入口；`AgentRunStream` 文档的 `!Send` 声明与 `Rc<RefCell<&mut DefaultAgentMachine>>` / non-Send boxed future 实现一致；facade pivot 文档与 `AgentRunStream::interject` / `interject_pivot` API 一致；CLI 环境继承文档与三个 CLI adapter/probe 仅 `command.env(..)` 覆盖、无 `env_clear()` 的实现一致；ACP 环境说明与 `AcpConfig::inherit_env` + `connection.rs` `env_clear()` 实现一致；worktree isolation 文档与 registry `WorktreeManager` 接线、ephemeral dirty retain 语义一致；OpenCode 权限模式文档与仅 `BypassPermissions` 映射 `--auto`、host permission bridge 恒 false 的能力矩阵一致；`max_turns` / `max_decision_loops` 文档与 machine 以 runtime round-trip / decision loop 强制的实现一致；conversation rows 文档的 `meta` / generation 模型与 `MessageRecord.meta`、四类演进行 `generation` 字段一致；agent effect/facade 预算文档与 `FacadeError::BudgetExhausted`、driver step/usage charge 接线一致。
+- 验证：`cargo fmt --all`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。全量测试与 clippy 按任务政策跳过：本任务只改 markdown 与 rustdoc 注释，不改变编译产物或运行行为；沿用 M9-3 的全量绿色结果。
+- 无 breaking change（仅文档与 rustdoc 注释）。
 
 ### M9-5 [TODO] 终审 review：全计划收口
 

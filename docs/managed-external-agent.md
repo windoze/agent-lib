@@ -1,6 +1,6 @@
 # Managed External Agent 设计
 
-> 状态:设计草案。本文是在 [`external-agent.md`](./external-agent.md) 已落地的
+> 状态:设计与实现对照。本文是在 [`external-agent.md`](./external-agent.md) 已落地的
 > `ExternalSessionRequest` / `ExternalSessionResult` / `NeedExternalSession` /
 > `ExternalAgentMachine` 基础上,进一步设计“受管 external agent”:让 Claude Code、Codex、
 > OpenCode 不只是黑盒子进程,而是尽可能具备内部 `DefaultAgentMachine` 已有的流式输出、tool
@@ -54,13 +54,13 @@ scope wiring 决定 attended / headless 行为。
 | artifact refs 记录到 `ExternalAgentState` | 已实现 |
 | cancel / abandon 标记 `cleanup_required` | 已实现 |
 | 作为 subagent child 被 `DrivingSubagentHandler` 驱动 | 已实现 |
-| runtime adapter 抽象(`ExternalRuntimeAdapter` / `ExternalRuntimeSession`) | 已实现(离线 scripted/cassette 替身;真实 CLI adapter 待 M6-M8) |
-| 真实 Claude Code / Codex / OpenCode runtime adapter | 未实现(待 M6-M8) |
-| external runtime 发起 host tool call | machine + scripted runtime handler 已实现(真实 adapter 待实现) |
-| external runtime 发起 host subagent | machine + scripted runtime handler 已实现(真实 adapter 待实现) |
-| 长生命周期 session registry / process handles | `ExternalSessionRegistry`(start/reattach/resume/cleanup)已实现;真实 process handle 待 M6-M8 |
-| structured streaming live sink + replay sequence | 已实现(sink 已 sequenced + buffered replay dedup;`ExternalStreamPolicy` 选择/真实 runtime 接线待实现) |
-| cassette replay 真实 external session | runtime-parser cassette 回放层已实现(synthetic fixtures);真实 Claude/Codex/OpenCode cassette 待 M6-M8 |
+| runtime adapter 抽象(`ExternalRuntimeAdapter` / `ExternalRuntimeSession`) | 已实现(离线 scripted/cassette 替身 + feature-gated 真实 CLI adapter) |
+| 真实 Claude Code / Codex / OpenCode runtime adapter | 已实现(feature-gated;真实 CLI e2e 为 `#[ignore]`,缺 binary/login 时 skip) |
+| external runtime 发起 host tool call | machine + scripted runtime handler 已实现;真实 CLI adapter 仅在 capability 打开时接入,否则显式 `UnsupportedCapability` |
+| external runtime 发起 host subagent | machine + scripted runtime handler 已实现;真实 CLI adapter 当前 capability-gated,无桥接帧时显式拒绝 |
+| 长生命周期 session registry / process handles | `ExternalSessionRegistry`(start/reattach/resume/cleanup)与共享 CLI `process::ManagedChild` 已实现 |
+| structured streaming live sink + replay sequence | 已实现(sink sequenced + buffered replay dedup;三 CLI adapter 均可镜像观测到 live sink) |
+| cassette replay 真实 external session | runtime-parser cassette 回放层已实现,含 synthetic 与已提交的 runtime fixture;真实录制按需要更新 |
 
 也就是说,当前实现证明了“外部 agent 可作为一个 effect-driven machine 挂进系统”;但它还没有达到
 内部 agent 的能力 parity。本文设计补齐这一层。
@@ -107,7 +107,7 @@ scope wiring 决定 attended / headless 行为。
 
 ## 3. 能力 parity 表
 
-> **落地状态（截至 M9-5）**:下表「备注」列记录 *as-built* 状态而非目标。managed 路径已整链
+> **落地状态（截至 M9-4）**:下表「备注」列记录 *as-built* 状态而非目标。managed 路径已整链
 > 打通——`ExternalAgentMachine`(sans-io)+ registry-backed `ExternalSessionHandler`(M5)+ 三个
 > feature-gated runtime adapter(Claude Code M6 / Codex M7 / OpenCode M8)——离线由
 > scripted/cassette handler 验证,真实 CLI 由 `#[ignore]` e2e 覆盖。可运行的 scoped-effect wiring
@@ -1469,6 +1469,19 @@ Codex / OpenCode 的 prompt 以 CLI **位置参数**传递（Claude Code 走 std
   prompt 是任务文本而非凭据，与本机 CLI 自身存储的登录凭据处于同一信任域；stdin 传参需改 spawn 的
   stdio 接线（写 prompt 后关闭 stdin）增加失败面；OpenCode 的 stdin 读消息（无位置参数时阻塞读 stdin）
   是未文档化的隐式行为，不宜依赖。**约定：prompt 中不得放 secret**，敏感值经 env/文件传递。
+
+### CLI 环境继承（M9-4 / M-EXT-2 最终状态）
+
+Claude Code / Codex / OpenCode 三个私有 CLI adapter 当前沿用 `tokio::process::Command` 的默认行为:
+子进程继承宿主进程环境,再叠加各自 config 中的显式 `env` overrides。这样可以复用 CLI 自己的登录态、
+PATH、HOME、shell 工具配置与用户本机 MCP 配置,也是真实 CLI examples/e2e 依赖的运行边界。
+
+安全含义是:宿主环境里的 `AWS_*`、`DEEPSEEK_API_KEY`、私有代理配置等变量也会进入 CLI 及其拉起的
+工具/子进程。库不会读取或打印这些值,但也不会替调用方自动做 allowlist。生产宿主若需要更严格的隔离,
+应在启动 `agent-lib` 进程前提供精简环境(例如 wrapper、容器、launchd/systemd 环境、CI job 级 env
+allowlist),或优先使用带显式 `env_clear` / `inherit_env` 控制面的 ACP adapter。该差异在本轮作为文档化
+的 runtime 边界保留,不在三个私有 CLI adapter 中引入默认 `env_clear`,避免破坏依赖本机 CLI 登录与工具
+配置的既有用法。
 
 ## 17. budget / usage / cost
 
