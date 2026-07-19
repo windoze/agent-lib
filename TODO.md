@@ -856,7 +856,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::pending`（50 条全过）、`cargo test --all --all-targets`（exit 0，50 个测试目标）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（exit 0）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - Breaking change（pre-1.0，记录在此）：`PendingTurnError` 新增 `InvalidAssistantBlock` 与 `IncompleteToolUse` 两个变体（该枚举未标 `#[non_exhaustive]`，外部穷尽 match 需补分支）；含重复 tool_use id / 非法块 / 不完整 tool_use 的 assistant 响应从「freeze 放行、后续卡死」变为「finish_assistant 即报错」——行为修正。
 
-### M3-7 [TODO] `resolved_provider_call_id` 按 claimed 排除语义重推导（M-CONV-6）
+### M3-7 [DONE] `resolved_provider_call_id` 按 claimed 排除语义重推导（M-CONV-6）
 
 上下文：
 
@@ -873,6 +873,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：用上述 A/B 构造场景（手工快照数据）restore，断言解析结果与 validation 语义一致且 debug 构建不 panic。
 - `cargo test -p agent-lib --lib conversation::history` 全过。
+
+完成记录：
+
+- **选型：方案 (a)**——index 重推导复刻 validation 的 claimed 排除两趟逻辑。否决方案 (b)（restore 时把 `None` 规范化为 `Some`）：闭合 `Turn` 的 pairing 内容是持久化事实，规范化会改变内存事实 → 重导出的 `ToolPairingRecord` 与旧存行同键（`call_id`，事实表无代次列）不同内容 → `insert_set_against` 误报 `InsertConflict`，破坏 M3-5 的 insert-only 代次模型；(a) 不动 wire/serde 形状，爆炸半径最小。
+- 实现：`src/conversation/history/index.rs` 新增 `PairingProviderIdResolver<'a>`——每 turn 建立 `calls`/`call_order`（首现顺序）/`results` 三个锚点索引（与 validation `BlockFacts` 同构），并先把全部显式 `Some` id 收入 `claimed`；`resolve` 对 `None` pairing 按 pairing 顺序在未 claimed 候选中取「tool-use 在 call_msg 且 tool-result 在 result_msg」的唯一 id 并随即 claim。`turn_locations` 改用该 resolver——单点同时覆盖 restore 的 `ToolCallIndex::rebuild` 与运行时 `push_committed_turn` 增量路径。旧 `resolved_provider_call_id`（按内容顺序取首候选）删除。
+- `expect`/`debug_assert!` 差异行为消除：两趟 claimed 排除与 validation 保证逐条对应后，`expect`（零候选）与 `debug_assert!`（多候选）均结构性不可达——release 不再可能静默取错 claimed id，debug 不再 panic；断言保留为契约护栏。
+- 测试：`history/tests/index/provider.rs` 新增 `rebuild_replays_the_validators_claimed_exclusion_for_optional_ids`——同一 assistant 消息含 ToolUse `claimed-b`、`derived-a`（此内容顺序）+ 同一 Tool 消息含两个 result + pairing 显式 claim `claimed-b`、另一 pairing 为 `None`；经 `commit_draft` 提交（restore/外部快照同款入口）后断言：`claimed-b` 仍映射其显式框架 id，`derived-a` 映射到 `None` pairing 的框架 id，wire 上 `None` 保持不持久化，`assert_index_matches_rebuild` 通过。已用 `git stash` 对拍验证：该测试对旧实现失败（debug 构建 `debug_assert!` panic），对新实现通过。
+- 文档：新 resolver 的 rustdoc 写明两趟规则与「逐 pairing 内容顺序会抢夺显式 sibling 已 claim 的 id」的失败机理；`docs/conversation-core.md` 未覆盖该派生细节（`ToolCallIndex` 在文中仅标注「派生、非事实来源」），无需更新；`docs/review-2026-07.md` M-CONV-6 已标注 `✅ 已修复（M3-7）`。
+- 验证：`cargo fmt --all`、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test -p agent-lib --lib conversation::history`（8 条全过）、`cargo test --all --all-targets`（exit 0，约 44s，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。无 breaking change（crate 私有实现修正，pub 类型与 serde 形状未变）。
 
 ### M3-8 [TODO] fork 不继承 compaction projection 的文档化（M-CONV-7，方案 a）
 

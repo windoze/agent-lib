@@ -376,6 +376,7 @@ impl CommittedIndex {
 
 /// Derives complete call locations from one validator-certified turn.
 fn turn_locations(turn: &Turn, turn_position: usize) -> Vec<ToolCallLocation> {
+    let mut resolver = PairingProviderIdResolver::new(turn);
     turn.pairings()
         .iter()
         .map(|pairing| ToolCallLocation {
@@ -383,54 +384,88 @@ fn turn_locations(turn: &Turn, turn_position: usize) -> Vec<ToolCallLocation> {
             kind: ToolCallLocationKind::Committed,
             turn_id: turn.id(),
             call_id: Some(pairing.call_id()),
-            provider_call_id: resolved_provider_call_id(turn, pairing),
+            provider_call_id: resolver.resolve(pairing),
             call_message_id: pairing.call_msg(),
             result_message_id: Some(pairing.result_msg()),
         })
         .collect()
 }
 
-/// Resolves the optional persisted provider id from certified message anchors.
-fn resolved_provider_call_id(turn: &Turn, pairing: &ToolPairing) -> String {
-    if let Some(provider_call_id) = pairing.provider_call_id() {
-        return provider_call_id.to_owned();
+/// Re-derives optional provider ids with the validator's claimed-exclusion
+/// semantics.
+///
+/// `validation::pairing` certifies a `None` pairing only when exactly one
+/// *unclaimed* provider id matches its call/result message anchors, but the
+/// resolution is never persisted back onto the closed pairing. Indexing must
+/// therefore replay the same two-pass rule over the whole turn: explicit ids
+/// claim first, then each `None` pairing (in pairing order) takes the unique
+/// unclaimed id whose tool-use and tool-result blocks live in its anchor
+/// messages. Resolving pairings one at a time in content order would let a
+/// `None` pairing steal an id an explicit sibling already claimed.
+struct PairingProviderIdResolver<'a> {
+    calls: HashMap<&'a str, MessageId>,
+    call_order: Vec<&'a str>,
+    results: HashMap<&'a str, MessageId>,
+    claimed: HashSet<&'a str>,
+}
+
+impl<'a> PairingProviderIdResolver<'a> {
+    /// Indexes one certified turn's anchored blocks and pre-claims explicit ids.
+    fn new(turn: &'a Turn) -> Self {
+        let mut calls = HashMap::new();
+        let mut call_order = Vec::new();
+        let mut results = HashMap::new();
+        for message in turn.messages() {
+            for block in &message.payload().content {
+                match block {
+                    ContentBlock::ToolUse { id, .. } => {
+                        if !calls.contains_key(id.as_str()) {
+                            call_order.push(id.as_str());
+                        }
+                        calls.insert(id.as_str(), message.id());
+                    }
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        results.insert(tool_use_id.as_str(), message.id());
+                    }
+                    ContentBlock::Text { .. }
+                    | ContentBlock::Image { .. }
+                    | ContentBlock::Thinking { .. } => {}
+                }
+            }
+        }
+        let claimed = turn
+            .pairings()
+            .iter()
+            .filter_map(ToolPairing::provider_call_id)
+            .collect();
+        Self {
+            calls,
+            call_order,
+            results,
+            claimed,
+        }
     }
 
-    let result_ids = turn
-        .messages()
-        .iter()
-        .find(|message| message.id() == pairing.result_msg())
-        .into_iter()
-        .flat_map(|message| &message.payload().content)
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-            ContentBlock::Text { .. }
-            | ContentBlock::Image { .. }
-            | ContentBlock::ToolUse { .. }
-            | ContentBlock::Thinking { .. } => None,
-        })
-        .collect::<HashSet<_>>();
-    let mut candidates = turn
-        .messages()
-        .iter()
-        .find(|message| message.id() == pairing.call_msg())
-        .into_iter()
-        .flat_map(|message| &message.payload().content)
-        .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, .. } if result_ids.contains(id.as_str()) => {
-                Some(id.as_str())
-            }
-            ContentBlock::Text { .. }
-            | ContentBlock::Image { .. }
-            | ContentBlock::ToolUse { .. }
-            | ContentBlock::ToolResult { .. }
-            | ContentBlock::Thinking { .. } => None,
+    /// Resolves one pairing's provider id, claiming derived ids as it goes.
+    fn resolve(&mut self, pairing: &ToolPairing) -> String {
+        if let Some(provider_call_id) = pairing.provider_call_id() {
+            return provider_call_id.to_owned();
+        }
+        let mut candidates = self.call_order.iter().filter(|provider_call_id| {
+            !self.claimed.contains(**provider_call_id)
+                && self.calls.get(**provider_call_id) == Some(&pairing.call_msg())
+                && self.results.get(**provider_call_id) == Some(&pairing.result_msg())
         });
-    let provider_call_id = candidates
-        .next()
-        .expect("validated optional provider id has one anchored content match");
-    debug_assert!(candidates.next().is_none());
-    provider_call_id.to_owned()
+        let provider_call_id = candidates
+            .next()
+            .expect("validator-certified pairing has one unclaimed anchored match");
+        debug_assert!(
+            candidates.next().is_none(),
+            "validator certifies a unique unclaimed anchored match"
+        );
+        self.claimed.insert(provider_call_id);
+        (*provider_call_id).to_owned()
+    }
 }
 
 /// Derives mapped and not-yet-mapped call locations from current pending.

@@ -13,8 +13,8 @@ use super::{
 };
 use crate::{
     conversation::{
-        ContentBlockKind, ConversationError, PendingTurnError, PendingTurnPhase,
-        ToolCallMapping, TurnMeta,
+        ContentBlockKind, ConversationError, PendingTurnError, PendingTurnPhase, ToolCallMapping,
+        TurnMeta,
     },
     model::{
         content::{ContentBlock, ImageSource},
