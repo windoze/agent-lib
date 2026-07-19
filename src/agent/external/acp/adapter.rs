@@ -79,6 +79,7 @@ use crate::agent::permission::{
     PermissionCategory, PermissionDecision, PermissionRequest, PermissionRisk,
 };
 
+use crate::agent::external::process;
 use crate::agent::external::{
     ExternalAgentError, ExternalAgentOutput, ExternalCapability, ExternalEventSink,
     ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeAdapter,
@@ -401,12 +402,7 @@ impl AcpSession {
     /// and advancing the high-water `seq`.
     fn drain_and_emit(&mut self) -> Vec<ExternalObservedEvent> {
         let observed = self.decoder.take_observations();
-        for event in &observed {
-            if let Some(sink) = &self.sink {
-                sink.emit(event);
-            }
-            self.last_event_seq = Some(event.seq);
-        }
+        process::emit_observations(&observed, self.sink.as_ref(), &mut self.last_event_seq);
         observed
     }
 
@@ -689,27 +685,14 @@ impl AcpSession {
 
     /// Returns the session facts, or `None` before an id has been assigned.
     fn maybe_session_ref(&self) -> Option<ExternalSessionRef> {
-        if self.session_id.is_empty() {
-            None
-        } else {
-            Some(self.session_ref())
-        }
+        process::maybe_session_ref_for_id(acp_runtime_kind(), &self.session_id, self.last_event_seq)
     }
 }
 
 #[async_trait]
 impl ExternalRuntimeSession for AcpSession {
     fn session_ref(&self) -> ExternalSessionRef {
-        let session_id = (!self.session_id.is_empty()).then(|| self.session_id.clone());
-        ExternalSessionRef {
-            runtime: acp_runtime_kind(),
-            session_id: session_id.clone(),
-            transcript_ref: None,
-            // ACP resumes by its own session id via `session/load`, so it doubles
-            // as the opaque resume token.
-            resume_token: session_id,
-            last_event_seq: self.last_event_seq,
-        }
+        process::session_ref_for_id(acp_runtime_kind(), &self.session_id, self.last_event_seq)
     }
 
     async fn advance(
@@ -813,7 +796,7 @@ impl AcpAdapter {
     ) -> Self {
         Self {
             config,
-            capabilities: intersect_capabilities(&implemented_capabilities(), probed),
+            capabilities: process::intersect_capabilities(&implemented_capabilities(), probed),
             launcher: Arc::new(TokioProcessLauncher),
         }
     }
@@ -845,13 +828,11 @@ impl AcpAdapter {
         &self,
         request: &ExternalSessionRequest,
     ) -> Result<(), ExternalAgentError> {
-        if !request.tools.is_empty() && !self.capabilities.host_tools {
-            return Err(self.capabilities.unsupported(
-                ExternalCapability::HostTools,
-                "acp adapter cannot inject host tools without a client MCP bridge",
-            ));
-        }
-        Ok(())
+        process::reject_unsupported_tools(
+            &self.capabilities,
+            request,
+            "acp adapter cannot inject host tools without a client MCP bridge",
+        )
     }
 
     /// Resolves the effective session configuration for `request`.
@@ -987,25 +968,6 @@ fn implemented_capabilities() -> ExternalRuntimeCapabilities {
     capabilities
 }
 
-/// Intersects two capability sets field-by-field, keeping the left runtime.
-fn intersect_capabilities(
-    left: &ExternalRuntimeCapabilities,
-    right: &ExternalRuntimeCapabilities,
-) -> ExternalRuntimeCapabilities {
-    ExternalRuntimeCapabilities {
-        runtime: left.runtime.clone(),
-        streaming: left.streaming && right.streaming,
-        resume: left.resume && right.resume,
-        permission_bridge: left.permission_bridge && right.permission_bridge,
-        host_tools: left.host_tools && right.host_tools,
-        host_subagents: left.host_subagents && right.host_subagents,
-        artifacts: left.artifacts && right.artifacts,
-        usage: left.usage && right.usage,
-        graceful_shutdown: left.graceful_shutdown && right.graceful_shutdown,
-        reconfigure: left.reconfigure && right.reconfigure,
-    }
-}
-
 /// Projects an `initialize` result into the neutral negotiated-capability record.
 fn negotiated_from_initialize(
     result: &serde_json::Map<String, Value>,
@@ -1129,13 +1091,14 @@ fn apply_line_window(content: &str, line: Option<u32>, limit: Option<u32>) -> St
 #[cfg(test)]
 mod tests {
     use super::{
-        AcpAdapter, apply_line_window, implemented_capabilities, intersect_capabilities,
-        json_rpc_id_value, permission_outcome, select_option,
+        AcpAdapter, apply_line_window, implemented_capabilities, json_rpc_id_value,
+        permission_outcome, select_option,
     };
     use crate::agent::external::acp::{
         AcpConfig, AcpLauncher, AcpPermissionOption, AcpPermissionOptionKind, SpawnedAcpAgent,
         acp_runtime_kind,
     };
+    use crate::agent::external::process;
     use crate::agent::external::{
         ExternalAgentError, ExternalAgentEvent, ExternalCapability, ExternalEventSink,
         ExternalObservedEvent, ExternalPermissionMode, ExternalRuntimeAdapter,
@@ -1753,7 +1716,7 @@ mod tests {
         // ACP runtime label.
         let mut probed = implemented_capabilities();
         probed.resume = false;
-        let intersected = intersect_capabilities(&implemented_capabilities(), &probed);
+        let intersected = process::intersect_capabilities(&implemented_capabilities(), &probed);
         assert!(!intersected.resume);
         assert_eq!(intersected.runtime, acp_runtime_kind());
     }

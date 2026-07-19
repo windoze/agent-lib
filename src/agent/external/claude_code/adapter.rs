@@ -50,22 +50,19 @@
 #![allow(clippy::result_large_err)]
 
 use std::io;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdout, Command};
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::process::Command;
 
 use crate::agent::RunContext;
 use crate::agent::id::StepId;
 use crate::agent::interaction::InteractionResponse;
 use crate::agent::permission::PermissionDecision;
 
-use crate::agent::external::process_group;
+use crate::agent::external::process::{self, ChildStdinMode, ManagedChild, PreludeDeadline};
 use crate::agent::external::{
     ExternalAgentError, ExternalCapability, ExternalEventSink, ExternalObservedEvent,
     ExternalRuntimeAdapter, ExternalRuntimeCapabilities, ExternalRuntimeKind,
@@ -106,113 +103,50 @@ trait ClaudeSessionIo: Send {
     async fn close(&mut self) -> ExternalSessionShutdown;
 }
 
-/// Production [`ClaudeSessionIo`] backed by a real `tokio::process` child.
+/// Spawns the Claude Code CLI in managed structured-stream mode.
 ///
-/// It pipes the CLI's stdin/stdout, kills the child on drop, bounds each read
-/// with the configured read-idle timeout, and — on
-/// [`close`](ClaudeSessionIo::close) — drops stdin so the CLI sees EOF, waits
-/// for the exit within the shutdown grace (classifying it by status: zero →
-/// graceful, non-zero → failed), and on overrun force-kills the child's whole
-/// process group (unix; the direct child only on Windows) so CLI-spawned
-/// grandchildren cannot outlive the session (H-EXT-2).
-/// stderr is discarded so no raw runtime text can leak into a diagnostic.
-struct ClaudeProcessIo {
-    child: Child,
-    stdin: Option<tokio::process::ChildStdin>,
-    stdout: Lines<BufReader<ChildStdout>>,
-    read_timeout: Duration,
-    shutdown_grace: Duration,
-}
-
-impl ClaudeProcessIo {
-    /// Spawns the Claude Code CLI in managed structured-stream mode.
-    ///
-    /// `resume` carries the runtime session id to reattach to (`--resume <id>`)
-    /// when reviving a prior session; `None` starts a fresh one.
-    ///
-    /// # Errors
-    ///
-    /// Returns the raw [`io::Error`] from spawning (missing binary, permission
-    /// denied); the caller classifies it into
-    /// [`ExternalAgentError::Launch`]/[`ResumeUnavailable`](ExternalAgentError::ResumeUnavailable).
-    fn spawn(config: &ClaudeCodeConfig, resume: Option<&str>) -> io::Result<Self> {
-        let mut args = config.base_session_args();
-        args.push(VERBOSE_FLAG.to_owned());
-        if let Some(session_id) = resume {
-            args.push("--resume".to_owned());
-            args.push(session_id.to_owned());
-        }
-
-        let mut command = Command::new(config.binary());
-        command
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        if let Some(dir) = config.working_dir() {
-            command.current_dir(dir);
-        }
-        for (key, value) in config.env() {
-            command.env(key, value);
-        }
-        // The child leads its own process group on unix so a force-close can
-        // signal the whole group, grandchildren included (H-EXT-2).
-        process_group::configure_managed_command(&mut command);
-
-        let mut child = command.spawn()?;
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "claude code stdout was not captured",
-            )
-        })?;
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout).lines(),
-            read_timeout: config.read_idle_timeout(),
-            shutdown_grace: config.shutdown_grace(),
-        })
+/// `resume` carries the runtime session id to reattach to (`--resume <id>`) when
+/// reviving a prior session; `None` starts a fresh one. The shared
+/// [`ManagedChild`] owns stdin/stdout, read timeouts, exit-code classification,
+/// and process-group force-kill behavior.
+fn spawn_process(config: &ClaudeCodeConfig, resume: Option<&str>) -> io::Result<ManagedChild> {
+    let mut args = config.base_session_args();
+    args.push(VERBOSE_FLAG.to_owned());
+    if let Some(session_id) = resume {
+        args.push("--resume".to_owned());
+        args.push(session_id.to_owned());
     }
+
+    let mut command = Command::new(config.binary());
+    command.args(&args);
+    if let Some(dir) = config.working_dir() {
+        command.current_dir(dir);
+    }
+    for (key, value) in config.env() {
+        command.env(key, value);
+    }
+    ManagedChild::spawn(
+        command,
+        ChildStdinMode::Piped,
+        config.read_idle_timeout(),
+        config.shutdown_grace(),
+        "claude code stdout was not captured",
+        "claude code read timed out",
+    )
 }
 
 #[async_trait]
-impl ClaudeSessionIo for ClaudeProcessIo {
+impl ClaudeSessionIo for ManagedChild {
     async fn write_frame(&mut self, frame: &str) -> io::Result<()> {
-        let stdin = self.stdin.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "claude code stdin is closed")
-        })?;
-        stdin.write_all(frame.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await
+        self.write_line(frame, "claude code stdin is closed").await
     }
 
     async fn read_frame(&mut self) -> io::Result<Option<String>> {
-        match timeout(self.read_timeout, self.stdout.next_line()).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "claude code read timed out",
-            )),
-        }
+        self.read_line().await
     }
 
     async fn close(&mut self) -> ExternalSessionShutdown {
-        // Dropping stdin signals EOF so the CLI can exit on its own.
-        self.stdin = None;
-        match timeout(self.shutdown_grace, self.child.wait()).await {
-            Ok(Ok(status)) if status.success() => ExternalSessionShutdown::Graceful,
-            // A non-zero exit means the CLI failed mid-session, so its partial
-            // side effects cannot be trusted as clean (H-EXT-3).
-            Ok(Ok(_status)) => ExternalSessionShutdown::Failed,
-            Ok(Err(_error)) => ExternalSessionShutdown::Failed,
-            Err(_elapsed) => match process_group::force_kill(&mut self.child).await {
-                Ok(()) => ExternalSessionShutdown::ForcedKill,
-                Err(_error) => ExternalSessionShutdown::Failed,
-            },
-        }
+        ManagedChild::close(self).await
     }
 }
 
@@ -328,34 +262,17 @@ impl<Io: ClaudeSessionIo> ClaudeCodeSession<Io> {
         self.write_input(input).await?;
         self.first_turn_pending = true;
 
-        let deadline = Instant::now() + prelude_timeout;
+        let prelude = PreludeDeadline::new(prelude_timeout);
         while self.decoder.session_id().is_none() {
-            if ctx.is_cancelled() {
-                return Err(ExternalAgentError::SessionLost {
-                    session: self.maybe_session_ref(),
-                    detail: "claude code session begin was cancelled".to_owned(),
-                });
-            }
-            // The `timeout_at` below only fires while the runtime is polled; a
-            // transport whose reads resolve instantly would starve the timer, so
-            // the deadline is also enforced by this explicit wall-clock check.
-            if Instant::now() >= deadline {
-                return Err(ExternalAgentError::Launch {
-                    runtime: ExternalRuntimeKind::ClaudeCode,
-                    detail:
-                        "claude code session did not report a session id within the launch timeout"
-                            .to_owned(),
-                });
-            }
-            let line = match timeout_at(deadline, self.read_line()).await {
-                Ok(result) => result?,
-                Err(_elapsed) => {
-                    return Err(ExternalAgentError::Launch {
-                        runtime: ExternalRuntimeKind::ClaudeCode,
-                        detail: "claude code session did not report a session id within the launch timeout".to_owned(),
-                    });
-                }
-            };
+            prelude.check_active(
+                ctx,
+                self.maybe_session_ref(),
+                "claude code session begin was cancelled",
+                claude_prelude_timeout_error,
+            )?;
+            let line = prelude
+                .await_until(self.read_line(), claude_prelude_timeout_error)
+                .await?;
             match line {
                 Some(line) => {
                     let decision = self.decoder.push_line(&line)?;
@@ -397,12 +314,7 @@ impl<Io: ClaudeSessionIo> ClaudeCodeSession<Io> {
     /// sink and advancing the high-water `seq`.
     fn drain_and_emit(&mut self) -> Vec<ExternalObservedEvent> {
         let observed = self.decoder.take_observations();
-        for event in &observed {
-            if let Some(sink) = &self.sink {
-                sink.emit(event);
-            }
-            self.last_event_seq = Some(event.seq);
-        }
+        process::emit_observations(&observed, self.sink.as_ref(), &mut self.last_event_seq);
         observed
     }
 
@@ -493,27 +405,22 @@ impl<Io: ClaudeSessionIo> ClaudeCodeSession<Io> {
 
     /// Returns the session facts, or `None` before an id has been assigned.
     fn maybe_session_ref(&self) -> Option<ExternalSessionRef> {
-        if self.session_id.is_empty() {
-            None
-        } else {
-            Some(self.session_ref())
-        }
+        process::maybe_session_ref_for_id(
+            ExternalRuntimeKind::ClaudeCode,
+            &self.session_id,
+            self.last_event_seq,
+        )
     }
 }
 
 #[async_trait]
 impl<Io: ClaudeSessionIo> ExternalRuntimeSession for ClaudeCodeSession<Io> {
     fn session_ref(&self) -> ExternalSessionRef {
-        let session_id = (!self.session_id.is_empty()).then(|| self.session_id.clone());
-        ExternalSessionRef {
-            runtime: ExternalRuntimeKind::ClaudeCode,
-            session_id: session_id.clone(),
-            transcript_ref: None,
-            // Claude Code resumes by session id (`--resume <id>`), so it doubles
-            // as the opaque resume token.
-            resume_token: session_id,
-            last_event_seq: self.last_event_seq,
-        }
+        process::session_ref_for_id(
+            ExternalRuntimeKind::ClaudeCode,
+            &self.session_id,
+            self.last_event_seq,
+        )
     }
 
     async fn advance(
@@ -614,7 +521,7 @@ impl ClaudeCodeAdapter {
     ) -> Self {
         Self {
             config,
-            capabilities: intersect_capabilities(&implemented_capabilities(), probed),
+            capabilities: process::intersect_capabilities(&implemented_capabilities(), probed),
         }
     }
 
@@ -629,13 +536,11 @@ impl ClaudeCodeAdapter {
         &self,
         request: &ExternalSessionRequest,
     ) -> Result<(), ExternalAgentError> {
-        if !request.tools.is_empty() && !self.capabilities.host_tools {
-            return Err(self.capabilities.unsupported(
-                ExternalCapability::HostTools,
-                "claude code adapter cannot inject host tools without an MCP bridge",
-            ));
-        }
-        Ok(())
+        process::reject_unsupported_tools(
+            &self.capabilities,
+            request,
+            "claude code adapter cannot inject host tools without an MCP bridge",
+        )
     }
 
     /// Resolves the effective session configuration for `request`.
@@ -689,7 +594,7 @@ impl ExternalRuntimeAdapter for ClaudeCodeAdapter {
         self.reject_unsupported_tools(request)?;
 
         let config = self.session_config(request);
-        let io = ClaudeProcessIo::spawn(&config, None)
+        let io = spawn_process(&config, None)
             .map_err(|error| launch_error(&config, "spawning claude code", &error))?;
         let mut session = ClaudeCodeSession::new(
             io,
@@ -720,7 +625,7 @@ impl ExternalRuntimeAdapter for ClaudeCodeAdapter {
         };
 
         let config = self.session_config(request);
-        let io = ClaudeProcessIo::spawn(&config, Some(&session_id)).map_err(|error| {
+        let io = spawn_process(&config, Some(&session_id)).map_err(|error| {
             ExternalAgentError::ResumeUnavailable {
                 session: session.clone(),
                 detail: format!("failed spawning claude code to resume: {:?}", error.kind()),
@@ -759,22 +664,12 @@ fn implemented_capabilities() -> ExternalRuntimeCapabilities {
     }
 }
 
-/// Intersects two capability sets field-by-field, keeping the left runtime.
-fn intersect_capabilities(
-    left: &ExternalRuntimeCapabilities,
-    right: &ExternalRuntimeCapabilities,
-) -> ExternalRuntimeCapabilities {
-    ExternalRuntimeCapabilities {
-        runtime: left.runtime.clone(),
-        streaming: left.streaming && right.streaming,
-        resume: left.resume && right.resume,
-        permission_bridge: left.permission_bridge && right.permission_bridge,
-        host_tools: left.host_tools && right.host_tools,
-        host_subagents: left.host_subagents && right.host_subagents,
-        artifacts: left.artifacts && right.artifacts,
-        usage: left.usage && right.usage,
-        graceful_shutdown: left.graceful_shutdown && right.graceful_shutdown,
-        reconfigure: left.reconfigure && right.reconfigure,
+/// Builds the classified timeout used by the fresh-start prelude deadline.
+fn claude_prelude_timeout_error() -> ExternalAgentError {
+    ExternalAgentError::Launch {
+        runtime: ExternalRuntimeKind::ClaudeCode,
+        detail: "claude code session did not report a session id within the launch timeout"
+            .to_owned(),
     }
 }
 
@@ -852,9 +747,10 @@ fn control_response_frame(
 mod tests {
     use super::{
         ClaudeCodeAdapter, ClaudeCodeSession, ClaudeSessionIo, control_response_frame,
-        implemented_capabilities, intersect_capabilities, user_text_frame,
+        implemented_capabilities, user_text_frame,
     };
     use crate::agent::external::ClaudeCodeConfig;
+    use crate::agent::external::process;
     use crate::agent::external::{
         ExternalAgentError, ExternalCapability, ExternalEventSink, ExternalObservedEvent,
         ExternalPermissionMode, ExternalRuntimeAdapter, ExternalRuntimeCapabilities,
@@ -1430,7 +1326,7 @@ mod tests {
     fn claude_code_adapter_intersect_keeps_left_runtime_and_ands_flags() {
         let left = implemented_capabilities();
         let right = ExternalRuntimeCapabilities::none(ExternalRuntimeKind::ClaudeCode);
-        let both = intersect_capabilities(&left, &right);
+        let both = process::intersect_capabilities(&left, &right);
         assert_eq!(both.runtime, ExternalRuntimeKind::ClaudeCode);
         for capability in ExternalCapability::ALL {
             assert!(!both.supports(capability));
@@ -1517,34 +1413,24 @@ mod tests {
     /// worktree as reusable). These tests spawn a real short-lived `sh` child
     /// wired exactly like the production transport.
     mod close_classification {
-        use super::super::{ClaudeProcessIo, ClaudeSessionIo};
-        use crate::agent::external::{ExternalSessionShutdown, process_group};
+        use crate::agent::external::ExternalSessionShutdown;
+        use crate::agent::external::process::{self, ChildStdinMode, ManagedChild};
         use std::time::Duration;
-        use tokio::io::{AsyncBufReadExt, BufReader};
         use tokio::process::Command;
 
         /// Spawns a real `sh -c <script>` child with piped stdio.
-        fn spawn_sh(script: &str) -> ClaudeProcessIo {
+        fn spawn_sh(script: &str) -> ManagedChild {
             let mut command = Command::new("sh");
-            command
-                .arg("-c")
-                .arg(script)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true);
-            // Mirror the production spawn: the child leads its own process group.
-            process_group::configure_managed_command(&mut command);
-            let mut child = command.spawn().expect("spawn sh");
-            let stdin = child.stdin.take();
-            let stdout = child.stdout.take().expect("stdout is piped");
-            ClaudeProcessIo {
-                child,
-                stdin,
-                stdout: BufReader::new(stdout).lines(),
-                read_timeout: Duration::from_secs(1),
-                shutdown_grace: Duration::from_millis(250),
-            }
+            command.arg("-c").arg(script);
+            ManagedChild::spawn(
+                command,
+                ChildStdinMode::Piped,
+                Duration::from_secs(1),
+                Duration::from_millis(250),
+                "stdout is piped",
+                "test read timed out",
+            )
+            .expect("spawn sh")
         }
 
         /// A zero exit status closes `Graceful`.
@@ -1575,9 +1461,9 @@ mod tests {
         #[tokio::test]
         async fn force_close_kills_the_whole_process_group() {
             let mut io = spawn_sh("sleep 300 & sleep 300");
-            let pgid = io.child.id().expect("child id") as i32;
+            let pgid = io.child_id().expect("child id") as i32;
             assert_eq!(io.close().await, ExternalSessionShutdown::ForcedKill);
-            process_group::assert_process_group_reaped(pgid).await;
+            process::assert_process_group_reaped(pgid).await;
         }
     }
 

@@ -5,19 +5,15 @@
 //! direct child orphans those grandchildren, which can keep writing to a
 //! worktree the cleanup path is about to delete or reuse. On unix every managed
 //! child is therefore spawned as a process-group leader
-//! ([`configure_managed_command`]) and the force-close path
-//! ([`force_kill`]) signals the whole group: SIGTERM first, then SIGKILL after
-//! a short escalation window.
+//! ([`configure_managed_command`]) and the force-close path ([`force_kill`])
+//! signals the whole group: SIGTERM first, then SIGKILL after a short escalation
+//! window.
 //!
 //! Windows has no POSIX process-group semantics, so the close path there keeps
 //! tokio's direct-child `start_kill`; that platform difference is documented in
 //! `docs/managed-external-agent.md` §16. The group guarantee covers the
 //! cooperative `close` path only: a transport dropped without `close` still
 //! relies on `kill_on_drop`, which reaps just the direct child.
-//!
-//! Used by all three CLI adapters and the ACP connection; the
-//! capability-probe processes are short-lived one-shots bounded by
-//! `wait_with_output` and deliberately stay on plain `kill_on_drop`.
 
 use std::io;
 use std::time::Duration;
@@ -25,9 +21,9 @@ use tokio::process::{Child, Command};
 
 /// Grace window between the process-group SIGTERM and the SIGKILL escalation.
 ///
-/// Bounded independently of the configured shutdown grace (which already
-/// elapsed before [`force_kill`] runs) so a force-close stays fast; a process
-/// that ignores SIGTERM only costs this window before SIGKILL lands.
+/// Bounded independently of the configured shutdown grace (which already elapsed
+/// before [`force_kill`] runs) so a force-close stays fast; a process that ignores
+/// SIGTERM only costs this window before SIGKILL lands.
 #[cfg(unix)]
 const SIGTERM_ESCALATION_GRACE: Duration = Duration::from_secs(2);
 
@@ -151,8 +147,8 @@ mod tests {
         command.spawn().expect("spawn sh")
     }
 
-    /// A configured command spawns the child as leader of its own process
-    /// group (pgid == pid), the precondition for group-wide signalling.
+    /// A configured command spawns the child as leader of its own process group
+    /// (pgid == pid), the precondition for group-wide signalling.
     #[tokio::test]
     async fn configured_child_leads_its_own_process_group() {
         let mut child = spawn_sh("sleep 30");

@@ -1674,7 +1674,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - **验证**：`cargo fmt --all`、`cargo test -p agent-lib --lib adapter::`（88 条通过）、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`（默认离线全量通过，真实端点/CLI 测试保持 ignored，无挂起）、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - 无 breaking change（crate-private 重构；公共类型、函数签名、serde/wire 行为不变）。
 
-### M8-2 [TODO] 三个 CLI adapter 收敛共享 child-process 模块（external 报告 L-12）
+### M8-2 [DONE] 三个 CLI adapter 收敛共享 child-process 模块（external 报告 L-12）
 
 上下文：
 
@@ -1691,6 +1691,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 全部 external feature 测试原样通过。
 - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`。
 - 三 adapter 目录行数显著下降（完成记录给出 before/after）。
+
+完成记录：
+
+- **共享模块落地**：新增 `src/agent/external/process/`。`process/mod.rs` 承载共享 `ManagedChild`（spawn + process-group 配置、line read idle timeout、grace close + exit-code 分类 + force-kill 兜底）、`PreludeDeadline`（prelude wall-clock deadline + cancellation guard）、observation drain helper、标准 session ref helper、`intersect_capabilities`、`reject_unsupported_tools`、autonomous turn input 映射与 mid-session close trace/worst-disposition 折叠；原 `process_group.rs` 移入 `process/group.rs`，仍是 unix process-group SIGTERM/SIGKILL 原语的单一实现。
+- **三个 CLI adapter 接线**：Claude Code 删除本地 `ClaudeProcessIo`，生产 IO 直接用共享 `ManagedChild`（仅保留 stdin frame 写入、argv 构造、decoder 接线）；Codex/OpenCode 删除本地 `CodexProcessTurn` / `OpenCodeProcessTurn`，launcher 只构造 runtime-specific argv 与 config/env/cwd，子进程生命周期由 `ManagedChild` 处理。三者的 prelude deadline/cancel、observation emission、session ref、水位更新、probed capability intersect、host-tool 声明拒绝、Codex/OpenCode autonomous input 映射均改走共享 helper。
+- **ACP 复用部分同步**：ACP connection 保持 JSON-RPC transport 形状，但复用 `process::read_line_with_timeout`、`process::close_child` 与 `process::configure_managed_command`；ACP adapter 的 observation drain、session ref、capability intersect 与 host-tool 声明拒绝也改走共享 helper。ACP 写入路径保留原有 write/flush 诊断分支，避免把 `flush failed` 行为折叠成泛化写错误。
+- **重复残留检查**：`grep process_group` 无旧模块引用；`fn intersect_capabilities` 只剩 `src/agent/external/process/mod.rs` 单一实现；三份 adapter 中的 `drain_and_emit` / `maybe_session_ref` / Codex+OpenCode `note_close` 仅保留薄封装，实际逻辑在共享 helper 中。行为按 M1/M2 修复后的语义保持不变，未改变公共 API。
+- **行数 before/after（adapter.rs 文件）**：`claude_code/adapter.rs` 1629 → 1515（-114）；`codex/adapter.rs` 2050 → 1938（-112）；`opencode/adapter.rs` 2152 → 2039（-113）。新增共享模块为 `process/mod.rs` 356 行 + `process/group.rs` 181 行；ACP connection 500 → 491（-9）。
+- **验证**：`cargo fmt --all`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo clippy --all-targets -- -D warnings`、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（通过，real CLI 测试保持 ignored）、`cargo test --all --all-targets`（通过，real endpoint/CLI 测试保持 ignored）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过，无挂起测试。
+- `docs/review-2026-07.md` “复制代码”中三个 CLI adapter 重复项已标注 `✅ 已修复（M8-2）`。无 breaking change（crate-private 重构；公共类型、函数签名、serde/wire 行为不变）。
 
 ### M8-3 [TODO] M8 review：收敛收口
 

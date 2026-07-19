@@ -22,10 +22,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-use crate::agent::external::process_group;
+use crate::agent::external::process;
 use crate::agent::external::{ExternalAgentError, ExternalSessionShutdown};
 
 use super::{AcpConfig, acp_runtime_kind};
@@ -155,18 +155,19 @@ impl SpawnedAcpAgent {
     /// Returns [`ExternalAgentError::SessionLost`] when the read fails or exceeds
     /// the configured timeout.
     pub async fn read_line(&mut self) -> Result<Option<String>, ExternalAgentError> {
-        let mut line = String::new();
-        let read = tokio::time::timeout(self.read_timeout, self.reader.read_line(&mut line))
-            .await
-            .map_err(|_| session_lost("acp transport read timed out"))?
-            .map_err(|error| session_lost(format!("acp transport read failed: {error}")))?;
-        if read == 0 {
-            return Ok(None);
-        }
-        while line.ends_with('\n') || line.ends_with('\r') {
-            line.pop();
-        }
-        Ok(Some(line))
+        process::read_line_with_timeout(
+            &mut self.reader,
+            self.read_timeout,
+            "acp transport read timed out",
+        )
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                session_lost("acp transport read timed out")
+            } else {
+                session_lost(format!("acp transport read failed: {error}"))
+            }
+        })
     }
 
     /// Closes the transport, returning how the session ended.
@@ -190,17 +191,7 @@ impl SpawnedAcpAgent {
                 .unwrap_or(ExternalSessionShutdown::Graceful);
         };
 
-        match tokio::time::timeout(grace, child.wait()).await {
-            Ok(Ok(status)) if status.success() => ExternalSessionShutdown::Graceful,
-            // A non-zero exit means the agent failed, so its partial side
-            // effects cannot be trusted as clean (H-EXT-3).
-            Ok(Ok(_status)) => ExternalSessionShutdown::Failed,
-            Ok(Err(_error)) => ExternalSessionShutdown::Failed,
-            Err(_elapsed) => match process_group::force_kill(child).await {
-                Ok(()) => ExternalSessionShutdown::ForcedKill,
-                Err(_error) => ExternalSessionShutdown::Failed,
-            },
-        }
+        process::close_child(child, grace).await
     }
 }
 
@@ -231,7 +222,7 @@ impl AcpLauncher for TokioProcessLauncher {
             .kill_on_drop(true);
         // The child leads its own process group on unix so a force-close can
         // signal the whole group, grandchildren included (H-EXT-2).
-        process_group::configure_managed_command(&mut command);
+        process::configure_managed_command(&mut command);
 
         let mut child = command
             .spawn()
@@ -427,7 +418,7 @@ mod tests {
     /// real short-lived `sh` child wired exactly like the production transport.
     mod close_classification {
         use super::super::SpawnedAcpAgent;
-        use crate::agent::external::{ExternalSessionShutdown, process_group};
+        use crate::agent::external::{ExternalSessionShutdown, process};
         use std::time::Duration;
         use tokio::process::Command;
 
@@ -442,7 +433,7 @@ mod tests {
                 .stderr(std::process::Stdio::null())
                 .kill_on_drop(true);
             // Mirror the production spawn: the child leads its own process group.
-            process_group::configure_managed_command(&mut command);
+            process::configure_managed_command(&mut command);
             let mut child = command.spawn().expect("spawn sh");
             let stdin = child.stdin.take().expect("stdin is piped");
             let stdout = child.stdout.take().expect("stdout is piped");
@@ -494,7 +485,7 @@ mod tests {
                 agent.close(Duration::from_millis(250)).await,
                 ExternalSessionShutdown::ForcedKill
             );
-            process_group::assert_process_group_reaped(pgid).await;
+            process::assert_process_group_reaped(pgid).await;
         }
     }
 }

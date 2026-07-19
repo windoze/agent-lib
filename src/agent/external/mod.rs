@@ -85,7 +85,7 @@ mod opencode;
     feature = "external-codex",
     feature = "external-opencode"
 ))]
-mod process_group;
+mod process;
 mod profile;
 mod registry;
 mod runtime;

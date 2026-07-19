@@ -66,23 +66,19 @@
 #![allow(clippy::result_large_err)]
 
 use std::io;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdout, Command};
-use tokio::time::{Instant, timeout, timeout_at};
+use tokio::process::Command;
 
-use crate::agent::{RunContext, TraceNodeId};
+use crate::agent::RunContext;
 
-use crate::agent::external::process_group;
+use crate::agent::external::process::{self, ChildStdinMode, ManagedChild, PreludeDeadline};
 use crate::agent::external::{
-    ExternalAgentError, ExternalCapability, ExternalEventSink, ExternalObservedEvent,
-    ExternalRuntimeAdapter, ExternalRuntimeCapabilities, ExternalRuntimeKind,
-    ExternalRuntimeSession, ExternalSessionInput, ExternalSessionRef, ExternalSessionRequest,
-    ExternalSessionShutdown, RuntimeDecisionPoint,
+    ExternalAgentError, ExternalEventSink, ExternalObservedEvent, ExternalRuntimeAdapter,
+    ExternalRuntimeCapabilities, ExternalRuntimeKind, ExternalRuntimeSession, ExternalSessionInput,
+    ExternalSessionRef, ExternalSessionRequest, ExternalSessionShutdown, RuntimeDecisionPoint,
 };
 
 use super::{CodexConfig, CodexDecision, CodexDecodeContext, CodexStreamDecoder};
@@ -201,86 +197,34 @@ impl CodexLauncher for SystemCodexLauncher {
         let args = spec.args(&self.config);
 
         let mut command = Command::new(self.config.binary());
-        command
-            .args(&args)
-            // Codex reads a prompt only from its positional argument; a piped or
-            // inherited stdin makes it block on "Reading additional input from
-            // stdin…", so it is closed. stderr is discarded so no raw runtime
-            // text (which could echo prompt or tool output) can leak into a
-            // diagnostic — only the structured `--json` stdout is consumed.
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+        command.args(&args);
         if let Some(dir) = self.config.working_dir() {
             command.current_dir(dir);
         }
         for (key, value) in self.config.env() {
             command.env(key, value);
         }
-        // The child leads its own process group on unix so a force-close can
-        // signal the whole group, grandchildren included (H-EXT-2).
-        process_group::configure_managed_command(&mut command);
-
-        let mut child = command.spawn()?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "codex exec stdout was not captured",
-            )
-        })?;
-        Ok(Box::new(CodexProcessTurn {
-            child,
-            stdout: BufReader::new(stdout).lines(),
-            read_timeout: self.config.read_idle_timeout(),
-            shutdown_grace: self.config.shutdown_grace(),
-        }))
+        Ok(Box::new(ManagedChild::spawn(
+            command,
+            // Codex reads prompt text only from its positional argument; a piped
+            // or inherited stdin makes it block on additional input.
+            ChildStdinMode::Null,
+            self.config.read_idle_timeout(),
+            self.config.shutdown_grace(),
+            "codex exec stdout was not captured",
+            "codex exec read timed out",
+        )?))
     }
-}
-
-/// Production [`CodexTurnStream`] backed by a real `tokio::process` child.
-///
-/// It pipes the CLI's stdout, kills the child on drop, bounds each read with
-/// the configured read-idle timeout, and — on [`close`](CodexTurnStream::close)
-/// — waits for the one-shot process to exit within the shutdown grace (a
-/// settled turn has already exited), classifies the exit by status (zero →
-/// graceful, non-zero → failed), and on overrun force-kills the child's whole
-/// process group (unix; the direct child only on Windows) so CLI-spawned
-/// grandchildren cannot outlive the turn (H-EXT-2).
-struct CodexProcessTurn {
-    child: Child,
-    stdout: Lines<BufReader<ChildStdout>>,
-    read_timeout: Duration,
-    shutdown_grace: Duration,
 }
 
 #[async_trait]
-impl CodexTurnStream for CodexProcessTurn {
+impl CodexTurnStream for ManagedChild {
     async fn read_frame(&mut self) -> io::Result<Option<String>> {
-        match timeout(self.read_timeout, self.stdout.next_line()).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "codex exec read timed out",
-            )),
-        }
+        self.read_line().await
     }
 
     async fn close(&mut self) -> ExternalSessionShutdown {
-        // A one-shot turn process exits on its own once the turn settles, so a
-        // graceful close usually just reaps it; a still-running turn is waited on
-        // within the grace window and force-killed on overrun.
-        match timeout(self.shutdown_grace, self.child.wait()).await {
-            Ok(Ok(status)) if status.success() => ExternalSessionShutdown::Graceful,
-            // A non-zero exit means the CLI turn failed, so its partial side
-            // effects cannot be trusted as clean (H-EXT-3).
-            Ok(Ok(_status)) => ExternalSessionShutdown::Failed,
-            Ok(Err(_error)) => ExternalSessionShutdown::Failed,
-            Err(_elapsed) => match process_group::force_kill(&mut self.child).await {
-                Ok(()) => ExternalSessionShutdown::ForcedKill,
-                Err(_error) => ExternalSessionShutdown::Failed,
-            },
-        }
+        ManagedChild::close(self).await
     }
 }
 
@@ -430,9 +374,9 @@ impl<L: CodexLauncher> CodexSession<L> {
             self.session_id = id.clone();
         }
 
-        let deadline = Instant::now() + prelude_timeout;
+        let prelude = PreludeDeadline::new(prelude_timeout);
         // Fresh vs resume classification axis, shared by both deadline guards.
-        let deadline_error = || match &first {
+        let deadline_error = |first: &FirstLaunch| match first {
             FirstLaunch::Fresh => ExternalAgentError::Launch {
                 runtime: ExternalRuntimeKind::Codex,
                 detail: "codex exec did not report a thread id within the launch timeout"
@@ -445,22 +389,15 @@ impl<L: CodexLauncher> CodexSession<L> {
             },
         };
         while self.decoder.session_id().is_none() {
-            if ctx.is_cancelled() {
-                return Err(ExternalAgentError::SessionLost {
-                    session: self.maybe_session_ref(),
-                    detail: "codex session begin was cancelled".to_owned(),
-                });
-            }
-            // The `timeout_at` below only fires while the runtime is polled; a
-            // transport whose reads resolve instantly would starve the timer, so
-            // the deadline is also enforced by this explicit wall-clock check.
-            if Instant::now() >= deadline {
-                return Err(deadline_error());
-            }
-            let line = match timeout_at(deadline, self.read_line()).await {
-                Ok(result) => result?,
-                Err(_elapsed) => return Err(deadline_error()),
-            };
+            prelude.check_active(
+                ctx,
+                self.maybe_session_ref(),
+                "codex session begin was cancelled",
+                || deadline_error(&first),
+            )?;
+            let line = prelude
+                .await_until(self.read_line(), || deadline_error(&first))
+                .await?;
             match line {
                 Some(line) => {
                     let decision = self.decoder.push_line(&line)?;
@@ -512,12 +449,7 @@ impl<L: CodexLauncher> CodexSession<L> {
     /// sink and advancing the high-water `seq`.
     fn drain_and_emit(&mut self) -> Vec<ExternalObservedEvent> {
         let observed = self.decoder.take_observations();
-        for event in &observed {
-            if let Some(sink) = &self.sink {
-                sink.emit(event);
-            }
-            self.last_event_seq = Some(event.seq);
-        }
+        process::emit_observations(&observed, self.sink.as_ref(), &mut self.last_event_seq);
         observed
     }
 
@@ -531,14 +463,12 @@ impl<L: CodexLauncher> CodexSession<L> {
     /// plus a per-session counter (the crate mints no other ids), keeping it
     /// deterministic and collision-free.
     fn note_close(&mut self, ctx: &RunContext, disposition: ExternalSessionShutdown) {
-        let seq = self.close_trace_seq;
-        self.close_trace_seq += 1;
-        let id = TraceNodeId::new(format!("external-shutdown/{}/{seq}", ctx.run_id()));
-        let _ = ctx.trace().record_external_shutdown(id, disposition);
-        self.worst_close = Some(match self.worst_close {
-            Some(worst) => worst.merge(disposition),
-            None => disposition,
-        });
+        process::record_mid_session_close(
+            ctx,
+            &mut self.close_trace_seq,
+            &mut self.worst_close,
+            disposition,
+        );
     }
 
     /// Spawns the follow-up turn process for `input`, or refuses an unsupported
@@ -607,27 +537,22 @@ impl<L: CodexLauncher> CodexSession<L> {
 
     /// Returns the session facts, or `None` before a thread id has been assigned.
     fn maybe_session_ref(&self) -> Option<ExternalSessionRef> {
-        if self.session_id.is_empty() {
-            None
-        } else {
-            Some(self.session_ref())
-        }
+        process::maybe_session_ref_for_id(
+            ExternalRuntimeKind::Codex,
+            &self.session_id,
+            self.last_event_seq,
+        )
     }
 }
 
 #[async_trait]
 impl<L: CodexLauncher> ExternalRuntimeSession for CodexSession<L> {
     fn session_ref(&self) -> ExternalSessionRef {
-        let session_id = (!self.session_id.is_empty()).then(|| self.session_id.clone());
-        ExternalSessionRef {
-            runtime: ExternalRuntimeKind::Codex,
-            session_id: session_id.clone(),
-            transcript_ref: None,
-            // Codex resumes by thread id (`exec resume <id>`), so it doubles as
-            // the opaque resume token.
-            resume_token: session_id,
-            last_event_seq: self.last_event_seq,
-        }
+        process::session_ref_for_id(
+            ExternalRuntimeKind::Codex,
+            &self.session_id,
+            self.last_event_seq,
+        )
     }
 
     async fn advance(
@@ -739,7 +664,7 @@ impl CodexAdapter {
     ) -> Self {
         Self {
             config,
-            capabilities: intersect_capabilities(&implemented_capabilities(), probed),
+            capabilities: process::intersect_capabilities(&implemented_capabilities(), probed),
         }
     }
 
@@ -754,13 +679,11 @@ impl CodexAdapter {
         &self,
         request: &ExternalSessionRequest,
     ) -> Result<(), ExternalAgentError> {
-        if !request.tools.is_empty() && !self.capabilities.host_tools {
-            return Err(self.capabilities.unsupported(
-                ExternalCapability::HostTools,
-                "codex adapter cannot inject host tools; codex exec runs autonomously",
-            ));
-        }
-        Ok(())
+        process::reject_unsupported_tools(
+            &self.capabilities,
+            request,
+            "codex adapter cannot inject host tools; codex exec runs autonomously",
+        )
     }
 
     /// Builds the decode context stamping the worktree onto command observations.
@@ -902,25 +825,16 @@ fn turn_message(
     capabilities: &ExternalRuntimeCapabilities,
     input: &ExternalSessionInput,
 ) -> Result<String, ExternalAgentError> {
-    match input {
-        ExternalSessionInput::Start { prompt } => Ok(prompt.clone()),
-        ExternalSessionInput::Continue { message } => Ok(message.clone()),
-        ExternalSessionInput::RespondInteraction { .. } => Err(capabilities.unsupported(
-            ExternalCapability::PermissionBridge,
-            "codex exec runs autonomously; there is no host-answerable interaction to resolve",
-        )),
-        ExternalSessionInput::RespondToolResults { .. } => Err(capabilities.unsupported(
-            ExternalCapability::HostTools,
-            "codex adapter does not bridge host tool results",
-        )),
-        ExternalSessionInput::RespondSubagent { .. } => Err(capabilities.unsupported(
-            ExternalCapability::HostSubagents,
-            "codex adapter does not bridge host subagents",
-        )),
-        ExternalSessionInput::Shutdown => Err(ExternalAgentError::Protocol {
-            detail: "codex session shutdown must go through shutdown(), not advance".to_owned(),
-        }),
-    }
+    process::autonomous_turn_message(
+        capabilities,
+        input,
+        process::AutonomousTurnMessages {
+            interaction: "codex exec runs autonomously; there is no host-answerable interaction to resolve",
+            tool_results: "codex adapter does not bridge host tool results",
+            subagent: "codex adapter does not bridge host subagents",
+            shutdown: "codex session shutdown must go through shutdown(), not advance",
+        },
+    )
 }
 
 /// Returns the managed features this adapter can actually fulfill.
@@ -945,32 +859,14 @@ fn implemented_capabilities() -> ExternalRuntimeCapabilities {
     }
 }
 
-/// Intersects two capability sets field-by-field, keeping the left runtime.
-fn intersect_capabilities(
-    left: &ExternalRuntimeCapabilities,
-    right: &ExternalRuntimeCapabilities,
-) -> ExternalRuntimeCapabilities {
-    ExternalRuntimeCapabilities {
-        runtime: left.runtime.clone(),
-        streaming: left.streaming && right.streaming,
-        resume: left.resume && right.resume,
-        permission_bridge: left.permission_bridge && right.permission_bridge,
-        host_tools: left.host_tools && right.host_tools,
-        host_subagents: left.host_subagents && right.host_subagents,
-        artifacts: left.artifacts && right.artifacts,
-        usage: left.usage && right.usage,
-        graceful_shutdown: left.graceful_shutdown && right.graceful_shutdown,
-        reconfigure: left.reconfigure && right.reconfigure,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         CodexAdapter, CodexLauncher, CodexSession, CodexTurnSpec, CodexTurnStream, FirstLaunch,
-        implemented_capabilities, intersect_capabilities, turn_message,
+        implemented_capabilities, turn_message,
     };
     use crate::agent::external::CodexConfig;
+    use crate::agent::external::process;
     use crate::agent::external::{
         ExternalAgentError, ExternalCapability, ExternalEventSink, ExternalObservedEvent,
         ExternalPermissionMode, ExternalRuntimeAdapter, ExternalRuntimeCapabilities,
@@ -1904,7 +1800,7 @@ mod tests {
     fn codex_adapter_intersect_keeps_left_runtime_and_ands_flags() {
         let left = implemented_capabilities();
         let right = ExternalRuntimeCapabilities::none(ExternalRuntimeKind::Codex);
-        let both = intersect_capabilities(&left, &right);
+        let both = process::intersect_capabilities(&left, &right);
         assert_eq!(both.runtime, ExternalRuntimeKind::Codex);
         for capability in ExternalCapability::ALL {
             assert!(!both.supports(capability));
@@ -1940,32 +1836,24 @@ mod tests {
     /// dirty worktree as reusable). These tests spawn a real short-lived `sh`
     /// child wired exactly like the production turn stream.
     mod close_classification {
-        use super::super::{CodexProcessTurn, CodexTurnStream};
-        use crate::agent::external::{ExternalSessionShutdown, process_group};
+        use crate::agent::external::ExternalSessionShutdown;
+        use crate::agent::external::process::{self, ChildStdinMode, ManagedChild};
         use std::time::Duration;
-        use tokio::io::{AsyncBufReadExt, BufReader};
         use tokio::process::Command;
 
         /// Spawns a real `sh -c <script>` child with piped stdout.
-        fn spawn_sh(script: &str) -> CodexProcessTurn {
+        fn spawn_sh(script: &str) -> ManagedChild {
             let mut command = Command::new("sh");
-            command
-                .arg("-c")
-                .arg(script)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true);
-            // Mirror the production spawn: the child leads its own process group.
-            process_group::configure_managed_command(&mut command);
-            let mut child = command.spawn().expect("spawn sh");
-            let stdout = child.stdout.take().expect("stdout is piped");
-            CodexProcessTurn {
-                child,
-                stdout: BufReader::new(stdout).lines(),
-                read_timeout: Duration::from_secs(1),
-                shutdown_grace: Duration::from_millis(250),
-            }
+            command.arg("-c").arg(script);
+            ManagedChild::spawn(
+                command,
+                ChildStdinMode::Null,
+                Duration::from_secs(1),
+                Duration::from_millis(250),
+                "stdout is piped",
+                "test read timed out",
+            )
+            .expect("spawn sh")
         }
 
         /// A zero exit status closes `Graceful`.
@@ -1996,9 +1884,9 @@ mod tests {
         #[tokio::test]
         async fn force_close_kills_the_whole_process_group() {
             let mut turn = spawn_sh("sleep 300 & sleep 300");
-            let pgid = turn.child.id().expect("child id") as i32;
+            let pgid = turn.child_id().expect("child id") as i32;
             assert_eq!(turn.close().await, ExternalSessionShutdown::ForcedKill);
-            process_group::assert_process_group_reaped(pgid).await;
+            process::assert_process_group_reaped(pgid).await;
         }
     }
 
