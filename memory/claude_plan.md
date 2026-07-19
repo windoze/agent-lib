@@ -36,4 +36,9 @@
 - [x] 实施修复：删 `rebuild_tool_call_index` 包装 + `DerivedIndexMismatch` 变体，restore 直接 `rebuild`，文档同步
 - [x] 验证全过：fmt、clippy（默认 + external features）、conversation::persistence 19 条、全量测试 exit 0、cargo doc
 - [x] `docs/review-2026-07.md` M-CONV-1 标注 ✅ 已修复（M3-3）；TODO.md M3-3 标 [DONE] + 完成记录（含 breaking change 说明）
-- [ ] 提交
+- [x] 提交（a46490a）
+
+## 结果
+
+M3-3 完成（方案 a）：空校验与 `DerivedIndexMismatch` 变体删除，restore 直接
+`ToolCallIndex::rebuild`。全量门禁通过，commit a46490a。停止，等待下一次调用（下一个任务 M3-4）。
