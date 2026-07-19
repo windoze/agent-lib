@@ -1141,6 +1141,10 @@ pub enum FacadeError {
 }
 ```
 
+`LoopLimitExceeded` 的分类来自结构化状态,而不是错误消息文本:正常步数上限落在
+`LoopCursor::Done(StepLimitReached)`,恢复/错误游标路径则读取 `ErrorCursorKind`。`message`
+只作为人类可读诊断,修改措辞不影响 facade 错误类别。
+
 `send` / `run` 失败时默认行为建议:
 
 ```text

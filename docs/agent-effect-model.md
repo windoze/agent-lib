@@ -116,14 +116,17 @@ drain 一个 stream 时必须区分:
 - **硬失败(运行时故障)**:payload kind 不匹配、内部不一致、conversation / state 操作
   失败。机器经 `cancel_pending(DiscardTurn)` 清理后停在 `LoopCursor::Error`。清理自身
   的失败不再被吞:折叠进错误消息;转移表含 `(Done|Error) → Error` 边,error 停靠对
-  所有 cursor kind 全可达,诊断不会丢。
+  所有 cursor kind 全可达,诊断不会丢。`ErrorCursor` 同时携带稳定的
+  `ErrorCursorKind`,message 只作为人类可读补充,facade 不再解析 message 子串做分类
+  (M5-3)。
 
 同契约下的两条终态修正:
 
 - **步数上限是正常终态**:达到 `max_steps` 走 `LoopCursor::Done(StepLimitReached)`
   而非 Error;tool phase 已 drain(无 open call),pending turn 以 `ResumeTurn` 空闭包
   保全(已冻结的 tool 结果不丢)。facade 把该终态结构化映射为
-  `FacadeError::LoopLimitExceeded`(不再字符串匹配)。
+  `FacadeError::LoopLimitExceeded`;若恢复到带 `ErrorCursorKind::LoopLimitExceeded`
+  的 error cursor,facade 也按 kind 结构化分类。
 - **reconfig abandon 保全文本**:during-turn reconfig park 在 `ReadyToCommit`
   (`ResumeTurn` 在该相位非法),abandon 时改为 `commit_pending` 提交已冻结的文本响应;
   被放弃的 reconfiguration 留在队列,下个 turn 边界重发。

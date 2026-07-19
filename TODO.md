@@ -1288,7 +1288,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 验证：`cargo fmt --all`、`cargo test -p agent-lib --lib facade::`（211 条全过）、`cargo clippy --all-targets -- -D warnings`、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`cargo test --all --all-targets`（exit 0，无挂起）、`cargo test --features "external-claude-code external-codex external-opencode external-acp" --all-targets`（exit 0，无挂起）、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
 - 无 breaking change（typed-tool deny 行为未变；流式 `Done.events` 仅补齐已承诺的生命周期事件）。
 
-### M5-3 [TODO] 结构化错误 kind 替代字符串匹配分类（M-ERR-5）
+### M5-3 [DONE] 结构化错误 kind 替代字符串匹配分类（M-ERR-5）
 
 上下文：
 
@@ -1303,6 +1303,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 - 单元测试：触发步数上限，facade 错误为 `LoopLimitExceeded`；修改内部措辞不影响分类（通过构造直接验证 kind 路径）。
 - `cargo test -p agent-lib --lib facade::agent` 全过。
+
+完成记录：
+
+- **结构化 kind 落点**：`ErrorCursor` 新增 `kind: ErrorCursorKind`（`Other` / `LoopLimitExceeded`），serde 缺字段默认 `Other`，`Other` 序列化时省略，旧 error cursor wire 可直接恢复；新增 `ErrorCursor::with_kind`、`ErrorCursor::kind` 与 `LoopCursor::error_with_kind`。message 保留为人类可读诊断，不再承担 facade 分类语义。
+- **facade 分类修复**：`classify_error` 改收 `&ErrorCursor` 并按 `ErrorCursorKind` 匹配；`LoopLimitExceeded` kind 直接映射 `FacadeError::LoopLimitExceeded`，`Other` 才落到 `AgentError::Other(message)`。`run_full` 与 `stream` 两条 `LoopCursor::Error` 路径统一调用该结构化分类；M4-4 已有的 `Done(StepLimitReached)` 正常终态映射保持不变。源码中 facade 的 `message.contains("loop step limit")` 字符串匹配已删除。
+- **测试**：保留并通过既有两条生产路径测试 `exceeding_the_tool_round_budget_fails` / `exceeding_the_tool_round_budget_fails_the_stream`（真实触发 step limit → `LoopLimitExceeded`）；新增 `error_cursor_classification_uses_kind_not_message_text`，直接构造 `ErrorCursorKind::LoopLimitExceeded` 验证改措辞仍正确分类，并构造 message 含旧关键词的 `Other` 验证不会被误分类；新增 `error_cursor_kind_defaults_for_legacy_wire_and_round_trips_specific_kinds`，覆盖旧 wire 缺 kind 默认与 typed kind round-trip。
+- **文档**：`docs/agent-effect-model.md` §2.4 与 `docs/facade-api.md` §16 同步结构化 kind 口径；`docs/review-2026-07.md` M-ERR-5 已标注 `✅ 已修复（M5-3）`。
+- **验证**：`cargo fmt --all`、`cargo test -p agent-lib --lib facade::agent`（52 条全过）、`cargo test -p agent-lib --lib agent::state`（21 条全过）、`cargo clippy --all-targets -- -D warnings`、`cargo test --all --all-targets`（exit 0，默认离线全量套件全过）、`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 全部通过。
+- **兼容性**：无签名破坏；旧 error cursor 数据可读。带非 `Other` kind 的新 error cursor wire 在旧版本中会因未知字段被拒（pre-1.0 可接受，且当前生产 step-limit 路径仍走 `Done(StepLimitReached)`）。
 
 ### M5-4 [TODO] facade 暴露 cancel 与 pivot 入口（M-PROM-2 cancel/pivot 部分）
 

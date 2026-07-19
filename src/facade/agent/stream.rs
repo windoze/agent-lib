@@ -338,7 +338,7 @@ pub(super) fn start(
                     events: weave_approval_events(collected.events, recorded_approvals),
                 })
             }
-            LoopCursor::Error(error) => Err(classify_error(error.message())),
+            LoopCursor::Error(error) => Err(classify_error(error)),
             other => Err(FacadeError::Agent(AgentError::Other(format!(
                 "agent run ended on a non-terminal cursor ({:?})",
                 other.kind()

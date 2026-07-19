@@ -225,6 +225,21 @@ impl LoopCursor {
         Ok(Self::Error(ErrorCursor::new(message)?))
     }
 
+    /// Creates an error cursor with stable diagnostic text and a structured kind.
+    ///
+    /// The message remains human-readable context; consumers that need stable
+    /// classification should inspect [`ErrorCursor::kind`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentStateError::EmptyCursorError`] when `message` is empty.
+    pub fn error_with_kind(
+        message: impl Into<String>,
+        kind: ErrorCursorKind,
+    ) -> Result<Self, AgentStateError> {
+        Ok(Self::Error(ErrorCursor::with_kind(message, kind)?))
+    }
+
     /// Returns the coarse cursor kind used by transition validation.
     #[must_use]
     pub const fn kind(&self) -> LoopCursorKind {
@@ -661,6 +676,8 @@ pub enum LoopDoneReason {
 #[serde(deny_unknown_fields)]
 pub struct ErrorCursor {
     message: String,
+    #[serde(default, skip_serializing_if = "ErrorCursorKind::is_other")]
+    kind: ErrorCursorKind,
 }
 
 impl ErrorCursor {
@@ -670,8 +687,24 @@ impl ErrorCursor {
     ///
     /// Returns [`AgentStateError::EmptyCursorError`] when `message` is empty.
     pub fn new(message: impl Into<String>) -> Result<Self, AgentStateError> {
+        Self::with_kind(message, ErrorCursorKind::Other)
+    }
+
+    /// Creates an error cursor from stable diagnostic text and kind.
+    ///
+    /// The kind is the machine-readable classification channel. The message is
+    /// preserved for humans and must not be parsed for semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentStateError::EmptyCursorError`] when `message` is empty.
+    pub fn with_kind(
+        message: impl Into<String>,
+        kind: ErrorCursorKind,
+    ) -> Result<Self, AgentStateError> {
         let cursor = Self {
             message: message.into(),
+            kind,
         };
         cursor.validate()?;
         Ok(cursor)
@@ -683,12 +716,39 @@ impl ErrorCursor {
         &self.message
     }
 
+    /// Returns the stable machine-readable error kind.
+    #[must_use]
+    pub const fn kind(&self) -> ErrorCursorKind {
+        self.kind
+    }
+
     fn validate(&self) -> Result<(), AgentStateError> {
         if self.message.is_empty() {
             Err(AgentStateError::EmptyCursorError)
         } else {
             Ok(())
         }
+    }
+}
+
+/// Stable machine-readable kind carried by an [`ErrorCursor`].
+///
+/// Human-readable messages can change without changing this value. Consumers
+/// such as the facade should classify errors from this enum rather than by
+/// matching substrings in [`ErrorCursor::message`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCursorKind {
+    /// A general runtime failure with no more specific public classification.
+    #[default]
+    Other,
+    /// The agent loop exhausted its configured per-turn step budget.
+    LoopLimitExceeded,
+}
+
+impl ErrorCursorKind {
+    const fn is_other(kind: &Self) -> bool {
+        matches!(kind, Self::Other)
     }
 }
 

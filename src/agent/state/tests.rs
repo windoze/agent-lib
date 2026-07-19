@@ -1,7 +1,7 @@
 use super::{
-    AgentRuntimeHandles, AgentState, AgentStateError, CursorRequirement, LoopCursor,
-    LoopCursorKind, LoopDoneReason, PivotSource, QueuedPivot, QueuedReconfig, ReconfigRequest,
-    ToolSetPatch, ToolWaitRequirements,
+    AgentRuntimeHandles, AgentState, AgentStateError, CursorRequirement, ErrorCursorKind,
+    LoopCursor, LoopCursorKind, LoopDoneReason, PivotSource, QueuedPivot, QueuedReconfig,
+    ReconfigRequest, ToolSetPatch, ToolWaitRequirements,
 };
 use crate::{
     agent::{
@@ -508,6 +508,30 @@ fn legacy_streaming_step_cursor_omits_requirement() {
     assert!(cursor.pending_requirement_ids().is_empty());
 
     let decoded: LoopCursor = serde_json::from_value(encoded).expect("deserialize legacy cursor");
+    assert_eq!(decoded, cursor);
+}
+
+#[test]
+fn error_cursor_kind_defaults_for_legacy_wire_and_round_trips_specific_kinds() {
+    let legacy = json!({
+        "state": "error",
+        "data": { "message": "legacy diagnostic without kind" }
+    });
+    let decoded: LoopCursor = serde_json::from_value(legacy).expect("deserialize legacy error");
+    let LoopCursor::Error(error) = decoded else {
+        panic!("expected error cursor");
+    };
+    assert_eq!(error.kind(), ErrorCursorKind::Other);
+    assert_eq!(error.message(), "legacy diagnostic without kind");
+
+    let cursor = LoopCursor::error_with_kind(
+        "step budget exhausted with renamed wording",
+        ErrorCursorKind::LoopLimitExceeded,
+    )
+    .expect("typed error cursor");
+    let encoded = serde_json::to_value(&cursor).expect("serialize typed error cursor");
+    assert_eq!(encoded["data"]["kind"], json!("loop_limit_exceeded"));
+    let decoded: LoopCursor = serde_json::from_value(encoded).expect("deserialize typed error");
     assert_eq!(decoded, cursor);
 }
 

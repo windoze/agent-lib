@@ -24,8 +24,8 @@ use thiserror::Error;
 
 pub use cursor::{
     ApprovalCursor, CancelRecoveryCursor, CancelRecoveryReason, CursorRequirement, DoneCursor,
-    ErrorCursor, LoopCursor, LoopCursorKind, LoopDoneReason, ReconfigCursor, StepCursor,
-    ToolWaitCursor, ToolWaitRequirements,
+    ErrorCursor, ErrorCursorKind, LoopCursor, LoopCursorKind, LoopDoneReason, ReconfigCursor,
+    StepCursor, ToolWaitCursor, ToolWaitRequirements,
 };
 pub use queue::{
     PivotSource, QueuedPivot, QueuedReconfig, ReconfigQueue, ReconfigRequest, ToolSetPatch,

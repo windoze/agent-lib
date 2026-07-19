@@ -19,8 +19,8 @@ use tokio::sync::oneshot;
 
 use super::{Agent, AgentBuilder, AgentSnapshot};
 use crate::agent::{
-    ApprovalResponse, Interaction, InteractionHandler, InteractionKind, InteractionResponse,
-    RequirementResult, RunContext,
+    AgentError, ApprovalResponse, ErrorCursor, ErrorCursorKind, Interaction, InteractionHandler,
+    InteractionKind, InteractionResponse, RequirementResult, RunContext,
 };
 use crate::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
 use crate::facade::approval::{Approval, ApprovalDecision, ApprovalPolicy};
@@ -540,6 +540,28 @@ async fn exceeding_the_tool_round_budget_fails_the_stream() {
         matches!(terminal, Some(FacadeError::LoopLimitExceeded)),
         "an exhausted loop budget maps to LoopLimitExceeded on the stream path, got {terminal:?}"
     );
+}
+
+#[test]
+fn error_cursor_classification_uses_kind_not_message_text() {
+    let limit = ErrorCursor::with_kind(
+        "the human-facing wording can change",
+        ErrorCursorKind::LoopLimitExceeded,
+    )
+    .expect("typed limit error cursor");
+    assert!(matches!(
+        super::classify_error(&limit),
+        FacadeError::LoopLimitExceeded
+    ));
+
+    let ordinary = ErrorCursor::new("legacy loop step limit words in an unrelated error")
+        .expect("ordinary error cursor");
+    match super::classify_error(&ordinary) {
+        FacadeError::Agent(AgentError::Other(message)) => {
+            assert_eq!(message, ordinary.message());
+        }
+        other => panic!("ordinary error must not be classified by message text: {other:?}"),
+    }
 }
 
 #[tokio::test]

@@ -46,14 +46,14 @@ use async_trait::async_trait;
 use crate::agent::requirement::AgentSpecRef;
 use crate::agent::{
     AgentError, AgentInput, AgentMachine, AgentSpec, AgentState, Blackboard, BudgetLimits,
-    Capability, CostTier, DefaultAgentMachine, EscalationError, EscalationOutcome, EscalationRules,
-    EscalationTrigger, Escalator, HandlerScope, HumanGate, ImpactScope, Interaction,
-    InteractionHandler, InteractionKind, LlmClientHandler, LlmHandler, LlmStepMode, LoopCursor,
-    LoopDoneReason, LoopPolicy, Mailbox, ModelRef, Notification, PermissionRisk, Plan,
-    RequirementIds, RequirementResult, RunContext, RunId, ScriptedVerifier, StepInput,
-    TaskDescriptor, TaskEvaluator, ToolApprovalPolicy, ToolExecutionIds, ToolFailurePolicy,
-    ToolHandler, ToolRegistry, ToolRegistryHandler, ToolSetRef, Uncertainty, Verifier,
-    WorkerProfile, WorkerProfileRef, WorkerReport, WorkerRoster, WorktreeRef, drain,
+    Capability, CostTier, DefaultAgentMachine, ErrorCursor, ErrorCursorKind, EscalationError,
+    EscalationOutcome, EscalationRules, EscalationTrigger, Escalator, HandlerScope, HumanGate,
+    ImpactScope, Interaction, InteractionHandler, InteractionKind, LlmClientHandler, LlmHandler,
+    LlmStepMode, LoopCursor, LoopDoneReason, LoopPolicy, Mailbox, ModelRef, Notification,
+    PermissionRisk, Plan, RequirementIds, RequirementResult, RunContext, RunId, ScriptedVerifier,
+    StepInput, TaskDescriptor, TaskEvaluator, ToolApprovalPolicy, ToolExecutionIds,
+    ToolFailurePolicy, ToolHandler, ToolRegistry, ToolRegistryHandler, ToolSetRef, Uncertainty,
+    Verifier, WorkerProfile, WorkerProfileRef, WorkerReport, WorkerRoster, WorktreeRef, drain,
 };
 use crate::client::LlmClient;
 use crate::conversation::{Conversation, ConversationConfig};
@@ -470,7 +470,7 @@ impl Agent {
                     events: weave_approval_events(collected.events, recorded_approvals),
                 })
             }
-            LoopCursor::Error(error) => Err(classify_error(error.message())),
+            LoopCursor::Error(error) => Err(classify_error(error)),
             other => Err(FacadeError::Agent(AgentError::Other(format!(
                 "agent run ended on a non-terminal cursor ({:?})",
                 other.kind()
@@ -1620,20 +1620,17 @@ pub(crate) fn build_loop_policy(
     )
 }
 
-/// Classifies an [`ErrorCursor`](crate::agent::ErrorCursor) message into a
-/// [`FacadeError`].
+/// Classifies an [`ErrorCursor`] into a [`FacadeError`].
 ///
 /// Since M4-4 the base machine reports an exhausted per-turn step budget as a
 /// normal terminal ([`LoopDoneReason::StepLimitReached`]), which both run paths
 /// map to [`FacadeError::LoopLimitExceeded`] structurally before reaching this
-/// function. The string match below is a legacy fallback for snapshots restored
-/// from pre-M4-4 error cursors; M5-3 replaces message-based classification with
-/// structured kinds throughout.
-fn classify_error(message: &str) -> FacadeError {
-    if message.contains("loop step limit") {
-        FacadeError::LoopLimitExceeded
-    } else {
-        FacadeError::Agent(AgentError::Other(message.to_owned()))
+/// function. Error cursors use [`ErrorCursorKind`] for any additional stable
+/// classification; the message is human-readable context only.
+fn classify_error(error: &ErrorCursor) -> FacadeError {
+    match error.kind() {
+        ErrorCursorKind::LoopLimitExceeded => FacadeError::LoopLimitExceeded,
+        ErrorCursorKind::Other => FacadeError::Agent(AgentError::Other(error.message().to_owned())),
     }
 }
 
