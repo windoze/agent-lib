@@ -906,11 +906,12 @@ pub(crate) async fn fulfill_batch(
 /// Cancellation wakes every cancel-selecting handler at about the same time —
 /// the reference LLM handler, the shipped external-session read loops (M3-1),
 /// and any host tool/interaction handler that selects on the shared token.
-/// Those handlers may need a short moment to run their cleanup tail: an
-/// external delegate's session sweep runs *after* its drive returns (M3-2), so
-/// dropping the batch future the instant cancel fires would skip that sweep
-/// and leak the session. The grace keeps polling the in-flight batch instead;
-/// a handler that ignores cancellation — a blocked ask-user tool is the
+/// Those handlers may need a short moment to run their cleanup tail. (The M3-2
+/// external session sweep no longer depends on this window: since M3-R the
+/// facade drive spawns it as a detached `'static` task, so classified teardown
+/// completes in the background even when the grace expires mid-teardown.) The
+/// grace keeps polling the in-flight batch instead of dropping it on the
+/// spot; a handler that ignores cancellation — a blocked ask-user tool is the
 /// canonical case — is detached only once the grace expires.
 pub(crate) const CANCEL_UNWIND_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -935,11 +936,12 @@ pub(crate) enum BatchOutcome {
 /// mid-batch does not detach in-flight fulfill futures on the spot: the batch
 /// keeps being polled for up to [`CANCEL_UNWIND_GRACE`] so cooperative
 /// handlers can observe the token and run their cleanup tails (plain drop was
-/// evaluated and rejected — an external delegate's session cleanup runs after
-/// its drive future returns, so detaching that future would leak the runtime;
-/// a detached background join was not an option because the batch future
-/// borrows the scope stack and so is not `'static`). When the grace expires
-/// with futures still in flight, the batch future is dropped, detaching them.
+/// evaluated and rejected — a detached background join was not an option
+/// because the batch future borrows the scope stack and so is not `'static`;
+/// the M3-2 external session sweep needed no such join: since M3-R the facade
+/// drive spawns the sweep itself as a detached `'static` task). When the
+/// grace expires with futures still in flight, the batch future is dropped,
+/// detaching them.
 ///
 /// The detach semantics place a contract on handlers: a fulfill future may be
 /// dropped at any await point once the run is cancelled and the grace has

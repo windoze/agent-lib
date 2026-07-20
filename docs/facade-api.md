@@ -996,7 +996,10 @@ pub async fn default_external_session_handler_with_capabilities(
   `ExternalSessionHandler::cleanup_agent`(registry-backed handler 转发给 registry 的 `cleanup_agent`)——
   adapter `shutdown()`(best-effort `session/cancel` + transport close + 进程组终止)与 ephemeral worktree
   按 disposition 的处置全部自动完成,**宿主不做任何额外动作也不泄漏子进程**;sweep disposition 同时
-  best-effort 记入 run trace。正常结束(committed)的 session 保持 live 供复用,worktree 干净拆除/脏保留
+  best-effort 记入 run trace。**自 M3-R 起 sweep 以 detached 后台任务运行**:慢死 session 的分类化
+  teardown(`shutdown_grace` 默认 ~30s,远超 outer run cancel 的 2s `CANCEL_UNWIND_GRACE`)在 drive
+  返回后继续跑完,不被外层 run 的 cancel unwind grace 截断;trace 审计在 sweep 完成时落入共享 run
+  trace。正常结束(committed)的 session 保持 live 供复用,worktree 干净拆除/脏保留
   策略不变;宿主用完一个 completed session(如 Attachable)时仍经 `.registry()` 显式关闭。drop facade
   `Agent` 时 registry 随之 drop:子进程有 `kill_on_drop` 兜底(直接子进程会被回收),但不跑
   `session/cancel`/disposition 分类/进程组终止/worktree 清扫——需要分类化 teardown 的宿主必须在 drop 前

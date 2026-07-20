@@ -1748,7 +1748,7 @@ impl SubagentSpawner for FacadeExternalSpawner {
 /// A drive that ends without a committed session — cancel-abandoned
 /// ([`cleanup_required`](ExternalDriveOutcome::cleanup_required)) or failed
 /// before reaching its terminal cursor — may have left a live runtime in the
-/// handler's registry, so this helper force-closes it before returning:
+/// handler's registry, so this helper force-closes it:
 /// [`ExternalSessionHandler::cleanup_agent`] is called with the drive's
 /// freshly minted agent id, which scopes the sweep to exactly this drive's
 /// sessions. The shipped registry-backed handler forwards that to
@@ -1759,6 +1759,13 @@ impl SubagentSpawner for FacadeExternalSpawner {
 /// run trace (best effort). A host that does nothing extra therefore leaks no
 /// subprocess. A *committed* drive keeps its live session untouched — the
 /// clean-teardown / dirty-retention worktree policy is unchanged.
+///
+/// The sweep is spawned as a detached background task before this helper
+/// returns (M3-R): a slow-to-die session can take far longer to close than the
+/// outer run's cancel-unwind grace, and an inline await could be dropped
+/// mid-sweep with it. Classified teardown therefore continues in the
+/// background beyond the outer run's cancellation; its trace audit lands in
+/// the shared run trace whenever it finishes.
 ///
 /// # Errors
 ///
@@ -1832,12 +1839,35 @@ pub(crate) async fn drive_external(
     // committed drive is left untouched (worktree teardown/retention policy
     // unchanged). Each swept session's disposition is recorded into the run
     // trace, best effort, mirroring the adapter mid-session close audit.
+    //
+    // M3-R (F1): the sweep is spawned as a detached `'static` task rather than
+    // awaited inline. This drive future runs inside the outer run's batch under
+    // `fulfill_batch_cancellable`'s `CANCEL_UNWIND_GRACE` (2s), while a
+    // slow-to-die session can take far longer to close (the adapter's
+    // `shutdown_grace` defaults to ~30s: a child may linger after stdin EOF).
+    // An inline await could be dropped mid-sweep when the grace expires —
+    // skipping the process-group SIGTERM→SIGKILL (leaking grandchildren), the
+    // ephemeral worktree sweep, and the trace audit. The handler is an `Arc`,
+    // the ids are owned, and the trace handle is shared, so the spawned sweep
+    // borrows nothing: the drive settles promptly and classified teardown
+    // completes in the background regardless of the outer run's grace.
+    //
+    // M3-R (F2): the trace node id carries the drive's `agent_id` as well as
+    // the outer `run_id`, so two uncommitted external drives swept under one
+    // outer run never mint colliding node ids (the second sweep's audit would
+    // be silently swallowed by the trace's duplicate-id rejection).
     if !captured.completed {
-        let dispositions = session_handler.cleanup_agent(agent_id).await;
-        for (seq, disposition) in dispositions.into_iter().enumerate() {
-            let id = TraceNodeId::new(format!("external-cleanup-sweep/{}/{seq}", ctx.run_id()));
-            let _ = ctx.trace().record_external_shutdown(id, disposition);
-        }
+        let sweep_handler = Arc::clone(session_handler);
+        let sweep_trace = ctx.trace().clone();
+        let run_id = ctx.run_id();
+        let _sweep = tokio::spawn(async move {
+            let dispositions = sweep_handler.cleanup_agent(agent_id).await;
+            for (seq, disposition) in dispositions.into_iter().enumerate() {
+                let id =
+                    TraceNodeId::new(format!("external-cleanup-sweep/{run_id}/{agent_id}/{seq}"));
+                let _ = sweep_trace.record_external_shutdown(id, disposition);
+            }
+        });
     }
 
     match result {
@@ -2671,6 +2701,54 @@ mod tests {
         }
     }
 
+    /// Polls `condition` until it holds or `bound` elapses, returning whether
+    /// it held. The M3-R sweep runs as a detached background task, so tests
+    /// observe its effects through this instead of racing the spawned task.
+    #[cfg(feature = "external-acp")]
+    async fn observed_within(
+        bound: std::time::Duration,
+        mut condition: impl FnMut() -> bool,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        while !condition() {
+            if start.elapsed() >= bound {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        true
+    }
+
+    /// A session handler whose `cleanup_agent` waits `teardown` before
+    /// forwarding to the inner registry handler, emulating a slow-to-die
+    /// session — a child that lingers after stdin EOF while the adapter's
+    /// `shutdown_grace` waits on its exit.
+    #[cfg(feature = "external-acp")]
+    struct SlowToDieSessionHandler {
+        inner: std::sync::Arc<crate::agent::external::RegistryExternalSessionHandler>,
+        teardown: std::time::Duration,
+    }
+
+    #[cfg(feature = "external-acp")]
+    #[async_trait::async_trait]
+    impl crate::agent::ExternalSessionHandler for SlowToDieSessionHandler {
+        async fn fulfill(
+            &self,
+            request: &crate::agent::external::ExternalSessionRequest,
+            ctx: &crate::agent::RunContext,
+        ) -> crate::agent::RequirementResult {
+            self.inner.fulfill(request, ctx).await
+        }
+
+        async fn cleanup_agent(
+            &self,
+            agent_id: crate::agent::AgentId,
+        ) -> Vec<crate::agent::external::ExternalSessionShutdown> {
+            tokio::time::sleep(self.teardown).await;
+            self.inner.cleanup_agent(agent_id).await
+        }
+    }
+
     /// M3-2: a cancelled facade drive force-closes the abandoned session
     /// through the handler's registry with no host involvement — the runtime
     /// observes `session/cancel`, the live handle is deregistered (no dangling
@@ -2747,18 +2825,26 @@ mod tests {
         );
         assert!(!outcome.completed);
 
-        // The abandoned session was force-closed with no host involvement: the
-        // adapter's shutdown sent session/cancel and closed the transport, and
-        // the registry deregistered the live handle.
+        // M3-R (F1): the sweep runs as a detached background task, so poll for
+        // its effects rather than assuming they landed before the drive
+        // returned (this fake closes fast, so they land almost immediately):
+        // the adapter's shutdown sent session/cancel and closed the
+        // transport, the registry deregistered the live handle, the ephemeral
+        // worktree was swept, and the disposition hit the run trace.
+        let swept =
+            observed_within(Duration::from_secs(5), || {
+                launcher.written().contains(r#""method":"session/cancel""#)
+                    && registry.live_len() == 0
+                    && worktrees.cleanups().len() == 1
+                    && ctx.trace().records().iter().any(|record| {
+                        matches!(record.kind(), TraceNodeKind::ExternalShutdown { .. })
+                    })
+            })
+            .await;
         assert!(
-            launcher.written().contains(r#""method":"session/cancel""#),
-            "the sweep reached the live runtime: {}",
+            swept,
+            "the detached sweep force-closed the abandoned session: {}",
             launcher.written()
-        );
-        assert_eq!(
-            registry.live_len(),
-            0,
-            "no dangling handle after the cancelled drive"
         );
 
         // The ephemeral worktree was swept exactly once with the session's
@@ -2768,13 +2854,132 @@ mod tests {
         assert_eq!(cleanups[0].1, ExternalSessionShutdown::Graceful);
 
         // The sweep's disposition was audited into the run trace.
-        let shutdown_nodes = ctx
+        let shutdown_nodes: Vec<_> = ctx
             .trace()
             .records()
             .into_iter()
             .filter(|record| matches!(record.kind(), TraceNodeKind::ExternalShutdown { .. }))
-            .count();
-        assert_eq!(shutdown_nodes, 1, "the sweep is recorded in the trace");
+            .collect();
+        assert_eq!(
+            shutdown_nodes.len(),
+            1,
+            "the sweep is recorded in the trace"
+        );
+
+        // M3-R (F2): the audit node id carries the drive's agent id after the
+        // run id, so two uncommitted drives swept under one outer run mint
+        // distinct node ids instead of silently swallowing the second audit.
+        let node_id = shutdown_nodes[0].id().to_string();
+        assert!(
+            node_id.starts_with(&format!("external-cleanup-sweep/{}/", ctx.run_id()))
+                && node_id.matches('/').count() == 3,
+            "the sweep node id is scoped by run and agent: {node_id}"
+        );
+    }
+
+    /// M3-R (F1): with a slow-to-die session (~3s teardown, far beyond the
+    /// outer run's 2s `CANCEL_UNWIND_GRACE`), a cancelled drive still settles
+    /// promptly — the sweep is spawned as a detached task — and classified
+    /// teardown completes in the background: `session/cancel` reaches the live
+    /// runtime, the handle is deregistered, the worktree is swept, and the
+    /// disposition is audited into the shared run trace.
+    #[cfg(feature = "external-acp")]
+    #[tokio::test]
+    async fn drive_external_cancel_detached_sweep_outlives_unwind_grace() {
+        use super::drive_external;
+        use crate::agent::external::{
+            AcpAdapter, AcpLauncher, ExternalRuntimeAdapter, ExternalSessionRegistry,
+            RegistryExternalSessionHandler, WorktreeManager,
+        };
+        use crate::agent::{BudgetLimits, RunContext, TraceNodeKind};
+        use crate::facade::collab::CollabBridge;
+        use crate::facade::ids::FacadeIds;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let launcher = Arc::new(SilentTurnLauncher::new(&[
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}"#,
+        ]));
+        let adapter = AcpAdapter::with_launcher(
+            crate::agent::external::AcpConfig::opencode_acp(),
+            Arc::clone(&launcher) as Arc<dyn AcpLauncher>,
+        );
+        let worktrees = Arc::new(RecordingWorktreeManager::new());
+        let registry = Arc::new(ExternalSessionRegistry::with_worktree_manager(
+            Arc::new(adapter) as Arc<dyn ExternalRuntimeAdapter>,
+            Arc::clone(&worktrees) as Arc<dyn WorktreeManager>,
+        ));
+        // Teardown takes ~3s: beyond the outer run's 2s CANCEL_UNWIND_GRACE,
+        // so an inline sweep would be dropped mid-flight by a cancelled outer
+        // run (the F1 finding).
+        let session_handler = Arc::new(SlowToDieSessionHandler {
+            inner: Arc::new(RegistryExternalSessionHandler::new(Arc::clone(&registry))),
+            teardown: Duration::from_secs(3),
+        });
+
+        let agent = ManagedExternalAgent::opencode_acp()
+            .session_handler(session_handler)
+            .build()
+            .expect("managed ACP external agent builds");
+
+        let ids = FacadeIds::seeded(15);
+        let ctx = RunContext::new_root(
+            ids.run_id(),
+            BudgetLimits::unbounded(),
+            ids.trace_root("external-cancel-detached-sweep"),
+        );
+        let token = ctx.cancellation().clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token.cancel();
+        });
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_external(
+                "coder",
+                &agent,
+                &ids,
+                "refactor".to_owned(),
+                &CollabBridge::default(),
+                None,
+                &ctx,
+            ),
+        )
+        .await
+        .expect("a cancelled drive settles in seconds, not after the read timeout")
+        .expect("a cancelled drive still returns its captured outcome");
+        canceller.await.expect("canceller task");
+
+        // The drive returned after spawning the sweep, not after awaiting the
+        // ~3s teardown: well inside the 2s unwind grace an outer run allows.
+        let settled = started.elapsed();
+        assert!(
+            settled < Duration::from_secs(2),
+            "the drive settles promptly, detaching the slow sweep: {settled:?}"
+        );
+        assert!(outcome.cleanup_required);
+        assert!(!outcome.completed);
+
+        // The detached sweep still runs classified teardown to completion in
+        // the background, beyond any outer-run unwind grace.
+        let swept =
+            observed_within(Duration::from_secs(10), || {
+                launcher.written().contains(r#""method":"session/cancel""#)
+                    && registry.live_len() == 0
+                    && worktrees.cleanups().len() == 1
+                    && ctx.trace().records().iter().any(|record| {
+                        matches!(record.kind(), TraceNodeKind::ExternalShutdown { .. })
+                    })
+            })
+            .await;
+        assert!(
+            swept,
+            "the detached sweep completed slow classified teardown: {}",
+            launcher.written()
+        );
     }
 
     #[cfg(feature = "external-acp")]
@@ -2922,7 +3127,10 @@ mod tests {
             token.cancel();
         };
 
-        let outcome = tokio::time::timeout(Duration::from_secs(2), async {
+        // M3-R (F3): 5s, comfortably clear of the drive's own 2s
+        // `CANCEL_UNWIND_GRACE`, so this test asserts "does not hang" rather
+        // than racing the exact grace boundary.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
             let (outcome, ()) = tokio::join!(drive, canceller);
             outcome
         })

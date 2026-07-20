@@ -771,6 +771,104 @@ async fn snapshot_captures_queued_unapplied_reconfigs_for_restore() {
     assert_eq!(restored_client.requests()[0].model, "test-model-v2");
 }
 
+/// M3-R (F4b): a queued (never applied) tool-set reconfig survives snapshot +
+/// restore and applies at the restored agent's first turn boundary — the
+/// swapped registry both advertises and executes the new tool.
+#[tokio::test]
+async fn restore_applies_queued_tool_set_reconfig_at_first_turn_boundary() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let weather_calls = Arc::new(AtomicUsize::new(0));
+    let calendar_calls = Arc::new(AtomicUsize::new(0));
+    // Both tools sit in the facade registry so the calendar-only replacement
+    // passes admission; the current set starts as the weather-only subset…
+    let mut agent = agent_with_tools(
+        client,
+        vec![
+            counting_weather_tool(weather_calls.clone()),
+            counting_calendar_tool(calendar_calls.clone()),
+        ],
+        Approval::auto_allow(),
+    );
+    let weather_only = ToolSetRef::new(
+        agent.state().current_tool_set().id(),
+        vec![weather_tool_decl()],
+    );
+    agent
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: weather_only,
+        })
+        .expect("weather-only reconfig is accepted");
+    agent
+        .run("narrow to weather.")
+        .await
+        .expect("the narrowing reconfig applies");
+    assert_eq!(
+        tool_names(agent.state().current_tool_set().tools()),
+        vec!["get_weather"]
+    );
+
+    // …then queue (but never apply) a swap to the calendar-only set.
+    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), vec![calendar_tool_decl()]);
+    agent
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement.clone(),
+        })
+        .expect("replace-tool-set reconfig is accepted");
+    assert_eq!(agent.state().queued_reconfigs().len(), 1);
+    assert_eq!(
+        tool_names(agent.state().current_tool_set().tools()),
+        vec!["get_weather"],
+        "the queued reconfig has not applied yet"
+    );
+
+    // Snapshot BEFORE any run, round-tripping through JSON since persistence
+    // is the snapshot's purpose.
+    let snapshot = agent
+        .snapshot()
+        .expect("snapshot captures the queued reconfig");
+    let json = serde_json::to_string(&snapshot).expect("snapshot serializes");
+    let snapshot: AgentSnapshot = serde_json::from_str(&json).expect("snapshot deserializes");
+
+    // Restore with a surface covering both the current set (`get_weather`)
+    // and the queued set (`read_calendar`).
+    let restored_client = ScriptedClient::new(vec![
+        tool_use_response_for(
+            "read_calendar",
+            "call-calendar",
+            json!({ "day": "Tuesday" }),
+        ),
+        text_response("restored calendar checked"),
+    ]);
+    let mut restored = Agent::restore()
+        .snapshot(snapshot)
+        .client(restored_client.clone())
+        .tool(counting_weather_tool(weather_calls.clone()))
+        .tool(counting_calendar_tool(calendar_calls.clone()))
+        .build()
+        .expect("restore with a covering surface");
+    assert_eq!(restored.state().queued_reconfigs().len(), 1);
+    assert_eq!(
+        tool_names(restored.state().current_tool_set().tools()),
+        vec!["get_weather"],
+        "the restored agent still sits on the pre-reconfig tool set"
+    );
+
+    let output = restored
+        .run_full("Check the calendar.")
+        .await
+        .expect("the queued reconfig applies at the first turn boundary");
+
+    assert_eq!(output.reply.text(), "restored calendar checked");
+    assert_eq!(restored.state().current_tool_set(), &replacement);
+    assert!(restored.state().queued_reconfigs().is_empty());
+    // The swapped registry advertised the new tool on the very first request…
+    let requests = restored_client.requests();
+    assert_eq!(tool_names(&requests[0].tools), vec!["read_calendar"]);
+    // …and executed it; the retired weather tool never ran.
+    assert_eq!(calendar_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(weather_calls.load(Ordering::SeqCst), 0);
+}
+
 #[test]
 fn restore_rejects_a_surface_missing_current_tool_set_tools() {
     let client = ScriptedClient::new(vec![text_response("unused")]);
@@ -1077,6 +1175,103 @@ async fn reconfigure_patch_tool_set_removing_a_delegate_yields_unknown_tool() {
             .iter()
             .all(|event| !event.starts_with("Delegation")),
         "no delegation events are emitted for the removed tool: {signature:?}"
+    );
+}
+
+/// M3-R (F4a): the SingleTool delegation-mode mirror of the PerSubagent M2-3
+/// tests above — removing the unified delegate tool from the active tool set
+/// gates delegation routing exactly like removing an `ask_*` tool does.
+#[tokio::test]
+async fn reconfigure_replace_tool_set_removing_the_unified_delegate_yields_unknown_tool() {
+    let client = ScriptedClient::new(vec![
+        tool_use_response_for(
+            "delegate",
+            "del-1",
+            json!({ "agent": "researcher", "task": "find prior art" }),
+        ),
+        text_response("delegate tool unavailable"),
+    ]);
+    let reviewer = Agent::worker()
+        .description("Strict code reviewer.")
+        .system("You review code.")
+        .build()
+        .expect("worker builds");
+    let researcher = Agent::worker()
+        .description("Diligent researcher.")
+        .system("You research prior art.")
+        .build()
+        .expect("worker builds");
+    let weather_calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = AgentBuilder::default()
+        .client(client.clone())
+        .model("supervisor-model")
+        .system("You are the supervisor.")
+        .tool(counting_weather_tool(weather_calls.clone()))
+        .approval(Approval::auto_allow())
+        .subagent("reviewer", reviewer)
+        .subagent("researcher", researcher)
+        .delegation(Delegation::single_tool("delegate"))
+        .build()
+        .expect("agent builds");
+    // The initial tool set advertises exactly one unified delegation tool.
+    assert!(
+        agent
+            .state()
+            .current_tool_set()
+            .tools()
+            .iter()
+            .any(|declaration| declaration.name == "delegate")
+    );
+
+    let retained: Vec<_> = agent
+        .state()
+        .current_tool_set()
+        .tools()
+        .iter()
+        .filter(|declaration| declaration.name != "delegate")
+        .cloned()
+        .collect();
+    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), retained);
+
+    agent
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement.clone(),
+        })
+        .expect("replace-tool-set reconfig is accepted");
+
+    let output = agent
+        .run_full("Delegate the research.")
+        .await
+        .expect("run succeeds");
+
+    assert_eq!(output.reply.text(), "delegate tool unavailable");
+    assert_eq!(agent.state().current_tool_set(), &replacement);
+    // The removed unified tool is filtered out of the advertised set.
+    assert_eq!(tool_names(&client.requests()[0].tools), vec!["get_weather"]);
+    // The model's stale call gets the same UnknownTool result any other
+    // removed tool gets, folded back into the next request.
+    assert!(
+        messages_contain_tool_error(&client.requests()[1].messages, "unknown tool `delegate`"),
+        "the removed unified delegate tool yields an UnknownTool result: {:?}",
+        client.requests()[1].messages
+    );
+    // No delegation is recorded or driven for the removed tool.
+    assert!(
+        output.delegations.is_empty(),
+        "the removed unified delegate tool drives no delegation: {:?}",
+        output.delegations
+    );
+    let signature = lifecycle_signature(&output.events);
+    assert!(
+        signature
+            .iter()
+            .all(|event| !event.starts_with("Delegation")),
+        "no delegation events are emitted for the removed tool: {signature:?}"
+    );
+    assert_eq!(
+        weather_calls.load(Ordering::SeqCst),
+        0,
+        "the retained weather tool was never called"
     );
 }
 

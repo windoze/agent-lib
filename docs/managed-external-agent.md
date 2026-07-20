@@ -880,7 +880,10 @@ Claude/Codex/OpenCode adapter（M6-M8）只需在 adapter 层填 parser + proces
   （`drive_external`）在 drive 未 committed 收尾（cancel/abandon 置 `cleanup_required`，或抵达终态前失败）时
   自动调用该钩子——shutdown（best-effort `session/cancel` + transport close + 进程组终止）与 ephemeral
   worktree 按 disposition 的处置随之完成，sweep disposition best-effort 记入 run trace，**宿主不做任何
-  额外动作也不泄漏子进程**；正常 committed 的 session 保持 live 供复用（worktree 干净拆除/脏保留策略不
+  额外动作也不泄漏子进程**；**自 M3-R 起该 sweep 以 detached 后台任务运行**——慢死 session 的分类化
+  teardown（`shutdown_grace` 默认 ~30s，远超 outer run cancel 的 2s `CANCEL_UNWIND_GRACE`）在 drive
+  返回后继续跑完，不被外层 run 的 cancel unwind grace 截断，trace 审计在 sweep 完成时落入共享 run
+  trace；正常 committed 的 session 保持 live 供复用（worktree 干净拆除/脏保留策略不
   变），用完仍由宿主经 `.registry()` 显式关闭。facade `Agent` drop 时 registry 随之 drop：直接子进程有
   `kill_on_drop` 兜底回收，但不跑 `session/cancel`/disposition 分类/进程组终止/worktree 清扫，孙进程与
   worktree 可能残留——需要分类化 teardown 的宿主必须在 drop 前显式 sweep（见 `Agent` rustdoc）。持有真实
