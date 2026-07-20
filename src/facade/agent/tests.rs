@@ -1024,8 +1024,8 @@ mod facade_surface {
 }
 
 /// Builds a supervisor with two scripted model-routed delegates, `reviewer`
-/// and `researcher`, so a tool-set reconfig can remove one delegation tool
-/// while the other is retained.
+/// and `researcher`, exercising the facade's delegation-declaration merge on
+/// tool-set reconfigs.
 fn delegating_agent(client: Arc<dyn LlmClient>) -> Agent {
     let reviewer = Agent::worker()
         .description("Strict code reviewer.")
@@ -1048,97 +1048,123 @@ fn delegating_agent(client: Arc<dyn LlmClient>) -> Agent {
         .expect("agent builds")
 }
 
+/// B1 hardening: `ReplaceToolSet` covers only the non-delegation surface. The
+/// facade re-derives the `ask_<name>` declarations from the registered
+/// delegates and merges them into the queued set, so a caller replacement
+/// naming only plugin tools keeps every delegate advertised and routable
+/// (previously the verbatim replacement silently dropped them and the model's
+/// `ask_*` calls degraded to `UnknownTool`).
 #[tokio::test]
-async fn reconfigure_replace_tool_set_removing_a_delegate_yields_unknown_tool() {
+async fn reconfigure_replace_tool_set_preserves_delegation_tools() {
     let client = ScriptedClient::new(vec![
         tool_use_response_for(
             "ask_reviewer",
             "del-1",
             json!({ "task": "review the diff" }),
         ),
-        tool_use_response_for(
-            "ask_researcher",
-            "del-2",
-            json!({ "task": "find prior art" }),
-        ),
-        text_response("found three papers"),
-        text_response("reviewer unavailable; researcher reported"),
+        text_response("the diff looks good"),
+        text_response("reviewer reported"),
     ]);
-    let mut agent = delegating_agent(client.clone());
-    let retained: Vec<_> = agent
-        .state()
-        .current_tool_set()
-        .tools()
-        .iter()
-        .filter(|declaration| declaration.name != "ask_reviewer")
-        .cloned()
-        .collect();
-    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), retained);
+    let reviewer = Agent::worker()
+        .description("Strict code reviewer.")
+        .system("You review code.")
+        .build()
+        .expect("worker builds");
+    let weather_calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = AgentBuilder::default()
+        .client(client.clone())
+        .model("supervisor-model")
+        .system("You are the supervisor.")
+        .tool(counting_weather_tool(weather_calls.clone()))
+        .approval(Approval::auto_allow())
+        .subagent("reviewer", reviewer)
+        .build()
+        .expect("agent builds");
+    // The caller's replacement names only its own (plugin) tools — it cannot
+    // mint the facade-internal `ask_reviewer` declaration.
+    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), vec![weather_tool_decl()]);
 
     agent
         .reconfigure(ReconfigRequest::ReplaceToolSet {
-            tool_set: replacement.clone(),
+            tool_set: replacement,
         })
         .expect("replace-tool-set reconfig is accepted");
 
     let output = agent
-        .run_full("Review the diff, then research prior art.")
+        .run_full("Review the diff.")
         .await
         .expect("run succeeds");
 
+    assert_eq!(output.reply.text(), "reviewer reported");
+    // The applied set is the caller's tools plus the re-synthesized delegation
+    // declarations, in that order.
     assert_eq!(
-        output.reply.text(),
-        "reviewer unavailable; researcher reported"
+        tool_names(agent.state().current_tool_set().tools()),
+        vec!["get_weather", "ask_reviewer"]
     );
-    assert_eq!(agent.state().current_tool_set(), &replacement);
-    // The removed delegation tool is filtered out of the advertised set.
+    // `ask_reviewer` stays advertised on the first post-reconfig request…
     assert_eq!(
         tool_names(&client.requests()[0].tools),
-        vec!["ask_researcher"]
+        vec!["get_weather", "ask_reviewer"]
     );
-    // The model's stale call gets the same UnknownTool result any other
-    // removed tool gets, folded back into the next request.
-    assert!(
-        messages_contain_tool_error(
-            &client.requests()[1].messages,
-            "unknown tool `ask_reviewer`"
-        ),
-        "the removed delegation tool yields an UnknownTool result: {:?}",
-        client.requests()[1].messages
-    );
-    // No delegation is recorded or driven for the removed tool, while the
-    // retained delegation tool still drives to completion.
+    // …and the delegation still routes and drives to completion.
+    assert_eq!(output.delegations.len(), 1);
     let signature = lifecycle_signature(&output.events);
-    assert!(
-        signature
-            .iter()
-            .all(|event| !event.starts_with("DelegationStarted{delegate=reviewer")),
-        "the removed delegation tool emits no DelegationStarted: {signature:?}"
-    );
     assert_eq!(
         signature
             .iter()
-            .filter(|event| event.contains("delegate=researcher"))
+            .filter(|event| event.contains("delegate=reviewer"))
             .collect::<Vec<_>>(),
         vec![
-            "DelegationStarted{delegate=researcher,status=Completed}",
-            "DelegationFinished{delegate=researcher,status=Completed}",
+            "DelegationStarted{delegate=reviewer,status=Completed}",
+            "DelegationFinished{delegate=reviewer,status=Completed}",
         ],
-        "the retained delegation tool still drives: {signature:?}"
+        "the merged delegation tool still drives: {signature:?}"
     );
+    assert_eq!(weather_calls.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
-async fn reconfigure_patch_tool_set_removing_a_delegate_yields_unknown_tool() {
-    let client = ScriptedClient::new(vec![
-        tool_use_response_for(
-            "ask_reviewer",
-            "del-1",
-            json!({ "task": "review the diff" }),
-        ),
-        text_response("reviewer is gone"),
-    ]);
-    let mut agent = delegating_agent(client.clone());
+/// B1 hardening: a caller-supplied replacement set must not declare a name
+/// that collides with a synthesized delegation declaration — delegation tools
+/// are derived state, and admitting a caller-minted twin would shadow the
+/// facade's own declaration.
+#[test]
+fn reconfigure_replace_tool_set_conflicting_delegation_declaration_is_rejected() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let mut agent = delegating_agent(client);
+    let conflicting = ToolSetRef::new(
+        reconfig_tool_set_id(1),
+        vec![
+            weather_tool_decl(),
+            crate::model::tool::Tool {
+                name: "ask_reviewer".to_owned(),
+                description: "caller-minted twin of the delegation tool".to_owned(),
+                input_schema: json!({ "type": "object" }),
+            },
+        ],
+    );
+
+    let error = agent
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: conflicting,
+        })
+        .expect_err("a replacement colliding with a delegation tool is rejected");
+
+    assert!(
+        matches!(error, FacadeError::Config(ref message) if message.contains("ask_reviewer") && message.contains("synthesized")),
+        "unexpected error: {error:?}"
+    );
+    assert!(agent.state().queued_reconfigs().is_empty());
+}
+
+/// B1 hardening: a patch cannot remove a delegation tool. Re-synthesizing over
+/// the removal would silently ignore the caller's edit, so the facade rejects
+/// it explicitly instead — delegation declarations are derived from the
+/// registered delegates, never patch-managed.
+#[test]
+fn reconfigure_patch_tool_set_removing_a_delegation_tool_is_rejected() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let mut agent = delegating_agent(client);
     let patch = ToolSetPatch::new(
         agent.state().current_tool_set().id(),
         reconfig_tool_set_id(2),
@@ -1147,49 +1173,65 @@ async fn reconfigure_patch_tool_set_removing_a_delegate_yields_unknown_tool() {
     )
     .expect("valid tool-set patch");
 
-    agent
+    let error = agent
         .reconfigure(ReconfigRequest::PatchToolSet { patch })
-        .expect("patch-tool-set reconfig is accepted");
+        .expect_err("removing a delegation tool through a patch is rejected");
 
-    let output = agent
-        .run_full("Review the diff.")
-        .await
-        .expect("run succeeds");
-
-    assert_eq!(output.reply.text(), "reviewer is gone");
+    assert!(
+        matches!(error, FacadeError::Config(ref message) if message.contains("ask_reviewer") && message.contains("derived")),
+        "unexpected error: {error:?}"
+    );
+    assert!(agent.state().queued_reconfigs().is_empty());
+    // The rejected admission changed nothing: both delegation tools remain.
     assert_eq!(
         tool_names(agent.state().current_tool_set().tools()),
-        vec!["ask_researcher"]
-    );
-    assert!(
-        messages_contain_tool_error(
-            &client.requests()[1].messages,
-            "unknown tool `ask_reviewer`"
-        ),
-        "the patch-removed delegation tool yields an UnknownTool result: {:?}",
-        client.requests()[1].messages
-    );
-    let signature = lifecycle_signature(&output.events);
-    assert!(
-        signature
-            .iter()
-            .all(|event| !event.starts_with("Delegation")),
-        "no delegation events are emitted for the removed tool: {signature:?}"
+        vec!["ask_reviewer", "ask_researcher"]
     );
 }
 
-/// M3-R (F4a): the SingleTool delegation-mode mirror of the PerSubagent M2-3
-/// tests above — removing the unified delegate tool from the active tool set
-/// gates delegation routing exactly like removing an `ask_*` tool does.
+/// B1 hardening: a patch cannot shadow a delegation tool through
+/// add-or-replace either — the synthesized declaration is the single authority
+/// for that name.
+#[test]
+fn reconfigure_patch_tool_set_shadowing_a_delegation_tool_is_rejected() {
+    let client = ScriptedClient::new(vec![text_response("unused")]);
+    let mut agent = delegating_agent(client);
+    let patch = ToolSetPatch::new(
+        agent.state().current_tool_set().id(),
+        reconfig_tool_set_id(2),
+        Vec::new(),
+        vec![crate::model::tool::Tool {
+            name: "ask_reviewer".to_owned(),
+            description: "caller-minted twin of the delegation tool".to_owned(),
+            input_schema: json!({ "type": "object" }),
+        }],
+    )
+    .expect("valid tool-set patch");
+
+    let error = agent
+        .reconfigure(ReconfigRequest::PatchToolSet { patch })
+        .expect_err("shadowing a delegation tool through a patch is rejected");
+
+    assert!(
+        matches!(error, FacadeError::Config(ref message) if message.contains("ask_reviewer") && message.contains("synthesized")),
+        "unexpected error: {error:?}"
+    );
+    assert!(agent.state().queued_reconfigs().is_empty());
+}
+
+/// B1 hardening, SingleTool mirror: the unified delegation tool is likewise
+/// re-derived from the registered delegates and merged, so a replacement
+/// naming only the typed tools keeps it advertised and routable.
 #[tokio::test]
-async fn reconfigure_replace_tool_set_removing_the_unified_delegate_yields_unknown_tool() {
+async fn reconfigure_replace_tool_set_preserves_the_unified_delegation_tool() {
     let client = ScriptedClient::new(vec![
         tool_use_response_for(
             "delegate",
             "del-1",
             json!({ "agent": "researcher", "task": "find prior art" }),
         ),
-        text_response("delegate tool unavailable"),
+        text_response("found three papers"),
+        text_response("researcher reported"),
     ]);
     let reviewer = Agent::worker()
         .description("Strict code reviewer.")
@@ -1213,29 +1255,11 @@ async fn reconfigure_replace_tool_set_removing_the_unified_delegate_yields_unkno
         .delegation(Delegation::single_tool("delegate"))
         .build()
         .expect("agent builds");
-    // The initial tool set advertises exactly one unified delegation tool.
-    assert!(
-        agent
-            .state()
-            .current_tool_set()
-            .tools()
-            .iter()
-            .any(|declaration| declaration.name == "delegate")
-    );
-
-    let retained: Vec<_> = agent
-        .state()
-        .current_tool_set()
-        .tools()
-        .iter()
-        .filter(|declaration| declaration.name != "delegate")
-        .cloned()
-        .collect();
-    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), retained);
+    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), vec![weather_tool_decl()]);
 
     agent
         .reconfigure(ReconfigRequest::ReplaceToolSet {
-            tool_set: replacement.clone(),
+            tool_set: replacement,
         })
         .expect("replace-tool-set reconfig is accepted");
 
@@ -1244,35 +1268,108 @@ async fn reconfigure_replace_tool_set_removing_the_unified_delegate_yields_unkno
         .await
         .expect("run succeeds");
 
-    assert_eq!(output.reply.text(), "delegate tool unavailable");
-    assert_eq!(agent.state().current_tool_set(), &replacement);
-    // The removed unified tool is filtered out of the advertised set.
-    assert_eq!(tool_names(&client.requests()[0].tools), vec!["get_weather"]);
-    // The model's stale call gets the same UnknownTool result any other
-    // removed tool gets, folded back into the next request.
-    assert!(
-        messages_contain_tool_error(&client.requests()[1].messages, "unknown tool `delegate`"),
-        "the removed unified delegate tool yields an UnknownTool result: {:?}",
-        client.requests()[1].messages
+    assert_eq!(output.reply.text(), "researcher reported");
+    // The unified delegation tool is re-synthesized into the applied set.
+    assert_eq!(
+        tool_names(agent.state().current_tool_set().tools()),
+        vec!["get_weather", "delegate"]
     );
-    // No delegation is recorded or driven for the removed tool.
-    assert!(
-        output.delegations.is_empty(),
-        "the removed unified delegate tool drives no delegation: {:?}",
-        output.delegations
+    assert_eq!(
+        tool_names(&client.requests()[0].tools),
+        vec!["get_weather", "delegate"]
     );
+    // The unified tool still routes to the named delegate and drives it.
+    assert_eq!(output.delegations.len(), 1);
     let signature = lifecycle_signature(&output.events);
     assert!(
         signature
             .iter()
-            .all(|event| !event.starts_with("Delegation")),
-        "no delegation events are emitted for the removed tool: {signature:?}"
+            .any(|event| event.starts_with("DelegationStarted{delegate=researcher")),
+        "the unified delegation tool still drives: {signature:?}"
     );
+    assert_eq!(weather_calls.load(Ordering::SeqCst), 0);
+}
+
+/// B1 hardening, snapshot roundtrip: a reconfig-merged tool set (caller tools
+/// + re-synthesized delegation declarations) serializes and restores
+/// consistently — the restored agent advertises the same surface and the
+/// delegation still routes.
+#[tokio::test]
+async fn snapshot_restore_preserves_reconfig_merged_delegation_tools() {
+    let client = ScriptedClient::new(vec![text_response("reconfigured")]);
+    let reviewer = Agent::worker()
+        .description("Strict code reviewer.")
+        .system("You review code.")
+        .build()
+        .expect("worker builds");
+    let weather_calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = AgentBuilder::default()
+        .client(client)
+        .model("supervisor-model")
+        .system("You are the supervisor.")
+        .tool(counting_weather_tool(weather_calls.clone()))
+        .approval(Approval::auto_allow())
+        .subagent("reviewer", reviewer)
+        .build()
+        .expect("agent builds");
+    let replacement = ToolSetRef::new(reconfig_tool_set_id(1), vec![weather_tool_decl()]);
+    agent
+        .reconfigure(ReconfigRequest::ReplaceToolSet {
+            tool_set: replacement,
+        })
+        .expect("replace-tool-set reconfig is accepted");
+    agent
+        .run("apply the reconfig.")
+        .await
+        .expect("reconfig applies at the run's turn boundary");
     assert_eq!(
-        weather_calls.load(Ordering::SeqCst),
-        0,
-        "the retained weather tool was never called"
+        tool_names(agent.state().current_tool_set().tools()),
+        vec!["get_weather", "ask_reviewer"]
     );
+
+    // Round-trip through JSON, since persistence is the snapshot's purpose.
+    let snapshot = agent.snapshot().expect("snapshot captures the merged set");
+    let json = serde_json::to_string(&snapshot).expect("snapshot serializes");
+    let snapshot: AgentSnapshot = serde_json::from_str(&json).expect("snapshot deserializes");
+
+    let restored_client = ScriptedClient::new(vec![
+        tool_use_response_for(
+            "ask_reviewer",
+            "del-1",
+            json!({ "task": "review the diff" }),
+        ),
+        text_response("the diff looks good"),
+        text_response("reviewer reported"),
+    ]);
+    let restored_reviewer = Agent::worker()
+        .description("Strict code reviewer.")
+        .system("You review code.")
+        .build()
+        .expect("worker builds");
+    let mut restored = Agent::restore()
+        .snapshot(snapshot)
+        .client(restored_client.clone())
+        .tool(counting_weather_tool(weather_calls.clone()))
+        .subagent("reviewer", restored_reviewer)
+        .build()
+        .expect("restore with the reconfigured tool surface");
+
+    assert_eq!(
+        tool_names(restored.state().current_tool_set().tools()),
+        vec!["get_weather", "ask_reviewer"],
+        "the restored surface matches the reconfig-merged set"
+    );
+
+    let output = restored
+        .run_full("Review the diff.")
+        .await
+        .expect("restored agent runs on the merged tool set");
+    assert_eq!(output.reply.text(), "reviewer reported");
+    assert_eq!(
+        tool_names(&restored_client.requests()[0].tools),
+        vec!["get_weather", "ask_reviewer"]
+    );
+    assert_eq!(output.delegations.len(), 1);
 }
 
 #[tokio::test]

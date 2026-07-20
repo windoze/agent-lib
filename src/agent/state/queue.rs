@@ -207,11 +207,24 @@ pub enum ReconfigRequest {
         expected_version: u64,
     },
     /// Replace future tool declarations without storing a runtime registry.
+    ///
+    /// The agent layer applies the given set verbatim. The facade
+    /// (`Agent::reconfigure`) narrows this contract: caller-supplied sets cover
+    /// only the non-delegation surface, while synthesized delegation tool
+    /// declarations (`ask_<name>` / the unified single-tool name) are always
+    /// re-derived from the currently registered delegates and merged in before
+    /// the request is queued (mag gap B1).
     ReplaceToolSet {
         /// New static tool declarations.
         tool_set: ToolSetRef,
     },
     /// Patch future tool declarations against an expected current tool set.
+    ///
+    /// The agent layer applies removals and add-or-replace edits verbatim. The
+    /// facade (`Agent::reconfigure`) rejects a patch that removes or shadows a
+    /// synthesized delegation tool declaration (`FacadeError::Config`):
+    /// delegation declarations are derived from the registered delegates and
+    /// are never caller-managed (mag gap B1).
     PatchToolSet {
         /// Declarative patch to apply to the current tool set.
         patch: ToolSetPatch,

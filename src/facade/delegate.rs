@@ -1723,6 +1723,11 @@ enum Resolved<'a> {
 /// tool-set reconfig can swap, so a call to a reconfig-removed `ask_<name>`
 /// resolves to the same `UnknownTool` tool result the filtered registry
 /// returns for any other removed tool and never drives a delegation (M2-3).
+/// Since the B1 hardening the facade's `Agent::reconfigure` re-derives
+/// delegation declarations from the registered delegates on every tool-set
+/// reconfig, so this path can no longer remove one; the gate remains the
+/// in-run backstop for tool sets that lost a delegation declaration any other
+/// way (for example a restored state pruned by B4).
 pub(crate) struct DelegationToolHandler {
     base: ToolRegistryHandler,
     route: DelegationRoute,

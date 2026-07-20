@@ -221,6 +221,45 @@ facade re-export 完整性已收口（M2-4）。
 
 ---
 
+## B1（强烈建议）`ReplaceToolSet` 逐字替换导致委派声明失踪
+
+状态：✅ 已修复（2026-07-20，提交 TBD）——facade 在应用 tool-set reconfig 前按当前注册的
+delegates 重合成委派声明并合并，tool surface 与委派集合永远一致。
+
+### 现状（修复前）
+
+- `Agent::reconfigure(ReconfigRequest::ReplaceToolSet{..})` 在 state 层**逐字替换**
+  `current_tool_set`，但 agent 的 tool surface 还包含 facade 在 build 时合成的 `ask_<name>`
+  委派声明（`build_agent_tool_declarations`，pub(crate)）。
+- 后果：消费者（mag）用 `ReplaceToolSet` 更新插件工具集时，替换集里不可能包含 `ask_*`
+  （合成逻辑在 agent-lib 内部），Replace 之后所有仍注册的 delegate 从 tool surface 静默
+  消失——模型再调 `ask_x` 只能得到 `UnknownTool`（M2-3 的一致性 gate 反而把这种状态「正确
+  地」变成了故障）。tool surface 与「仍注册的 delegates」失去一致性，是 agent-lib 层的
+  footgun。
+
+### 方案（已落地）
+
+- **重合成在 facade 层做**（state 层不持有 delegate 知识）：`Agent::reconfigure` 在请求
+  入队前拦截 `ReplaceToolSet` / `PatchToolSet`，用
+  `Delegation::declarations(&delegates, &external_agents)` 重合成委派声明。最终 tool set =
+  调用方给的非委派工具 + 当前注册 delegates 的委派声明（合并后入队，state 层语义不变）。
+- **冲突显式报错**：调用方 `ReplaceToolSet` 集合自带与 `ask_<已注册delegate>`（或
+  SingleTool 统一工具名）同名的声明 → `FacadeError::Config`；`PatchToolSet` 的 remove 或
+  add-or-replace 指定委派工具名 → 同样 `FacadeError::Config`。选择显式拒绝而非静默覆盖：
+  委派声明是派生状态，调用方不应管理；要下线委派工具应删除 delegate 注册（或 restore 时
+  prune，见 B4）。
+- delegate 集合本身变化（subagent/external_agent 注册、B4 的 prune）时声明派生路径不变；
+  M2-3 的「active set 不再声明则停止路由」gate 保留为 run 内兜底。
+- snapshot 存的是合并后的集合（队列里的请求已是合并形态），restore 以快照 `AgentState`
+  为权威、`build_agent_tool_declarations` 重建可执行面，roundtrip 一致（测试钉住）。
+- 测试（`facade/agent/tests.rs`，全部离线）：Replace 只含插件工具 → `ask_x` 仍在 surface
+  且委派仍路由（PerSubagentTool 与 SingleTool 两模式）；Replace 自带冲突 `ask_x` → Config；
+  Patch remove / add-or-replace `ask_x` → Config；Replace 应用后 snapshot+JSON
+  roundtrip+restore → surface 一致、委派仍路由。M2-3 三个「reconfig 移除委派工具 →
+  UnknownTool」测试语义被本改动翻转，已改写为新语义的钉住测试。
+
+---
+
 ## B4（强烈建议）restore 复活已删除 delegate 且回落 auto_allow
 
 状态：✅ 已修复（2026-07-20，提交 TBD）——`AgentRestoreBuilder::prune_unregistered_delegates()`

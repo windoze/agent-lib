@@ -37,7 +37,7 @@
 //! before a final assistant message the run fails with
 //! [`FacadeError::LoopLimitExceeded`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
@@ -673,24 +673,45 @@ impl Agent {
     /// provider the current model targets when one is inferable — so an invalid
     /// model can never be queued and rendered into the next request.
     ///
+    /// `ReplaceToolSet` / `PatchToolSet` manage only the **non-delegation**
+    /// surface. The delegation tool declarations (one `ask_<name>` per
+    /// model-routed delegate, or the unified single-tool name) are never taken
+    /// from the caller: they are synthesized `pub(crate)`-side and are always
+    /// re-derived from the delegates currently registered on this agent, then
+    /// merged into the queued set, so a replacement can never silently drop a
+    /// still-registered delegate from the model-visible surface (mag gap B1).
+    /// A caller-supplied `ReplaceToolSet` declaration that collides with a
+    /// synthesized delegation name, and a `PatchToolSet` that removes or
+    /// shadows one, are rejected with [`FacadeError::Config`] — delegation
+    /// declarations are derived state the caller must not manage; drop the
+    /// delegate registration instead of editing its tool.
+    ///
     /// # Errors
     ///
     /// Returns [`FacadeError::InvalidState`] when a turn is in progress.
     /// Returns [`FacadeError::Config`] when the request content is invalid or
     /// unsupported: a skill-variant request (no facade skill registry exists),
-    /// or a `SetModel` payload that fails the builder-level
+    /// a `SetModel` payload that fails the builder-level
     /// model checks (blank name, non-finite temperature, mismatched provider
-    /// extras). Returns [`FacadeError::Agent`] when the underlying agent state
-    /// rejects the request, for example because a system-prompt overlay version
-    /// is stale, a tool-set patch targets a non-current tool-set id, or the
-    /// requested tool set is not backed by the registered facade tool surface.
-    /// On any admission failure nothing is queued.
+    /// extras), or a tool-set request that tries to manage a synthesized
+    /// delegation declaration directly. Returns [`FacadeError::Agent`] when the
+    /// underlying agent state rejects the request, for example because a
+    /// system-prompt overlay version is stale, a tool-set patch targets a
+    /// non-current tool-set id, or the requested tool set is not backed by the
+    /// registered facade tool surface. On any admission failure nothing is
+    /// queued.
     pub fn reconfigure(&mut self, request: ReconfigRequest) -> Result<(), FacadeError> {
         ensure_facade_reconfig_request_supported(&request)?;
         ensure_facade_reconfig_rest_boundary(self.machine.cursor())?;
         if let ReconfigRequest::SetModel { model } = &request {
             ensure_facade_set_model_valid(model, self.machine.state().current_model())?;
         }
+        let request = merge_facade_delegation_declarations(
+            request,
+            &self.delegation,
+            &self.delegates,
+            &self.external_agents,
+        )?;
         self.machine.reconfigure(request)?;
         Ok(())
     }
@@ -1967,6 +1988,94 @@ fn ensure_facade_reconfig_request_supported(request: &ReconfigRequest) -> Result
         | ReconfigRequest::PatchToolSet { .. }
         | ReconfigRequest::SetModel { .. }
         | ReconfigRequest::SetLoopPolicy { .. } => Ok(()),
+    }
+}
+
+/// Merges the synthesized delegation declarations into a tool-set reconfig so
+/// the model-visible surface always mirrors the currently registered delegates
+/// (mag gap B1).
+///
+/// The agent layer applies `ReplaceToolSet` verbatim, but the facade owns the
+/// delegation declarations (one `ask_<name>` per model-routed delegate, or the
+/// unified single-tool name): they are synthesized `pub(crate)`-side, so a
+/// caller's replacement set cannot contain them, and a verbatim apply would
+/// silently drop every still-registered delegate from the tool surface. The
+/// facade therefore intercepts here — the state layer has no delegate
+/// knowledge — and splits responsibility: the caller's declarations cover the
+/// non-delegation surface, while the delegation declarations are re-derived
+/// from `delegation` + `delegates` + `external_agents` on every request and
+/// appended to the queued set.
+///
+/// Delegation declarations are derived state, never caller-managed input:
+///
+/// - a `ReplaceToolSet` whose set declares a name that collides with a
+///   synthesized delegation declaration is rejected (`FacadeError::Config`);
+/// - a `PatchToolSet` that removes or shadows (add-or-replace) such a name is
+///   rejected the same way, rather than silently re-synthesizing over the
+///   caller's edit — an explicit error surfaces the mistaken assumption that
+///   delegation tools are patch-managed. To retire a delegation tool, drop the
+///   delegate registration (or prune it on restore) instead.
+///
+/// Agents without delegation declarations (rules/dispatcher routing, or no
+/// delegates) pass every request through unchanged.
+fn merge_facade_delegation_declarations(
+    request: ReconfigRequest,
+    delegation: &Delegation,
+    delegates: &[LocalSubagent],
+    external_agents: &[ManagedExternalDelegate],
+) -> Result<ReconfigRequest, FacadeError> {
+    let delegation_declarations = delegation.declarations(delegates, external_agents);
+    if delegation_declarations.is_empty() {
+        return Ok(request);
+    }
+    let delegation_names: BTreeSet<&str> = delegation_declarations
+        .iter()
+        .map(|declaration| declaration.name.as_str())
+        .collect();
+
+    match request {
+        ReconfigRequest::ReplaceToolSet { tool_set } => {
+            if let Some(conflict) = tool_set
+                .tools()
+                .iter()
+                .find(|declaration| delegation_names.contains(declaration.name.as_str()))
+            {
+                return Err(FacadeError::Config(format!(
+                    "replace-tool-set reconfig must not declare `{}`: delegation tool \
+                     declarations are synthesized from the registered delegates and merged \
+                     automatically",
+                    conflict.name
+                )));
+            }
+            let mut tools = tool_set.tools().to_vec();
+            tools.extend(delegation_declarations);
+            Ok(ReconfigRequest::ReplaceToolSet {
+                tool_set: ToolSetRef::new(tool_set.id(), tools),
+            })
+        }
+        ReconfigRequest::PatchToolSet { patch } => {
+            for name in patch.remove() {
+                if delegation_names.contains(name.as_str()) {
+                    return Err(FacadeError::Config(format!(
+                        "patch-tool-set reconfig cannot remove `{name}`: delegation tool \
+                         declarations are derived from the registered delegates, not managed \
+                         by callers; drop the delegate registration instead"
+                    )));
+                }
+            }
+            for tool in patch.add_or_replace() {
+                if delegation_names.contains(tool.name.as_str()) {
+                    return Err(FacadeError::Config(format!(
+                        "patch-tool-set reconfig cannot add or replace `{}`: delegation tool \
+                         declarations are synthesized from the registered delegates and must \
+                         not be shadowed by caller declarations",
+                        tool.name
+                    )));
+                }
+            }
+            Ok(ReconfigRequest::PatchToolSet { patch })
+        }
+        other => Ok(other),
     }
 }
 
