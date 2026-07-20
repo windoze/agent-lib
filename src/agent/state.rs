@@ -142,6 +142,24 @@ impl AgentState {
             .with_provider_extras(provider_extras);
     }
 
+    /// Drops the declarations named by `dropped` from both the current tool
+    /// set and the spec's initial tool set, in place.
+    ///
+    /// Crate-internal: the facade restore path calls this when the caller
+    /// opted into pruning delegates the host did not re-register
+    /// (`AgentRestoreBuilder::prune_unregistered_delegates`). The pruned
+    /// delegates' synthesized `ask_<name>` declarations must leave the
+    /// restored model-visible surface together with the delegates themselves;
+    /// otherwise the restored current tool set would keep advertising (and
+    /// referencing) tools whose delegates are gone. Queued-but-unapplied
+    /// reconfigs are deliberately left untouched: one whose resulting tool
+    /// set still names a dropped declaration fails the restore-time tool
+    /// surface validation loudly instead of being silently rewritten.
+    pub(crate) fn drop_tool_declarations(&mut self, dropped: &BTreeSet<String>) {
+        self.current_tool_set.drop_declarations(dropped);
+        self.spec.drop_initial_tool_declarations(dropped);
+    }
+
     /// Returns the currently effective loop policy.
     #[must_use]
     pub const fn current_loop_policy(&self) -> &LoopPolicy {

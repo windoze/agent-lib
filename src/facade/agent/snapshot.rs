@@ -32,7 +32,7 @@
 //! and restored with each delegate's session facts) — because there is no
 //! stable facade-level artifact store to aggregate (`docs/facade-api.md` §15.2).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -563,6 +563,13 @@ pub struct AgentRestoreBuilder {
     ids: Option<FacadeIds>,
     subagent_overrides: Vec<LocalSubagent>,
     external_overrides: Vec<ManagedExternalDelegate>,
+    /// When `true`, restore keeps only the delegates the host re-registered
+    /// through [`subagent`](Self::subagent) /
+    /// [`external_agent`](Self::external_agent) and drops every persisted
+    /// delegate left un-re-registered instead of resurrecting it with a
+    /// defaulted approval policy (see
+    /// [`prune_unregistered_delegates`](Self::prune_unregistered_delegates)).
+    prune_unregistered_delegates: bool,
     restore_external: RestoreExternal,
     provider_extras: Option<ProviderExtras>,
     budget: Option<BudgetLimits>,
@@ -601,6 +608,10 @@ impl std::fmt::Debug for AgentRestoreBuilder {
                     .iter()
                     .map(ManagedExternalDelegate::name)
                     .collect::<Vec<_>>(),
+            )
+            .field(
+                "prune_unregistered_delegates",
+                &self.prune_unregistered_delegates,
             )
             .field("restore_external", &self.restore_external)
             .field("provider_extras", &self.provider_extras)
@@ -744,6 +755,11 @@ impl AgentRestoreBuilder {
     /// policy (or otherwise replace the persisted recipe). The `name` is stamped
     /// onto `worker` exactly as [`AgentBuilder::subagent`](super::AgentBuilder::subagent)
     /// does.
+    ///
+    /// Re-registration only *overrides*; it never removes a persisted delegate.
+    /// See [`prune_unregistered_delegates`](Self::prune_unregistered_delegates)
+    /// for dropping snapshot delegates the host deliberately no longer
+    /// registers.
     #[must_use]
     pub fn subagent(mut self, name: impl Into<String>, worker: LocalSubagent) -> Self {
         self.subagent_overrides.push(worker.with_name(name));
@@ -762,10 +778,66 @@ impl AgentRestoreBuilder {
     /// [`AgentBuilder::external_agent`](super::AgentBuilder::external_agent) does.
     /// Re-registration is **required** for
     /// [`RestoreExternal::AttachOrFail`](crate::facade::RestoreExternal::AttachOrFail).
+    ///
+    /// Re-registration only *overrides*; it never removes a persisted delegate.
+    /// See [`prune_unregistered_delegates`](Self::prune_unregistered_delegates)
+    /// for dropping snapshot delegates the host deliberately no longer
+    /// registers.
     #[must_use]
     pub fn external_agent(mut self, name: impl Into<String>, agent: ManagedExternalAgent) -> Self {
         self.external_overrides
             .push(ManagedExternalDelegate::new(name, agent));
+        self
+    }
+
+    /// Prunes every snapshotted delegate the host did **not** re-register,
+    /// instead of resurrecting it (opt-in; the default keeps the full
+    /// snapshot delegate set).
+    ///
+    /// # Why this exists
+    ///
+    /// A snapshot persists each delegate's data-only recipe but never its
+    /// [`ApprovalPolicy`](crate::facade::ApprovalPolicy) — a possibly
+    /// closure-bearing runtime handle. An un-re-registered delegate is
+    /// therefore rebuilt with [`ApprovalPolicy::default`], i.e. **auto_allow**:
+    /// it runs every tool call without pausing. Combined with the default
+    /// merge semantics — a re-registration only *overrides* the persisted
+    /// recipe of the same name — a delegate the host removed from its
+    /// configuration between the snapshot and the restore silently comes
+    /// back: it stays registered, its `ask_<name>` tool stays advertised on
+    /// the model-visible tool surface, and it runs approval-free. Enable this
+    /// prune when the host's current configuration is the authority over
+    /// which delegates may exist: the restored agent then keeps **exactly**
+    /// the delegates re-registered through [`subagent`](Self::subagent) and
+    /// [`external_agent`](Self::external_agent), covering both local
+    /// subagents and managed external delegates.
+    ///
+    /// # Semantics
+    ///
+    /// - The final delegate set is the re-registered set: snapshot entries
+    ///   whose name was not re-registered are dropped, together with their
+    ///   synthesized delegation declarations (`ask_<name>` in model-routed
+    ///   mode), which are removed from the restored state's current and
+    ///   initial tool sets so they are never advertised to the model again.
+    /// - Re-registered delegates keep their freshly supplied approval policy
+    ///   / session handler, exactly as without pruning.
+    /// - Nothing else in the snapshot is touched: the conversation history,
+    ///   model, system prompt, loop policy, queued reconfigs, collaboration
+    ///   slices, and non-delegation tool declarations restore as before.
+    /// - Pruned managed external delegates also drop their retained session
+    ///   facts; the [`restore_external`](Self::restore_external) policy only
+    ///   reconciles the sessions of delegates that survive the prune.
+    /// - A queued-but-unapplied reconfig whose resulting tool set still
+    ///   references a pruned delegate's tool makes [`build`](Self::build)
+    ///   fail with [`FacadeError::InvalidState`] (the restored tool surface
+    ///   cannot cover it) — loudly, never silently.
+    ///
+    /// The default (no prune) is unchanged and fully backward compatible:
+    /// every snapshotted delegate is restored, with un-re-registered ones
+    /// falling back to [`ApprovalPolicy::default`].
+    #[must_use]
+    pub const fn prune_unregistered_delegates(mut self) -> Self {
+        self.prune_unregistered_delegates = true;
         self
     }
 
@@ -822,6 +894,20 @@ impl AgentRestoreBuilder {
             }
         };
 
+        // When pruning is enabled the re-registered names become the entire
+        // restored delegate set; collect them before the merge loops below
+        // consume the override vectors.
+        let subagent_override_names: BTreeSet<String> = self
+            .subagent_overrides
+            .iter()
+            .map(|delegate| delegate.name().to_owned())
+            .collect();
+        let external_override_names: BTreeSet<String> = self
+            .external_overrides
+            .iter()
+            .map(|delegate| delegate.name().to_owned())
+            .collect();
+
         // Rebuild the registered external delegates from their data-only
         // snapshots (a snapshot cannot carry the runtime session handler, §15.2),
         // then apply the caller's re-registrations (which re-supply that handler),
@@ -862,6 +948,33 @@ impl AgentRestoreBuilder {
             }
         }
 
+        // Prune (opt-in): drop every snapshotted delegate the host did not
+        // re-register. A snapshot persists no approval policy, so an
+        // un-re-registered delegate would otherwise resurrect with
+        // `ApprovalPolicy::default` (auto_allow) even when the host removed
+        // it from its configuration between processes. Diff the delegation
+        // declarations before/after the cut so the pruned delegates'
+        // synthesized `ask_<name>` tools can leave the restored state's tool
+        // sets below together with the delegates themselves.
+        let mut dropped_delegation_tools: BTreeSet<String> = BTreeSet::new();
+        if self.prune_unregistered_delegates {
+            let before: BTreeSet<String> = snapshot
+                .delegation
+                .declarations(&delegates, &external_agents)
+                .iter()
+                .map(|declaration| declaration.name.clone())
+                .collect();
+            delegates.retain(|delegate| subagent_override_names.contains(delegate.name()));
+            external_agents.retain(|delegate| external_override_names.contains(delegate.name()));
+            let after: BTreeSet<String> = snapshot
+                .delegation
+                .declarations(&delegates, &external_agents)
+                .iter()
+                .map(|declaration| declaration.name.clone())
+                .collect();
+            dropped_delegation_tools = before.difference(&after).cloned().collect();
+        }
+
         // Restore keeps the snapshot's AgentState declarations as the data
         // authority, but the runtime handlers re-injected here still must be
         // compatible with the restored delegation surface.
@@ -887,6 +1000,14 @@ impl AgentRestoreBuilder {
         // agent. A caller-supplied provider_extras override only re-binds the
         // current model's provider-specific request fields for future requests.
         let mut state = snapshot.agent_state.into_state()?;
+        if !dropped_delegation_tools.is_empty() {
+            // The snapshot's AgentState is the declaration authority, so the
+            // prune must cut there too: the pruned delegates' `ask_<name>`
+            // declarations leave the current and initial tool sets, keeping
+            // the model-visible surface consistent with the pruned delegate
+            // set (and the surface check below satisfiable).
+            state.drop_tool_declarations(&dropped_delegation_tools);
+        }
         ensure_restored_tool_surface(&tool_registry_resolver, &state)?;
         if let Some(provider_extras) = provider_extras {
             state.override_current_provider_extras(provider_extras);
@@ -902,6 +1023,11 @@ impl AgentRestoreBuilder {
         // `restore_external` policy (§15.3).
         let mut last_external_sessions: HashMap<String, RetainedExternalSession> = HashMap::new();
         for snap in &snapshot.external_delegates {
+            // A pruned external delegate is gone entirely: it leaves no
+            // retained session facts to reconcile.
+            if self.prune_unregistered_delegates && !external_override_names.contains(&snap.name) {
+                continue;
+            }
             let retained = match self.restore_external {
                 RestoreExternal::MarkInterrupted => RetainedExternalSession {
                     status: ExternalDelegateStatus::Interrupted,

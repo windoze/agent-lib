@@ -25,7 +25,15 @@ use futures::stream::BoxStream;
 use crate::client::{Capability, ChatRequest, ClientError, LlmClient, Response};
 use crate::facade::agent::{Agent, AgentBuilder};
 use crate::facade::delegate::Delegation;
-use crate::facade::{AgentSnapshot, ArtifactRef, Collaboration, FacadeError, Tool, ToolContext};
+use crate::facade::external::ManagedExternalAgent;
+use crate::facade::{
+    AgentSnapshot, Approval, ApprovalPolicy, ArtifactRef, Collaboration, FacadeError, Tool,
+    ToolContext,
+};
+use crate::model::content::ContentBlock;
+use crate::model::message::{Message, Role};
+use crate::model::normalized::StopReason;
+use crate::model::usage::Usage;
 use crate::stream::StreamEvent;
 
 /// A never-driven client, so the builder / restore builder have a runtime handle
@@ -509,4 +517,280 @@ fn top_level_artifacts_are_ignored_on_restore() {
         restored.mailbox().is_some(),
         "grafted top-level artifacts do not disturb the restored topology"
     );
+}
+
+// ---------------------------------------------------------------------------
+// B4: opt-in pruning of snapshot delegates the host did not re-register.
+//
+// A snapshot persists no delegate approval policy (a runtime handle), so the
+// default merge rebuilds an un-re-registered delegate with
+// `ApprovalPolicy::default()` (auto_allow) and never removes one — a delegate
+// the host deleted from its configuration between processes would silently
+// resurrect, approval-free. `prune_unregistered_delegates()` makes the
+// re-registered set authoritative instead.
+// ---------------------------------------------------------------------------
+
+/// A client that always answers one fixed text turn, so the snapshotted
+/// conversation can carry real history (driven only by the
+/// prune-preservation test; every other test stays on the never-driven
+/// [`StubClient`]).
+#[derive(Debug)]
+struct TextClient;
+
+#[async_trait]
+impl LlmClient for TextClient {
+    fn capability(&self) -> &Capability {
+        &crate::client::ANTHROPIC_DEFAULT_CAPABILITY
+    }
+
+    async fn chat(&self, _request: ChatRequest) -> Result<Response, ClientError> {
+        Ok(Response {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "supervisor reply".to_owned(),
+                    extra: Default::default(),
+                }],
+            },
+            usage: Usage::default(),
+            stop_reason: StopReason::normalize("end_turn"),
+            extra: Default::default(),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _request: ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, ClientError>>, ClientError> {
+        Err(ClientError::Other(
+            "streaming not used in prune tests".to_owned(),
+        ))
+    }
+}
+
+/// A three-delegate supervisor: local subagents `alpha` + `beta`, managed
+/// external delegate `coder`, plus one typed tool.
+fn delegate_supervisor() -> Agent {
+    AgentBuilder::default()
+        .client(Arc::new(StubClient))
+        .model("supervisor-model")
+        .tool(noop_tool("get_weather"))
+        .subagent("alpha", Agent::worker().system("a").build().expect("w"))
+        .subagent("beta", Agent::worker().system("b").build().expect("w"))
+        .external_agent(
+            "coder",
+            ManagedExternalAgent::claude_code()
+                .build()
+                .expect("external agent builds"),
+        )
+        .build()
+        .expect("build agent")
+}
+
+/// A worker re-registration carrying an explicit, recognizable approval
+/// policy (auto_deny rather than the auto_allow restore fallback).
+fn reregistered_worker() -> crate::facade::LocalSubagent {
+    Agent::worker()
+        .system("a2")
+        .approval(ApprovalPolicy::new(Approval::auto_deny()))
+        .build()
+        .expect("worker builds")
+}
+
+/// The model-visible tool names of the restored agent's current tool set.
+fn current_tool_names(agent: &Agent) -> Vec<String> {
+    agent
+        .state()
+        .current_tool_set()
+        .tools()
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect()
+}
+
+#[test]
+fn restore_prune_keeps_only_reregistered_delegates() {
+    let agent = delegate_supervisor();
+    let snapshot = agent.snapshot().expect("snapshot at a committed point");
+
+    // The host re-registers only `alpha` (with an explicit approval policy)
+    // and opts into pruning: `beta` and `coder` must not resurrect.
+    let restored = Agent::restore()
+        .snapshot(snapshot)
+        .client(Arc::new(StubClient))
+        .tool(noop_tool("get_weather"))
+        .subagent("alpha", reregistered_worker())
+        .prune_unregistered_delegates()
+        .build()
+        .expect("restore with prune");
+
+    let names: Vec<&str> = restored
+        .subagents()
+        .iter()
+        .map(|delegate| delegate.name())
+        .collect();
+    assert_eq!(names, ["alpha"], "only the re-registered delegate survives");
+    assert!(
+        restored.external_agents().is_empty(),
+        "the un-re-registered external delegate is pruned"
+    );
+
+    // The surviving delegate keeps the freshly supplied approval policy, not
+    // the auto_allow fallback.
+    let approval = format!("{:?}", restored.subagents()[0].approval());
+    assert!(
+        approval.contains("auto_deny"),
+        "the re-registered approval policy applies, got {approval}"
+    );
+
+    // The pruned delegates' `ask_<name>` declarations leave the model-visible
+    // tool surface together with the delegates.
+    let tools = current_tool_names(&restored);
+    assert!(tools.iter().any(|name| name == "ask_alpha"));
+    assert!(tools.iter().any(|name| name == "get_weather"));
+    assert!(
+        !tools.iter().any(|name| name == "ask_beta"),
+        "ask_beta must not be advertised after pruning, got {tools:?}"
+    );
+    assert!(
+        !tools.iter().any(|name| name == "ask_coder"),
+        "ask_coder must not be advertised after pruning, got {tools:?}"
+    );
+}
+
+#[test]
+fn restore_without_prune_keeps_full_snapshot_delegate_set() {
+    let agent = delegate_supervisor();
+    let snapshot = agent.snapshot().expect("snapshot at a committed point");
+
+    // Backward compatibility: without the opt-in prune the old merge behavior
+    // holds verbatim — every snapshotted delegate is restored, and the
+    // un-re-registered one falls back to the default (auto_allow) policy.
+    let restored = Agent::restore()
+        .snapshot(snapshot)
+        .client(Arc::new(StubClient))
+        .tool(noop_tool("get_weather"))
+        .subagent("alpha", reregistered_worker())
+        .build()
+        .expect("restore without prune");
+
+    let names: Vec<&str> = restored
+        .subagents()
+        .iter()
+        .map(|delegate| delegate.name())
+        .collect();
+    assert_eq!(names, ["alpha", "beta"], "the full snapshot set is kept");
+    let external: Vec<&str> = restored
+        .external_agents()
+        .iter()
+        .map(|delegate| delegate.name())
+        .collect();
+    assert_eq!(external, ["coder"]);
+
+    let beta = restored
+        .subagents()
+        .iter()
+        .find(|delegate| delegate.name() == "beta")
+        .expect("beta restored");
+    let approval = format!("{:?}", beta.approval());
+    assert!(
+        approval.contains("auto_allow"),
+        "an un-re-registered delegate falls back to the default policy, got {approval}"
+    );
+
+    let tools = current_tool_names(&restored);
+    for expected in ["ask_alpha", "ask_beta", "ask_coder", "get_weather"] {
+        assert!(
+            tools.iter().any(|name| name == expected),
+            "{expected} stays advertised without pruning, got {tools:?}"
+        );
+    }
+}
+
+#[test]
+fn restore_prune_with_no_reregistrations_drops_all_delegates() {
+    let agent = delegate_supervisor();
+    let snapshot = agent.snapshot().expect("snapshot at a committed point");
+
+    let restored = Agent::restore()
+        .snapshot(snapshot)
+        .client(Arc::new(StubClient))
+        .tool(noop_tool("get_weather"))
+        .prune_unregistered_delegates()
+        .build()
+        .expect("restore with prune and zero re-registrations");
+
+    assert!(restored.subagents().is_empty());
+    assert!(restored.external_agents().is_empty());
+
+    let tools = current_tool_names(&restored);
+    assert!(
+        !tools.iter().any(|name| name.starts_with("ask_")),
+        "no delegation tool survives a full prune, got {tools:?}"
+    );
+    assert!(
+        tools.iter().any(|name| name == "get_weather"),
+        "non-delegation tools are untouched, got {tools:?}"
+    );
+}
+
+#[tokio::test]
+async fn restore_prune_preserves_history_model_and_tool_surface() {
+    // Drive one real turn so the snapshot carries conversation history, then
+    // confirm the prune touches nothing outside the delegate set: history,
+    // model, system prompt, and the non-delegation tool surface restore as
+    // before.
+    let mut agent = AgentBuilder::default()
+        .client(Arc::new(TextClient))
+        .model("supervisor-model")
+        .system("You supervise.")
+        .tool(noop_tool("get_weather"))
+        .subagent("alpha", Agent::worker().system("a").build().expect("w"))
+        .subagent("beta", Agent::worker().system("b").build().expect("w"))
+        .external_agent(
+            "coder",
+            ManagedExternalAgent::claude_code()
+                .build()
+                .expect("external agent builds"),
+        )
+        .build()
+        .expect("build agent");
+    let reply = agent.run("hello").await.expect("run one turn");
+    assert_eq!(reply.text(), "supervisor reply");
+    let snapshot = agent.snapshot().expect("snapshot at a committed point");
+    assert!(
+        snapshot.supervisor.structural_version() > 0,
+        "the snapshot carries real conversation history"
+    );
+
+    let restored = Agent::restore()
+        .snapshot(snapshot.clone())
+        .client(Arc::new(StubClient))
+        .tool(noop_tool("get_weather"))
+        .subagent("alpha", reregistered_worker())
+        .prune_unregistered_delegates()
+        .build()
+        .expect("restore with prune");
+
+    // Conversation history is byte-identical to the pre-restore snapshot.
+    let re_snapshot = restored.snapshot().expect("re-snapshot restored agent");
+    assert_eq!(
+        re_snapshot.supervisor, snapshot.supervisor,
+        "pruning leaves the conversation history untouched"
+    );
+
+    // Model and system prompt restore as before.
+    assert_eq!(restored.state().current_model().model(), "supervisor-model");
+    assert_eq!(
+        restored.state().spec().system_prompt(),
+        Some("You supervise.")
+    );
+
+    // The non-delegation tool surface and the surviving delegate tool are
+    // intact; only the pruned delegates' tools are gone.
+    let tools = current_tool_names(&restored);
+    assert!(tools.iter().any(|name| name == "get_weather"));
+    assert!(tools.iter().any(|name| name == "ask_alpha"));
+    assert!(!tools.iter().any(|name| name == "ask_beta"));
+    assert!(!tools.iter().any(|name| name == "ask_coder"));
 }

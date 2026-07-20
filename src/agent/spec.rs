@@ -6,6 +6,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeSet,
     num::NonZeroU32,
     path::{Path, PathBuf},
 };
@@ -84,6 +85,16 @@ impl AgentSpec {
     pub const fn loop_policy(&self) -> &LoopPolicy {
         &self.loop_policy
     }
+
+    /// Drops the declarations named by `dropped` from the initial tool set.
+    ///
+    /// Crate-internal: the facade restore path calls this when the caller
+    /// opted into pruning delegates the host did not re-register, keeping the
+    /// persisted initial tool set consistent with the pruned current tool
+    /// set (see [`AgentState::drop_tool_declarations`](crate::agent::AgentState::drop_tool_declarations)).
+    pub(crate) fn drop_initial_tool_declarations(&mut self, dropped: &BTreeSet<String>) {
+        self.initial_tools.drop_declarations(dropped);
+    }
 }
 
 /// Filesystem boundary assigned to an Agent.
@@ -139,6 +150,16 @@ impl ToolSetRef {
     #[must_use]
     pub fn tools(&self) -> &[Tool] {
         &self.tools
+    }
+
+    /// Drops the declarations named by `dropped` from this set, in place.
+    ///
+    /// Crate-internal: the facade restore path uses this to remove a pruned
+    /// delegate's synthesized `ask_<name>` declaration from a restored tool
+    /// set (see
+    /// [`AgentState::drop_tool_declarations`](crate::agent::AgentState::drop_tool_declarations)).
+    pub(crate) fn drop_declarations(&mut self, dropped: &BTreeSet<String>) {
+        self.tools.retain(|tool| !dropped.contains(&tool.name));
     }
 }
 

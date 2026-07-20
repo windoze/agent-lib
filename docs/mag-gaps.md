@@ -221,6 +221,40 @@ facade re-export 完整性已收口（M2-4）。
 
 ---
 
+## B4（强烈建议）restore 复活已删除 delegate 且回落 auto_allow
+
+状态：✅ 已修复（2026-07-20，提交 TBD）——`AgentRestoreBuilder::prune_unregistered_delegates()`
+opt-in 裁剪语义落地，默认行为不变。
+
+### 现状
+
+- snapshot 不携带 delegate 的 `ApprovalPolicy`（可能含闭包的运行时句柄），restore 合并逻辑
+  （`facade/agent/snapshot.rs` 的 external/local 合并段）对未被重注册的 delegate 一律回落
+  `ApprovalPolicy::default()` = **auto_allow**；host 的 `.subagent()` / `.external_agent()` 重注册
+  只按名**覆盖**，从不删除。
+- 后果：host 在两次进程之间从配置中**删除**的 delegate 在 restore 后仍注册在 agent 上、
+  `ask_<name>` 仍广告在 tool surface、且以免审批的 auto_allow 运行——本应下线的 delegate 被
+  静默复活（安全相关）。
+
+### 方案（已落地）
+
+- 新增 opt-in 方法 `AgentRestoreBuilder::prune_unregistered_delegates()`：开启后最终 delegate
+  集合 = host 重注册集合，同时覆盖 local（`subagent_overrides`）与 external
+  （`external_overrides`）；被裁剪 delegate 的合成 `ask_<name>` 声明从恢复出的 current/initial
+  tool set 中同步移除（`build_agent_tool_declarations` 与 `AgentState` 两侧一致，不再出现在模型
+  可见 tool surface），external delegate 的 retained session facts 一并丢弃。
+- 裁剪不影响 snapshot 其余部分：对话历史、model、system prompt、loop policy、reconfig 队列、
+  协作 slice、非委派工具声明照常恢复（测试钉住）。
+- 排队未应用的 reconfig 若仍引用被裁剪 delegate 的工具，restore 以 `FacadeError::InvalidState`
+  显式失败，不静默改写。
+- 向后兼容：不加 prune 时旧行为逐字保持（snapshot 全部 delegate 恢复、未重注册者回落 default
+  策略），依赖「restore 恢复全部 snapshot delegate」的既有消费者不受影响。
+- 测试（`facade/agent/snapshot_tests.rs`，全部离线）：prune + 部分重注册只留重注册者（审批策略
+  为重注册值，`ask_<pruned>` 不在 tool 声明中）；不加 prune 保持旧行为；prune + 零重注册则
+  delegate 为空；prune 不影响历史/model/tool surface。
+
+---
+
 ## C 组（可选后置，本计划不做，仅登记）
 
 - **C1**（mag A5）专用 `FacadeError::Cancelled` 变体：现在 cancel 以
@@ -267,7 +301,9 @@ facade re-export 完整性已收口（M2-4）。
 
 - restore 不重新 `.subagent(..)` 注册，子 agent 审批策略静默回落 `ApprovalPolicy::default()`
   = auto_allow（`facade/agent/snapshot.rs:838-842`）；external delegate 不重注册则
-  `session_handler: None`，drive 即失败。mag 恢复路径必须重注册全部 delegate。
+  `session_handler: None`，drive 即失败。mag 恢复路径必须重注册全部 delegate。B4 已提供
+  `AgentRestoreBuilder::prune_unregistered_delegates()`（opt-in）：开启后未被重注册的 snapshot
+  delegate 被裁剪而非复活，host 当前配置即为 delegate 集合权威；不开则旧行为不变。
 - `AgentRunStream` 是 `!Send` 且整个 run 借用 `&mut Agent`（`facade/agent/stream.rs:676-688`）——
   宿主需 per-session actor 模型。
 - 注入 `interaction_handler` 后它是被暂停交互的**唯一应答方**，但 gate 仍由 `ApprovalPolicy`
