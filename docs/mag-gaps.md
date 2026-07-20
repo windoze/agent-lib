@@ -223,7 +223,7 @@ facade re-export 完整性已收口（M2-4）。
 
 ## B1（强烈建议）`ReplaceToolSet` 逐字替换导致委派声明失踪
 
-状态：✅ 已修复（2026-07-20，提交 TBD）——facade 在应用 tool-set reconfig 前按当前注册的
+状态：✅ 已修复（2026-07-20，提交 7eaf754）——facade 在应用 tool-set reconfig 前按当前注册的
 delegates 重合成委派声明并合并，tool surface 与委派集合永远一致。
 
 ### 现状（修复前）
@@ -262,7 +262,7 @@ delegates 重合成委派声明并合并，tool surface 与委派集合永远一
 
 ## B4（强烈建议）restore 复活已删除 delegate 且回落 auto_allow
 
-状态：✅ 已修复（2026-07-20，提交 TBD）——`AgentRestoreBuilder::prune_unregistered_delegates()`
+状态：✅ 已修复（2026-07-20，提交 21815a6）——`AgentRestoreBuilder::prune_unregistered_delegates()`
 opt-in 裁剪语义落地，默认行为不变。
 
 ### 现状
