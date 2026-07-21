@@ -64,6 +64,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
+use crate::agent::external::process::jsonl::JsonlDecoderCore;
+#[cfg(test)]
+use crate::agent::external::process::jsonl::MAX_CONSECUTIVE_NON_JSON_LINES;
 use crate::agent::external::{
     ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalObservedEvent,
     ExternalToolBatchId, ExternalToolCall,
@@ -73,8 +76,6 @@ use crate::agent::interaction::Interaction;
 use crate::agent::permission::{PermissionCategory, PermissionRequest, PermissionRisk};
 use crate::model::tool::ToolStatus;
 use crate::model::usage::Usage;
-
-const MAX_CONSECUTIVE_NON_JSON_LINES: usize = 8;
 
 /// Host-supplied identities the decoder needs to mint a permission
 /// [`Interaction`] when Claude Code asks to use a gated tool.
@@ -156,12 +157,9 @@ struct ActiveTool {
 #[derive(Debug)]
 pub struct ClaudeStreamDecoder {
     context: ClaudeDecodeContext,
-    next_seq: u64,
-    session_id: Option<String>,
+    core: JsonlDecoderCore,
     cwd: Option<String>,
-    pending: Vec<ExternalObservedEvent>,
     active_tools: BTreeMap<String, ActiveTool>,
-    consecutive_non_json_lines: usize,
 }
 
 impl ClaudeStreamDecoder {
@@ -171,12 +169,9 @@ impl ClaudeStreamDecoder {
     pub fn new(context: ClaudeDecodeContext) -> Self {
         Self {
             context,
-            next_seq: 0,
-            session_id: None,
+            core: JsonlDecoderCore::new(),
             cwd: None,
-            pending: Vec::new(),
             active_tools: BTreeMap::new(),
-            consecutive_non_json_lines: 0,
         }
     }
 
@@ -193,7 +188,7 @@ impl ClaudeStreamDecoder {
     /// [`ExternalSessionRef::last_event_seq`]: crate::agent::external::ExternalSessionRef::last_event_seq
     #[must_use]
     pub fn with_next_seq(mut self, next_seq: u64) -> Self {
-        self.next_seq = next_seq;
+        self.core = self.core.with_next_seq(next_seq);
         self
     }
 
@@ -201,14 +196,14 @@ impl ClaudeStreamDecoder {
     /// reported one.
     #[must_use]
     pub fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
+        self.core.session_id()
     }
 
     /// Drains the observations buffered since the last drain, transferring
     /// ownership to the caller and leaving the running `seq` untouched.
     #[must_use]
     pub fn take_observations(&mut self) -> Vec<ExternalObservedEvent> {
-        std::mem::take(&mut self.pending)
+        self.core.take_observations()
     }
 
     /// Decodes one raw `stream-json` frame line.
@@ -223,39 +218,22 @@ impl ClaudeStreamDecoder {
     /// non-JSON lines, or for a JSON line that is not an object, is missing a
     /// string `type`, or is a known frame missing a required inner object.
     pub fn push_line(&mut self, line: &str) -> Result<Option<ClaudeDecision>, ExternalAgentError> {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let Some((frame_type, frame)) = self.core.parse_frame(line, "claude stream-json")? else {
             return Ok(None);
-        }
-
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => {
-                self.consecutive_non_json_lines = 0;
-                value
-            }
-            Err(_) => return self.tolerate_non_json_line(),
-        };
-        let Some(frame) = value.as_object() else {
-            return Err(protocol("claude stream-json frame is not a JSON object"));
-        };
-        let Some(frame_type) = frame.get("type").and_then(Value::as_str) else {
-            return Err(protocol(
-                "claude stream-json frame is missing a string `type`",
-            ));
         };
 
-        let decision = match frame_type {
+        let decision = match frame_type.as_str() {
             "system" => {
-                self.handle_system(frame);
+                self.handle_system(&frame);
                 None
             }
-            "assistant" => self.handle_assistant(frame)?,
+            "assistant" => self.handle_assistant(&frame)?,
             "user" => {
-                self.handle_user(frame)?;
+                self.handle_user(&frame)?;
                 None
             }
-            "control_request" => self.handle_control_request(frame)?,
-            "result" => Some(self.handle_result(frame)?),
+            "control_request" => self.handle_control_request(&frame)?,
+            "result" => Some(self.handle_result(&frame)?),
             // `stream_event` partial-message deltas and any unknown frame type are
             // tolerated: the whole assistant message already carries the text.
             _ => None,
@@ -267,22 +245,9 @@ impl ClaudeStreamDecoder {
         Ok(decision)
     }
 
-    fn tolerate_non_json_line(&mut self) -> Result<Option<ClaudeDecision>, ExternalAgentError> {
-        self.consecutive_non_json_lines = self.consecutive_non_json_lines.saturating_add(1);
-        if self.consecutive_non_json_lines <= MAX_CONSECUTIVE_NON_JSON_LINES {
-            return Ok(None);
-        }
-        Err(protocol(format!(
-            "too many consecutive non-json claude stream-json lines ({}/{})",
-            self.consecutive_non_json_lines, MAX_CONSECUTIVE_NON_JSON_LINES
-        )))
-    }
-
     /// Buffers `event` under the next monotonic sequence number.
     fn emit(&mut self, event: ExternalAgentEvent) {
-        self.pending
-            .push(ExternalObservedEvent::new(self.next_seq, event));
-        self.next_seq += 1;
+        self.core.emit(event);
     }
 
     /// Handles a `system` frame, emitting [`SessionStarted`] for the `init`
@@ -301,7 +266,7 @@ impl ClaudeStreamDecoder {
             self.cwd = Some(cwd.to_owned());
         }
         if let Some(id) = &session_id {
-            self.session_id = Some(id.clone());
+            self.core.set_session_id(id.clone());
         }
         self.emit(ExternalAgentEvent::SessionStarted { session_id });
     }
@@ -367,7 +332,7 @@ impl ClaudeStreamDecoder {
             .get("id")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .unwrap_or_else(|| format!("claude-batch-{}", self.next_seq));
+            .unwrap_or_else(|| format!("claude-batch-{}", self.core.next_seq()));
         Ok(Some(ClaudeDecision::PausedForToolCalls {
             batch_id: ExternalToolBatchId::new(batch_id),
             calls: host_calls,

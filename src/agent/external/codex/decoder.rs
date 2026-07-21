@@ -78,13 +78,14 @@
 
 use serde_json::{Map, Value};
 
+use crate::agent::external::process::jsonl::JsonlDecoderCore;
+#[cfg(test)]
+use crate::agent::external::process::jsonl::MAX_CONSECUTIVE_NON_JSON_LINES;
 use crate::agent::external::{
     ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalObservedEvent,
 };
 use crate::model::tool::ToolStatus;
 use crate::model::usage::Usage;
-
-const MAX_CONSECUTIVE_NON_JSON_LINES: usize = 8;
 
 /// Host-supplied context the decoder needs while turning `codex exec --json`
 /// frames into observations.
@@ -150,11 +151,8 @@ pub enum CodexDecision {
 #[derive(Debug)]
 pub struct CodexStreamDecoder {
     context: CodexDecodeContext,
-    next_seq: u64,
-    session_id: Option<String>,
+    core: JsonlDecoderCore,
     last_message: Option<String>,
-    pending: Vec<ExternalObservedEvent>,
-    consecutive_non_json_lines: usize,
 }
 
 impl CodexStreamDecoder {
@@ -163,11 +161,8 @@ impl CodexStreamDecoder {
     pub fn new(context: CodexDecodeContext) -> Self {
         Self {
             context,
-            next_seq: 0,
-            session_id: None,
+            core: JsonlDecoderCore::new(),
             last_message: None,
-            pending: Vec::new(),
-            consecutive_non_json_lines: 0,
         }
     }
 
@@ -184,7 +179,7 @@ impl CodexStreamDecoder {
     /// [`ExternalSessionRef::last_event_seq`]: crate::agent::external::ExternalSessionRef::last_event_seq
     #[must_use]
     pub fn with_next_seq(mut self, next_seq: u64) -> Self {
-        self.next_seq = next_seq;
+        self.core = self.core.with_next_seq(next_seq);
         self
     }
 
@@ -192,14 +187,14 @@ impl CodexStreamDecoder {
     /// reported one.
     #[must_use]
     pub fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
+        self.core.session_id()
     }
 
     /// Drains the observations buffered since the last drain, transferring
     /// ownership to the caller and leaving the running `seq` untouched.
     #[must_use]
     pub fn take_observations(&mut self) -> Vec<ExternalObservedEvent> {
-        std::mem::take(&mut self.pending)
+        self.core.take_observations()
     }
 
     /// Decodes one raw `codex exec --json` frame line.
@@ -215,46 +210,31 @@ impl CodexStreamDecoder {
     /// string `type`, is a `thread.started` without a `thread_id`, or is an
     /// `item.*` frame whose `item` is absent or not an object.
     pub fn push_line(&mut self, line: &str) -> Result<Option<CodexDecision>, ExternalAgentError> {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let Some((frame_type, frame)) = self.core.parse_frame(line, "codex exec json")? else {
             return Ok(None);
-        }
-
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => {
-                self.consecutive_non_json_lines = 0;
-                value
-            }
-            Err(_) => return self.tolerate_non_json_line(),
-        };
-        let Some(frame) = value.as_object() else {
-            return Err(protocol("codex exec json frame is not a JSON object"));
-        };
-        let Some(frame_type) = frame.get("type").and_then(Value::as_str) else {
-            return Err(protocol("codex exec json frame is missing a string `type`"));
         };
 
-        let decision = match frame_type {
+        let decision = match frame_type.as_str() {
             "thread.started" => {
-                self.handle_thread_started(frame)?;
+                self.handle_thread_started(&frame)?;
                 None
             }
             "item.started" => {
-                self.handle_item(frame, ItemPhase::Started)?;
+                self.handle_item(&frame, ItemPhase::Started)?;
                 None
             }
             "item.updated" => {
                 // Progress updates carry no terminal fact the started/completed
                 // pair does not already provide; tolerate them.
-                self.require_item(frame)?;
+                self.require_item(&frame)?;
                 None
             }
             "item.completed" => {
-                self.handle_item(frame, ItemPhase::Completed)?;
+                self.handle_item(&frame, ItemPhase::Completed)?;
                 None
             }
-            "turn.completed" => Some(self.handle_turn_completed(frame)),
-            "turn.failed" => Some(self.handle_turn_failed(frame)),
+            "turn.completed" => Some(self.handle_turn_completed(&frame)),
+            "turn.failed" => Some(self.handle_turn_failed(&frame)),
             // `turn.started`, a top-level transient `error` notice, and any
             // unknown future frame type are tolerated: the turn boundary frames
             // already carry the terminal decision.
@@ -267,22 +247,9 @@ impl CodexStreamDecoder {
         Ok(decision)
     }
 
-    fn tolerate_non_json_line(&mut self) -> Result<Option<CodexDecision>, ExternalAgentError> {
-        self.consecutive_non_json_lines = self.consecutive_non_json_lines.saturating_add(1);
-        if self.consecutive_non_json_lines <= MAX_CONSECUTIVE_NON_JSON_LINES {
-            return Ok(None);
-        }
-        Err(protocol(format!(
-            "too many consecutive non-json codex exec json lines ({}/{})",
-            self.consecutive_non_json_lines, MAX_CONSECUTIVE_NON_JSON_LINES
-        )))
-    }
-
     /// Buffers `event` under the next monotonic sequence number.
     fn emit(&mut self, event: ExternalAgentEvent) {
-        self.pending
-            .push(ExternalObservedEvent::new(self.next_seq, event));
-        self.next_seq += 1;
+        self.core.emit(event);
     }
 
     /// Handles a `thread.started` frame, emitting
@@ -297,7 +264,7 @@ impl CodexStreamDecoder {
                 "codex thread.started is missing a string `thread_id`",
             ));
         };
-        self.session_id = Some(thread_id.to_owned());
+        self.core.set_session_id(thread_id.to_owned());
         self.emit(ExternalAgentEvent::SessionStarted {
             session_id: Some(thread_id.to_owned()),
         });

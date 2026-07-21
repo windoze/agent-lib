@@ -41,14 +41,12 @@
 //! secret … 的日志/错误必须脱敏").
 
 use std::io;
-use std::process::Stdio;
 
 use async_trait::async_trait;
-use tokio::process::Command;
-use tokio::time::timeout;
 
+use crate::agent::external::process::probe::{invoke_probe, probe_cli};
 use crate::agent::external::{
-    ExternalAgentError, ExternalCapability, ExternalRuntimeCapabilities, ExternalRuntimeKind,
+    ExternalAgentError, ExternalRuntimeCapabilities, ExternalRuntimeKind,
 };
 
 use super::OpenCodeConfig;
@@ -58,32 +56,10 @@ use super::OpenCodeConfig;
 /// This is the provider-neutral shape an [`OpenCodeProbeExec`] returns for a
 /// single `opencode <args>` run: whether the process exited successfully and its
 /// captured `stdout` / `stderr` decoded as lossy UTF-8. The probe inspects the
-/// text but never echoes it into an error.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenCodeProbeOutput {
-    /// Whether the process exited with a success status.
-    pub success: bool,
-    /// Captured standard output, decoded lossily.
-    pub stdout: String,
-    /// Captured standard error, decoded lossily.
-    pub stderr: String,
-}
-
-impl OpenCodeProbeOutput {
-    /// Returns the combined `stdout` + `stderr` text.
-    ///
-    /// A CLI may print its `--help` to either stream (or split it across both),
-    /// so feature detection scans the union rather than a single stream.
-    fn combined(&self) -> String {
-        let mut text = String::with_capacity(self.stdout.len() + self.stderr.len() + 1);
-        text.push_str(&self.stdout);
-        if !self.stdout.is_empty() && !self.stderr.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&self.stderr);
-        text
-    }
-}
+/// text but never echoes it into an error. It aliases the shared probe output
+/// type single-sourced in the crate's managed-process plumbing, re-exported
+/// here to keep the runtime's public surface stable.
+pub type OpenCodeProbeOutput = crate::agent::external::process::probe::ProbeOutput;
 
 /// Runs OpenCode probe subcommands, abstracting the real process spawn.
 ///
@@ -125,36 +101,15 @@ impl OpenCodeProbeExec for SystemOpenCodeExec {
         config: &OpenCodeConfig,
         args: &[&str],
     ) -> io::Result<OpenCodeProbeOutput> {
-        let mut command = Command::new(config.binary());
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(dir) = config.working_dir() {
-            command.current_dir(dir);
-        }
-        for (key, value) in config.env() {
-            command.env(key, value);
-        }
-
-        let child = command.spawn()?;
-        let output = match timeout(config.timeout(), child.wait_with_output()).await {
-            Ok(result) => result?,
-            Err(_elapsed) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "opencode probe timed out",
-                ));
-            }
-        };
-
-        Ok(OpenCodeProbeOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
+        invoke_probe(
+            config.binary(),
+            args,
+            config.working_dir(),
+            config.env(),
+            config.timeout(),
+            "opencode probe timed out",
+        )
+        .await
     }
 }
 
@@ -190,9 +145,10 @@ pub async fn probe(
 /// `opencode run --format json` event stream; if the CLI does not advertise both
 /// `--format` and its `json` value on `run`, the probe fails loudly with
 /// [`ExternalAgentError::UnsupportedCapability`] for
-/// [`ExternalCapability::Streaming`] rather than pretending the runtime is
-/// usable. Every other capability is detected conservatively from the help text
-/// and defaults to `false` when not clearly advertised (design §15):
+/// [`ExternalCapability::Streaming`](crate::agent::external::ExternalCapability::Streaming)
+/// rather than pretending the runtime is usable. Every other capability is
+/// detected conservatively from the help text and defaults to `false` when not
+/// clearly advertised (design §15):
 ///
 /// - `permission_bridge` — `--auto` present on `run` (a permission-gating model
 ///   the bridge can drive).
@@ -215,66 +171,16 @@ pub async fn probe_with_exec(
     config: &OpenCodeConfig,
     exec: &dyn OpenCodeProbeExec,
 ) -> Result<ExternalRuntimeCapabilities, ExternalAgentError> {
-    let version = exec
-        .invoke(config, &["--version"])
-        .await
-        .map_err(|error| launch_error(config, "querying --version", &error))?;
-    if !version.success {
-        return Err(ExternalAgentError::Launch {
-            runtime: ExternalRuntimeKind::OpenCode,
-            detail: format!(
-                "opencode binary {} exited unsuccessfully for --version",
-                config.binary().display()
-            ),
-        });
-    }
-
-    let top_help = exec
-        .invoke(config, &["--help"])
-        .await
-        .map_err(|error| launch_error(config, "querying --help", &error))?;
-    let run_help = exec
-        .invoke(config, &["run", "--help"])
-        .await
-        .map_err(|error| launch_error(config, "querying run --help", &error))?;
-
-    let top_text = top_help.combined();
-    let run_text = run_help.combined();
-    if top_text.trim().is_empty() && run_text.trim().is_empty() {
-        return Err(ExternalAgentError::Launch {
-            runtime: ExternalRuntimeKind::OpenCode,
-            detail: format!(
-                "opencode binary {} produced no --help output to probe",
-                config.binary().display()
-            ),
-        });
-    }
-
-    let capabilities = detect_capabilities(&top_text, &run_text);
-    if !capabilities.streaming {
-        return Err(capabilities.unsupported(
-            ExternalCapability::Streaming,
-            "opencode CLI does not advertise `run --format json` structured event stream",
-        ));
-    }
-
-    Ok(capabilities)
-}
-
-/// Builds a classified [`ExternalAgentError::Launch`] from a spawn/timeout error.
-///
-/// The `detail` names the stage and the classified [`io::ErrorKind`] plus the
-/// binary path only; it never embeds the config's environment values or the
-/// CLI's raw output, so a launch failure cannot leak a secret.
-fn launch_error(config: &OpenCodeConfig, stage: &str, error: &io::Error) -> ExternalAgentError {
-    ExternalAgentError::Launch {
-        runtime: ExternalRuntimeKind::OpenCode,
-        detail: format!(
-            "failed launching opencode binary {} while {stage}: {:?}",
-            config.binary().display(),
-            error.kind()
-        ),
-    }
+    probe_cli(
+        async |args: &[&str]| exec.invoke(config, args).await,
+        config.binary(),
+        ExternalRuntimeKind::OpenCode,
+        "opencode",
+        &[&["--help"], &["run", "--help"]],
+        |texts: &[String]| detect_capabilities(&texts[0], &texts[1]),
+        "opencode CLI does not advertise `run --format json` structured event stream",
+    )
+    .await
 }
 
 /// Conservatively derives the managed capabilities from the top-level and `run`

@@ -4,7 +4,11 @@
 //! wiring, but their subprocess lifecycle is intentionally identical: spawn a
 //! managed process group, read newline-delimited stdout with an idle timeout,
 //! close by waiting for a graceful exit and then force-killing the group, and
-//! keep session observations/supported-capability checks consistent.
+//! keep session observations/supported-capability checks consistent. The
+//! managed CLI runtimes additionally share their capability-probe protocol
+//! ([`probe`]) and the envelope of their newline-delimited JSON decoders
+//! ([`jsonl`]); the two one-shot-per-turn runtimes (Codex, OpenCode) further
+//! share their whole session state machine ([`oneshot`]).
 
 // These helpers return the external adapter's canonical error enum to match the
 // surrounding adapter modules. Boxing only here would make the shared API less
@@ -12,6 +16,23 @@
 #![allow(clippy::result_large_err)]
 
 mod group;
+
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
+pub(crate) mod jsonl;
+
+#[cfg(any(feature = "external-codex", feature = "external-opencode"))]
+pub(crate) mod oneshot;
+
+#[cfg(any(
+    feature = "external-claude-code",
+    feature = "external-codex",
+    feature = "external-opencode"
+))]
+pub(crate) mod probe;
 
 use std::io;
 use std::sync::Arc;

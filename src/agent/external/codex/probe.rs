@@ -38,14 +38,12 @@
 //! secret … 的日志/错误必须脱敏").
 
 use std::io;
-use std::process::Stdio;
 
 use async_trait::async_trait;
-use tokio::process::Command;
-use tokio::time::timeout;
 
+use crate::agent::external::process::probe::{invoke_probe, probe_cli};
 use crate::agent::external::{
-    ExternalAgentError, ExternalCapability, ExternalRuntimeCapabilities, ExternalRuntimeKind,
+    ExternalAgentError, ExternalRuntimeCapabilities, ExternalRuntimeKind,
 };
 
 use super::CodexConfig;
@@ -55,32 +53,10 @@ use super::CodexConfig;
 /// This is the provider-neutral shape a [`CodexProbeExec`] returns for a single
 /// `codex <args>` run: whether the process exited successfully and its captured
 /// `stdout` / `stderr` decoded as lossy UTF-8. The probe inspects the text but
-/// never echoes it into an error.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CodexProbeOutput {
-    /// Whether the process exited with a success status.
-    pub success: bool,
-    /// Captured standard output, decoded lossily.
-    pub stdout: String,
-    /// Captured standard error, decoded lossily.
-    pub stderr: String,
-}
-
-impl CodexProbeOutput {
-    /// Returns the combined `stdout` + `stderr` text.
-    ///
-    /// A CLI may print its `--help` to either stream (or split it across both),
-    /// so feature detection scans the union rather than a single stream.
-    fn combined(&self) -> String {
-        let mut text = String::with_capacity(self.stdout.len() + self.stderr.len() + 1);
-        text.push_str(&self.stdout);
-        if !self.stdout.is_empty() && !self.stderr.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&self.stderr);
-        text
-    }
-}
+/// never echoes it into an error. It aliases the shared probe output type
+/// single-sourced in the crate's managed-process plumbing, re-exported here to
+/// keep the runtime's public surface stable.
+pub type CodexProbeOutput = crate::agent::external::process::probe::ProbeOutput;
 
 /// Runs Codex probe subcommands, abstracting the real process spawn.
 ///
@@ -113,36 +89,15 @@ pub struct SystemCodexExec;
 #[async_trait]
 impl CodexProbeExec for SystemCodexExec {
     async fn invoke(&self, config: &CodexConfig, args: &[&str]) -> io::Result<CodexProbeOutput> {
-        let mut command = Command::new(config.binary());
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(dir) = config.working_dir() {
-            command.current_dir(dir);
-        }
-        for (key, value) in config.env() {
-            command.env(key, value);
-        }
-
-        let child = command.spawn()?;
-        let output = match timeout(config.timeout(), child.wait_with_output()).await {
-            Ok(result) => result?,
-            Err(_elapsed) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "codex probe timed out",
-                ));
-            }
-        };
-
-        Ok(CodexProbeOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
+        invoke_probe(
+            config.binary(),
+            args,
+            config.working_dir(),
+            config.env(),
+            config.timeout(),
+            "codex probe timed out",
+        )
+        .await
     }
 }
 
@@ -177,9 +132,10 @@ pub async fn probe(
 /// The managed adapter drives Codex through its structured `codex exec --json`
 /// event stream; if the CLI does not advertise `--json` on `exec`, the probe
 /// fails loudly with [`ExternalAgentError::UnsupportedCapability`] for
-/// [`ExternalCapability::Streaming`] rather than pretending the runtime is
-/// usable. Every other capability is detected conservatively from the help text
-/// and defaults to `false` when not clearly advertised (design §15):
+/// [`ExternalCapability::Streaming`](crate::agent::external::ExternalCapability::Streaming)
+/// rather than pretending the runtime is usable. Every other capability is
+/// detected conservatively from the help text and defaults to `false` when not
+/// clearly advertised (design §15):
 ///
 /// - `permission_bridge` — `--ask-for-approval` or `--sandbox` present.
 /// - `resume` — the `resume` subcommand present.
@@ -200,66 +156,16 @@ pub async fn probe_with_exec(
     config: &CodexConfig,
     exec: &dyn CodexProbeExec,
 ) -> Result<ExternalRuntimeCapabilities, ExternalAgentError> {
-    let version = exec
-        .invoke(config, &["--version"])
-        .await
-        .map_err(|error| launch_error(config, "querying --version", &error))?;
-    if !version.success {
-        return Err(ExternalAgentError::Launch {
-            runtime: ExternalRuntimeKind::Codex,
-            detail: format!(
-                "codex binary {} exited unsuccessfully for --version",
-                config.binary().display()
-            ),
-        });
-    }
-
-    let top_help = exec
-        .invoke(config, &["--help"])
-        .await
-        .map_err(|error| launch_error(config, "querying --help", &error))?;
-    let exec_help = exec
-        .invoke(config, &["exec", "--help"])
-        .await
-        .map_err(|error| launch_error(config, "querying exec --help", &error))?;
-
-    let top_text = top_help.combined();
-    let exec_text = exec_help.combined();
-    if top_text.trim().is_empty() && exec_text.trim().is_empty() {
-        return Err(ExternalAgentError::Launch {
-            runtime: ExternalRuntimeKind::Codex,
-            detail: format!(
-                "codex binary {} produced no --help output to probe",
-                config.binary().display()
-            ),
-        });
-    }
-
-    let capabilities = detect_capabilities(&top_text, &exec_text);
-    if !capabilities.streaming {
-        return Err(capabilities.unsupported(
-            ExternalCapability::Streaming,
-            "codex CLI does not advertise `codex exec --json` structured event stream",
-        ));
-    }
-
-    Ok(capabilities)
-}
-
-/// Builds a classified [`ExternalAgentError::Launch`] from a spawn/timeout error.
-///
-/// The `detail` names the stage and the classified [`io::ErrorKind`] plus the
-/// binary path only; it never embeds the config's environment values or the
-/// CLI's raw output, so a launch failure cannot leak a secret.
-fn launch_error(config: &CodexConfig, stage: &str, error: &io::Error) -> ExternalAgentError {
-    ExternalAgentError::Launch {
-        runtime: ExternalRuntimeKind::Codex,
-        detail: format!(
-            "failed launching codex binary {} while {stage}: {:?}",
-            config.binary().display(),
-            error.kind()
-        ),
-    }
+    probe_cli(
+        async |args: &[&str]| exec.invoke(config, args).await,
+        config.binary(),
+        ExternalRuntimeKind::Codex,
+        "codex",
+        &[&["--help"], &["exec", "--help"]],
+        |texts: &[String]| detect_capabilities(&texts[0], &texts[1]),
+        "codex CLI does not advertise `codex exec --json` structured event stream",
+    )
+    .await
 }
 
 /// Conservatively derives the managed capabilities from the top-level and `exec`

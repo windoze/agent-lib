@@ -86,13 +86,14 @@
 
 use serde_json::{Map, Value};
 
+use crate::agent::external::process::jsonl::JsonlDecoderCore;
+#[cfg(test)]
+use crate::agent::external::process::jsonl::MAX_CONSECUTIVE_NON_JSON_LINES;
 use crate::agent::external::{
     ExternalAgentError, ExternalAgentEvent, ExternalAgentOutput, ExternalObservedEvent,
 };
 use crate::model::tool::ToolStatus;
 use crate::model::usage::Usage;
-
-const MAX_CONSECUTIVE_NON_JSON_LINES: usize = 8;
 
 /// Host-supplied context the decoder needs while turning `opencode run --format
 /// json` frames into observations.
@@ -158,13 +159,10 @@ pub enum OpenCodeDecision {
 #[derive(Debug)]
 pub struct OpenCodeStreamDecoder {
     context: OpenCodeDecodeContext,
-    next_seq: u64,
-    session_id: Option<String>,
+    core: JsonlDecoderCore,
     last_message: Option<String>,
     usage: Usage,
     cost_micros: u64,
-    pending: Vec<ExternalObservedEvent>,
-    consecutive_non_json_lines: usize,
 }
 
 impl OpenCodeStreamDecoder {
@@ -173,13 +171,10 @@ impl OpenCodeStreamDecoder {
     pub fn new(context: OpenCodeDecodeContext) -> Self {
         Self {
             context,
-            next_seq: 0,
-            session_id: None,
+            core: JsonlDecoderCore::new(),
             last_message: None,
             usage: Usage::default(),
             cost_micros: 0,
-            pending: Vec::new(),
-            consecutive_non_json_lines: 0,
         }
     }
 
@@ -196,21 +191,21 @@ impl OpenCodeStreamDecoder {
     /// [`ExternalSessionRef::last_event_seq`]: crate::agent::external::ExternalSessionRef::last_event_seq
     #[must_use]
     pub fn with_next_seq(mut self, next_seq: u64) -> Self {
-        self.next_seq = next_seq;
+        self.core = self.core.with_next_seq(next_seq);
         self
     }
 
     /// Returns the runtime-assigned session id, once a frame has reported one.
     #[must_use]
     pub fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
+        self.core.session_id()
     }
 
     /// Drains the observations buffered since the last drain, transferring
     /// ownership to the caller and leaving the running `seq` untouched.
     #[must_use]
     pub fn take_observations(&mut self) -> Vec<ExternalObservedEvent> {
-        std::mem::take(&mut self.pending)
+        self.core.take_observations()
     }
 
     /// Decodes one raw `opencode run --format json` frame line.
@@ -229,43 +224,26 @@ impl OpenCodeStreamDecoder {
         &mut self,
         line: &str,
     ) -> Result<Option<OpenCodeDecision>, ExternalAgentError> {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let Some((frame_type, frame)) = self.core.parse_frame(line, "opencode run json")? else {
             return Ok(None);
-        }
-
-        let value: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => {
-                self.consecutive_non_json_lines = 0;
-                value
-            }
-            Err(_) => return self.tolerate_non_json_line(),
-        };
-        let Some(frame) = value.as_object() else {
-            return Err(protocol("opencode run json frame is not a JSON object"));
-        };
-        let Some(frame_type) = frame.get("type").and_then(Value::as_str) else {
-            return Err(protocol(
-                "opencode run json frame is missing a string `type`",
-            ));
         };
 
         // OpenCode has no dedicated init frame; the session id rides on every
         // mirrored event, so capture it lazily from the first frame that reports
         // one and announce the session once.
-        self.ensure_session(frame);
+        self.ensure_session(&frame);
 
-        let decision = match frame_type {
+        let decision = match frame_type.as_str() {
             "text" => {
-                self.handle_text(frame)?;
+                self.handle_text(&frame)?;
                 None
             }
             "tool_use" => {
-                self.handle_tool_use(frame)?;
+                self.handle_tool_use(&frame)?;
                 None
             }
-            "step_finish" => self.handle_step_finish(frame)?,
-            "error" => Some(decode_error(frame)),
+            "step_finish" => self.handle_step_finish(&frame)?,
+            "error" => Some(decode_error(&frame)),
             // `step_start` is a pure step boundary, `reasoning` is internal
             // thinking, and any unknown future frame type carries no terminal
             // fact the step-finish/error frames do not already provide.
@@ -278,35 +256,22 @@ impl OpenCodeStreamDecoder {
         Ok(decision)
     }
 
-    fn tolerate_non_json_line(&mut self) -> Result<Option<OpenCodeDecision>, ExternalAgentError> {
-        self.consecutive_non_json_lines = self.consecutive_non_json_lines.saturating_add(1);
-        if self.consecutive_non_json_lines <= MAX_CONSECUTIVE_NON_JSON_LINES {
-            return Ok(None);
-        }
-        Err(protocol(format!(
-            "too many consecutive non-json opencode run json lines ({}/{})",
-            self.consecutive_non_json_lines, MAX_CONSECUTIVE_NON_JSON_LINES
-        )))
-    }
-
     /// Buffers `event` under the next monotonic sequence number.
     fn emit(&mut self, event: ExternalAgentEvent) {
-        self.pending
-            .push(ExternalObservedEvent::new(self.next_seq, event));
-        self.next_seq += 1;
+        self.core.emit(event);
     }
 
     /// Captures the runtime session id from a frame's `sessionID` and emits
     /// [`SessionStarted`](ExternalAgentEvent::SessionStarted) the first time one
     /// is seen.
     fn ensure_session(&mut self, frame: &Map<String, Value>) {
-        if self.session_id.is_some() {
+        if self.core.session_id().is_some() {
             return;
         }
         let Some(session_id) = frame.get("sessionID").and_then(Value::as_str) else {
             return;
         };
-        self.session_id = Some(session_id.to_owned());
+        self.core.set_session_id(session_id.to_owned());
         self.emit(ExternalAgentEvent::SessionStarted {
             session_id: Some(session_id.to_owned()),
         });
