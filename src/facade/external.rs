@@ -87,12 +87,9 @@ mod delegate;
 
 pub(crate) use delegate::drive_external;
 pub use delegate::{
-    ExternalDelegateStatus, ManagedExternalDelegate, RestoreExternal, RetainedExternalSession,
+    ExternalDelegateStatus, ExternalDriveOutcome, ManagedExternalDelegate, RestoreExternal,
+    RetainedExternalSession, run_external_once,
 };
-// Keeps the pre-split `crate::facade::external::ExternalDriveOutcome` path
-// reachable; consumers read it off `drive_external`'s return without naming it.
-#[allow(unused_imports)]
-pub(crate) use delegate::ExternalDriveOutcome;
 
 /// The grade of managed behavior a caller asks a runtime to provide (§11.3).
 ///

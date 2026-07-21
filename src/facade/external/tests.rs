@@ -695,7 +695,6 @@ impl crate::agent::external::AcpLauncher for SilentTurnLauncher {
 /// A worktree manager that hands out synthetic prepared paths and records
 /// every cleanup call, so the test can watch the sweep's worktree wiring
 /// without touching a real filesystem.
-#[cfg(feature = "external-acp")]
 struct RecordingWorktreeManager {
     cleanups: std::sync::Mutex<
         Vec<(
@@ -705,7 +704,6 @@ struct RecordingWorktreeManager {
     >,
 }
 
-#[cfg(feature = "external-acp")]
 impl RecordingWorktreeManager {
     fn new() -> Self {
         Self {
@@ -726,7 +724,6 @@ impl RecordingWorktreeManager {
     }
 }
 
-#[cfg(feature = "external-acp")]
 #[async_trait::async_trait]
 impl crate::agent::external::WorktreeManager for RecordingWorktreeManager {
     async fn prepare(
@@ -764,7 +761,6 @@ impl crate::agent::external::WorktreeManager for RecordingWorktreeManager {
 /// Polls `condition` until it holds or `bound` elapses, returning whether
 /// it held. The M3-R sweep runs as a detached background task, so tests
 /// observe its effects through this instead of racing the spawned task.
-#[cfg(feature = "external-acp")]
 async fn observed_within(bound: std::time::Duration, mut condition: impl FnMut() -> bool) -> bool {
     let start = std::time::Instant::now();
     while !condition() {
@@ -1538,5 +1534,327 @@ async fn default_handler_with_capabilities_fails_fast_when_feature_disabled() {
             );
         }
         other => panic!("expected a fail-fast ExternalAgent error, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M1-1 `run_external_once` one-shot tests — all offline and free of any
+// `external-*` feature: a fake adapter/session behind a real registry stands
+// in for the live runtime.
+// ---------------------------------------------------------------------------
+
+/// How a fake one-shot session answers `advance`.
+#[derive(Clone)]
+enum OnceAdvance {
+    /// Complete the session immediately with this summary.
+    Complete(&'static str),
+    /// Pend forever, modelling a live but silent runtime a cancel abandons
+    /// mid-turn.
+    Hang,
+}
+
+/// A fake runtime adapter whose sessions follow a fixed [`OnceAdvance`]
+/// script and whose `shutdown` calls are counted, so the one-shot tests can
+/// observe the sweep without any `external-*` feature.
+struct OnceFakeAdapter {
+    advance: OnceAdvance,
+    shutdowns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The live session [`OnceFakeAdapter`] starts, keyed `once-sess-1` so the
+/// registry can register it.
+struct OnceFakeSession {
+    advance: OnceAdvance,
+    session: crate::agent::external::ExternalSessionRef,
+    shutdowns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn once_session_ref() -> crate::agent::external::ExternalSessionRef {
+    crate::agent::external::ExternalSessionRef {
+        runtime: crate::agent::ExternalRuntimeKind::ClaudeCode,
+        session_id: Some("once-sess-1".to_owned()),
+        transcript_ref: None,
+        resume_token: None,
+        last_event_seq: None,
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::agent::external::ExternalRuntimeAdapter for OnceFakeAdapter {
+    fn kind(&self) -> crate::agent::ExternalRuntimeKind {
+        crate::agent::ExternalRuntimeKind::ClaudeCode
+    }
+
+    fn capabilities(&self) -> crate::agent::ExternalRuntimeCapabilities {
+        crate::agent::ExternalRuntimeCapabilities::none(self.kind())
+    }
+
+    async fn start(
+        &self,
+        _request: &crate::agent::external::ExternalSessionRequest,
+        _ctx: &crate::agent::RunContext,
+        _sink: Option<std::sync::Arc<dyn crate::agent::external::ExternalEventSink>>,
+    ) -> Result<
+        Box<dyn crate::agent::external::ExternalRuntimeSession>,
+        crate::agent::external::ExternalAgentError,
+    > {
+        Ok(Box::new(OnceFakeSession {
+            advance: self.advance.clone(),
+            session: once_session_ref(),
+            shutdowns: std::sync::Arc::clone(&self.shutdowns),
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::agent::external::ExternalRuntimeSession for OnceFakeSession {
+    fn session_ref(&self) -> crate::agent::external::ExternalSessionRef {
+        self.session.clone()
+    }
+
+    async fn advance(
+        &mut self,
+        _input: &crate::agent::external::ExternalSessionInput,
+        _ctx: &crate::agent::RunContext,
+    ) -> Result<
+        crate::agent::external::RuntimeDecisionPoint,
+        crate::agent::external::ExternalAgentError,
+    > {
+        match &self.advance {
+            OnceAdvance::Complete(summary) => {
+                Ok(crate::agent::external::RuntimeDecisionPoint::Completed {
+                    session: self.session.clone(),
+                    output: crate::agent::external::ExternalAgentOutput {
+                        summary: (*summary).to_owned(),
+                        artifacts: Vec::new(),
+                        usage: None,
+                        cost_micros: None,
+                    },
+                    observations: Vec::new(),
+                })
+            }
+            OnceAdvance::Hang => {
+                std::future::pending::<
+                    Result<
+                        crate::agent::external::RuntimeDecisionPoint,
+                        crate::agent::external::ExternalAgentError,
+                    >,
+                >()
+                .await
+            }
+        }
+    }
+
+    async fn shutdown(&mut self) -> crate::agent::external::ExternalSessionShutdown {
+        self.shutdowns
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::agent::external::ExternalSessionShutdown::Graceful
+    }
+}
+
+/// The one-shot test rig: a managed external agent whose registry-backed
+/// handler drives the fake runtime, plus the observable pieces the tests
+/// assert against.
+struct OnceRig {
+    agent: ManagedExternalAgent,
+    registry: std::sync::Arc<crate::agent::external::ExternalSessionRegistry>,
+    worktrees: std::sync::Arc<RecordingWorktreeManager>,
+    shutdowns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn once_rig(advance: OnceAdvance) -> OnceRig {
+    use crate::agent::external::{
+        ExternalRuntimeAdapter, ExternalSessionRegistry, RegistryExternalSessionHandler,
+        WorktreeManager,
+    };
+    use std::sync::Arc;
+
+    let shutdowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let worktrees = Arc::new(RecordingWorktreeManager::new());
+    let registry = Arc::new(ExternalSessionRegistry::with_worktree_manager(
+        Arc::new(OnceFakeAdapter {
+            advance,
+            shutdowns: std::sync::Arc::clone(&shutdowns),
+        }) as Arc<dyn ExternalRuntimeAdapter>,
+        Arc::clone(&worktrees) as Arc<dyn WorktreeManager>,
+    ));
+    let agent = ManagedExternalAgent::claude_code()
+        .session_handler(Arc::new(RegistryExternalSessionHandler::new(Arc::clone(
+            &registry,
+        ))))
+        .build()
+        .expect("managed external agent builds");
+    OnceRig {
+        agent,
+        registry,
+        worktrees,
+        shutdowns,
+    }
+}
+
+/// M1-1 happy path: the one-shot drive runs the task to completion and
+/// returns the session's final summary as the outcome.
+#[tokio::test]
+async fn run_external_once_completes_and_returns_summary() {
+    use super::run_external_once;
+    use crate::agent::{BudgetLimits, CancellationToken};
+    use crate::facade::ids::FacadeIds;
+
+    let rig = once_rig(OnceAdvance::Complete("refactor done"));
+
+    let outcome = run_external_once(
+        "coder",
+        &rig.agent,
+        &FacadeIds::seeded(21),
+        "refactor the module".to_owned(),
+        None,
+        BudgetLimits::unbounded(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("the one-shot drive completes");
+
+    assert!(outcome.completed);
+    assert_eq!(outcome.summary, "refactor done");
+    assert!(!outcome.cleanup_required);
+}
+
+/// M1-1 reclamation: the delegation drive deliberately leaves a *committed*
+/// session live for reuse; the one-shot wrapper schedules its own detached
+/// sweep, so the registry drains and the session is shut down with its
+/// worktree swept — all without host involvement.
+#[tokio::test]
+async fn run_external_once_completed_sweeps_the_live_session() {
+    use super::run_external_once;
+    use crate::agent::{BudgetLimits, CancellationToken};
+    use crate::facade::ids::FacadeIds;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let rig = once_rig(OnceAdvance::Complete("done"));
+
+    let outcome = run_external_once(
+        "coder",
+        &rig.agent,
+        &FacadeIds::seeded(22),
+        "refactor".to_owned(),
+        None,
+        BudgetLimits::unbounded(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("the one-shot drive completes");
+    assert!(outcome.completed);
+
+    // The drive left the committed session live; the wrapper's sweep is a
+    // detached task that cannot have run yet — the current-thread runtime had
+    // no await point between the call and this assertion.
+    assert_eq!(
+        rig.registry.live_len(),
+        1,
+        "a committed drive keeps its live session until the wrapper's sweep lands"
+    );
+
+    let swept = observed_within(Duration::from_secs(5), || {
+        rig.registry.live_len() == 0
+            && rig.shutdowns.load(Ordering::SeqCst) == 1
+            && rig.worktrees.cleanups().len() == 1
+    })
+    .await;
+    assert!(
+        swept,
+        "the one-shot wrapper's detached sweep reclaimed the completed session"
+    );
+}
+
+/// M1-1 cancel: a cancelled one-shot drive settles promptly with an
+/// uncompleted, cleanup-marked outcome, and the drive's (unchanged)
+/// uncommitted-outcome sweep reclaims the abandoned session.
+#[tokio::test]
+async fn run_external_once_cancel_abandons_and_sweeps_the_live_session() {
+    use super::run_external_once;
+    use crate::agent::{BudgetLimits, CancellationToken};
+    use crate::facade::ids::FacadeIds;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let rig = once_rig(OnceAdvance::Hang);
+
+    let token = CancellationToken::new();
+    let cancel_token = token.clone();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_token.cancel();
+    });
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_external_once(
+            "coder",
+            &rig.agent,
+            &FacadeIds::seeded(23),
+            "refactor".to_owned(),
+            None,
+            BudgetLimits::unbounded(),
+            token,
+        ),
+    )
+    .await
+    .expect("a cancelled one-shot drive settles in seconds, not after the silent runtime")
+    .expect("a cancelled drive still returns its captured outcome");
+    canceller.await.expect("canceller task");
+
+    assert!(!outcome.completed, "a cancelled drive did not complete");
+    assert!(
+        outcome.cleanup_required,
+        "the abandoned session is marked for cleanup"
+    );
+
+    let swept = observed_within(Duration::from_secs(5), || {
+        rig.registry.live_len() == 0
+            && rig.shutdowns.load(Ordering::SeqCst) == 1
+            && rig.worktrees.cleanups().len() == 1
+    })
+    .await;
+    assert!(
+        swept,
+        "the detached sweep force-closed the abandoned session"
+    );
+}
+
+/// M1-1 fail-fast: a managed external agent with no runtime session handler
+/// cannot be driven — the one-shot entry surfaces the same classified
+/// `ExternalAgent` error the delegation drive returns.
+#[tokio::test]
+async fn run_external_once_without_session_handler_fails_fast() {
+    use super::run_external_once;
+    use crate::agent::{BudgetLimits, CancellationToken};
+    use crate::facade::ids::FacadeIds;
+
+    let agent = ManagedExternalAgent::claude_code()
+        .build()
+        .expect("the preset builds without a session handler");
+
+    let error = run_external_once(
+        "coder",
+        &agent,
+        &FacadeIds::seeded(24),
+        "refactor".to_owned(),
+        None,
+        BudgetLimits::unbounded(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("a managed external agent with no session handler cannot be driven");
+
+    match error {
+        FacadeError::ExternalAgent { name, message } => {
+            assert_eq!(name, "coder");
+            assert!(
+                message.contains("no runtime session handler"),
+                "unexpected error message: {message}"
+            );
+        }
+        other => panic!("expected ExternalAgent error, got {other:?}"),
     }
 }

@@ -61,10 +61,11 @@ pub use config::{ModelConfig, ProviderConfig, ProviderConfigBuilder};
 pub use delegate::{AgentWorkerBuilder, Delegation, LocalSubagent};
 pub use error::FacadeError;
 pub use external::{
-    CapabilitySource, ExternalAgentCapabilities, ExternalDelegateStatus, ExternalRunMode,
-    ManagedExternalAgent, ManagedExternalAgentBuilder, ManagedExternalDelegate,
+    CapabilitySource, ExternalAgentCapabilities, ExternalDelegateStatus, ExternalDriveOutcome,
+    ExternalRunMode, ManagedExternalAgent, ManagedExternalAgentBuilder, ManagedExternalDelegate,
     RegistryExternalSessionHandler, RestoreExternal, RetainedExternalSession,
     default_external_session_handler, default_external_session_handler_with_capabilities,
+    run_external_once,
 };
 pub use ids::FacadeIds;
 pub use run::{

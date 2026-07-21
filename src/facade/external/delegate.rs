@@ -5,11 +5,11 @@ use crate::agent::external::{
     ExternalSessionPolicy, ExternalSessionRef, ExternalStreamPolicy, WorktreeIsolation,
 };
 use crate::agent::{
-    AgentError, AgentId, AgentMachine, AgentSpecRef, DrivingSubagentHandler, ExternalRuntimeKind,
-    ExternalSessionHandler, HandlerScope, Interaction, InteractionHandler, LoopCursor,
-    RequirementIds, RequirementKindTag, RequirementResult, RunContext, RunId, ScopePop,
-    SpawnedChild, StepInput, StepOutcome, SubagentHandler, SubagentOutput, SubagentSpawner,
-    ToolSetRef, TraceNodeId, TurnDone, WorktreeRef,
+    AgentError, AgentId, AgentMachine, AgentSpecRef, BudgetLimits, CancellationToken,
+    DrivingSubagentHandler, ExternalRuntimeKind, ExternalSessionHandler, HandlerScope, Interaction,
+    InteractionHandler, LoopCursor, RequirementIds, RequirementKindTag, RequirementResult,
+    RunContext, RunId, ScopePop, SpawnedChild, StepInput, StepOutcome, SubagentHandler,
+    SubagentOutput, SubagentSpawner, ToolSetRef, TraceHandle, TraceNodeId, TurnDone, WorktreeRef,
 };
 use crate::conversation::{Conversation, ConversationConfig};
 use crate::facade::agent::final_turn_summary;
@@ -197,11 +197,13 @@ pub struct RetainedExternalSession {
 
 /// The facts captured from a driven external delegation.
 ///
-/// A [`RecordingExternalMachine`] snapshots these off the
-/// [`ExternalAgentState`] after every step, so the last write reflects the final
-/// state whether the session ran to completion or was abandoned on cancel.
+/// The drive's recording wrapper snapshots these off the
+/// [`ExternalAgentState`] after every step, so the last write reflects the
+/// final state whether the session ran to completion or was abandoned on
+/// cancel. Hosts receive this from [`run_external_once`]; the crate-internal
+/// delegation drive folds it back as the delegation tool result.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ExternalDriveOutcome {
+pub struct ExternalDriveOutcome {
     /// The session's final summary text, folded back as the tool result.
     pub summary: String,
     /// Token usage reported by the runtime for the delegated turn.
@@ -449,6 +451,25 @@ pub(crate) async fn drive_external(
     parent_interaction: Option<Arc<dyn InteractionHandler>>,
     ctx: &RunContext,
 ) -> Result<ExternalDriveOutcome, FacadeError> {
+    drive_external_with_agent_id(name, agent, ids, task, collab, parent_interaction, ctx)
+        .await
+        .map(|(_agent_id, outcome)| outcome)
+}
+
+/// The worker behind [`drive_external`] and [`run_external_once`]: it drives
+/// the delegation with a freshly minted `agent_id` and reports it back to the
+/// caller, so the caller can scope an additional terminal cleanup sweep to
+/// exactly this drive's sessions. See [`drive_external`] for the full
+/// contract.
+async fn drive_external_with_agent_id(
+    name: &str,
+    agent: &ManagedExternalAgent,
+    ids: &FacadeIds,
+    task: String,
+    collab: &CollabBridge,
+    parent_interaction: Option<Arc<dyn InteractionHandler>>,
+    ctx: &RunContext,
+) -> Result<(AgentId, ExternalDriveOutcome), FacadeError> {
     let Some(session_handler) = agent.session_handler() else {
         return Err(FacadeError::ExternalAgent {
             name: name.to_owned(),
@@ -503,44 +524,20 @@ pub(crate) async fn drive_external(
     // M3-2: a drive that did not commit its session — cancel-abandoned
     // (`cleanup_required`) or failed before reaching a terminal cursor — may
     // have left a live runtime in the handler's registry; sweep it so a host
-    // that does nothing extra leaks no subprocess. The freshly minted
-    // `agent_id` scopes the sweep to exactly this drive's sessions, and a
-    // committed drive is left untouched (worktree teardown/retention policy
-    // unchanged). Each swept session's disposition is recorded into the run
-    // trace, best effort, mirroring the adapter mid-session close audit.
-    //
-    // M3-R (F1): the sweep is spawned as a detached `'static` task rather than
-    // awaited inline. This drive future runs inside the outer run's batch under
-    // `fulfill_batch_cancellable`'s `CANCEL_UNWIND_GRACE` (2s), while a
-    // slow-to-die session can take far longer to close (the adapter's
-    // `shutdown_grace` defaults to ~30s: a child may linger after stdin EOF).
-    // An inline await could be dropped mid-sweep when the grace expires —
-    // skipping the process-group SIGTERM→SIGKILL (leaking grandchildren), the
-    // ephemeral worktree sweep, and the trace audit. The handler is an `Arc`,
-    // the ids are owned, and the trace handle is shared, so the spawned sweep
-    // borrows nothing: the drive settles promptly and classified teardown
-    // completes in the background regardless of the outer run's grace.
-    //
-    // M3-R (F2): the trace node id carries the drive's `agent_id` as well as
-    // the outer `run_id`, so two uncommitted external drives swept under one
-    // outer run never mint colliding node ids (the second sweep's audit would
-    // be silently swallowed by the trace's duplicate-id rejection).
+    // that does nothing extra leaks no subprocess. The drive's `agent_id`
+    // scopes the sweep to exactly this drive's sessions, and a committed
+    // drive is left untouched (worktree teardown/retention policy unchanged).
     if !captured.completed {
-        let sweep_handler = Arc::clone(session_handler);
-        let sweep_trace = ctx.trace().clone();
-        let run_id = ctx.run_id();
-        let _sweep = tokio::spawn(async move {
-            let dispositions = sweep_handler.cleanup_agent(agent_id).await;
-            for (seq, disposition) in dispositions.into_iter().enumerate() {
-                let id =
-                    TraceNodeId::new(format!("external-cleanup-sweep/{run_id}/{agent_id}/{seq}"));
-                let _ = sweep_trace.record_external_shutdown(id, disposition);
-            }
-        });
+        spawn_external_cleanup_sweep(
+            Arc::clone(session_handler),
+            ctx.trace().clone(),
+            ctx.run_id(),
+            agent_id,
+        );
     }
 
     match result {
-        RequirementResult::Subagent(Ok(_output)) => Ok(captured),
+        RequirementResult::Subagent(Ok(_output)) => Ok((agent_id, captured)),
         RequirementResult::Subagent(Err(error)) => Err(FacadeError::ExternalAgent {
             name: name.to_owned(),
             message: external_drive_error_message(&error),
@@ -553,6 +550,130 @@ pub(crate) async fn drive_external(
             ),
         }),
     }
+}
+
+/// Spawns the detached `'static` cleanup sweep for one external drive.
+///
+/// Shared by [`drive_external_with_agent_id`] (uncommitted outcomes) and
+/// [`run_external_once`] (additionally the completed one): the drive's
+/// `agent_id` scopes the sweep to exactly that drive's sessions, and each
+/// swept session's disposition is recorded into the run trace, best effort,
+/// mirroring the adapter mid-session close audit.
+///
+/// The sweep is spawned rather than awaited inline (M3-R, F1). A drive future
+/// can run inside an outer run's batch under `fulfill_batch_cancellable`'s
+/// `CANCEL_UNWIND_GRACE` (2s), while a slow-to-die session can take far longer
+/// to close (the adapter's `shutdown_grace` defaults to ~30s: a child may
+/// linger after stdin EOF). An inline await could be dropped mid-sweep when
+/// the grace expires — skipping the process-group SIGTERM→SIGKILL (leaking
+/// grandchildren), the ephemeral worktree sweep, and the trace audit. The
+/// handler is an `Arc`, the ids are owned, and the trace handle is shared, so
+/// the spawned sweep borrows nothing: the drive settles promptly and
+/// classified teardown completes in the background regardless of the outer
+/// run's grace.
+///
+/// The trace node id carries the drive's `agent_id` as well as the outer
+/// `run_id` (M3-R, F2), so two drives swept under one outer run never mint
+/// colliding node ids (the second sweep's audit would be silently swallowed
+/// by the trace's duplicate-id rejection).
+fn spawn_external_cleanup_sweep(
+    session_handler: Arc<dyn ExternalSessionHandler>,
+    trace: TraceHandle,
+    run_id: RunId,
+    agent_id: AgentId,
+) {
+    let _sweep = tokio::spawn(async move {
+        let dispositions = session_handler.cleanup_agent(agent_id).await;
+        for (seq, disposition) in dispositions.into_iter().enumerate() {
+            let id = TraceNodeId::new(format!("external-cleanup-sweep/{run_id}/{agent_id}/{seq}"));
+            let _ = trace.record_external_shutdown(id, disposition);
+        }
+    });
+}
+
+/// Drives one managed external agent through a single self-contained task and
+/// returns its captured [`ExternalDriveOutcome`] — a "launch the runtime → run
+/// one task → collect the final text → reclaim the process" one-shot.
+///
+/// Unlike the crate-internal delegation drive (which the stateful
+/// [`Agent`](crate::facade::Agent) reuses across runs, deliberately keeping a
+/// *committed* session live for reuse), this entry point owns the whole run:
+/// it mints a fresh root [`RunContext`] from `budget` and `cancel` — a
+/// one-shot call has no parent chain — and drives with collaboration
+/// reflection disabled (the default `CollabBridge` is an inactive no-op).
+/// `parent_interaction`, when present, answers the external runtime's
+/// permission prompts with delegate attribution, exactly as the delegation
+/// drive routes them.
+///
+/// # Reclamation guarantee
+///
+/// The runtime's session/process is reclaimed at **every** terminal state of
+/// the call, so a host that does nothing extra leaks no subprocess:
+///
+/// - **failed / cancelled** — swept by the drive itself (its unchanged
+///   semantics: `cleanup_required` or a pre-terminal failure schedules the
+///   detached cleanup);
+/// - **completed** — the drive leaves its live session registered for reuse,
+///   so this wrapper schedules the same detached sweep for it; a one-shot
+///   caller has no later run that could reuse the session and no
+///   [`Agent`](crate::facade::Agent) drop to catch it.
+///
+/// The sweep runs as a detached background task: the call returns as soon as
+/// the outcome lands, while classified teardown (transport close,
+/// process-group termination, worktree sweep, trace audit) completes in the
+/// background.
+///
+/// # Errors
+///
+/// Returns [`FacadeError::ExternalAgent`] when `agent` has no runtime session
+/// handler attached — attach one with
+/// [`ManagedExternalAgentBuilder::session_handler`](crate::facade::ManagedExternalAgentBuilder::session_handler),
+/// or build with
+/// [`build_with_default_session_handler`](crate::facade::ManagedExternalAgentBuilder::build_with_default_session_handler)
+/// — or when the drive fails before reaching a terminal cursor.
+pub async fn run_external_once(
+    name: &str,
+    agent: &ManagedExternalAgent,
+    ids: &FacadeIds,
+    task: String,
+    parent_interaction: Option<Arc<dyn InteractionHandler>>,
+    budget: BudgetLimits,
+    cancel: CancellationToken,
+) -> Result<ExternalDriveOutcome, FacadeError> {
+    let ctx = RunContext::new_root_with_cancellation(
+        ids.run_id(),
+        budget,
+        ids.trace_root("external-once"),
+        cancel,
+    );
+    let (agent_id, outcome) = drive_external_with_agent_id(
+        name,
+        agent,
+        ids,
+        task,
+        &CollabBridge::default(),
+        parent_interaction,
+        &ctx,
+    )
+    .await?;
+
+    // One-shot reclamation (see the doc above): the drive sweeps only
+    // *uncommitted* outcomes, so the wrapper schedules the same detached sweep
+    // for a completed one — the one-shot caller has no later run that could
+    // reuse the session and no `Agent` drop to catch it. The handler is
+    // necessarily attached: the drive could not have completed without one.
+    if outcome.completed
+        && let Some(session_handler) = agent.session_handler()
+    {
+        spawn_external_cleanup_sweep(
+            Arc::clone(session_handler),
+            ctx.trace().clone(),
+            ctx.run_id(),
+            agent_id,
+        );
+    }
+
+    Ok(outcome)
 }
 
 /// Renders external drive failures with a targeted interaction-routing message.
