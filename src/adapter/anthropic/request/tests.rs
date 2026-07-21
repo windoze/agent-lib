@@ -295,6 +295,64 @@ fn each_tool_status_maps_to_anthropic_error_boolean_without_mutating_source() {
 }
 
 #[test]
+fn adjacent_tool_result_messages_coalesce_into_one_user_message() {
+    let tool_use = |id: &str| ContentBlock::ToolUse {
+        id: id.to_owned(),
+        name: "read_file".to_owned(),
+        input: json!({ "path": "README.md" }),
+        extra: empty_extra(),
+    };
+    let tool_result = |id: &str| Message {
+        role: Role::Tool,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: id.to_owned(),
+            content: vec![ContentBlock::Text {
+                text: format!("contents for {id}"),
+                extra: empty_extra(),
+            }],
+            status: ToolStatus::Ok,
+            extra: empty_extra(),
+        }],
+    };
+    let mut chat = minimal_request();
+    chat.messages = vec![
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "read these".to_owned(),
+                extra: empty_extra(),
+            }],
+        },
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                tool_use("call_00"),
+                tool_use("call_01"),
+                tool_use("call_02"),
+            ],
+        },
+        tool_result("call_00"),
+        tool_result("call_01"),
+        tool_result("call_02"),
+    ];
+
+    let body = serialize_body(&chat).expect("serialize parallel tool results");
+    let messages = body["messages"].as_array().expect("messages array");
+
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1]["role"], json!("assistant"));
+    assert_eq!(messages[2]["role"], json!("user"));
+    let results = messages[2]["content"].as_array().expect("merged content");
+    assert_eq!(
+        results
+            .iter()
+            .map(|block| block["tool_use_id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("call_00"), json!("call_01"), json!("call_02")]
+    );
+}
+
+#[test]
 fn unknown_content_block_request_serializes_raw_value() {
     let raw = json!({
         "type": "future_block",

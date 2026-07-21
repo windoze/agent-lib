@@ -59,7 +59,7 @@ struct AnthropicMessage {
 }
 
 /// Roles accepted in the Anthropic `messages` array.
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum AnthropicRole {
     User,
@@ -68,12 +68,21 @@ enum AnthropicRole {
 
 /// Serializes one normalized request and performs the final extras merge.
 fn serialize_body(request: &ChatRequest) -> Result<Value, ClientError> {
-    let messages = request
-        .messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| message_to_wire(index, message))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut messages: Vec<AnthropicMessage> = Vec::new();
+    for (index, message) in request.messages.iter().enumerate() {
+        let wire = message_to_wire(index, message)?;
+        // Adjacent normalized messages can share a wire role (parallel tool
+        // calls commit one `Role::Tool` message per result). Anthropic and
+        // Anthropic-compatible endpoints require every `tool_use` to be
+        // answered by a `tool_result` in the single immediately following
+        // message, so coalesce same-role neighbours into one message.
+        match messages.last_mut() {
+            Some(previous) if previous.role == wire.role => {
+                previous.content.extend(wire.content);
+            }
+            _ => messages.push(wire),
+        }
+    }
     let wire = AnthropicRequestBody {
         model: &request.model,
         messages,
