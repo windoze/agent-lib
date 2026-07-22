@@ -9,10 +9,6 @@
 //!
 //! The terminal `data: [DONE]` sentinel is not a chunk: the normalizer
 //! recognizes it before JSON decoding so it never reaches [`decode`].
-//!
-//! M3-1 only decodes these views to validate chunk framing; their fields are
-//! first read by the M3-2 state machine. The per-struct `#[allow(dead_code)]`
-//! annotations are transitional and are removed once M3-2 consumes each field.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -21,7 +17,6 @@ use serde_json::Value;
 ///
 /// `choices` is empty on the standalone usage chunk emitted after
 /// `include_usage`; otherwise it carries exactly one choice at index 0.
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(super) struct DecodedChunk {
     /// Incremental choices; empty on the terminal usage-only chunk.
@@ -34,7 +29,6 @@ pub(super) struct DecodedChunk {
 }
 
 /// One streaming choice, carrying a delta and an optional terminal reason.
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(super) struct Choice {
     /// Incremental message fields for this choice.
@@ -49,10 +43,9 @@ pub(super) struct Choice {
 /// Every field is optional: the first chunk typically carries `role`, content
 /// chunks carry `content` or `reasoning_content`, and tool-call chunks carry
 /// `tool_calls` keyed by `index`.
-#[allow(dead_code)]
 #[derive(Default, Debug, Deserialize)]
 pub(super) struct Delta {
-    /// Role tag, present on the first chunk of a choice.
+    /// Role tag, present on the first chunk of a choice (always `assistant`).
     #[serde(default)]
     pub(super) role: Option<String>,
     /// Assistant-visible text fragment.
@@ -70,7 +63,6 @@ pub(super) struct Delta {
 ///
 /// `id` and `function.name` appear only on the first chunk for an index;
 /// subsequent chunks carry further `function.arguments` string fragments.
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(super) struct ToolCallDelta {
     /// Positional key identifying which tool call this fragment belongs to.
@@ -84,7 +76,6 @@ pub(super) struct ToolCallDelta {
 }
 
 /// Incremental function-call fields within a tool-call delta.
-#[allow(dead_code)]
 #[derive(Default, Debug, Deserialize)]
 pub(super) struct FunctionDelta {
     /// Tool name, present only on the first fragment for an index.

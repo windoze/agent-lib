@@ -1,13 +1,21 @@
-//! Focused tests for Chat/Completions SSE normalization.
+//! Stateful chunk-to-event tests for Chat/Completions SSE normalization.
 //!
-//! M3-1 covers the terminal skeleton: the `[DONE]` sentinel ends the stream
-//! normally without a JSON parse error, and the `event:` field is not checked
-//! against any payload discriminator. Full per-field event production
-//! (text / reasoning / tool deltas, usage, terminal stop reason) and fixture
-//! end-to-end comparison arrive in M3-3.
+//! Each test feeds an inline SSE byte string through the full
+//! `normalize_sse` pipeline (split on an uneven chunk pattern) and asserts the
+//! exact [`StreamEvent`] sequence the M3-2 state machine produces, covering the
+//! six scenarios from design doc §4.4: text, reasoning, single tool call,
+//! parallel interleaved tool calls, terminal usage, and the `finish_reason`
+//! stop-reason table, plus the `[DONE]` / EOF error paths.
 
 use super::*;
-use crate::{client::ClientError, stream::StreamEvent};
+use crate::{
+    model::{
+        message::Role,
+        normalized::{Normalized, StopReason},
+        usage::Usage,
+    },
+    stream::{BlockId, BlockKind, Delta},
+};
 use futures::{TryStreamExt, stream};
 use std::convert::Infallible;
 
@@ -15,8 +23,8 @@ use std::convert::Infallible;
 ///
 /// The repeating uneven chunk sizes exercise UTF-8 and SSE-line splits so tests
 /// do not depend on HTTP chunk boundaries.
-async fn decode_fixture(fixture: &str) -> Result<Vec<StreamEvent>, ClientError> {
-    let chunks = irregular_chunks(fixture.as_bytes());
+async fn decode_fixture(fixture: impl AsRef<str>) -> Result<Vec<StreamEvent>, ClientError> {
+    let chunks = irregular_chunks(fixture.as_ref().as_bytes());
     let source = stream::iter(chunks.into_iter().map(Ok::<_, Infallible>));
     normalize_sse(source, |never| match never {})
         .try_collect()
@@ -38,20 +46,345 @@ fn irregular_chunks(bytes: &[u8]) -> Vec<Vec<u8>> {
     chunks
 }
 
-/// A `data: [DONE]` sentinel ends the stream normally, and the non-JSON
-/// sentinel itself never surfaces as a parse error (design doc §4.4.1).
+/// Builds an SSE body from chunk JSON payloads terminated by `[DONE]`.
+fn sse(chunks: &[&str]) -> String {
+    let mut fixture = String::new();
+    for chunk in chunks {
+        fixture.push_str("data: ");
+        fixture.push_str(chunk);
+        fixture.push_str("\n\n");
+    }
+    fixture.push_str("data: [DONE]\n\n");
+    fixture
+}
+
+/// A plain text stream opens one text block, appends deltas, stops it, and ends
+/// with a message stop carrying the `finish_reason` (design doc §4.4.3).
 #[tokio::test]
-async fn done_sentinel_terminates_stream_without_json_error() {
-    let fixture = concat!(
-        "data: {\"id\":\"chatcmpl-done\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
-        "data: [DONE]\n\n",
+async fn text_stream_emits_text_block_then_message_stop() {
+    let fixture = sse(&[
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}"#,
+    ]);
+    let events = decode_fixture(fixture).await.expect("text stream decodes");
+    let text = BlockId::new("text");
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::MessageStart {
+                role: Role::Assistant,
+            },
+            StreamEvent::BlockStart {
+                id: text.clone(),
+                kind: BlockKind::Text,
+            },
+            StreamEvent::BlockDelta {
+                id: text.clone(),
+                delta: Delta::Text("Hello".to_owned()),
+            },
+            StreamEvent::BlockDelta {
+                id: text.clone(),
+                delta: Delta::Text(" world".to_owned()),
+            },
+            StreamEvent::BlockStop { id: text },
+            StreamEvent::MessageStop {
+                stop_reason: Normalized::from_mapped(StopReason::EndTurn, "stop"),
+            },
+        ]
     );
+}
+
+/// `reasoning_content` opens a reasoning block (no signature) that precedes the
+/// text block, matching the wire field order (design doc §4.4.3).
+#[tokio::test]
+async fn reasoning_stream_emits_reasoning_block_before_text() {
+    let fixture = sse(&[
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"reasoning_content":"th"},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"reasoning_content":"ink"},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}]}"#,
+    ]);
     let events = decode_fixture(fixture)
         .await
-        .expect("the [DONE] sentinel must terminate the stream cleanly");
-    // M3-1 skeleton produces no normalized events yet (M3-2 fills these in);
-    // the assertion here is that the stream ends without error.
-    assert!(events.is_empty());
+        .expect("reasoning stream decodes");
+    let reasoning = BlockId::new("reasoning");
+    let text = BlockId::new("text");
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::MessageStart {
+                role: Role::Assistant,
+            },
+            StreamEvent::BlockStart {
+                id: reasoning.clone(),
+                kind: BlockKind::Reasoning,
+            },
+            StreamEvent::BlockDelta {
+                id: reasoning.clone(),
+                delta: Delta::Reasoning("th".to_owned()),
+            },
+            StreamEvent::BlockDelta {
+                id: reasoning.clone(),
+                delta: Delta::Reasoning("ink".to_owned()),
+            },
+            StreamEvent::BlockStart {
+                id: text.clone(),
+                kind: BlockKind::Text,
+            },
+            StreamEvent::BlockDelta {
+                id: text.clone(),
+                delta: Delta::Text("answer".to_owned()),
+            },
+            StreamEvent::BlockStop {
+                id: reasoning.clone(),
+            },
+            StreamEvent::BlockStop { id: text },
+            StreamEvent::MessageStop {
+                stop_reason: Normalized::from_mapped(StopReason::EndTurn, "stop"),
+            },
+        ]
+    );
+}
+
+/// A single tool call opens its block on the first fragment (carrying `id` and
+/// `function.name`) and appends raw argument fragments; the JSON is never parsed
+/// mid-stream — no `ToolInputAvailable` event is emitted (design doc §4.4.2).
+#[tokio::test]
+async fn single_tool_call_streams_argument_fragments_without_parsing() {
+    let fixture = sse(&[
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"SF\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+    ]);
+    let events = decode_fixture(fixture).await.expect("tool stream decodes");
+    let tool = BlockId::new("tool-call-0");
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::MessageStart {
+                role: Role::Assistant,
+            },
+            StreamEvent::BlockStart {
+                id: tool.clone(),
+                kind: BlockKind::ToolInput {
+                    tool_name: "get_weather".to_owned(),
+                    tool_call_id: "call_1".to_owned(),
+                },
+            },
+            StreamEvent::BlockDelta {
+                id: tool.clone(),
+                delta: Delta::Json(r#"{"city":"#.to_owned()),
+            },
+            StreamEvent::BlockDelta {
+                id: tool.clone(),
+                delta: Delta::Json(r#""SF"}"#.to_owned()),
+            },
+            StreamEvent::BlockStop { id: tool },
+            StreamEvent::MessageStop {
+                stop_reason: Normalized::from_mapped(StopReason::ToolUse, "tool_calls"),
+            },
+        ]
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolInputAvailable { .. })),
+        "arguments must not be parsed mid-stream"
+    );
+}
+
+/// Two interleaved `index` values keep independent tool-input blocks keyed by
+/// their wire `index`, so parallel tool calls accumulate correctly (§4.4.2).
+#[tokio::test]
+async fn parallel_tool_calls_interleave_by_index() {
+    let fixture = sse(&[
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"f0","arguments":""}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"c1","type":"function","function":{"name":"f1","arguments":""}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":"}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"b\":"}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":null}]}"#,
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]},"finish_reason":"tool_calls"}]}"#,
+    ]);
+    let events = decode_fixture(fixture)
+        .await
+        .expect("parallel tool stream decodes");
+    let tool0 = BlockId::new("tool-call-0");
+    let tool1 = BlockId::new("tool-call-1");
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::MessageStart {
+                role: Role::Assistant,
+            },
+            StreamEvent::BlockStart {
+                id: tool0.clone(),
+                kind: BlockKind::ToolInput {
+                    tool_name: "f0".to_owned(),
+                    tool_call_id: "c0".to_owned(),
+                },
+            },
+            StreamEvent::BlockStart {
+                id: tool1.clone(),
+                kind: BlockKind::ToolInput {
+                    tool_name: "f1".to_owned(),
+                    tool_call_id: "c1".to_owned(),
+                },
+            },
+            StreamEvent::BlockDelta {
+                id: tool0.clone(),
+                delta: Delta::Json(r#"{"a":"#.to_owned()),
+            },
+            StreamEvent::BlockDelta {
+                id: tool1.clone(),
+                delta: Delta::Json(r#"{"b":"#.to_owned()),
+            },
+            StreamEvent::BlockDelta {
+                id: tool0.clone(),
+                delta: Delta::Json("1}".to_owned()),
+            },
+            StreamEvent::BlockDelta {
+                id: tool1.clone(),
+                delta: Delta::Json("2}".to_owned()),
+            },
+            StreamEvent::BlockStop { id: tool0 },
+            StreamEvent::BlockStop { id: tool1 },
+            StreamEvent::MessageStop {
+                stop_reason: Normalized::from_mapped(StopReason::ToolUse, "tool_calls"),
+            },
+        ]
+    );
+}
+
+/// The terminal usage chunk (empty `choices`) emits one additive usage segment
+/// ahead of the deferred message stop (design doc §4.4.4).
+#[tokio::test]
+async fn terminal_usage_chunk_emits_additive_usage_before_stop() {
+    let fixture = sse(&[
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#,
+        r#"{"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":12,"total_tokens":21}}"#,
+    ]);
+    let events = decode_fixture(fixture)
+        .await
+        .expect("usage stream decodes");
+    let text = BlockId::new("text");
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::MessageStart {
+                role: Role::Assistant,
+            },
+            StreamEvent::BlockStart {
+                id: text.clone(),
+                kind: BlockKind::Text,
+            },
+            StreamEvent::BlockDelta {
+                id: text.clone(),
+                delta: Delta::Text("hi".to_owned()),
+            },
+            StreamEvent::Usage(Usage {
+                input: 9,
+                output: 12,
+                total: Some(21),
+                ..Usage::default()
+            }),
+            StreamEvent::BlockStop { id: text },
+            StreamEvent::MessageStop {
+                stop_reason: Normalized::from_mapped(StopReason::EndTurn, "stop"),
+            },
+        ]
+    );
+}
+
+/// Every `finish_reason` value maps through the shared §4.3 table, including an
+/// unknown value and an absent one.
+#[tokio::test]
+async fn finish_reason_maps_each_value_to_stop_reason() {
+    let cases: [(&str, Normalized<StopReason>); 5] = [
+        ("stop", Normalized::from_mapped(StopReason::EndTurn, "stop")),
+        (
+            "length",
+            Normalized::from_mapped(StopReason::MaxTokens, "length"),
+        ),
+        (
+            "tool_calls",
+            Normalized::from_mapped(StopReason::ToolUse, "tool_calls"),
+        ),
+        (
+            "content_filter",
+            Normalized::from_mapped(StopReason::Refusal, "content_filter"),
+        ),
+        ("weird", Normalized::unknown("weird")),
+    ];
+
+    for (finish_reason, expected) in cases {
+        let chunk = format!(
+            r#"{{"choices":[{{"index":0,"delta":{{"content":"x"}},"finish_reason":"{finish_reason}"}}]}}"#
+        );
+        let fixture = sse(&[&chunk]);
+        let events = decode_fixture(fixture)
+            .await
+            .expect("finish_reason stream decodes");
+        let stop_reason = events.iter().find_map(|event| match event {
+            StreamEvent::MessageStop { stop_reason } => Some(stop_reason.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            stop_reason,
+            Some(expected),
+            "finish_reason `{finish_reason}`"
+        );
+    }
+
+    // A missing finish_reason maps to `Other` with no retained raw value.
+    let fixture =
+        sse(&[r#"{"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}"#]);
+    let events = decode_fixture(fixture)
+        .await
+        .expect("null finish_reason stream decodes");
+    let stop_reason = events.iter().find_map(|event| match event {
+        StreamEvent::MessageStop { stop_reason } => Some(stop_reason.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        stop_reason,
+        Some(Normalized::without_raw(StopReason::Other))
+    );
+}
+
+/// The `data: [DONE]` sentinel closes every open block and emits the cached
+/// message stop, without surfacing the non-JSON sentinel as a parse error.
+#[tokio::test]
+async fn done_sentinel_closes_open_blocks_and_emits_message_stop() {
+    let fixture = sse(&[
+        r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#,
+    ]);
+    let events = decode_fixture(fixture)
+        .await
+        .expect("[DONE] must terminate the stream cleanly");
+    let text = BlockId::new("text");
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::MessageStart {
+                role: Role::Assistant,
+            },
+            StreamEvent::BlockStart {
+                id: text.clone(),
+                kind: BlockKind::Text,
+            },
+            StreamEvent::BlockDelta {
+                id: text.clone(),
+                delta: Delta::Text("hi".to_owned()),
+            },
+            StreamEvent::BlockStop { id: text },
+            StreamEvent::MessageStop {
+                stop_reason: Normalized::from_mapped(StopReason::EndTurn, "stop"),
+            },
+        ]
+    );
 }
 
 /// The SSE `event:` field is accepted without an event/type consistency check;
@@ -60,20 +393,45 @@ async fn done_sentinel_terminates_stream_without_json_error() {
 async fn message_event_field_is_not_checked_for_consistency() {
     let fixture = concat!(
         "event: message\n",
-        "data: {\"id\":\"chatcmpl-event\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
         "event: message\n",
         "data: [DONE]\n\n",
     );
     let events = decode_fixture(fixture)
         .await
         .expect("event: message must not be treated as a mismatch");
-    assert!(events.is_empty());
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::MessageStop { .. })),
+        "event: message must still produce a message stop"
+    );
+}
+
+/// A stream with only the sentinel still emits a message start and stop.
+#[tokio::test]
+async fn empty_stream_emits_message_start_and_stop() {
+    let fixture = "data: [DONE]\n\n";
+    let events = decode_fixture(fixture)
+        .await
+        .expect("empty stream decodes");
+    assert_eq!(
+        events,
+        vec![
+            StreamEvent::MessageStart {
+                role: Role::Assistant,
+            },
+            StreamEvent::MessageStop {
+                stop_reason: Normalized::without_raw(StopReason::Other),
+            },
+        ]
+    );
 }
 
 /// A stream that ends without a `[DONE]` sentinel surfaces as a protocol error.
 #[tokio::test]
 async fn premature_eof_without_done_sentinel_is_a_protocol_error() {
-    let fixture = "data: {\"id\":\"chatcmpl-eof\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"deepseek-chat\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n";
+    let fixture = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n";
     let error = decode_fixture(fixture)
         .await
         .expect_err("a stream without [DONE] must not end cleanly");
@@ -81,8 +439,21 @@ async fn premature_eof_without_done_sentinel_is_a_protocol_error() {
     assert!(error.to_string().contains("[DONE]"));
 }
 
-/// The chunk wire view decodes every delta shape the state machine will need in
-/// M3-2: assistant text, reasoning content, indexed tool-call fragments, and the
+/// A non-`assistant` role is rejected as a protocol error.
+#[tokio::test]
+async fn non_assistant_role_is_a_protocol_error() {
+    let fixture = sse(&[
+        r#"{"choices":[{"index":0,"delta":{"role":"system","content":"x"},"finish_reason":"stop"}]}"#,
+    ]);
+    let error = decode_fixture(fixture)
+        .await
+        .expect_err("a non-assistant role must be rejected");
+    assert!(matches!(error, ClientError::Protocol(_)));
+    assert!(error.to_string().contains("assistant"));
+}
+
+/// The chunk wire view decodes every delta shape the state machine consumes:
+/// assistant text, reasoning content, indexed tool-call fragments, and the
 /// terminal usage-only chunk.
 #[test]
 fn wire_decodes_each_delta_shape() {

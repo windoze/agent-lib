@@ -750,7 +750,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 无 breaking change：`mod.rs` 替换的是 M1-2 的 `ClientError::Other` 占位桩，`chat_stream` 签名不变；
   其余为纯新增 `pub(super)`/私有文件。`common/` 零改动。
 
-### M3-2 [TODO] 流式状态机：normalizer.rs（文本/reasoning/工具增量/终态）
+### M3-2 [DONE] 流式状态机：normalizer.rs（文本/reasoning/工具增量/终态）
 
 上下文：
 
@@ -792,6 +792,81 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
      的 stop_reason 正确；
   6. EOF 无 `[DONE]` → `incomplete_error`。
 - `cargo test -p agent-lib --lib adapter::openai_chat` 通过。
+
+完成记录（2026-07-23）：
+
+核心设计决策（逐条对 §4.4 关键差异 + 验证条件）：
+
+1. **MessageStop 延迟到 `[DONE]`**（关键，解决 wire 顺序矛盾）：usage chunk 在 `finish_reason`
+   之后到达（空 `choices` 独立 chunk），而 accumulator 契约要求 `Usage` 不能落在 `MessageStop`
+   之后（`EventAfterMessageStop`）。故 `finish_reason` chunk **只缓存 `stop_reason`**（复用
+   `normalize_finish_reason`），usage chunk 到达即发 `Usage`，`[DONE]` 时 flush：关闭所有打开的
+   block + 发 `MessageStop`。`stop_reason` 仍来自 `finish_reason`（符合 §4.4.4「由末 chunk 的
+   finish_reason 发 MessageStop」语义），且 `Usage` 严格在 `MessageStop` 前（accumulator 不报错）。
+   EOF 无 `[DONE]` 走 `incomplete_error`，不 flush（不完整流）。
+2. **每 kind 一个活跃 block + 统一 `[DONE]` 关闭**：`active_text`/`active_reasoning: Option<BlockId>`。
+   `content` 续接同一 text block，`reasoning_content` 续接同一 reasoning block（DeepSeek 实际流
+   reasoning 全→content 全，各只开一次，折叠后 content 顺序 = reasoning→text，与非流式 convert 一致）。
+   block id：`text`/`reasoning`/`tool-call-{wire_index}`（位置派生稳定 id，先例 `anthropic-block-{index}`）。
+   统一在 `[DONE]` 关闭（固定序 reasoning→text→tools by index），不在中途关，避免字段切换的开关复杂度。
+3. **不发 `ToolInputAvailable`**（严格遵循 §4.4.2「`BlockStart(ToolInput)+Delta::Json+BlockStop`，
+   绝不中途解析 JSON」）：适配器**零 JSON 解析**，让 accumulator 在 `BlockStop` 时自己解析 accumulated
+   arguments（合法 fixture 下与非流式 `ToolUse` 一致）。与 `openai_resp` 不同（Responses 有
+   `function_call_arguments.done` 显式边界才发 `ToolInputAvailable`），chat/completions 无此边界。
+   测试 `single_tool_call_streams_argument_fragments_without_parsing` 显式断言事件序列无 `ToolInputAvailable`。
+4. **tool_call 首片**：`id`/`function.name` 只在首 chunk（§4.4.2），`index` 首次出现 = 首片，必须带
+   `id`+`function.name`（缺任一→`ClientError::Protocol`），开 `BlockStart(ToolInput{tool_name,tool_call_id})`；
+   后续片（同 `index`）只发 `Delta::Json`（arguments 非空时）。多 `index` 并行按 wire `index` 独立维护
+   `Vec<ToolCallState{index, block_id}>`，交错到达各自续接（测试 `parallel_tool_calls_interleave_by_index`）。
+5. **role**：固定 `Role::Assistant`（chat/completions assistant 响应），但读 `delta.role` 字段验证
+   若存在须为 `"assistant"`（移除 wire.rs role 的过渡 `#[allow(dead_code)]`，对齐 M2-1 `convert_message`
+   的 role 验证）。
+
+- **finish_reason 复用（无漂移）**：`normalize_finish_reason`（`response/convert.rs`）从 `pub(super)` 改
+  `pub(crate)`；`response.rs` 的 `mod convert;` 改 `pub(crate) mod convert;`（其内部其余 `pub(super)`/私有
+  helper 仍只在 response 可见，仅 `normalize_finish_reason` 对 crate 暴露）。stream 经
+  `crate::adapter::openai_chat::response::convert::normalize_finish_reason` 引用，响应侧与流式终态共用同一份
+  §4.3 映射表，无复制粘贴漂移。
+- **wire.rs**：移除 5 个 struct 的过渡 `#[allow(dead_code)]`（M3-2 状态机读取所有字段），更新模块文档
+  （删 M3-1 过渡说明）。
+- **normalizer.rs**：`StreamNormalizer` 状态 `{ terminal, message_started, active_text, active_reasoning,
+  tool_calls: Vec<ToolCallState>, stop_reason: Option<Normalized<StopReason>> }`。`translate`：terminal→报错；
+  `[DONE]`→`ensure_message_started`+`close_open_blocks`+`MessageStop`(cached/`without_raw(Other)`)；否则 `decode`
+  →usage 即时发 `Usage`→`choices[0]` `translate_choice`（`MessageStart` + role 验证 + content/reasoning/tool_calls
+  增量 + `finish_reason` 缓存）。`is_terminal`/`incomplete_error` 沿用 M3-1。
+- **decoder.rs / stream/mod.rs 零改动**：`translate`/`is_terminal`/`incomplete_error` 签名不变，
+  `impl SseNormalizer` 委托照旧，`chat_stream` 接线（M3-1）不动。
+
+验证结果（全绿）：
+
+- `cargo fmt --all`（无 diff）；
+- `cargo clippy --all-targets -- -D warnings`；
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+- `cargo test -p agent-lib --lib adapter::openai_chat`（40 通过：28 既有 request/response/mod/transport +
+  12 stream，0.02s 秒级）；
+- `cargo test --all --all-targets`（全部 `test result:` 行 `0 failed`，lib 1094→1102 +8，集成/replay/smoke
+  套件全绿，无回归）；
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
+
+12 个 stream 测试（inline SSE 字符串经 `decode_fixture` 端到端，**不依赖 `.sse` fixture 文件**，断言精确
+`StreamEvent` 序列）覆盖 6 场景 + finish_reason 全表 + role/空流：① 纯文本流（text block + Delta::Text* +
+BlockStop + MessageStop）② reasoning 流（BlockKind::Reasoning + Delta::Reasoning，reasoning→text 顺序）③
+单工具调用（首片 BlockStart(ToolInput{name,id})、arguments 逐片 Delta::Json、末尾 BlockStop、**中途无 JSON
+解析/无 ToolInputAvailable**）④ 两个 index 交错并行工具调用 ⑤ 空 choices usage chunk → 加性 `Usage`
+（finish_reason 后到达却在 MessageStop 前）⑥ finish_reason 全表（stop/length/tool_calls/content_filter/未知
+→unknown/缺失→without_raw(Other)）⑦ `[DONE]` 关闭 block + MessageStop ⑧ `event: message` 不触发一致性错
+⑨ 空流（仅 `[DONE]`）→ MessageStart + MessageStop ⑩ EOF 无 `[DONE]` → `Protocol` 含 "[DONE]" ⑪ 非 assistant
+role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fixture` 签名改 `impl AsRef<str>`
+（String/&str 都传，消除 needless_borrow）。
+
+- **显式留给 M3-3**（避免重复或漏做）：`stream/tests/fixtures/*.sse`（脱敏录屏，`include_str!`）+
+  `parsing.rs`（不规则字节分块 `[1,2,7,3,19,5,11]` 喂完整管线 + `Accumulator` 折叠与 M2 非流式 `parse_response`
+  对照：文本/reasoning/tool_use/stop_reason/usage）+ `errors.rs`（哨兵终止/EOF 报错/SSE 错误帧）+ `transport.rs`
+  （一次性 TcpListener SSE）。M3-2 的 inline 测试已钉死状态机正确性（单 chunk 序列 → 精确事件），M3-3 在其上加
+  录屏级端到端 + 折叠一致性对照。
+- 无 breaking change：`mod convert;`→`pub(crate) mod convert;` 与 `normalize_finish_reason` `pub(super)`→`pub(crate)`
+  均为**放宽可见性**（向后兼容）；`wire.rs` 移除的是过渡 `#[allow(dead_code)]` 而非 API；其余纯新增 `pub(super)`/私有
+  字段与方法 + 测试。
 
 ### M3-3 [TODO] 流式 fixtures + 端到端折叠对照 + transport
 

@@ -16,7 +16,10 @@ use crate::{
 };
 use serde_json::{Map, Value};
 
-mod convert;
+// `pub(crate)` so the streaming terminal path (§4.4.4) can reuse the same
+// `normalize_finish_reason` mapping instead of duplicating it; the module's
+// other helpers stay `pub(super)`/private and remain response-only.
+pub(crate) mod convert;
 
 use convert::{convert_message, normalize_finish_reason};
 

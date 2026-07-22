@@ -78,7 +78,11 @@ pub(super) fn convert_message(message: &Value) -> Result<Vec<ContentBlock>, Clie
 /// `tool_calls`→`ToolUse`, `content_filter`→`Refusal`, anything else (or
 /// absence)→`Other`. The raw wire value is retained for diagnostics except when
 /// `finish_reason` is missing.
-pub(super) fn normalize_finish_reason(finish_reason: Option<&str>) -> Normalized<StopReason> {
+///
+/// Shared between the non-streaming response path (§4.3) and the streaming
+/// terminal chunk (§4.4.4) so the two sides cannot drift; visible at crate
+/// scope for that reason.
+pub(crate) fn normalize_finish_reason(finish_reason: Option<&str>) -> Normalized<StopReason> {
     match finish_reason {
         Some("stop") => Normalized::from_mapped(StopReason::EndTurn, "stop"),
         Some("length") => Normalized::from_mapped(StopReason::MaxTokens, "length"),
