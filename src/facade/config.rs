@@ -34,9 +34,10 @@ const DEFAULT_MAX_TOKENS: u32 = 1024;
 /// A provider endpoint plus the wire protocol it speaks.
 ///
 /// Construct one from the environment ([`ProviderConfig::anthropic_from_env`],
-/// [`ProviderConfig::openai_from_env`]), from a fluent builder
-/// ([`ProviderConfig::anthropic`], [`ProviderConfig::openai`]), or directly from
-/// an already-built [`EndpointConfig`] ([`ProviderConfig::custom`]).
+/// [`ProviderConfig::openai_from_env`], [`ProviderConfig::openai_chat_from_env`]),
+/// from a fluent builder ([`ProviderConfig::anthropic`],
+/// [`ProviderConfig::openai`], [`ProviderConfig::openai_chat`]), or directly
+/// from an already-built [`EndpointConfig`] ([`ProviderConfig::custom`]).
 ///
 /// # Credential handling
 ///
@@ -116,6 +117,37 @@ impl ProviderConfig {
         ))
     }
 
+    /// Builds an OpenAI Chat/Completions provider from environment variables.
+    ///
+    /// This is the direct-access classic `POST /v1/chat/completions` path: it
+    /// reads the required `OPENAI_CHAT_BASE_URL` and the optional
+    /// `OPENAI_CHAT_API_KEY` (sent as a `Bearer` token). Unlike
+    /// [`ProviderConfig::openai_from_env`] it uses Bearer auth, not the
+    /// Azure-style `api-key` header + `api-version` query.
+    ///
+    /// When `OPENAI_CHAT_API_KEY` is absent or blank the endpoint is built with
+    /// [`AuthScheme::None`], matching unauthenticated OpenAI-compatible servers
+    /// such as vLLM. Point `OPENAI_CHAT_BASE_URL` at the target server, for
+    /// example `https://api.deepseek.com` for DeepSeek or `http://host:port/v1`
+    /// for vLLM; dialect-specific request fields (DeepSeek thinking mode,
+    /// reasoning effort) travel through [`ProviderExtras`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FacadeError::Config`] when `OPENAI_CHAT_BASE_URL` is missing or
+    /// blank. The error message names the variable but never its value.
+    pub fn openai_chat_from_env() -> Result<Self, FacadeError> {
+        let base_url = required_env("OPENAI_CHAT_BASE_URL")?;
+        let auth = match optional_owned_env("OPENAI_CHAT_API_KEY") {
+            Some(api_key) => AuthScheme::Bearer(api_key),
+            None => AuthScheme::None,
+        };
+        Ok(Self::custom(
+            openai_chat_endpoint(base_url, auth),
+            ProviderId::OpenAiChat,
+        ))
+    }
+
     /// Starts a fluent builder for an Anthropic Messages provider.
     #[must_use]
     pub fn anthropic() -> ProviderConfigBuilder {
@@ -126,6 +158,19 @@ impl ProviderConfig {
     #[must_use]
     pub fn openai() -> ProviderConfigBuilder {
         ProviderConfigBuilder::new(ProviderId::OpenAiResp)
+    }
+
+    /// Starts a fluent builder for an OpenAI Chat/Completions provider.
+    ///
+    /// Like [`ProviderConfig::openai_chat_from_env`] this targets the classic
+    /// `POST /v1/chat/completions` endpoint with direct Bearer auth (no
+    /// Azure-style `api-key` header or `api-version` query). The fluent builder
+    /// always requires an [`api_key`](ProviderConfigBuilder::api_key); for an
+    /// unauthenticated endpoint (vLLM) use [`ProviderConfig::openai_chat_from_env`]
+    /// or [`ProviderConfig::custom`] with [`AuthScheme::None`].
+    #[must_use]
+    pub fn openai_chat() -> ProviderConfigBuilder {
+        ProviderConfigBuilder::new(ProviderId::OpenAiChat)
     }
 }
 
@@ -217,8 +262,9 @@ impl ProviderConfigBuilder {
     /// Sets the protocol version override (optional; a default is used when
     /// omitted).
     ///
-    /// For Anthropic this becomes the `anthropic-version` header; for OpenAI it
-    /// becomes the `api-version` query parameter.
+    /// For Anthropic this becomes the `anthropic-version` header; for OpenAI
+    /// Responses it becomes the `api-version` query parameter. Chat/Completions
+    /// has no version parameter, so this field is ignored for that provider.
     #[must_use]
     pub fn api_version(mut self, api_version: impl Into<String>) -> Self {
         self.api_version = Some(api_version.into());
@@ -250,10 +296,10 @@ impl ProviderConfigBuilder {
                 openai_endpoint(base_url, api_key, version)
             }
             // Classic chat/completions direct access: Bearer auth, no Azure-style
-            // api-version header/query. The env constructor (`openai_chat_from_env`,
-            // M4-1) handles the vLLM no-auth case; this generic builder path always
+            // api-version header/query. The env constructor (`openai_chat_from_env`)
+            // handles the vLLM no-auth case; this generic builder path always
             // carries a resolved api_key.
-            ProviderId::OpenAiChat => openai_chat_endpoint(base_url, api_key),
+            ProviderId::OpenAiChat => openai_chat_endpoint(base_url, AuthScheme::Bearer(api_key)),
         };
         Ok(ProviderConfig::custom(endpoint, self.provider))
     }
@@ -284,12 +330,14 @@ fn openai_endpoint(base_url: String, api_key: String, api_version: String) -> En
 
 /// Builds the OpenAI Chat/Completions endpoint transport from resolved parts.
 ///
-/// Chat/completions uses direct Bearer auth (OpenAI-compatible, DeepSeek, vLLM),
-/// not the Azure-style `api-key` header + `api-version` query of [`openai_endpoint`].
-fn openai_chat_endpoint(base_url: String, api_key: String) -> EndpointConfig {
+/// Chat/completions uses direct auth (Bearer for OpenAI-compatible/DeepSeek/vLLM
+/// with a key, `None` for unauthenticated vLLM), not the Azure-style `api-key`
+/// header + `api-version` query of [`openai_endpoint`]. The caller picks the
+/// [`AuthScheme`]; query params and extra headers stay empty.
+fn openai_chat_endpoint(base_url: String, auth: AuthScheme) -> EndpointConfig {
     EndpointConfig {
         base_url,
-        auth: AuthScheme::Bearer(api_key),
+        auth,
         query_params: Vec::new(),
         extra_headers: Vec::new(),
     }
@@ -311,6 +359,13 @@ fn optional_env(name: &str, default: &str) -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default.to_owned())
+}
+
+/// Reads a non-blank optional environment variable, returning `None` when unset
+/// or blank. Used for credentials that may legitimately be absent (for example
+/// `OPENAI_CHAT_API_KEY` on a no-auth vLLM endpoint).
+fn optional_owned_env(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 /// Validates a required builder field is present and non-blank.

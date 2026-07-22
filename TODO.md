@@ -1058,7 +1058,7 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
 
 ## M4：facade 接线与集成
 
-### M4-1 [TODO] facade 接线：client_for_provider 分支 + openai_chat_from_env + lib.rs 文档
+### M4-1 [DONE] facade 接线：client_for_provider 分支 + openai_chat_from_env + lib.rs 文档
 
 上下文：
 
@@ -1094,6 +1094,56 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
   测试）。
 - `cargo test -p agent-lib --lib facade` 通过；
   `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
+
+完成记录（2026-07-23）：
+
+- **现状盘点**：M1-1 为满足 facade exhaustive match 已落地 `ProviderId::OpenAiChat` 触点——
+  `client_for_provider()` 分支（`chat.rs:397`，`Arc::new(OpenAiChatAdapter::new(endpoint))`）、
+  `ProviderConfigBuilder::build()` 的 `OpenAiChat` arm（`config.rs`）、私有 `openai_chat_endpoint`
+  helper 均已在位。本任务只补 **env 读取构造器 + vLLM 无 auth 路径 + lib.rs 协议清单 + facade rustdoc**，
+  不重复接线 `client_for_provider`（TODO「`client_for_provider` 加分支」已由 M1-1 满足，无需再动）。
+- **`openai_chat_from_env()`（`config.rs`）**：读必需 `OPENAI_CHAT_BASE_URL`（缺失/空→`FacadeError::Config`，
+  复用 `required_env`，文案点名变量不点值）；读可选 `OPENAI_CHAT_API_KEY`——有值→`AuthScheme::Bearer`，
+  缺失/空→`AuthScheme::None`（vLLM 等无 auth OpenAI 兼容端点，§5.2/§6）。返回
+  `ProviderConfig::custom(endpoint, ProviderId::OpenAiChat)`。rustdoc 注明 Bearer 直连（**非** Azure 风格
+  `api-key` 头 + `api-version` query）+ DeepSeek/vLLM base_url 示例 + 方言字段走 `ProviderExtras`。
+  新增私有 helper `optional_owned_env`（返回 `Option<String>`，区别于带默认值的 `optional_env`）。
+- **泛化 `openai_chat_endpoint(base_url, auth: AuthScheme)`**：原签名 `(base_url, api_key)` 恒产 Bearer；
+  改为接收 `AuthScheme`，让 vLLM 的 None 路径与 Bearer 路径复用同一 helper，消除 EndpointConfig 字面量重复。
+  builder 调用点改为 `openai_chat_endpoint(base_url, AuthScheme::Bearer(api_key))`。私有 helper，零公开 API 影响。
+- **`ProviderConfig::openai_chat()` builder 入口**：与 `anthropic()`/`openai()` 对称的 fluent 入口
+  （`ProviderConfigBuilder::new(ProviderId::OpenAiChat)`，build 的 OpenAiChat arm 已存在）。builder 路径恒带
+  api_key（Bearer）；无 auth（vLLM）走 `openai_chat_from_env` 或 `custom`。`api_version()` rustdoc 补注
+  「Chat/Completions 无版本参数，该字段被忽略」（build 的 OpenAiChat arm 不读它）；`ProviderConfig` struct
+  doc 的构造器清单同步补 `openai_chat_from_env`/`openai_chat`。
+- **`src/lib.rs` 协议清单（§6 要求）**：行 3（`translates … wire formats`）+ 行 16-17（`adapter implements …
+  HTTP and SSE protocols`）两处「Anthropic Messages and OpenAI Responses」→「Anthropic Messages, OpenAI Responses,
+  and OpenAI Chat/Completions」。
+- **facade rustdoc（§6 要求）**：`Chat` struct doc 示例（引用 `openai_from_env` 处）后补一段，指向
+  `ProviderConfig::openai_chat_from_env` + `OPENAI_CHAT_BASE_URL` 用法；不改既有示例语义、不新增可编译 doctest。
+- **单测（`config/tests.rs`，复用既有 `ENV_LOCK` + `EnvGuard`，env 隔离不污染并行测试）4 个**：
+  ① `openai_chat_from_env_errors_when_base_url_missing`（缺 base_url→`FacadeError::Config`，TODO 验证条件 a）；
+  ② `openai_chat_from_env_reads_bearer_when_api_key_present`（齐备→Bearer + provider==OpenAiChat + **`client_for_provider`
+     返回的 client `capability() == OPENAI_CHAT_DEFAULT_CAPABILITY`**，TODO 验证条件 b，经 `crate::facade::chat::client_for_provider`
+     import，`assert_eq!` 钉死——`dyn LlmClient` 方法分发不需 trait import 故未 import `LlmClient`，`Capability`/`AuthScheme` 均
+     derive PartialEq）；
+  ③ `openai_chat_from_env_allows_unauthenticated_endpoint`（无 api_key→`AuthScheme::None`，vLLM 路径）；
+  ④ `openai_chat_builder_sets_bearer_auth_and_ignores_version`（`openai_chat()` builder 产 Bearer + 空 query/headers + 忽略 api_version）。
+- **DeepSeek 入口决策（§6「本任务定夺」）**：采用最小方案——只加 `openai_chat_from_env`，DeepSeek 由用户把
+  base_url 指到 `https://api.deepseek.com`；不加 DeepSeek 专用 facade 构造器，`DEEPSEEK_*` env 由 M4-3 的
+  `#[ignore]` 真实端点测试直接读。
+- **零改动**：`client_for_provider` 分支（M1-1 已在）、`tests/normalization/config.rs`（M4-2 范围）、
+  `tests/integration_openai_chat.rs`（M4-3 范围）、`common/`/`error.rs` 均未动。
+- 验证结果（全绿）：
+  - `cargo fmt --all`：无 diff；
+  - `cargo clippy --all-targets -- -D warnings`：exit 0；
+  - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`：exit 0；
+  - `cargo test -p agent-lib --lib facade`：282 通过（含新增 4 个 config 用例，19 config::tests 全绿）；
+  - `cargo test --all --all-targets`：全部 `test result:` 行 `0 failed`（lib 1119→1123 +4，集成/replay/smoke 套件全绿，无回归）；
+  - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`：exit 0（修了一处 redundant-explicit-link：
+    `[`ProviderExtras`](crate::model::extras::ProviderExtras)` → `[`ProviderExtras`]`，因 `ProviderExtras` 已在 `use` 作用域）。
+- 无 breaking change：新增 `openai_chat_from_env`/`openai_chat()` 公开构造器（向后兼容形状新增）+ 放宽私有
+  `openai_chat_endpoint` 签名 + 新增私有 `optional_owned_env` helper + 文档；`ProviderConfig` 结构形状不变。
 
 ### M4-2 [TODO] 归一化矩阵：tests/normalization/config.rs 注册新 Provider
 

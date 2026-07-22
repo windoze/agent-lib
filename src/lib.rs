@@ -1,9 +1,10 @@
 //! Provider-neutral Client and Conversation building blocks for LLM API access.
 //!
-//! `agent-lib` translates Anthropic Messages and OpenAI Responses wire formats
-//! into one set of requests, complete responses, content blocks, token usage,
-//! errors, and incremental events. Applications choose a concrete adapter at
-//! the endpoint boundary and can use [`client::LlmClient`] everywhere else.
+//! `agent-lib` translates Anthropic Messages, OpenAI Responses, and OpenAI
+//! Chat/Completions wire formats into one set of requests, complete responses,
+//! content blocks, token usage, errors, and incremental events. Applications
+//! choose a concrete adapter at the endpoint boundary and can use
+//! [`client::LlmClient`] everywhere else.
 //!
 //! # Architecture and boundaries
 //!
@@ -13,8 +14,8 @@
 //!   one accumulator used to reconstruct a [`client::Response`].
 //! - [`client`] defines endpoint configuration, structured capabilities,
 //!   classified errors, requests, responses, and the dyn-safe client trait.
-//! - [`adapter`] implements the Anthropic Messages and OpenAI Responses HTTP
-//!   and SSE protocols.
+//! - [`adapter`] implements the Anthropic Messages, OpenAI Responses, and
+//!   OpenAI Chat/Completions HTTP and SSE protocols.
 //! - [`facade`] is the batteries-included assembly layer most applications should
 //!   start with: it wires provider/client config, one-shot [`facade::Chat`],
 //!   stateful [`facade::ChatSession`], tool-using [`facade::Agent`], typed tools,

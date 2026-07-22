@@ -6,7 +6,8 @@
 //! variables, they are serialized through a shared mutex.
 
 use super::{ModelConfig, ProviderConfig};
-use crate::client::{AuthScheme, ChatRequest, EndpointConfig};
+use crate::client::{AuthScheme, ChatRequest, EndpointConfig, OPENAI_CHAT_DEFAULT_CAPABILITY};
+use crate::facade::chat::client_for_provider;
 use crate::model::extras::{ProviderExtras, ProviderId};
 use serde_json::{Map, json};
 use std::num::NonZeroU32;
@@ -203,6 +204,79 @@ fn openai_from_env_errors_when_required_variable_missing() {
     let result = ProviderConfig::openai_from_env();
 
     assert!(matches!(result, Err(crate::facade::FacadeError::Config(_))));
+}
+
+#[test]
+fn openai_chat_from_env_errors_when_base_url_missing() {
+    let _lock = ENV_LOCK.lock().expect("env lock");
+    let _guard = EnvGuard::clearing(&["OPENAI_CHAT_BASE_URL", "OPENAI_CHAT_API_KEY"]);
+
+    let result = ProviderConfig::openai_chat_from_env();
+
+    assert!(matches!(result, Err(crate::facade::FacadeError::Config(_))));
+}
+
+#[test]
+fn openai_chat_from_env_reads_bearer_when_api_key_present() {
+    let _lock = ENV_LOCK.lock().expect("env lock");
+    let guard = EnvGuard::clearing(&["OPENAI_CHAT_BASE_URL", "OPENAI_CHAT_API_KEY"]);
+    guard.set("OPENAI_CHAT_BASE_URL", "https://api.deepseek.com");
+    guard.set("OPENAI_CHAT_API_KEY", "env-chat-token");
+
+    let config = ProviderConfig::openai_chat_from_env().expect("chat env config");
+
+    assert_eq!(config.provider(), ProviderId::OpenAiChat);
+    let endpoint = config.endpoint();
+    assert_eq!(endpoint.base_url, "https://api.deepseek.com");
+    assert_eq!(
+        endpoint.auth,
+        AuthScheme::Bearer("env-chat-token".to_owned())
+    );
+    assert!(endpoint.query_params.is_empty());
+    assert!(endpoint.extra_headers.is_empty());
+
+    // The facade must construct an OpenAiChatAdapter whose capability matches
+    // the protocol-level chat/completions table (design doc §6: the
+    // client_for_provider branch is the integration touchpoint).
+    let client = client_for_provider(config);
+    assert_eq!(
+        client.capability(),
+        &*OPENAI_CHAT_DEFAULT_CAPABILITY,
+        "client_for_provider must yield a chat/completions client"
+    );
+}
+
+#[test]
+fn openai_chat_from_env_allows_unauthenticated_endpoint() {
+    let _lock = ENV_LOCK.lock().expect("env lock");
+    let guard = EnvGuard::clearing(&["OPENAI_CHAT_BASE_URL", "OPENAI_CHAT_API_KEY"]);
+    guard.set("OPENAI_CHAT_BASE_URL", "http://127.0.0.1:8000/v1");
+    // No OPENAI_CHAT_API_KEY: a vLLM-style no-auth endpoint.
+
+    let config = ProviderConfig::openai_chat_from_env().expect("no-auth chat env config");
+
+    assert_eq!(config.provider(), ProviderId::OpenAiChat);
+    assert_eq!(config.endpoint().auth, AuthScheme::None);
+    assert!(config.endpoint().query_params.is_empty());
+    assert!(config.endpoint().extra_headers.is_empty());
+}
+
+#[test]
+fn openai_chat_builder_sets_bearer_auth_and_ignores_version() {
+    let config = ProviderConfig::openai_chat()
+        .base_url("https://chat.example.test")
+        .api_key("chat-token")
+        // Chat/completions has no version parameter; the builder must ignore it.
+        .api_version("ignored")
+        .build()
+        .expect("openai_chat builder should succeed with required fields");
+
+    assert_eq!(config.provider(), ProviderId::OpenAiChat);
+    let endpoint = config.endpoint();
+    assert_eq!(endpoint.base_url, "https://chat.example.test");
+    assert_eq!(endpoint.auth, AuthScheme::Bearer("chat-token".to_owned()));
+    assert!(endpoint.query_params.is_empty());
+    assert!(endpoint.extra_headers.is_empty());
 }
 
 #[test]

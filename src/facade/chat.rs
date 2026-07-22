@@ -68,6 +68,11 @@ pub use stream::RunStream;
 /// # Ok(())
 /// # }
 /// ```
+///
+/// For the classic OpenAI Chat/Completions protocol (OpenAI-compatible, DeepSeek,
+/// vLLM), swap the provider for
+/// [`ProviderConfig::openai_chat_from_env`](crate::facade::config::ProviderConfig::openai_chat_from_env)
+/// and point `OPENAI_CHAT_BASE_URL` at the target server.
 #[derive(Clone)]
 pub struct Chat {
     client: Arc<dyn LlmClient>,
