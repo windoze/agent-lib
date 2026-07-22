@@ -59,7 +59,7 @@ f32 temperature 经 serde 提升为 f64；测试用精确值（0.25/0.5）避免
 - [x] 移除 mod.rs allow(dead_code)
 - [x] fmt + clippy + test（修了一处测试数据不一致：Ok 用例 text 应为 "lookup failed" 非 "sunny"）
 - [x] TODO.md 标 [DONE] + 完成记录
-- [ ] 提交
+- [x] 提交（commit e2228a9）
 
 ### 验证结果摘要（全绿）
 
