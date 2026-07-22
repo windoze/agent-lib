@@ -664,7 +664,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M3：SSE 流式
 
-### M3-1 [TODO] 流式骨架：stream/wire.rs + decoder.rs（[DONE] 哨兵）
+### M3-1 [DONE] 流式骨架：stream/wire.rs + decoder.rs（[DONE] 哨兵）
 
 上下文：
 
@@ -696,6 +696,59 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 单元测试：含 `[DONE]` 行的最小 SSE 字节流喂 decoder → 正常 terminal 收尾，无 JSON
   解析错误；`event: message` 行不触发一致性错误。
 - `cargo test -p agent-lib --lib adapter::openai_chat` 通过。
+
+完成记录（2026-07-23）：
+
+- `stream/wire.rs`（新建，crate-private serde 视图）：5 个视图类型 + `decode` 函数。
+  - `DecodedChunk { choices: Vec<Choice>, usage: Option<Value> }`（两者 `#[serde(default)]`：
+    空 `choices` 的 usage-only chunk 与缺 `usage` 的内容 chunk 都能解析）；
+  - `Choice { delta: Delta, finish_reason: Option<String> }`；
+  - `Delta { role, content, reasoning_content, tool_calls }`（全 `Option`，逐字段 `#[serde(default)]`）；
+  - `ToolCallDelta { index: u64, id: Option<String>, function: Option<FunctionDelta> }`（`index` 键控，§4.4.2）；
+  - `FunctionDelta { name, arguments }`（`arguments` 是字符串片段，绝不中途解析）。
+  - 多余字段（`id`/`object`/`created`/`model`/`system_fingerprint`/`choices[].index`/`tool_calls[].type`）
+    **不建模**，serde 默认忽略——设计文档「进不了 extra 的流式 chunk 不需要」（无 raw 保留，与
+    `openai_resp` wire 的保留 `raw` 不同）。
+  - **过渡性 `#[allow(dead_code)]`**（每个结构体一个 + 模块文档说明）：M3-1 仅 `decode` 验证形态，字段
+    未被 lib 路径读取（`pub(super)` 在 crate 内**不**豁免 dead_code，沿用 M1-2/M2-1 过渡 allow 惯例）；
+    M3-2 状态机读取字段后移除。
+- `stream/normalizer.rs`（新建，`StreamNormalizer` 桩，`#[derive(Default)]`）：
+  - `translate`：先判 `terminal` → 报「received a chunk after the [DONE] sentinel」；再
+    **`event.data.trim() == "[DONE]"` 特判 → 置 `terminal=true` + 返回空事件**（在 `wire::decode` 之前，
+    §4.4.1「JSON 解析前特判」，非 JSON 哨兵永不触发解析错误）；否则 `decode(&event.data)` 验证可解析
+    （M3-2 替换为状态机产出，本任务产出 0 事件）。
+  - `is_terminal → self.terminal`；`incomplete_error → "SSE body ended before the [DONE] sentinel"`
+    （EOF 无哨兵报错；`is_terminal` 让 `common::normalize_sse` 的 unfold 自然终止流，无需额外机制）。
+  - **不做 event/type 一致性检查**（与 `openai_resp` 的 type 校验相反）：chat/completions 无 `type` 判别
+    字段、`event: message` 是常态，normalizer 直接忽略 `event.event` 字段。
+- `stream/decoder.rs`（新建，照 `openai_resp/stream/decoder.rs`）：`normalize_sse` 包装
+  `common::normalize_sse::<StreamNormalizer, …>` + `impl SseNormalizer for StreamNormalizer`
+  （逐方法委托 + `invalid_sse → invalid_stream`）。
+- `stream/mod.rs`（替换 M1-2 占位桩为真实接线，照 `openai_resp/stream/mod.rs`）：`mod decoder; mod normalizer;
+  mod wire;` + `use decoder::normalize_sse;` + `chat_stream`（`stream` 守卫 → `build_request`（自动带
+  `include_usage`）→ `common::execute_sse_response` → `normalize_sse`）+ `invalid_stream` +
+  `#[cfg(test)] mod tests;`。rustdoc 写 10min connect+headers 限定、body 无总超时、`[DONE]` 正常终止 / EOF 报错。
+- `stream/tests/mod.rs`（新建，最小骨架；M3-3 扩 parsing/transport/errors 子模块复用其 helper）：
+  `decode_fixture` + `irregular_chunks` helper + 4 个测试：① `[DONE]` 正常 terminal 收尾、events 空、
+  无 JSON 解析错误；② `event: message` 不触发一致性错误；③ EOF 无 `[DONE]` → `ClientError::Protocol`
+  含「[DONE]」；④ `wire_decodes_each_delta_shape` 直接钉住 wire.rs（text/reasoning/tool_call/usage-only
+  四种 chunk 的字段解析，覆盖所有建模字段，不让 wire 正确性推给 M3-2）。
+- 验证结果（全绿）：
+  - `cargo fmt --all`（无 diff，仅 fmt 重排 `normalizer.rs` 的 import 为单行）；
+  - `cargo clippy --all-targets -- -D warnings`；
+  - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  - `cargo test -p agent-lib --lib adapter::openai_chat`（32 通过：28 既有 request/response/mod +
+    6 transport + 4 新增 stream，0.02s 秒级完成）；
+  - `cargo test --all --all-targets`（全部 `test result:` 行 `0 failed`，lib 1090→1094 +4，
+    集成/replay/smoke 套件全绿，无回归）；
+  - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
+- **显式留给 M3-2**（避免重复或漏做）：把 `translate` 的占位 `decode(...)?; Ok(Vec::new())` 替换为状态机
+  产出——文本/reasoning block 随字段开关、tool_calls 按 `index` 键控增量（位置派生 block id，先例
+  `anthropic-block-{index}`，`src/adapter/anthropic/stream/normalizer.rs:423-424`）、末 chunk
+  `finish_reason` → `MessageStop`（复用 `response/convert.rs::normalize_finish_reason`，抽到 crate-private
+  共用位置）、空 `choices` usage chunk → 加性 `Usage`；并移除 wire.rs 的过渡 `#[allow(dead_code)]`。
+- 无 breaking change：`mod.rs` 替换的是 M1-2 的 `ClientError::Other` 占位桩，`chat_stream` 签名不变；
+  其余为纯新增 `pub(super)`/私有文件。`common/` 零改动。
 
 ### M3-2 [TODO] 流式状态机：normalizer.rs（文本/reasoning/工具增量/终态）
 
