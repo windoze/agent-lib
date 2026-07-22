@@ -9,10 +9,6 @@ use crate::{
 use serde_json::Map;
 
 /// Constructs a small valid non-streaming request for transport tests.
-///
-/// M2-1 wires only the parsing sub-module; the transport sub-module (M2-2)
-/// exercises `chat()` over a local socket and consumes this helper.
-#[allow(dead_code)]
 fn minimal_request() -> ChatRequest {
     ChatRequest {
         model: "deepseek-chat".to_owned(),
@@ -33,9 +29,6 @@ fn minimal_request() -> ChatRequest {
 }
 
 /// Builds an unauthenticated local endpoint configuration for mock servers.
-///
-/// See [`minimal_request`]: consumed by the M2-2 transport sub-module.
-#[allow(dead_code)]
 fn local_endpoint(base_url: String) -> EndpointConfig {
     EndpointConfig {
         base_url,
@@ -55,3 +48,4 @@ const REAL_TOOL_RESPONSE: &str = include_str!("fixtures/tool_response.json");
 const REAL_REASONING_RESPONSE: &str = include_str!("fixtures/reasoning_response.json");
 
 mod parsing;
+mod transport;

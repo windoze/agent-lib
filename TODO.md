@@ -498,7 +498,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   模块/函数 + 新增 RESPONSE_EXTRA_KEY 私有常量；`chat()`/`invalid_response` 签名不变（仅替换占位 body 为真实
   transport+parse 委托）。transport.rs（状态码/内容类型/错误映射的本地服务器测试）留 **M2-2**，符合本任务边界。
 
-### M2-2 [TODO] 非流式 transport 测试：状态码/内容类型/错误映射
+### M2-2 [DONE] 非流式 transport 测试：状态码/内容类型/错误映射
 
 上下文：
 
@@ -524,6 +524,48 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 上述用例逐个断言 `ClientError` 的分类变体（对照 `src/client/error.rs:61-105`）。
 - `cargo test -p agent-lib --lib adapter::openai_chat` 通过，且测试秒级完成（本地
   回环，无超时等待）。
+
+完成记录（2026-07-23）：
+
+- `response/tests/transport.rs`（新建）：一次性 `TcpListener`（`bind("127.0.0.1:0")`
+  取临时端口）本地服务器 + `chat_with_timeout`（5s 外层超时包裹 `adapter.chat(request)`，
+  防 transport 回归卡死测试）。6 个 `#[tokio::test]` 精确对应 TODO 6 用例，逐个断言
+  `ClientError` 分类变体（对照 `error.rs:61-105`）：
+  1. **200 + 合法 body**（复用既有 `REAL_TEXT_RESPONSE` fixture）→ 正常 `Response`，
+     断言 `role == Assistant` + usage `input=13`/`output=26`（transport→parse 接线贯通）；
+  2. **429 + `Retry-After: 3`** → `assert_eq!(…, ClientError::RateLimited { retry_after:
+     Some(Duration::from_secs(3)) })`（seconds 形式确定性）；
+  3. **401** → `matches!(…, ClientError::Auth)`；
+  4. **400 + OpenAI context-length body**（`maximum context length … context_length_exceeded`，
+     含 CONTEXT_LENGTH_MARKERS 双重命中，且不含 content-filter marker）→
+     `matches!(…, ClientError::ContextLengthExceeded)`；
+  5. **400 + content-filter body**（`code:"content_filter"`，含 CONTENT_FILTER_MARKERS，
+     且不含任何 context-length marker，避免被先判成 ContextLengthExceeded）→
+     `matches!(…, ClientError::ContentFiltered)`；
+  6. **500 非 2xx**（绕开 4xx marker 分支）→ `ClientError::Api { status: 500, body }`，
+     断言 status + body 保留原文（含 `server_error`）。
+- 服务器请求行断言 `POST /chat/completions HTTP/1.1`（每用例都钉，确认 `endpoint_url(&["chat","completions"])`
+  的 path 组装；比照 openai_resp transport 模板断言 Responses path）。
+- `response/tests/mod.rs`：`mod parsing;` 后加 `mod transport;`；移除 `minimal_request`/
+  `local_endpoint` 上 M2-1 预留的过渡 `#[allow(dead_code)]`（transport.rs 已消费，allow 失效，
+  沿用 M1-2→M1-3「接线后移除过渡 allow」惯例），并收紧 doc 注释。
+- **零改动**：`src/adapter/common/`、`src/client/error.rs`、`response.rs`/`convert.rs` 均未动——
+  chat() 的 transport→parse 接线在 M2-1 已完成（`execute_json_response` → `parse_response`，
+  非 2xx 经 `ClientError::from_http_response`），本任务只在其上钉测试。fixtures 沿用 M2-1 既有
+  三个脱敏录制（无真实 key/账号）。
+- **范围克制**：不复制 openai_resp transport 的 invalid-success-body 用例（parsing.rs 已充分
+  覆盖 `parse_response` 错误路径）、不复制 stream-guard 用例（mod.rs tests M1-2 已钉）；严格
+  按 TODO 6 用例，避免冗余。200 成功用例已确认 transport→parse 完整接线。
+- 验证结果（全绿）：
+  - `cargo fmt --all`（无 diff）；
+  - `cargo clippy --all-targets -- -D warnings`；
+  - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  - `cargo test -p agent-lib --lib adapter::openai_chat`（28 通过：22 既有 request/response/mod +
+    6 新增 transport，0.02s 秒级完成）；
+  - `cargo test --all --all-targets`（全部 `test result:` 行 `0 failed`，lib 1072→1078 +6，
+    集成/replay/smoke 套件全绿，无回归）；
+  - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
+- 无 breaking change：纯新增测试文件 + 测试模块声明；移除的是过渡 `#[allow(dead_code)]` 而非公开 API。
 
 ### M2-R [TODO] M2 review：非流式响应侧正确性核对
 
