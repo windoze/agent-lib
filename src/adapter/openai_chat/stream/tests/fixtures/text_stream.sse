@@ -1,0 +1,11 @@
+data: {"id":"chatcmpl-demo-text-stream","object":"chat.completion.chunk","created":1783882282,"model":"deepseek-chat","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-demo-text-stream","object":"chat.completion.chunk","created":1783882282,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-demo-text-stream","object":"chat.completion.chunk","created":1783882282,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-demo-text-stream","object":"chat.completion.chunk","created":1783882282,"model":"deepseek-chat","choices":[],"usage":{"prompt_tokens":13,"completion_tokens":26,"total_tokens":39,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":0}}}
+
+data: [DONE]
+
+: end of recorded fixture

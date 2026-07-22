@@ -868,7 +868,7 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
   均为**放宽可见性**（向后兼容）；`wire.rs` 移除的是过渡 `#[allow(dead_code)]` 而非 API；其余纯新增 `pub(super)`/私有
   字段与方法 + 测试。
 
-### M3-3 [TODO] 流式 fixtures + 端到端折叠对照 + transport
+### M3-3 [DONE] 流式 fixtures + 端到端折叠对照 + transport
 
 上下文：
 
@@ -900,6 +900,57 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
 - 四个 fixture 的精确事件序列断言全部通过；Accumulator 折叠 == 非流式解析对照通过；
   错误路径用例通过。
 - `cargo test -p agent-lib --lib adapter::openai_chat` 通过，秒级完成。
+
+完成记录（2026-07-23）：
+
+- **fixtures**（`stream/tests/fixtures/`，脱敏 demo，无真实 key/账号/内网地址——grep 已确认）：
+  4 个 `.sse` + 4 个**配对** `.json`（同语义非流式 body，供折叠对照）。每 `.sse` 覆盖一类 §4.4 场景：
+  ① `text_stream`（stop→EndTurn，cached_tokens）② `tool_stream`（双 `index` 并行，tool_calls→ToolUse）
+  ③ `reasoning_stream`（reasoning→text，reasoner，reasoning_tokens）④ `usage_terminal`（`length`→MaxTokens，
+  fixture 层补 finish_reason 覆盖，区别于 ①）。每个 `.sse` 都带「末个空 `choices` usage chunk + `[DONE]`」
+  的真实 `include_usage` 终态，并以 `: end of recorded fixture` 注释行收尾（比照 `openai_resp` fixtures 惯例，
+  且为 `data: [DONE]` 提供必需的尾随空行使 eventsource_stream 正确 dispatch 哨兵）。
+- **`stream/tests/mod.rs`**（保留 M3-2 的 12 个 inline 状态机测试不动）：补 `fold_events`（共享 accumulator
+  折叠）/`comparable`（清空 response-level extra）helper、4 个 `.sse` 的 `include_str!` 常量、
+  `mod errors/parsing/transport;` 声明，更新模块 doc。transport-specific import（`AuthScheme`/`EndpointConfig`/
+  `LlmClient`/`Message`/`ContentBlock`/`Map`）下沉 `transport.rs`，比照 `openai_resp` 的 import 分工，避免 mod.rs
+  unused-import。
+- **`stream/tests/parsing.rs`**（新建）：每个 fixture 一测——不规则字节分块 `[1,2,7,3,19,5,11]` 喂完整
+  `normalize_sse` 管线 → `assert_eq!(events, vec![精确全序列])`（逐事件钉死 MessageStart/BlockStart/Δ/
+  Usage/BlockStop/MessageStop，含 finish_reason→stop_reason 与 usage 细字段）→ `fold_events` 折叠 →
+  与配对 `.json` 的 `OpenAiChatAdapter::parse_response` 经 `comparable`（清空 extra）对照 `assert_eq!`。
+  另一 `usage_events_are_single_additive_segments…` 测试遍历 4 fixture 断言**恰好 1 个**加性 Usage 段且聚合 ==
+  非流式 usage（§4.4.4/§7.1）。
+- **折叠对照的 extra 差异处理**（关键）：流式 normalizer 不发 `ResponseMetadata` → folded `extra` 空；非流式
+  `parse_response` 把 `choices`（含 `logprobs`）/`object`/`id`/`model`/`system_fingerprint` 全留 `extra`。故
+  `comparable` 两边清空 response-level `extra`，只比 message(content blocks)/stop_reason/usage——per-block extra
+  两边皆空（fixture 用合法 JSON arguments），content 可整体比对。
+- **`stream/tests/errors.rs`**（新建，6 用例）：①直接 normalizer——`[DONE]` 后再喂 chunk → Protocol「after the
+  [DONE] sentinel」（terminal guard，§4.4.1）②管线 EOF 无 `[DONE]` → Protocol「[DONE]」③`data: {not valid json`
+  → `wire::decode` 失败 → Protocol（chat/completions 无 `type:"error"` 事件建模，畸形帧即最接近的「SSE 错误帧」）
+  ④非法 UTF-8(`0xff`) → Protocol「valid UTF-8」⑤直接 normalizer——tool 首片缺 `id` → Protocol「must carry `id`」
+  （§4.4.2，M3-R 健壮性清单）⑥空 `delta`+未知字段(`id`/`object`/`system_fingerprint`)+`[DONE]` → 干净
+  MessageStart/MessageStop，不 panic。
+- **`stream/tests/transport.rs`**（新建，6 用例，照 `openai_resp/stream/tests/transport.rs`）：一次性
+  `TcpListener`（`bind("127.0.0.1:0")`）+ `collect_with_timeout`（5s 外层超时防回归卡死）。逐例断言：
+  ①200+SSE（复用 `REAL_TEXT_STREAM`）→ 折叠 role=Assistant + usage 13/26（transport→decode→normalizer→fold 贯通），
+  服务器侧断言 `POST /chat/completions` + `"stream":true` ②429+`Retry-After:4` → `RateLimited{Some(4s)}` 
+  ③500 → `Api{status:500}`（含 `server_error`）④200+`application/json` → Protocol「application/json」（SSE
+  content-type 守卫）⑤200+无 `[DONE]` 截断体 → 消费期 Protocol「[DONE]」（transport 层 EOF）⑥`request(false)` →
+  Protocol「stream to be true」（stream 守卫先于 transport）。
+- **零改动**：`stream/{mod.rs,decoder.rs,normalizer.rs,wire.rs}`、`response.rs`/`convert.rs`、`common/`、
+  `error.rs` 均未动——M3-3 纯测试新增，状态机与传输接线在 M3-1/M3-2/M2-1 已完成，本任务只在其上钉录屏级端到端 +
+  折叠一致性 + transport。
+- 验证结果（全绿）：
+  - `cargo fmt --all`（无 diff）；
+  - `cargo clippy --all-targets -- -D warnings`；
+  - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  - `cargo test -p agent-lib --lib adapter::openai_chat`（57 通过：40 既有 request/response/mod/transport/stream +
+    5 parsing + 6 errors + 6 transport，0.03s 秒级）；
+  - `cargo test --all --all-targets`（全部 `test result:` 行 `0 failed`，lib 1102→1119 +17，集成/replay/smoke 套件全绿，无回归）；
+  - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
+- 无 breaking change：纯新增测试文件 + 测试模块声明 + 4 对脱敏 fixture；`stream/tests/mod.rs` 的改动仅为测试
+  基础设施（helper + 常量 + 子模块声明 + import/doc），不动任何生产代码或公开 API。
 
 ### M3-R [TODO] M3 review：流式正确性核对
 

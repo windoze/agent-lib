@@ -1,69 +1,68 @@
-## Execution Plan — M3-2：流式状态机 normalizer.rs（文本/reasoning/工具增量/终态）
+## Execution Plan — M3-3：流式 fixtures + 端到端折叠对照 + transport
 
-TODO.md 第一个未完成任务：**M3-2**（`[TODO]`）。把 `stream/normalizer.rs` 从 M3-1 哨兵骨架
-升级为完整 chunk→`Vec<StreamEvent>` 状态机。设计文档 §4.4。
+TODO.md 第一个未完成任务：**M3-3 [TODO]**。M3-1/M3-2 已 DONE。本任务在其上加录屏级
+`.sse` fixture + Accumulator 折叠一致性对照 + transport。设计文档 §4.4 / §7.1。
 
 ### 关键事实（已核对）
 
-- **SSE 契约**（`common/sse.rs`）：`translate` 返回事件追加进 pending；`is_terminal()` 为 true 后流立即
-  `None` 结束（**无法再发事件**）；EOF 未 terminal → `incomplete_error()`。
-- **accumulator 约束**（`stream/accumulator/mod.rs`）：必须发 `MessageStart`、`MessageStop`；
-  **`MessageStop` 之后不能有任何事件**；每个打开的 block 必须 `BlockStop`；`Usage` 加性只要在 `MessageStop` 前。
-- **wire 顺序矛盾**：`finish_reason` 在末个内容 chunk，usage 在其后（空 choices 独立 chunk）。若
-  `finish_reason` 时即发 `MessageStop`，后续 `Usage` 会落在 `MessageStop` 后 → 违反 accumulator。
+- M3-2 `stream/tests/mod.rs` 已有 12 个 inline 状态机测试（精确事件序列）+ helper
+  `decode_fixture`/`irregular_chunks`/`sse`。**不重构、不移动**，本任务在其上追加。
+- **折叠对照的 extra 差异**：流式 normalizer 不发 `ResponseMetadata` → folded `extra` 空；
+  非流式 `parse_response` 把 `choices`/`object`/`id`/顶层字段全留 `extra`。故对照前**清空
+  response-level extra**，只比 message(content blocks)/stop_reason/usage。per-block extra 两边都空
+  （fixture 用合法 JSON arguments）→ content 可整体 `assert_eq!`。
+- **Usage 两边同源**：流式与非流式都经同一份自定义 `Usage::deserialize`（prompt_tokens→input、
+  cached_tokens→cache_read、reasoning_tokens→reasoning，details 包装器被消费，extra 空）。
+- chat/completions **无 `type:"error"` 事件建模** → errors.rs 的「SSE 错误帧」= 畸形 data 帧
+  （非法 JSON → `wire::decode` 失败 → Protocol）。
+- `common::normalize_sse`：`is_terminal()`（[DONE] 后）→ unfold `None` 正常结束；[DONE] 后的 chunk
+  **不会再喂进 translate**（terminal guard 仅直接调 normalizer 时可达）。
 
-### 核心设计决策
+### 设计决策
 
-1. **延迟 `MessageStop` 到 `[DONE]`**：`finish_reason` chunk 只缓存 `stop_reason`（复用 M2-1
-   `normalize_finish_reason`）；`Usage` 到达即发；`[DONE]` 时 flush：关闭所有打开 block + 发 `MessageStop`。
-   - `Usage`（finish_reason 后到达）< `MessageStop`（[DONE] 时），满足 accumulator ✓；
-   - stop_reason 仍来自 finish_reason，符合 §4.4.4 语义 ✓。
-2. **每 kind 一个活跃 block**：`active_text`/`active_reasoning: Option<BlockId>`；content 续接同一 text
-   block，reasoning 续接同一 reasoning block（DeepSeek 实际流 reasoning 全→content 全，各开一次）。
-   block id：`text`/`reasoning`/`tool-call-{wire_index}`（位置派生稳定 id）。统一在 `[DONE]` 关闭
-   （固定序 reasoning→text→tools by index），不在中途关。
-3. **不发 `ToolInputAvailable`**：严格遵循 §4.4.2「`BlockStart(ToolInput)+Delta::Json+BlockStop`，绝不
-   中途解析 JSON」。适配器零 JSON 解析，accumulator 在 `BlockStop` 时自己解析 accumulated arguments
-   （合法 fixture 下与非流式 ToolUse 一致）。— 与 openai_resp 不同（Responses 有 `arguments.done` 显式
-   边界才发 ToolInputAvailable），chat/completions 无此边界。
-4. **tool_call 首片**：index 首次出现 = 首片，必须带 `id`+`function.name`（§4.4.2 只在首 chunk），
-   开 `BlockStart(ToolInput)`，缺则 `ClientError::Protocol`；后续片只发 `Delta::Json`（非空时）。
-5. **role**：固定 `Role::Assistant`，但读 `delta.role` 字段验证若存在须为 `"assistant"`（移除 wire.rs
-   role 的 dead_code allow，对齐 M2-1 convert_message role 验证）。
+1. **配对 fixture**：4 个 `.sse` 各配一个同语义非流式 `.json`（放 `stream/tests/fixtures/`）。
+   折叠对照 = `comparable(fold(sse)) == comparable(parse(json))`，`comparable` 清空 response extra。
+2. **fixture 区分度**：①text `stop`→EndTurn ②tool `tool_calls`→ToolUse（并行双 index）
+   ③reasoning `stop`→EndTurn ④usage_terminal 用 `length`→MaxTokens（fixture 层补 finish_reason 覆盖，
+   避免与 ①重复）。每 fixture 都带终态 usage chunk（真实 include_usage 形态）。
+3. **parsing.rs**：每 fixture 一个测试 = 不规则分块喂管线断言**精确全序列** + 折叠对照 parse(json)。
+4. **errors.rs**：①直接 normalizer：[DONE] 后再喂 chunk → Protocol「after the [DONE] sentinel」
+   ②管线 EOF 无 [DONE] → Protocol「[DONE]」③`data: {broken` → decode 失败 Protocol
+   ④非法 UTF-8(0xff) → Protocol「valid UTF-8」⑤直接 normalizer：tool 首片缺 id → Protocol「must carry `id`」
+   ⑥空 delta + 未知字段 + [DONE] → 干净终止不 panic（M3-R 健壮性）。
+5. **transport.rs**：照 `openai_resp/stream/tests/transport.rs`，断言改 `POST /chat/completions`、
+   `[DONE]`。6 用例：200 成功折叠 + 429 retry + content-type + 截断体 EOF + 非 stream 守卫 + 500→Api。
+6. **mod.rs 改动**：补 import（`Response`/`AuthScheme`/`EndpointConfig`/`LlmClient`/`Message`/
+   `ContentBlock`/`Accumulator`/`AccumulatorError`/`Map`/`Value`）+ helper `fold_events`/`comparable`
+   + 4 个 `.sse` `include_str!` 常量 + `mod errors/parsing/transport;` + 更新模块 doc。保留 12 inline 测试。
 
-### finish_reason 复用
+### 事件序列（trace normalizer，parsing.rs 断言依据）
 
-`normalize_finish_reason` 在 `response/convert.rs` 当前 `pub(super)`。改为 **`pub(crate)`**
-（crate-private，任务要求），stream 经全路径引用。最小改动，convert.rs 本就是映射的家。
-
-### 文件改动
-
-| 文件 | 动作 |
-|---|---|
-| `response/convert.rs` | `normalize_finish_reason`：`pub(super)`→`pub(crate)`。 |
-| `stream/wire.rs` | 移除 5 个 struct 过渡 `#[allow(dead_code)]`；更新模块文档。 |
-| `stream/normalizer.rs`（核心） | 完整状态机，替换 M3-1 桩。 |
-| `stream/tests/mod.rs` | 重写 M3-1 两骨架测试为完整状态机测试（decode_fixture 端到端断言精确事件序列）。 |
+- text: MsgStart, BlockStart(text), ΔText"Hello", ΔText" world", Usage(13/26/39,cr4), BlockStop(text), MsgStop(EndTurn,"stop")
+- tool: MsgStart, BlockStart(t0,{first,call_demo_a}), BlockStart(t1,{second,call_demo_b}), ΔJson(t0,"{\"a\":"), ΔJson(t1,"{\"b\":"), ΔJson(t0,"1}"), ΔJson(t1,"2}"), Usage(53/18/71), BlockStop(t0), BlockStop(t1), MsgStop(ToolUse,"tool_calls")
+- reasoning: MsgStart, BlockStart(reasoning), ΔReasoning"Let me think", ΔReasoning" step by step.", BlockStart(text), ΔText"The answer is 42.", Usage(30/50/80,cr6,r35), BlockStop(reasoning), BlockStop(text), MsgStop(EndTurn,"stop")
+- usage_terminal: MsgStart, BlockStart(text), ΔText"Truncated", ΔText" answer", Usage(20/64/84,cr2), BlockStop(text), MsgStop(MaxTokens,"length")
 
 ### 执行步骤
 
-1. [x] 上下文读取（TODO/PLAN/设计文档 §4.4 + common/sse + accumulator + openai_resp normalizer
-   terminal/item MessageStart/finish_arguments + anthropic block_id 先例 + wire/tests/response 现状）。
-2. [x] `response/convert.rs`：normalize_finish_reason → pub(crate)（+ `response.rs` `mod convert`→`pub(crate) mod convert`）。
-3. [x] `stream/wire.rs`：移除 5 个 struct allow + 更新文档。
-4. [x] `stream/normalizer.rs`：完整状态机（MessageStop 延迟 [DONE] / 每 kind 活跃 block / 不发 ToolInputAvailable / tool 首片 id+name / role 验证）。
-5. [x] `stream/tests/mod.rs`：12 测试（6 场景 + finish_reason 全表 + role/空流/[DONE]/event:message/wire），decode_fixture 改 impl AsRef<str>。
-6. [x] 门禁全绿：fmt 无 diff / 默认+external clippy exit 0 / test -p openai_chat 40 通过 / test --all lib 1094→1102 无 failed / doc exit 0。
-7. [x] TODO M3-2 [TODO]→[DONE] + 完成记录。
-8. [ ] git commit + stop。
+1. [x] 上下文读取（TODO §M3-3 + openai_resp stream/tests 全套 + chat normalizer/wire/decoder +
+   accumulator + common/sse + Response/Usage 形状 + response parsing fixtures）。
+2. [ ] 建 8 个 fixture（4 .sse + 4 .json，脱敏 demo）。
+3. [ ] 改 `stream/tests/mod.rs`（import + helper + 常量 + mod 声明 + doc）。
+4. [ ] 新建 `parsing.rs`（4 fixture 精确序列 + 折叠对照）。
+5. [ ] 新建 `errors.rs`（6 用例）。
+6. [ ] 新建 `transport.rs`（6 用例）。
+7. [ ] 门禁全绿：fmt / clippy(默认+external) / test -p openai_chat / test --all / doc。脱敏 grep。
+8. [ ] TODO M3-3 [TODO]→[DONE] + 完成记录；commit + stop。
 
 ### 进度日志
 
-- [x] 上下文读取 + 设计决策定稿（MessageStop 延迟解决 wire 顺序矛盾是关键洞察）
-- [x] convert.rs / response.rs 可见性放宽（finish_reason 复用）
-- [x] wire.rs 移除过渡 allow + 文档
-- [x] normalizer.rs 完整状态机
-- [x] tests/mod.rs 12 测试（修复 clippy needless_borrow：decode_fixture 改 impl AsRef<str>）
-- [x] 门禁全绿
-- [x] TODO M3-2 [DONE] + 完成记录
-- [ ] git commit + stop
+- [x] 上下文读取 + 设计决策定稿
+- [x] 8 fixture（4 .sse + 4 .json，脱敏 demo）
+- [x] mod.rs（import + fold_events/comparable helper + 4 .sse 常量 + 3 mod 声明 + doc）；transport-specific import 下沉 transport.rs
+- [x] parsing.rs（4 fixture 精确序列 + 折叠对照 + 加性 usage 单测）
+- [x] errors.rs（6 用例：terminal guard / EOF / 畸形 JSON / 非法 UTF-8 / tool 首片缺 id / 空delta+未知字段）
+- [x] transport.rs（6 用例：200 折叠 / 429 retry / 500→Api / content-type / 截断 EOF / 非 stream 守卫）
+- [x] 修复：.sse 缺尾随空行导致 [DONE] 不 dispatch → 加 `\n\n: end of recorded fixture`
+- [x] 门禁全绿：fmt 无 diff / clippy 默认+external exit 0 / test -p openai_chat 57 通过（40+17）/ test --all 全 `0 failed`（lib 1119）/ doc exit 0 / 脱敏 grep 无命中
+- [ ] TODO M3-3 [TODO]→[DONE] + 完成记录；commit + stop

@@ -1,20 +1,26 @@
-//! Stateful chunk-to-event tests for Chat/Completions SSE normalization.
+//! Chat/Completions SSE normalization tests.
 //!
-//! Each test feeds an inline SSE byte string through the full
-//! `normalize_sse` pipeline (split on an uneven chunk pattern) and asserts the
-//! exact [`StreamEvent`] sequence the M3-2 state machine produces, covering the
-//! six scenarios from design doc §4.4: text, reasoning, single tool call,
-//! parallel interleaved tool calls, terminal usage, and the `finish_reason`
-//! stop-reason table, plus the `[DONE]` / EOF error paths.
+//! This module holds the shared byte-chunking and folding helpers used by the
+//! [`parsing`], [`errors`], and [`transport`] submodules, plus the inline
+//! state-machine tests. Each state-machine test feeds an inline SSE byte string
+//! through the full `normalize_sse` pipeline (split on an uneven chunk pattern)
+//! and asserts the exact [`StreamEvent`] sequence the M3-2 state machine
+//! produces, covering the six scenarios from design doc §4.4: text, reasoning,
+//! single tool call, parallel interleaved tool calls, terminal usage, and the
+//! `finish_reason` stop-reason table, plus the `[DONE]` / EOF error paths.
 
 use super::*;
 use crate::{
+    client::Response,
     model::{
         message::Role,
         normalized::{Normalized, StopReason},
         usage::Usage,
     },
-    stream::{BlockId, BlockKind, Delta},
+    stream::{
+        BlockId, BlockKind, Delta,
+        accumulator::{Accumulator, AccumulatorError},
+    },
 };
 use futures::{TryStreamExt, stream};
 use std::convert::Infallible;
@@ -57,6 +63,41 @@ fn sse(chunks: &[&str]) -> String {
     fixture.push_str("data: [DONE]\n\n");
     fixture
 }
+
+// Sanitized demo recordings (no real keys/accounts) of chat/completions streams
+// exercising each scenario from design doc §4.4. Each `.sse` has a paired
+// `.json` representing the same semantic response as a non-streaming body, used
+// to prove the streaming fold equals the non-streaming parse.
+const REAL_TEXT_STREAM: &str = include_str!("fixtures/text_stream.sse");
+const REAL_TOOL_STREAM: &str = include_str!("fixtures/tool_stream.sse");
+const REAL_REASONING_STREAM: &str = include_str!("fixtures/reasoning_stream.sse");
+const REAL_USAGE_TERMINAL_STREAM: &str = include_str!("fixtures/usage_terminal.sse");
+
+/// Folds a decoded event list through the shared accumulator into a response.
+fn fold_events(events: &[StreamEvent]) -> Result<Response, AccumulatorError> {
+    let mut accumulator = Accumulator::new();
+    for event in events {
+        accumulator.push(event.clone())?;
+    }
+    accumulator.finish()
+}
+
+/// Reduces a response to the modeled members for streaming/non-streaming
+/// comparison.
+///
+/// Streaming events carry no response-level metadata, so a folded response has
+/// an empty `extra`; a non-streaming `parse_response` retains top-level wire
+/// fields (including `choices` with `logprobs`) in `extra`. Clearing `extra`
+/// on both sides leaves the message content, usage, and stop reason — the
+/// fields a stream and its complete response must agree on.
+fn comparable(mut response: Response) -> Response {
+    response.extra.clear();
+    response
+}
+
+mod errors;
+mod parsing;
+mod transport;
 
 /// A plain text stream opens one text block, appends deltas, stops it, and ends
 /// with a message stop carrying the `finish_reason` (design doc §4.4.3).
@@ -266,9 +307,7 @@ async fn terminal_usage_chunk_emits_additive_usage_before_stop() {
         r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#,
         r#"{"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":12,"total_tokens":21}}"#,
     ]);
-    let events = decode_fixture(fixture)
-        .await
-        .expect("usage stream decodes");
+    let events = decode_fixture(fixture).await.expect("usage stream decodes");
     let text = BlockId::new("text");
     assert_eq!(
         events,
@@ -412,9 +451,7 @@ async fn message_event_field_is_not_checked_for_consistency() {
 #[tokio::test]
 async fn empty_stream_emits_message_start_and_stop() {
     let fixture = "data: [DONE]\n\n";
-    let events = decode_fixture(fixture)
-        .await
-        .expect("empty stream decodes");
+    let events = decode_fixture(fixture).await.expect("empty stream decodes");
     assert_eq!(
         events,
         vec![

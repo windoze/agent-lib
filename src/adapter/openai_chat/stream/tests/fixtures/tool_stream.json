@@ -1,0 +1,34 @@
+{
+  "id": "chatcmpl-demo-tool-stream",
+  "object": "chat.completion",
+  "created": 1783882290,
+  "model": "deepseek-chat",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_demo_a",
+            "type": "function",
+            "function": { "name": "first", "arguments": "{\"a\":1}" }
+          },
+          {
+            "id": "call_demo_b",
+            "type": "function",
+            "function": { "name": "second", "arguments": "{\"b\":2}" }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls",
+      "logprobs": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 53,
+    "completion_tokens": 18,
+    "total_tokens": 71
+  }
+}

@@ -1,0 +1,19 @@
+data: {"id":"chatcmpl-demo-tool-stream","object":"chat.completion.chunk","created":1783882290,"model":"deepseek-chat","choices":[{"index":0,"delta":{"role":"assistant","content":null},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-demo-tool-stream","object":"chat.completion.chunk","created":1783882290,"model":"deepseek-chat","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_demo_a","type":"function","function":{"name":"first","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-demo-tool-stream","object":"chat.completion.chunk","created":1783882290,"model":"deepseek-chat","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_demo_b","type":"function","function":{"name":"second","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-demo-tool-stream","object":"chat.completion.chunk","created":1783882290,"model":"deepseek-chat","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-demo-tool-stream","object":"chat.completion.chunk","created":1783882290,"model":"deepseek-chat","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"b\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-demo-tool-stream","object":"chat.completion.chunk","created":1783882290,"model":"deepseek-chat","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-demo-tool-stream","object":"chat.completion.chunk","created":1783882290,"model":"deepseek-chat","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-demo-tool-stream","object":"chat.completion.chunk","created":1783882290,"model":"deepseek-chat","choices":[],"usage":{"prompt_tokens":53,"completion_tokens":18,"total_tokens":71}}
+
+data: [DONE]
+
+: end of recorded fixture

@@ -1,0 +1,13 @@
+data: {"id":"chatcmpl-demo-reasoning-stream","object":"chat.completion.chunk","created":1783882300,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-demo-reasoning-stream","object":"chat.completion.chunk","created":1783882300,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"reasoning_content":"Let me think"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-demo-reasoning-stream","object":"chat.completion.chunk","created":1783882300,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"reasoning_content":" step by step."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-demo-reasoning-stream","object":"chat.completion.chunk","created":1783882300,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"content":"The answer is 42."},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-demo-reasoning-stream","object":"chat.completion.chunk","created":1783882300,"model":"deepseek-reasoner","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":50,"total_tokens":80,"prompt_tokens_details":{"cached_tokens":6},"completion_tokens_details":{"reasoning_tokens":35}}}
+
+data: [DONE]
+
+: end of recorded fixture
