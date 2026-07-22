@@ -391,7 +391,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M2：非流式响应侧
 
-### M2-1 [TODO] 响应解析：wire 类型 + parse_response + finish_reason 映射 + chat()
+### M2-1 [DONE] 响应解析：wire 类型 + parse_response + finish_reason 映射 + chat()
 
 上下文：
 
@@ -436,6 +436,67 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   4. arguments 非法 JSON 字符串时保留原文进 extra 而非报错；
   5. `object` 不符报错。
 - `cargo test -p agent-lib --lib adapter::openai_chat` 通过。
+
+完成记录（2026-07-23）：
+
+- `response.rs`：替换 M1-2/M1-3 的 `chat()` 桩。`parse_response(body)` 反序列化字节 →
+  `parse_response_value(value)`。`parse_response_value` 校验 `object == "chat.completion"`
+  （三态 match：Some(String) 匹配 / Some(String) 不匹配报错 / Some(_) 非字符串报错 / None 缺失报错，
+  比照 `openai_resp/response.rs:69`）；`take_usage` 从 wire 移除 usage（消费进 `Usage` 字段，
+  unmodeled usage 字段自然落 `Usage.extra`，与 openai_resp 一致）；`read_choice` 读 `choices[0]`
+  的 `message` 与 `finish_reason`（**借用不消费**，见下）；`convert_message` + `normalize_finish_reason`
+  完成归一；`extra = wire`（剩余顶层）。
+- `chat()`：`if request.stream` 守卫（M1-2 已钉，先于 transport）→ `self.build_request(&request)?` →
+  `common::execute_json_response(&self.http_client, request, Self::parse_response)`。错误分类完全复用
+  `common::map_transport_error` / `ClientError::from_http_response`（已覆盖 429/Retry-After、408/504、
+  401/403、context-length、content-filter 的 OpenAI 拼写），`common/` 与 `error.rs` 零改动。
+- `response/convert.rs`（新建，crate-private）：
+  - `convert_message(&Value) -> Result<Vec<ContentBlock>>`：**借用 message 不消费**，便于 choices 完整留 extra。
+    校验 `role == "assistant"`（防御，与 openai_resp 一致）；block 顺序 = reasoning(Thinking) →
+    text(Text) → tool_calls(ToolUse)（anthropic reasoning-before-text 惯例 + wire 字段序，设计文档 §4.3）。
+  - `convert_content`：string→Text；null/缺失/空→无 block；multimodal array 防御性支持（拼接 type=="text"
+    的 text 字段，非 text 部分丢弃，有损但 robust，不 panic）；非 string/null/array → Protocol 报错。
+  - `convert_tool_call`：取 `id` / `function.name` / `function.arguments` 为 required string（缺失→Protocol
+    报错，不引入空值风险，与 review M-STATE-1 指出的「accumulator 不检查空 id/name」相反方向的安全选择）。
+  - `parse_arguments`：空 arguments `""`→`json!({})`（与 openai_resp `empty_function_arguments` 一致）；
+    **解析失败 → `input=Value::Null` + `extra[RESPONSE_EXTRA_KEY]["raw_arguments"]=原文`**（设计文档 §4.3
+    「解析失败保留原文进 extra」；input=null 表示无有效输入、不伪造，原文可经 extra 恢复）。
+  - `normalize_finish_reason(Option<&str>)`：finish_reason 为权威终止信号，映射表 `stop`→EndTurn /
+    `length`→MaxTokens / `tool_calls`→ToolUse / `content_filter`→Refusal / 其它→unknown(Other) /
+    缺失/null→`without_raw(Other)`。**不引入 has_tool_call 兜底**（避免与 openai_resp 的 status+evidence
+    复杂逻辑漂移；chat 的 finish_reason 是单一权威字段）。
+- **`RESPONSE_EXTRA_KEY` 常量**：声明于 `mod.rs`（`const RESPONSE_EXTRA_KEY: &str = "openai_chat";`，比照
+  openai_resp 的 `openai_response`），convert.rs 经 `crate::adapter::openai_chat::RESPONSE_EXTRA_KEY` 引用，
+  仅用于非法 arguments 的 raw_arguments 命名空间。
+- **choices 不从 extra 移除**（关键设计决策，与 openai_resp「remove output + 按 block 重建 evidence」不同）：
+  只 remove `usage`；`choices`（含 `choices[0].logprobs`/`message`/`finish_reason`）、`object`、`id`、`created`、
+  `model`、`system_fingerprint` 等**全部保留在 `Response.extra`**。理由：设计文档 §2.2 明确「logprobs 归一化模型
+  无处安放，**只能进 extra**」，而 logprobs 在 `choices[0]` 内——保 choices 是满足该约束最简洁的形态，同时顺带
+  满足 §4.3「未建模字段（created/system_fingerprint 等）进 extra」。message 因此在 extra 中与归一化 block 并存
+  （冗余但无损，利于 forward-compat；M3 流式 Accumulator 折叠对照按文本/reasoning/tool_use/stop_reason/usage
+  字段比对，不受 extra 形状影响）。
+- `response/tests/{mod.rs, parsing.rs}` + 3 个脱敏 fixtures（`text_response.json`/`tool_response.json`/
+  `reasoning_response.json`，无真实 key/账号）：
+  - parsing.rs 10 用例：① text fixture（content + usage 含 cached/reasoning details + extra 含 object/model/
+    created/system_fingerprint/choices.logprobs、不含 usage）② tool fixture（id/name/arguments 解析 + ToolUse
+    stop）③ reasoning fixture（Thinking 在 Text 前 + signature=None + reasoning_tokens）④ **finish_reason 全表**
+    （stop/length/tool_calls/content_filter/未知/缺失→对应 stop_reason，缺失 without_raw）⑤ null finish_reason→Other
+    ⑥ 未知顶层字段 + 结构化 logprobs 留 extra（usage 不留）⑦ 空 arguments→json!({}) ⑧ **非法 arguments→input=null +
+    extra[RESPONSE_EXTRA_KEY]["raw_arguments"]=原文** ⑨ 并行 tool_calls→有序 ToolUse blocks ⑩ object 不符/缺失
+    choices/空 choices/缺 message/非 assistant role/缺 function/非 string content/非 string finish_reason/非法 usage
+    一族 Protocol 报错 + malformed JSON 报错。
+  - mod.rs 含 `minimal_request`/`local_endpoint`（加 `#[allow(dead_code)]` + 注释标注 M2-2 transport 接线，
+    沿用 M1-2 过渡 allow 惯例）；fixtures 经 `include_str!` 加载。
+- 验证结果（全绿）：
+  - `cargo fmt --all`（无 diff）；
+  - `cargo clippy --all-targets -- -D warnings`；
+  - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  - `cargo test -p agent-lib --lib adapter::openai_chat`（22 通过：12 既有 request/mod + 10 新增 response/parsing）；
+  - `cargo test --all --all-targets`（全部 `test result:` 行 `0 failed`，lib 1062→1072 +10，集成/replay/smoke 套件全绿，无回归）；
+  - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
+- 无 breaking change：纯新增 `parse_response`（pub 方法）+ `parse_response_value`（pub(super)）+ 私有 convert
+  模块/函数 + 新增 RESPONSE_EXTRA_KEY 私有常量；`chat()`/`invalid_response` 签名不变（仅替换占位 body 为真实
+  transport+parse 委托）。transport.rs（状态码/内容类型/错误映射的本地服务器测试）留 **M2-2**，符合本任务边界。
 
 ### M2-2 [TODO] 非流式 transport 测试：状态码/内容类型/错误映射
 

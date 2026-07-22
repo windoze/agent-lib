@@ -22,6 +22,11 @@ mod request;
 mod response;
 mod stream;
 
+/// Namespace used inside content-block extras for chat/completions wire metadata
+/// that has no provider-neutral field (for example raw tool-call arguments that
+/// failed JSON parsing).
+const RESPONSE_EXTRA_KEY: &str = "openai_chat";
+
 /// Client resources and endpoint configuration for OpenAI Chat/Completions.
 ///
 /// The adapter owns a reusable HTTP client while keeping endpoint transport

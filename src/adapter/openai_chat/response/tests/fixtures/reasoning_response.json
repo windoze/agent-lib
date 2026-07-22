@@ -1,0 +1,26 @@
+{
+  "id": "chatcmpl-recorded-reasoning",
+  "object": "chat.completion",
+  "created": 1783882300,
+  "model": "deepseek-reasoner",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "The answer is 42.",
+        "reasoning_content": "Let me think about this step by step."
+      },
+      "finish_reason": "stop",
+      "logprobs": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 30,
+    "completion_tokens": 50,
+    "total_tokens": 80,
+    "prompt_tokens_details": { "cached_tokens": 6 },
+    "completion_tokens_details": { "reasoning_tokens": 35 }
+  },
+  "system_fingerprint": "fp_demo_reasoning"
+}

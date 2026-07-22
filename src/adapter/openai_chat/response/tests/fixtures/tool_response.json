@@ -1,0 +1,33 @@
+{
+  "id": "chatcmpl-recorded-tool",
+  "object": "chat.completion",
+  "created": 1783882290,
+  "model": "deepseek-chat",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_recorded_weather",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\":\"Tokyo\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls",
+      "logprobs": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 56,
+    "completion_tokens": 18,
+    "total_tokens": 74
+  },
+  "system_fingerprint": "fp_demo_tool"
+}

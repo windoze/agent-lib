@@ -1,0 +1,25 @@
+{
+  "id": "chatcmpl-recorded-text",
+  "object": "chat.completion",
+  "created": 1783882282,
+  "model": "deepseek-chat",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hi there"
+      },
+      "finish_reason": "stop",
+      "logprobs": null
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 13,
+    "completion_tokens": 26,
+    "total_tokens": 39,
+    "prompt_tokens_details": { "cached_tokens": 4 },
+    "completion_tokens_details": { "reasoning_tokens": 0 }
+  },
+  "system_fingerprint": "fp_demo_text"
+}
