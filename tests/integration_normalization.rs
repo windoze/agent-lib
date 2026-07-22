@@ -10,7 +10,7 @@ use tokio::time::timeout;
 /// The outer deadline keeps this entire test case below one minute even when
 /// an endpoint stalls while executing one of the multi-request scenarios.
 #[tokio::test]
-#[ignore = "requires credentials for the Anthropic and/or OpenAI real endpoint"]
+#[ignore = "requires credentials for the Anthropic, OpenAI Responses, and/or OpenAI Chat/Completions real endpoint"]
 async fn configured_providers_share_the_normalized_conversation_contract() {
     timeout(
         Duration::from_secs(55),

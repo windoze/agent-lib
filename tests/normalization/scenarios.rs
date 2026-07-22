@@ -140,7 +140,7 @@ fn chat_request(
     system: Option<&str>,
 ) -> ChatRequest {
     ChatRequest {
-        model: target.model.to_owned(),
+        model: target.model.clone(),
         messages,
         tools,
         system: system.map(str::to_owned),

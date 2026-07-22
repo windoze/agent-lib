@@ -1145,7 +1145,7 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
 - 无 breaking change：新增 `openai_chat_from_env`/`openai_chat()` 公开构造器（向后兼容形状新增）+ 放宽私有
   `openai_chat_endpoint` 签名 + 新增私有 `optional_owned_env` helper + 文档；`ProviderConfig` 结构形状不变。
 
-### M4-2 [TODO] 归一化矩阵：tests/normalization/config.rs 注册新 Provider
+### M4-2 [DONE] 归一化矩阵：tests/normalization/config.rs 注册新 Provider
 
 上下文：
 
@@ -1166,6 +1166,50 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
 
 - 无 env 时 `cargo test --test integration_normalization` 照常通过（新分支静默
   跳过）；有 env 时本地手验新 provider 入矩阵（可在完成记录注明手验结果）。
+
+完成记录（2026-07-23）：
+
+- `tests/normalization/config.rs` 注册 `OpenAiChat` provider，纯新增分支、scenario/
+  assertions/mod.rs 零改动（已 grep 确认全部 provider-neutral，无按 provider 数量的断言
+  或快照——`assertions.rs:92` 的 `calls.len()` 是 tool-call 计数，与 provider 计数无关）：
+  - import 加 `openai_chat::OpenAiChatAdapter`（与既有两个适配器并列）。
+  - `Provider` enum 末尾追加 `OpenAiChat`（保持矩阵顺序确定性）；`configured_targets()` 的
+    数组同步末尾追加；`build_target` match 加 arm `Provider::OpenAiChat => build_openai_chat_target()`。
+  - 新增 `build_openai_chat_target()`（照 `build_anthropic_target`/`build_openai_target` 惯例）：
+    env **三件套门禁**——`OPENAI_CHAT_BASE_URL`（必需）+ `OPENAI_CHAT_API_KEY`（必需）+
+    `OPENAI_CHAT_MODEL`（必需），任一缺失/空 → `integration_env` 返回 `None` → `filter_map` 静默
+    跳过（与既有 provider 一致，无 env 时矩阵行为不变）。**Bearer 直连**（`AuthScheme::Bearer(token)`，
+    `query_params: Vec::new()`，`extra_headers: Vec::new()`），区别于 Azure 风格的 `build_openai_target`
+    （`api-key` 头 + `api-version` query，设计文档 §6/M4-1 的正确传输形态）。label
+    `"OpenAI Chat/Completions"`。model 走 env（而非硬编码常量）——chat/completions 覆盖 DeepSeek/vLLM/
+    任意 OpenAI 兼容端点，部署模型名 caller-specific，env 是正确选择（env 名与 facade
+    `openai_chat_from_env` 的 `OPENAI_CHAT_BASE_URL`/`OPENAI_CHAT_API_KEY` 一致，`OPENAI_CHAT_MODEL`
+    沿用 M4-3 的 `DEEPSEEK_MODEL`/`VLLM_MODEL` 的 `*_MODEL` 惯例）。
+- **连带必要改动（class-wide 修法，非 narrow patch）**：`IntegrationTarget.model` 字段类型
+  `&'static str` → `String`。根因：既有两 provider 用编译期常量模型名（`&'static str` 充分），但
+  OpenAiChat 的 model 名来自 env（运行时 `String`）。字段泛化为 `String` 后两者都支持——常量站点加
+  `.to_owned()`（`build_anthropic_target` 的 `"databricks-claude-haiku-4-5"`、`build_openai_target` 的
+  `"gpt-5.5"`），env 站点直接持有 `String`；`scenarios.rs` 的 `target.model.to_owned()` → `.clone()`。
+  字段 rustdoc 补注「Owned so a provider may source its model name from the environment」。全在
+  `tests/normalization/` 内（test-only，零公开 API 影响）。`label` 维持 `&'static str`（恒为字面量）。
+- `tests/integration_normalization.rs` 的 `#[ignore]` 文案补 OpenAI Chat/Completions（原仅
+  Anthropic/OpenAI），口径准确化（属 normalization 子系统连带更新，非语义变更）。
+- 验证结果（全绿）：
+  - `cargo fmt --all`：无 diff（仅我的编辑）。
+  - `cargo clippy --all-targets -- -D warnings`：exit 0（含 integration_normalization binary）。
+  - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`：exit 0。
+  - `cargo test --test integration_normalization`：exit 0，`configured_providers_share_the_normalized_conversation_contract … ignored`
+    （无 env 干净跳过，新 ignore 文案已生效）。
+- **未跑全量 `cargo test --all --all-targets`**：本任务只改 `tests/normalization/config.rs` +
+  `scenarios.rs`（字段类型泛化）+ 一个 `#[ignore]` 文案，唯一受影响 binary 是 `integration_normalization`，
+  已被 `clippy --all-targets`（编译每个 binary）+ 其自身 test run 完整覆盖；无生产代码、无其他 test binary
+  改动。全量门禁留给 M4-R review。
+- **env-present 路径未实跑**：无真实端点凭据（`OPENAI_CHAT_*` 三件套），构造逻辑结构上镜像已在 CI 验证的
+  `build_anthropic_target`/`build_openai_target`（仅 3 env vs 2 env、Bearer auth、model 来自 env 三处差异，
+  均经类型系统 + clippy 钉死），故按 M4-2 验证条件允许的「注明未实测」标注。有 env 时本地手验真实 provider
+  入矩阵（尤其 DeepSeek/vLLM 方言）留给 M4-3 `#[ignore]` 真实端点测试与 M5-1 capability-matrix 引用。
+- 无 breaking change：纯测试新增 provider 分支 + test-only struct 字段类型泛化（`&'static str`→`String`，
+  仅 `tests/normalization/` 内）+ ignore 文案。无生产代码、无公开 API 改动。
 
 ### M4-3 [TODO] #[ignore] 真实端点测试：tests/integration_openai_chat.rs（DeepSeek + vLLM）
 

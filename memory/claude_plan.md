@@ -1,98 +1,87 @@
-## Execution Plan — M4-1：facade 接线（client_for_provider 分支 + openai_chat_from_env + lib.rs 文档）
+## Execution Plan — M4-2：归一化矩阵注册 OpenAiChat provider
 
-TODO.md 第一个未完成任务：**M4-1 [TODO]**（M1/M2/M3 含 review 全部 [DONE]）。
-目标：把 OpenAI Chat/Completions 协议接入 facade 层，补齐 M1-1 为满足 exhaustive match
-而留下的「env 读取构造器 + vLLM 无 auth 路径」欠账，并同步顶层协议清单文档。
+TODO.md 第一个未完成任务：**M4-2 [TODO]**（M1/M2/M3 + M4-1 全部 [DONE]）。
+目标：在 `tests/normalization/config.rs` 注册 `OpenAiChat` provider，使 OpenAI
+Chat/Completions（DeepSeek/vLLM 方言）进入跨 provider 归一化矩阵。
 
-### 现状盘点（M1-1 已落地，本任务在其上加薄层）
+### 现状盘点（已读源码核实）
 
-- `ProviderId::OpenAiChat` 变体 ✓（`src/model/extras.rs`）
-- `OPENAI_CHAT_DEFAULT_CAPABILITY` 静态 ✓（`src/client/capability.rs`，已在 `client/mod.rs` `pub use`）
-- `openai_chat_endpoint(base_url, api_key)` 私有 helper ✓（`src/facade/config.rs:289`）
-- `ProviderConfigBuilder::build()` 已处理 `ProviderId::OpenAiChat => openai_chat_endpoint(...)` ✓（`config.rs:256`）
-- `client_for_provider()` 已有 `ProviderId::OpenAiChat => Arc::new(OpenAiChatAdapter::new(endpoint))` 分支 ✓（`chat.rs:395`）
+- `tests/normalization/config.rs`：`Provider` enum = `{Anthropic, OpenAiResponses}`；
+  `configured_targets()` 按确定性顺序 + `filter_map(build_target)`；每 provider 一个
+  `build_*_target()`（env 缺失返回 `None` 静默跳过）；模型名是**硬编码常量**
+  （`"databricks-claude-haiku-4-5"` / `"gpt-5.5"`），env 只读 base_url + token 两项。
+- `scenarios.rs` / `assertions.rs` / `mod.rs`：**全部 provider-neutral**，不按 provider
+  分支，无按 provider 数量的断言/快照（grep 确认；`calls.len()` 是 tool call 计数，非 provider 计数）。
+- `OpenAiChatAdapter`：`pub struct`，`with_http_client(endpoint, http_client)` 已就绪
+  （`src/adapter/openai_chat/mod.rs:64`），经 `agent_lib::adapter::openai_chat` 可访问。
+- `OPENAI_CHAT_DEFAULT_CAPABILITY.tool_calling = true`（capability.rs:111）→ scenario 的
+  `capability().tool_calling` 检查会通过。
+- transport 形态（§6/M4-1）：**Bearer 直连**，无 `api-key` 头、无 `api-version` query
+  （区别于 Azure 风格的 `build_openai_target`）。
+- design doc §7.2 item 4：「归一化矩阵：`config.rs:20` 注册新 `Provider` 分支」，无特定
+  model env 约定。
+- ACP fs 沙箱漏洞（C1）属不同子系统，不阻塞本任务（不抢占 TODO 顺序）。
 
-### 待补（本任务产出）
+### 实施（靶向 patch）
 
-#### 1. config.rs：`openai_chat_from_env()` 构造器（核心）
+#### 1. `tests/normalization/config.rs`
 
-- 读 `OPENAI_CHAT_BASE_URL`（**必需**，缺失/空 → `FacadeError::Config`，复用 `required_env`）。
-- 读 `OPENAI_CHAT_API_KEY`（**可选**）：有值 → `AuthScheme::Bearer`；缺失/空 → `AuthScheme::None`
-  （vLLM 等无 auth OpenAI 兼容端点）。
-- 错误风格与 `openai_from_env`/`anthropic_from_env` 一致（`FacadeError::Config`，文案点名变量不点值）。
-- DeepSeek：最小方案，只加 `openai_chat_from_env`；用户把 base_url 指到 `https://api.deepseek.com`
-  （DeepSeek 专用 env 入口留给 M4-3 `#[ignore]` 测试直接读 `DEEPSEEK_*`）。
+- import：`adapter::{anthropic::AnthropicAdapter, openai_chat::OpenAiChatAdapter, openai_resp::OpenAiRespAdapter}`。
+- `Provider` enum 末尾追加 `OpenAiChat`（保持矩阵顺序确定性）。
+- `configured_targets()` 的数组末尾追加 `Provider::OpenAiChat`。
+- `build_target` match 加 arm：`Provider::OpenAiChat => build_openai_chat_target()`。
+- 新增 `build_openai_chat_target()`：env 三件套门禁，Bearer 直连，`with_http_client`。
+  - env（与 facade `openai_chat_from_env` 一致 + `*_MODEL` 惯例，比照 M4-3 的
+    `DEEPSEEK_MODEL`/`VLLM_MODEL`）：`OPENAI_CHAT_BASE_URL`（必需）、
+    `OPENAI_CHAT_API_KEY`（必需）、`OPENAI_CHAT_MODEL`（必需——模型名 provider 相关、
+    DeepSeek/vLLM 各异，用 env 而非常量，符合 M4-2「可用 model 名」「env 惯例」要求）。
+  - model 走 `integration_env`（非密钥，复用统一 skip-message 行为）。
+  - EndpointConfig：`auth: AuthScheme::Bearer(token)`，`query_params: Vec::new()`，
+    `extra_headers: Vec::new()`。
 
-#### 2. config.rs：泛化 `openai_chat_endpoint(base_url, auth: AuthScheme)`
+#### 2. `tests/integration_normalization.rs`
 
-- 现签名 `(base_url, api_key) -> 总是 Bearer`。改为 `(base_url, auth: AuthScheme)`，
-  让 None 路径复用同一 helper，消除 EndpointConfig 字面量重复。
-- 影响 builder 调用点：`openai_chat_endpoint(base_url, AuthScheme::Bearer(api_key))`。
-- 私有 helper，零公开 API 影响。
+- `#[ignore]` 文案补 OpenAI Chat/Completions（口径准确化，属 normalization 子系统连带更新）。
 
-#### 3. config.rs：`ProviderConfig::openai_chat()` builder 入口
+### 验证
 
-- 与 `anthropic()`/`openai()` 对称的 fluent builder 入口（`ProviderConfigBuilder::new(OpenAiChat)`）。
-- builder 路径恒带 api_key（Bearer）；无 auth（vLLM）走 `openai_chat_from_env` 或 `custom`。
-- 顺手在 `api_version()` rustdoc 注明 chat/completions 忽略该字段（build 的 OpenAiChat arm 不读它）。
-
-#### 4. config/tests.rs：env 隔离单测（复用既有 `ENV_LOCK` + `EnvGuard`）
-
-按 TODO 验证条件两条：
-- a) env 缺 `OPENAI_CHAT_BASE_URL` → 明确 `FacadeError::Config`。
-- b) env 齐备（base_url + api_key）→ 构造成功，且 `client_for_provider(config)` 返回的 client
-  `capability()` 与 `OPENAI_CHAT_DEFAULT_CAPABILITY` 一致（经 `crate::facade::chat::client_for_provider`，
-  import `LlmClient`）。
-- 补：无 api_key → `AuthScheme::None`（vLLM 路径）；`openai_chat()` builder 产 Bearer + provider==OpenAiChat。
-
-#### 5. lib.rs：协议清单文档（§6 要求）
-
-- 行 3：`translates Anthropic Messages and OpenAI Responses wire formats` → 加 `and OpenAI Chat/Completions`。
-- 行 16-17：`adapter implements the Anthropic Messages and OpenAI Responses HTTP and SSE protocols`
-  → 加 `and OpenAI Chat/Completions`。
-
-#### 6. chat.rs：facade rustdoc 示例（§6 要求）
-
-- `Chat` struct doc 示例（行 61 引用 `openai_from_env` 处）后补一条 chat/completions 用法提示，
-  指向 `ProviderConfig::openai_chat_from_env`；不改既有示例语义、不新增可编译 doctest 负担。
-
-### 验证条件（TODO）
-
-- `cargo test -p agent-lib --lib facade` 通过。
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过。
-- 全量门禁：`cargo fmt --all` / `cargo clippy --all-targets [--features external-*] -- -D warnings`
-  / `cargo test --all --all-targets` 全绿。
-
-### 执行顺序（小而靶向的 patch，每步间 re-read 受影响区）
-
-1. [x] 上下文读取（TODO §M4-1 + 设计文档 §5.3/§6 + config.rs/config tests + chat.rs/chat tests + lib.rs + openai_chat/mod.rs）
-2. [ ] config.rs：泛化 `openai_chat_endpoint` 签名 + 改 builder 调用点。
-3. [ ] config.rs：加 `openai_chat_from_env()` + `openai_chat()` builder + `api_version()` rustdoc 注记。
-4. [ ] config/tests.rs：加 env 隔离单测（含 client_for_provider capability 对照）。
-5. [ ] lib.rs：协议清单两处。
-6. [ ] chat.rs：rustdoc 示例补注。
-7. [ ] 跑门禁（fmt → clippy ×2 → facade 测试 → doc）→ 全量 test。
-8. [ ] TODO.md 标 [DONE] + 完成记录；commit + stop。
+- `cargo fmt --all`
+- `cargo clippy --all-targets -- -D warnings`（编译 + lint 含 integration_normalization 全部 binary）
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
+- `cargo test --test integration_normalization`（编译 + ignored 测试干净跳过，exit 0）
+- **不跑全量 `cargo test --all --all-targets`**：本任务只改 `tests/normalization/config.rs`
+  + 一个 `#[ignore]` 字符串，唯一受影响的 binary 是 `integration_normalization`，已被
+  clippy --all-targets + 其自身 test run 覆盖；无生产代码、无其他 test binary 改动
+  （全量门禁留给 M4-R review）。
+- env-present 路径需真实端点，留手动验证 / M5-1 引用（M4-2 验证条件允许「手验或注明未实测」）。
 
 ### 边界 / 不做
 
-- 不动 `client_for_provider` 分支（M1-1 已在）。
-- 不动 `tests/normalization/config.rs`（M4-2 范围）。
+- 不改 `scenarios.rs`/`assertions.rs`/`mod.rs`（provider-neutral，无需动）。
 - 不加 `tests/integration_openai_chat.rs`（M4-3 范围）。
-- 不加 DeepSeek 专用 facade 构造器（最小方案；DEEPSEEK_* 由 M4-3 ignored 测试直读）。
-- 无 breaking change：新增构造器/builder + 放宽私有 helper 签名 + 文档。
+- 不动 facade / 生产代码。
+- 无 breaking change：纯新增测试 provider 分支 + ignore 文案。
+
+### 执行顺序
+
+1. [x] 上下文读取（config.rs/mod.rs/scenarios.rs/assertions.rs/integration_normalization.rs
+   + openai_chat/mod.rs + capability.rs + design doc §6/§7.2 + M4-1 完成记录）。
+2. [ ] config.rs：import + enum + configured_targets + build_target arm + build_openai_chat_target。
+3. [ ] integration_normalization.rs：ignore 文案。
+4. [ ] 跑门禁（fmt → clippy ×2 → test --test integration_normalization）。
+5. [ ] TODO.md M4-2 [TODO]→[DONE] + 完成记录；commit + stop。
 
 ### 进度日志
 
 - [x] 上下文读取完成；计划定稿。
-- [x] config.rs：泛化 `openai_chat_endpoint(base_url, auth: AuthScheme)` + builder 调用点改传 `AuthScheme::Bearer`。
-- [x] config.rs：加 `openai_chat_from_env()`（必需 base_url / 可选 api_key→Bearer|None）+ `openai_chat()` builder +
-      `optional_owned_env` helper + `api_version()`/struct doc 注记。
-- [x] config/tests.rs：4 个 env 隔离单测（缺 base_url→错；齐备→Bearer+capability==默认；无 key→None；builder→Bearer 忽略 version）。
-- [x] lib.rs：协议清单两处补 OpenAI Chat/Completions。
-- [x] chat.rs：`Chat` 示例后补 chat/completions rustdoc 指引。
-- [x] 门禁全绿：fmt 无 diff / clippy 默认 PASS / clippy external PASS / facade 282 通过 /
-      test --all 全 0 failed（lib 1119→1123 +4）/ doc PASS（修 redundant-explicit-link）。
-- [x] TODO M4-1 [TODO]→[DONE] + 完成记录。
-- [x] commit（c9b082a）+ stop。
+- [x] config.rs：import + enum + configured_targets + build_target arm + build_openai_chat_target。
+- [x] 连带：`IntegrationTarget.model` `&'static str`→`String`（2 常量站 `.to_owned()` +
+      scenarios.rs `.clone()`）——env-sourced model 名的 class-wide 必要修法。
+- [x] integration_normalization.rs：ignore 文案补 OpenAI Chat/Completions。
+- [x] 门禁全绿：fmt 无 diff / clippy 默认 exit0 / clippy external exit0 /
+      `test --test integration_normalization` exit0（ignored 干净跳过，新文案生效）。
+- [x] 未跑全量套件（唯一受影响 binary = integration_normalization 已被 clippy 覆盖，
+      无生产代码改动）；env-present 路径无凭据未实跑（注明未实测，留 M4-3/M5-1）。
+- [x] TODO M4-2 [TODO]→[DONE] + 完成记录。
+- [ ] commit + stop。
 

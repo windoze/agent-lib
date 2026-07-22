@@ -1,7 +1,9 @@
 //! Real endpoint construction kept separate from provider-neutral scenarios.
 
 use agent_lib::{
-    adapter::{anthropic::AnthropicAdapter, openai_resp::OpenAiRespAdapter},
+    adapter::{
+        anthropic::AnthropicAdapter, openai_chat::OpenAiChatAdapter, openai_resp::OpenAiRespAdapter,
+    },
     client::{AuthScheme, EndpointConfig, LlmClient},
 };
 use std::{env, time::Duration};
@@ -11,7 +13,11 @@ pub(super) struct IntegrationTarget {
     /// Human-readable context used only in diagnostics.
     pub(super) label: &'static str,
     /// Deployment name placed into otherwise provider-neutral requests.
-    pub(super) model: &'static str,
+    ///
+    /// Owned so a provider may source its model name from the environment
+    /// (e.g. OpenAI Chat/Completions via DeepSeek or vLLM) rather than a
+    /// compile-time constant.
+    pub(super) model: String,
     /// Dynamic client used by every scenario after endpoint construction.
     pub(super) client: Box<dyn LlmClient>,
 }
@@ -21,14 +27,19 @@ pub(super) struct IntegrationTarget {
 enum Provider {
     Anthropic,
     OpenAiResponses,
+    OpenAiChat,
 }
 
 /// Builds all targets whose complete credential sets are available.
 pub(super) fn configured_targets() -> Result<Vec<IntegrationTarget>, String> {
-    [Provider::Anthropic, Provider::OpenAiResponses]
-        .into_iter()
-        .filter_map(build_target)
-        .collect()
+    [
+        Provider::Anthropic,
+        Provider::OpenAiResponses,
+        Provider::OpenAiChat,
+    ]
+    .into_iter()
+    .filter_map(build_target)
+    .collect()
 }
 
 /// Selects only endpoint construction details; scenarios never inspect this
@@ -37,6 +48,7 @@ fn build_target(provider: Provider) -> Option<Result<IntegrationTarget, String>>
     match provider {
         Provider::Anthropic => build_anthropic_target(),
         Provider::OpenAiResponses => build_openai_target(),
+        Provider::OpenAiChat => build_openai_chat_target(),
     }
 }
 
@@ -54,7 +66,7 @@ fn build_anthropic_target() -> Option<Result<IntegrationTarget, String>> {
     Some(
         integration_http_client().map(|http_client| IntegrationTarget {
             label: "Anthropic Messages",
-            model: "databricks-claude-haiku-4-5",
+            model: "databricks-claude-haiku-4-5".to_owned(),
             client: Box::new(AnthropicAdapter::with_http_client(endpoint, http_client)),
         }),
     )
@@ -77,8 +89,36 @@ fn build_openai_target() -> Option<Result<IntegrationTarget, String>> {
     Some(
         integration_http_client().map(|http_client| IntegrationTarget {
             label: "OpenAI Responses",
-            model: "gpt-5.5",
+            model: "gpt-5.5".to_owned(),
             client: Box::new(OpenAiRespAdapter::with_http_client(endpoint, http_client)),
+        }),
+    )
+}
+
+/// Creates the OpenAI Chat/Completions dynamic client when its three
+/// variables (base URL, API key, and a usable model name) all exist.
+///
+/// Unlike the Azure-style Responses target above, Chat/Completions talks to
+/// the endpoint with Bearer auth directly — no `api-key` header and no
+/// `api-version` query (design doc §6). The model is read from the
+/// environment because the endpoint may be DeepSeek, vLLM, or any other
+/// OpenAI-compatible server whose deployment name is caller-specific.
+fn build_openai_chat_target() -> Option<Result<IntegrationTarget, String>> {
+    let base_url = integration_env("OpenAI Chat", "OPENAI_CHAT_BASE_URL")?;
+    let token = integration_env("OpenAI Chat", "OPENAI_CHAT_API_KEY")?;
+    let model = integration_env("OpenAI Chat", "OPENAI_CHAT_MODEL")?;
+    let endpoint = EndpointConfig {
+        base_url,
+        auth: AuthScheme::Bearer(token),
+        query_params: Vec::new(),
+        extra_headers: Vec::new(),
+    };
+
+    Some(
+        integration_http_client().map(|http_client| IntegrationTarget {
+            label: "OpenAI Chat/Completions",
+            model,
+            client: Box::new(OpenAiChatAdapter::with_http_client(endpoint, http_client)),
         }),
     )
 }
