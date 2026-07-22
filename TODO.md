@@ -567,7 +567,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - 无 breaking change：纯新增测试文件 + 测试模块声明；移除的是过渡 `#[allow(dead_code)]` 而非公开 API。
 
-### M2-R [TODO] M2 review：非流式响应侧正确性核对
+### M2-R [DONE] M2 review：非流式响应侧正确性核对
 
 核对清单：
 
@@ -581,6 +581,84 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 跑全量门禁命令，全部通过。
 
 产出：本任务下方追加 review 记录。
+
+完成记录（2026-07-23）：
+
+核对结论（逐条对 checklist）：
+
+1. **设计文档 §4.3 逐条对照，无遗漏行**：
+   - **`object == "chat.completion"` 校验**（`response.rs:74-91` 四态 match：Some(String) 匹配放行 /
+     Some(String) 不符报错 / Some(非 string) 报错 / None 缺失报错，比照 `openai_resp/response.rs:69`
+     的 `object=="response"`）✓
+   - **取 `choices[0]`**（`read_choice` `response.rs:122-156`：`n>1` 只取第一条，逐层校验 choices 缺失/
+     非数组/空数组/`choices[0]` 非 object/缺 message/finish_reason 类型）✓
+   - **三种 content 落点**（`convert.rs:28-73` `convert_message`，借用 message 不消费以保 choices 留 extra）：
+     - `message.content` → `ContentBlock::Text`（`convert_content:98-134`，string→Text；null/缺失/空→无 block；
+       多模态 array 防御性拼接 text 部分，非 text 丢弃）✓
+     - `message.reasoning_content` → `ContentBlock::Thinking { text, signature: None, extra: 空 }`
+       （`convert.rs:44-52`，**signature 恒 None** 符合 §4.3；空串不产出）✓
+     - `message.tool_calls[]` → `ContentBlock::ToolUse`（`convert_tool_call:141-172`）✓
+   - **arguments 解析失败降级**（`parse_arguments:175-192`）：空串→`json!({})`；合法→解析为 Value；
+     **非法 JSON→`input=Value::Null` + `extra[RESPONSE_EXTRA_KEY]["raw_arguments"]=原文`**（§4.3「解析失败保留原文
+     进 extra」；input=null 表示无有效输入、不伪造，原文可经 extra 恢复，与伪造/丢弃相反方向的安全选择）✓
+   - **`finish_reason` 全表**（`normalize_finish_reason:81-90`，§4.3 映射表逐行）：`stop`→EndTurn / `length`→MaxTokens /
+     `tool_calls`→ToolUse / `content_filter`→Refusal / `Some(其它)`→`Normalized::unknown(raw)`（
+     `StopReason::unknown_value()==Other`，`normalized.rs:92-96` 钉死）→ value=Other / `None`→
+     `Normalized::without_raw(Other)`；二者 value 均为 Other，吻合表「其它/缺失→Other」，raw 仅在有原文时保留 ✓
+   - **extra 兜底**（`response.rs:105` `extra = wire`，只 `remove("usage")`）：`choices`（含 `choices[0].logprobs`、
+     `message`、`finish_reason`）、`object`、`id`、`created`、`model`、`system_fingerprint` 及一切未建模顶层字段
+     **全部保留**（§4.3「未建模字段进 extra」+ §2.2「logprobs 只能进 extra」——logprobs 在 `choices[0]` 内，保 choices
+     是最简满足约束的形态）✓
+   - block 顺序：reasoning(Thinking) → text(Text) → tool_calls(ToolUse)（anthropic reasoning-before-text 惯例 +
+     wire 字段序，`recorded_reasoning_response_maps_reasoning_block_before_text` 钉死）✓
+
+2. **`Usage` 零改动且 cached/reasoning details 有测试钉住**：
+   - `git diff 401bdd8(M1-R)→HEAD -- src/model/usage.rs` **空**（零改动）✓
+   - `Usage` 自定义 Deserialize 已认识 `prompt_tokens`/`completion_tokens`/`total_tokens`、
+     `prompt_tokens_details.cached_tokens`、`completion_tokens_details.reasoning_tokens`（M2-1 上下文确认）。
+     cached/reasoning details 由 fixture 测试钉住：
+     - text fixture（`cached_tokens=4`/`reasoning_tokens=0`）→ `cache_read==4`/`reasoning==0`
+       （`parsing.rs:29-30`）✓
+     - reasoning fixture（`reasoning_tokens=35`/`cached_tokens=6`）→ `reasoning==35`/`cache_read==6`
+       （`parsing.rs:95-96`）✓
+   - `take_usage`（`response.rs:111-117`）将 usage 从 wire 移除并消费进 `Usage` 字段，未建模 usage 字段自然落
+     `Usage.extra`，与 openai_resp 一致。
+
+3. **`src/adapter/common/` 与 `src/client/error.rs` 零改动**：
+   - `git diff 401bdd8→HEAD -- src/adapter/common/` **空**；`-- src/client/error.rs` **空** ✓
+   - M2 两个提交（`d01f398` M2-1 / `ea52ff6` M2-2）`--stat` 仅触及 `src/adapter/openai_chat/` 内文件
+     （+ TODO.md / memory/claude_plan.md），未越界到 common/error/usage ✓
+   - chat() 的错误分类完全复用既有 `common::execute_json_response` + `ClientError::from_http_response`
+     （已覆盖 429/Retry-After、408/504、401/403、context-length、content-filter 的 OpenAI 拼写），
+     M2 transport 测试（6 用例）逐个断言该分类，零改动底层。
+
+4. **fixtures 与 `openai_resp` 惯例一致**：
+   - 目录结构同构：`response/tests/{mod.rs, parsing.rs, transport.rs}` + `response/tests/fixtures/*.json`，
+     与 `openai_resp/response/tests/` 一一对应（openai_resp 仅 text/tool 两个 fixture；openai_chat 多一个
+     reasoning fixture，对应 §7.1「含 `reasoning_content`」要求）✓
+   - `include_str!` 加载（`tests/mod.rs:42-48`，与 openai_resp 同款）✓
+   - **脱敏检查**：fixtures 均为 demo 值（model `deepseek-chat`/`deepseek-reasoner`、id `chatcmpl-recorded-*`、
+     `system_fingerprint: fp_demo_*`、`call_recorded_weather`），`grep -iE 'sk-|Bearer |secret|...'` 仅命中
+     `*_tokens` 字段名（含子串 "token"），**无真实 key/token/账号** ✓
+
+门禁输出摘要（全绿，2026-07-23 独立重跑）：
+
+- `cargo fmt --all`：无 diff。
+- `cargo clippy --all-targets -- -D warnings`：exit 0。
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`：exit 0。
+- `cargo test --all --all-targets`：全部 50 个 `test result:` 行 `0 failed`（lib 1090 通过；集成/replay/smoke 套件全绿，无回归）。
+- `cargo test -p agent-lib --lib adapter::openai_chat`：28 通过（12 request/mod + 10 response/parsing + 6 transport），0.02s。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`：exit 0。
+
+发现的问题及处置：
+
+- 无 spec 偏差、无 workaround、无未调度测试失败。M2 实现（§4.3 响应解析 + chat() 接线 + transport 测试）
+  与设计文档完全一致；M3（SSE 流式）桩状态（`stream/mod.rs::chat_stream` 返回 `ClientError::Other` 占位，非 panic）
+  符合本里程碑边界，已在 M3-1/M3-2 排期，不构成 M2 的阻塞或遗留问题。
+- 微小观察（非问题，不阻断）：`convert_content`（`convert.rs:98-134`）对多模态 array form 仅拼接 `type=="text"`
+  部分、丢弃非 text 部分（有损但 robust，第一期 assistant content 为 string/null，array 是防御性 forward-compat），
+  与 §4.3「`message.content` → Text」的 phase-one 范围一致；若将来 chat/completions assistant 输出多模态，
+  需扩 `convert_content`——属 M5 之后的能力扩展，不在 M2 review 范围内单列任务。
 
 ---
 
