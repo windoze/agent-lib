@@ -293,7 +293,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 无 breaking change：纯新增 `build_request`（pub 方法）+ 私有映射函数；移除的是过渡 `#[allow(dead_code)]`
   而非公开 API。浮点：temperature 经 serde f32→f64，测试用精确值（0.25/0.5）规避 f32↔f64 不等。
 
-### M1-R [TODO] M1 review：骨架与请求侧正确性核对
+### M1-R [DONE] M1 review：骨架与请求侧正确性核对
 
 目的：独立核对 M1 的正确性与完整性，不新增功能。
 
@@ -308,6 +308,84 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 跑全量门禁命令（见文件头），全部通过。
 
 产出：在本任务下方追加 review 记录（核对结论 + 门禁输出摘要 + 发现的问题及处置）。
+
+完成记录（2026-07-23）：
+
+核对结论（逐条对 checklist）：
+
+1. **设计文档 §4.2 映射表逐行核对，无遗漏行**：
+   - `ChatRequest.system` → 首条 `{"role":"system","content":…}`（`request.rs:67-69`）✓
+   - user/assistant 文本 → `{"role","content"}`（`input.rs` `user_message_to_wire`/`assistant_message_to_wire`）✓
+   - assistant `ContentBlock::Thinking` → 该消息 `reasoning_content` 字段，**无条件原样回放**
+     （`input.rs:95-97`、`117-119`：拼接到 `reasoning` 字符串，非空即插入，不判断本轮是否有
+     tool_call——符合 §5.1「统一原样回放永远安全」推论）✓
+   - assistant `ContentBlock::ToolUse` → `tool_calls:[{id,type:"function",function:{name,arguments:<JSON 字符串>}}]`
+     （`input.rs:202-216` `tool_call_to_wire`，arguments 经 `serde_json::to_string` 序列化为字符串）✓
+   - `ContentBlock::ToolResult` → 独立 `{"role":"tool","tool_call_id","content"}` 消息；`Vec<ContentBlock>`
+     扁平化文本（image/unknown 有损丢弃，`parts.join("\n")`）；非 `Ok` 状态拼入文本前缀
+     `[tool error/denied/cancelled]`（`input.rs:132-164`，Anthropic `is_error` 类比）✓
+   - `ChatRequest.tools` → `tools:[{type:"function",function:{name,description,parameters}}]`，比 Responses
+     多一层 `function` 嵌套（`input.rs:220-229` `tool_to_wire`）✓
+   - `stream=true` → 自动注入 `stream_options:{"include_usage":true}`，`stream=false` 省略
+     （`request.rs:83-85` + `StreamOptions` 私有结构体 + `skip_serializing_if=Option::is_none`）✓
+   - `provider_extras` → 所有映射完成后 `merge_into` 最后合并，可覆盖任意顶层字段；mismatch 返回
+     `IgnoredProviderMismatch` outcome，`serialize_body` 据此报 `ClientError::Protocol`（`request.rs:90-103`）✓
+   - `max_tokens` 非可选，直接对应（`request.rs:49,79`，**非** Responses 的 `max_output_tokens`）✓
+   - 关键防线确认：`reasoning_content` 无条件回放 + `stream_options` 注入两条均命中且有 `json!` 精确
+     比对单测钉死（`assistant_message_aggregates…`、`stream_flag_controls_include_usage…`）。
+
+2. **三处触点形状与既有先例一致；capability 字段与设计文档 §6 一致**：
+   - `ProviderId::OpenAiChat`（`extras.rs:21`）：serde `rename_all="snake_case"` → `open_ai_chat`，与
+     `anthropic`/`open_ai_resp` 同风格；round-trip 测试表已追加 `(OpenAiChat,"open_ai_chat")`（`extras.rs:170`）✓
+   - `OPENAI_CHAT_DEFAULT_CAPABILITY`（`capability.rs:106-123`，full struct literal 比照
+     `OPENAI_RESP_DEFAULT_CAPABILITY`）：`max_context_tokens:None`；
+     `input_modalities:{Text,Image}`；`output_modalities:{Text}`；
+     `streaming/tool_calling/parallel_tool_calls/reasoning=true`；
+     `prompt_caching/structured_output=false`（显式，与既有静态的关键差异，对应 §6「无 prompt_caching
+     /structured_output 声明」）；`stop_reasons:{ToolUse,EndTurn,MaxTokens,StopSequence,Refusal}`
+     （`StopSequence`=chat 的 `stop` 参数，`Refusal`=`content_filter`）✓ 逐字段断言测试
+     `openai_chat_default_describes_protocol_capabilities`（`capability.rs:230-261`）钉死。
+   - 模块注册 `src/adapter/mod.rs:5` `pub mod openai_chat;`（字母序排在 `common` 与 `openai_resp` 之间）✓；
+     `src/client/mod.rs:14-16` 已 `pub use` 出 `OPENAI_CHAT_DEFAULT_CAPABILITY`。
+   - facade 耦合（M1-1 因 exhaustive match 触及）：`config.rs:256/289`（Bearer 直连分支 +
+     `openai_chat_endpoint` helper）、`chat.rs:395`（`client_for_provider` 分支）均在位，形状一致。
+
+3. **wire 类型无泄漏；Debug 不泄露密钥**：
+   - `request/input.rs` 全部映射函数产出 `serde_json::Value`（无 wire struct 泄漏）；
+     `message_to_wire`/`tool_to_wire` 为 `pub(super)`（仅 `request` 模块可见，不外泄到 `adapter::openai_chat`
+     之外），其余 fn 私有；`request.rs` 顶层 `OpenAiChatRequestBody`/`StreamOptions` 私有 ✓
+   - `Debug` 脱敏：`mod.rs:122-140` `adapter_debug_redacts_endpoint_credentials` 钉住——构造含
+     `sk-ant-secret`（Bearer）+ `extra_headers` 同密钥的 adapter，断言 `format!("{adapter:?}")` 既不含
+     `sk-ant-secret` 又含 `[REDACTED]`（密钥经 `EndpointConfig` 脱敏 `Debug`，与 `openai_resp` 同款）✓
+
+4. **请求单测覆盖 §7.1 全部关键用例，`json!` 精确比对**：
+   - 6 个关键用例逐一覆盖，且均用 `assert_eq!(…, json!{…})` 对**完整请求 body** 精确比对（非字段抽查）：
+     ① system 首条消息 ② tools `function` 嵌套形状 ③ tool_result 扁平化 + 非 `Ok` 拼入
+     ④ `stream_options` 注入（true/false 两态）⑤ extras 覆盖既有字段 + mismatch 报错
+     ⑥ 多轮历史 assistant 一条消息携带 `reasoning_content` + `tool_calls`（§5.1 DeepSeek 400 防线）。
+   - 额外覆盖：image 多模态 array form（含 URL/Base64）、invalid role/block 一族报错、auth 变体
+     （Bearer/None）+ 可选字段 omit + malformed endpoint（`ClientError::Other`）。transport/auth 类用例
+     因天然是字段观察（method/path/query/headers）而用字段抽查，属合理，非 body-shape 用例。
+   - `openai_chat` 模块共 12 用例（3 M1-2 + 9 M1-3）全绿。
+
+门禁输出摘要（全绿）：
+
+- `cargo fmt --all`：无 diff。
+- `cargo clippy --all-targets -- -D warnings`：通过。
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`：通过。
+- `cargo test --all --all-targets`：全部 `test result:` 行 `0 failed`（lib 1074 通过，集成/replay/smoke 套件全绿，无回归）。
+- `cargo test -p agent-lib --lib adapter::openai_chat`：12 通过。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`：通过。
+
+发现的问题及处置：
+
+- 无 spec 偏差、无 workaround、无未调度测试失败。M1 实现与设计文档 §4.2/§5.1/§6/§7.1 完全一致，
+  M2-1（非流式 transport+parse）/M3（SSE）的桩状态符合本里程碑边界（`ClientError::Other` 占位，非 panic），
+  已在对应任务排期，不构成 M1 的阻塞或遗留问题。
+- 微小观察（非问题，不阻断）：`input.rs:182` `flatten_tool_result_text` 的错误文案为「must be text
+  or image」，而实际 `Image`/`Unknown` 均被静默接受（仅丢弃），文案略宽于实际接受的 `Text|Image|Unknown`；
+  这是面向开发者的诊断文案精度问题，不影响任何 spec 行为或测试，留待将来顺手收口，不在本 review
+  范围内单列任务。
 
 ---
 
