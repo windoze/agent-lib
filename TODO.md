@@ -952,7 +952,7 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
 - 无 breaking change：纯新增测试文件 + 测试模块声明 + 4 对脱敏 fixture；`stream/tests/mod.rs` 的改动仅为测试
   基础设施（helper + 常量 + 子模块声明 + import/doc），不动任何生产代码或公开 API。
 
-### M3-R [TODO] M3 review：流式正确性核对
+### M3-R [DONE] M3 review：流式正确性核对
 
 核对清单：
 
@@ -966,6 +966,93 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
 - 跑全量门禁命令，全部通过。
 
 产出：本任务下方追加 review 记录。
+
+完成记录（2026-07-23）：
+
+核对结论（逐条对 checklist）：
+
+1. **设计文档 §4.4 四个关键差异逐条对照实现，全部命中**：
+   - **§4.4.1 `[DONE]` 哨兵特判在 JSON 解析前**：`normalizer.rs:81` 的 `if event.data.trim() == "[DONE]"`
+     分支**先于** `decode(&event.data)`（`:94`）执行——非 JSON 哨兵永不进入 `wire::decode`，故永不触发解析错误。
+     模块级 rustdoc（`:76-80`）与 `wire.rs:10-11` 注释均显式标注该顺序。`done_sentinel_closes_open_blocks_and_emits_message_stop`
+     + errors.rs `trailing_chunk_after_done_sentinel_is_rejected`（断言文案含 "after the [DONE] sentinel"）钉死 ✓
+   - **§4.4.2 `index` 键控增量、绝不中途解析 JSON**：`push_tool_call`（`:229-256`）按 `delta.index` 在
+     `tool_calls` Vec 里 `find` 已开 block；首片→`start_tool_call`（`:260-297`）要求 `id`+`function.name`
+     缺一报 `Protocol`，发 `BlockStart(ToolInput{tool_name,tool_call_id})`；后续片只把 `function.arguments`
+     原样 `Delta::Json(String)`（`:250-253`），**零 JSON 解析**。BlockId 位置派生 `tool-call-{index}`
+     （`:284`，先例 `anthropic-block-{index}`）。`single_tool_call_streams_argument_fragments_without_parsing`
+     显式断言事件序列无 `ToolInputAvailable`；`parallel_tool_calls_interleave_by_index` 钉双 `index` 并行交错 ✓
+   - **§4.4.3 `reasoning_content` 落点正确**：`push_reasoning_delta`（`:191-197`）发 `BlockDelta{Delta::Reasoning}`
+     + `reasoning_block_id`（`:214-225`）发 `BlockStart{BlockKind::Reasoning}`。`Delta::Reasoning(String)`
+     仅携带文本（`src/stream/mod.rs:11`，无 signature 字段；`ReasoningSignature` 是 Anthropic 专用独立变体，
+     chat/completions normalizer 从不产生）——符合「无 signature」。reasoning→text 顺序由
+     `close_open_blocks` 固定序（reasoning 先于 text）保证，`reasoning_stream_emits_reasoning_block_before_text` 钉死 ✓
+   - **§4.4.4 终态双源（finish_reason + usage chunk）无重复 MessageStop**：`finish_reason` chunk **只缓存**
+     `stop_reason`（`translate_choice` 末尾 `:174-176`，复用 `normalize_finish_reason`），usage chunk 到达即发 `Usage`
+     （`:98-102`），`MessageStop` **唯一**在 `[DONE]` 分支发一次（`:85-91`，带缓存/`without_raw(Other)` stop_reason）。
+     grep 确认 `MessageStop` 全文件仅此一处产出 → 无重复。`terminal_usage_chunk_emits_additive_usage_before_stop`
+     钉死「finish_reason 在前 chunk、usage 在后 chunk、`[DONE]` 才发 MessageStop」且 Usage 严格在 MessageStop 前
+     （满足 accumulator `Usage` 不能落在 `MessageStop` 之后契约）。`stop_reason` 仍源自 `finish_reason`，语义未变 ✓
+   - **关键设计决策核实（非 spec 偏差）**：§4.4.4 字面「由末 chunk 的 finish_reason 发 MessageStop」被实现为
+     「finish_reason 缓存 stop_reason、MessageStop 延迟到 `[DONE]` flush」。这是为解决 usage chunk 在 finish_reason
+     **之后**到达与 accumulator「Usage 必须在 MessageStop 前」契约的矛盾而做的**必要排序修正**——observable 行为
+     （最终 Response 的 stop_reason 来自 finish_reason、usage 来自 usage chunk）与 spec 一致，且双源无重复 MessageStop
+     完全满足 checklist 第 1 条。已在 normalizer 模块 doc（`:16-22`）与 M3-2 完成记录充分说明，非 workaround。
+
+2. **与 M2 的一致性（finish_reason 单一映射 + 折叠对照存在且通过）**：
+   - **映射表无漂移**：`response.rs:22 pub(crate) mod convert;`；`normalize_finish_reason`（`convert.rs:85`，`pub(crate)`）
+     被非流式 `response.rs:99` 与流式 `normalizer.rs:175` 共用同一份 §4.3 映射表（`stop`→EndTurn / `length`→MaxTokens /
+     `tool_calls`→ToolUse / `content_filter`→Refusal / 其它→unknown / 缺失→without_raw(Other)）。grep 确认全 crate
+     无第二份 finish_reason 映射实现。流式 `finish_reason_maps_each_value_to_stop_reason` 覆盖全表（含 unknown/缺失），
+     与 M2 非流式全表测试同源 ✓
+   - **折叠对照测试存在且通过**：`stream/tests/parsing.rs` 4 个 fixture 各一测——不规则字节分块 `[1,2,7,3,19,5,11]`
+     喂完整 `normalize_sse` 管线 → `assert_eq!(events, vec![精确全序列])` → `fold_events`（共享 `Accumulator`）折叠 →
+     经 `comparable`（清空 response-level extra，因流式不发 `ResponseMetadata` 故 folded extra 空、非流式留
+     `choices`/`object`/`id` 等）与配对 `.json` 的 `parse_response` 逐字段 `assert_eq!`。4 fixture 全部通过
+     （text/tool/reasoning/usage_terminal）；另 `usage_events_are_single_additive_segments_matching_non_streaming_usage`
+     断言每 fixture 恰好 1 个加性 Usage 段且聚合 == 非流式 usage（§4.4.4/§7.1）✓
+
+3. **fixtures 脱敏检查（无真实 key/token/账号/内网地址）**：
+   - stream fixtures（4 `.sse` + 4 配对 `.json`）全部 demo 值：id `chatcmpl-demo-*`、tool_call_id `call_demo_a`/`call_demo_b`、
+     model `deepseek-chat`/`deepseek-reasoner`、`created` 为固定时间戳；`grep -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'` 在 fixtures
+     内**零命中**（无内网/公网 IP）✓
+   - `grep -niE 'sk-|bearer |secret|api[_-]?key|password|token='` 命中均在**测试代码**而非 fixture：`mod.rs:131-139`
+     的 Debug 脱敏断言（`sk-ant-secret` 是**断言被脱敏**的假密钥）、`request/tests.rs` 的假占位密钥 `sk-deepseek-secret`/
+     `Bearer token`（验证 auth 头组装）、`response/tests/transport.rs:112` 的模拟错误 body 文案 "Incorrect API key"
+     （非真实凭据）。与 M2-R 脱敏结论一致，无新泄漏 ✓
+
+4. **状态机对乱序/缺失字段的健壮性（不 panic）**：
+   - `normalizer.rs` **零 panic 路径**：grep `unwrap()/expect(/panic!/unreachable!` 零命中，全部走 `?` + 显式
+     `ok_or_else`→`ClientError::Protocol` ✓
+   - **缺 `id` 的后续 chunk**：`push_tool_call` 按 `index` 查已开 block，后续片不读 `id`（只读 `function.arguments`），
+     故「后续 chunk 缺 id」是正常路径，不发错误更不 panic ✓
+   - **首片缺 `id`**：`first_tool_call_fragment_without_id_is_rejected` 钉死 → `Protocol`「must carry `id`」（非 panic）✓
+   - **空 delta + 未知字段**：`empty_delta_and_unknown_fields_terminate_cleanly`（errors.rs）——chunk 带 `delta:{}`
+     + 未建模顶层字段（`id`/`object`/`system_fingerprint`）+ `[DONE]` → 干净 `MessageStart`+`MessageStop`，不 panic
+     （wire.rs serde 默认忽略未建模字段）✓
+   - **非法 UTF-8 / 畸形 JSON / 非法 usage**：分别 errors.rs `invalid_utf8_is_protocol_error`、`malformed_chunk_json_is_protocol_error`
+     与 normalizer.rs:99-100 `invalid usage object` → 全部 `Protocol`，不 panic ✓
+
+门禁输出摘要（全绿，2026-07-23 独立重跑）：
+
+- `cargo fmt --all`：无 diff。
+- `cargo clippy --all-targets -- -D warnings`：exit 0（PASS）。
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`：exit 0（PASS）。
+- `cargo test -p agent-lib --lib adapter::openai_chat`：57 通过（12 request/mod + 10 response/parsing + 6 response/transport
+  + 12 stream/mod inline + 5 stream/parsing + 6 stream/errors + 6 stream/transport），0.02s。
+- `cargo test --all --all-targets`：全部 `test result:` 行 `0 failed`（lib 1119 通过；集成/replay/smoke 套件全绿，无 FAILED、无 panic）。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`：exit 0（PASS）。
+
+发现的问题及处置：
+
+- **无 spec 偏差、无 workaround、无未调度测试失败**。M3 流式实现（wire/decoder/normalizer + fixtures/折叠对照/errors/transport）
+  与设计文档 §4.4 四个关键差异、§7.1 折叠对照要求完全一致。MessageStop 延迟到 `[DONE]` 是经核实的必要排序修正
+  （解决 usage-after-finish_reason 与 accumulator 契约矛盾），非 spec 偏差。
+- **范围外观察（非 M3 缺陷，不阻断，记备查）**：2026-07-23 全库安全审查（`docs/review-2026-07-23.md`）发现共享
+  `Accumulator::apply_unknown_delta` 对 `stream_deltas` 非 Array 字段会 `expect` panic（H-ROB-1）。**chat/completions
+  normalizer 只产生 Text/Reasoning/ToolInput/Usage/MessageStart/MessageStop 事件，从不产生 `ContentBlock::Unknown`**，
+  故该 panic 经 chat/completions 流式路径**不可达**，与本 M3 review 正交；属独立全库审查线，不在 openai_chat M1–M5
+  任务范围内，按任务规则不抢占当前 TODO 顺序，留给单独的安全修复批次处置。
 
 ---
 
