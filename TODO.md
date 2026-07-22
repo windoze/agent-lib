@@ -116,7 +116,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
 - 无 breaking change：`#[non_exhaustive]` enum 新增变体 + 新增 `pub static` + 新增 `pub mod`，均为向后兼容的形状新增。
 
-### M1-2 [TODO] 适配器骨架：OpenAiChatAdapter 结构体与 LlmClient 契约
+### M1-2 [DONE] 适配器骨架：OpenAiChatAdapter 结构体与 LlmClient 契约
 
 上下文：
 
