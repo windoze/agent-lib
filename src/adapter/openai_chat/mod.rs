@@ -29,8 +29,6 @@ mod stream;
 /// [`crate::adapter::openai_resp::OpenAiRespAdapter`].
 #[derive(Clone, Debug)]
 pub struct OpenAiChatAdapter {
-    // Read by `build_request`/transport once M1-3 wires the request body.
-    #[allow(dead_code)]
     http_client: reqwest::Client,
     endpoint: EndpointConfig,
 }

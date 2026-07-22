@@ -191,7 +191,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - 无 breaking change：公开 API（结构体形状、`new`、`capability`）与 M1-1 桩完全一致；新增 `with_http_client`/
   `endpoint()` 为向后兼容的形状新增。
 
-### M1-3 [TODO] 请求侧映射：build_request + Message/Tool → messages/tools
+### M1-3 [DONE] 请求侧映射：build_request + Message/Tool → messages/tools
 
 上下文：
 
@@ -245,6 +245,53 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
   6. **带工具调用的多轮历史中，assistant 消息完整携带 `reasoning_content` +
      `tool_calls`**（§5.1 规则，DeepSeek 400 防线）。
 - `cargo test -p agent-lib --lib adapter::openai_chat` 通过。
+
+完成记录（2026-07-23）：
+
+- `request.rs`：`build_request` 组装 `POST /chat/completions`（`common::endpoint_url(&["chat","completions"])`
+  + `common::endpoint_headers` + `.json(&body)`）。`serialize_body` 用 `OpenAiChatRequestBody` 结构体
+  序列化为 `Value`，再在**所有映射完成后** `provider_extras.merge_into(body, ProviderId::OpenAiChat)`
+  最后合并（可覆盖任意顶层字段，mismatch → `ClientError::Protocol` 报错，与既有适配器同款）。
+  错误分类：`invalid_request` → `ClientError::Protocol`（请求映射），`invalid_endpoint` →
+  `ClientError::Other`（端点配置，照 `openai_resp`）。
+- 顶层 body 字段（设计文档 §4.2）：`model` / `messages` / `max_tokens`（**非** Responses 的
+  `max_output_tokens`，直接对应 `ChatRequest.max_tokens`）/ `stream`；`temperature` `Option` omit-None；
+  `tools` omit-empty；`stream_options: {include_usage:true}` 仅 `stream=true` 注入（`StreamOptions` 结构体）。
+- `request/input.rs`（纯函数映射，逐行对 §4.2 表）：
+  - `system` → 首条 `{"role":"system","content":…}`（在 `serialize_body` 注入，先于 messages 循环）。
+  - user：纯文本 → `content` 字符串（多 Text 块拼接）；含 image/unknown → 多模态 array form
+    （`{type:text,text}` / `{type:image_url,image_url:{url}}` / raw），vision 输入保真。
+  - **assistant 多 block 聚合成一条 chat 消息**（chat/completions 消息模型是一条 message 挂 content +
+    reasoning_content + tool_calls）：Text → `content`（拼接，空则 `null`）；Thinking → `reasoning_content`
+    （拼接，**无条件原样回放** §5.1 推论，无 signature）；ToolUse → `tool_calls:[{id,type:"function",
+    function:{name,arguments:<JSON 字符串>}}]`。
+  - Tool 角色：每 `ToolResult` 块 → 一条 `{"role":"tool","tool_call_id","content"}`；`Vec<ContentBlock>`
+    扁平化文本（image/unknown 有损丢弃，第一期接受，`parts.join("\n")`）；非 `Ok` 状态拼入文本前缀
+    `[tool error/denied/cancelled]`（`tool_result_status_marker`，Anthropic `is_error` 类比，chat 无该字段）。
+  - `tool_to_wire`：`{type:"function",function:{name,description,parameters}}`（比 Responses 多一层
+    `function` 嵌套）。
+  - System 角色 → 报错（用 `ChatRequest.system`）；role/block 不匹配（如 user 带 ToolUse、assistant 带
+    Image、tool 带 Text）→ `ClientError::Protocol`「not valid for {Role} role」；空 Tool 消息 → 报错
+    「contains no tool results」。
+- wire 类型全部 crate-private（`input.rs` 内私有 fn，`tool_to_wire`/`message_to_wire` 为 `pub(super)`）；
+  顶层 body 结构体 `OpenAiChatRequestBody`/`StreamOptions` 私有；无泄漏到 `adapter::openai_chat` 外。
+- `mod.rs`：移除 M1-2 过渡性 `#[allow(dead_code)]`（`http_client` 现被 `build_request` 读取，M1-2 完成
+  记录要求接线后移除）。
+- **不接线 `chat()`/`chat_stream()`**：response.rs / stream/mod.rs 桩保持不变（`ClientError::Other`
+  占位），transport+parse 留 M2-1，SSE 解码+归一化留 M3。
+- 验证结果（全绿）：
+  - `cargo fmt --all`（无 diff）；
+  - `cargo clippy --all-targets -- -D warnings`；
+  - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  - `cargo test -p agent-lib --lib adapter::openai_chat`（12 通过：3 M1-2 既有 + 9 M1-3 新增）；
+  - `cargo test --all --all-targets`（全绿，lib 1065→1074 +9，无回归；其余套件 0 失败）；
+  - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p agent-lib`。
+- 9 个新增请求单测（`json!` 精确比对完整 body + method/path/query/headers）覆盖 TODO 列出的 6 个关键
+  用例：① system 首条消息 ② tools function 嵌套 ③ tool_result 扁平化 + 非 Ok 拼入 ④ stream_options
+  注入 ⑤ extras 覆盖 + mismatch ⑥ assistant 一条消息携带 reasoning_content + tool_calls（§5.1）；
+  另含 image 多模态、invalid role/block、auth 变体/可选字段/malformed endpoint。
+- 无 breaking change：纯新增 `build_request`（pub 方法）+ 私有映射函数；移除的是过渡 `#[allow(dead_code)]`
+  而非公开 API。浮点：temperature 经 serde f32→f64，测试用精确值（0.25/0.5）规避 f32↔f64 不等。
 
 ### M1-R [TODO] M1 review：骨架与请求侧正确性核对
 
