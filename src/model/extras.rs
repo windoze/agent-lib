@@ -16,6 +16,9 @@ pub enum ProviderId {
     Anthropic,
     /// OpenAI Responses wire protocol.
     OpenAiResp,
+    /// OpenAI Chat/Completions wire protocol (classic `POST /v1/chat/completions`,
+    /// shared by OpenAI-compatible baselines, DeepSeek, and vLLM).
+    OpenAiChat,
 }
 
 /// Provider-owned request fields that the normalized request model omits.
@@ -164,6 +167,7 @@ mod tests {
         for (provider, wire_name) in [
             (ProviderId::Anthropic, "anthropic"),
             (ProviderId::OpenAiResp, "open_ai_resp"),
+            (ProviderId::OpenAiChat, "open_ai_chat"),
         ] {
             let extras = ProviderExtras {
                 provider,

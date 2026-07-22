@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use crate::adapter::anthropic::AnthropicAdapter;
+use crate::adapter::openai_chat::OpenAiChatAdapter;
 use crate::adapter::openai_resp::OpenAiRespAdapter;
 use crate::client::{ChatRequest, LlmClient};
 use crate::conversation::{
@@ -391,6 +392,7 @@ pub(crate) fn client_for_provider(provider: ProviderConfig) -> Arc<dyn LlmClient
     match provider_id {
         ProviderId::Anthropic => Arc::new(AnthropicAdapter::new(endpoint)),
         ProviderId::OpenAiResp => Arc::new(OpenAiRespAdapter::new(endpoint)),
+        ProviderId::OpenAiChat => Arc::new(OpenAiChatAdapter::new(endpoint)),
     }
 }
 

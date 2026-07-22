@@ -97,6 +97,31 @@ pub static OPENAI_RESP_DEFAULT_CAPABILITY: LazyLock<Capability> = LazyLock::new(
     ]),
 });
 
+/// Protocol-level default capabilities for OpenAI Chat/Completions endpoints
+/// (classic `POST /v1/chat/completions`, shared by OpenAI-compatible baselines,
+/// DeepSeek, and vLLM).
+///
+/// The context limit remains unknown because it is model-specific. Clone this
+/// value before applying model or deployment overrides.
+pub static OPENAI_CHAT_DEFAULT_CAPABILITY: LazyLock<Capability> = LazyLock::new(|| Capability {
+    max_context_tokens: None,
+    input_modalities: set([Modality::Text, Modality::Image]),
+    output_modalities: set([Modality::Text]),
+    streaming: true,
+    tool_calling: true,
+    parallel_tool_calls: true,
+    prompt_caching: false,
+    reasoning: true,
+    structured_output: false,
+    stop_reasons: set([
+        StopReason::ToolUse,
+        StopReason::EndTurn,
+        StopReason::MaxTokens,
+        StopReason::StopSequence,
+        StopReason::Refusal,
+    ]),
+});
+
 /// Builds an ordered set for deterministic capability serialization.
 fn set<T: Ord, const N: usize>(values: [T; N]) -> BTreeSet<T> {
     BTreeSet::from(values)
@@ -105,7 +130,8 @@ fn set<T: Ord, const N: usize>(values: [T; N]) -> BTreeSet<T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTHROPIC_DEFAULT_CAPABILITY, Capability, Modality, OPENAI_RESP_DEFAULT_CAPABILITY,
+        ANTHROPIC_DEFAULT_CAPABILITY, Capability, Modality, OPENAI_CHAT_DEFAULT_CAPABILITY,
+        OPENAI_RESP_DEFAULT_CAPABILITY,
     };
     use crate::model::normalized::StopReason;
     use std::collections::BTreeSet;
@@ -198,6 +224,40 @@ mod tests {
         assert!(capability.reasoning);
         assert!(capability.structured_output);
         assert!(!capability.stop_reasons.contains(&StopReason::StopSequence));
+    }
+
+    #[test]
+    fn openai_chat_default_describes_protocol_capabilities() {
+        let capability = &*OPENAI_CHAT_DEFAULT_CAPABILITY;
+
+        assert_eq!(capability.max_context_tokens, None);
+        assert_eq!(
+            capability.input_modalities,
+            BTreeSet::from([Modality::Text, Modality::Image])
+        );
+        assert_eq!(
+            capability.output_modalities,
+            BTreeSet::from([Modality::Text])
+        );
+        assert!(capability.streaming);
+        assert!(capability.tool_calling);
+        assert!(capability.parallel_tool_calls);
+        // chat/completions does not declare prompt caching or structured output.
+        assert!(!capability.prompt_caching);
+        assert!(capability.reasoning);
+        assert!(!capability.structured_output);
+        // stop_reasons covers every normalized value reachable from chat/completions,
+        // including StopSequence (the classic `stop` parameter) and Refusal.
+        assert_eq!(
+            capability.stop_reasons,
+            BTreeSet::from([
+                StopReason::ToolUse,
+                StopReason::EndTurn,
+                StopReason::MaxTokens,
+                StopReason::StopSequence,
+                StopReason::Refusal,
+            ])
+        );
     }
 
     #[test]

@@ -11,7 +11,8 @@ pub mod request;
 pub mod response;
 
 pub use capability::{
-    ANTHROPIC_DEFAULT_CAPABILITY, Capability, Modality, OPENAI_RESP_DEFAULT_CAPABILITY,
+    ANTHROPIC_DEFAULT_CAPABILITY, Capability, Modality, OPENAI_CHAT_DEFAULT_CAPABILITY,
+    OPENAI_RESP_DEFAULT_CAPABILITY,
 };
 pub use config::{AuthScheme, EndpointConfig};
 pub use error::ClientError;

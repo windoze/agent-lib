@@ -2,4 +2,5 @@
 
 pub mod anthropic;
 mod common;
+pub mod openai_chat;
 pub mod openai_resp;

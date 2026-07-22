@@ -35,7 +35,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 
 ## M1：适配器骨架与请求侧
 
-### M1-1 [TODO] 库内前置触点：ProviderId 变体 + capability 静态 + 模块注册
+### M1-1 [DONE] 库内前置触点：ProviderId 变体 + capability 静态 + 模块注册
 
 上下文：
 
@@ -72,6 +72,49 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - `cargo test -p agent-lib --lib client::capability` 与
   `cargo test -p agent-lib --lib model::extras` 通过。
 - `cargo clippy --all-targets -- -D warnings` 通过。
+
+完成记录（2026-07-23）：
+
+- `ProviderId::OpenAiChat` 新增（`src/model/extras.rs`），serde `rename_all="snake_case"` →
+  `open_ai_chat`，与既有 `anthropic`/`open_ai_resp` 一致。`provider_extras_round_trip_for_every_provider_id`
+  测试表追加 `(OpenAiChat, "open_ai_chat")`，钉住新变体的序列化往返。
+- `OPENAI_CHAT_DEFAULT_CAPABILITY`（`src/client/capability.rs`，比照 `OPENAI_RESP_DEFAULT_CAPABILITY`
+  的 full struct literal）落地：`max_context_tokens: None`；
+  `input_modalities: {Text, Image}`；`output_modalities: {Text}`；
+  `streaming/tool_calling/parallel_tool_calls/reasoning = true`；
+  `prompt_caching/structured_output = false`（显式，与既有静态的关键差异）；
+  `stop_reasons: {ToolUse, EndTurn, MaxTokens, StopSequence, Refusal}`（含 `StopSequence`——chat/completions
+  支持 `stop` 参数；含 `Refusal`——`content_filter`）。rustdoc 注明协议级默认值、context 模型相关、克隆后覆盖。
+  新增测试 `openai_chat_default_describes_protocol_capabilities` 逐字段断言（含 `prompt_caching/structured_output=false`
+  与完整 `stop_reasons` 集合），并补进 tests 的 `use` 导入。
+- `src/adapter/mod.rs` 注册 `pub mod openai_chat;`（按字母序排在 `common` 与 `openai_resp` 之间）；模块文档注释
+  无协议清单，无需同步列表。
+- `src/client/mod.rs` 将 `OPENAI_CHAT_DEFAULT_CAPABILITY` 一并 `pub use` 出去，供适配器/集成引用。
+- **不可避免的编译耦合（已最小正确处理，非 workaround）**：`ProviderId` 虽 `#[non_exhaustive]`，定义 crate 内仍要求
+  exhaustive match。新增变体让两处 facade exhaustive match 编译断裂，而 M1-1 的验证条件要求 `cargo clippy --all-targets
+  -- -D warnings` 全绿，故这两处必须在本任务内收口：
+  - `src/facade/config.rs` `ProviderConfigBuilder::build()` 加 `ProviderId::OpenAiChat => openai_chat_endpoint(base_url, api_key)`
+    分支，并新增 `openai_chat_endpoint()` helper（Bearer 直连、无 `api-key` 头/无 `api-version` query，设计文档 §5.3/§6 的
+    正确传输形态）。env 读取构造器 `openai_chat_from_env()`、vLLM 无 auth 的 None 路径仍留给 **M4-1**。
+  - `src/facade/chat.rs` `client_for_provider()` 加 `ProviderId::OpenAiChat => Arc::new(OpenAiChatAdapter::new(endpoint))`
+    分支。因适配器结构体要到 **M1-2** 才落地，为此在 `src/adapter/openai_chat/mod.rs` 放**最小编译桩**：结构体形状
+    `{ http_client, endpoint }` + `#[derive(Clone, Debug)]`（Debug 经 `EndpointConfig` 脱敏，与 `openai_resp` 同款）+
+    `new(endpoint)` 构造函数 + `#[async_trait] impl LlmClient`，其中 `capability()` 已返回最终静态；`chat()`/`chat_stream()`
+    返回 `ClientError::Other("…implemented in M1-2")` 占位（非 `unimplemented!` panic，避免潜伏崩溃）。
+- **显式留给后续任务**（避免 M1-2/M4-1 重复或漏做）：
+  - M1-2：补 `with_http_client(endpoint, http_client)` 构造函数 + `endpoint()` 访问器；`chat()`/`chat_stream()` 的
+    stream 标志互斥校验（本任务钉死的校验逻辑/错误类型）并替换占位 body 为委托；建 §4.1 子模块空壳（request/response/stream）；
+    补模块级 rustdoc；加 stream=true/chat_stream stream=false 报错单测。
+  - M4-1：`openai_chat_from_env()` env 读取构造器、`src/lib.rs:13-14` 协议清单文档加 chat/completions、facade rustdoc 示例。
+- 验证结果（全绿）：
+  - `cargo fmt --all`（无 diff）；
+  - `cargo clippy --all-targets -- -D warnings`；
+  - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  - `cargo test -p agent-lib --lib client::capability`（6 通过，含新增 openai_chat 用例）；
+  - `cargo test -p agent-lib --lib model::extras`（4 通过，round-trip 已含 OpenAiChat）；
+  - `cargo test --all --all-targets`（全绿，含 facade/集成测试，无回归）；
+  - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`。
+- 无 breaking change：`#[non_exhaustive]` enum 新增变体 + 新增 `pub static` + 新增 `pub mod`，均为向后兼容的形状新增。
 
 ### M1-2 [TODO] 适配器骨架：OpenAiChatAdapter 结构体与 LlmClient 契约
 

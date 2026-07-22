@@ -249,6 +249,11 @@ impl ProviderConfigBuilder {
                     .unwrap_or_else(|| OPENAI_DEFAULT_API_VERSION.to_owned());
                 openai_endpoint(base_url, api_key, version)
             }
+            // Classic chat/completions direct access: Bearer auth, no Azure-style
+            // api-version header/query. The env constructor (`openai_chat_from_env`,
+            // M4-1) handles the vLLM no-auth case; this generic builder path always
+            // carries a resolved api_key.
+            ProviderId::OpenAiChat => openai_chat_endpoint(base_url, api_key),
         };
         Ok(ProviderConfig::custom(endpoint, self.provider))
     }
@@ -273,6 +278,19 @@ fn openai_endpoint(base_url: String, api_key: String, api_version: String) -> En
             value: api_key,
         },
         query_params: vec![("api-version".to_owned(), api_version)],
+        extra_headers: Vec::new(),
+    }
+}
+
+/// Builds the OpenAI Chat/Completions endpoint transport from resolved parts.
+///
+/// Chat/completions uses direct Bearer auth (OpenAI-compatible, DeepSeek, vLLM),
+/// not the Azure-style `api-key` header + `api-version` query of [`openai_endpoint`].
+fn openai_chat_endpoint(base_url: String, api_key: String) -> EndpointConfig {
+    EndpointConfig {
+        base_url,
+        auth: AuthScheme::Bearer(api_key),
+        query_params: Vec::new(),
         extra_headers: Vec::new(),
     }
 }
