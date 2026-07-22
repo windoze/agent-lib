@@ -153,6 +153,44 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 - `cargo test -p agent-lib --lib adapter::openai_chat` 通过；
   `cargo clippy --all-targets -- -D warnings` 通过。
 
+完成记录（2026-07-23）：
+
+- `src/adapter/openai_chat/mod.rs`：替换 M1-1 的最小编译桩为完整骨架，结构体形状与
+  `OpenAiRespAdapter` 完全一致（`{ http_client: reqwest::Client, endpoint: EndpointConfig }`，
+  `#[derive(Clone, Debug)]`，密钥经 `EndpointConfig` 脱敏）。两个构造函数 `new(endpoint)`
+  （默认 client 走 `common::default_http_client`）+ `with_http_client(endpoint, http_client)` +
+  `endpoint()` 访问器齐备；rustdoc 沿用 openai_resp 的超时口径。
+- `LlmClient` impl：`capability() → &OPENAI_CHAT_DEFAULT_CAPABILITY`（trait 返回引用；
+  任务文案「`.clone()`」为口语化措辞，trait 签名 `&Capability` 决定必须返回引用，与 M1-1 桩一致）。
+  `chat()`/`chat_stream()` 按模板委托给子模块 inherent 方法（`OpenAiChatAdapter::chat` /
+  `OpenAiChatAdapter::chat_stream`，inherent 优先于 trait 同名方法，UFCS 无歧义，openai_resp 同款）。
+- stream 互斥校验（本任务钉死，与 openai_resp 同款）：
+  - `response.rs::chat()` 首句 `if request.stream { Err(invalid_response("…stream to be false")) }`；
+  - `stream/mod.rs::chat_stream()` 首句 `if !request.stream { Err(invalid_stream("…stream to be true")) }`；
+  - 两者均为 `ClientError::Protocol`，helper 文案 `invalid OpenAI Chat/Completions {response,stream}: …`。
+- 校验通过后的主体为桩：返回 `ClientError::Other("…implemented in M1-3/M2-1 / M1-3/M3")` 占位，
+  **非 `unimplemented!` panic**（延续 M1-1「避免潜伏崩溃」原则）。build_request（M1-3）/
+  transport+parse（M2-1）/ SSE 解码+归一化（M3-1/M3-2）后续填充。
+- §4.1 子模块空壳已建：`mod.rs`（全量）+ `request.rs`（纯 rustdoc 壳，M1-3 填 build_request）+
+  `response.rs`（chat 桩 + `pub(super) fn invalid_response`）+ `stream/mod.rs`（chat_stream 桩 +
+  `fn invalid_stream`）。`request/input.rs`、`response/convert.rs`、`stream/{decoder,wire,normalizer}.rs`
+  不在本任务创建——它们只在各自任务（M1-3/M2-1/M3-1/M3-2）被父模块 `mod` 声明引用时才落地，
+  避免产生无引用的 dead 文件。
+- 模块级 rustdoc：一句话覆盖 classic `POST /v1/chat/completions`（含 SSE），方言策略指向
+  设计文档 §5（统一回放 `reasoning_content` + extras 兜底，不建 quirk 类型）。
+- 过渡性 `#[allow(dead_code)]`：`http_client` 字段在 M1-2 桩里尚未被读取（M1-3 `build_request`/
+  transport 才读），加逐字段 `#[allow(dead_code)]` + 注释标注接线任务；`endpoint` 已被 `endpoint()`
+  读取无需标注。M1-3 接线后该 allow 自然失效、届时移除。
+- 验证结果（全绿）：
+  - `cargo fmt --all`（无 diff，仅 fmt 重排 stream/response 的 import 顺序与 format! 换行）；
+  - `cargo clippy --all-targets -- -D warnings`；
+  - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`；
+  - `cargo test -p agent-lib --lib adapter::openai_chat`（3 通过：Debug 脱敏 + chat 拒 stream=true +
+    chat_stream 拒 stream=false，错误类型 `Protocol`、文案含 "stream to be false/true"，与 openai_resp 同款）；
+  - `cargo test -p agent-lib --lib`（1065 全绿，+3 新增，facade 依赖的桩替换无回归）。
+- 无 breaking change：公开 API（结构体形状、`new`、`capability`）与 M1-1 桩完全一致；新增 `with_http_client`/
+  `endpoint()` 为向后兼容的形状新增。
+
 ### M1-3 [TODO] 请求侧映射：build_request + Message/Tool → messages/tools
 
 上下文：

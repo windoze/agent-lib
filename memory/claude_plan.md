@@ -1,58 +1,59 @@
-## Execution Plan — M1-1 库内前置触点
+## Execution Plan — M1-2 适配器骨架：OpenAiChatAdapter 结构体与 LlmClient 契约
 
 This file records the actionable plan and progress updates for the current invocation.
 
 ## 任务（TODO.md 第一个未完成任务）
-**M1-1 [TODO] 库内前置触点：ProviderId 变体 + capability 静态 + 模块注册**
+**M1-2 [TODO] 适配器骨架：OpenAiChatAdapter 结构体与 LlmClient 契约**
 
-三个核心交付物 + 保证全 crate 编译通过（`cargo clippy --all-targets -- -D warnings`）。
+把 M1-1 留下的最小编译桩升级为真正骨架，钉死 stream 互斥校验，建 §4.1 子模块空壳。
 
-## 三处触点现状（已读源码确认）
+## 设计要点（对照 openai_resp 模板 + 设计文档 §4.1/§4.3/§4.4）
+- 结构体 `{ http_client: reqwest::Client, endpoint: EndpointConfig }`，`new` /
+  `with_http_client` / `endpoint()` 访问器，`#[derive(Clone, Debug)]`（密钥经 EndpointConfig 脱敏）。
+- `LlmClient` impl：`capability() → &OPENAI_CHAT_DEFAULT_CAPABILITY`（trait 返回引用；
+  任务文案 "clone()" 为口语化措辞，M1-1 桩已用引用，保持）。
+- `chat()` / `chat_stream()` 按模板拆到子模块（inherent method），mod.rs 的 trait impl 委托：
+  - `chat()` → `OpenAiChatAdapter::chat`（落 `response.rs`）
+  - `chat_stream()` → `OpenAiChatAdapter::chat_stream`（落 `stream/mod.rs`）
+  - inherent 方法优先于 trait 同名方法，UFCS 无歧义（openai_resp 同款）。
+- stream 互斥校验（本任务钉死，与 openai_resp 同款）：
+  - `chat()` 首句 `if request.stream { Err(invalid_response("…stream to be false")) }`
+  - `chat_stream()` 首句 `if !request.stream { Err(invalid_stream("…stream to be true")) }`
+  - 错误类型 `ClientError::Protocol`，helper：
+    - `response.rs`: `pub(super) fn invalid_response` = `Protocol("invalid OpenAI Chat/Completions response: …")`
+    - `stream/mod.rs`: `fn invalid_stream` = `Protocol("invalid OpenAI Chat/Completions stream: …")`
+  - 校验通过后的主体：本任务为桩（返回 `ClientError::Other` 占位，**非 panic**，延续 M1-1 原则），
+    build_request(M1-3) / execute+parse(M2-1) / SSE(M3) 后续填充。
+- §4.1 子模块空壳：本任务建 mod.rs + request.rs(壳) + response.rs(chat 桩) + stream/mod.rs(桩)。
+  request/input.rs、response/convert.rs、stream/{decoder,wire,normalizer}.rs 留给各自任务，
+  本任务不创建无引用的空文件（避免 dead 文件）。
 
-1. **`src/model/extras.rs:14`** `ProviderId`（`#[non_exhaustive]` + `#[serde(rename_all="snake_case")]`）。
-   - 现有：`Anthropic`→`anthropic`、`OpenAiResp`→`open_ai_resp`。新增 `OpenAiChat`→`open_ai_chat`。
-   - extras.rs 内 exhaustive 测试：`provider_extras_round_trip_for_every_provider_id`（:163-180）遍历 `(provider, wire_name)` 表，需追加 `(OpenAiChat, "open_ai_chat")`。其余用具体值，无 exhaustive match，无需改。
+## 文件改动
+1. `src/adapter/openai_chat/mod.rs` —— 替换 M1-1 桩为完整骨架（模块 rustdoc + 三 mod 声明 +
+   结构体 + 两构造函数 + endpoint 访问器 + LlmClient impl 委托 + tests：Debug 脱敏 + 两条校验）。
+2. `src/adapter/openai_chat/request.rs` —— 新建空壳（模块 rustdoc，M1-3 填 build_request）。
+3. `src/adapter/openai_chat/response.rs` —— 新建：`impl OpenAiChatAdapter { chat() 校验+桩 }` +
+   `pub(super) fn invalid_response`。
+4. `src/adapter/openai_chat/stream/mod.rs` —— 新建：`impl OpenAiChatAdapter { chat_stream() 校验+桩 }`
+   + `fn invalid_stream`。
 
-2. **`src/client/capability.rs:77`** 新增 `OPENAI_CHAT_DEFAULT_CAPABILITY`（full struct literal，比照既有静态）：
-   - `max_context_tokens: None`；`input_modalities: {Text, Image}`；`output_modalities: {Text}`
-   - `streaming/tool_calling/parallel_tool_calls/reasoning = true`
-   - `prompt_caching/structured_output = false`（关键差异，显式写出）
-   - `stop_reasons: {ToolUse, EndTurn, MaxTokens, StopSequence, Refusal}`
-   - rustdoc 同既有口径；测试追加断言 + use 导入。
+## 验证
+- `cargo fmt --all`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
+- `cargo test -p agent-lib --lib adapter::openai_chat`
+- 全量门禁留 M1-R；本任务跑目标测试足够。
 
-3. **`src/adapter/mod.rs`** 加 `pub mod openai_chat;`，建占位 `src/adapter/openai_chat/mod.rs`（M1-2 填充）。模块文档注释无协议清单，无需同步。
+## 收口
+- TODO.md：M1-2 标题 `[TODO]` → `[DONE]`，追加完成记录。
+- git commit：`[M1-2] 适配器骨架：OpenAiChatAdapter 结构体与 LlmClient 契约`。
+- 停。
 
-## 关键风险：facade 内两处 exhaustive match（blocker）
-- `src/facade/config.rs:237-252` `ProviderConfigBuilder::build()`：无 wildcard。
-- `src/facade/chat.rs:391-394` `client_for_provider()`：无 wildcard。
-- `ProviderId` 虽 `#[non_exhaustive]`，**定义 crate 内仍要求 exhaustive**，新增变体让这两处编译失败。
-- 验证条件要求 clippy 全绿。策略：先做三处核心改动 → `cargo check` 实证 → 最小正确修复（非 workaround）。
-  - `config.rs` build()：加 `OpenAiChat` arm（Bearer endpoint，设计文档 §5.3/§6 形态明确）。
-  - `client_for_provider`：依赖 `OpenAiChatAdapter`（M1-2 才有），实证后处置——优先在 mod.rs 放满足编译的最小桩，绝不 `unimplemented!`/wildcard 绕过。
-
-## 执行步骤
-1. 本计划文件 ✓
-2. extras.rs：`OpenAiChat` 变体 + round-trip 测试表 ✓
-3. capability.rs：静态 + 测试 + use 导入 ✓
-4. adapter/mod.rs + 占位 mod.rs ✓
-5. `cargo check` 实证 facade break ✓（config.rs build() + chat.rs client_for_provider() 两处 exhaustive match 断裂）
-6. 最小正确修复 facade ✓
-7. `cargo fmt` → clippy（base + external-features）✓
-8. 相关单测 + 全量 ✓
-9. TODO.md 标 [DONE] + 完成记录
-10. git commit + stop
-
-## Progress（已完成）
-- 实现完成且全门禁通过：
-  - `cargo fmt --all`（无 diff）
-  - `cargo clippy --all-targets -- -D warnings`
-  - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`
-  - `cargo test -p agent-lib --lib client::capability`（6 通过，含新增 openai_chat 用例）
-  - `cargo test -p agent-lib --lib model::extras`（4 通过，round-trip 已含 OpenAiChat）
-  - `cargo test --all --all-targets`（全绿）
-  - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`
-- 关键实现决策：新增 `ProviderId::OpenAiChat` 使 crate 内两处 exhaustive match（facade/config.rs `build()`、facade/chat.rs `client_for_provider()`）编译断裂。M1-1 验证要求 clippy 全绿，故这两处必须在本任务内最小正确处理（非 workaround）：
-  - config.rs：加 `OpenAiChat` arm + `openai_chat_endpoint()` Bearer helper（设计 §5.3/§6 正确传输形态）；env 读取构造器 `openai_chat_from_env` 留给 M4-1。
-  - chat.rs：加 `OpenAiChat` arm 引用 `OpenAiChatAdapter`；为此在 openai_chat/mod.rs 放**最小编译桩**（结构体形状 + Clone/Debug + new() + LlmClient，capability() 已为最终值；chat/chat_stream 返回 `ClientError::Other` 占位）。构造函数 with_http_client、stream 标志互斥校验、真实 body、子模块空壳、rustdoc、stream=true/false 单测全部留给 M1-2。
-- 显式留给后续任务：lib.rs 协议清单文档 → M4-1；真实适配器骨架 → M1-2；env 构造器 → M4-1。
-- 无 breaking change（non_exhaustive enum 新增变体 + 新静态 + 新模块，均为向后兼容的形状新增）。
+## 进度日志
+- 阅读模板/设计文档，确认实现边界 ✓
+- 实现完成（mod.rs/response.rs/stream/mod.rs/request.rs）✓
+- 全门禁通过：fmt 无 diff；clippy base + external-features 全绿；
+  `cargo test -p agent-lib --lib adapter::openai_chat` 3 通过；
+  `cargo test -p agent-lib --lib` 1065 全绿无回归 ✓
+- TODO.md 标 M1-2 [DONE] + 完成记录 ✓
+- 提交 + 停。
