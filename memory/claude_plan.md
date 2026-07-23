@@ -1,93 +1,50 @@
-## Execution Plan — M5-1：文档同步（DESIGN.md 决策反转 + capability-matrix + README + AGENTS.md + client-layer-references）
+## Execution Plan — M5-R：M5 review + 最终收口归档
 
-TODO.md 第一个未完成任务：**M5-1 [TODO]**（M1-1~M4-R 全部 [DONE]）。
-这是**纯文档同步任务**，定义来源是设计文档 `docs/openai-chat-api.md` §8 的同步清单。
-不新增功能、不改生产代码，只改 `*.md` 文档（+ 顺手核对 `src/lib.rs`/`src/adapter/mod.rs` 注释一致性，纯注释核对）。
+TODO.md 第一个未完成任务：**M5-R [TODO]**（M1-1~M5-2 全部 [DONE]）。这是整个 openai_chat
+适配器计划的**最后一个任务**——最终 review + 收口结论 + 归档。
 
-### 任务范围（逐条对 TODO M5-1 实现要求）
-1. **`DESIGN.md` §1.1 决策反转（必须做）**：协议清单加 chat/completions；删除/修订「不支持」段 →「经 `openai_chat` 适配器支持，方言策略见 `docs/openai-chat-api.md`」；DeepSeek、vLLM 协议归类从 Anthropic 移到 chat/completions。
-2. **`docs/capability-matrix.md`**：协议级默认值表加 chat/completions 列（与 `OPENAI_CHAT_DEFAULT_CAPABILITY` 一致）；新增 DeepSeek/vLLM 实测一节（思考模式、400 规则、vLLM 回放兼容性——引用 M4-3 实测结论，vLLM 未实测如实标注）。
-3. **`README.md`**：provider 选择段落加 chat/completions；ignored 测试命令加 `cargo test --test integration_openai_chat -- --ignored --nocapture`。
-4. **`AGENTS.md`**：`src/` 布局 `adapter/` 描述加 openai_chat；「Required environment」表加 `OPENAI_CHAT_BASE_URL`/`OPENAI_CHAT_API_KEY`/`VLLM_*`（注明可选/跳过语义）。
-5. **`docs/client-layer-references.md`**：参考分工总表加一行（可参考 `async-openai` 的 chat 模块）。
-6. **顺手核对** `src/lib.rs` 与 `src/adapter/mod.rs` 的协议清单注释与实际一致（M4-1 已改 lib.rs，需确认 mod.rs）。
+### 任务范围（逐条对 TODO M5-R 核对清单）
+1. **§8 文档同步清单逐条销号**：DESIGN.md / capability-matrix.md / README.md / AGENTS.md /
+   client-layer-references.md 五个文档同步项确认 M5-1 已完成。
+2. **`DESIGN.md` 矛盾表述核对**：全文 grep `chat/completions`、`DeepSeek`、`vLLM`，确认不存在
+   与本适配器矛盾的「不支持」表述。
+3. **§2.1 第一期目标三条逐条验收**：① 适配器 + 两方言（DeepSeek/vLLM）；② 三层测试
+   （模块单测/transport/#[ignore] 真实端点）；③ 归一化矩阵。
+4. **§2.2 非目标确认未被偷渡**：无 logprobs 建模（只能进 extra）、无 n>1 多 choice、
+   无 quirk 配置类型、采样参数走 extras。
+5. **规模核对**：实现/测试行数与 §9 估算（实现 1200–1500 + 测试 800–1000）量级是否相符，
+   超标说明原因（chat 协议简单但 fixture/折叠对照测试多）。
+6. **全部任务 [DONE] 或显式降级**：确认 M1-1~M5-2 + M1-R/M2-R/M3-R/M4-R 全 DONE。
+7. **最终全量门禁**（含 external features clippy）：fmt / clippy×2 / test --all --all-targets /
+   doc -D warnings。
+8. **PLAN.md 追加最终收口结论**（比照 `docs/archive/2026-07-20-mag-gaps/PLAN.md` 体例）。
+9. **归档**：PLAN.md + TODO.md → `docs/archive/2026-07-23-openai-chat/`。
 
-### 验证条件
-- 文档中的命令、env 变量名、文件路径与代码实际**逐条对照，不凭记忆**。
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过；`cargo fmt --all` 无 diff。
-- 因纯 `.md` 改动（+注释核对），**无需重跑全量测试套件**（沿用 M4-R 绿基线，注明 skip）。
-
-### 关键数据源（实测结论引用，来自 M4-3 完成记录 TODO.md:1252-1301）
-- DeepSeek 实测：4 用例全过（非流式 text+usage / 流式 text delta+usage / thinking 模式 Thinking block / **thinking 多轮+工具调用 round-2 回放 reasoning_content+tool_calls 不 400**）。
-- 真实 spec 细节 2 条：① chat/completions `tool_choice` 必须嵌套 `{"type":"function","function":{"name":...}}`（非 Responses 扁平形）；② DeepSeek 思考模式拒 `tool_choice` 字段 → 用强指令 system prompt 自然触发工具调用。
-- §5.1 400 规则验证成立；thinking_extras passthrough 确认。
-- vLLM 未实测（无 `VLLM_BASE_URL`/凭据，2 测试干净 skip）→ 如实标注「待实测」。
-- env 约定：DeepSeek `DEEPSEEK_API_KEY`(必需)/`DEEPSEEK_BASE_URL`(默认 https://api.deepseek.com)/`DEEPSEEK_MODEL`；vLLM `VLLM_BASE_URL`(必需)/`VLLM_API_KEY`(缺省 None)/`VLLM_MODEL`；facade `OPENAI_CHAT_BASE_URL`(必需)/`OPENAI_CHAT_API_KEY`(可选)。
-
-### OPENAI_CHAT_DEFAULT_CAPABILITY 字段（capability-matrix 列必须与此一致，来自 M1-1）
-`max_context_tokens: None`；`input_modalities: {Text, Image}`；`output_modalities: {Text}`；
-`streaming/tool_calling/parallel_tool_calls/reasoning = true`；`prompt_caching/structured_output = false`；
-`stop_reasons: {ToolUse, EndTurn, MaxTokens, StopSequence, Refusal}`。
+### 验证方式（不凭记忆，逐条对照代码/文档）
+- §8 销号：读 5 个文档相关段落，确认与代码（capability.rs/config.rs/lib.rs/adapter/mod.rs）一致。
+- grep 核对：`chat/completions` / `DeepSeek` / `vLLM` 在 DESIGN.md 的全部出现位置。
+- §2.2 防偷渡：grep `logprobs` / `Quirk` / `n > 1` 在 `src/adapter/openai_chat/` 内的建模情况。
+- 规模核对：`wc -l src/adapter/openai_chat/**/*.rs` 分实现 vs 测试统计。
 
 ### 执行步骤
-1. 读取所有目标文档 + 设计文档 §8 同步清单 + capability 静态实际值（逐条对照，不凭记忆）。
-2. 逐文件编辑（小而精准的 patch，每个文件一组改动）。
-3. 跑 `cargo fmt --all --check` + `cargo doc --no-deps --workspace`（注释核对可能触及 src/lib.rs/adapter/mod.rs 但 M4-1 已确认 lib.rs，若 mod.rs 需改属注释）。
-4. 标记 TODO M5-1 [TODO]→[DONE] + 完成记录。
-5. commit。
-6. stop。
+1. 并行收集验证证据：grep DESIGN.md / 5 文档 §8 对照 / src/adapter/openai_chat 行数 / 非目标 grep。
+2. 跑全量门禁（fmt→clippy×2→test→doc），记录摘要。
+3. 在 PLAN.md 末尾追加「最终收口结论（M5-R）」章节（比照 mag-gaps 体例）。
+4. 在 TODO.md M5-R 任务下方追加最终 review 记录（逐条对 checklist + 门禁摘要 + 规模核对）。
+5. 标记 M5-R [TODO]→[DONE]。
+6. 创建 `docs/archive/2026-07-23-openai-chat/`，把 PLAN.md + TODO.md 复制进去。
+7. 提示是否在根目录保留 PLAN.md/TODO.md 或删除——**比照 mag-gaps 归档惯例：归档是复制还是移动**。
+   （先查 mag-gaps 归档时根目录是否还留 PLAN.md/TODO.md。当前根目录有 PLAN.md/TODO.md，说明归档是复制；
+   但 mag-gaps 之后又新建了当前这对——所以归档后根目录的应移走。需确认。）
+8. commit（含 PLAN.md 收口结论 + TODO.md review 记录 + archive/ 新文件 + 根目录 PLAN/TODO 处置）。
+9. stop。
 
 ### 进度日志
-- [x] 读取文档 + 设计 §8 + 代码实际值（capability.rs:106-123 确认 OPENAI_CHAT_DEFAULT_CAPABILITY；config.rs/normalization/integration 测试确认 env 名；lib.rs/adapter/mod.rs 注释核对一致无需改）。
-- [x] 逐文件编辑（DESIGN.md §1.1 决策反转 / capability-matrix 加列+实测节 / README 三处口径+provider段+ignored命令 / AGENTS adapter+env表 / client-layer-references 加行）。
-- [x] 门禁：`cargo fmt --all --check` exit0；`cargo doc --no-deps --workspace -D warnings` Finished+Generated exit0；逐条对照 env/路径/命令 vs 代码全一致。全量 test 套件未重跑（纯 .md，沿用 M4-R 绿基线）。
-- [x] TODO M5-1 [TODO]→[DONE] + 完成记录（逐文件+逐条对照+门禁摘要）。commit + stop。
-
----
-
-## Execution Plan — M5-2：e2e 手搓 DeepSeek 客户端替换为 OpenAiChatAdapter
-
-TODO.md 第一个未完成任务：**M5-2 [TODO]**（M1-1~M5-1 全部 [DONE]）。
-两个 `#[ignore]` 真实 CLI e2e 各有一份**手搓**非流式 DeepSeek chat/completions 客户端：
-- `tests/agent_external_real_e2e.rs:144-388`（DeepSeekConfig/chat_url/wire 类型/chat_messages/normalize_finish_reason/DeepSeekLlmHandler）
-- `tests/agent_external_managed_real_e2e.rs:217-442`（同款，整个文件 `#![cfg(all(feature=external-claude-code, feature=external-codex))]` 门控）
-
-### 替换策略
-保留 `DeepSeekLlmHandler`（实现 `LlmHandler` trait，返回 `RequirementResult::Llm`，是 e2e 包装层 + logging），
-**只把手搓 reqwest POST + wire 反序列化替换为委托 `OpenAiChatAdapter::chat()`**。
-- `DeepSeekLlmHandler` 字段 `http: reqwest::Client` → `adapter: OpenAiChatAdapter`。
-- `new(config, log)`：用 `EndpointConfig { base_url, auth: AuthScheme::Bearer(api_key), query_params:Vec::new(), extra_headers:Vec::new() }` 构造 `OpenAiChatAdapter::new(endpoint)`（Bearer 直连，与手搓 `bearer_auth` 等价；adapter 内部 `endpoint_url(&["chat","completions"])` 取代 `chat_url()`）。
-- `chat(&self, request: &ChatRequest)`：clone request（adapter.chat 消费 ChatRequest）→ 委托 → logging。
-
-### 行为等价（TODO 明列 4 维度：finish_reason 映射 / system 渲染 / bearer 直连 / 不打印 key）
-adapter 全部满足：finish_reason 用 §4.3 映射表（比手搓更完整，coordinator 场景均为 stop→EndTurn 一致）；system 渲染为首条 system 消息（与手搓 chat_messages 一致）；bearer 直连（EndpointConfig）；不打印 key（adapter + logging 均不打印）。
-
-### 保留的 e2e wrapper 逻辑（非手搓 HTTP，保留在 wrapper 以维持等价）
-1. **response_format 注入**：手搓在 `system.contains("JSON_OBJECT")` 时 `body["response_format"]={"type":"json_object"}`。改走 **provider_extras 逃生舱**：clone request 后设 `provider_extras=Some(ProviderExtras{provider:OpenAiChat, fields:{"response_format":{"type":"json_object"}}})`，adapter `merge_into` 注入 body（M1-3 已支持 extras 覆盖任意顶层字段）。
-2. **model fallback**：`request.model.is_empty()` → `config.model`（coordinator 已恒非空，防御性等价）。
-3. **empty-content → Protocol error**：adapter 返回后用 `response_text` 取文本，空则 `ClientError::Protocol("...empty assistant message")`（手搓语义）。
-4. **logging**：文件1 `DeepSeekCallLog` 记 prompt/response 文本（`record_prompt` 在 chat 开头、`record_response` 在 empty 检查**之后**）；文件2 只记调用次数（`record()`）。两文件各自保留原 logging 形态。
-
-### 删除的手搓代码（两文件）
-`DeepSeekConfig::chat_url()`、`DeepSeekChatResponse`/`DeepSeekChoice`/`DeepSeekMessage` wire 类型、`chat_messages()`、`normalize_finish_reason()`、`http` 字段 + reqwest POST 逻辑；连带清理不再使用的 import（`serde::Deserialize`、`Normalized`/`StopReason`/`Usage`、`reqwest::*`、视情况的 `Value`/`json`）。保留：`DeepSeekConfig`(from_env+字段)、`DeepSeekCallLog`、`request_text`(文件1)、`message_text`/`content_text`/`response_text`(coordinator+logging 用)。
-
-### 关键 API（已确认公开路径）
-- `agent_lib::adapter::openai_chat::OpenAiChatAdapter`（`new(endpoint)`，实现 `LlmClient::chat`）
-- `agent_lib::client::{EndpointConfig, AuthScheme, ChatRequest, ClientError, Response}`
-- `agent_lib::model::{ProviderExtras, ProviderId}`（`ProviderId::OpenAiChat`）
-- `ChatRequest` derive Clone（wrapper 可 clone）
-
-### 执行步骤
-1. 改 `tests/agent_external_real_e2e.rs`（无 feature gate，默认编译）。
-2. 改 `tests/agent_external_managed_real_e2e.rs`（feature-gated）。
-3. 每个文件改完查 unused import，保持 `cargo clippy --all-targets -- -D warnings` 全绿（含 external features clippy）。
-4. 验证：`cargo test --test agent_external_real_e2e`（默认 ignored/skip exit0）；带 feature `cargo test --features "external-claude-code external-codex" --test agent_external_managed_real_e2e`（ignored/skip exit0）；全量 `cargo test --all --all-targets`；`cargo fmt --all`。
-5. 实跑：环境无 DEEPSEEK_API_KEY/CLI → 标注「编译验证，未实跑」（TODO 验证条件允许）。
-6. TODO M5-2 [TODO]→[DONE] + 完成记录。commit + stop。
-
-### 进度日志
-- [x] 读取两文件手搓客户端 + extras.rs + adapter mod.rs + 确认公开 API 路径/ChatRequest Clone + 确认 `OpenAiChatAdapter` 有 inherent `pub async fn chat`（response.rs:53），wrapper 调用无需 import trait。
-- [x] 改文件1（real_e2e）：import（加 adapter/client/extras，删 normalized/usage/Deserialize）→ 删 HTTP_TIMEOUT → 删 chat_url → 改 DeepSeekLlmHandler（http→adapter，new 构造 EndpointConfig+Bearer，chat 委托 adapter + provider_extras 注入 response_format + model fallback + empty-content 检查 + record_prompt/response）→ 删 wire 类型/chat_messages/normalize_finish_reason（保留 request_text）。`cargo check` 通过。
-- [x] 改文件2（managed_real_e2e，feature-gated）：对称改动，logging 形态为只记次数 record()，无 request_text。
-- [x] 门禁全绿：`cargo fmt --all`（无 diff）；`cargo clippy --all-targets -- -D warnings` exit0；`cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings` exit0（覆盖文件2）；`cargo test --test agent_external_real_e2e` 3 ignored exit0；`cargo test --features "external-claude-code external-codex" --test agent_external_managed_real_e2e` 3 ignored exit0；`cargo test --all --all-targets` 全部 `test result: ok.` 0 failed（lib 1123，无回归）。doc 未跑（未改 src/pub item，沿用 M5-1 绿基线）。
-- [x] TODO 标 DONE + 完成记录 + commit + stop。（commit cf528cf）
+- [x] 收集验证证据：DESIGN.md grep（不支持清单只剩 Gemini，无矛盾）/ §8 五项 spot-check 全落地 /
+  §2.2 防偷渡（logprobs 仅 doc+fixture+extra 未建模、无 Quirk 类型、无 n>1）/ 规模（实现 1492 在区间内、
+  测试 2367 超 2.4×）/ 归档惯例确认（git mv，mag-gaps 范例 d98ca39）。
+- [x] 全量门禁全绿：fmt exit0 / clippy×2 exit0 / test 51 套件 0 failed（1381 passed, 16 ignored）/
+  doc exit0。
+- [x] PLAN.md 追加「最终收口结论（M5-R）」；TODO.md M5-R review 记录 + [TODO]→[DONE]。
+- [x] 归档：`git mv` PLAN.md/TODO.md → `docs/archive/2026-07-23-openai-chat/`（设计文档保留 docs/）。
+- [x] commit + stop。整个 openai_chat 计划收口。

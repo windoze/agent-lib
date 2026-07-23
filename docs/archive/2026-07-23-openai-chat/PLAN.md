@@ -166,3 +166,77 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 5. 跨里程碑验收线索：M2 完成后非流式解析可作为 M3 流式折叠的对照基准；M4 完成后
    facade 用户可用 `ProviderConfig::openai_chat_from_env()` 一行接入 DeepSeek；M5 完成
    后 `DESIGN.md` 不再有与本适配器矛盾的「不支持」表述。
+
+## 最终收口结论（M5-R）
+
+本计划已完成（2026-07-23），四个目标逐项达成：
+
+1. **适配器骨架与请求侧（M1）✅**：`OpenAiChatAdapter { http_client, endpoint }` 实现
+   `LlmClient`（非流式 `chat()` + SSE 流式 `chat_stream()`）；库内触点 `ProviderId::OpenAiChat`、
+   `OPENAI_CHAT_DEFAULT_CAPABILITY`、`pub mod openai_chat` 三处就位。请求映射逐行落地设计文档
+   §4.2（system 首条消息、`reasoning_content` 统一原样回放 §5.1 推论、`tool_calls` 嵌套
+   arguments-as-JSON-string、`tool` 角色扁平化 + 非 Ok 状态拼入、`stream_options.include_usage`
+   注入、`provider_extras` 最后合并覆盖）。`json!` 精确比对完整 body 的请求单测钉死全部关键用例，
+   含 §5.1 DeepSeek 400 防线（带工具调用多轮历史中 assistant 一条消息携带 `reasoning_content`
+   + `tool_calls`）。
+2. **非流式响应侧（M2）✅**：`parse_response` 校验 `object == "chat.completion"`、取 `choices[0]`，
+   三种 content 落点（`content`→Text / `reasoning_content`→Thinking{signature:None} / `tool_calls`→
+   ToolUse），arguments 解析失败降级为 `input=null`+原文进 extra（§4.3），`finish_reason` 全表映射
+   （stop/length/tool_calls/content_filter/未知/缺失），未建模字段（含 `choices[0].logprobs`）进
+   `Response.extra`（§2.2 logprobs 只能进 extra 的约束用保 choices 的最简形态满足）。`chat()` 复用
+   `execute_json_response` + `from_http_response`（common/error 零改动）；一次性 `TcpListener` transport
+   测试钉住 429/401/400-context-length/400-content-filter/500 分类。`Usage` 零改动（cached/reasoning
+   details fixture 钉死）。
+3. **SSE 流式（M3）✅**：§4.4 四个关键差异全部命中——`[DONE]` 哨兵在 JSON 解析前特判终止；`tool_calls`
+   按 `index` 键控增量、`BlockStart(ToolInput)+Delta::Json+BlockStop` 绝不中途解析 JSON（适配器零 JSON
+   解析，accumulator 自解析）；`reasoning_content`→`BlockKind::Reasoning`+`Delta::Reasoning`（无 signature）；
+   终态双源无重复 `MessageStop`（`finish_reason` 只缓存 stop_reason、usage chunk 到达即发 `Usage`、
+   `MessageStop` 延迟到 `[DONE]` flush——解决 usage-after-finish_reason 与 accumulator「Usage 必须在
+   MessageStop 前」契约矛盾的必要排序修正，observable 行为与 spec 一致）。4 个脱敏 `.sse` fixture +
+   4 个配对 `.json`，不规则字节分块 `[1,2,7,3,19,5,11]` 喂管线 + `Accumulator` 折叠与非流式
+   `parse_response` 逐字段对照（§7.1）。`finish_reason` 映射表非流式/流式共用同一份代码（无漂移）。
+4. **facade 接线与集成（M4）✅**：`client_for_provider` 分支 + `openai_chat_from_env`（Bearer 直连，
+   非 Azure 风格；api_key 缺省→`AuthScheme::None` 支持 vLLM 无 auth）+ `src/lib.rs` 协议清单；归一化矩阵
+   `tests/normalization/config.rs` 注册 `OpenAiChat` provider（顺序确定性保持，无 env 静默跳过）；
+   `tests/integration_openai_chat.rs` 6 个 `#[ignore]` 测试——**DeepSeek 4 用例实测全过**（含 §5.1 关键的
+   thinking 多轮 + 工具调用 round-2 回放 `reasoning_content`+`tool_calls` 不 400），2 个 vLLM 干净跳过
+   （如实标注未实测）。Azure 风格 `openai_from_env` 语义未被误改（两条路径物理隔离）。
+5. **文档同步与重复实现收口（M5）✅**：设计文档 §8 五项同步清单逐条销号——`DESIGN.md` §1.1 决策反转
+   （协议清单加 chat/completions、DeepSeek/vLLM 从 Anthropic 移出、「不支持」段移除 chat/completions、
+   追加反转注记）；`docs/capability-matrix.md` 加 chat/completions 列 + DeepSeek/vLLM 实测一节；
+   `README.md` provider 段 + ignored 命令；`AGENTS.md` env 表；`docs/client-layer-references.md` 参考分工行。
+   M5-2 把两份 e2e 的手搓 DeepSeek 客户端替换为 `OpenAiChatAdapter` 委托（`response_format` 走 extras 逃生舱），
+   删除全部重复 HTTP/wire 代码，行为等价。**`DESIGN.md` 全文不存在与本适配器矛盾的「不支持」表述**
+   （grep `chat/completions`/`DeepSeek`/`vLLM` 核对，唯一「不支持」条目是 Gemini）。
+
+非目标（设计文档 §2.2）确认未被偷渡：`logprobs` 未建模（仅 doc 注释 + fixture + extra 断言，符合
+「只能进 extra」）；无 `n > 1` 多 choice（仅 `choices[0]`）；无 quirk 配置类型（仅 mod.rs doc 注释
+「no quirk configuration types」，方言经 `ProviderExtras` 逃生舱）；采样参数扩充一律走 extras。
+
+规模核对（vs 设计文档 §9 估算「实现 1200–1500 + 测试 800–1000」）：实现文件 ~1492 行（含 inline
+`#[cfg(test)]` 辅助），**在估算区间内**；测试文件 ~2367 行，**超估算约 2.4×**。超标原因：§9 估算基于
+openai_resp 的 ~1400 测试行，但未计入本适配器特有的 (a) `Accumulator` 折叠一致性对照测试（§7.1 要求
+fold == 非流式 `parse_response`，stream/tests/mod.rs 532 行 + parsing.rs 逐 fixture 对照）；(b) 11 个
+fixture 文件（3 response .json + 4 stream .sse + 4 配对 .json）；(c) 更细的测试分层（response/stream 各
+errors/parsing/transport/mod 四子模块）；(d) 不规则字节分块健壮性测试。属更高覆盖密度而非臃肿，
+单测运行仍秒级（`adapter::openai_chat` 57 测试 0.02s，全量 `cargo test --all --all-targets` 套件级
+均在 2s 内完成，无超时）。
+
+最终验证（M5-R，2026-07-23）全部通过：
+
+- `cargo fmt --all --check`：exit 0。
+- `cargo clippy --all-targets -- -D warnings`：exit 0。
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`：exit 0。
+- `cargo test --all --all-targets`：51 套件全部 `0 failed`、exit 0（1381 passed；16 ignored 为真实端点/
+  归一化矩阵 `#[ignore]`，缺 env 干净跳过）。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`：exit 0。
+
+范围外遗留（独立审查线，非本计划缺陷）：全库安全审查 `docs/review-2026-07-23.md`（记忆
+`review-2026-07-23-acp-fs-sandbox`）的 CRITICAL/H1/M1–M4 缺陷与本适配器正交——H-ROB-1（共享
+`Accumulator::apply_unknown_delta` 对 `stream_deltas` 非 Array 字段 `expect` panic）经 chat/completions
+流式路径**不可达**（normalizer 从不产生 `ContentBlock::Unknown`），M3-R 已核实。留给单独的安全修复批次，
+不在 openai_chat M1–M5 范围内，按任务规则不抢占 TODO 顺序。
+
+收尾归档：本计划与任务单在 M5-R 完成后归档到 `docs/archive/2026-07-23-openai-chat/`（比照
+`docs/archive/2026-07-20-mag-gaps/` 体例，`git mv` 根 `PLAN.md`/`TODO.md` 入档，设计文档
+`docs/openai-chat-api.md` 保留在 `docs/`）。
