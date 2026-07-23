@@ -1492,7 +1492,7 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
 
 无 breaking change：纯文档同步（5 个 `.md`），未触及任何代码或公开 API。
 
-### M5-2 [TODO] 可选收尾：e2e 手搓 DeepSeek 客户端替换为适配器
+### M5-2 [DONE] 可选收尾：e2e 手搓 DeepSeek 客户端替换为适配器
 
 上下文：
 
@@ -1517,6 +1517,72 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
   则标注「编译验证，未实跑」。
 - 若判定不替换（收益/风险不划算），在完成记录写明理由并把本任务标为 `[DONE]`（降级
   完成）。
+
+完成记录（2026-07-23）：
+
+两份手搓的非流式 DeepSeek chat/completions 客户端（`tests/agent_external_real_e2e.rs:144-388` 与
+`tests/agent_external_managed_real_e2e.rs:217-442`，后者 `#![cfg(all(feature=external-claude-code,
+feature=external-codex))]` 门控）已替换为委托 `OpenAiChatAdapter`，删除全部手搓 HTTP + wire 解析代码。
+**未发现适配器缺口**——`response_format` 经 provider_extras 逃生舱即可表达，无需保留手搓客户端。
+
+替换形态（保留 `DeepSeekLlmHandler` 这个 `LlmHandler` 包装层 + logging，只换底层 transport）：
+
+- **`DeepSeekLlmHandler` 字段 `http: reqwest::Client` → `adapter: OpenAiChatAdapter`**。`new(config, log)`
+  构造 `EndpointConfig { base_url, auth: AuthScheme::Bearer(api_key), query_params: Vec::new(),
+  extra_headers: Vec::new() }` → `OpenAiChatAdapter::new(endpoint)`（Bearer 直连，无 Azure 风格 `api-key`
+  头/`api-version` query；adapter 内部 `endpoint_url(&["chat","completions"])` 取代手搓 `chat_url()`）。
+- **`chat()`**：clone request（adapter.chat 消费 `ChatRequest`，而 handler 拿到 `&ChatRequest`）→ 委托
+  `self.adapter.chat(request).await`（inherent `pub async fn chat`，`response.rs:53`，UFCS 调用 inherent
+  优先于 trait，无需 import `LlmClient` trait）→ logging。
+- **保留的 e2e wrapper 逻辑（行为等价，非手搓 HTTP）**：
+  1. `response_format` 注入（`system.contains("JSON_OBJECT")`）改走 **provider_extras 逃生舱**：
+     `ProviderExtras { provider: OpenAiChat, fields: { "response_format": {"type":"json_object"} } }`，
+     adapter `merge_into` 在所有映射完成后注入 body（M1-3 已支持 extras 覆盖任意顶层字段）。
+  2. model fallback（`request.model.is_empty()` → `config.model`；coordinator 已恒非空，防御性等价）。
+  3. empty-content → `ClientError::Protocol("...empty assistant message")`（手搓语义，adapter 返回后用
+     `response_text` 复检）。
+  4. logging 形态不变：文件1 `DeepSeekCallLog` 记 prompt/response 文本（`record_prompt` 在 chat 开头、
+     `record_response` 在 empty 检查之后）；文件2 只记调用次数（`record()`）。
+
+删除的手搓代码（两文件）：`DeepSeekConfig::chat_url()`、`DeepSeekChatResponse`/`DeepSeekChoice`/
+`DeepSeekMessage` wire 类型、`chat_messages()`、`normalize_finish_reason()`、`http` 字段 + reqwest POST
+逻辑；连带清理 import（`serde::Deserialize`、`model::normalized::{Normalized, StopReason}`、
+`model::usage::Usage`）与不再使用的 `HTTP_TIMEOUT` 常量。保留：`DeepSeekConfig`(from_env+字段)、
+`DeepSeekCallLog`、`request_text`(文件1，record_prompt 用)、`message_text`/`content_text`/`response_text`
+(coordinator + logging 用)。
+
+行为等价核对（TODO 明列 4 维度 + 细微差异）：
+
+- **finish_reason 映射**：adapter 用 §4.3 完整映射表（比手搓更全：补 `tool_calls`→ToolUse、缺失→Other）；
+  coordinator 场景 finish_reason=stop → 两路径均 EndTurn，等价。
+- **system 渲染**：adapter 把 `ChatRequest.system` 渲染为首条 system 消息，与手搓 `chat_messages` 一致。
+- **bearer 直连**：`EndpointConfig` Bearer + 空 query/headers，adapter `endpoint_headers` 产 `Authorization:
+  Bearer`，与手搓 `bearer_auth` 等价。
+- **不打印 key**：wrapper + adapter 均不打印；logging 不含 key（文件1记 prompt/response 文本、文件2记次数）。
+- 细微差异（非 spec 偏差，coordinator 场景下不可观察）：手搓 `temperature.unwrap_or(0.0)` 发 0.0，adapter
+  omit-None；coordinator 恒 `Some(0.0)`，两路径均发 0.0。手搓 extra 仅 id/model，adapter 留整个 wire
+  （含 choices/object/id/model 等，更丰富）；coordinator 只用 `response_text`/`parse_plan`，不依赖 extra。
+  adapter per-request 超时 10min 比手搓 75s 宽，但被 coordinator 外层 timeout（420s/600s）兜底。
+
+验证结果（全绿）：
+
+- `cargo fmt --all`：无 diff。
+- `cargo clippy --all-targets -- -D warnings`：exit 0。
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp"
+  -- -D warnings`：exit 0（覆盖 feature-gated 的文件2）。
+- `cargo test --test agent_external_real_e2e`：3 ignored、exit 0、0.00s（不触网）。
+- `cargo test --features "external-claude-code external-codex" --test agent_external_managed_real_e2e`：
+  3 ignored、exit 0、0.00s（不触网）。
+- `cargo test --all --all-targets`：全部 `test result: ok.` 0 failed（lib 1123，与 M4-R/M5-1 基线一致，无回归）。
+- `RUSTDOCFLAGS="-D warnings" cargo doc` 未跑：未改任何 src/pub item（只改两个 test 文件），沿用 M5-1 doc 绿基线。
+
+实跑：环境无 `DEEPSEEK_API_KEY` 与本地 `claude`/`codex` CLI，两个 coordinator 测试默认 `#[ignore]`
+不触网；按 TODO 验证条件标注「编译验证，未实跑」。替换后 transport+解析路径与 M4-3 已实测通过的
+`OpenAiChatAdapter`（DeepSeek 4 用例含 §5.1 reasoning_content 回放防 400）同源；构造形态（Bearer 直连 +
+provider_extras 注入）与 facade `openai_chat_from_env` / M4-3 integration helper 一致。
+
+无 breaking change：纯测试文件重构（两 `#[ignore]` e2e），不动生产代码、不动公开 API、不动既有测试断言
+（coordinator 的 `deepseek_log.call_count() >= 2` / `final_text.contains(FINAL_MARKER)` 等断言不变）。
 
 ### M5-R [TODO] M5 review + 最终收口
 

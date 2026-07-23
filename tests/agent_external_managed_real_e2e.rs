@@ -82,18 +82,17 @@ use agent_lib::agent::{
     WorktreeIsolation, WorktreeRef, drain,
 };
 use agent_lib::{
-    client::{ChatRequest, ClientError, Response as LlmResponse},
+    adapter::openai_chat::OpenAiChatAdapter,
+    client::{AuthScheme, ChatRequest, ClientError, EndpointConfig, Response as LlmResponse},
     conversation::{Conversation, ConversationConfig},
     model::{
         content::ContentBlock,
+        extras::{ProviderExtras, ProviderId},
         message::{Message, Role},
-        normalized::{Normalized, StopReason},
-        usage::Usage,
     },
 };
 use agent_testkit::prelude::*;
 use async_trait::async_trait;
-use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::{process::Command, time::timeout};
 
@@ -111,8 +110,6 @@ const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const CHILD_TIMEOUT: Duration = Duration::from_secs(240);
 /// Whole-coordinator budget: plan call + two children + final synthesis.
 const COORDINATOR_TIMEOUT: Duration = Duration::from_secs(600);
-/// Per-request HTTP timeout for the DeepSeek coordinator LLM.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(75);
 /// Bounds each child's `start → advance* → done` drive at the policy level.
 const MAX_CHILD_TURNS: u32 = 12;
 
@@ -241,21 +238,6 @@ impl DeepSeekConfig {
                 .unwrap_or_else(|| "deepseek-chat".to_owned()),
         })
     }
-
-    fn chat_url(&self) -> Result<reqwest::Url, ClientError> {
-        let mut url = reqwest::Url::parse(&self.base_url)
-            .map_err(|err| ClientError::Other(format!("invalid DeepSeek base URL: {err}")))?;
-        let current = url.path().trim_end_matches('/');
-        let path = if current.ends_with("/chat/completions") {
-            current.to_owned()
-        } else if current.is_empty() {
-            "/chat/completions".to_owned()
-        } else {
-            format!("{current}/chat/completions")
-        };
-        url.set_path(&path);
-        Ok(url)
-    }
 }
 
 /// Counts DeepSeek round-trips so the coordinator test can assert the model was
@@ -278,76 +260,53 @@ impl DeepSeekCallLog {
 
 struct DeepSeekLlmHandler {
     config: DeepSeekConfig,
-    http: reqwest::Client,
+    adapter: OpenAiChatAdapter,
     log: Arc<DeepSeekCallLog>,
 }
 
 impl DeepSeekLlmHandler {
     fn new(config: DeepSeekConfig, log: Arc<DeepSeekCallLog>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .expect("build DeepSeek HTTP client");
-        Self { config, http, log }
+        // Bearer direct-connect, no Azure-style `api-key` header / `api-version`
+        // query: the chat/completions adapter owns URL + header assembly.
+        let endpoint = EndpointConfig {
+            base_url: config.base_url.clone(),
+            auth: AuthScheme::Bearer(config.api_key.clone()),
+            query_params: Vec::new(),
+            extra_headers: Vec::new(),
+        };
+        Self {
+            config,
+            adapter: OpenAiChatAdapter::new(endpoint),
+            log,
+        }
     }
 
     async fn chat(&self, request: &ChatRequest) -> Result<LlmResponse, ClientError> {
-        let mut body = json!({
-            "model": if request.model.is_empty() {
-                self.config.model.as_str()
-            } else {
-                request.model.as_str()
-            },
-            "messages": chat_messages(request),
-            "max_tokens": request.max_tokens,
-            "temperature": request.temperature.unwrap_or(0.0),
-            "stream": false,
-        });
+        // The adapter owns transport and wire parsing; this handler only applies
+        // the e2e coordinator's request shaping and counts the round trip.
+        let mut request = request.clone();
+        if request.model.is_empty() {
+            request.model = self.config.model.clone();
+        }
+        // The coordinator's planning system prompt requests a JSON object; force
+        // structured output through the provider-extras escape hatch, which the
+        // adapter merges into the request body verbatim.
         if request
             .system
             .as_deref()
             .is_some_and(|system| system.contains("JSON_OBJECT"))
         {
-            body["response_format"] = json!({ "type": "json_object" });
+            request.provider_extras = Some(ProviderExtras {
+                provider: ProviderId::OpenAiChat,
+                fields: Map::from_iter([(
+                    "response_format".to_owned(),
+                    json!({ "type": "json_object" }),
+                )]),
+            });
         }
 
-        let url = self.config.chat_url()?;
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.config.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|err| ClientError::Network(err.to_string()))?;
-
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let text = response
-            .text()
-            .await
-            .map_err(|err| ClientError::Network(err.to_string()))?;
-
-        if !status.is_success() {
-            return Err(ClientError::from_http_response(
-                status.as_u16(),
-                text,
-                retry_after.as_deref(),
-            ));
-        }
-
-        let wire: DeepSeekChatResponse = serde_json::from_str(&text)
-            .map_err(|err| ClientError::Protocol(format!("invalid DeepSeek JSON: {err}")))?;
-        let choice = wire
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| ClientError::Protocol("DeepSeek returned no choices".to_owned()))?;
-        let content = choice.message.content.unwrap_or_default();
+        let response = self.adapter.chat(request).await?;
+        let content = response_text(&response);
         if content.trim().is_empty() {
             return Err(ClientError::Protocol(
                 "DeepSeek returned an empty assistant message".to_owned(),
@@ -355,26 +314,7 @@ impl DeepSeekLlmHandler {
         }
         self.log.record();
 
-        let mut extra = Map::new();
-        if let Some(id) = wire.id {
-            extra.insert("id".to_owned(), Value::String(id));
-        }
-        if let Some(model) = wire.model {
-            extra.insert("model".to_owned(), Value::String(model));
-        }
-
-        Ok(LlmResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: vec![ContentBlock::Text {
-                    text: content,
-                    extra: Map::new(),
-                }],
-            },
-            usage: wire.usage.unwrap_or_default(),
-            stop_reason: normalize_finish_reason(choice.finish_reason.as_deref()),
-            extra,
-        })
+        Ok(response)
     }
 }
 
@@ -387,57 +327,6 @@ impl LlmHandler for DeepSeekLlmHandler {
         _ctx: &RunContext,
     ) -> RequirementResult {
         RequirementResult::Llm(self.chat(request).await)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct DeepSeekChatResponse {
-    id: Option<String>,
-    model: Option<String>,
-    choices: Vec<DeepSeekChoice>,
-    usage: Option<Usage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DeepSeekChoice {
-    message: DeepSeekMessage,
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DeepSeekMessage {
-    content: Option<String>,
-}
-
-fn chat_messages(request: &ChatRequest) -> Vec<Value> {
-    let mut messages = Vec::new();
-    if let Some(system) = &request.system {
-        messages.push(json!({ "role": "system", "content": system }));
-    }
-    for message in &request.messages {
-        let text = message_text(message);
-        if text.trim().is_empty() {
-            continue;
-        }
-        messages.push(json!({
-            "role": match message.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
-                Role::Tool => "tool",
-            },
-            "content": text,
-        }));
-    }
-    messages
-}
-
-fn normalize_finish_reason(raw: Option<&str>) -> Normalized<StopReason> {
-    match raw.unwrap_or("stop") {
-        "stop" => Normalized::from_mapped(StopReason::EndTurn, "stop"),
-        "length" => Normalized::from_mapped(StopReason::MaxTokens, "length"),
-        "content_filter" => Normalized::from_mapped(StopReason::Refusal, "content_filter"),
-        other => StopReason::normalize(other),
     }
 }
 
