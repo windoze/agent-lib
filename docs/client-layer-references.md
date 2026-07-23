@@ -10,6 +10,7 @@
 | `StreamEvent` | **Vercel AI SDK v5**(首要) | 事件分类学、id 关联机制、tool 三段式、step/approval/abort | 传输格式(SSE 编码)、纯 UI part(`data-*`/`source-url`) |
 | `ContentBlock` | Anthropic SDK | 完整态块分类(text/image/tool_use/tool_result/thinking) | provider 专有序列化细节 |
 | OpenAI Response 适配器 | `async-openai` | Response API 的 SSE 事件 → 我们 StreamEvent 的映射 | 它的类型直接对外(仅内部适配用) |
+| OpenAI Chat/Completions 适配器 | `async-openai`(chat 模块) | classic `/v1/chat/completions` 的 `messages`/`tool_calls`/`stream` 结构、SSE chunk(含 `[DONE]` 哨兵、`include_usage` 终态 chunk) → StreamEvent 映射 | 它的类型直接对外(仅内部适配用);不为 DeepSeek/vLLM 方言建 quirk 类型(方言经 `ProviderExtras` 逃生舱) |
 | `Message` / `Tool` 组织 | `genai` | Rust 化的 message/tool 结构组织方式 | 它的 stream 事件模型(抹平了增量,见探测报告) |
 
 ## 为什么 Vercel AI SDK 是流式的首要参考

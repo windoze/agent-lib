@@ -1,50 +1,44 @@
-## Execution Plan — M4-R：M4 review（接线与集成正确性核对）
+## Execution Plan — M5-1：文档同步（DESIGN.md 决策反转 + capability-matrix + README + AGENTS.md + client-layer-references）
 
-TODO.md 第一个未完成任务：**M4-R [TODO]**（M1-1~M4-3 全部 [DONE]）。
-这是 review 任务，**不新增功能**，仅独立核对 M4 三个实现任务（M4-1 facade 接线 / M4-2 归一化矩阵 / M4-3 真实端点测试）的正确性与完整性，最后跑全量门禁。
+TODO.md 第一个未完成任务：**M5-1 [TODO]**（M1-1~M4-R 全部 [DONE]）。
+这是**纯文档同步任务**，定义来源是设计文档 `docs/openai-chat-api.md` §8 的同步清单。
+不新增功能、不改生产代码，只改 `*.md` 文档（+ 顺手核对 `src/lib.rs`/`src/adapter/mod.rs` 注释一致性，纯注释核对）。
 
-### 核对清单（逐条对 TODO M4-R checklist）
-1. **facade 构造器错误路径** 与既有 `*_from_env` 一致；Azure 风格 `openai_from_env` 未被误改语义。
-2. **归一化矩阵顺序确定性** 保持；无 env 时默认测试树全绿。
-3. **真实端点测试** 全部 `#[ignore]`、无 key 泄漏、缺 env 干净跳过。
-4. **M4-3 实测结论**（或未实测标注）已写入完成记录，M5-1 可直接引用。
-5. **跑全量门禁命令**（含 external features 的 clippy），全部通过。
+### 任务范围（逐条对 TODO M5-1 实现要求）
+1. **`DESIGN.md` §1.1 决策反转（必须做）**：协议清单加 chat/completions；删除/修订「不支持」段 →「经 `openai_chat` 适配器支持，方言策略见 `docs/openai-chat-api.md`」；DeepSeek、vLLM 协议归类从 Anthropic 移到 chat/completions。
+2. **`docs/capability-matrix.md`**：协议级默认值表加 chat/completions 列（与 `OPENAI_CHAT_DEFAULT_CAPABILITY` 一致）；新增 DeepSeek/vLLM 实测一节（思考模式、400 规则、vLLM 回放兼容性——引用 M4-3 实测结论，vLLM 未实测如实标注）。
+3. **`README.md`**：provider 选择段落加 chat/completions；ignored 测试命令加 `cargo test --test integration_openai_chat -- --ignored --nocapture`。
+4. **`AGENTS.md`**：`src/` 布局 `adapter/` 描述加 openai_chat；「Required environment」表加 `OPENAI_CHAT_BASE_URL`/`OPENAI_CHAT_API_KEY`/`VLLM_*`（注明可选/跳过语义）。
+5. **`docs/client-layer-references.md`**：参考分工总表加一行（可参考 `async-openai` 的 chat 模块）。
+6. **顺手核对** `src/lib.rs` 与 `src/adapter/mod.rs` 的协议清单注释与实际一致（M4-1 已改 lib.rs，需确认 mod.rs）。
 
-### 已读代码（核对状态）
-- `src/facade/config.rs`（534 行）：✓ 已通读。
-  - `openai_chat_from_env()`（:139-149）：必需 `OPENAI_CHAT_BASE_URL`（`required_env`→`FacadeError::Config`）；可选 `OPENAI_CHAT_API_KEY`（有→Bearer，无→None）。错误路径与 `anthropic_from_env`/`openai_from_env` 同款。
-  - Azure 风格 `openai_from_env()`（:110-118）：**未改语义**，仍 `api-key` 头 + `api-version` query；`openai_endpoint()` 不变。
-  - `openai_chat()` builder（:172-174）+ `build()` OpenAiChat arm（:302）：Bearer 直连、忽略 api_version。
-- `tests/normalization/config.rs`（143 行）：✓ 已通读。三 provider 顺序确定性（Anthropic→OpenAiResponses→OpenAiChat 末尾追加）；`build_openai_chat_target()` 三 env 门禁，无 env 静默跳过；Bearer 直连；`model: String`。
-- `tests/integration_openai_chat.rs`（537 行）：✓ 已通读。6 测试全 `#[tokio::test]`+`#[ignore]`；`deepseek()`/`vllm()` 缺 env 早退 skip；从不打印 key 值；90s 超时包裹。
-- M4-3 实测结论：✓ TODO.md:1252-1301 已详记（4 DeepSeek 实测过 / 2 vLLM skip；§5.1 400 规则验证成立；2 个真实 spec 细节修正）。
+### 验证条件
+- 文档中的命令、env 变量名、文件路径与代码实际**逐条对照，不凭记忆**。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过；`cargo fmt --all` 无 diff。
+- 因纯 `.md` 改动（+注释核对），**无需重跑全量测试套件**（沿用 M4-R 绿基线，注明 skip）。
 
-### 待核对（下一步）
-- `src/facade/config/tests.rs`：M4-1 的 4 个 config 单测在位且通过（env 隔离 `ENV_LOCK`/`EnvGuard`）。
-- `src/facade/chat.rs` `client_for_provider`：OpenAiChat 分支（M1-1 落地）形状一致。
-- `src/lib.rs` 协议清单：两处已加 chat/completions。
-- `tests/integration_normalization.rs` 的 `#[ignore]` 文案：已补 OpenAI Chat/Completions（M4-2 连带）。
+### 关键数据源（实测结论引用，来自 M4-3 完成记录 TODO.md:1252-1301）
+- DeepSeek 实测：4 用例全过（非流式 text+usage / 流式 text delta+usage / thinking 模式 Thinking block / **thinking 多轮+工具调用 round-2 回放 reasoning_content+tool_calls 不 400**）。
+- 真实 spec 细节 2 条：① chat/completions `tool_choice` 必须嵌套 `{"type":"function","function":{"name":...}}`（非 Responses 扁平形）；② DeepSeek 思考模式拒 `tool_choice` 字段 → 用强指令 system prompt 自然触发工具调用。
+- §5.1 400 规则验证成立；thinking_extras passthrough 确认。
+- vLLM 未实测（无 `VLLM_BASE_URL`/凭据，2 测试干净 skip）→ 如实标注「待实测」。
+- env 约定：DeepSeek `DEEPSEEK_API_KEY`(必需)/`DEEPSEEK_BASE_URL`(默认 https://api.deepseek.com)/`DEEPSEEK_MODEL`；vLLM `VLLM_BASE_URL`(必需)/`VLLM_API_KEY`(缺省 None)/`VLLM_MODEL`；facade `OPENAI_CHAT_BASE_URL`(必需)/`OPENAI_CHAT_API_KEY`(可选)。
 
-### 门禁命令（核对清单第 5 条，必须全绿）
-```bash
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings
-cargo test --all --all-targets                    # timeout ≤30min
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
-```
+### OPENAI_CHAT_DEFAULT_CAPABILITY 字段（capability-matrix 列必须与此一致，来自 M1-1）
+`max_context_tokens: None`；`input_modalities: {Text, Image}`；`output_modalities: {Text}`；
+`streaming/tool_calling/parallel_tool_calls/reasoning = true`；`prompt_caching/structured_output = false`；
+`stop_reasons: {ToolUse, EndTurn, MaxTokens, StopSequence, Refusal}`。
 
-### 与 M4-R 正交（不抢占）
-- 全库安全审查（`docs/review-2026-07-23.md`，记忆 `review-2026-07-23-acp-fs-sandbox`）的 C1/H1/M1-M4 缺陷属独立审查线，**不在 openai_chat M1–M5 范围**。M3-R 已核实 H-ROB-1 经 chat/completions 路径不可达。本 review 不处置这些无关历史问题，按任务规则不抢占 TODO 顺序。
-
-### 收尾
-- TODO.md M4-R 任务下方追加 review 记录（核对结论逐条 + 门禁输出摘要 + 发现问题及处置）。
-- 标题 `[TODO]` → `[DONE]`。
-- commit：`[M4-R] M4 review：接线与集成正确性核对（[TODO]→[DONE]）`。
-- 停。
+### 执行步骤
+1. 读取所有目标文档 + 设计文档 §8 同步清单 + capability 静态实际值（逐条对照，不凭记忆）。
+2. 逐文件编辑（小而精准的 patch，每个文件一组改动）。
+3. 跑 `cargo fmt --all --check` + `cargo doc --no-deps --workspace`（注释核对可能触及 src/lib.rs/adapter/mod.rs 但 M4-1 已确认 lib.rs，若 mod.rs 需改属注释）。
+4. 标记 TODO M5-1 [TODO]→[DONE] + 完成记录。
+5. commit。
+6. stop。
 
 ### 进度日志
-- [x] 静态核对（config.rs / config/tests.rs / normalization config / integration_openai_chat / chat.rs client_for_provider / lib.rs 协议清单 / normalization ignore 文案）全部通过。
-- [x] 门禁全绿：fmt 无 diff / clippy 默认 exit0 / clippy external exit0 / test 51 ok 行 0 failed exit0（lib 1123、openai_chat 57、facade 282；integration_openai_chat 6 ignored、integration_normalization 1 ignored）/ doc exit0。
-- [x] TODO.md M4-R [TODO]→[DONE] + review 完成记录（逐条 checklist + 门禁摘要 + 问题处置）。
-- [ ] commit + stop。
+- [x] 读取文档 + 设计 §8 + 代码实际值（capability.rs:106-123 确认 OPENAI_CHAT_DEFAULT_CAPABILITY；config.rs/normalization/integration 测试确认 env 名；lib.rs/adapter/mod.rs 注释核对一致无需改）。
+- [x] 逐文件编辑（DESIGN.md §1.1 决策反转 / capability-matrix 加列+实测节 / README 三处口径+provider段+ignored命令 / AGENTS adapter+env表 / client-layer-references 加行）。
+- [x] 门禁：`cargo fmt --all --check` exit0；`cargo doc --no-deps --workspace -D warnings` Finished+Generated exit0；逐条对照 env/路径/命令 vs 代码全一致。全量 test 套件未重跑（纯 .md，沿用 M4-R 绿基线）。
+- [x] TODO M5-1 [TODO]→[DONE] + 完成记录（逐文件+逐条对照+门禁摘要）。commit + stop。

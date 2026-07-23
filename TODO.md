@@ -1393,7 +1393,7 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
 
 ## M5：文档同步与收尾
 
-### M5-1 [TODO] 文档同步：DESIGN.md 决策反转 + capability-matrix + README + AGENTS.md + client-layer-references
+### M5-1 [DONE] 文档同步：DESIGN.md 决策反转 + capability-matrix + README + AGENTS.md + client-layer-references
 
 上下文：
 
@@ -1424,6 +1424,73 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
 - 文档中的命令、env 变量名、文件路径与代码实际一致（逐条对照，不凭记忆）。
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace` 通过；`cargo fmt --all`
   无 diff。
+
+完成记录（2026-07-23）：
+
+纯文档同步任务，定义来源为设计文档 §8 同步清单（`docs/openai-chat-api.md:172-178`）。**未改任何
+`src/` 生产代码**——M5-1「顺手核对 `src/lib.rs` 与 `src/adapter/mod.rs` 协议清单注释」经核对：
+`src/lib.rs:3,17`（M4-1 已含 "Anthropic Messages, OpenAI Responses, and OpenAI Chat/Completions"）、
+`src/adapter/mod.rs:1` 注释为通用描述（无协议清单）且 `pub mod openai_chat;`（mod.rs:5）已在位——均与
+实际一致，无需改动。
+
+逐文件改动（对 §8 清单 + TODO 实现要求）：
+
+1. **`DESIGN.md` §1.1 决策反转（必须做）**：
+   - 协议清单新增 `OpenAI Chat/Completions` 协议项（OpenAI 兼容端点、DeepSeek、vLLM；指向
+     `docs/openai-chat-api.md`）。
+   - `Anthropic` 行移除 DeepSeek、vllm（保留 Anthropic、Grok、ollama 等）——DeepSeek、vLLM 改归
+     chat/completions（设计文档 §1 反转理由）。
+   - 「不支持」段删除 `OpenAI chat/completion` 条目（保留 Gemini）；追加一段「决策反转」注记，
+     说明早期「不支持」决策已反转、反转理由指向 §1。
+2. **`docs/capability-matrix.md`**：
+   - 开头「两种 wire protocol」→「三种」；adapter 句补 `OpenAiChatAdapter`。
+   - 协议级默认值表加第三列 OpenAI Chat/Completions，逐字段与 `OPENAI_CHAT_DEFAULT_CAPABILITY`
+     （`capability.rs:106-123`）一致：`prompt_caching`/`structured_output`=`false`（区别于另两协议），
+     `stop_reasons` 含 `StopSequence`/`Refusal`。表下补注 `prompt_caching`/`structured_output=false` 的
+     原因（无标准 prompt-caching/structured_output 声明字段）+ `StopSequence`(stop 参数)/
+     `Refusal`(content_filter) 归属。
+   - 新增「DeepSeek / vLLM 实测范围（OpenAI Chat/Completions）」一节（插在「响应侧逃生舱实证」前），
+     含 DeepSeek 4 用例实测表、§5.1 400 规则验证、2 个真实 spec 细节（tool_choice 嵌套 / 思考模式拒
+     tool_choice）、vLLM 待实测如实标注。
+3. **`README.md`**：
+   - Client 层描述、下层接口、模块概览三处「Anthropic Messages 与 OpenAI Responses」口径补
+     chat/completions。
+   - Endpoint 环境变量表后新增「OpenAI Chat/Completions」provider 选择段落 + env 表
+     （`OPENAI_CHAT_BASE_URL` 必填 / `OPENAI_CHAT_API_KEY` 可选 / `OPENAI_CHAT_MODEL`），指向
+     `ProviderConfig::openai_chat_from_env`。
+   - ignored 测试命令加 `cargo test --test integration_openai_chat -- --ignored --nocapture`。
+4. **`AGENTS.md`**：
+   - `src/` 布局 `adapter/` 描述列出三协议（Anthropic Messages / OpenAI Responses / OpenAI Chat/Completions）。
+   - Required environment 段补「OpenAI Chat/Completions 真实端点回归」env 表：`OPENAI_CHAT_BASE_URL`/
+     `OPENAI_CHAT_API_KEY`（no-auth when absent）、`DEEPSEEK_API_KEY`(+`BASE_URL`/`MODEL`)、
+     `VLLM_BASE_URL`/`VLLM_API_KEY`/`VLLM_MODEL`（均 skip when unset）。
+5. **`docs/client-layer-references.md`**：参考分工总表加一行「OpenAI Chat/Completions 适配器」→
+   主参考 `async-openai`(chat 模块)，抄 messages/tool_calls/stream 结构与 SSE chunk(`[DONE]`/
+   `include_usage`)→StreamEvent 映射，不抄类型对外/不为方言建 quirk。
+
+逐条对照（文档命令/env/路径 vs 代码实际，不凭记忆）：
+
+- 测试文件 `tests/integration_openai_chat.rs` 存在 ✓。
+- facade `openai_chat_from_env`（`config.rs:140-141`）读 `OPENAI_CHAT_BASE_URL`(required) +
+  `OPENAI_CHAT_API_KEY`(optional) ✓ — README/AGENTS 文档一致。
+- normalization `build_openai_chat_target`（`tests/normalization/config.rs:107-109`）读
+  `OPENAI_CHAT_BASE_URL`/`API_KEY`/`MODEL` ✓ — README env 表一致。
+- integration 测试 helper：`deepseek()` 读 `DEEPSEEK_API_KEY`/`BASE_URL`/`MODEL`；`vllm()` 读
+  `VLLM_BASE_URL`/`API_KEY`(缺省 None)/`MODEL` ✓ — AGENTS env 表一致。
+- capability-matrix chat 列逐字段 == `OPENAI_CHAT_DEFAULT_CAPABILITY`（已读 `capability.rs:106-123`
+  确认）✓。
+
+验证结果（全绿）：
+
+- `cargo fmt --all --check`：exit 0（无 diff；本任务未改任何 .rs）。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`：exit 0（Finished + Generated，17.77s）。
+- 全量测试套件**未重跑**：本任务纯 `.md` 改动（+ 核对确认无需改 src 注释），不影响编译输出，沿用
+  M4-R 全量绿基线（lib 1123 通过 / 集成套件全绿）。按任务规则，只改文档无需重跑套件。
+
+无 spec 偏差、无 workaround。决策反转（`DESIGN.md` §1.1）按设计文档 §1/§8 要求完成；DeepSeek、vLLM
+协议归类从 Anthropic 移到 chat/completions；vLLM 未实测如实标注「待实测」（不编造）。
+
+无 breaking change：纯文档同步（5 个 `.md`），未触及任何代码或公开 API。
 
 ### M5-2 [TODO] 可选收尾：e2e 手搓 DeepSeek 客户端替换为适配器
 

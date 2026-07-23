@@ -1,14 +1,14 @@
 # Capability 能力矩阵与逃生舱实证
 
-本文记录 `agent-lib` 当前两种 wire protocol 的 `Capability` 默认值，并把这些协议级
+本文记录 `agent-lib` 当前三种 wire protocol 的 `Capability` 默认值，并把这些协议级
 默认值与 2026-07-13 在 Microsoft Foundry 部署上的实测范围分开说明。这样，调用方既能
 看到库公开的默认能力，也不会把尚未针对具体 model/deployment 验证的能力误认为运行时
 保证。
 
 默认值的唯一代码来源是
-[`src/client/capability.rs`](../src/client/capability.rs)。`AnthropicAdapter` 与
-`OpenAiRespAdapter` 的 `LlmClient::capability()` 分别返回对应默认表项。当前没有运行时
-能力探测；部署、模型或 API 版本有差异时，调用方应克隆默认值并应用自己的覆盖。
+[`src/client/capability.rs`](../src/client/capability.rs)。`AnthropicAdapter`、
+`OpenAiRespAdapter` 与 `OpenAiChatAdapter` 的 `LlmClient::capability()` 分别返回对应默认表项。
+当前没有运行时能力探测；部署、模型或 API 版本有差异时，调用方应克隆默认值并应用自己的覆盖。
 
 除 LLM wire protocol 外，本文末尾另有一节
 [Managed External Runtime 能力模型](#managed-external-runtime-能力模型)，描述受管外部 agent
@@ -16,18 +16,24 @@
 
 ## 协议级默认值
 
-| `Capability` 字段 | Anthropic Messages 默认值 | OpenAI Responses 默认值 |
-|---|---|---|
-| `max_context_tokens` | `None` | `None` |
-| `input_modalities` | `Text`, `Image`, `File` | `Text`, `Image`, `Audio`, `File` |
-| `output_modalities` | `Text` | `Text`, `Audio` |
-| `streaming` | `true` | `true` |
-| `tool_calling` | `true` | `true` |
-| `parallel_tool_calls` | `true` | `true` |
-| `prompt_caching` | `true` | `true` |
-| `reasoning` | `true` | `true` |
-| `structured_output` | `true` | `true` |
-| `stop_reasons` | `ToolUse`, `EndTurn`, `MaxTokens`, `StopSequence`, `Refusal` | `ToolUse`, `EndTurn`, `MaxTokens`, `Refusal` |
+| `Capability` 字段 | Anthropic Messages 默认值 | OpenAI Responses 默认值 | OpenAI Chat/Completions 默认值 |
+|---|---|---|---|
+| `max_context_tokens` | `None` | `None` | `None` |
+| `input_modalities` | `Text`, `Image`, `File` | `Text`, `Image`, `Audio`, `File` | `Text`, `Image` |
+| `output_modalities` | `Text` | `Text`, `Audio` | `Text` |
+| `streaming` | `true` | `true` | `true` |
+| `tool_calling` | `true` | `true` | `true` |
+| `parallel_tool_calls` | `true` | `true` | `true` |
+| `prompt_caching` | `true` | `true` | `false` |
+| `reasoning` | `true` | `true` | `true` |
+| `structured_output` | `true` | `true` | `false` |
+| `stop_reasons` | `ToolUse`, `EndTurn`, `MaxTokens`, `StopSequence`, `Refusal` | `ToolUse`, `EndTurn`, `MaxTokens`, `Refusal` | `ToolUse`, `EndTurn`, `MaxTokens`, `StopSequence`, `Refusal` |
+
+> Chat/Completions 的 `prompt_caching` / `structured_output` 默认为 `false`，区别于另两个协议：
+> classic `/v1/chat/completions` 没有标准化的 prompt-caching 声明字段，也没有 `structured_output`
+> 声明（结构化输出若需要应经 `provider_extras` 逃生舱传入，如 response_format）。`StopSequence`
+> 进入 `stop_reasons` 集合对应 chat/completions 的 `stop` 参数；`Refusal` 对应 `finish_reason =
+> content_filter`。完整设计见 [`docs/openai-chat-api.md`](openai-chat-api.md) §6。
 
 `max_context_tokens` 有意保持未知：context window 属于具体模型和部署，而不是 wire
 protocol 的固定属性。集合使用 `BTreeSet`，因此序列化与测试顺序稳定。这里的 modality
@@ -60,6 +66,40 @@ Anthropic Messages wire 的
 [`tests/integration_normalization.rs`](../tests/integration_normalization.rs)，默认标记为
 `#[ignore]`，仅在提供 `.envrc` 所述配置时访问 endpoint。协议边界、错误路径以及尚未由
 真实调用覆盖的 stop reason 由录制 fixture 和合成单元测试验证。
+
+## DeepSeek / vLLM 实测范围（OpenAI Chat/Completions）
+
+`openai_chat` 适配器的真实端点回归位于
+[`tests/integration_openai_chat.rs`](../tests/integration_openai_chat.rs)，全部 `#[ignore]`，
+缺 env 时干净跳过。覆盖两套 OpenAI 兼容端点（DeepSeek 官方 API、vLLM 自建服务），共用同一个
+`OpenAiChatAdapter`，方言差异仅经 `provider_extras` 逃生舱传入（不为方言建 quirk 类型）。
+
+### DeepSeek（已实测）
+
+环境具备 `DEEPSEEK_API_KEY`（可选 `DEEPSEEK_BASE_URL` 默认 `https://api.deepseek.com`、
+`DEEPSEEK_MODEL`）时，4 个用例实跑通过（2026-07-23，`--ignored --nocapture --test-threads=1`）：
+
+| 用例 | 验证内容 |
+|---|---|
+| 非流式 text | 基础问答，断言非空 text + Assistant role + usage > 0 |
+| 流式 text | 事件流含 `MessageStart` + Text block + Text delta + 加性 `Usage` + `MessageStop`；折叠后与非流式一致 |
+| 思考模式 | `deepseek-reasoner` + `{"thinking":{"type":"enabled"}}` extras，响应含 `Thinking` block（`reasoning_content` → `ContentBlock::Thinking`） |
+| **思考模式多轮 + 工具调用** | round-1 reasoner 自然触发工具调用（`Thinking` + `ToolUse` + stop=`ToolUse`）；round-2 回放完整历史（assistant 消息携带 `Thinking`+`ToolUse`，由请求侧自动序列化为 `reasoning_content`+`tool_calls`）+ tool result + 跟进，**不返回 400 且正常收尾** |
+
+**§5.1「400 规则」验证成立**：DeepSeek 思考模式要求「`reasoning_content` 在思考模式多轮历史中必须完整回传」，否则 API 400。适配器请求侧「统一原样回放 `reasoning_content`」策略（设计文档 §5.1 推论）满足该规则——round-2 回放带 `reasoning_content`+`tool_calls` 的 assistant 历史后 DeepSeek 未 400。`provider_extras` passthrough 路径（`thinking` extras）也确认畅通。
+
+实测中发现的 2 个真实 spec 细节（适配器透传 extras，非适配器 bug）：
+
+1. **chat/completions `tool_choice` 必须嵌套**为 `{"type":"function","function":{"name":...}}`，**非** Responses API 的扁平 `{"type":"function","name":...}` 形态。DeepSeek 对扁平形态报 `field function: invalid type: null`。
+2. **DeepSeek 思考模式拒绝 `tool_choice` 字段**（`"Thinking mode does not support this tool_choice"`）。思考模式下的工具调用改用强指令 system prompt 自然触发，不需要 `tool_choice` 强制。
+
+### vLLM（待实测）
+
+环境未配置 `VLLM_BASE_URL` / 凭据，2 个 vLLM 用例（非流式 smoke / 流式 smoke）干净 skip
+（`--ignored` 时早退 ok）。构造逻辑结构上镜像 DeepSeek（仅 `AuthScheme::None`（`VLLM_API_KEY`
+缺省）一处差异 + model 名来自 env），尚未在真实 vLLM 端点上验证：流式/非流式基础行为、以及
+vLLM 在 `--reasoning-parser` 下 `reasoning_content` 回放是否被接受（设计文档 §5.2 待验证项）。
+具备 vLLM 端点时应补跑 `cargo test --test integration_openai_chat -- --ignored --nocapture`。
 
 ## 响应侧逃生舱实证
 

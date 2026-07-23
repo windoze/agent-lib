@@ -5,8 +5,8 @@
 到可校验/可分支/可快照的会话，再到 sans-io 的 agent 状态机，最后是 batteries-included 的
 facade 装配层：
 
-- **Client 层** —— 把 Anthropic Messages 与 OpenAI Responses 的 wire 格式统一成同一套请求 /
-  响应 / 流式事件，上层只依赖 dyn-safe 的 `LlmClient`，不感知具体厂商。
+- **Client 层** —— 把 Anthropic Messages、OpenAI Responses 与 OpenAI Chat/Completions 的 wire
+  格式统一成同一套请求 / 响应 / 流式事件，上层只依赖 dyn-safe 的 `LlmClient`，不感知具体厂商。
 - **Conversation 层** —— 以强类型 identity、不可变消息 envelope 和唯一的 pending 事务，把一次
   会话建模成可校验、可分支、可投影 / 压缩、可快照恢复的历史。
 - **Agent 层** —— 在 Conversation 之上提供 sans-io 状态机（`AgentMachine`），把每个副作用
@@ -284,7 +284,8 @@ Facade 是**装配层**，把 identity、pending 事务、`AgentMachine`、`Hand
 想脱离 facade 的装配约定、自己控制副作用兑现时，直接用下面各层：
 
 - **Client 层（`agent_lib::client` / `adapter`）** —— 通过 dyn-safe 的 `LlmClient` 直接发请求。
-  `EndpointConfig` 只描述传输端点，adapter（`AnthropicAdapter` / OpenAI Responses）负责协议路径与
+  `EndpointConfig` 只描述传输端点，adapter（`AnthropicAdapter` / OpenAI Responses /
+  OpenAI Chat/Completions）负责协议路径与
   wire 转换；`chat` 用 `stream=false`，`chat_stream` 用 `stream=true`，流式事件交给统一的
   `Accumulator` 折叠成同一个 `Response`。
 
@@ -346,7 +347,7 @@ Facade 是**装配层**，把 identity、pending 事务、`AgentMachine`、`Hand
 | `model` | 完整态消息、多模态内容块、工具 schema、token usage、归一化枚举，以及保留未建模字段的逃生舱。 |
 | `stream` | 稳定 block id、归一化 delta，以及把增量事件折叠回完整 `Response` 的统一 `Accumulator`。 |
 | `client` | `EndpointConfig`、认证、结构化 capability、分类错误，以及 dyn-safe 的 `LlmClient` trait。 |
-| `adapter` | Anthropic Messages 与 OpenAI Responses 的 HTTP / SSE 适配器。 |
+| `adapter` | Anthropic Messages、OpenAI Responses 与 OpenAI Chat/Completions 的 HTTP / SSE 适配器。 |
 | `conversation` | 强类型 identity、`Conversation`、`PendingTurn` 事务、`Boundary`、fork、projection / compaction、snapshot / restore。 |
 | `agent` | data-only 的 Agent 配置与状态、sans-io `AgentMachine`、`Requirement` 副作用模型与参考 driver；`agent::collab` 协作原语；`agent::external` 外部会话、`Dispatcher` 与 `Escalator`。 |
 | `facade` | batteries-included 装配层：`Chat` / `ChatSession`、工具 `Agent`、subagent 与 external agent delegation、`Dispatcher` / `Escalator` 路由、自动 `Collaboration`，以及统一 `Reply` / `RunOutput` / `RunEvent` / snapshot-restore。 |
@@ -398,6 +399,19 @@ cargo run --example managed_mixed        --features "external-claude-code extern
 | model | `ANTHROPIC_MODEL`（默认 `databricks-claude-haiku-4-5`） | `OPENAI_MODEL`（默认 `gpt-5.5`） |
 | API version | `ANTHROPIC_VERSION`（默认 `2023-06-01` header） | `OPENAI_API_VERSION`（默认 `2025-04-01-preview` query） |
 
+> 上表对应 examples 里的 `AGENT_LIB_PROVIDER` 切换（仅 Anthropic / OpenAI Responses）。
+> **OpenAI Chat/Completions**（classic `/v1/chat/completions`，覆盖 DeepSeek、vLLM 等 OpenAI 兼容
+> 端点）走独立的 facade 入口 `ProviderConfig::openai_chat_from_env`，不通过 `AGENT_LIB_PROVIDER`：
+
+| 变量 | 说明 |
+| --- | --- |
+| `OPENAI_CHAT_BASE_URL`（必填） | chat/completions 端点 base URL（DeepSeek：`https://api.deepseek.com`；vLLM：自建服务地址） |
+| `OPENAI_CHAT_API_KEY`（可选） | Bearer token；缺省走无认证（`AuthScheme::None`，用于 vLLM 等无 auth 端点） |
+| `OPENAI_CHAT_MODEL` | 归一化矩阵测试读取的模型名（默认无，按需配置） |
+
+方言字段（如 DeepSeek 思考模式 `thinking`、`reasoning_effort`、采样参数等）经 `provider_extras`
+逃生舱传入；设计与方言策略见 [`docs/openai-chat-api.md`](docs/openai-chat-api.md)。
+
 ## 构建与测试
 
 ```bash
@@ -427,6 +441,7 @@ cargo clippy --all-targets \
 ```bash
 cargo test --test integration_anthropic -- --ignored --nocapture
 cargo test --test integration_openai_resp -- --ignored --nocapture
+cargo test --test integration_openai_chat -- --ignored --nocapture
 cargo test --features external-claude-code --test external_claude_code -- --ignored --nocapture
 ```
 

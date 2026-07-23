@@ -10,8 +10,9 @@ things" reference.
 ## Repository layout
 
 - `src/` — the `agent-lib` crate: `client/` (provider-neutral client
-  contracts), `adapter/` (LLM wire adapters; shared HTTP/SSE/request helpers
-  live in `adapter/common/`), `conversation/` (Conversation core), `model/`
+  contracts), `adapter/` (LLM wire adapters — Anthropic Messages / OpenAI Responses /
+  OpenAI Chat/Completions; shared HTTP/SSE/request helpers live in `adapter/common/`),
+  `conversation/` (Conversation core), `model/`
   (normalized data model + escape hatches), and `agent/` (sans-io machines +
   effect handlers, including `agent/external/` for the managed external-runtime
   stack and `agent/external/process/` for shared CLI child-process plumbing).
@@ -102,6 +103,16 @@ login, inherited from the process environment. Only optional overrides are read
 The mixed multi-agent e2e additionally needs a `DEEPSEEK_API_KEY` (optional
 `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL`) for its coordinator LLM; it is read from
 the environment or a `.envrc` and never logged.
+
+The OpenAI Chat/Completions real-endpoint regression
+([`tests/integration_openai_chat.rs`](tests/integration_openai_chat.rs), `#[ignore]`,
+skips cleanly when unset) reads its own endpoint vars, also never printed:
+
+| Variable | Effect | Default |
+|---|---|---|
+| `OPENAI_CHAT_BASE_URL` / `OPENAI_CHAT_API_KEY` | facade adapter endpoint + Bearer token (no-auth `AuthScheme::None` when key absent) | none (skips) |
+| `DEEPSEEK_API_KEY` | DeepSeek dialect (`DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` optional) | none (skips) |
+| `VLLM_BASE_URL` | vLLM dialect (`VLLM_API_KEY` optional → no-auth; `VLLM_MODEL` optional) | none (skips) |
 
 ### Ignored real e2e commands
 

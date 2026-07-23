@@ -12,11 +12,16 @@
 
 支持的 provider 协议(按 **wire format** 划分,而非厂商):
 - **OpenAI Response**:OpenAI、Microsoft Foundry、Grok 等
-- **Anthropic**:Anthropic、Grok、DeepSeek、ollama、vllm 等
+- **Anthropic**:Anthropic、Grok、ollama 等
+- **OpenAI Chat/Completions**:OpenAI 兼容端点、DeepSeek、vLLM 等(classic `POST /v1/chat/completions`,含 SSE 流式)。经 `openai_chat` 适配器支持,方言策略见 [`docs/openai-chat-api.md`](docs/openai-chat-api.md)。
 
 不支持:
-- **OpenAI chat/completion**:新服务端普遍支持 response 或 anthropic;且 chat API 被各家定制过多,兼容性成本高。
 - **Gemini**:当前阶段无需求、无测试条件,暂缓。
+
+> 注:早期版本曾在此列出「不支持 OpenAI chat/completion」,并把 DeepSeek、vLLM 归在 Anthropic
+> 协议下。该决策已反转——DeepSeek 官方主力接口与 vLLM 自建服务的生产入口都是
+> `/v1/chat/completions`,其 Anthropic 兼容层覆盖不全(尤其思考模式与工具调用的组合)。反转理由
+> 与方言设计见 [`docs/openai-chat-api.md`](docs/openai-chat-api.md) §1。
 
 > **协议 vs 厂商方言**:协议是稳定的,厂商是易变的。同一协议下存在厂商方言差异(缺失字段、不支持 `cache_control`、content block 类型差异、system prompt 处理不同等)。在 `Protocol`(wire format)之外,应引入轻量的 **endpoint config**(base_url、auth 方式、方言开关/quirks),不让方言差异污染核心 message 模型。
 
