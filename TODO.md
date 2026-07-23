@@ -1211,7 +1211,7 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
 - 无 breaking change：纯测试新增 provider 分支 + test-only struct 字段类型泛化（`&'static str`→`String`，
   仅 `tests/normalization/` 内）+ ignore 文案。无生产代码、无公开 API 改动。
 
-### M4-3 [TODO] #[ignore] 真实端点测试：tests/integration_openai_chat.rs（DeepSeek + vLLM）
+### M4-3 [DONE] #[ignore] 真实端点测试：tests/integration_openai_chat.rs（DeepSeek + vLLM）
 
 上下文：
 
@@ -1248,6 +1248,57 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
 - 有 DeepSeek key：人工跑 `cargo test --test integration_openai_chat -- --ignored
   --nocapture`，DeepSeek 用例（尤其第 4 条 400 规则）通过；结果与 vLLM 实测结论记录
   在完成记录中（环境缺失则如实标注「未实测」，留给 M5-1 的 capability-matrix 引用）。
+
+完成记录（2026-07-23）：
+
+- `tests/integration_openai_chat.rs`（新建，全部 `#[tokio::test]` + `#[ignore]`，6 测试）：
+  - **helpers**：`deepseek()`（`DEEPSEEK_API_KEY` 必需→否则 skip；Bearer 直连，无 query/extra_headers；
+    base_url 默认 `https://api.deepseek.com`、chat_model 默认 `deepseek-chat`、reasoner_model 默认
+    `deepseek-reasoner`）/`vllm()`（`VLLM_BASE_URL` 必需；`VLLM_API_KEY` 缺省→`AuthScheme::None`；
+    `VLLM_MODEL` 缺省→占位 + skip 文案提示）/`text_request`/`weather_tool`/`thinking_extras`/
+    `with_extras`/`fold_events`/`collect_stream`（90s 外层超时包裹，防 live 调用卡死）。
+    90s per-call 超时（比 e2e 75s/模板 55s 略宽，因 ignored 测试手动跑命中真实网络）。
+  - **测试逐条对 TODO 实现要求**：
+    1. `deepseek_non_streaming_text_returns_content_and_usage`——chat 非流式，断言非空 text + Assistant + usage>0。
+    2. `deepseek_streaming_text_yields_text_delta_and_usage`——流式，断言 MessageStart + Text block +
+       Text delta + 加性 Usage + MessageStop；fold 后 role/usage 一致。
+    3. `deepseek_thinking_mode_returns_reasoning_block`——reasoner + thinking_extras，断言响应含 `Thinking` block
+       （`reasoning_content`→`ContentBlock::Thinking`，§4.3/§5.1）。
+    4. **`deepseek_thinking_multiturn_with_tool_call_avoids_400`**（§5.1 关键）：round-1 reasoner + weather_tool
+       自然触发工具调用 → 断言 `Thinking` + `ToolUse` + stop_reason=ToolUse；round-2 回放完整历史（assistant 消息
+       携带 Thinking+ToolUse，适配器请求侧自动序列化为 `reasoning_content`+`tool_calls`）+ tool result + 跟进 →
+       断言**不 400**且正常收尾。
+    5. `vllm_non_streaming_text_smoke`——非流式基础，断言非空 text + Assistant + usage.input>0。
+    6. `vllm_streaming_text_smoke`——流式基础，断言 text delta + MessageStop + fold；若流中出现 reasoning block
+       则 eprintln 记录（§5.2 待验证项，不硬断言）。
+  - **脱敏**：测试代码从不打印 key 值，skip 文案只点 env 变量名；fixtures 无（实时端点，无录制文件）。
+- **真实端点实测（环境有 `DEEPSEEK_API_KEY`，VLLM_* 全无）——4 DeepSeek 全过、2 vLLM 干净跳过**：
+  - `cargo test --test integration_openai_chat -- --ignored --nocapture --test-threads=1`：
+    6 passed（4 DeepSeek live ok + 2 vLLM skip ok），3.96s。
+  - **实测发现的 2 个真实 spec 细节（已修正，非适配器 bug——适配器只是透传 extras）**：
+    1. **chat/completions `tool_choice` 必须嵌套**：`{"type":"function","function":{"name":...}}`，**非**
+       Responses API 的扁平 `{"type":"function","name":...}`。DeepSeek 对扁平形式报
+       `tool_choice: field function: invalid type: null, expected struct ToolChoiceFunction`。（修正后该 helper
+       被 test 4 弃用——见下条——故已删除；正确嵌套形状记于此供 M5 文档/capability-matrix 引用。）
+    2. **DeepSeek 思考模式拒绝 `tool_choice` 字段**：`"Thinking mode does not support this tool_choice"`（400）。
+       test 4 改用**强指令 system prompt**（"MUST call get_weather tool before answering"）+ 显式 user 请求
+       让 reasoner 自然发起工具调用——§5.1 验证本就不需要 `tool_choice` 强制（DeepSeek 思考模式支持工具调用，
+       仅禁用该约束字段）。reasoner 在该方式下稳定产出 `Thinking`+`ToolUse`+stop=ToolUse。
+  - **§5.1 400 规则验证成立**：round-2 回放带 `Thinking`（→`reasoning_content`）+`ToolUse`（→`tool_calls`）的
+    assistant 历史后，DeepSeek **未返回 400**，正常产出最终回答——证明适配器请求侧「统一原样回放
+    reasoning_content」策略（§5.1 推论）满足 DeepSeek 的 `reasoning_content in thinking mode must be passed back` 规则。
+  - **§5.1 thinking_extras 透传确认**：test 3 带 `{"thinking":{"type":"enabled"}}` extras 打真实 DeepSeek 通过，
+    证明 DeepSeek 容忍未知 body 字段（思考实由 `deepseek-reasoner` 模型驱动），extras 逃生舱 passthrough 路径畅通。
+  - **vLLM 未实测**：环境无 `VLLM_BASE_URL`/凭据，2 个 vLLM 测试干净 skip（`--ignored` 时早退 ok）。
+    构造逻辑结构上镜像 DeepSeek（仅 auth=None 一处差异 + model 来自 env，均经类型系统 + clippy 钉死），
+    按 TODO 验证条件允许的「注明未实测」标注，留给有 vLLM 端点的手验 / M5-1 capability-matrix「vLLM 实测」一节引用。
+- 验证结果（全绿）：
+  - `cargo fmt --all`：无 diff（`--check` 通过）。
+  - `cargo clippy --all-targets -- -D warnings`：exit 0。
+  - `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`：exit 0。
+  - `cargo test --test integration_openai_chat`（无额外 env 标志，默认 run）：6 ignored、exit 0、0.00s
+    （第二层 Option 门禁：`--ignored` 无 env 亦早退 ok，不触网）。
+- 无 breaking change：纯新增 `#[ignore]` 测试文件（6 测试 + helpers），不动生产代码、不动既有测试、不动公开 API。
 
 ### M4-R [TODO] M4 review：接线与集成正确性核对
 
