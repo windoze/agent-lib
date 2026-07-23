@@ -1300,7 +1300,7 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
     （第二层 Option 门禁：`--ignored` 无 env 亦早退 ok，不触网）。
 - 无 breaking change：纯新增 `#[ignore]` 测试文件（6 测试 + helpers），不动生产代码、不动既有测试、不动公开 API。
 
-### M4-R [TODO] M4 review：接线与集成正确性核对
+### M4-R [DONE] M4 review：接线与集成正确性核对
 
 核对清单：
 
@@ -1312,6 +1312,82 @@ role → `Protocol` 含 "assistant" ⑫ wire 各 delta shape 解析。`decode_fi
 - 跑全量门禁命令（含 external features 的 clippy），全部通过。
 
 产出：本任务下方追加 review 记录。
+
+完成记录（2026-07-23）：
+
+核对结论（逐条对 M4-R checklist）：
+
+1. **facade 构造器错误路径与既有 `*_from_env` 一致；Azure 风格 `openai_from_env` 未被误改语义**：
+   - `openai_chat_from_env()`（`config.rs:139-149`）必需 `OPENAI_CHAT_BASE_URL` 走 `required_env`
+     （`config.rs:347-354`：缺/空→`FacadeError::Config("required environment variable {name} is not set")`），
+     与 `anthropic_from_env`（:90-98 `required_env("ANTHROPIC_AUTH_TOKEN")`）和 `openai_from_env`
+     （:110-118 `required_env("OPENAI_BASE_URL")`+`required_env("OPENAI_API_KEY")`）**完全同款 helper、同款错误分类、
+     同款文案风格**（点名变量不点值）✓。可选 `OPENAI_CHAT_API_KEY` 走 `optional_owned_env`（:367-369），
+     有→Bearer、无/空→None（vLLM 无 auth 路径）✓。
+   - **Azure 风格 `openai_from_env` 语义未改**：仍 `openai_endpoint(base_url, api_key, api_version)`（:115）
+     → `AuthScheme::Header{name:"api-key"}` + `query_params:[("api-version",...)]`（`openai_endpoint`:319-329）。
+     该 helper 本身未动；chat 的 Bearer 直连走**独立的** `openai_chat_endpoint`（:337-344，query/headers 空），
+     两条路径物理隔离，无交叉污染 ✓。
+   - config 测试钉死（`tests.rs:209-280`）：缺 base_url→`FacadeError::Config`；齐备→Bearer +
+     `provider==OpenAiChat` + **`client_for_provider` 返回的 client `capability() == OPENAI_CHAT_DEFAULT_CAPABILITY`**
+     （:241-246，TODO M4-1 验证条件 b）；无 api_key→`AuthScheme::None`；builder 忽略 version。4 用例全绿。
+
+2. **归一化矩阵顺序确定性保持；无 env 时默认测试树全绿**：
+   - `Provider` enum（`normalization/config.rs:27-31`）`Anthropic / OpenAiResponses / OpenAiChat`，OpenAiChat
+     **末尾追加**，保持矩阵顺序确定性 ✓；`configured_targets()`（:34-43）数组同步末尾追加 ✓。
+   - `build_openai_chat_target()`（:106-124）三 env 门禁（`OPENAI_CHAT_BASE_URL`+`OPENAI_CHAT_API_KEY`+
+     `OPENAI_CHAT_MODEL`），任一缺失/空→`integration_env` 返回 `None`→`filter_map` 静默跳过；scenario/
+     assertions 零改动（provider-neutral，已 grep 确认无按 provider 数量的断言/快照）✓。
+   - `tests/integration_normalization.rs:13` `#[ignore]` 文案已补 "and/or OpenAI Chat/Completions"（M4-2 连带）✓。
+   - 无 env 时 `cargo test --test integration_normalization`：1 ignored、exit 0（默认测试树全绿）✓。
+   - 顺带确认 M4-2 的 `IntegrationTarget.model: &'static str → String` 泛化（`config.rs:20`）让 env-sourced
+     model 名可用、`scenarios.rs` 改 `.clone()`，全在 `tests/normalization/` 内（test-only），无公开 API 影响 ✓。
+
+3. **真实端点测试全部 `#[ignore]`、无 key 泄漏、缺 env 干净跳过**：
+   - 6 个测试全部 `#[tokio::test]` + `#[ignore = "..."]`（`integration_openai_chat.rs:206/242/296/332/452/485`）✓。
+   - 缺 env 干净跳过：`deepseek()`（:70-91）缺 `DEEPSEEK_API_KEY`→eprintln skip + return None；`vllm()`
+     （:96-124）缺 `VLLM_BASE_URL`→skip；每测试体 `let Some(..) = helper() else { return; }`（:208/244/298/
+     334/454/487）✓。
+   - **无 key 泄漏**：`nonempty_env` 只读不打印；helper 内从不打印 key 值，skip 文案只点 env 变量名
+     （如 "DEEPSEEK_API_KEY is not configured"）；grep 确认测试代码无凭据打印 ✓。
+   - 超时包裹：`PER_CALL_TIMEOUT=90s`（:37），`collect_stream`（:190-202）与每个 `.await` 都经 `timeout()`
+     包裹，防 live 调用卡死 ✓。
+   - 默认 `cargo test --test integration_openai_chat`：6 ignored、exit 0、0.00s（不触网）✓。
+
+4. **M4-3 实测结论已写入完成记录，M5-1 可直接引用**：
+   - TODO.md:1252-1301 完成记录详记：环境有 `DEEPSEEK_API_KEY`、`VLLM_*` 全无；
+     - **4 个 DeepSeek 实测全过**（含 §5.1 reasoning_content 回放防 400 的关键 test 4：round-2 回放带
+       Thinking+ToolUse 历史后 DeepSeek 未 400）；
+     - 2 个 vLLM 干净 skip；
+     - 2 个真实 spec 细节修正（chat/completions `tool_choice` 必须嵌套 `{"type":"function","function":{"name":...}}`；
+       DeepSeek 思考模式拒 `tool_choice` → 改强指令 system prompt 自然触发工具调用）；
+     - §5.1 400 规则验证成立；§5.1 thinking_extras passthrough 确认；vLLM 未实测已如实标注。
+   - 结论齐备，M5-1 capability-matrix「DeepSeek/vLLM 实测」一节可直接引用（思考模式、400 规则、
+     tool_choice 嵌套形状、vLLM 回放兼容性待实测）✓。
+
+门禁输出摘要（全绿，2026-07-23 独立重跑）：
+
+- `cargo fmt --all`：无 diff。
+- `cargo clippy --all-targets -- -D warnings`：exit 0（PASS）。
+- `cargo clippy --all-targets --features "external-claude-code external-codex external-opencode external-acp" -- -D warnings`：exit 0（PASS）。
+- `cargo test --all --all-targets`：51 个 `test result: ok.` 行全部 `0 failed`、0 FAILED、exit 0
+  （lib 1123 通过 = `openai_chat` 57 + `facade` 282 + 其余；`integration_openai_chat` 6 ignored 干净跳过；
+  `integration_normalization` 1 ignored 干净跳过；集成/replay/smoke 套件全绿，无回归）。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace`：exit 0（PASS）。
+
+发现的问题及处置：
+
+- **无 spec 偏差、无 workaround、无未调度测试失败**。M4 三个实现任务（facade 接线 / 归一化矩阵 /
+  真实端点测试）与设计文档 §6（传输形态）/§7.3（两套 env 配置）/§5.1（400 规则）完全一致；
+  `openai_from_env` 的 Azure 风格语义未被 chat 路径误改（两条路径物理隔离）；归一化矩阵顺序确定性保持、
+  无 env 默认全绿；真实端点测试全 `#[ignore]`、无 key 泄漏、缺 env 干净跳过。
+- **范围外观察（非 M4 缺陷，不阻断，记备查）**：全库安全审查（`docs/review-2026-07-23.md`，记忆
+  `review-2026-07-23-acp-fs-sandbox`）的 C1/H1/M1-M4 缺陷属独立审查线，经核查与 chat/completions 路径无关
+  （H-ROB-1 accumulator `apply_unknown_delta` panic 经 chat/completions 流式路径不可达，M3-R 已核实），不在
+  openai_chat M1–M5 范围内，按任务规则不抢占当前 TODO 顺序，留给单独的安全修复批次处置。
+- **M4-2 未跑全量门禁的债务已清**：M4-2 完成记录当时只跑 `integration_normalization` binary + clippy（注释
+  「全量门禁留给 M4-R review」），本 review 的全量 `cargo test --all --all-targets` 已覆盖该 binary 并确认
+  无回归，债务结清。
 
 ---
 
